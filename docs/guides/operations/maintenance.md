@@ -489,7 +489,9 @@ erasure of the same bucket the only check left is the re-list each run makes
 just before it publishes, which leaves a short window, so avoid `--no-claim`
 while an erasure request for the tenant is pending. `maintain migrate` takes
 the same claims, prints the same `claims:` line, and accepts the same
-`--no-claim` and `--dry-run`.
+`--no-claim`. Its `--dry-run` also takes no claims, but it is not compaction's
+plan report: it skips the walk and runs only the read-only re-audit (see
+[Re-encoding compaction parts](#re-encoding-compaction-parts)).
 
 ### Compaction claim metrics
 
@@ -1049,9 +1051,10 @@ rollout decision, not a tuning knob:
 - every reader and maintainer in the fleet must already run a build that reads
   version 2 compaction records. A build that cannot read one fails every
   resolve of that bucket's records, for queries and maintenance alike;
-- once a version 2 record is written there is no rollback past a build that
-  reads them. The record is immutable, and leaving the flag off afterwards only
-  stops new ones;
+- the release before the one you are running must read version 2 compaction
+  records too, so a one-release rollback stays safe. Once a version 2 record is
+  written there is no rollback past a build that reads them. The record is
+  immutable, and leaving the flag off afterwards only stops new ones;
 - the superseded record and its parts stay listed, and keep counting in
   `l1_compaction_parts`, until `sweep` deletes them. That takes two sweep
   passes: the first pass that finds the superseded record past the protection
@@ -1077,7 +1080,7 @@ reencode_blocked: shard=2 hour=9 reason=contested_overlap largest_component=2
 # A contested_overlap or multiple_records bucket is not re-encoded by any run, ...
 buckets_not_migrated: 1
 not_migrated: shard=1 hour=100 path=reencode reason=claim_skipped claim_reason=held_by_another
-# Each not_migrated bucket published nothing this run. A later migrate run retries every one of them.
+# Each not_migrated bucket published nothing this run. This run drained the walk and cleared its cursor, ...
 ```
 
 A `reencode_blocked` line has one of three reasons:
@@ -1107,9 +1110,27 @@ A `not_migrated` line names the path the bucket was dispatched to
 - `publish_abandoned`: the run passed its compaction deadline before the
   publish.
 
-A later `migrate` run retries every `not_migrated` bucket. A run that leaves
-any `reencode_blocked` or `not_migrated` bucket exits nonzero, as one that
-leaves a blocked bucket does, even when it stopped on its budget.
+When a `not_migrated` bucket is retried depends on how the run ended, and the
+`# ` line under the list says which case applies:
+
+- the walk drained and the re-audit found stragglers: the run cleared its
+  cursor, so the next `migrate` run starts over and retries every one;
+- the run stopped on its budget: its cursor is saved past every bucket it
+  examined, so the next run resumes after them, and a `not_migrated` bucket is
+  retried by the first run after the walk drains, which starts over from the
+  beginning. Holding the cursor back instead would let a bucket another process
+  holds stop the walk from reaching the buckets after it;
+- the walk drained and the re-audit raised the floor: another writer carried
+  the bucket to the target after the walk passed it, and nothing is left to
+  retry.
+
+The exit code follows the same cases. A run that drains the walk exits nonzero
+when the re-audit finds stragglers, which every `blocked_bucket`,
+`reencode_blocked` and unresolved `not_migrated` bucket leaves behind, and
+exits zero when it raises the floor, even with `not_migrated` lines printed. A
+run that stops on its budget exits nonzero when it leaves any
+`reencode_blocked` or `not_migrated` bucket, and zero otherwise:
+`blocked_bucket` lines alone do not fail it.
 
 `--dry-run` does not run the walk. It runs the read-only re-audit, prints the
 three below-target figures and any `blocked_bucket` lines, takes no claim,

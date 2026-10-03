@@ -2183,10 +2183,36 @@ fn reencode_blocked_report(blocked: &[ReencodeBlockedBucket]) -> String {
     out
 }
 
+/// When a migrate run's `not_migrated` buckets are retried, which follows from
+/// how the run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotMigratedRetry {
+    /// The walk drained and cleared its cursor, and the fresh re-audit refused
+    /// the floor: the next run starts over and reaches every one of them.
+    NextRun,
+    /// The run stopped on its budget with the cursor persisted past them: the
+    /// next run resumes after them, and only a walk that starts over reaches
+    /// them again.
+    AfterTheWalkDrains,
+    /// The walk drained and the fresh re-audit raised the floor: another writer
+    /// carried each of them to the target after this run passed it.
+    Resolved,
+}
+
+impl NotMigratedRetry {
+    fn of(report: &FamilyMigrateReport) -> Self {
+        match report.verification {
+            _ if !report.walk_complete => NotMigratedRetry::AfterTheWalkDrains,
+            Some(Verification::FloorRaised { .. }) => NotMigratedRetry::Resolved,
+            _ => NotMigratedRetry::NextRun,
+        }
+    }
+}
+
 /// One line per bucket the walk dispatched a rewrite for that published
-/// nothing, with the path and the reason, followed by the sentence that says a
-/// later run retries them. Returns the empty string for an empty list.
-fn not_migrated_report(buckets: &[NotMigratedBucket]) -> String {
+/// nothing, with the path and the reason, followed by the sentence that says
+/// when a later run retries them. Returns the empty string for an empty list.
+fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -> String {
     if buckets.is_empty() {
         return String::new();
     }
@@ -2209,10 +2235,24 @@ fn not_migrated_report(buckets: &[NotMigratedBucket]) -> String {
             bucket.shard, bucket.ingest_hour
         ));
     }
-    out.push_str(
-        "# Each not_migrated bucket published nothing this run. A later migrate run retries \
-         every one of them.\n",
-    );
+    out.push_str(match retry {
+        NotMigratedRetry::NextRun => {
+            "# Each not_migrated bucket published nothing this run. This run drained the walk \
+             and cleared its cursor, so the next migrate run starts over and retries every one \
+             of them.\n"
+        }
+        NotMigratedRetry::AfterTheWalkDrains => {
+            "# Each not_migrated bucket published nothing this run. This run stopped on its \
+             budget with the cursor past them, so the next run resumes after them: they are \
+             retried by the first run after the walk drains, which starts over from the \
+             beginning.\n"
+        }
+        NotMigratedRetry::Resolved => {
+            "# Each not_migrated bucket published nothing this run, and the fresh re-audit found \
+             nothing below the target: another writer carried it to the target after this run \
+             passed it. Nothing is left to retry.\n"
+        }
+    });
     out
 }
 
@@ -2259,7 +2299,10 @@ fn migrate_report_text(
         "buckets_not_migrated: {}\n",
         report.not_migrated.len()
     ));
-    out.push_str(&not_migrated_report(&report.not_migrated));
+    out.push_str(&not_migrated_report(
+        &report.not_migrated,
+        NotMigratedRetry::of(report),
+    ));
     if let Some((shard, hour)) = report.cursor_advanced_to {
         out.push_str(&format!("cursor_advanced_to: shard={shard} hour={hour}\n"));
     }
@@ -2303,7 +2346,16 @@ fn migrate_report_text(
 /// bucket's records are contested or more than one, it gets a
 /// `reencode_blocked` line with its reason. A bucket whose rewrite published
 /// nothing (claim skipped, cancelled, record set changed, publish abandoned)
-/// gets a `not_migrated` line. Either kind of line makes the run exit nonzero.
+/// gets a `not_migrated` line. Either kind of line makes the run exit nonzero,
+/// unless the walk drained and the fresh re-audit raised the floor: another
+/// writer then carried the bucket to the target after the walk passed it, and
+/// the run exits zero.
+///
+/// "Until a later run migrates it" below is the next run when this one drained
+/// the walk, since a drained walk clears its cursor. After a budget stop the
+/// cursor is persisted past every bucket this run examined, so the next run
+/// resumes after them, and a bucket this run skipped is reached again only by
+/// the first run after the walk drains.
 ///
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
@@ -2453,14 +2505,24 @@ pub async fn migrate_to(
              persisted cursor (the floor is not raised until the walk drains and the re-audit is \
              clean)."
         )?;
-        return unmigrated_buckets_verdict(&report, tenant, sig, &family);
+        return budget_stop_verdict(&report, tenant, sig, &family);
     }
 
     match report.verification {
+        // The fresh re-audit found nothing below the target, so the run
+        // succeeded whatever the walk left listed: another writer carried each
+        // such bucket to the target after the walk passed it.
         Some(Verification::FloorRaised { floor_version }) => {
             writeln!(out, "verification: clean (no records below target)")?;
             writeln!(out, "floor_raised_to: {floor_version}")?;
-            unmigrated_buckets_verdict(&report, tenant, sig, &family)
+            if !report.reencode_blocked.is_empty() {
+                writeln!(
+                    out,
+                    "# Each reencode_blocked bucket was carried to the target by another writer \
+                     after this run passed it."
+                )?;
+            }
+            Ok(())
         }
         Some(Verification::Stragglers {
             l0,
@@ -2487,8 +2549,11 @@ pub async fn migrate_to(
                  either: rewrite_record_parts may include a superseded predecessor rewrite \
                  record, and l1_compaction_parts may include a compaction record that a later \
                  rewrite superseded. Both stay listed until `ravel-cli maintain sweep` for this \
-                 tenant, signal and shard deletes them, which it does once the superseding \
-                 rewrite is past the protection horizon. The floor was NOT raised.\n\n\
+                 tenant, signal and shard deletes them. Sweep does nothing to them until the \
+                 superseding record is older than the protection horizon and no HEAD still names \
+                 their parts; the first sweep pass after that writes their unnamed-since marker, \
+                 and a pass at least the pinned-query window later deletes them. The floor was \
+                 NOT raised.\n\n\
                  Whether re-running helps depends on why they are below target. A below-target \
                  L0 record that is merely not yet sealed migrates on a later run. A below-target \
                  L0 that only \
@@ -2497,10 +2562,12 @@ pub async fn migrate_to(
                  migrated by this job at all. A below-target compaction part is re-encoded only \
                  by a run with --reencode-compaction-parts, and only in a bucket whose one \
                  compaction record survives supersession; the record it supersedes keeps \
-                 counting in l1_compaction_parts until `sweep` deletes it, which takes two sweep \
-                 passes (the first writes its unnamed-since marker, and one at least the \
-                 pinned-query window later deletes it), so the floor is raised by the first \
-                 migrate run after that second pass. The {} blocked_bucket line(s) above \
+                 counting in l1_compaction_parts until `sweep` deletes it. Sweep does nothing to \
+                 it until the version 2 record is older than the protection horizon and no HEAD \
+                 still names the superseded record's parts; the first sweep pass after that \
+                 writes its unnamed-since marker, a pass at least the pinned-query window later \
+                 deletes the record and its parts, and the floor is raised by the first migrate \
+                 run after that. The {} blocked_bucket line(s) above \
                  name every bucket THIS INVOCATION EXAMINED that no re-run clears, with its \
                  reason -- a walk that resumed from a cursor does not re-report the loser-only \
                  buckets an earlier invocation found, and a below-target compaction part gets a \
@@ -2508,8 +2575,9 @@ pub async fn migrate_to(
                  overlap in a bucket whose authoritative records are at the target \
                  (losing_record_parts). If there are any, re-running is not the remedy. The {} \
                  reencode_blocked line(s) name the buckets whose compaction parts this run did \
-                 not re-encode, and the {} not_migrated line(s) the buckets a later run \
-                 retries.",
+                 not re-encode, and the {} not_migrated line(s) the buckets the next migrate \
+                 run retries: this run drained the walk and cleared its cursor, so the next run \
+                 starts over.",
                 blocked.len(),
                 report.reencode_blocked.len(),
                 report.not_migrated.len(),
@@ -2523,10 +2591,12 @@ pub async fn migrate_to(
     }
 }
 
-/// The exit verdict of a run that did not refuse on stragglers: an error when
-/// it left any bucket on [`FamilyMigrateReport::reencode_blocked`] or
-/// [`FamilyMigrateReport::not_migrated`], as a blocked bucket does.
-fn unmigrated_buckets_verdict(
+/// The exit verdict of a run that stopped on its budget: an error when it left
+/// any bucket on [`FamilyMigrateReport::reencode_blocked`] or
+/// [`FamilyMigrateReport::not_migrated`]. A `blocked_bucket` line alone does
+/// not make such a run exit nonzero; the run that drains the walk does, through
+/// its re-audit's stragglers.
+fn budget_stop_verdict(
     report: &FamilyMigrateReport,
     tenant: &str,
     signal: Signal,
@@ -2540,8 +2610,10 @@ fn unmigrated_buckets_verdict(
     anyhow::bail!(
         "migrate left {reencode_blocked} bucket(s) reencode_blocked and {not_migrated} \
          bucket(s) not_migrated in the {family} family for tenant {tenant} signal {signal:?}. \
-         A later migrate run retries every not_migrated bucket; the reencode_blocked lines say \
-         what clears each of the others."
+         This run stopped on its budget with the cursor past them, so the next run resumes \
+         after them: the not_migrated buckets are retried by the first run after the walk \
+         drains, which starts over from the beginning. The reencode_blocked lines say what \
+         clears each of the others."
     )
 }
 
@@ -3514,47 +3586,87 @@ mod tests {
             reason,
         };
         assert_eq!(
-            not_migrated_report(&[
-                not_migrated(
-                    MigrationPath::L0Migration,
-                    NotMigratedReason::ClaimSkipped {
-                        reason: ravel_maintain::ClaimSkipReason::StealLost
-                    }
-                ),
-                not_migrated(
-                    MigrationPath::Reencode,
-                    NotMigratedReason::Cancelled {
-                        at: ravel_maintain::Checkpoint::PartBoundary
-                    }
-                ),
-                not_migrated(
-                    MigrationPath::L0Migration,
-                    NotMigratedReason::RecordSetChanged
-                ),
-                not_migrated(MigrationPath::Reencode, NotMigratedReason::PublishAbandoned),
-            ]),
+            not_migrated_report(
+                &[
+                    not_migrated(
+                        MigrationPath::L0Migration,
+                        NotMigratedReason::ClaimSkipped {
+                            reason: ravel_maintain::ClaimSkipReason::StealLost
+                        }
+                    ),
+                    not_migrated(
+                        MigrationPath::Reencode,
+                        NotMigratedReason::Cancelled {
+                            at: ravel_maintain::Checkpoint::PartBoundary
+                        }
+                    ),
+                    not_migrated(
+                        MigrationPath::L0Migration,
+                        NotMigratedReason::RecordSetChanged
+                    ),
+                    not_migrated(MigrationPath::Reencode, NotMigratedReason::PublishAbandoned),
+                ],
+                NotMigratedRetry::NextRun
+            ),
             "not_migrated: shard=0 hour=5 path=l0_migration reason=claim_skipped \
              claim_reason=steal_lost\n\
              not_migrated: shard=0 hour=5 path=reencode reason=cancelled \
              checkpoint=part_boundary\n\
              not_migrated: shard=0 hour=5 path=l0_migration reason=record_set_changed\n\
              not_migrated: shard=0 hour=5 path=reencode reason=publish_abandoned\n\
-             # Each not_migrated bucket published nothing this run. A later migrate run \
-             retries every one of them.\n"
+             # Each not_migrated bucket published nothing this run. This run drained the walk \
+             and cleared its cursor, so the next migrate run starts over and retries every one \
+             of them.\n"
         );
-        assert_eq!(not_migrated_report(&[]), "");
+        assert_eq!(not_migrated_report(&[], NotMigratedRetry::NextRun), "");
     }
 
-    /// A run that did not refuse on stragglers (a budget stop, or a raised
-    /// floor) still exits nonzero when it left a reencode_blocked or a
-    /// not_migrated bucket, and zero when it left neither.
+    /// The sentence under the not_migrated lines follows how the run ended: a
+    /// drained walk with stragglers retries them on the next run, a budget stop
+    /// on the first run after the walk drains, and a raised floor not at all.
     ///
-    /// Non-vacuity: replace the body of `unmigrated_buckets_verdict` with
-    /// `Ok(())` and both `is_err` assertions fail.
+    /// Non-vacuity: drop the `_ if !report.walk_complete` arm of
+    /// `NotMigratedRetry::of` and the budget-stop assertion fails with
+    /// `NextRun`; drop the `FloorRaised` arm and the raised-floor one fails.
     #[test]
-    fn a_run_leaving_unmigrated_buckets_exits_nonzero() {
+    fn the_not_migrated_note_follows_how_the_run_ended() {
+        let budget_stop = FamilyMigrateReport {
+            budget_exhausted: true,
+            ..FamilyMigrateReport::default()
+        };
+        assert_eq!(
+            NotMigratedRetry::of(&budget_stop),
+            NotMigratedRetry::AfterTheWalkDrains
+        );
+        let raised = FamilyMigrateReport {
+            walk_complete: true,
+            verification: Some(Verification::FloorRaised { floor_version: 2 }),
+            ..FamilyMigrateReport::default()
+        };
+        assert_eq!(NotMigratedRetry::of(&raised), NotMigratedRetry::Resolved);
+        let refused = FamilyMigrateReport {
+            walk_complete: true,
+            verification: Some(Verification::Stragglers {
+                l0: 1,
+                l1: 0,
+                rewrite_parts: 0,
+                blocked: Vec::new(),
+            }),
+            ..FamilyMigrateReport::default()
+        };
+        assert_eq!(NotMigratedRetry::of(&refused), NotMigratedRetry::NextRun);
+    }
+
+    /// A run that stopped on its budget exits nonzero when it left a
+    /// reencode_blocked or a not_migrated bucket, says when the not_migrated
+    /// ones are retried, and exits zero when it left neither.
+    ///
+    /// Non-vacuity: replace the body of `budget_stop_verdict` with `Ok(())` and
+    /// both `is_err` assertions fail.
+    #[test]
+    fn a_budget_stop_leaving_unmigrated_buckets_exits_nonzero() {
         let clean = FamilyMigrateReport::default();
-        assert!(unmigrated_buckets_verdict(&clean, "acme", Signal::Logs, "rlog").is_ok());
+        assert!(budget_stop_verdict(&clean, "acme", Signal::Logs, "rlog").is_ok());
 
         let reencode_blocked = FamilyMigrateReport {
             reencode_blocked: vec![ReencodeBlockedBucket {
@@ -3564,9 +3676,7 @@ mod tests {
             }],
             ..FamilyMigrateReport::default()
         };
-        assert!(
-            unmigrated_buckets_verdict(&reencode_blocked, "acme", Signal::Logs, "rlog").is_err()
-        );
+        assert!(budget_stop_verdict(&reencode_blocked, "acme", Signal::Logs, "rlog").is_err());
 
         let not_migrated = FamilyMigrateReport {
             not_migrated: vec![NotMigratedBucket {
@@ -3577,11 +3687,13 @@ mod tests {
             }],
             ..FamilyMigrateReport::default()
         };
-        let err = unmigrated_buckets_verdict(&not_migrated, "acme", Signal::Logs, "rlog")
+        let err = budget_stop_verdict(&not_migrated, "acme", Signal::Logs, "rlog")
             .expect_err("a not_migrated bucket exits nonzero")
             .to_string();
         assert!(
-            err.contains("A later migrate run retries every not_migrated bucket"),
+            err.contains(
+                "the not_migrated buckets are retried by the first run after the walk drains"
+            ),
             "{err}"
         );
     }

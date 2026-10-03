@@ -61,8 +61,9 @@
 //! current segment format version gets those parts re-encoded at the current
 //! version and a version 2 compaction record that supersedes the old one. It
 //! sits behind [`CompactorConfig::reencode_writer_enabled`], off by default.
-//! Its caller is the `migrate` walk ([`crate::migrate::migrate_family`]); no
-//! operator surface turns the switch on yet.
+//! Its caller is the `migrate` walk ([`crate::migrate::migrate_family`]), and
+//! `ravel-cli maintain migrate --reencode-compaction-parts` turns the switch on
+//! for one run.
 
 use std::collections::BTreeMap;
 

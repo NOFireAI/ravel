@@ -272,8 +272,11 @@ pub enum MigrationPath {
     Reencode,
 }
 
-/// Why a rewrite the walk dispatched published nothing. Each one is retried by
-/// the next run, which plans the bucket again.
+/// Why a rewrite the walk dispatched published nothing. The bucket is retried,
+/// planned again from scratch, by the next walk that reaches it: the next run
+/// when this one drained the walk (a drained walk clears the cursor), and after
+/// a budget stop the first run after the walk drains, since the persisted
+/// cursor is past it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotMigratedReason {
     /// The bucket's claim was not available, so the rewrite built nothing
@@ -415,8 +418,11 @@ pub struct FamilyMigrateReport {
     /// on [`Self::not_migrated`].
     pub buckets_migrated: usize,
     /// L0 records whose data the buckets in [`Self::buckets_migrated`] carried
-    /// to the target: the L0 records a migration rewrote, and the inputs a
-    /// re-encoded compaction record names.
+    /// to the target, counted differently on each path. An L0 migration counts
+    /// the bucket's raw-served L0 records that were below the target, not the
+    /// at-target records its rewrite also carried into the new record. A
+    /// re-encode counts every input the re-encoded compaction record names,
+    /// whatever version each was written at.
     pub records_migrated: u64,
     /// Every bucket this invocation found permanently blocked, each named with
     /// its `(shard, ingest_hour)` and the reason no re-run clears it
@@ -461,8 +467,14 @@ pub struct FamilyMigrateReport {
     /// in walk order, with the path and the reason: a claim another process
     /// held, a claim this run lost, a record set that changed before the
     /// publish, or a publish abandoned at the deadline. None of these counts in
-    /// [`Self::buckets_migrated`], the fresh re-audit still counts what each
-    /// left below the target, and the next run retries each one.
+    /// [`Self::buckets_migrated`], and the fresh re-audit still counts what each
+    /// left below the target unless another writer carried it there first.
+    ///
+    /// The cursor advances past these buckets like any other examined one, so
+    /// a held claim never stalls the walk. When the walk drains it clears the
+    /// cursor and the next run retries every one; after a budget stop the next
+    /// run resumes past them, and they are retried by the first run after the
+    /// walk drains.
     pub not_migrated: Vec<NotMigratedBucket>,
     /// The `(shard, ingest_hour)` the cursor was persisted at, when this
     /// invocation stopped on its budget. `None` once the walk completes: a

@@ -565,8 +565,17 @@ async fn two_surviving_records_are_named_and_write_nothing() {
 
 /// Hold the bucket's claim as process 1 on `clock`.
 async fn hold_claim(store: &dyn ObjectStoreBackend, clock: &FixedClock) -> ClaimGuard {
+    hold_claim_on(store, clock, &bucket()).await
+}
+
+/// Hold `held`'s claim as process 1 on `clock`.
+async fn hold_claim_on(
+    store: &dyn ObjectStoreBackend,
+    clock: &FixedClock,
+    held: &ravel_maintain::Bucket,
+) -> ClaimGuard {
     let holder = ClaimGuard::new(
-        &bucket(),
+        held,
         &participant(1, clock),
         ClaimConfig {
             lease_duration: LEASE,
@@ -831,4 +840,150 @@ async fn a_record_set_changed_under_the_reencode_is_named() {
         (1, 1),
         "the predecessor and the rewrite record, no version 2 record"
     );
+}
+
+/// The L0 migration is parked at its first part PUT while a third L0 input
+/// lands in the bucket. Its pre-publish re-list finds a record set with one
+/// more commit record and no compaction record, rewrite record or tombstone,
+/// so it publishes nothing and the report names the bucket on the L0 path with
+/// the changed record set.
+///
+/// Reverting `migrate_listing_gate(&now).unwrap_or(MigrateOutcome::RecordSetChanged)`
+/// in `migrate_bucket_format` to `unwrap_or(MigrateOutcome::Rewritten { parts:
+/// 0, publish: PublishOutcome::Abandoned })` names the bucket
+/// `publish_abandoned` instead, and the `not_migrated` assertion fails.
+#[tokio::test]
+async fn a_record_set_changed_under_the_l0_migration_is_named() {
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    provision(store.inner()).await;
+    seed_l0(store.inner()).await;
+    let gate = store.hold(Op::Put, Some(PART_KEYS.to_string()), Occurrence::Nth(1));
+
+    let config = CompactorConfig::default();
+    let m = migrate(store.as_ref(), &config, target() + 1);
+    let landing = async {
+        let id = parked_part_put(&gate).await;
+        seed_input(
+            store.inner(),
+            &InputSpec::new(
+                Uuid::from_u128(3),
+                10,
+                3,
+                vec![raw_series("keep", &[("k", "a")], &[(3_000, 3.0)])],
+            ),
+        )
+        .await;
+        assert!(gate.release(id), "the parked part PUT was released");
+    };
+    let (report, ()) = tokio::join!(m, landing);
+
+    assert_eq!(
+        report.not_migrated,
+        not_migrated(
+            MigrationPath::L0Migration,
+            NotMigratedReason::RecordSetChanged
+        )
+    );
+    assert_eq!(report.buckets_migrated, 0);
+    assert_eq!(report.records_migrated, 0);
+    assert_eq!(report.verification, stragglers(3, 0), "all three inputs");
+    assert_eq!(
+        compaction_records(store.as_ref()).await.len(),
+        0,
+        "nothing published"
+    );
+}
+
+/// One `migrate` toward `target_version` under `budget`, at the sealed instant.
+async fn migrate_budgeted(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    target_version: u32,
+    budget: MigrateBudget,
+) -> FamilyMigrateReport {
+    migrate_family(
+        store,
+        &FixedClock::new(sealed_now_ns()),
+        config,
+        tenant_hash(),
+        Signal::Metrics,
+        FAMILY,
+        target_version,
+        SHARDS,
+        budget,
+        "migrate_force2 test",
+    )
+    .await
+    .expect("migrate")
+}
+
+/// A budget stop persists the cursor past a not_migrated bucket, so the next
+/// run resumes after it and does not retry it; the run after the walk drains
+/// starts over and does. The held bucket is the hour before the one that
+/// migrates, so the walk passes it first, and the one-record budget runs out
+/// on the bucket after it.
+///
+/// Guarding `position = Some((shard, hour));` in `migrate_family` with
+/// `if report.not_migrated.is_empty()`, which holds the cursor before the first
+/// not_migrated bucket, fails the first run's cursor assertion.
+#[tokio::test]
+async fn a_budget_stop_resumes_past_a_not_migrated_bucket() {
+    let store = MemoryStore::new();
+    store.set_clock_ms(u64::try_from(sealed_now_ns() / 1_000_000).expect("positive"));
+    let clock = FixedClock::new(sealed_now_ns());
+    provision(&store).await;
+    let held_hour = HOUR - 1;
+    seed_l0(&store).await;
+    seed_input(
+        &store,
+        &InputSpec::new_at(
+            held_hour,
+            Uuid::from_u128(4),
+            10,
+            1,
+            vec![raw_series("keep", &[("k", "a")], &[(1_000, 1.0)])],
+        ),
+    )
+    .await;
+    let holder = hold_claim_on(&store, &clock, &bucket_at(held_hour)).await;
+    let mut config = claiming_cfg(2, &clock);
+    config.reencode_writer_enabled = false;
+    let budget = MigrateBudget::records(1);
+
+    let first = migrate_budgeted(&store, &config, target() + 1, budget).await;
+    assert_eq!(first.buckets_examined, 2);
+    assert_eq!(
+        first.not_migrated,
+        vec![NotMigratedBucket {
+            shard: SHARD,
+            ingest_hour: held_hour,
+            path: MigrationPath::L0Migration,
+            reason: NotMigratedReason::ClaimSkipped {
+                reason: ClaimSkipReason::HeldByAnother
+            },
+        }]
+    );
+    assert_eq!(first.buckets_migrated, 1, "the bucket after the held one");
+    assert!(first.budget_exhausted);
+    assert_eq!(first.cursor_advanced_to, Some((SHARD, HOUR)));
+
+    let second = migrate_budgeted(&store, &config, target() + 1, budget).await;
+    assert_eq!(second.buckets_examined, 0, "the walk resumes past both");
+    assert_eq!(
+        second.not_migrated,
+        Vec::new(),
+        "the held bucket is not retried"
+    );
+    assert!(second.walk_complete);
+    assert_eq!(second.cursor_advanced_to, None, "a drained walk clears it");
+
+    holder.complete(&store).await.expect("release the claim");
+    let later_ns = sealed_now_ns() + 2 * i64::try_from(LEASE.as_nanos()).expect("fits");
+    clock.set(later_ns);
+    store.set_clock_ms(u64::try_from(later_ns / 1_000_000).expect("positive"));
+    let third = migrate_budgeted(&store, &config, target() + 1, MigrateBudget::unlimited()).await;
+    assert_eq!(third.buckets_examined, 2, "the walk starts over");
+    assert_eq!(third.not_migrated, Vec::new());
+    assert_eq!(third.buckets_migrated, 1, "the held bucket, now free");
+    assert_eq!(third.records_migrated, 1);
 }

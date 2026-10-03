@@ -1694,12 +1694,16 @@ enum MaintainCommand {
         /// the target: write the parts again at the current version and a
         /// version 2 compaction record that supersedes the old one. Every
         /// reader and maintainer in the fleet must already run a build that
-        /// reads version 2 compaction records; once one is written there is no
-        /// rollback past a build that reads them. The format floor rises on
-        /// the first migrate run after sweep has deleted the superseded record,
-        /// which takes two sweep passes: one that writes its unnamed-since
-        /// marker, and one at least the pinned-query window later.
-        /// Off by default: such a bucket is then reported as reencode_blocked.
+        /// reads version 2 compaction records, and the release before the
+        /// running one must read them too, so a one-release rollback stays
+        /// safe: once one is written there is no rollback past a build that
+        /// reads them. Sweep does nothing to the superseded record until the
+        /// version 2 record is older than the protection horizon and no HEAD
+        /// still names the superseded record's parts; the first sweep pass
+        /// after that writes its unnamed-since marker, a pass at least the
+        /// pinned-query window later deletes the record and its parts, and the
+        /// format floor rises on the first migrate run after that. Off by
+        /// default: such a bucket is then reported as reencode_blocked.
         #[arg(long)]
         reencode_compaction_parts: bool,
     },
@@ -3835,6 +3839,11 @@ mod tests {
     /// siblings do not, and neither do the bucket-root writers `store
     /// qualify` and `tenant token upsert`/`revoke` (see `command_is_write`'s
     /// comments for why the latter two are deliberately left ungated).
+    ///
+    /// `maintain migrate --dry-run` runs only the read-only re-audit, so it is
+    /// a read even with `--reencode-compaction-parts`: replacing
+    /// `MaintainCommand::Migrate { dry_run, .. } => !dry_run,` in
+    /// `command_is_write` with `=> true` fails the dry-run migrate case.
     #[test]
     fn command_is_write_classifies_the_named_shapes() {
         let cases: &[(&[&str], bool)] = &[
@@ -4019,6 +4028,33 @@ mod tests {
                     "t",
                     "--signal",
                     "logs",
+                    "--dry-run",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "maintain",
+                    "migrate",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--reencode-compaction-parts",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "maintain",
+                    "migrate",
+                    "--tenant",
+                    "t",
+                    "--signal",
+                    "logs",
+                    "--reencode-compaction-parts",
                     "--dry-run",
                 ],
                 false,
