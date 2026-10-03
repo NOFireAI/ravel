@@ -615,8 +615,8 @@ async fn measure_planning_latency(
             .plan_segment(seg, tenant_hash, &query, &accounting)
             .await
             .expect("plan segment");
-        if let Some((survivors, _, _, _)) = planned {
-            total_blocks += survivors;
+        if let Some((survivors, _, _, _, _)) = planned {
+            total_blocks += survivors.len();
         }
     }
     let serial = start.elapsed();
@@ -640,7 +640,7 @@ async fn measure_planning_latency(
     assert_eq!(
         planned
             .iter()
-            .filter_map(|p| p.as_ref().map(|(s, _, _, _)| *s))
+            .filter_map(|p| p.as_ref().map(|(s, _, _, _, _)| s.len()))
             .sum::<usize>(),
         total_blocks,
         "both planning passes must prune to the same surviving-block count"
@@ -991,6 +991,11 @@ async fn publish_dataset(
     let tenant_hash = tenant.hash();
     let cfg = RlogConfig {
         block_target_records: config.block_target_records.max(1),
+        // The striped route deals whole row groups to partitions (ADR-2414
+        // decision A1), so the cached fan-out past the segment count this
+        // sweep measures needs more row groups than partitions: two blocks per
+        // group keeps that true at this fixture's block counts.
+        group_target_blocks: 2,
         ..RlogConfig::default()
     };
     let mut total = 0usize;
