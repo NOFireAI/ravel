@@ -941,6 +941,24 @@ fn survivor_provenance(
     }
 }
 
+/// The run-wide triple of a filtered run: the minimum over its survivors' keys
+/// when it carries a column, as `build.rs`'s `merged_run_prefix` stamps a
+/// merged run, so a writer whose samples were all erased no longer names it.
+/// A run without a column keeps its own.
+fn survivor_run_prefix(
+    run: &RunPlan,
+    provenance: Option<&Vec<SampleProvenance>>,
+) -> (i64, u64, u64) {
+    provenance
+        .and_then(|column| {
+            column
+                .iter()
+                .map(|p| (p.created_unix_ns, p.writer_epoch, p.writer_seq))
+                .min()
+        })
+        .unwrap_or((run.created_unix_ns, run.writer_epoch, run.writer_seq))
+}
+
 /// Copy one run's TS and VAL-or-HIST pages verbatim (no decode) out of its
 /// whole fetched object. Used for a run whose series matches no applicable
 /// request's labels at all: every sample survives, so there is nothing to
@@ -1029,7 +1047,8 @@ pub struct RewriteBuild {
 /// Every surviving sample keeps its dedup key, taken from where `provenance`
 /// says: each output run carries its input run's triple and, when the input
 /// run has one, the per-sample provenance column filtered to the survivors
-/// ([`survivor_provenance`]).
+/// ([`survivor_provenance`]). A filtered run with a column takes the minimum of
+/// its survivors' keys as its triple ([`survivor_run_prefix`]).
 pub async fn build_rewrite(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -1223,15 +1242,18 @@ pub async fn build_rewrite(
                                         "output_sample_count sum overflowed u64".to_string(),
                                     )
                                 })?;
+                            let provenance = survivor_provenance(run, column, &kept, decoded)?;
+                            let (created, epoch, seq) =
+                                survivor_run_prefix(run, provenance.as_ref());
                             runs_out.push(RunInputV7 {
                                 run: encode_run_v4(
                                     &series_id,
-                                    run.created_unix_ns,
-                                    run.writer_epoch,
-                                    run.writer_seq,
+                                    created,
+                                    epoch,
+                                    seq,
                                     &SeriesValues::Scalar(survivors),
                                 )?,
-                                provenance: survivor_provenance(run, column, &kept, decoded)?,
+                                provenance,
                             });
                         }
                     }
@@ -1263,15 +1285,18 @@ pub async fn build_rewrite(
                                         "output_sample_count sum overflowed u64".to_string(),
                                     )
                                 })?;
+                            let provenance = survivor_provenance(run, column, &kept, decoded)?;
+                            let (created, epoch, seq) =
+                                survivor_run_prefix(run, provenance.as_ref());
                             runs_out.push(RunInputV7 {
                                 run: encode_run_v4(
                                     &series_id,
-                                    run.created_unix_ns,
-                                    run.writer_epoch,
-                                    run.writer_seq,
+                                    created,
+                                    epoch,
+                                    seq,
                                     &SeriesValues::Histogram(survivors),
                                 )?,
-                                provenance: survivor_provenance(run, column, &kept, decoded)?,
+                                provenance,
                             });
                         }
                     }
