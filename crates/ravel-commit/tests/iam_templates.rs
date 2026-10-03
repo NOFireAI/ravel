@@ -731,20 +731,22 @@ struct Policy {
 /// Effect, Action, and Resource are read directly (see `statement_actions`,
 /// `statement_resources`, `key_patterns_for`, `kms_statement_resources`, ...);
 /// Condition is read for the `s3:prefix` ListBucket block
-/// (`list_prefix_patterns`). Nothing else is examined by any guard.
+/// (`list_prefix_patterns`) and for the create-only PutObject block
+/// (`create_only_put_patterns`). Nothing else is examined by any guard.
 ///
 /// This list is the guard's contract: a statement carrying any key outside it
 /// is one no guard reasons about, so it must fail closed at `load_policy`
 /// rather than be silently skipped.
 const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource", "Condition"];
 
-/// The complete set of `Condition` operators any guard in this file reads.
-/// Only `list_prefix_patterns` reads a Condition at all, and only its
-/// `StringLike` block. A statement whose Condition names any other operator --
-/// a different comparison such as `StringNotLike`, or a set-qualified form such
-/// as `ForAnyValue:StringLike` -- carries a constraint no guard reasons about,
-/// so it must fail closed at `validate_statement` rather than pass with its
-/// Condition unexamined.
+/// The complete set of `Condition` operators any guard in this file reads on a
+/// list statement: `list_prefix_patterns` reads only its `StringLike` block.
+/// (The create-only PutObject Condition has its own one-shape check,
+/// `validate_create_only_put_condition`.) A list statement whose Condition
+/// names any other operator -- a different comparison such as `StringNotLike`,
+/// or a set-qualified form such as `ForAnyValue:StringLike` -- carries a
+/// constraint no guard reasons about, so it must fail closed at
+/// `validate_statement` rather than pass with its Condition unexamined.
 const HANDLED_CONDITION_OPERATORS: &[&str] = &["StringLike"];
 
 /// The complete set of `Condition` keys any guard in this file reads, under a
@@ -999,12 +1001,14 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     let resources = statement_resources(stmt);
     validate_actions_and_resources(role, sid, index, effect, &actions, &resources)?;
 
-    // Condition presence must track the list action. `list_prefix_patterns`
-    // is the only Condition reader and only reads one when the Action grants
-    // s3:ListBucket, so:
+    // Two guards read a Condition: `list_prefix_patterns`, on a statement
+    // whose Action grants s3:ListBucket, and `create_only_put_patterns`, on an
+    // Allow whose every Action is exactly s3:PutObject. So:
     //  - a list statement MUST carry a Condition (an unconstrained bucket-wide
-    //    list is rejected, exactly like a missing Resource), and
-    //  - a non-list statement must carry NONE (a Condition there is read by no
+    //    list is rejected, exactly like a missing Resource);
+    //  - a PutObject-only statement may carry one, and only the create-only
+    //    shape `validate_create_only_put_condition` accepts; and
+    //  - any other statement must carry NONE (a Condition there is read by no
     //    guard: a StringLike/s3:prefix on the protected-delete Deny would pass
     //    validation while, in AWS, a DeleteObject request carries no s3:prefix
     //    context key, so the Deny never fires and protects nothing).
@@ -2229,7 +2233,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/a/alert-lease",
             "t/*/a/state/latest",
             "sys/pq-probe/*",
-            "t/????????????????????????????????/pq/t/*",
+            "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
         ],
         put_actions: &["s3:PutObject", "s3:PutObject"],
         deletes: &["sys/pq-probe/*"],
@@ -5203,6 +5207,55 @@ fn query_manifest_write_is_create_only() {
     }
 }
 
+/// The create-only manifest grant reaches manifest keys and nothing else under
+/// `t/<hash>/pq/t/`: `t/<32 x ?>/pq/t/*/v/<20 x ?>.pqm`. The table segment is
+/// `*` because names run 1 to 63 bytes; the version is exactly 20 characters
+/// (`VERSION_WIDTH` in `crates/ravel-pqtable/src/keys.rs`) with the `.pqm`
+/// suffix. A key that is not a manifest version, or one under another tenant
+/// prefix shape, must not match.
+#[test]
+fn query_manifest_create_grant_reaches_only_manifest_keys() {
+    let query = load_policy("query");
+    let create_only = create_only_put_patterns(&query);
+    assert_eq!(
+        create_only,
+        ["t/????????????????????????????????/pq/t/*/v/????????????????????.pqm"],
+        "query: the create-only grant must be exactly the manifest key pattern"
+    );
+    let tenant = parquet_tenant_manifest_prefix();
+    let reached = [
+        parquet_manifest_key(),
+        format!("{tenant}hits/v/18446744073709551615.pqm"),
+        format!("{tenant}{}/v/{:020}.pqm", "a".repeat(63), 1),
+    ];
+    let not_reached = [
+        format!("{tenant}hits"),
+        format!("{tenant}hits/v/"),
+        format!("{tenant}hits/data.parquet"),
+        format!("{tenant}hits/v/{:019}.pqm", 1),
+        format!("{tenant}hits/v/{:021}.pqm", 1),
+        format!("{tenant}hits/v/{:020}.parquet", 1),
+        format!("{tenant}hits/v/{:020}.pqm.tmp", 1),
+        format!("{tenant}hits/x/{:020}.pqm", 1),
+        parquet_grants_key(),
+        format!("t/{}/pq/t/hits/v/{:020}.pqm", "ab".repeat(17), 1),
+    ];
+    for pattern in &create_only {
+        for key in &reached {
+            assert!(
+                glob_matches(pattern, key),
+                "{pattern:?} must reach the manifest key {key:?}"
+            );
+        }
+        for key in &not_reached {
+            assert!(
+                !glob_matches(pattern, key),
+                "{pattern:?} reaches {key:?}, which is not a manifest version key"
+            );
+        }
+    }
+}
+
 /// The create-only Condition passes the choke point in its one exact shape and
 /// every variant fails closed: a different value, operator, or key; a second
 /// operator; a Deny; or an Action set that is not exactly `s3:PutObject`.
@@ -5259,6 +5312,22 @@ fn create_only_put_condition_shape_fails_closed_on_every_variant() {
             ),
         ),
         (
+            "StringEqualsIfExists operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEqualsIfExists": {"s3:if-none-match": "*"}}),
+            ),
+        ),
+        (
+            "ForAnyValue:StringEquals operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"ForAnyValue:StringEquals": {"s3:if-none-match": "*"}}),
+            ),
+        ),
+        (
             "if-match key",
             stmt(
                 "Allow",
@@ -5305,6 +5374,30 @@ fn create_only_put_condition_shape_fails_closed_on_every_variant() {
         assert!(
             err.contains("CreateOnly"),
             "{name}: rejection must name the Sid; got {err:?}"
+        );
+    }
+
+    // `StringEqualsIfExists` is the dangerous one: a PUT that sends no
+    // If-None-Match header has no value for the key, so the operator passes it
+    // and the statement grants an unconditional overwrite. Both spellings embed
+    // the exact operator name, so they must be refused by an exact operator
+    // lookup and not by some later check a looser lookup would also reach.
+    for (operator, name) in [
+        ("StringEqualsIfExists", "StringEqualsIfExists operator"),
+        (
+            "ForAnyValue:StringEquals",
+            "ForAnyValue:StringEquals operator",
+        ),
+    ] {
+        assert!(operator.contains(CREATE_ONLY_CONDITION_OPERATOR));
+        let (_, case) = cases
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("operator case present");
+        let err = validate_statement("fixture", 0, case).expect_err(name);
+        assert!(
+            err.contains("its operator is not StringEquals"),
+            "{name}: must be refused by the operator check; got {err:?}"
         );
     }
 }
