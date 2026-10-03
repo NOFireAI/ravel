@@ -1268,8 +1268,10 @@ pool nests inside the per-tenant pool, so the tenant's total is unchanged by the
 per-query share: statements running together share the tenant ceiling, and a
 statement that arrives while another holds most of it gets what is left, not a
 reserved quarter. One tenant's SQL memory is therefore still at most 50% of
-`MemTotal`, and with the 25% fetcher cache and 5% catalog cache the budget
-shares sum to 80%.
+`MemTotal`. The two caches carve the memory budget (`MemTotal` less the 2 GiB
+reserve) rather than `MemTotal`, so the three ceilings together come to about
+78% of `MemTotal` on the reference host (25,125,558,681 of 32,212,254,720),
+and more on a loopback store, where the fetcher cache derives at 40%.
 
 A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
 `--sql-partition-count`, or `--promql-fetch-fanout` is a startup error naming
