@@ -6275,16 +6275,24 @@ impl BlockRangeFetcher {
         // too (`SkipIndex::candidate_blocks`'s own doc), so a binary search
         // per candidate is enough; no caller passes an unsorted list.
         // The pages other partitions' row groups hold in the selected columns
-        // are fences: this partition's runs are never bridged or coalesced
-        // across one, so the spans partitions fetch for one object stay
-        // disjoint and their wire bytes sum to at most the object's size.
+        // are fences: this partition's runs are never bridged, coalesced or
+        // joined by the coverage crossover across one, so the spans partitions
+        // fetch for one object stay disjoint and their wire bytes sum to at
+        // most the object's size.
         let mut fences: Vec<(u64, u64)> = Vec::new();
+        // Whether another partition owns a row group of this object: only then
+        // is a whole-object read someone else's bytes as well as this share's.
+        let mut partial_share = false;
         if let Some(owned) = owned_blocks {
             let owned_groups: HashSet<u32> = owned
                 .iter()
                 .filter_map(|&b| u32::try_from(b).ok())
                 .filter_map(|b| page_dir.locate_block(b).map(|(g, _)| g.first_block))
                 .collect();
+            partial_share = page_dir
+                .groups
+                .iter()
+                .any(|g| !owned_groups.contains(&g.first_block));
             let foreign: Vec<usize> = candidates
                 .iter()
                 .copied()
@@ -6306,7 +6314,7 @@ impl BlockRangeFetcher {
             candidates.retain(|c| owned.binary_search(c).is_ok());
         }
         stats.candidate_blocks = candidates.len() as u64;
-        let wanted = projected_page_extents(
+        let mut wanted = projected_page_extents(
             key,
             page_dir,
             blocks_desc.offset,
@@ -6333,9 +6341,24 @@ impl BlockRangeFetcher {
         // routinely covers the whole object) must not shrink that footprint,
         // or an all-columns read of such an object would skip `covering_read`
         // and its whole-object cache admission entirely.
+        //
+        // A partial share (another partition owns a row group of this object)
+        // never reads the whole object: that would move the other shares' bytes
+        // again. It weighs its runs against its own span instead, from its first
+        // wanted page to its last with any fence inside it counted, and on
+        // crossing joins every gap between its runs that holds no fence. A share
+        // whose span holds no other share's page becomes one range of exactly
+        // its span; otherwise one range per stretch between fences. The request
+        // saving is kept and the bytes stay disjoint from every other share's.
         let wanted_bytes: u64 = self.bridged_run_bytes(&seg_ref.level, &wanted, &fences);
-        let coverage = wanted_bytes as f64 / blocks_desc.len.max(1) as f64;
-        if coverage >= self.coverage_threshold {
+        if partial_share {
+            if let Some(span) = extents_span(&wanted) {
+                let coverage = wanted_bytes as f64 / (span.1 - span.0).max(1) as f64;
+                if coverage >= self.coverage_threshold {
+                    wanted = coalesce_fenced(&wanted, u64::MAX, &fences);
+                }
+            }
+        } else if wanted_bytes as f64 / blocks_desc.len.max(1) as f64 >= self.coverage_threshold {
             // `wanted` is already owned (resolved above from the decoded skip
             // index and page directory, not borrowed from `asm`), so dropping
             // the assembler here is safe, as the version-3 coverage crossover
@@ -7487,6 +7510,14 @@ fn merge_fences(extents: &[ByteExtent]) -> Vec<(u64, u64)> {
         }
     }
     out
+}
+
+/// `[start, end)` from the first extent's start to the last extent's end, or
+/// `None` for no extents.
+fn extents_span(extents: &[ByteExtent]) -> Option<(u64, u64)> {
+    let start = extents.iter().map(|e| e.abs_start).min()?;
+    let end = extents.iter().map(ByteExtent::abs_end).max()?;
+    Some((start, end))
 }
 
 /// Whether the gap `[from, to)` holds any byte of a fence. `fences` is the
@@ -12802,6 +12833,17 @@ mod owned_block_plan_tests {
     /// `coalesce_gap` `None` keeps the fetcher's default gap, which bridges
     /// every hole this object has.
     async fn fixture_with_gap(two_streams: bool, coalesce_gap: Option<u64>) -> Fixture {
+        fixture_shaped(two_streams, coalesce_gap, BLOCKS, None).await
+    }
+
+    /// An object of `blocks` one-record blocks in groups of [`GROUP_BLOCKS`],
+    /// and `coverage` overriding the fetcher's coverage crossover threshold.
+    async fn fixture_shaped(
+        two_streams: bool,
+        coalesce_gap: Option<u64>,
+        blocks: usize,
+        coverage: Option<f64>,
+    ) -> Fixture {
         let cfg = RlogConfig {
             block_target_records: 1,
             group_target_blocks: GROUP_BLOCKS,
@@ -12815,7 +12857,7 @@ mod owned_block_plan_tests {
             writer_seq: 1,
         };
         let mut writer = RlogWriter::new(cfg, identity);
-        for ts in 0..BLOCKS as i64 {
+        for ts in 0..blocks as i64 {
             writer.push(record(ts, two_streams)).expect("push");
         }
         let object = writer.finish().expect("finish");
@@ -12828,9 +12870,9 @@ mod owned_block_plan_tests {
             data_object_key: KEY.to_string(),
             object_size: object.len() as u64,
             min_event_ts_ns: 0,
-            max_event_ts_ns: BLOCKS as i64 - 1,
+            max_event_ts_ns: blocks as i64 - 1,
             ingest_hour_bucket: 0,
-            sample_count: BLOCKS as u64,
+            sample_count: blocks as u64,
             series_count: 0,
             shard: 0,
             content_hash: [9u8; 32],
@@ -12852,6 +12894,9 @@ mod owned_block_plan_tests {
             .with_whole_object_threshold(0);
         if let Some(gap) = coalesce_gap {
             range_fetcher = range_fetcher.with_coalesce_gap(gap);
+        }
+        if let Some(f) = coverage {
+            range_fetcher = range_fetcher.with_coverage_threshold(f);
         }
         let fetcher = LogSegmentFetcher::new(store)
             .with_block_range_threshold(0)
@@ -13165,5 +13210,218 @@ mod owned_block_plan_tests {
             vec![(0, 800)],
             "unfenced bridges both"
         );
+    }
+
+    async fn plan_columns(
+        fx: &Fixture,
+        columns: &ColumnSelection,
+        owned: Option<OwnedBlocks<'_>>,
+    ) -> (LogObjectBytes, BlockRangeStats) {
+        fx.fetcher
+            .block_range
+            .fetch_object_with_footer_subset(
+                &fx.seg,
+                TENANT,
+                i64::MIN,
+                i64::MAX,
+                &[],
+                columns,
+                None,
+                ReadPhases::SCAN,
+                owned,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("fetch")
+    }
+
+    /// Absolute `[start, end)` of row group `g`'s chunks in the columns `keep`
+    /// names (`None` keeps every column).
+    fn group_span(fx: &Fixture, g: usize, keep: Option<&HashSet<u32>>) -> (u64, u64) {
+        let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
+            .expect("directories");
+        let blocks_offset = footer::open(&fx.object)
+            .expect("footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS")
+            .offset;
+        let page_dir = dirs.page_dir();
+        let chunks: Vec<(u64, u64)> = page_dir.groups[g]
+            .chunks
+            .iter()
+            .filter(|c| keep.is_none_or(|k| k.contains(&c.column_id)))
+            .filter_map(|c| page_dir.chunk_range(g, c.column_id))
+            .collect();
+        let start = chunks.iter().map(|c| c.0).min().expect("a chunk");
+        let end = chunks.iter().map(|c| c.0 + c.1).max().expect("a chunk");
+        (blocks_offset + start, blocks_offset + end)
+    }
+
+    /// Five blocks in groups of four and one, every column read, A owning the
+    /// four-block group and B the one-block group. A's group alone covers more
+    /// than the default threshold of the whole BLOCKS section, so a crossover
+    /// weighed against the object would read the whole object for A while B
+    /// range-reads its group: wire bytes above the object's length. A partial
+    /// share's crossover reads its own span instead: one GET each, exactly the
+    /// two groups' spans, and A never places B's group. A partition owning every
+    /// block still takes the one whole-object GET.
+    ///
+    /// Fails against the whole-object crossover on a partial share (A moves the
+    /// object) and against a collapse onto the object's BLOCKS extent instead of
+    /// the share's (A's bytes are the section, and B's group is placed in A).
+    #[tokio::test]
+    async fn a_partial_share_crossover_reads_its_own_span_not_the_object() {
+        let fx = fixture_shaped(false, None, GROUP_BLOCKS + 1, None).await;
+        let blocks_len = footer::open(&fx.object)
+            .expect("footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS")
+            .len;
+        let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
+            .expect("directories");
+        let own = |blocks| {
+            Some(OwnedBlocks {
+                blocks,
+                dirs: Some(&dirs),
+            })
+        };
+        let owned_a: Vec<usize> = (0..GROUP_BLOCKS).collect();
+        let owned_b: Vec<usize> = vec![GROUP_BLOCKS];
+        let span_a = group_span(&fx, 0, None);
+        let span_b = group_span(&fx, 1, None);
+        assert!(
+            (span_a.1 - span_a.0) as f64 / blocks_len as f64 >= DEFAULT_LOG_COVERAGE_THRESHOLD,
+            "A's group must cross the default threshold against the whole section, or this proves nothing"
+        );
+
+        let (bytes_a, stats_a) = plan_columns(&fx, &ColumnSelection::all(), own(&owned_a)).await;
+        let (_, stats_b) = plan_columns(&fx, &ColumnSelection::all(), own(&owned_b)).await;
+        assert!(
+            !stats_a.whole_object,
+            "a partial share never reads the object"
+        );
+        assert_eq!(
+            stats_a.block_range_gets, 1,
+            "one covering range for A's share"
+        );
+        assert_eq!(stats_a.block_bytes_fetched, span_a.1 - span_a.0);
+        assert_eq!(stats_b.block_range_gets, 1);
+        assert_eq!(stats_b.block_bytes_fetched, span_b.1 - span_b.0);
+        assert!(
+            bytes_a.read(span_b.0, span_b.1 - span_b.0).is_err(),
+            "A's read stays out of B's group"
+        );
+        assert!(stats_a.block_bytes_fetched + stats_b.block_bytes_fetched <= blocks_len);
+
+        let all: Vec<usize> = (0..=GROUP_BLOCKS).collect();
+        let (_, stats_full) = plan_columns(&fx, &ColumnSelection::all(), own(&all)).await;
+        assert!(
+            stats_full.whole_object,
+            "a full share keeps the whole-object read"
+        );
+        assert_eq!(stats_full.block_range_gets, 1);
+        assert_eq!(stats_full.block_bytes_fetched, fx.object.len() as u64);
+    }
+
+    /// A narrow projection with no coalesce gap leaves holes inside a group, so
+    /// without a crossover the share issues one GET per chunk run. With the
+    /// threshold set between the share's coverage of its own span and its
+    /// coverage of the whole BLOCKS section, the share crosses over against its
+    /// own span and issues exactly one GET of exactly that span.
+    ///
+    /// Fails against a partial share that never crosses over (more than one
+    /// GET), against a crossover weighed on the BLOCKS section (it does not
+    /// cross at this threshold, so more than one GET), and against a collapse
+    /// onto the object's extent (bytes are not the span, and other groups'
+    /// blocks are placed).
+    #[tokio::test]
+    async fn a_partial_share_crossover_collapses_its_runs_into_one_range() {
+        let off = fixture_shaped(false, Some(0), BLOCKS, Some(2.0)).await;
+        let blocks_len = footer::open(&off.object)
+            .expect("footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS")
+            .len;
+        let dirs = RlogReader::decode_directories(&off.object[..], &RlogConfig::default())
+            .expect("directories");
+        let selected = ColumnSelection::fixed_only()
+            .resolve(dirs.field_dir())
+            .expect("a narrow projection resolves to a column set");
+        let owned: Vec<usize> = (GROUP_BLOCKS..2 * GROUP_BLOCKS).collect();
+        let own = || {
+            Some(OwnedBlocks {
+                blocks: &owned,
+                dirs: Some(&dirs),
+            })
+        };
+        let span = group_span(&off, 1, Some(&selected));
+        let span_len = span.1 - span.0;
+
+        let (_, runs) = plan(&off, i64::MIN, own()).await;
+        assert!(
+            runs.block_range_gets > 1,
+            "the share must have holes to collapse: {} GETs",
+            runs.block_range_gets
+        );
+        let own_coverage = runs.block_bytes_fetched as f64 / span_len as f64;
+        let section_coverage = runs.block_bytes_fetched as f64 / blocks_len as f64;
+        assert!(section_coverage < own_coverage && own_coverage < 1.0);
+        let threshold = (own_coverage + section_coverage) / 2.0;
+
+        let on = fixture_shaped(false, Some(0), BLOCKS, Some(threshold)).await;
+        let (bytes, stats) = plan(&on, i64::MIN, own()).await;
+        assert!(!stats.whole_object);
+        assert_eq!(
+            stats.block_range_gets, 1,
+            "one covering range for the share"
+        );
+        assert_eq!(stats.block_bytes_fetched, span_len);
+        assert_eq!(placed_blocks(&on, &bytes), owned);
+    }
+
+    /// A share whose span holds another partition's group (A owning groups 0
+    /// and 2, B group 1) collapses to one range per own group, each exactly
+    /// that group's projected span, so the shares' bytes stay disjoint and
+    /// within the BLOCKS section.
+    ///
+    /// Fails against a collapse that reads the whole span through the fence (A
+    /// places B's blocks, and the sum passes the section length), and against
+    /// one that only subtracts B's pages from the span (A also reads group 1's
+    /// unprojected chunk between them: three ranges, more bytes).
+    #[tokio::test]
+    async fn a_partial_share_crossover_does_not_read_through_a_fence() {
+        let fx = fixture_shaped(false, Some(0), BLOCKS, Some(0.0)).await;
+        let blocks_len = footer::open(&fx.object)
+            .expect("footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS")
+            .len;
+        let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
+            .expect("directories");
+        let own = |blocks| {
+            Some(OwnedBlocks {
+                blocks,
+                dirs: Some(&dirs),
+            })
+        };
+        let owned_a: Vec<usize> = (0..GROUP_BLOCKS).chain(2 * GROUP_BLOCKS..BLOCKS).collect();
+        let owned_b: Vec<usize> = (GROUP_BLOCKS..2 * GROUP_BLOCKS).collect();
+        let (bytes_a, stats_a) = plan(&fx, i64::MIN, own(&owned_a[..])).await;
+        let (bytes_b, stats_b) = plan(&fx, i64::MIN, own(&owned_b[..])).await;
+        assert_eq!(placed_blocks(&fx, &bytes_a), owned_a);
+        assert_eq!(placed_blocks(&fx, &bytes_b), owned_b);
+        assert!(!stats_a.whole_object && !stats_b.whole_object);
+        let selected = ColumnSelection::fixed_only()
+            .resolve(dirs.field_dir())
+            .expect("a narrow projection resolves to a column set");
+        let span_len = |g| {
+            let (start, end) = group_span(&fx, g, Some(&selected));
+            end - start
+        };
+        assert_eq!(stats_a.block_range_gets, 2, "one range per owned group");
+        assert_eq!(stats_a.block_bytes_fetched, span_len(0) + span_len(2));
+        assert_eq!(stats_b.block_range_gets, 1);
+        assert_eq!(stats_b.block_bytes_fetched, span_len(1));
+        assert!(stats_a.block_bytes_fetched + stats_b.block_bytes_fetched <= blocks_len);
     }
 }
