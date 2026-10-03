@@ -2339,7 +2339,12 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             BOOTSTRAP_CONFIG_PATTERN,
             BOOTSTRAP_ENC_PATTERN,
             BOOTSTRAP_META_PATTERN,
-            BOOTSTRAP_ANY_SIGNAL_PROV_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_P_PATTERN,
+            PROV_A_PATTERN,
+            PROV_U_PATTERN,
             BOOTSTRAP_ALERT_STATE_PATTERN,
             BOOTSTRAP_PQ_GRANTS_PATTERN,
         ],
@@ -10392,7 +10397,9 @@ fn maintain_template_covers_every_unnamed_marker_call() {
 const BOOTSTRAP_CONFIG_PATTERN: &str = "t/????????????????????????????????/config";
 const BOOTSTRAP_ENC_PATTERN: &str = "t/????????????????????????????????/enc";
 const BOOTSTRAP_META_PATTERN: &str = "t/????????????????????????????????/m/meta";
-const BOOTSTRAP_ANY_SIGNAL_PROV_PATTERN: &str = "t/????????????????????????????????/?/prov";
+const PROV_P_PATTERN: &str = "t/????????????????????????????????/p/prov";
+const PROV_A_PATTERN: &str = "t/????????????????????????????????/a/prov";
+const PROV_U_PATTERN: &str = "t/????????????????????????????????/u/prov";
 const BOOTSTRAP_ALERT_STATE_PATTERN: &str = "t/????????????????????????????????/a/state/latest";
 const BOOTSTRAP_PQ_GRANTS_PATTERN: &str = "t/????????????????????????????????/pq/grants";
 const BOOTSTRAP_HEAD_M_PATTERN: &str = "t/????????????????????????????????/catalog/m/HEAD";
@@ -10434,7 +10441,12 @@ const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
             BOOTSTRAP_CONFIG_PATTERN,
             BOOTSTRAP_ENC_PATTERN,
             BOOTSTRAP_META_PATTERN,
-            BOOTSTRAP_ANY_SIGNAL_PROV_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_P_PATTERN,
+            PROV_A_PATTERN,
+            PROV_U_PATTERN,
             BOOTSTRAP_ALERT_STATE_PATTERN,
             BOOTSTRAP_PQ_GRANTS_PATTERN,
         ],
@@ -10660,6 +10672,7 @@ fn bootstrap_negative_witnesses() -> Vec<String> {
         "enc/x",
         "m/meta/x",
         "m/prov/x",
+        "x/prov",
         "a/state/latest/x",
         "pq/grants/x",
         "catalog/m/HEAD/x",
@@ -10790,12 +10803,34 @@ fn bootstrap_list_grants_carry_exactly_the_expected_conditions() {
             assert!(!pattern.contains('*'), "{role}: {pattern:?} carries a `*`");
             for segment in &segments[2..] {
                 assert!(
-                    *segment == "?" || !segment.contains('?'),
-                    "{role}: {pattern:?} has a `?` outside the tenant and signal segments"
+                    !segment.contains('?'),
+                    "{role}: {pattern:?} has a `?` outside the tenant segment"
                 );
             }
         }
     }
+
+    // Query reads the provisioning record of whichever signal a query
+    // resolves, so its statement names one record per signal letter.
+    let query = EXPECTED_BOOTSTRAP_GRANTS
+        .iter()
+        .find(|e| e.role == "query")
+        .expect("query row");
+    let hash = "?".repeat(test_tenant().to_hex().len());
+    let want: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|s| format!("t/{hash}/{}/prov", s.key_prefix()))
+        .collect();
+    let got: Vec<String> = query
+        .tenant_patterns
+        .iter()
+        .filter(|p| p.ends_with("/prov"))
+        .map(|p| (*p).to_string())
+        .collect();
+    assert_eq!(
+        got, want,
+        "query: one provisioning-record pattern per signal"
+    );
 }
 
 /// Every bootstrap read in `bootstrap_reads` is admitted by the list statement
@@ -10864,6 +10899,7 @@ fn bootstrap_list_grants_admit_no_other_key() {
             format!("t/{hex}0/enc"),
             alert_lease_key(),
             format!("sys/t/{hex}"),
+            format!("t/{hex}/x/prov"),
         ];
         if expected.role == "maintain" {
             refused.push("sys/auth".to_string());
@@ -10986,4 +11022,52 @@ fn a_widened_bootstrap_condition_fails_the_negative_witnesses() {
         check_bootstrap_grants_admit_only(&load_policy(role), expected)
             .expect("the shipped template passes the same check");
     }
+}
+
+/// Query's per-signal provisioning-record patterns collapsed back into one
+/// `t/<hash>/?/prov` admit `t/<hash>/x/prov`, a letter no `Signal` uses, and
+/// fail the negative witnesses.
+#[test]
+fn a_single_wildcard_query_prov_pattern_fails_the_negative_witnesses() {
+    let hex = test_tenant().to_hex();
+    let hash = "?".repeat(hex.len());
+    let expected = EXPECTED_BOOTSTRAP_GRANTS
+        .iter()
+        .find(|e| e.role == "query")
+        .expect("query row");
+    let any_signal = format!("t/{hash}/?/prov");
+    let mut collapsed: Vec<String> = Vec::new();
+    for value in expected.tenant_patterns {
+        if value.ends_with("/prov") {
+            if !collapsed.contains(&any_signal) {
+                collapsed.push(any_signal.clone());
+            }
+        } else {
+            collapsed.push((*value).to_string());
+        }
+    }
+    assert_eq!(
+        collapsed.len(),
+        expected.tenant_patterns.len() + 1 - ALL_SIGNALS.len(),
+        "the fixture collapsed every provisioning-record pattern"
+    );
+
+    let path = policy_json_path("query");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read template"))
+            .expect("parse template");
+    let stmt = json["Statement"]
+        .as_array_mut()
+        .expect("Statement array")
+        .iter_mut()
+        .find(|s| s["Sid"] == serde_json::json!(expected.tenant_sid))
+        .expect("bootstrap statement");
+    stmt["Condition"] = serde_json::json!({"StringLike": {"s3:prefix": collapsed}});
+    let policy = build_policy("query", "single-wildcard fixture", &json);
+    let err = check_bootstrap_grants_admit_only(&policy, expected)
+        .expect_err("a single-wildcard signal segment must fail the negative witnesses");
+    assert!(err.contains(&format!("\"t/{hex}/x/prov\"")), "{err}");
+
+    check_bootstrap_grants_admit_only(&load_policy("query"), expected)
+        .expect("the shipped template passes the same check");
 }

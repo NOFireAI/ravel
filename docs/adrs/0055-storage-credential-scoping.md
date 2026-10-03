@@ -1642,7 +1642,7 @@ treats a real 404 as a normal state, and only for the role that reads it):
 | `t/<hash>/config` | yes | yes | yes | `read_config`; absent is the deployment defaults |
 | `t/<hash>/enc` | yes | yes | yes | `bootstrap_tenant_epoch`, startup under `--tenant-kms-config`; absent records the first epochs |
 | `t/<hash>/m/meta` | yes | yes | | the metadata sink (creates it) and the metadata cache |
-| `t/<hash>/<sig>/prov` | `m`, `l`, `s` | every signal | `m`, `l`, `s` | `validate_or_adopt` and the generation reads; the query catalog's enforcement reads it for every signal it resolves |
+| `t/<hash>/<sig>/prov` | `m`, `l`, `s` | `m`, `l`, `s`, `p`, `a`, `u` | `m`, `l`, `s` | `validate_or_adopt` and the generation reads; the query catalog's enforcement reads it for every signal it resolves, so Query names one pattern per signal letter, not a `?` signal segment |
 | `t/<hash>/catalog/<sig>/HEAD` | | | `m`, `l`, `s` | the scheduled fold's `get_head`; absent is the first fold |
 | `t/<hash>/a/state/latest` | | yes | yes | `read_alert_state_memo` in the evaluator and in `alert_keep_set` |
 | `t/<hash>/pq/grants` | | yes | | `grants::list`; absent is no grants |
@@ -1662,8 +1662,9 @@ enumerate nothing else. `crates/ravel-commit/tests/iam_templates.rs` pins the
 exact condition values per role, checks each call site's key against its
 role's list statement, and checks that the new statements admit no other key:
 not a sibling a role does not read (`sys/auth` for Maintain), not a key one
-segment deeper, not a listing prefix such as `sys/` or `t/<hash>/`, and not a
-tenant segment 31 or 33 characters wide.
+segment deeper, not a listing prefix such as `sys/` or `t/<hash>/`, not a tenant
+segment 31 or 33 characters wide, and not `t/<hash>/x/prov`, a letter no
+signal uses.
 
 On a fresh AWS bucket under per-role credentials, every server role now
 creates `sys/tenancy`, Maintain creates `sys/gc` as §4 describes, and the

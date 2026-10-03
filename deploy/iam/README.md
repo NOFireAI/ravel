@@ -743,7 +743,7 @@ would admit nothing. The existing list statements are unchanged.
 | `t/<tenant_hash>/config` | yes | yes | yes | `read_config`; absent means the tenant runs on the deployment defaults |
 | `t/<tenant_hash>/enc` | yes | yes | yes | `bootstrap_tenant_epoch` at startup under `--tenant-kms-config`; absent means no epoch is recorded yet, and the process records the first ones |
 | `t/<tenant_hash>/m/meta` | yes | yes | | the metadata sink (creates it) and the metadata cache (serves nothing) |
-| `t/<tenant_hash>/<signal>/prov` | `m`, `l`, `s` | every signal | `m`, `l`, `s` | `validate_or_adopt` and the shard-generation reads; absent means a tenant with no write yet. The query catalog reads it for whichever signal a query resolves, including signals that never get a record |
+| `t/<tenant_hash>/<signal>/prov` | `m`, `l`, `s` | `m`, `l`, `s`, `p`, `a`, `u` | `m`, `l`, `s` | `validate_or_adopt` and the shard-generation reads; absent means a tenant with no write yet. The query catalog reads it for whichever signal a query resolves, including signals that never get a record, so Query names one pattern per signal letter rather than a `?` that would admit any one-character segment |
 | `t/<tenant_hash>/catalog/<signal>/HEAD` | | | `m`, `l`, `s` | the scheduled fold's `get_head`; absent means the first fold |
 | `t/<tenant_hash>/a/state/latest` | | yes | yes | the alert evaluator (folds the full history) and alert retention (checks the commit prefix) |
 | `t/<tenant_hash>/pq/grants` | | yes | | `grants::list`; absent is an empty grant list |
@@ -755,17 +755,21 @@ under `t/*/*/maint/*` by `MaintainList`, so those need no new grant.
 These statements list nothing else. A list request whose prefix is one of
 these keys can return only that key, since no key the system writes begins
 with one of them and continues. They admit no `sys/` or `t/<tenant_hash>/`
-listing, no key one segment deeper, and no tenant segment wider or narrower
-than a tenant hash. `crates/ravel-commit/tests/iam_templates.rs` pins the
-exact condition values per role, checks that each read above is admitted by
-its role's statement, and checks that the bootstrap statements admit no other
+listing, no key one segment deeper, no tenant segment wider or narrower than
+a tenant hash, and no `prov` record under a letter no signal uses.
+`crates/ravel-commit/tests/iam_templates.rs` pins the exact condition values
+per role, checks that each read above is admitted by its role's statement,
+and checks that the bootstrap statements admit no other
 key: neither a sibling key the role does not read (`sys/auth` for Maintain),
-nor a deeper key, a listing prefix or a 31- or 33-character tenant segment.
+nor a deeper key, a listing prefix, a 31- or 33-character tenant segment, or
+`t/<tenant_hash>/x/prov` for Query.
 
 Some keys are deliberately left out. `sys/t/<tenant_hash>`, the alert lease
 and the compaction claims are written with a create-if-absent PUT first and
 read only once that PUT reports the object exists. The idempotency markers are
-found by listing a prefix, not by a single-key read. A data object that a
+found by listing a prefix, not by a single-key read. The gateway holds no list
+grant on that prefix either, so on AWS S3 the lookup is refused and keyed
+ingest falls back to a plain write; that is issue #2462. A data object that a
 concurrent compaction deleted is a race, not a bootstrap state, and naming
 those keys would need a `*`.
 
