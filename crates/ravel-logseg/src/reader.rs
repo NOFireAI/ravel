@@ -638,6 +638,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             current: None,
             surviving: Vec::new(),
             dicts: DictCache::default(),
+            last_block_index: None,
         })
     }
 
@@ -698,27 +699,43 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// reports), not ordinal positions into the survivor list.
     ///
     /// A caller dealing whole row groups to partitions (ADR-2414 decision A1,
-    /// `ravel_sql::logs_scan::owned_work`) groups the segment's blocks by
-    /// PAGE_DIR row-group boundaries before pruning runs, so it cannot name a
-    /// partition's share as ordinal survivor positions: which ordinal a given
-    /// raw block lands at depends on how many blocks ahead of it the skip,
-    /// POSTINGS, and bloom pruning removes, which the caller has not computed
-    /// and does not want to duplicate. Set membership has no such dependency:
-    /// a raw block index either belongs to the partition's row groups or it
-    /// does not, regardless of where pruning places it in the survivor order.
+    /// `ravel_sql::logs_scan::owned_work`) groups a PRIOR scan's own,
+    /// already-pruned survivor list (`plan_segment`'s `indices`, which IS
+    /// pruning's output, not its input) by PAGE_DIR row-group boundaries, then
+    /// deals each group's raw block indices to a partition. Naming a
+    /// partition's share as ordinal positions into THIS call's own survivor
+    /// list would require this scan to reproduce that prior scan's survivor
+    /// order before the deal could even be addressed; a raw block index has no
+    /// such ordering dependency; it either belongs to the partition's row
+    /// groups or it does not, whatever ordinal this scan's own pruning later
+    /// gives it.
     ///
-    /// A raw index that pruning removed (it is not in this call's own survivor
-    /// list) is silently absent from the result rather than an error: a row
-    /// group dealt whole to a partition is not guaranteed to have every block
-    /// survive, only every SURVIVING block kept together.
+    /// `expected_survivors` is that prior scan's survivor list, in the same
+    /// whole-object-index space [`BlockScan::survivor_block_indices`] reports.
+    /// Both scans run the same skip/POSTINGS/bloom proofs over the same
+    /// immutable object against the same predicate and prune arms, so they are
+    /// expected to agree exactly. If they do not, `wanted` was computed
+    /// against a different survivor list than this scan actually has, and a
+    /// row-ref stamped from it would address the wrong block: this refuses
+    /// with a typed `Corrupted` error rather than silently keeping whatever
+    /// intersection of `wanted` happens to still be present.
     pub fn scan_blocks_raw_subset(
         &self,
         content: &Predicate,
         prune: &[Predicate],
         columns: &ColumnSelection,
         wanted: &[usize],
+        expected_survivors: &[usize],
     ) -> Result<BlockScan, LogSegError> {
         let mut scan = self.scan_blocks(content, prune, columns)?;
+        let actual = scan.survivor_block_indices();
+        if actual != expected_survivors {
+            return Err(LogSegError::Corrupted(format!(
+                "segment survivor mismatch: expected {} survivors, this open found {}",
+                expected_survivors.len(),
+                actual.len(),
+            )));
+        }
         let wanted: std::collections::HashSet<usize> = wanted.iter().copied().collect();
         scan.blocks
             .retain(|b| wanted.contains(&(b.block_index as usize)));
@@ -744,6 +761,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             current: None,
             surviving: Vec::new(),
             dicts: DictCache::default(),
+            last_block_index: None,
         }
     }
 
@@ -1029,6 +1047,11 @@ pub struct BlockScan {
     surviving: Vec<usize>,
     /// The current row group's decoded dictionaries, shared by its blocks.
     dicts: DictCache,
+    /// The whole-object block index [`Self::decode_block`] most recently
+    /// decoded (set unconditionally there, independent of whether
+    /// [`Self::current`] has since been taken by the row exit). `None` before
+    /// the first block and after construction only.
+    last_block_index: Option<u32>,
 }
 
 impl BlockScan {
@@ -1060,6 +1083,19 @@ impl BlockScan {
     /// [`RlogReader::scan_blocks_subset`]'s `indices` addresses.
     pub fn survivor_block_indices(&self) -> Vec<usize> {
         self.blocks.iter().map(|b| b.block_index as usize).collect()
+    }
+
+    /// The whole-object block index of the block [`Self::decode_block`] most
+    /// recently decoded, or `None` before the first block.
+    ///
+    /// Unlike indexing into whatever index list a caller used to construct
+    /// this cursor, this is the block that was ACTUALLY decoded: it stays
+    /// correct even if a caller's own bookkeeping (a cursor position into a
+    /// separately-tracked index list) has drifted out of step with this
+    /// cursor's own drain order, which is exactly the failure mode a
+    /// position-based lookup cannot detect.
+    pub fn current_block_index(&self) -> Option<usize> {
+        self.last_block_index.map(|b| b as usize)
     }
 
     /// Decode the next surviving block and return the rows of it that match the
@@ -1186,6 +1222,7 @@ impl BlockScan {
             return Ok(false);
         };
         self.next += 1;
+        self.last_block_index = Some(loc.block_index);
         // Resolve the block's pages now, from the shared PAGE_DIR, rather than
         // from a per-block list built at scan time (issue #760). `block_pages`
         // returns offsets relative to the BLOCKS section; shift them to
@@ -5400,18 +5437,66 @@ mod tests {
         let block_ts =
             |b: usize| -> Vec<i64> { records[4 * b..4 * b + 4].iter().map(|r| r.ts_ns).collect() };
 
+        let expected_survivors = [2, 3, 4, 5, 6, 7];
         let mut scan = reader
-            .scan_blocks_raw_subset(&from_block_two, &[], &ColumnSelection::all(), &[0, 1, 6, 5])
+            .scan_blocks_raw_subset(
+                &from_block_two,
+                &[],
+                &ColumnSelection::all(),
+                &[0, 1, 6, 5],
+                &expected_survivors,
+            )
             .expect("raw subset");
-        assert_eq!(scan.survivor_block_indices(), vec![5, 6]);
+        assert_eq!(scan.survivor_block_indices(), expected_survivors);
         let mut want = block_ts(5);
         want.extend(block_ts(6));
         assert_eq!(drain_ts(&mut scan, &object), want);
 
         let mut none = reader
-            .scan_blocks_raw_subset(&from_block_two, &[], &ColumnSelection::all(), &[0, 1])
+            .scan_blocks_raw_subset(
+                &from_block_two,
+                &[],
+                &ColumnSelection::all(),
+                &[0, 1],
+                &expected_survivors,
+            )
             .expect("raw subset of pruned blocks");
         assert_eq!(none.remaining_blocks(), 0);
         assert!(drain_ts(&mut none, &object).is_empty());
+    }
+
+    /// A survivor-list mismatch (the open's own pruning disagrees with the
+    /// caller's `expected_survivors`) refuses with a typed error instead of
+    /// silently keeping whatever intersection of `wanted` still exists.
+    ///
+    /// Fails against a wrong implementation that only compares survivor
+    /// *counts*: `[2, 3, 4, 5, 6, 7]` (6 real survivors) vs the wrong
+    /// `[0, 1, 2, 3, 4, 5]` below (also 6 entries, same length, different
+    /// blocks) would pass a length check but must still be refused here.
+    /// Also fails against a wrong implementation that ignores
+    /// `expected_survivors` entirely and just applies `wanted`: that version
+    /// returns `Ok` with the two requested blocks instead of `Err`.
+    #[test]
+    fn a_raw_subset_refuses_on_survivor_mismatch() {
+        let (_records, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&object, &cfg).expect("open");
+        let from_block_two = Predicate::TsRange {
+            min_ns: 1_008,
+            max_ns: i64::MAX,
+        };
+        let wrong_expected = [0, 1, 2, 3, 4, 5];
+        let result = reader.scan_blocks_raw_subset(
+            &from_block_two,
+            &[],
+            &ColumnSelection::all(),
+            &[2, 3],
+            &wrong_expected,
+        );
+        match result {
+            Err(LogSegError::Corrupted(_)) => {}
+            Err(other) => panic!("expected a typed Corrupted error, got {other:?}"),
+            Ok(_) => panic!("mismatched survivor list must refuse, not silently subset"),
+        }
     }
 }

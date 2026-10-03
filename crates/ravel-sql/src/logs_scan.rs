@@ -3361,16 +3361,31 @@ type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> 
 /// `Ok(None)` means the catalog summary proved the segment irrelevant, with no
 /// GET issued -- which cannot happen for a segment that was already counted
 /// with survivors, but is handled as end-of-segment rather than panicking.
+///
+/// `survivors` is the segment's whole surviving-block list the plan phase
+/// produced ([`OwnedSeg::survivors`]), of which `indices` is this partition's
+/// share. Every caller of this function reaches it only through `owned_work`
+/// (never `owned_whole_segments`, which never calls this function), so
+/// `survivors` is architecturally always `Some`; `None` is refused with a
+/// typed error rather than silently scanning without the cross-check (issue
+/// #2417), since a caller that could reach this function without it is a bug
+/// in this module, not a runtime condition to tolerate.
 fn open_segment_subset(
     ctx: Arc<PartitionCtx>,
     seg: SegmentRef,
     indices: Vec<usize>,
+    survivors: Option<Arc<Vec<usize>>>,
     footer: Option<LogFooter>,
     whole_object: Option<CarriedWholeObject>,
     dirs: Option<Arc<SegmentDirectories>>,
 ) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
+        let survivors = survivors.ok_or_else(|| {
+            SqlError::Internal(
+                "striped segment open with no plan-phase survivor list".into(),
+            )
+        })?;
         let scan = ctx
             .fetcher
             .scan_accounted_with_tenant_subset_raw(
@@ -3379,6 +3394,7 @@ fn open_segment_subset(
                 &ctx.query,
                 &ctx.columns,
                 &indices,
+                &survivors,
                 footer.as_ref(),
                 whole_object,
                 dirs.as_ref(),
@@ -3560,36 +3576,35 @@ struct RowRefRange {
     first_row: usize,
 }
 
-/// The surviving-block index of the block a partition's cursor is about to
-/// yield, or `None` when the scan emits no row refs (ADR-0774).
+/// The surviving-block index of a just-decoded block, or `None` when the scan
+/// emits no row refs (ADR-0774).
 ///
-/// `indices` is the partition's own list of surviving-block positions, so the
-/// cursor's `i`-th block is that list's `i`-th entry. The whole-segment fast
-/// path leaves the list empty and drains every survivor in order, so there the
-/// cursor position *is* the surviving-block index.
+/// `decoded_block` is the whole-object block index the scan itself just
+/// decoded ([`LogSegmentScan::current_block_index`]), not a position into a
+/// separately-tracked owned-block list: resolving a row-ref from the scan's
+/// own drain order, rather than from a cursor counted alongside it, means a
+/// list that has drifted out of step with the scan's actual blocks cannot
+/// silently stamp the wrong row-ref (issue #2417). `survivors` is the
+/// segment's whole surviving-block list; a row-ref carries a block's position
+/// in it, not its whole-object index. The whole-segment fast path passes
+/// `None` because there every block survives and the whole-object index
+/// already IS the row-ref address.
 ///
 /// A free function rather than a method because the columnar drain calls it
 /// while the block cursor holds a mutable borrow of the stream's state field.
 fn block_index(
     row_refs: bool,
-    indices: &[usize],
     survivors: Option<&[usize]>,
-    cursor: usize,
+    decoded_block: Option<usize>,
 ) -> DFResult<Option<usize>> {
     if !row_refs {
         return Ok(None);
     }
-    if indices.is_empty() {
-        return Ok(Some(cursor));
-    }
-    let owned = indices.get(cursor).copied().ok_or_else(|| {
-        DataFusionError::Internal(format!(
-            "row-ref cursor at block {cursor} past this partition's {} owned blocks",
-            indices.len()
-        ))
+    let owned = decoded_block.ok_or_else(|| {
+        DataFusionError::Internal(
+            "row-ref requested but the scan has not decoded a block yet".into(),
+        )
     })?;
-    // `indices` hold whole-object block indices; the row-ref carries the
-    // block's position in the segment's surviving-block list.
     let Some(survivors) = survivors else {
         return Ok(Some(owned));
     };
@@ -3805,26 +3820,22 @@ impl LogScanStream {
             .add_elapsed(self.origin);
     }
 
-    /// The surviving-block index of the block the cursor is about to yield, or
-    /// `None` when this scan emits no row refs.
-    ///
-    /// `current_indices` is this partition's own list of surviving-block
-    /// positions, so the cursor's `i`-th block is that list's `i`-th entry. The
-    /// whole-segment fast path leaves the list empty and drains every survivor
-    /// in order, so there the cursor position *is* the surviving-block index.
-    fn current_block(&self) -> DFResult<Option<usize>> {
+    /// The surviving-block index of the block just decoded, or `None` when
+    /// this scan emits no row refs. `decoded_block` is that block's
+    /// whole-object index ([`LogSegmentScan::current_block_index`]), not the
+    /// cursor's position in [`Self::current_indices`] (issue #2417).
+    fn current_block(&self, decoded_block: Option<usize>) -> DFResult<Option<usize>> {
         block_index(
             self.row_refs,
-            &self.current_indices,
             self.current_survivors.as_deref().map(Vec::as_slice),
-            self.block_cursor,
+            decoded_block,
         )
     }
 
-    /// The row-ref address for the block the cursor is about to yield, and
-    /// advance the cursor past it.
-    fn take_block_range(&mut self) -> DFResult<Option<RowRefRange>> {
-        let range = self.current_block()?.map(|block| RowRefRange {
+    /// The row-ref address for the block just decoded (`decoded_block`, its
+    /// whole-object index), and advance the cursor past it.
+    fn take_block_range(&mut self, decoded_block: Option<usize>) -> DFResult<Option<RowRefRange>> {
+        let range = self.current_block(decoded_block)?.map(|block| RowRefRange {
             segment: self.current_seg_ordinal,
             block,
             first_row: 0,
@@ -4078,7 +4089,7 @@ impl LogScanStream {
                         this.current_seg = Some(seg.clone());
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = indices.clone();
-                        this.current_survivors = survivors;
+                        this.current_survivors = survivors.clone();
                         this.current_footer = footer.clone();
                         this.current_dirs = dirs.clone();
                         // Moved, not cloned: this stream consumes the carried
@@ -4125,6 +4136,7 @@ impl LogScanStream {
                                 Arc::clone(&this.ctx),
                                 seg,
                                 indices,
+                                survivors,
                                 footer,
                                 whole_object,
                                 dirs,
@@ -4217,18 +4229,19 @@ impl LogScanStream {
                                 Step::Fallback
                             } else {
                                 // The row-ref address of the block just decoded,
-                                // resolved from the cursor position alone. It is
-                                // resolved here rather than before the decode
-                                // because the cursor sits one past its last block
-                                // once the scan is exhausted, and folded into
-                                // `Step::Failed` rather than returned early
-                                // because `scan` borrows `this.state` for the
-                                // whole arm.
+                                // resolved from the block the scan itself just
+                                // decoded (issue #2417), not from the cursor's
+                                // position in `current_indices`. It is resolved
+                                // here rather than before the decode because the
+                                // scan has no current block until one is
+                                // decoded, and folded into `Step::Failed` rather
+                                // than returned early because `scan` borrows
+                                // `this.state` for the whole arm.
+                                let decoded_block = scan.current_block_index();
                                 let built = block_index(
                                     this.row_refs,
-                                    &this.current_indices,
                                     this.current_survivors.as_deref().map(Vec::as_slice),
-                                    this.block_cursor,
+                                    decoded_block,
                                 )
                                 .and_then(|block| {
                                     build_columnar_batches(
@@ -4326,6 +4339,7 @@ impl LogScanStream {
                                     Arc::clone(&this.ctx),
                                     seg,
                                     this.current_indices.clone(),
+                                    this.current_survivors.clone(),
                                     this.current_footer.clone(),
                                     this.current_whole_object.take(),
                                     this.current_dirs.clone(),
@@ -4374,8 +4388,12 @@ impl LogScanStream {
                         Ok(Some(records)) => {
                             // Stamp the block's row-ref address before the
                             // records are held: the batch builder reads it out
-                            // of `pending_range` as it chunks them.
-                            match this.take_block_range() {
+                            // of `pending_range` as it chunks them. Resolved
+                            // from the block the scan itself just decoded
+                            // (issue #2417), not from the cursor's position in
+                            // `current_indices`.
+                            let decoded_block = scan.current_block_index();
+                            match this.take_block_range(decoded_block) {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
@@ -4429,8 +4447,12 @@ impl LogScanStream {
                         Ok(Some(records)) => {
                             // Stamp the block's row-ref address before the
                             // records are held: the batch builder reads it out
-                            // of `pending_range` as it chunks them.
-                            match this.take_block_range() {
+                            // of `pending_range` as it chunks them. Resolved
+                            // from the block the scan itself just decoded
+                            // (issue #2417), not from the cursor's position in
+                            // `current_indices`.
+                            let decoded_block = scan.current_block_index();
+                            match this.take_block_range(decoded_block) {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
