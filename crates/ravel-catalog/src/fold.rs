@@ -321,8 +321,9 @@ enum HeadState {
     Corrupt {
         version: Version,
     },
-    /// HEAD decoded far enough to see a `format_version` this process does
-    /// not understand (ADR-0066 decision 2, "fail-closed-on-newer"). Unlike
+    /// HEAD decoded far enough to see a `format_version` above
+    /// [`HEAD_FORMAT_VERSION`] (ADR-0066 decision 2, "fail-closed-on-newer");
+    /// a version below it is [`HeadState::Corrupt`]. Unlike
     /// [`HeadState::Corrupt`], this HEAD is NOT rebuildable: a newer-format
     /// HEAD (e.g. an EH multi-part HEAD written by an already-upgraded peer)
     /// carries state this older process cannot see, so rebuilding a
@@ -2315,18 +2316,37 @@ impl Catalog {
                         head: Box::new(head),
                         version: got.version,
                     }),
-                    // A HEAD whose `format_version` this process does not
-                    // understand is NOT corruption and must NOT be rebuilt
-                    // (ADR-0066 decision 2, "fail-closed-on-newer"): rebuilding
-                    // would CAS-clobber a newer HEAD written by an upgraded
-                    // peer. Keep it a distinct state so the fold fails loudly.
-                    Err(SnapshotFormatError::UnsupportedHeadVersion(format_version)) => {
+                    // A HEAD newer than this process understands is NOT
+                    // corruption and must NOT be rebuilt (ADR-0066 decision 2,
+                    // "fail-closed-on-newer"): rebuilding would CAS-clobber a
+                    // newer HEAD written by an upgraded peer. Keep it a
+                    // distinct state so the fold fails loudly.
+                    Err(SnapshotFormatError::UnsupportedHeadVersion(format_version))
+                        if format_version > HEAD_FORMAT_VERSION =>
+                    {
                         tracing::error!(
                             key = %head_key,
                             format_version,
                             "HEAD is a newer format than this process understands; refusing to rebuild"
                         );
                         Ok(HeadState::UnsupportedVersion { format_version })
+                    }
+                    // Below the supported floor (`decode_head` accepts only
+                    // `HEAD_FORMAT_VERSION`, so the floor is that constant
+                    // today): corrupt, or written by an older peer during a
+                    // rolling upgrade. Either way it is rebuilt like any
+                    // undecodable HEAD: the CAS on `got.version` only moves
+                    // a HEAD forward, and an older peer refuses the result.
+                    Err(SnapshotFormatError::UnsupportedHeadVersion(format_version)) => {
+                        tracing::warn!(
+                            key = %head_key,
+                            format_version,
+                            supported = HEAD_FORMAT_VERSION,
+                            "HEAD format_version is below the supported version, rebuilding"
+                        );
+                        Ok(HeadState::Corrupt {
+                            version: got.version,
+                        })
                     }
                     Err(err) => {
                         tracing::warn!(error = %err, key = %head_key, "HEAD failed to decode, treating as absent");
@@ -6111,6 +6131,107 @@ mod tests {
         );
         assert_eq!(report.watermark_hour, Some(12));
         assert_eq!(report.entry_count, 2);
+    }
+
+    /// A HEAD below the supported format version (0: a writer that never set
+    /// the field) is corrupt, not newer, so ADR-0066 decision 2 does not
+    /// apply: the fold rebuilds it exactly as it rebuilds a HEAD of garbage
+    /// bytes (`corrupt_head_falls_back_to_rebuild_and_recovers_all_entries`).
+    #[tokio::test]
+    async fn below_floor_head_version_rebuilds_like_corrupt_head() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let below_floor = SnapshotHead {
+            format_version: 0,
+            watermark_hour: 10,
+            ..Default::default()
+        };
+        store
+            .put(
+                &head_key,
+                Bytes::from(below_floor.encode_to_vec()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite head with a version-0 head");
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("a below-floor HEAD is rebuilt, not refused as newer");
+        assert!(report.rebuilt);
+        assert!(!report.no_op);
+        assert_eq!(report.watermark_hour, Some(12));
+        assert_eq!(report.entry_count, 2);
+
+        let got = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("rebuilt head present");
+        let head = snapshot_format::decode_head(&got.data).expect("rebuilt head decodes");
+        assert_eq!(head.format_version, HEAD_FORMAT_VERSION);
+        assert_eq!(head.watermark_hour, 12);
+    }
+
+    /// A HEAD one version above this build is still refused (ADR-0066
+    /// decision 2) on a plain store, and its bytes are left untouched.
+    #[tokio::test]
+    async fn above_max_head_version_is_refused_and_not_overwritten() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let newer_bytes = SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION + 1,
+            watermark_hour: 10,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        store
+            .put(
+                &head_key,
+                Bytes::from(newer_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite head with a newer-format head");
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect_err("a newer-format HEAD must be refused");
+        assert!(
+            matches!(
+                err,
+                CatalogError::UnsupportedHeadVersion { format_version }
+                    if format_version == HEAD_FORMAT_VERSION + 1
+            ),
+            "expected UnsupportedHeadVersion, got {err:?}"
+        );
+
+        let got = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("newer head still present");
+        assert_eq!(got.data.as_ref(), newer_bytes.as_slice());
     }
 
     /// Every snapshot part key contains `/snap/`; a HEAD key never does, so

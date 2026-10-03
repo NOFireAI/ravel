@@ -74,7 +74,7 @@ Until first release, ADR-0027 stands unchanged; this ADR's machinery lands exerc
 Every decoder of a persistent format must, on a version newer than it knows, return a typed error distinct from corruption, and no caller may treat that error as absence, corruption, or a miss. (Sole deliberate exception: the local disk cache, where old-version-equals-miss is correct semantics, `crates/ravel-cache/src/disk.rs:143-148`.) Concretely:
 
 - RLOG and RSPAN trailer version failures become typed `UnsupportedVersion(u16)` variants instead of `Corrupted(String)`, matching RSEG.
-- The catalog fold distinguishes `UnsupportedHeadVersion` from a corrupt HEAD and fails its cycle instead of CAS-clobbering (`fold.rs:866-869`) — the rolling-upgrade hazard from Context. This is a hard prerequisite for multi-part fold (ADR-0063).
+- The catalog fold distinguishes `UnsupportedHeadVersion` from a corrupt HEAD and fails its cycle instead of CAS-clobbering (`fold.rs:866-869`) — the rolling-upgrade hazard from Context. This is a hard prerequisite for multi-part fold (ADR-0063). The refusal covers a HEAD above `HEAD_FORMAT_VERSION` only; a HEAD below the supported version is rebuilt (see the below-floor HEAD amendment).
 - The commit token parser surfaces an unknown version prefix as its own typed error rather than flat `InvalidCommitToken`, so a future v3 token is diagnosable at the client boundary.
 
 ### 3. Durable format floors in the provisioning record
@@ -633,3 +633,35 @@ resolution in `ravel-catalog`; T4 sweep and erasure; T5 the re-encode
 primitive in `rewrite.rs`, writer switch off by default; T6 `migrate` wiring;
 T7 (optional) background low-priority re-encode. T2 to T4 release before T5 to
 T7 are switched on.
+
+## Amendment (2026-10-03, #2271): a below-floor HEAD is rebuilt, not refused as newer
+
+<!-- amendment-applies: sections="2. Fail-closed-on-newer, everywhere, typed" pointer="below-floor HEAD amendment" -->
+
+Decision 2 has the fold refuse a HEAD it reads as `UnsupportedHeadVersion`
+rather than rebuild and CAS-overwrite it, because the HEAD may have been
+written by an upgraded peer and carry state this process cannot see. That
+reasoning holds for a `format_version` above `HEAD_FORMAT_VERSION` only. The
+fold refused every unsupported version, 0 included, and logged a below-floor
+HEAD as newer, so a HEAD from a writer that never set the field left the fold
+stuck behind a log line naming the wrong cause, while the query surfaces
+already answered the same HEAD as corrupt.
+
+The rule is now: a HEAD whose `format_version` is above `HEAD_FORMAT_VERSION`
+is refused and never written over, exactly as decision 2 says. A HEAD below
+the supported version takes the same path as any HEAD that fails to decode
+(`HeadState::Corrupt`): the fold rebuilds it and CAS-overwrites it, and logs
+that the version is below the supported one. `decode_head` accepts only
+`HEAD_FORMAT_VERSION`, so the supported floor equals that constant today; if a
+later version widens the accepted range, the floor moves with it and the
+comparison against the maximum is unchanged. No persistent format changes.
+
+Today the only value below the floor is 0, which no released binary writes,
+so such a HEAD is corrupt. That is not the reason the rebuild is safe in
+general: while ADR-0027's single-version rule applies, a later HEAD bump can
+ship a reader that accepts only the new version, and during that rolling
+upgrade an older peer does write a below-floor HEAD. Rebuilding it is still
+right. The HEAD is derived state the fold rebuilds from commit records, the
+overwrite is a CAS conditioned on the version just read, and the older peer
+reads the rebuilt HEAD as above its maximum and refuses, so overwrites only
+ever move a HEAD forward and two peers cannot alternate.
