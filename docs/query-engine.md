@@ -497,13 +497,22 @@ partition:
   the projected page extents and the coverage crossover are computed, so a
   partition fetches the pages of its own row groups only
   (`owned_block_plan_tests`). The coverage crossover therefore weighs the
-  partition's own footprint, and an open that owns a small share of a segment
-  stays on ranged reads where a whole-object read would otherwise have won.
+  partition's own footprint. A partition that owns every row group of an
+  object keeps the whole-object crossover. A partition sharing the object
+  never reads it whole: it weighs its runs against its own span, from its first
+  wanted page to its last, and on crossing joins every gap between its runs
+  that holds no fence (below) into one range, so a share whose span holds no
+  other partition's page reads exactly that span in one GET
+  (`a_partial_share_crossover_reads_its_own_span_not_the_object`,
+  `a_partial_share_crossover_collapses_its_runs_into_one_range`,
+  `a_partial_share_crossover_moves_its_own_span`).
 - **A partition's runs never cross another partition's row group.** The pages
   that row groups held by other partitions have in the projected columns are
   fences: neither the coalescing of holes under the coalesce gap nor the bridging
-  that holds an L0 object to `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs joins two
-  runs across one. Partitions therefore fetch disjoint spans of an object, and
+  that holds an L0 object to `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs, nor a
+  partial share's coverage crossover, joins two runs across one
+  (`a_partial_share_crossover_does_not_read_through_a_fence`). Partitions
+  therefore fetch disjoint spans of an object, and
   the block bytes they move for one object sum to at most the object's BLOCKS
   section (`partitions_dealt_interleaved_groups_fetch_disjoint_spans`,
   `interleaved_groups_move_each_groups_span_once`; the fence rule itself is
