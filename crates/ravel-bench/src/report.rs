@@ -1256,6 +1256,9 @@ mod tests {
             delete_class_nanodollars: 0,
             transfer_nanodollars_per_gib: 90_000_000, // $0.09/GiB
             retrieval_nanodollars_per_gib: 10_000_000, // $0.01/GiB
+            request_latency_micros: None,
+            per_connection_throughput_bytes_per_s: None,
+            timings_measured: None,
         };
         let counts = counts_with_attempts(3, 7, 2);
         let two_gib: u64 = 2 * 1024 * 1024 * 1024;
