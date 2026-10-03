@@ -6249,6 +6249,9 @@ pub struct DistribSnapshot {
     pub fragment_inflight_by_class: [(crate::distrib::AdmissionClass, u64); 2],
     /// Cumulative admission-queue waits per class (issue #1722).
     pub fragment_admission_waits_by_class: [(crate::distrib::AdmissionClass, u64); 2],
+    /// Admitted slices stopped mid-run at their query's deadline, cumulative,
+    /// per class (issue #2385).
+    pub fragment_deadline_stops_by_class: [(crate::distrib::AdmissionClass, u64); 2],
     /// Record GETs this worker's pinned resolves issued, cumulative (ADR-0071
     /// record-GET counter amendment). Not part of any query's accounting.
     pub fragment_record_get_requests_total: u64,
@@ -6283,6 +6286,7 @@ impl DistribSnapshot {
             fragment_capability_rejects_by_reason: metrics.capability_rejects_by_reason(),
             fragment_inflight_by_class: metrics.fragment_inflight_by_class(),
             fragment_admission_waits_by_class: metrics.fragment_admission_waits_by_class(),
+            fragment_deadline_stops_by_class: metrics.fragment_deadline_stops_by_class(),
             fragment_record_get_requests_total: metrics.fragment_record_get_requests_total(),
             fragment_record_get_bytes_total: metrics.fragment_record_get_bytes_total(),
             slices_local_total: metrics.slices_local_total(),
@@ -6378,6 +6382,23 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
             "ravel_distrib_fragment_admission_waits_total",
             &[Label::Mode(mode), Label::AdmissionClass(class)],
             waits,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_distrib_fragment_deadline_stops_total",
+        "Admitted fragment slices this worker stopped mid-run because their query's \
+         deadline passed while they read, by ADR-0071 admission class (issue #2385). A \
+         slice refused at its deadline before it ran is not counted here.",
+        "counter",
+    );
+    for (class, stops) in snapshot.fragment_deadline_stops_by_class {
+        write_sample(
+            out,
+            "ravel_distrib_fragment_deadline_stops_total",
+            &[Label::Mode(mode), Label::AdmissionClass(class)],
+            stops,
         );
     }
 
@@ -10530,9 +10551,12 @@ mod tests {
 
     /// The ADR-0071 distributed read fan-out family renders under
     /// the new `ravel_distrib_*` names, and every one of its series carries only
-    /// the closed `{mode}` label, except the per-class fragment in-flight gauge
-    /// and admission-wait counter, which also carry `class` (ADR-0044 section 4;
-    /// `class` added for the fragment admission classes, issue #1722): no per-shard, per-worker, or per-tenant label. Also asserts the
+    /// the closed `{mode}` label, except the per-class fragment in-flight gauge,
+    /// admission-wait counter and deadline-stop counter, which also carry
+    /// `class` (ADR-0044 section 4; `class` added for the fragment admission
+    /// classes, issue #1722, and the deadline-stop counter, issue #2385): no
+    /// per-shard, per-worker, or per-tenant label. Both classes render, a zero
+    /// one included. Also asserts the
     /// family is absent entirely when the snapshot is `None`, matching the "off
     /// unless --distributed-query" wiring.
     #[test]
@@ -10552,6 +10576,10 @@ mod tests {
             fragment_admission_waits_by_class: [
                 (crate::distrib::AdmissionClass::Pinned, 0),
                 (crate::distrib::AdmissionClass::Resolve, 9),
+            ],
+            fragment_deadline_stops_by_class: [
+                (crate::distrib::AdmissionClass::Pinned, 3),
+                (crate::distrib::AdmissionClass::Resolve, 0),
             ],
             fragment_record_get_requests_total: 13,
             fragment_record_get_bytes_total: 4_096,
@@ -10604,6 +10632,8 @@ mod tests {
             "ravel_distrib_fragment_inflight{mode=\"query\",class=\"resolve\"} 4",
             "ravel_distrib_fragment_admission_waits_total{mode=\"query\",class=\"pinned\"} 0",
             "ravel_distrib_fragment_admission_waits_total{mode=\"query\",class=\"resolve\"} 9",
+            "ravel_distrib_fragment_deadline_stops_total{mode=\"query\",class=\"pinned\"} 3",
+            "ravel_distrib_fragment_deadline_stops_total{mode=\"query\",class=\"resolve\"} 0",
             "ravel_distrib_fragment_record_get_requests_total{mode=\"query\"} 13",
             "ravel_distrib_fragment_record_get_bytes_total{mode=\"query\"} 4096",
             "ravel_distrib_slices_local_total{mode=\"query\"} 7",
@@ -13074,6 +13104,10 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                 (crate::distrib::AdmissionClass::Resolve, 0),
             ],
             fragment_admission_waits_by_class: [
+                (crate::distrib::AdmissionClass::Pinned, 0),
+                (crate::distrib::AdmissionClass::Resolve, 0),
+            ],
+            fragment_deadline_stops_by_class: [
                 (crate::distrib::AdmissionClass::Pinned, 0),
                 (crate::distrib::AdmissionClass::Resolve, 0),
             ],

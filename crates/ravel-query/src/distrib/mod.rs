@@ -36,6 +36,7 @@ pub mod proto {
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::{StreamExt, stream};
 use prost::Message;
@@ -69,6 +70,18 @@ pub type FetchedTriple = (
     FetchStats,
     Vec<Vec<FetchedHistogramSeries>>,
 );
+
+/// One query's deadline as the distributed and federated fetches carry it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WallDeadline {
+    /// Unix nanoseconds: the request's entry wall clock plus `request`. Every
+    /// slice and federated request is sent with it, and it is every fragment
+    /// capability's expiry.
+    pub unix_ns: i64,
+    /// The request's own deadline, which a slice stopped at `unix_ns` fails its
+    /// query with.
+    pub request: Duration,
+}
 
 /// The closed event-time envelope `[min, max]` of a slice's pinned segments,
 /// carried on the fragment request so the worker resolves its interim
@@ -154,7 +167,7 @@ impl Distributed {
         erasure: &[ErasurePredicate],
         accounting: &QueryAccounting,
         config: &EngineConfig,
-        deadline_unix_ns: i64,
+        deadline: WallDeadline,
         partial_aggregate: Option<pb::PartialAggregateRequest>,
     ) -> Result<Option<(FetchedTriple, Vec<codec::PartialAggregate>)>, QueryError> {
         let slices = partition_snapshot(snapshot, self.thresholds.max_parallel_slices);
@@ -179,10 +192,10 @@ impl Distributed {
         // all. Derived deterministically from the query's own identity so it is
         // stable across the slices of one fetch without threading a random source
         // through the engine; the value only needs to be a stable 16 bytes the
-        // mint and verify sides agree on. `deadline_unix_ns` is the query's
+        // mint and verify sides agree on. `deadline.unix_ns` is the query's
         // absolute deadline (the same one the engine enforces), which the mint
         // uses as the capability expiry.
-        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
+        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline.unix_ns, snapshot);
 
         let concurrency = self.thresholds.max_parallel_slices.max(1);
         let mut stream = stream::iter(slices)
@@ -215,7 +228,7 @@ impl Distributed {
                     window_start_ns,
                     window_end_ns,
                     budgets: Some(budgets),
-                    deadline_unix_ns,
+                    deadline_unix_ns: deadline.unix_ns,
                     erasure: encoded_erasure.clone(),
                     trace_context: String::new(),
                     // The Pinned fragment capability (ADR-0071 amendment,
@@ -427,7 +440,7 @@ impl Distributed {
                     // the worker made before it stopped is folded first (issue
                     // #1723).
                     fold_slice(accounting, &mut running, &mut stats, &response);
-                    return Err(slice_deadline_exceeded());
+                    return Err(slice_deadline_exceeded(deadline));
                 }
                 other => {
                     fold_slice(accounting, &mut running, &mut stats, &response);
@@ -490,7 +503,7 @@ impl Distributed {
         erasure: &[ErasurePredicate],
         accounting: &QueryAccounting,
         config: &EngineConfig,
-        deadline_unix_ns: i64,
+        deadline: WallDeadline,
     ) -> Result<Option<Vec<LogRecord>>, QueryError> {
         let slices = partition_snapshot(snapshot, self.thresholds.max_parallel_slices);
         if slices.is_empty() {
@@ -504,7 +517,7 @@ impl Distributed {
         let budgets = encode_budgets(config);
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
-        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
+        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline.unix_ns, snapshot);
 
         let concurrency = self.thresholds.max_parallel_slices.max(1);
         let mut stream = stream::iter(slices)
@@ -526,7 +539,7 @@ impl Distributed {
                     window_start_ns,
                     window_end_ns,
                     budgets: Some(budgets),
-                    deadline_unix_ns,
+                    deadline_unix_ns: deadline.unix_ns,
                     erasure: encoded_erasure.clone(),
                     trace_context: String::new(),
                     fragment_capability: Vec::new(),
@@ -616,7 +629,7 @@ impl Distributed {
                 pb::status::Code::Timeout => {
                     // Terminal for the query, as in the metrics loop.
                     fold_log_slice(accounting, &mut running, &response);
-                    return Err(slice_deadline_exceeded());
+                    return Err(slice_deadline_exceeded(deadline));
                 }
                 other => {
                     fold_log_slice(accounting, &mut running, &response);
@@ -672,7 +685,7 @@ impl Distributed {
         erasure: &[ErasurePredicate],
         accounting: &QueryAccounting,
         config: &EngineConfig,
-        deadline_unix_ns: i64,
+        deadline: WallDeadline,
     ) -> Result<Option<Vec<SpanRow>>, QueryError> {
         let slices = partition_snapshot(snapshot, self.thresholds.max_parallel_slices);
         if slices.is_empty() {
@@ -686,7 +699,7 @@ impl Distributed {
         let budgets = encode_budgets(config);
         let tenant_bytes = tenant_hash.0.to_vec();
         let signal_disc = codec::signal_to_u32(signal);
-        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline_unix_ns, snapshot);
+        let query_id = query_id_bytes(&tenant_bytes, signal_disc, deadline.unix_ns, snapshot);
 
         let concurrency = self.thresholds.max_parallel_slices.max(1);
         let mut stream = stream::iter(slices)
@@ -708,7 +721,7 @@ impl Distributed {
                     window_start_ns,
                     window_end_ns,
                     budgets: Some(budgets),
-                    deadline_unix_ns,
+                    deadline_unix_ns: deadline.unix_ns,
                     erasure: encoded_erasure.clone(),
                     trace_context: String::new(),
                     fragment_capability: Vec::new(),
@@ -797,7 +810,7 @@ impl Distributed {
                 pb::status::Code::Timeout => {
                     // Terminal for the query, as in the metrics loop.
                     fold_span_slice(accounting, &mut running, &response);
-                    return Err(slice_deadline_exceeded());
+                    return Err(slice_deadline_exceeded(deadline));
                 }
                 other => {
                     fold_span_slice(accounting, &mut running, &response);
@@ -870,13 +883,11 @@ fn fold_error_spend(live: &QueryAccounting, err: DistribError) -> QueryError {
     distrib_error(err)
 }
 
-/// The error a slice that ended `TIMEOUT` fails its query with. The deadline
-/// it names is a placeholder: every engine entry point runs the fetch inside
-/// its own deadline wrapper, which rewrites a `DeadlineExceeded` to carry the
-/// request's own deadline, the one this stop enforced.
-fn slice_deadline_exceeded() -> QueryError {
+/// The error a slice that ended `TIMEOUT` fails its query with: the request's
+/// own deadline, the one the stop enforced.
+fn slice_deadline_exceeded(deadline: WallDeadline) -> QueryError {
     QueryError::DeadlineExceeded {
-        deadline: std::time::Duration::ZERO,
+        deadline: deadline.request,
     }
 }
 

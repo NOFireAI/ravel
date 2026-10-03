@@ -238,6 +238,12 @@ pub struct FragmentMetrics {
     /// `class` label; a class queuing does not mean it rejected anything (this
     /// admission never rejects), only that a caller waited for a permit.
     fragment_admission_waits_total: [AtomicU64; 2],
+    /// Admitted slices this worker stopped mid-run because their query's
+    /// deadline passed while they read, indexed by [`AdmissionClass`].
+    /// Rendered under the closed `class` label. A slice refused before it ran
+    /// is not counted here: a `Pinned` refusal counts under the `expired`
+    /// capability reject reason.
+    fragment_deadline_stops_total: [AtomicU64; 2],
     /// Record GETs this worker's pinned resolves issued (ADR-0071
     /// pinned-record amendment decision 5, and the record-GET counter
     /// amendment): one per pinned L0 segment, one per pinned L1 part, two for
@@ -290,6 +296,7 @@ impl Default for FragmentMetrics {
             fragment_capability_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_inflight: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_admission_waits_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            fragment_deadline_stops_total: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_record_get_requests_total: AtomicU64::new(0),
             fragment_record_get_bytes_total: AtomicU64::new(0),
             slices_local_total: AtomicU64::new(0),
@@ -355,6 +362,12 @@ impl FragmentMetrics {
     /// and had to queue.
     fn record_admission_wait(&self, class: AdmissionClass) {
         self.fragment_admission_waits_total[class.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an admitted `class` slice was stopped mid-run at its
+    /// query's deadline.
+    fn record_deadline_stop(&self, class: AdmissionClass) {
+        self.fragment_deadline_stops_total[class.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_slice_local(&self) {
@@ -443,6 +456,17 @@ impl FragmentMetrics {
     /// per class under the `class` label.
     pub fn fragment_admission_waits_by_class(&self) -> [(AdmissionClass, u64); 2] {
         AdmissionClass::ALL.map(|class| (class, self.fragment_admission_waits_total(class)))
+    }
+
+    pub fn fragment_deadline_stops_total(&self, class: AdmissionClass) -> u64 {
+        self.fragment_deadline_stops_total[class.index()].load(Ordering::Relaxed)
+    }
+
+    /// The per-class mid-run deadline stop counts paired with their
+    /// [`AdmissionClass`], for the `/metrics` renderer to emit one series per
+    /// class under the `class` label.
+    pub fn fragment_deadline_stops_by_class(&self) -> [(AdmissionClass, u64); 2] {
+        AdmissionClass::ALL.map(|class| (class, self.fragment_deadline_stops_total(class)))
     }
 
     /// Record GETs this process's pinned resolves have issued.
@@ -947,13 +971,14 @@ impl FragmentService {
     /// or the deadline a federating coordinator put on a Resolve request.
     /// Reaching it drops the run, so the slice issues no store request once
     /// the timer fires (which, like the engine's own deadline, can be up to
-    /// the timer's resolution late) and returns no result. The slice then
-    /// ends in-band with a `TIMEOUT` summary carrying what it spent before the
-    /// stop, which the coordinator treats as terminal for the query: no
-    /// re-dispatch and no local read.
+    /// the timer's resolution late) and returns no result, and counts the stop
+    /// under `class`. The slice then ends in-band with a `TIMEOUT` summary
+    /// carrying what it spent before the stop, which the coordinator treats as
+    /// terminal for the query: no re-dispatch and no local read.
     async fn run_until_deadline(
         &self,
         request: pb::FetchRequest,
+        class: AdmissionClass,
         remaining: Duration,
     ) -> Vec<pb::FetchResponse> {
         let spent = QueryAccounting::new();
@@ -961,10 +986,13 @@ impl FragmentService {
             // Biased so a run that finishes in the same poll as the deadline
             // still loses: the deadline is exclusive.
             biased;
-            () = self.inner.clock.sleep(remaining) => vec![expired_slice_summary(
-                &spent.snapshot(),
-                "fragment slice stopped: the query's deadline passed while it ran".to_string(),
-            )],
+            () = self.inner.clock.sleep(remaining) => {
+                self.inner.metrics.record_deadline_stop(class);
+                vec![expired_slice_summary(
+                    &spent.snapshot(),
+                    "fragment slice stopped: the query's deadline passed while it ran".to_string(),
+                )]
+            }
             frames = self.resolve_and_run(request, false, spent.clone()) => frames,
         }
     }
@@ -1330,7 +1358,7 @@ impl SeriesFetch for FragmentService {
                     let remaining = Duration::from_nanos(
                         u64::try_from(deadline_unix_ns.saturating_sub(now_ns)).unwrap_or(0),
                     );
-                    self.run_until_deadline(inner, remaining).await
+                    self.run_until_deadline(inner, class, remaining).await
                 }
             }
             None => {
@@ -1877,15 +1905,12 @@ impl RoutingSliceFetcher {
                     stats: response.stats,
                 }))
             }
-            // The worker stopped the slice at the query's deadline, or refused
-            // it because that deadline had already passed. The worker is
-            // healthy and any other attempt, this coordinator's own included,
-            // would run past the same deadline, so this is terminal: no
-            // quarantine, no re-dispatch, no local read. The spend it made
-            // before the stop rides on the response.
-            Ok(response) if response.status == pb::status::Code::Timeout => {
-                Attempt::Keep(Box::new(Ok(response)))
-            }
+            // Every other summary is terminal, `TIMEOUT` included: the worker
+            // stopped the slice at the query's deadline, or refused it because
+            // that deadline had already passed. The worker is healthy and any
+            // other attempt, this coordinator's own included, would run past
+            // the same deadline, so no quarantine, no re-dispatch, no local
+            // read. The spend it made before the stop rides on the response.
             Ok(response) => Attempt::Keep(Box::new(Ok(response))),
             Err(DistribError::Transport(message)) => {
                 tracing::warn!(
@@ -7383,7 +7408,8 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     ///
     /// Mutation proof: answering a slice `run_until_deadline` stopped with a
     /// gRPC `deadline_exceeded` status again, as before #2385, fails the
-    /// `expect` on the in-band response.
+    /// `expect` on the in-band response; deleting the `record_deadline_stop`
+    /// call in `run_until_deadline` leaves the `pinned` stop counter at 0.
     #[tokio::test]
     async fn a_capability_that_expires_mid_run_stops_the_slice_before_its_next_store_request() {
         use ravel_object_store::fault::{Occurrence, Op};
@@ -7423,6 +7449,17 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             fx.metrics.capability_rejects(CapabilityReject::Expired),
             0,
             "admitted live, so this is the run's bound, not a capability reject"
+        );
+        assert_eq!(
+            fx.metrics
+                .fragment_deadline_stops_total(AdmissionClass::Pinned),
+            1,
+            "the stop counts under its own class"
+        );
+        assert_eq!(
+            fx.metrics
+                .fragment_deadline_stops_total(AdmissionClass::Resolve),
+            0
         );
     }
 
@@ -7506,7 +7543,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// request, with its deadline still ahead, is served `Ok`.
     ///
     /// Mutation proof: as for the refusal test above, an unbounded Resolve run
-    /// ends `Ok` with the series instead of `TIMEOUT`.
+    /// ends `Ok` with the series instead of `TIMEOUT`; deleting the
+    /// `record_deadline_stop` call in `run_until_deadline`, or recording every
+    /// stop as `Pinned`, leaves the `resolve` stop counter at 0.
     #[tokio::test]
     async fn a_federated_fetch_stops_at_its_deadline_and_reports_its_spend() {
         use ravel_object_store::fault::{Occurrence, Op};
@@ -7558,6 +7597,136 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             1,
             "the held data GET, counted at issue"
         );
+        assert_eq!(
+            fx.metrics
+                .fragment_deadline_stops_total(AdmissionClass::Resolve),
+            1,
+            "the stop counts under its own class"
+        );
+        assert_eq!(
+            fx.metrics
+                .fragment_deadline_stops_total(AdmissionClass::Pinned),
+            0
+        );
+        assert_eq!(
+            control
+                .metrics
+                .fragment_deadline_stops_by_class()
+                .map(|(_, stops)| stops),
+            [0, 0],
+            "a slice served before its deadline is no stop"
+        );
+    }
+
+    /// A federating coordinator's link to the expiry fixture's peer: every
+    /// Resolve request is answered by the fixture's own `FragmentService` under
+    /// [`PEER_TOKEN`], after its deadline is recorded. The first request costs
+    /// `first_spend`: the coordinator's paused tokio clock and the peer's
+    /// clock both move by it before the peer answers.
+    struct SpendingPeer {
+        service: FragmentService,
+        clock: Arc<SteppedClock>,
+        first_spend: Duration,
+        deadlines: Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl SliceFetcher for SpendingPeer {
+        async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            let first = {
+                let mut deadlines = self.deadlines.lock();
+                deadlines.push(request.deadline_unix_ns);
+                deadlines.len() == 1
+            };
+            if first {
+                tokio::time::sleep(self.first_spend).await;
+                let spent = i64::try_from(self.first_spend.as_nanos()).expect("small");
+                self.clock.set(self.clock.now_ns() + spent);
+            }
+            fetch_decoded(&self.service, request, PEER_TOKEN)
+                .await
+                .map_err(|status| DistribError::Transport(status.to_string()))
+        }
+    }
+
+    /// Issue #2385: every `match[]` selector of one metadata request sends a
+    /// federated peer the request's own wall clock deadline, entry plus the
+    /// request deadline, however much of it earlier selectors spent. The first
+    /// selector spends 3 s of a 5 s deadline, more than half, so a deadline
+    /// counted from the second selector's start with only the 2 s left (entry
+    /// plus 2 s) is already behind the peer's clock (entry plus 3 s): the peer
+    /// refuses it and the request fails `DeadlineExceeded`.
+    ///
+    /// Mutation proof: calling `resolve_series_with_budgets` with the remaining
+    /// time in `resolve_matched_series` again, as before, records entry plus
+    /// 2 s for the second selector and fails the request.
+    #[tokio::test(start_paused = true)]
+    async fn every_metadata_selector_sends_a_federated_peer_the_request_deadline() {
+        let fx = expiry_fixture("metadata-selectors").await;
+        let entry_ns = fx.clock.now_ns();
+        let request_deadline = Duration::from_secs(5);
+        let peer = Arc::new(SpendingPeer {
+            service: fx.service.clone(),
+            clock: fx.clock.clone(),
+            first_spend: Duration::from_secs(3),
+            deadlines: Mutex::new(Vec::new()),
+        });
+        let federation =
+            ravel_query::distrib::Federation::new(vec![ravel_query::distrib::RemoteCluster {
+                name: "peer".to_string(),
+                fetcher: peer.clone(),
+                tenant: None,
+                skip_unavailable: false,
+                soft_timeout: Duration::from_secs(60),
+            }]);
+        let local: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            Arc::new(Catalog::new(local.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine = ravel_query::QueryEngine::new(
+            catalog,
+            local,
+            ravel_query::EngineConfig {
+                deadline: Duration::from_secs(60),
+                ..ravel_query::EngineConfig::default()
+            },
+        )
+        .with_federation(Arc::new(federation));
+        let engine = Arc::new(engine);
+        let controls = ravel_query::http::AppState::new(
+            Arc::clone(&engine),
+            Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+                std::collections::HashMap::new(),
+            )),
+        )
+        .controls();
+        let request = ravel_query::http::MetadataRequest {
+            selectors: vec!["m".to_string(), "{__name__=\"m\"}".to_string()],
+            window: ravel_types::TimeRange {
+                start_ns: 0,
+                end_ns: 2 * HOUR_NS,
+            },
+            min_tokens: Vec::new(),
+            deadline: request_deadline,
+            allow_partial: false,
+            now_ns: entry_ns,
+            budgets: None,
+        };
+
+        let outcome = ravel_query::http::service::series(
+            &controls,
+            &engine,
+            ravel_types::TenantId::new("coordinator".to_string()).hash(),
+            &request,
+        )
+        .await;
+
+        assert_eq!(
+            *peer.deadlines.lock(),
+            vec![entry_ns + 5_000_000_000; 2],
+            "both selectors carry entry plus the 5 s request deadline"
+        );
+        let outcome = outcome.unwrap_or_else(|err| panic!("the request answers: {err:?}"));
+        assert_eq!(outcome.series.len(), 1, "the peer's one series");
     }
 
     /// Issue #2385, the coordinator half: a remote worker that ends a slice

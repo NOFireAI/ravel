@@ -699,6 +699,10 @@ async fn resolve_matched_series(
     // resolve_series call only the time still remaining. Without this, each
     // match[] selector would be granted the full `deadline` afresh, so N
     // selectors would get N times the documented budget with no aggregate cap.
+    // Each call also gets the request's entry `now_ns` and whole `deadline`,
+    // so the wall clock deadline its distributed and federated reads carry is
+    // the same `now_ns + deadline` for every selector, not one counted from
+    // the selector's own start.
     let request_deadline = tokio::time::Instant::now() + deadline;
 
     let mut combined: Option<(QueryAccountingSnapshot, CostEstimate)> = None;
@@ -713,12 +717,13 @@ async fn resolve_matched_series(
     if request.selectors.is_empty() {
         let remaining = remaining_budget(request_deadline, deadline)?;
         let (series, stats) = engine
-            .resolve_series_with_budgets(
+            .resolve_series_within(
                 tenant_hash,
                 &[],
                 request.window,
                 &request.min_tokens,
                 request.now_ns,
+                deadline,
                 remaining,
                 Some(budgets),
             )
@@ -756,12 +761,13 @@ async fn resolve_matched_series(
         let matchers: Vec<LabelMatcher> = parse_match_selector(selector)?;
         let remaining = remaining_budget(request_deadline, deadline)?;
         let (series, stats) = engine
-            .resolve_series_with_budgets(
+            .resolve_series_within(
                 tenant_hash,
                 &matchers,
                 request.window,
                 &request.min_tokens,
                 request.now_ns,
+                deadline,
                 remaining,
                 Some(budgets),
             )
