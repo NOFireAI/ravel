@@ -138,8 +138,10 @@ async fn start_server_configured(
         adaptive_flush_delay: false,
         // Long enough that no time-based flush ever fires during a test: the
         // shutdown drain is the only thing that can flush the buffered record.
-        max_flush_delay: Duration::from_secs(3600),
-        max_flush_delay_idle: Duration::from_secs(3600),
+        // 3599s rather than 3600s: an hour of trigger delay plus the hour of
+        // flush lifetime leaves no flush deferral cap, which `start` refuses.
+        max_flush_delay: Duration::from_secs(3599),
+        max_flush_delay_idle: Duration::from_secs(3599),
         min_flush_bytes: 1024 * 1024 * 1024,
         idle_flush_byte_floor: 0,
         mode,
