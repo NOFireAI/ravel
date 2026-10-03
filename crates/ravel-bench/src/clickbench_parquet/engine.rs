@@ -244,3 +244,107 @@ mod in_process {
 
 #[cfg(feature = "sql-latency")]
 pub use in_process::InProcessEngine;
+
+/// In-process DataFusion over the ClickBench fixture on the local
+/// filesystem: the oracle the suite's engines are compared against. Shares
+/// no Ravel code with [`in_process::InProcessEngine`], so a defect common to
+/// both the subject engine and its oracle cannot hide a wrong answer.
+#[cfg(feature = "sql-latency")]
+mod reference {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    use datafusion::prelude::SessionContext;
+    use datafusion_datasource_parquet::ParquetFormat;
+
+    use super::{DdlReceipt, EngineError, RecordBatch, SuiteEngine};
+
+    /// The checked-in `create.sql` text, embedded at compile time. Its first
+    /// statement (`CREATE EXTERNAL TABLE hits_raw ... LOCATION
+    /// 'hits.parquet'`) is never run as SQL here: the relative `LOCATION` is
+    /// meaningless outside the fixture's own temp directory, so this engine
+    /// instead registers `hits_raw` directly as a `ListingTable` over
+    /// whatever `location` the caller names. Only the second statement
+    /// (`CREATE VIEW hits ...`) runs, verbatim, against that table.
+    const CREATE_SQL: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/clickbench/parquet/create.sql"
+    ));
+
+    fn create_view_statement() -> Result<&'static str, EngineError> {
+        CREATE_SQL
+            .split(';')
+            .map(str::trim)
+            .find(|stmt| stmt.to_ascii_uppercase().starts_with("CREATE VIEW"))
+            .ok_or_else(|| {
+                EngineError::Unreachable(
+                    "create.sql carries no CREATE VIEW hits statement".to_string(),
+                )
+            })
+    }
+
+    pub struct ReferenceEngine {
+        ctx: SessionContext,
+    }
+
+    impl ReferenceEngine {
+        /// Registers `hits_raw` as a `ListingTable` over `location` -- a
+        /// directory holding the four fixture parts, or the single combined
+        /// file, whichever `location` names -- using
+        /// `ParquetFormat::default().with_binary_as_string(true)`, then runs
+        /// `create.sql`'s `CREATE VIEW hits` statement on top of it.
+        pub async fn new(location: &Path) -> Result<Self, EngineError> {
+            let ctx = SessionContext::new();
+            let format = Arc::new(ParquetFormat::default().with_binary_as_string(true));
+            let options = ListingOptions::new(format);
+            let url = ListingTableUrl::parse(location.to_string_lossy())
+                .map_err(|e| EngineError::Unreachable(format!("listing url: {e}")))?;
+            let state = ctx.state();
+            let config = ListingTableConfig::new(url)
+                .with_listing_options(options)
+                .infer_schema(&state)
+                .await
+                .map_err(|e| EngineError::Unreachable(format!("infer schema: {e}")))?;
+            let table = ListingTable::try_new(config)
+                .map_err(|e| EngineError::Unreachable(format!("listing table: {e}")))?;
+            ctx.register_table("hits_raw", Arc::new(table))
+                .map_err(|e| EngineError::Unreachable(format!("register hits_raw: {e}")))?;
+
+            ctx.sql(create_view_statement()?)
+                .await
+                .map_err(|e| EngineError::Ddl(format!("create view hits: {e}")))?;
+
+            Ok(ReferenceEngine { ctx })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SuiteEngine for ReferenceEngine {
+        async fn ddl(&self, sql: &str) -> Result<DdlReceipt, EngineError> {
+            self.ctx
+                .sql(sql)
+                .await
+                .map_err(|e| EngineError::Ddl(e.to_string()))?;
+            Ok(DdlReceipt {
+                outcome: "ok".to_string(),
+                files: None,
+            })
+        }
+
+        async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, EngineError> {
+            self.ctx
+                .sql(sql)
+                .await
+                .map_err(|e| EngineError::Query(e.to_string()))?
+                .collect()
+                .await
+                .map_err(|e| EngineError::Query(e.to_string()))
+        }
+    }
+}
+
+#[cfg(feature = "sql-latency")]
+pub use reference::ReferenceEngine;

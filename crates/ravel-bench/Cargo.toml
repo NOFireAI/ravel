@@ -139,6 +139,13 @@ datafusion = { version = "54", default-features = false, features = ["sql"], opt
 parquet58 = { package = "parquet", version = "58", default-features = false, features = [
     "arrow",
 ], optional = true }
+# Gated behind `sql-latency`. The ClickBench Parquet lane's reference engine
+# (`src/clickbench_parquet/engine.rs`) registers the fixture directly as a
+# DataFusion `ListingTable` over `ParquetFormat`, independent of any Ravel
+# read path, so the suite has an oracle that never shares code with the
+# engine it is checking. Not a new external crate: this already resolves in
+# the workspace lockfile at 54.1.0, the same version `ravel-parquet` links.
+datafusion-datasource-parquet = { version = "54", default-features = false, optional = true }
 # Gated behind `sql-latency`. The logs scan-partitioning scaling bench
 # (`logs_scan_scaling`) wires ADR-0046's read cache into `LogSegmentFetcher` so
 # it can report the object-store request count with and without the cache's
@@ -199,7 +206,7 @@ stage-timing = ["ravel-ingest/stage-timing"]
 # corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
 # same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
 # second datafusion/arrow activation) and the plain gates never compile it.
-sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures", "dep:parquet58", "dep:ravel-pqtable", "dep:ravel-memory"]
+sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures", "dep:parquet58", "dep:ravel-pqtable", "dep:ravel-memory", "dep:datafusion-datasource-parquet"]
 # The `sql_latency_bench --flight` lane (issue #680): the same corpus executed
 # through a running `ravel-server`'s Flight SQL endpoint instead of an
 # in-process executor. Off by default. No new external crate: `arrow-flight`
