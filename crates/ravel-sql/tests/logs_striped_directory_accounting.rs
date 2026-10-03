@@ -252,6 +252,33 @@ fn fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
         .with_read_gate(gate)
 }
 
+/// The same cache and read gate as [`fetcher`] with the fetcher's default
+/// thresholds, so these small objects are read whole: the plan phase decodes
+/// the directories from their ranged reads and each partition's open takes the
+/// whole object's bytes with those directories carried, through
+/// `open_scan_on_gate_from_decoded`.
+fn whole_object_fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
+    let cache_bytes = 64u64 << 20;
+    let cache: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(CacheLimits::new(
+        cache_bytes,
+        (cache_bytes / 4096) as usize,
+        cache_bytes,
+    )));
+    let gate = Arc::new(ReadGate::new(
+        CpuGateConfig {
+            permits: 2,
+            inline_floor_bytes: 0,
+            eval_floor_samples: 0,
+        },
+        Arc::new(InstantClock::new()),
+    ));
+    let block_range = BlockRangeFetcher::new(Arc::clone(&store)).with_suffix_len(SUFFIX_LEN);
+    LogSegmentFetcher::new(store)
+        .with_block_range(block_range)
+        .with_cache(cache)
+        .with_read_gate(gate)
+}
+
 fn sum_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
     fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
         if plan.name() == "LogsScanExec" {
@@ -281,14 +308,26 @@ async fn run(
     snapshot: &Snapshot,
     target_partitions: usize,
 ) -> Run {
-    let phase = PhaseAccounting::new();
-    let provider = LogsTableProvider::new(
-        snapshot.clone(),
-        TenantHash(TENANT),
+    run_with(
+        store,
+        snapshot,
+        target_partitions,
         fetcher(Arc::clone(store)),
-        phase.clone(),
     )
-    .with_declared_columns(declared());
+    .await
+}
+
+async fn run_with(
+    store: &Arc<dyn ObjectStoreBackend>,
+    snapshot: &Snapshot,
+    target_partitions: usize,
+    fetcher: LogSegmentFetcher,
+) -> Run {
+    let _ = store;
+    let phase = PhaseAccounting::new();
+    let provider =
+        LogsTableProvider::new(snapshot.clone(), TenantHash(TENANT), fetcher, phase.clone())
+            .with_declared_columns(declared());
     let ctx = SessionContext::new_with_config(
         SessionConfig::new().with_target_partitions(target_partitions),
     );
@@ -321,12 +360,15 @@ struct Fixture {
     page_dir: u64,
     /// The `body` projection's block pages, per object, summed.
     pages: u64,
+    /// The objects' lengths, summed.
+    object_bytes: u64,
 }
 
 async fn fixture() -> Fixture {
     let base = Arc::new(MemoryStore::new());
     let mut segments = Vec::new();
     let (mut directories, mut fetch_side, mut page_dir, mut pages) = (0u64, 0u64, 0u64, 0u64);
+    let mut object_bytes = 0u64;
     for s in 0..SEGMENTS {
         let (seg_ref, obj) = write_segment(base.as_ref(), s).await;
         directories += directory_bytes(&obj);
@@ -336,6 +378,18 @@ async fn fixture() -> Fixture {
             .sum::<u64>();
         page_dir += section_bytes(&obj, kind::PAGE_DIR);
         pages += page_bytes(&obj);
+        object_bytes += obj.len() as u64;
+        // The read-gate assertions below catch a second PAGE_DIR decode only
+        // when the suffix probe already covers PAGE_DIR: a probe that missed
+        // it would fetch (and decode) it separately in every route.
+        let page_dir_desc = *ravel_logseg::footer::open(&obj)
+            .expect("footer")
+            .section(kind::PAGE_DIR)
+            .expect("PAGE_DIR");
+        assert!(
+            page_dir_desc.offset >= (obj.len() as u64).saturating_sub(SUFFIX_LEN),
+            "the {SUFFIX_LEN}-byte suffix probe must cover PAGE_DIR in segment {s}"
+        );
         segments.push(seg_ref);
     }
     let store: Arc<dyn ObjectStoreBackend> = base;
@@ -350,13 +404,16 @@ async fn fixture() -> Fixture {
         fetch_side,
         page_dir,
         pages,
+        object_bytes,
     }
 }
 
 /// A 1-of-N projection through the striped route decompresses each segment's
 /// directories once: the plan phase carries exactly that, the scan phase carries
 /// exactly the projected pages, and the total is the whole-object path's figure
-/// less that path's extra PAGE_DIR decode for the read gate.
+/// less the fast path's own per-object extras (its ranged fetch's SKIP_IDX,
+/// PAGE_DIR and FIELD_DIR decodes and the read gate's PAGE_DIR decode, which
+/// the assertions below subtract).
 #[tokio::test]
 async fn striped_projection_decompresses_once_per_segment() {
     let fx = fixture().await;
@@ -416,5 +473,61 @@ async fn striped_projection_decompresses_once_per_segment() {
             - (striped.phases.plan.decompressed_bytes + striped.phases.scan.decompressed_bytes),
         fx.fetch_side + fx.page_dir,
         "the striped route is below the fast path by the fast path's own per-object extras"
+    );
+}
+
+/// The same decode-once pin on the route that reads whole objects: the plan
+/// phase charges each segment's directories once, the scan phase charges the
+/// projected pages only, and together they equal one whole-object decode.
+///
+/// Fails against a reader built from carried directories that still seeds its
+/// open-time total (each partition's open charges the directories again, so the
+/// scan phase exceeds the pages by one directory decode per open), and against a
+/// read gate that decodes PAGE_DIR again to size its job (the scan phase exceeds
+/// the pages by `page_dir`). Both are asserted by the exact scan-phase figure.
+#[tokio::test]
+async fn whole_object_route_decompresses_once_per_segment() {
+    let fx = fixture().await;
+    let run = run_with(
+        &fx.store,
+        &fx.snapshot,
+        STRIPED_PARTS,
+        whole_object_fetcher(Arc::clone(&fx.store)),
+    )
+    .await;
+    assert_eq!(
+        sum_metric(
+            &run.plan,
+            "fast_path_rejected_fewer_segments_than_partitions"
+        ),
+        STRIPED_PARTS,
+        "the run under test must be the striped route, one refusal per partition"
+    );
+    assert_eq!(run.rows, SEGMENTS * BLOCKS_PER_SEG);
+    // The route under test: the plan phase read each whole object once (the
+    // suffix probe covers these small objects), and the opens took those bytes
+    // with the directories carried, so the scan phase issued no GET.
+    assert_eq!(
+        run.phases.plan.s3_bytes[ravel_types::accounting::AccountedOp::Get.index()],
+        fx.object_bytes,
+        "the plan phase holds each whole object"
+    );
+    assert_eq!(
+        run.phases.scan.s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
+        0,
+        "the opens read the carried whole objects, not the store"
+    );
+    assert_eq!(
+        run.phases.plan.decompressed_bytes, fx.directories,
+        "the plan phase decodes each segment's four directories exactly once"
+    );
+    assert_eq!(
+        run.phases.scan.decompressed_bytes, fx.pages,
+        "the whole-object opens decode only their blocks' pages, no directory"
+    );
+    assert_eq!(
+        run.phases.plan.decompressed_bytes + run.phases.scan.decompressed_bytes,
+        fx.directories + fx.pages,
+        "the total is one whole-object decode of the projection"
     );
 }
