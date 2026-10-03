@@ -69,8 +69,8 @@ use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats}
 use ravel_logseg::stream_dir::StreamDir;
 use ravel_logseg::{
     AttrValue, BlockScan, ByteSource, ColumnSelection, ColumnarBlockView, LogRecord, LogSegError,
-    LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SparseObject, SuffixOutcome,
-    decode_section_accounted, open_from_suffix, read_section_accounted_from,
+    LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SegmentDirectories, SparseObject,
+    SuffixOutcome, decode_section_accounted, open_from_suffix, read_section_accounted_from,
 };
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
@@ -4906,6 +4906,55 @@ impl BlockRangeFetcher {
             FieldDir::decode(&field_raw, MAX_FIELDS).map_err(|source| corrupt(key, source))?;
 
         Ok((footer, skip, field_dir, stats))
+    }
+
+    /// Read and decode all four footer directories (STREAM_DIR, FIELD_DIR,
+    /// SKIP_IDX, PAGE_DIR) for one segment, fetching no BLOCKS byte: the plan
+    /// phase's counterpart of [`RlogReader::from_source`] for a query whose
+    /// plan needs the full directory set (ADR-2414 decision A1), not just the
+    /// SKIP_IDX/FIELD_DIR pair [`fetch_plan_sections`](Self::fetch_plan_sections)
+    /// brings for prune-only arms.
+    ///
+    /// One ADR-0107 suffix probe plus, where the probe did not already cover
+    /// them, coalesced range GETs for the missing sections. The returned
+    /// [`SegmentDirectories`] is what every later open of this segment within
+    /// the same query reuses via [`RlogReader::from_decoded`], so its decode
+    /// (and the `open_decompressed_bytes` it carries) happens exactly once per
+    /// (query, segment) rather than once per partition that opens it.
+    pub async fn fetch_plan_directories(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        accounting: &QueryAccounting,
+    ) -> Result<(footer::LogFooter, Arc<SegmentDirectories>, BlockRangeStats), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let mut stats = BlockRangeStats::default();
+        let pin = EtagPin::default();
+        let phase = ReadPhases::PLAN.metadata;
+        let (footer, mut resident) = self
+            .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
+            .await?;
+
+        self.ensure_tail_plan_sections(
+            seg_ref,
+            tenant_hash,
+            &footer,
+            &[kind::STREAM_DIR, kind::FIELD_DIR, kind::SKIP_IDX, kind::PAGE_DIR],
+            phase,
+            &mut resident,
+            &pin,
+            accounting,
+            &mut stats,
+        )
+        .await?;
+
+        let mut sparse = SparseObject::new(seg_ref.object_size);
+        for (start, bytes) in resident {
+            sparse.place(start, bytes).map_err(|source| corrupt(key, source))?;
+        }
+        let dirs = RlogReader::decode_directories(&sparse, &self.cfg)
+            .map_err(|source| corrupt(key, source))?;
+        Ok((footer, Arc::new(dirs), stats))
     }
 
     /// Fetch one segment's object as decode-ready [`LogObjectBytes`], reading
