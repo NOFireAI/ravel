@@ -2829,18 +2829,31 @@ struct PlanCounts {
     full_reads: usize,
 }
 
-/// One relevant segment's contribution to [`PlanCounts`].
-struct SegPlan {
-    /// Whole-object block indices surviving this query's pruning, ascending
-    /// (ADR-2414 decision A1): the set [`owned_work`] deals, whole row group
-    /// by whole row group, into each partition's share.
+/// What the plan phase learned about a segment that has at least one
+/// surviving block (ADR-2414 decision A1).
+struct PlannedBlocks {
+    /// Whole-object block indices surviving this query's pruning, ascending:
+    /// the set [`owned_work`] deals, whole row group by whole row group, into
+    /// each partition's share, and the list every per-partition open's own
+    /// pruning must reproduce.
     indices: Arc<Vec<usize>>,
     /// This segment's directories, decoded once by the plan phase
     /// ([`LogSegmentFetcher::plan_segment`]) and carried to every
     /// per-partition subset open through [`OwnedSeg`] so the open reuses them
-    /// via `RlogReader::from_decoded` instead of decoding them again
-    /// (ADR-2414 decision A1).
+    /// via `RlogReader::from_decoded` instead of decoding them again.
     dirs: Arc<SegmentDirectories>,
+    /// The fetch memory budget's reservation for `dirs`
+    /// ([`LogSegmentFetcher::reserve_carried_directories`]), released when
+    /// the plan counts drop.
+    _dirs_reservation: ravel_memory::Reservation,
+}
+
+/// One relevant segment's contribution to [`PlanCounts`].
+struct SegPlan {
+    /// The surviving blocks and carried directories, or `None` when no block
+    /// of this segment survives: no partition opens such a segment, so it
+    /// keeps no directories resident and reserves nothing.
+    planned: Option<PlannedBlocks>,
     /// The whole-segment prune stats ([`BlockMetrics::record_segment_totals`]
     /// consumes `blocks_total` and the postings drop). `blocks_scanned`/`pages`
     /// are zero here -- planning decodes nothing.
@@ -3010,9 +3023,25 @@ async fn compute_plan_counts(
                 // reused.
                 _ => None,
             };
+            // Only a segment some partition will open keeps its directories,
+            // and only then are they reserved: `owned_work` skips a
+            // zero-survivor segment, so carrying them would hold decoded
+            // bytes nothing reuses.
+            let planned = if survivors > 0 {
+                let reservation = ctx
+                    .fetcher
+                    .reserve_carried_directories(&dirs)
+                    .map_err(SqlError::from)?;
+                Some(PlannedBlocks {
+                    indices: Arc::new(indices),
+                    dirs,
+                    _dirs_reservation: reservation,
+                })
+            } else {
+                None
+            };
             segs[idx] = Some(SegPlan {
-                indices: Arc::new(indices),
-                dirs,
+                planned,
                 stats,
                 footer,
                 whole_object,
@@ -3127,11 +3156,11 @@ fn owned_work(
         let mut global_group = 0usize;
         for (seg_idx, plan) in counts.segs.iter().enumerate() {
             let Some(plan) = plan else { continue };
-            if plan.indices.is_empty() {
+            let Some(planned) = &plan.planned else {
                 continue;
-            }
+            };
             let mut indices = Vec::new();
-            for group in row_groups(&plan.indices, plan.dirs.page_dir()) {
+            for group in row_groups(&planned.indices, planned.dirs.page_dir()) {
                 if global_group % n == partition {
                     indices.extend(group);
                 }
@@ -3142,10 +3171,10 @@ fn owned_work(
                     seg: segments[seg_idx].clone(),
                     ordinal: seg_idx,
                     indices,
-                    survivors: Some(Arc::clone(&plan.indices)),
+                    survivors: Some(Arc::clone(&planned.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
-                    dirs: Some(Arc::clone(&plan.dirs)),
+                    dirs: Some(Arc::clone(&planned.dirs)),
                 });
             }
         }
@@ -3153,18 +3182,18 @@ fn owned_work(
         let mut seg_ordinal = 0usize;
         for (seg_idx, plan) in counts.segs.iter().enumerate() {
             let Some(plan) = plan else { continue };
-            if plan.indices.is_empty() {
+            let Some(planned) = &plan.planned else {
                 continue;
-            }
+            };
             if seg_ordinal % n == partition {
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
                     ordinal: seg_idx,
-                    indices: plan.indices.to_vec(),
-                    survivors: Some(Arc::clone(&plan.indices)),
+                    indices: planned.indices.to_vec(),
+                    survivors: Some(Arc::clone(&planned.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
-                    dirs: Some(Arc::clone(&plan.dirs)),
+                    dirs: Some(Arc::clone(&planned.dirs)),
                 });
             }
             seg_ordinal += 1;
@@ -3364,6 +3393,7 @@ type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> 
 fn open_segment_subset(
     ctx: Arc<PartitionCtx>,
     seg: SegmentRef,
+    survivors: Option<Arc<Vec<usize>>>,
     indices: Vec<usize>,
     footer: Option<LogFooter>,
     whole_object: Option<CarriedWholeObject>,
@@ -3371,6 +3401,15 @@ fn open_segment_subset(
 ) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
+        // The open's own pruning must reproduce the plan's survivor list or
+        // the fetcher refuses it; without the list there is nothing to
+        // compare against, and a share cannot be opened unchecked.
+        let Some(survivors) = survivors else {
+            return Err(DataFusionError::Internal(format!(
+                "striped open of segment {} has no plan survivor list",
+                seg.data_object_key
+            )));
+        };
         let scan = ctx
             .fetcher
             .scan_accounted_with_tenant_subset_raw(
@@ -3378,6 +3417,7 @@ fn open_segment_subset(
                 ctx.tenant_hash,
                 &ctx.query,
                 &ctx.columns,
+                &survivors,
                 &indices,
                 footer.as_ref(),
                 whole_object,
@@ -3560,13 +3600,17 @@ struct RowRefRange {
     first_row: usize,
 }
 
-/// The surviving-block index of the block a partition's cursor is about to
-/// yield, or `None` when the scan emits no row refs (ADR-0774).
+/// The surviving-block index of the block a partition's scan is yielding, or
+/// `None` when the scan emits no row refs (ADR-0774).
 ///
-/// `indices` is the partition's own list of surviving-block positions, so the
-/// cursor's `i`-th block is that list's `i`-th entry. The whole-segment fast
-/// path leaves the list empty and drains every survivor in order, so there the
-/// cursor position *is* the surviving-block index.
+/// `yielded` is the whole-object block index the scan's own cursor reports for
+/// the block it decodes ([`LogSegmentScan::upcoming_block_index`]), not a
+/// position this stream counted on its side: a row-ref addresses a block by
+/// its position in the plan's survivor list, so the index the scan names is
+/// resolved through that list and a block the list does not hold is an error,
+/// never a neighbour's address. The whole-segment fast path leaves `indices`
+/// empty and drains every survivor in order, so there the cursor position
+/// *is* the surviving-block index.
 ///
 /// A free function rather than a method because the columnar drain calls it
 /// while the block cursor holds a mutable borrow of the stream's state field.
@@ -3575,6 +3619,7 @@ fn block_index(
     indices: &[usize],
     survivors: Option<&[usize]>,
     cursor: usize,
+    yielded: Option<usize>,
 ) -> DFResult<Option<usize>> {
     if !row_refs {
         return Ok(None);
@@ -3582,20 +3627,19 @@ fn block_index(
     if indices.is_empty() {
         return Ok(Some(cursor));
     }
-    let owned = indices.get(cursor).copied().ok_or_else(|| {
+    let yielded = yielded.ok_or_else(|| {
         DataFusionError::Internal(format!(
-            "row-ref cursor at block {cursor} past this partition's {} owned blocks",
-            indices.len()
+            "row-ref cursor at block {cursor} but the scan has no block to yield"
         ))
     })?;
-    // `indices` hold whole-object block indices; the row-ref carries the
+    // `yielded` is a whole-object block index; the row-ref carries the
     // block's position in the segment's surviving-block list.
     let Some(survivors) = survivors else {
-        return Ok(Some(owned));
+        return Ok(Some(yielded));
     };
-    survivors.binary_search(&owned).map(Some).map_err(|_| {
+    survivors.binary_search(&yielded).map(Some).map_err(|_| {
         DataFusionError::Internal(format!(
-            "owned block {owned} is not among the segment's surviving blocks"
+            "scan yielded block {yielded}, which is not among the segment's surviving blocks"
         ))
     })
 }
@@ -3805,26 +3849,25 @@ impl LogScanStream {
             .add_elapsed(self.origin);
     }
 
-    /// The surviving-block index of the block the cursor is about to yield, or
-    /// `None` when this scan emits no row refs.
-    ///
-    /// `current_indices` is this partition's own list of surviving-block
-    /// positions, so the cursor's `i`-th block is that list's `i`-th entry. The
-    /// whole-segment fast path leaves the list empty and drains every survivor
-    /// in order, so there the cursor position *is* the surviving-block index.
-    fn current_block(&self) -> DFResult<Option<usize>> {
+    /// The surviving-block index of the block the scan yielded, or `None` when
+    /// this scan emits no row refs. `yielded` is the block index the scan
+    /// reported before the decode ([`LogSegmentScan::upcoming_block_index`]);
+    /// see [`block_index`].
+    fn current_block(&self, yielded: Option<usize>) -> DFResult<Option<usize>> {
         block_index(
             self.row_refs,
             &self.current_indices,
             self.current_survivors.as_deref().map(Vec::as_slice),
             self.block_cursor,
+            yielded,
         )
     }
 
-    /// The row-ref address for the block the cursor is about to yield, and
-    /// advance the cursor past it.
-    fn take_block_range(&mut self) -> DFResult<Option<RowRefRange>> {
-        let range = self.current_block()?.map(|block| RowRefRange {
+    /// The row-ref address for the block the scan just yielded, and advance
+    /// the cursor past it. `yielded` is the scan's
+    /// [`LogSegmentScan::upcoming_block_index`] read before the decode.
+    fn take_block_range(&mut self, yielded: Option<usize>) -> DFResult<Option<RowRefRange>> {
+        let range = self.current_block(yielded)?.map(|block| RowRefRange {
             segment: self.current_seg_ordinal,
             block,
             first_row: 0,
@@ -4078,7 +4121,7 @@ impl LogScanStream {
                         this.current_seg = Some(seg.clone());
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = indices.clone();
-                        this.current_survivors = survivors;
+                        this.current_survivors = survivors.clone();
                         this.current_footer = footer.clone();
                         this.current_dirs = dirs.clone();
                         // Moved, not cloned: this stream consumes the carried
@@ -4124,6 +4167,7 @@ impl LogScanStream {
                             LogScanState::Opening(open_segment_subset(
                                 Arc::clone(&this.ctx),
                                 seg,
+                                survivors,
                                 indices,
                                 footer,
                                 whole_object,
@@ -4205,6 +4249,10 @@ impl LogScanStream {
                     // The view borrows `scan`, so every outcome is folded into an
                     // owned `Step` here; `this.fail`/`this.state` are only touched
                     // after the match, once that borrow has ended.
+                    // Read before the decode: the view it hands out borrows
+                    // `scan`, so the block's own index cannot be asked of the
+                    // scan afterwards.
+                    let upcoming = scan.upcoming_block_index();
                     let decode_started = Instant::now();
                     let step = match scan.next_block_columnar() {
                         Ok(ColumnarBlockOutcome::Exhausted) => Step::Exhausted(scan.stats()),
@@ -4229,6 +4277,7 @@ impl LogScanStream {
                                     &this.current_indices,
                                     this.current_survivors.as_deref().map(Vec::as_slice),
                                     this.block_cursor,
+                                    upcoming,
                                 )
                                 .and_then(|block| {
                                     build_columnar_batches(
@@ -4325,6 +4374,7 @@ impl LogScanStream {
                                 open_segment_subset(
                                     Arc::clone(&this.ctx),
                                     seg,
+                                    this.current_survivors.clone(),
                                     this.current_indices.clone(),
                                     this.current_footer.clone(),
                                     this.current_whole_object.take(),
@@ -4367,6 +4417,7 @@ impl LogScanStream {
                     }
                 }
                 LogScanState::Rows(scan) => {
+                    let upcoming = scan.upcoming_block_index();
                     let decode_started = Instant::now();
                     let next = scan.next_block();
                     this.blocks.decode_build_elapsed.add_elapsed(decode_started);
@@ -4375,7 +4426,7 @@ impl LogScanStream {
                             // Stamp the block's row-ref address before the
                             // records are held: the batch builder reads it out
                             // of `pending_range` as it chunks them.
-                            match this.take_block_range() {
+                            match this.take_block_range(upcoming) {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
@@ -4422,6 +4473,7 @@ impl LogScanStream {
                         }
                         continue;
                     }
+                    let upcoming = scan.upcoming_block_index();
                     let decode_started = Instant::now();
                     let next = scan.next_block();
                     this.blocks.decode_build_elapsed.add_elapsed(decode_started);
@@ -4430,7 +4482,7 @@ impl LogScanStream {
                             // Stamp the block's row-ref address before the
                             // records are held: the batch builder reads it out
                             // of `pending_range` as it chunks them.
-                            match this.take_block_range() {
+                            match this.take_block_range(upcoming) {
                                 Ok(range) => this.pending_range = range,
                                 Err(e) => return this.fail(e),
                             }
@@ -7829,11 +7881,15 @@ mod owned_work_tests {
     /// `segments` identical objects, each with every block surviving.
     fn plan(segments: usize) -> (PlanCounts, Vec<SegmentRef>) {
         let dirs = dirs();
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
         let segs = (0..segments)
             .map(|_| {
                 Some(SegPlan {
-                    indices: Arc::new((0..BLOCKS).collect()),
-                    dirs: Arc::clone(&dirs),
+                    planned: Some(PlannedBlocks {
+                        indices: Arc::new((0..BLOCKS).collect()),
+                        dirs: Arc::clone(&dirs),
+                        _dirs_reservation: budget.reserve(0).expect("reserve"),
+                    }),
                     stats: ScanStats::default(),
                     footer: None,
                     whole_object: None,

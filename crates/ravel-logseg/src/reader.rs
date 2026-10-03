@@ -100,9 +100,9 @@ pub struct ScanStats {
 /// read placed, opened with [`RlogReader::from_source`].
 pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
     source: &'a S,
-    stream_dir: StreamDir,
-    field_dir: FieldDir,
-    skip: SkipIndex,
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
+    skip: Arc<SkipIndex>,
     blocks_offset: u64,
     /// The object's decoded PAGE_DIR (ADR-0699 decision 2), through which
     /// every block's pages are located.
@@ -124,6 +124,9 @@ pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
     /// Each scan seeds its [`ScanStats::decompressed_bytes`] with this so the
     /// figure counts opening the object as well as decoding its blocks.
     open_decompressed_bytes: u64,
+    /// Decoded length of the four directory sections, whatever their
+    /// compression, carried from [`SegmentDirectories::decoded_bytes`].
+    directories_decoded_bytes: u64,
 }
 
 /// The decoded footer directories for one segment (STREAM_DIR, FIELD_DIR,
@@ -142,9 +145,9 @@ pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
 /// decompression and validation this struct represents on every open.
 #[derive(Clone)]
 pub struct SegmentDirectories {
-    stream_dir: StreamDir,
-    field_dir: FieldDir,
-    skip: SkipIndex,
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
+    skip: Arc<SkipIndex>,
     blocks_offset: u64,
     page_dir: Arc<PageDir>,
     bloom: SectionDesc,
@@ -154,6 +157,10 @@ pub struct SegmentDirectories {
     /// seeds [`ScanStats::decompressed_bytes`] with the same open-time total
     /// without re-decompressing anything to get it.
     open_decompressed_bytes: u64,
+    /// Decoded length of STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR
+    /// together, counted for a raw section as well, unlike
+    /// [`Self::open_decompressed_bytes`].
+    decoded_bytes: u64,
 }
 
 impl SegmentDirectories {
@@ -194,6 +201,16 @@ impl SegmentDirectories {
     pub fn open_decompressed_bytes(&self) -> u64 {
         self.open_decompressed_bytes
     }
+
+    /// Decoded length of STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR
+    /// together: each section's `uncomp_len`, whether it was stored zstd or
+    /// raw. This is what a holder of these directories keeps resident, so it
+    /// is the figure to reserve against a memory budget while they are held.
+    /// [`Self::open_decompressed_bytes`] differs for a raw section, which it
+    /// does not count because nothing was decompressed.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
 }
 
 impl<'a> RlogReader<'a> {
@@ -219,17 +236,21 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     ) -> Result<SegmentDirectories, LogSegError> {
         let footer = open_source(source)?;
         let mut open_decompressed_bytes = 0u64;
+        let mut decoded_bytes = 0u64;
         let stream_desc = *section(&footer, kind::STREAM_DIR)?;
         let stream_raw = read_section_from(source, &stream_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
+        decoded_bytes += stream_raw.len() as u64;
         let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
         let field_desc = *section(&footer, kind::FIELD_DIR)?;
         let field_raw = read_section_from(source, &field_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
+        decoded_bytes += field_raw.len() as u64;
         let field_dir = FieldDir::decode(&field_raw, MAX_FIELDS)?;
         let skip_desc = *section(&footer, kind::SKIP_IDX)?;
         let skip_raw = read_section_from(source, &skip_desc, cfg)?;
         open_decompressed_bytes += section_decompressed_len(&skip_desc, &skip_raw);
+        decoded_bytes += skip_raw.len() as u64;
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
         let blocks = *section(&footer, kind::BLOCKS)?;
         let bloom = *section(&footer, kind::BLOOM)?;
@@ -245,6 +266,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
                 .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
             let raw = read_section_from(source, &desc, cfg)?;
             open_decompressed_bytes += section_decompressed_len(&desc, &raw);
+            decoded_bytes += raw.len() as u64;
             Arc::new(PageDir::decode_validated(
                 &raw,
                 blocks.len,
@@ -253,20 +275,21 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             )?)
         };
         Ok(SegmentDirectories {
-            stream_dir,
-            field_dir,
-            skip,
+            stream_dir: Arc::new(stream_dir),
+            field_dir: Arc::new(field_dir),
+            skip: Arc::new(skip),
             blocks_offset: blocks.offset,
             page_dir,
             bloom,
             postings,
             open_decompressed_bytes,
+            decoded_bytes,
         })
     }
 
     /// Builds a reader over `source` from an already-decoded
-    /// [`SegmentDirectories`], cloning its fields rather than decoding
-    /// anything. `source` may hold a different placement than whatever
+    /// [`SegmentDirectories`], sharing its four directory sections by
+    /// [`Arc`] rather than decoding or copying anything. `source` may hold a different placement than whatever
     /// source `dirs` was originally decoded from (a different partition's
     /// [`crate::SparseObject`] over the same segment, holding only that
     /// partition's own ranged extents) -- only the directory CONTENT is
@@ -288,6 +311,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             bloom: dirs.bloom,
             postings: dirs.postings,
             open_decompressed_bytes: 0,
+            directories_decoded_bytes: dirs.decoded_bytes,
         }
     }
 
@@ -311,8 +335,8 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
 
     /// This reader's already-decoded directories, as a [`SegmentDirectories`]
     /// a later open of the same (immutable) object can reuse via
-    /// [`RlogReader::from_decoded`] (ADR-2414 decision A1). A clone of fields
-    /// decoded once at construction, never a re-decode. The returned
+    /// [`RlogReader::from_decoded`] (ADR-2414 decision A1). Shares the sections
+    /// decoded once at construction by [`Arc`], never a re-decode or a copy. The returned
     /// [`SegmentDirectories::open_decompressed_bytes`] is the figure this
     /// reader was seeded with: the decode's total for a reader built by
     /// [`RlogReader::from_source`], zero for one built by
@@ -327,6 +351,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             bloom: self.bloom,
             postings: self.postings,
             open_decompressed_bytes: self.open_decompressed_bytes,
+            decoded_bytes: self.directories_decoded_bytes,
         }
     }
 
@@ -698,28 +723,49 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// reports), not ordinal positions into the survivor list.
     ///
     /// A caller dealing whole row groups to partitions (ADR-2414 decision A1,
-    /// `ravel_sql::logs_scan::owned_work`) groups the segment's blocks by
-    /// PAGE_DIR row-group boundaries before pruning runs, so it cannot name a
-    /// partition's share as ordinal survivor positions: which ordinal a given
-    /// raw block lands at depends on how many blocks ahead of it the skip,
-    /// POSTINGS, and bloom pruning removes, which the caller has not computed
-    /// and does not want to duplicate. Set membership has no such dependency:
-    /// a raw block index either belongs to the partition's row groups or it
-    /// does not, regardless of where pruning places it in the survivor order.
+    /// `ravel_sql::logs_scan::owned_work`) groups its plan's surviving blocks
+    /// by PAGE_DIR row-group boundaries and hands each partition the raw
+    /// indices of its groups. `planned` is that plan's whole survivor list for
+    /// the segment, the list `wanted` was dealt from; `wanted` is this
+    /// caller's share of it.
     ///
-    /// A raw index that pruning removed (it is not in this call's own survivor
-    /// list) is silently absent from the result rather than an error: a row
-    /// group dealt whole to a partition is not guaranteed to have every block
-    /// survive, only every SURVIVING block kept together.
+    /// Pruning runs here again, over the same immutable object, and must
+    /// reproduce `planned` exactly. When it does not, the plan and this open
+    /// disagree about which blocks hold rows, so every position the caller
+    /// derived from `planned` (a row-ref's block position, ADR-0774) could name
+    /// the wrong block, and a block the plan counted could be dropped without a
+    /// trace. That is refused with [`LogSegError::Corrupted`] rather than
+    /// reconciled: nothing here drops a block quietly. A `wanted` index that is
+    /// not in `planned` is refused the same way.
     pub fn scan_blocks_raw_subset(
         &self,
         content: &Predicate,
         prune: &[Predicate],
         columns: &ColumnSelection,
+        planned: &[usize],
         wanted: &[usize],
     ) -> Result<BlockScan, LogSegError> {
         let mut scan = self.scan_blocks(content, prune, columns)?;
+        let opened = scan.survivor_block_indices();
+        if opened != planned {
+            return Err(LogSegError::Corrupted(format!(
+                "raw block subset: the plan listed {} surviving blocks but this open's pruning \
+                 kept {}; first difference at position {}",
+                planned.len(),
+                opened.len(),
+                planned
+                    .iter()
+                    .zip(&opened)
+                    .position(|(p, o)| p != o)
+                    .unwrap_or_else(|| planned.len().min(opened.len())),
+            )));
+        }
         let wanted: std::collections::HashSet<usize> = wanted.iter().copied().collect();
+        if let Some(stray) = wanted.iter().find(|w| planned.binary_search(w).is_err()) {
+            return Err(LogSegError::Corrupted(format!(
+                "raw block subset: block {stray} is not among the plan's surviving blocks"
+            )));
+        }
         scan.blocks
             .retain(|b| wanted.contains(&(b.block_index as usize)));
         scan.next = 0;
@@ -997,8 +1043,8 @@ struct BlockLoc {
 /// call instead, which lets the caller hold them however it likes -- an owned
 /// `Bytes` from a cache hit, say -- without a self-referential struct.
 pub struct BlockScan {
-    stream_dir: StreamDir,
-    field_dir: FieldDir,
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
     plans: Vec<ColumnPlan>,
     /// `None` decodes every column (see [`ColumnSelection::resolve`]). Column
     /// ids are self-generated and dense (docs on [`ColumnIdSet`]), so this
@@ -1060,6 +1106,16 @@ impl BlockScan {
     /// [`RlogReader::scan_blocks_subset`]'s `indices` addresses.
     pub fn survivor_block_indices(&self) -> Vec<usize> {
         self.blocks.iter().map(|b| b.block_index as usize).collect()
+    }
+
+    /// The whole-object block index of the block the next
+    /// [`Self::next_block`] or [`Self::next_block_columnar`] call decodes, or
+    /// `None` once every surviving block has been decoded. A caller stamping
+    /// each block with an address (a row-ref, ADR-0774) reads it here, from the
+    /// cursor that does the yielding, instead of counting calls against a list
+    /// of its own that could drift from what this scan kept.
+    pub fn upcoming_block_index(&self) -> Option<usize> {
+        self.blocks.get(self.next).map(|b| b.block_index as usize)
     }
 
     /// Decode the next surviving block and return the rows of it that match the
@@ -5380,38 +5436,109 @@ mod tests {
         );
     }
 
-    /// `scan_blocks_raw_subset` names whole-object block indices. A wanted
-    /// index pruning removed is absent, not an error, and the drain follows the
-    /// scan's own block order.
+    /// `scan_blocks_raw_subset` names whole-object block indices, the drain
+    /// follows the scan's own block order, and `upcoming_block_index` reports
+    /// each block's own index rather than a position.
     ///
     /// Fails against the ordinal reading of `wanted` (`scan_blocks_subset`
-    /// positions): with blocks 0 and 1 pruned, positions 0 and 1 are blocks 2
-    /// and 3 and position 6 does not exist.
+    /// positions): with blocks 0 and 1 pruned, ordinal 0 is block 2 and ordinal
+    /// 6 does not exist, so the drained timestamps and the reported indices
+    /// both differ from blocks 5 and 6.
     #[test]
     fn a_raw_subset_names_whole_object_block_indices() {
         let (records, object) = dict_fixture::two_group_object();
         let cfg = RlogConfig::default();
         let reader = RlogReader::new(&object, &cfg).expect("open");
-        // Four records per block, so ts >= 1008 prunes blocks 0 and 1.
+        // Four records per block, so ts >= 1008 prunes blocks 0 and 1 and the
+        // other six survive.
         let from_block_two = Predicate::TsRange {
             min_ns: 1_008,
             max_ns: i64::MAX,
         };
+        let planned = [2usize, 3, 4, 5, 6, 7];
         let block_ts =
             |b: usize| -> Vec<i64> { records[4 * b..4 * b + 4].iter().map(|r| r.ts_ns).collect() };
 
         let mut scan = reader
-            .scan_blocks_raw_subset(&from_block_two, &[], &ColumnSelection::all(), &[0, 1, 6, 5])
+            .scan_blocks_raw_subset(
+                &from_block_two,
+                &[],
+                &ColumnSelection::all(),
+                &planned,
+                &[6, 5],
+            )
             .expect("raw subset");
         assert_eq!(scan.survivor_block_indices(), vec![5, 6]);
+        assert_eq!(scan.upcoming_block_index(), Some(5));
         let mut want = block_ts(5);
         want.extend(block_ts(6));
-        assert_eq!(drain_ts(&mut scan, &object), want);
+        let mut got = Vec::new();
+        let mut upcoming = Vec::new();
+        while let Some(index) = scan.upcoming_block_index() {
+            upcoming.push(index);
+            let rows = scan.next_block(&object).expect("block").expect("a block");
+            got.extend(rows.iter().map(|r| r.ts_ns));
+        }
+        assert_eq!(got, want);
+        assert_eq!(upcoming, vec![5, 6], "each block reports its own index");
+        assert_eq!(scan.upcoming_block_index(), None);
 
         let mut none = reader
-            .scan_blocks_raw_subset(&from_block_two, &[], &ColumnSelection::all(), &[0, 1])
-            .expect("raw subset of pruned blocks");
+            .scan_blocks_raw_subset(&from_block_two, &[], &ColumnSelection::all(), &planned, &[])
+            .expect("an empty share");
         assert_eq!(none.remaining_blocks(), 0);
         assert!(drain_ts(&mut none, &object).is_empty());
+    }
+
+    /// A plan whose survivor list differs from what this open's pruning keeps
+    /// is refused, in both directions, and so is a share naming a block the
+    /// plan never listed. None of the three is reconciled by dropping blocks.
+    ///
+    /// Fails against the silent filter (`retain` on `wanted` alone): that
+    /// returns `Ok` for the pruned-wanted case (block 0 is dropped), for a plan
+    /// that omits a block the open kept (block 7 is dropped for want of being
+    /// listed), and for a plan listing a block the open pruned (block 1 is
+    /// never reported missing).
+    #[test]
+    fn a_raw_subset_refuses_a_plan_that_differs_from_the_open() {
+        let (_, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&object, &cfg).expect("open");
+        let from_block_two = Predicate::TsRange {
+            min_ns: 1_008,
+            max_ns: i64::MAX,
+        };
+        let all = ColumnSelection::all();
+        let refused = |planned: &[usize], wanted: &[usize]| -> String {
+            match reader.scan_blocks_raw_subset(&from_block_two, &[], &all, planned, wanted) {
+                Ok(scan) => panic!(
+                    "expected a refusal, got a scan over {:?}",
+                    scan.survivor_block_indices()
+                ),
+                Err(LogSegError::Corrupted(msg)) => msg,
+                Err(other) => panic!("expected Corrupted, got {other:?}"),
+            }
+        };
+
+        // The plan lists block 1, which this open's pruning removed.
+        assert!(
+            refused(&[1, 2, 3, 4, 5, 6, 7], &[5, 6]).contains("the plan listed 7"),
+            "a plan listing a pruned block"
+        );
+        // The plan omits block 7, which this open's pruning kept.
+        assert!(
+            refused(&[2, 3, 4, 5, 6], &[5, 6]).contains("the plan listed 5"),
+            "a plan omitting a surviving block"
+        );
+        // Same length, shifted by one block: the lists differ from position 0.
+        assert!(
+            refused(&[1, 2, 3, 4, 5, 6], &[5, 6]).contains("first difference at position 0"),
+            "a plan naming another block of the same count"
+        );
+        // The lists agree but the share names a block pruning removed.
+        assert!(
+            refused(&[2, 3, 4, 5, 6, 7], &[0, 5]).contains("block 0 is not among the plan"),
+            "a share naming a pruned block"
+        );
     }
 }

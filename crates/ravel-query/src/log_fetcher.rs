@@ -371,6 +371,14 @@ impl LogSegmentScan {
         self.scan.as_ref().map_or(0, BlockScan::remaining_blocks)
     }
 
+    /// The whole-object block index of the block the next decode yields, or
+    /// `None` when every surviving block has been drained or the cursor was
+    /// lost. Read before the decode call: the columnar exit's view borrows this
+    /// scan until it is dropped.
+    pub fn upcoming_block_index(&self) -> Option<usize> {
+        self.scan.as_ref().and_then(BlockScan::upcoming_block_index)
+    }
+
     /// Arms the test hook: the next gated block decode panics inside its job.
     #[cfg(test)]
     pub(crate) fn panic_next_gate_job_for_test(&mut self) {
@@ -904,18 +912,17 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         indices: Option<&[usize]>,
-        raw: bool,
+        raw_planned: Option<&[usize]>,
         block_sizes: bool,
         accounting: &QueryAccounting,
         span: &tracing::Span,
     ) -> Result<(BlockScan, u64), LogFetchError> {
         let Some(gate) = &self.read_gate else {
-            let scan = span.in_scope(|| match indices {
-                None => self.open_scan(key, bytes, query, columns, accounting),
-                Some(indices) if raw => {
-                    self.open_scan_raw_subset(key, bytes, query, columns, indices, accounting)
-                }
-                Some(indices) => {
+            let scan = span.in_scope(|| match (indices, raw_planned) {
+                (None, _) => self.open_scan(key, bytes, query, columns, accounting),
+                (Some(indices), Some(planned)) => self
+                    .open_scan_raw_subset(key, bytes, query, columns, planned, indices, accounting),
+                (Some(indices), None) => {
                     self.open_scan_subset(key, bytes, query, columns, indices, accounting)
                 }
             })?;
@@ -928,22 +935,24 @@ impl LogSegmentFetcher {
         let query = query.clone();
         let columns = columns.clone();
         let indices = indices.map(<[usize]>::to_vec);
+        let planned = raw_planned.map(<[usize]>::to_vec);
         let accounting = accounting.clone();
         let span = span.clone();
         gate.run(ReadSite::LogPostings, size, move || {
             span.in_scope(|| {
                 let (key, bytes) = (job_key.as_str(), &job_bytes);
-                let scan = match &indices {
-                    None => fetcher.open_scan(key, bytes, &query, &columns, &accounting),
-                    Some(indices) if raw => fetcher.open_scan_raw_subset(
+                let scan = match (&indices, &planned) {
+                    (None, _) => fetcher.open_scan(key, bytes, &query, &columns, &accounting),
+                    (Some(indices), Some(planned)) => fetcher.open_scan_raw_subset(
                         key,
                         bytes,
                         &query,
                         &columns,
+                        planned,
                         indices,
                         &accounting,
                     ),
-                    Some(indices) => {
+                    (Some(indices), None) => {
                         fetcher.open_scan_subset(key, bytes, &query, &columns, indices, &accounting)
                     }
                 }?;
@@ -1018,6 +1027,7 @@ impl LogSegmentFetcher {
         bytes: &LogObjectBytes,
         query: &LogQuery,
         columns: &ColumnSelection,
+        planned: &[usize],
         indices: &[usize],
         dirs: &Arc<SegmentDirectories>,
         block_sizes: bool,
@@ -1025,7 +1035,9 @@ impl LogSegmentFetcher {
     ) -> Result<(BlockScan, u64), LogFetchError> {
         let Some(gate) = &self.read_gate else {
             let scan = span.in_scope(|| {
-                self.open_scan_raw_subset_with_decoded(key, bytes, query, columns, indices, dirs)
+                self.open_scan_raw_subset_with_decoded(
+                    key, bytes, query, columns, planned, indices, dirs,
+                )
             })?;
             let block_job_bytes = if block_sizes {
                 max_block_uncompressed_len_from_page_dir(dirs.page_dir())
@@ -1040,6 +1052,7 @@ impl LogSegmentFetcher {
         let job_bytes = bytes.clone();
         let query = query.clone();
         let columns = columns.clone();
+        let planned = planned.to_vec();
         let indices = indices.to_vec();
         let dirs = Arc::clone(dirs);
         let span = span.clone();
@@ -1050,6 +1063,7 @@ impl LogSegmentFetcher {
                     &job_bytes,
                     &query,
                     &columns,
+                    &planned,
                     &indices,
                     &dirs,
                 )?;
@@ -1122,6 +1136,25 @@ impl LogSegmentFetcher {
                 reserved: e.reserved,
                 limit: e.limit,
             })
+    }
+
+    /// Reserves [`SegmentDirectories::decoded_bytes`] of `dirs` against this
+    /// fetcher's memory budget, the budget a [`CarriedWholeObject`]'s bytes
+    /// are reserved against, for a caller that keeps `dirs` resident across
+    /// a query (ADR-2414 decision A1: `ravel_sql::logs_scan` holds each
+    /// planned segment's directories for the opens that follow). The guard
+    /// releases the bytes when it drops, so the holder keeps it for as long
+    /// as it keeps `dirs`. A refusal is [`LogFetchError::FetchMemoryExhausted`],
+    /// the same error a refused whole-object reservation reports.
+    ///
+    /// The reservation is taken after the decode, not before as a
+    /// whole-object GET's is, because the directories' size is known only
+    /// once decoded.
+    pub fn reserve_carried_directories(
+        &self,
+        dirs: &SegmentDirectories,
+    ) -> Result<ravel_memory::Reservation, LogFetchError> {
+        self.reserve_fetch(dirs.decoded_bytes())
     }
 
     /// This fetcher's own limiter (bounds `fetch_accounted` and
@@ -1648,7 +1681,7 @@ impl LogSegmentFetcher {
         let span = decode_span();
         let (scan, block_job_bytes) = self
             .open_scan_on_gate(
-                key, &bytes, query, columns, None, false, true, accounting, &span,
+                key, &bytes, query, columns, None, None, true, accounting, &span,
             )
             .await?;
         Ok(Some(self.scan_handle(
@@ -1707,7 +1740,7 @@ impl LogSegmentFetcher {
         let span = decode_span();
         let (scan, block_job_bytes) = self
             .open_scan_on_gate(
-                key, &bytes, query, columns, None, false, true, accounting, &span,
+                key, &bytes, query, columns, None, None, true, accounting, &span,
             )
             .await?;
         Ok(Some(self.scan_handle(
@@ -2295,15 +2328,13 @@ impl LogSegmentFetcher {
     /// returned [`LogSegmentScan`] drains only the named subset of the
     /// segment's surviving blocks.
     ///
-    /// `indices` are whole-object block indices (ADR-2414 decision A1), the
-    /// partition's share of the segment's row groups as
-    /// `ravel_sql::logs_scan::owned_work` deals them, not ordinal positions
-    /// into a survivor list: a row group is dealt whole, so the partition's
-    /// raw block indices are known before this query's own pruning runs over
-    /// this object and cannot be expressed as positions into a pruning result
-    /// that has not run yet. The returned scan's whole-segment stats totals
-    /// are reported by [`plan_segment`](Self::plan_segment) instead, to keep
-    /// one segment's totals from being counted once per partition (see
+    /// `indices` are ordinal positions into this object's survivor list (a
+    /// row-ref's recorded position, ADR-0774). See
+    /// [`scan_accounted_with_tenant_subset_raw`](Self::scan_accounted_with_tenant_subset_raw)
+    /// for the whole-object-block-index counterpart the striped route uses.
+    /// The returned scan's whole-segment stats totals are reported by
+    /// [`plan_segment`](Self::plan_segment) instead, to keep one segment's
+    /// totals from being counted once per partition (see
     /// `ravel_sql::logs_scan`).
     ///
     /// `footer`, when `Some`, is the [`footer::LogFooter`] a prior
@@ -2323,11 +2354,6 @@ impl LogSegmentFetcher {
     /// read, per [`tenant_bytes_with_footer`](Self::tenant_bytes_with_footer)).
     ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
-    ///
-    /// `indices` are ordinal positions into this object's survivor list (a
-    /// row-ref's recorded position, ADR-0774). See
-    /// [`scan_accounted_with_tenant_subset_raw`](Self::scan_accounted_with_tenant_subset_raw)
-    /// for the whole-object-block-index counterpart.
     ///
     /// Issue #796: `scan` phase, same reasoning and the same not-buffered
     /// `accounting` handling as
@@ -2351,7 +2377,7 @@ impl LogSegmentFetcher {
             query,
             columns,
             indices,
-            false,
+            None,
             footer,
             carried_whole,
             None,
@@ -2363,9 +2389,15 @@ impl LogSegmentFetcher {
     /// [`scan_accounted_with_tenant_subset`](Self::scan_accounted_with_tenant_subset),
     /// but `indices` names whole-object block indices (ADR-2414 decision A1):
     /// the partition's share of a segment's row groups as
-    /// `ravel_sql::logs_scan::owned_work` deals them, known before this
-    /// query's own pruning runs over this object and so not expressible as
-    /// positions into a pruning result that does not exist yet.
+    /// `ravel_sql::logs_scan::owned_work` deals them from the plan's survivor
+    /// list, `planned`.
+    ///
+    /// `planned` is that whole survivor list for this segment, ascending. This
+    /// open prunes the object again and the result must equal `planned`; when
+    /// it does not, the call fails with [`LogFetchError::Corrupt`] instead of
+    /// draining a share that no longer matches the plan, because the row-ref
+    /// positions the caller derives from `planned` would then name the wrong
+    /// blocks (see [`RlogReader::scan_blocks_raw_subset`]).
     ///
     /// `dirs`, when `Some`, is the [`SegmentDirectories`] a prior
     /// [`plan_segment`](Self::plan_segment) already decoded for this exact
@@ -2379,6 +2411,7 @@ impl LogSegmentFetcher {
         tenant_hash: TenantHash,
         query: &LogQuery,
         columns: &ColumnSelection,
+        planned: &[usize],
         indices: &[usize],
         footer: Option<&footer::LogFooter>,
         carried_whole: Option<CarriedWholeObject>,
@@ -2391,7 +2424,7 @@ impl LogSegmentFetcher {
             query,
             columns,
             indices,
-            true,
+            Some(planned),
             footer,
             carried_whole,
             dirs,
@@ -2408,17 +2441,18 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         indices: &[usize],
-        raw: bool,
+        raw_planned: Option<&[usize]>,
         footer: Option<&footer::LogFooter>,
         carried_whole: Option<CarriedWholeObject>,
         dirs: Option<&Arc<SegmentDirectories>>,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
-        // `indices` is only raw whole-object block indices when `raw` holds
-        // (ADR-2414 decision A1 deliverable 3): the ordinal case's indices are
-        // positions into the pruned survivor list, a different index space
-        // that must never restrict the object-level candidate set below.
-        let owned_blocks = raw.then(|| OwnedBlocks {
+        // `indices` is only raw whole-object block indices when `raw_planned`
+        // is set (ADR-2414 decision A1 deliverable 3): the ordinal case's
+        // indices are positions into the pruned survivor list, a different
+        // index space that must never restrict the object-level candidate set
+        // below.
+        let owned_blocks = raw_planned.map(|_| OwnedBlocks {
             blocks: indices,
             dirs: dirs.map(|d| &**d),
         });
@@ -2440,10 +2474,10 @@ impl LogSegmentFetcher {
         };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let (scan, block_job_bytes) = match dirs {
-            Some(dirs) if raw => {
+        let (scan, block_job_bytes) = match (dirs, raw_planned) {
+            (Some(dirs), Some(planned)) => {
                 self.open_scan_on_gate_from_decoded(
-                    key, &bytes, query, columns, indices, dirs, true, &span,
+                    key, &bytes, query, columns, planned, indices, dirs, true, &span,
                 )
                 .await?
             }
@@ -2454,7 +2488,7 @@ impl LogSegmentFetcher {
                     query,
                     columns,
                     Some(indices),
-                    raw,
+                    raw_planned,
                     true,
                     accounting,
                     &span,
@@ -2919,7 +2953,7 @@ impl LogSegmentFetcher {
                 query,
                 &ColumnSelection::all(),
                 None,
-                false,
+                None,
                 true,
                 accounting,
                 span,
@@ -3081,15 +3115,18 @@ impl LogSegmentFetcher {
     /// [`open_scan_subset`](Self::open_scan_subset), but `indices` names
     /// whole-object block indices (ADR-2414 decision A1), not ordinal survivor
     /// positions: the partition's share of a segment's row groups as
-    /// `ravel_sql::logs_scan::owned_work` deals them, known before this query's
-    /// own pruning runs over this object and so not expressible as positions
-    /// into a pruning result that does not exist yet.
+    /// `ravel_sql::logs_scan::owned_work` deals them from the plan's survivor
+    /// list `planned`. This open's own pruning must reproduce `planned`
+    /// exactly; see [`RlogReader::scan_blocks_raw_subset`] for the refusal when
+    /// it does not.
+    #[allow(clippy::too_many_arguments)]
     fn open_scan_raw_subset(
         &self,
         key: &str,
         bytes: &LogObjectBytes,
         query: &LogQuery,
         columns: &ColumnSelection,
+        planned: &[usize],
         indices: &[usize],
         accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
@@ -3097,7 +3134,7 @@ impl LogSegmentFetcher {
         let reader =
             RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
         reader
-            .scan_blocks_raw_subset(&pred, &query.prune, columns, indices)
+            .scan_blocks_raw_subset(&pred, &query.prune, columns, planned, indices)
             .map_err(|source| corrupt(key, source))
     }
 
@@ -3106,12 +3143,14 @@ impl LogSegmentFetcher {
     /// instead of decoding STREAM_DIR, FIELD_DIR, SKIP_IDX, and PAGE_DIR again
     /// from `bytes` (ADR-2414 decision A1): the striped route's per-partition
     /// open of a segment the plan phase already opened once.
+    #[allow(clippy::too_many_arguments)]
     fn open_scan_raw_subset_with_decoded(
         &self,
         key: &str,
         bytes: &LogObjectBytes,
         query: &LogQuery,
         columns: &ColumnSelection,
+        planned: &[usize],
         indices: &[usize],
         dirs: &SegmentDirectories,
     ) -> Result<BlockScan, LogFetchError> {
@@ -3123,7 +3162,7 @@ impl LogSegmentFetcher {
         let pred = combined_predicate_with_streams(query, stream_ids);
         let reader = RlogReader::from_decoded(bytes, dirs);
         reader
-            .scan_blocks_raw_subset(&pred, &query.prune, columns, indices)
+            .scan_blocks_raw_subset(&pred, &query.prune, columns, planned, indices)
             .map_err(|source| corrupt(key, source))
     }
 
@@ -12832,6 +12871,7 @@ mod owned_block_plan_tests {
                 TENANT,
                 &query,
                 &ColumnSelection::all(),
+                &indices,
                 &indices,
                 None,
                 None,
