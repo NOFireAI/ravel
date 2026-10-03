@@ -270,9 +270,9 @@ pub struct Provenance {
     /// The logs fetch policy this run asked for (`--logs-fetch-policy`,
     /// ADR-0996 decision 2), as [`ravel_query::LogsFetchPolicy::as_str`] renders
     /// it. The policy is what selects the read shape: at the default
-    /// `cost-based` against a profile whose bytes are free, the resolution
-    /// saturates both byte quantities and every object is read whole in one
-    /// covering GET, which is what a stock server does.
+    /// `cost-based` against the reference profile the rate is the time term and
+    /// an object is read whole unless a narrow projection skips more than the
+    /// projection break-even, which is what a stock server does.
     ///
     /// A report written before this field existed deserializes to
     /// [`POLICY_NOT_RECORDED`]. Those runs predate the resolution, so no policy
@@ -508,9 +508,9 @@ fn default_logs_fetch_policy() -> String {
 /// The `Option` arguments carry the same distinction the server's flags do:
 /// `Some` is "the run set this", and the `unwrap_or` fallback is the compiled-in
 /// value the byte-leaning policy resolves to. A run that sets no flag therefore
-/// gets `cost-based` against the reference profile, which saturates the request
-/// cost and with it the routing threshold, rather than the 512 KiB threshold the
-/// bench used before the policy was reachable at all.
+/// gets `cost-based` against the reference profile, which resolves the time
+/// term's request cost and its projection break-even (ADR-2414 decision A3),
+/// exactly as the server does.
 pub fn logs_fetch_resolution(
     policy: LogsFetchPolicy,
     profile: &StoreCostProfile,
@@ -3269,9 +3269,17 @@ mod tests {
             "the default request cost is what the default policy resolves to"
         );
         assert_eq!(
-            settings.logs_block_range_threshold,
-            u64::MAX,
-            "cost-based at the reference profile reads every object whole"
+            settings.logs_projection_break_even_bytes, resolved.projection_break_even_bytes,
+            "the default break-even is what the default policy resolves to"
+        );
+        assert_eq!(
+            (
+                settings.logs_block_range_threshold,
+                settings.logs_request_cost_bytes,
+                settings.logs_projection_break_even_bytes,
+            ),
+            (524_288, 6_300_000, Some(31_500_000)),
+            "cost-based at the reference profile takes the time term (ADR-2414 decision A3)"
         );
     }
 
@@ -3286,23 +3294,27 @@ mod tests {
     }
 
     /// A loaded-tenant run at the default policy against the reference profile
-    /// hands the fetcher whole-object routing, the shape a stock server has:
-    /// both resolved quantities saturate. Before the policy was reachable the
-    /// threshold stayed at 512 KiB, so every larger object was range-read per
-    /// block (issue #1139).
+    /// hands the fetcher the routing a stock server has: the time term's
+    /// request cost, the 512 KiB routing threshold and the 31,500,000-byte
+    /// projection break-even (ADR-2414 decision A3). Byte-minimal hands it the
+    /// compiled-in rate and no break-even. The lane resolves through the same
+    /// call the server makes, so a lane that kept its own routing would read
+    /// differently here (issue #1139).
     #[test]
-    fn tenant_lane_at_the_default_policy_resolves_whole_object_routing() {
+    fn tenant_lane_at_the_default_policy_resolves_the_time_term() {
         let store = empty_store();
         let mut cfg = tenant_cfg(&store, "default-policy-tenant", None, 0);
         cfg.logs_fetch_policy = LogsFetchPolicy::default();
         let settings = tenant_settings_for(&cfg, 1);
-        assert_eq!(settings.logs_block_range_threshold, u64::MAX);
-        assert_eq!(settings.logs_request_cost_bytes, u64::MAX);
+        assert_eq!(settings.logs_block_range_threshold, 524_288);
+        assert_eq!(settings.logs_request_cost_bytes, 6_300_000);
+        assert_eq!(settings.logs_projection_break_even_bytes, Some(31_500_000));
 
         cfg.logs_fetch_policy = LogsFetchPolicy::ByteMinimal;
         let settings = tenant_settings_for(&cfg, 1);
         assert_eq!(settings.logs_block_range_threshold, 524_288);
         assert_eq!(settings.logs_request_cost_bytes, 1_887_437);
+        assert_eq!(settings.logs_projection_break_even_bytes, None);
     }
 
     /// Every statement outcome is appended to the progress file as a JSON
@@ -4352,7 +4364,7 @@ mod tests {
     /// constant, not a number, means a change to
     /// `DEFAULT_LOG_REQUEST_COST_BYTES` cannot silently desynchronise the bench
     /// from the engine. (`ExecutorSettings::default()` is cost-based and
-    /// resolves to the saturated rate instead; see
+    /// resolves to the reference profile's time term instead; see
     /// `default_executor_settings_route_the_way_their_policy_says`.)
     #[test]
     fn cold_executor_byte_minimal_uses_the_engine_default_request_cost() {
@@ -4374,6 +4386,7 @@ mod tests {
             logs_fetch_policy: LogsFetchPolicy::ByteMinimal,
             logs_request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
             logs_block_range_threshold: DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            logs_projection_break_even_bytes: None,
             ..ExecutorSettings::default()
         }
     }
@@ -4638,6 +4651,7 @@ mod tests {
     fn probe_miss_settings(suffix: u64) -> ExecutorSettings {
         ExecutorSettings {
             logs_block_range_threshold: 0,
+            logs_projection_break_even_bytes: None,
             logs_suffix_len: Some(suffix),
             fetch_concurrency: CARRY_BUDGET,
             ..ExecutorSettings::default()
@@ -4808,6 +4822,7 @@ mod tests {
             None,
             ExecutorSettings {
                 logs_block_range_threshold: 0,
+                logs_projection_break_even_bytes: None,
                 logs_suffix_len: None,
                 fetch_concurrency: CARRY_BUDGET,
                 ..ExecutorSettings::default()
@@ -5914,8 +5929,9 @@ mod tests {
             Duration::from_secs(30),
             false,
             None,
-            // Byte-minimal routing: the default policy reads every object
-            // whole, and this test is about the ranged path.
+            // Byte-minimal routing: the default policy reads this 2 MiB object
+            // whole (it is under the 31,500,000-byte projection break-even),
+            // and this test is about the ranged path.
             byte_minimal_settings(),
             false,
             None,
@@ -6003,6 +6019,7 @@ mod tests {
             None,
             ExecutorSettings {
                 logs_block_range_threshold: 0,
+                logs_projection_break_even_bytes: None,
                 ..settings
             },
             false,
@@ -6079,6 +6096,7 @@ mod tests {
             None,
             ExecutorSettings {
                 logs_block_range_threshold: 0,
+                logs_projection_break_even_bytes: None,
                 ..settings
             },
             false,
