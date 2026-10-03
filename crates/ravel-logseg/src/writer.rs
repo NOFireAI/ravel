@@ -284,6 +284,7 @@ impl RlogWriter {
                 "columnar push into a row-major writer".into(),
             ));
         }
+        batch.validate()?;
         if !batch.is_empty() {
             self.batches.push(batch);
         }
@@ -1013,7 +1014,7 @@ impl RlogWriter {
                         b.stream_ids.len(),
                     )
                 };
-                return Err(LogSegError::InconsistentStreamAttrs(message));
+                return Err(LogSegError::MalformedColumnarBatch(message));
             }
             for (id, blob) in b.stream_ids.iter().zip(b.stream_attrs.iter()) {
                 match streams.entry(*id) {
@@ -1151,7 +1152,7 @@ impl RlogWriter {
                 .iter()
                 .map(|sid| {
                     sorted_ids.binary_search(sid).map(|i| i as u32).map_err(|_| {
-                        LogSegError::InconsistentStreamAttrs(format!(
+                        LogSegError::MalformedColumnarBatch(format!(
                             "stream {} has no stream_attrs blob: not present in this object's stream directory",
                             sid.to_hex(),
                         ))
@@ -1180,6 +1181,8 @@ impl RlogWriter {
                 } else {
                     g_span.push(None);
                 }
+                // `push_columnar` (via `ColumnarLogBatch::validate`) guarantees
+                // every `stream_refs` value is below `stream_ids.len()`.
                 let local_ref = b.stream_refs[row] as usize;
                 g_stream_id.push(b.stream_ids[local_ref]);
                 g_stream_ref.push(batch_remap[local_ref]);
@@ -4287,18 +4290,27 @@ mod tests {
             2, // the row references `uncovered`, local index 2
         );
         let mut w = RlogWriter::new(RlogConfig::default(), identity());
-        w.push_columnar(batch).expect("columnar push");
+        let err = w
+            .push_columnar(batch.clone())
+            .expect_err("a stream id with no stream_attrs blob must be refused at push");
+        assert_malformed(err, &uncovered.to_hex());
+
+        // The build step keeps its own check for a batch that bypassed push.
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.batches.push(batch);
         let err = w
             .finish()
-            .expect_err("a stream id with no stream_attrs blob must be refused");
+            .expect_err("a stream id with no stream_attrs blob must be refused at build");
+        assert_malformed(err, &uncovered.to_hex());
+    }
+
+    /// Asserts `err` is `MalformedColumnarBatch` and its message contains `needle`.
+    fn assert_malformed(err: LogSegError, needle: &str) {
         match err {
-            LogSegError::InconsistentStreamAttrs(msg) => {
-                assert!(
-                    msg.contains(&uncovered.to_hex()),
-                    "message must name the uncovered stream in hex: {msg}"
-                );
+            LogSegError::MalformedColumnarBatch(msg) => {
+                assert!(msg.contains(needle), "message must contain {needle}: {msg}");
             }
-            other => panic!("expected InconsistentStreamAttrs, got {other:?}"),
+            other => panic!("expected MalformedColumnarBatch, got {other:?}"),
         }
     }
 
@@ -4321,19 +4333,76 @@ mod tests {
             0, // the row references `low`, a covered id; `uncovered` is unreferenced
         );
         let mut w = RlogWriter::new(RlogConfig::default(), identity());
-        w.push_columnar(batch).expect("columnar push");
+        let err = w
+            .push_columnar(batch.clone())
+            .expect_err("an uncovered stream id must be refused at push even if unreferenced");
+        assert_malformed(err, &uncovered.to_hex());
+
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.batches.push(batch);
         let err = w
             .finish()
-            .expect_err("an uncovered stream id must be refused even if no row references it");
-        match err {
-            LogSegError::InconsistentStreamAttrs(msg) => {
-                assert!(
-                    msg.contains(&uncovered.to_hex()),
-                    "message must name the uncovered stream in hex: {msg}"
-                );
-            }
-            other => panic!("expected InconsistentStreamAttrs, got {other:?}"),
-        }
+            .expect_err("an uncovered stream id must be refused at build even if unreferenced");
+        assert_malformed(err, &uncovered.to_hex());
+    }
+
+    #[test]
+    fn columnar_stream_attrs_shorter_than_stream_ids_is_refused() {
+        let batch = columnar_batch_with_stream_dir(vec![id(10), id(20)], vec![attrs_blob(10)], 0);
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let err = w.push_columnar(batch).expect_err("shorter stream_attrs");
+        assert_malformed(err, &id(20).to_hex());
+    }
+
+    #[test]
+    fn columnar_stream_attrs_longer_than_stream_ids_is_refused() {
+        let batch =
+            columnar_batch_with_stream_dir(vec![id(10)], vec![attrs_blob(10), attrs_blob(20)], 0);
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let err = w.push_columnar(batch).expect_err("longer stream_attrs");
+        assert_malformed(err, "stream_attrs entry at index 1");
+    }
+
+    #[test]
+    fn columnar_stream_ref_equal_to_stream_ids_len_is_refused() {
+        let batch = columnar_batch_with_stream_dir(vec![id(10)], vec![attrs_blob(10)], 1);
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let err = w.push_columnar(batch).expect_err("ref one past the end");
+        assert_malformed(err, "stream_refs[0]");
+    }
+
+    #[test]
+    fn columnar_stream_refs_len_not_num_rows_is_refused() {
+        let mut batch = columnar_batch_with_stream_dir(vec![id(10)], vec![attrs_blob(10)], 0);
+        batch.stream_refs.push(0);
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let err = w.push_columnar(batch).expect_err("two refs for one row");
+        assert_malformed(err, "stream_refs has 2 entries but num_rows is 1");
+    }
+
+    #[test]
+    fn columnar_per_row_column_len_not_num_rows_is_refused() {
+        let mut batch = columnar_batch_with_stream_dir(vec![id(10)], vec![attrs_blob(10)], 0);
+        batch.ts_ns.push(1);
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let err = w
+            .push_columnar(batch)
+            .expect_err("two timestamps for one row");
+        assert_malformed(err, "ts_ns has 2 entries but num_rows is 1");
+    }
+
+    #[test]
+    fn columnar_packed_trace_id_len_mismatch_is_refused() {
+        let mut batch = columnar_batch_with_stream_dir(vec![id(10)], vec![attrs_blob(10)], 0);
+        batch.trace_id_validity = {
+            let mut b = crate::columnar_batch::Bitmap::new();
+            b.push(true);
+            b
+        };
+        // Present row but no packed bytes: trace_id_at would slice out of range.
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let err = w.push_columnar(batch).expect_err("missing trace id bytes");
+        assert_malformed(err, "trace_id holds 0 bytes");
     }
 
     #[test]

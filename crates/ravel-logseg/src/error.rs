@@ -44,6 +44,18 @@ pub enum LogSegError {
     /// nothing has been decoded yet, so it is never `Corrupted`.
     #[error("inconsistent stream attrs: {0}")]
     InconsistentStreamAttrs(String),
+    /// A [`crate::columnar_batch::ColumnarLogBatch`] whose fields contradict
+    /// each other, refused when it is pushed (or, for the directory checks,
+    /// when the object is built). Covers: `stream_ids` and `stream_attrs` of
+    /// different lengths; a `stream_refs` value at or past `stream_ids.len()`;
+    /// `stream_refs`, `ts_ns`, `observed_ts_ns`, `severity_num`, `flags`,
+    /// `severity_text`, `body` or a validity bitmap whose length is not
+    /// `num_rows`; a packed `trace_id` or `span_id` buffer whose length does
+    /// not match its present rows; a stream id missing from the object's
+    /// directory. A caller-side input error, not a stream id collision and not
+    /// object corruption.
+    #[error("malformed columnar batch: {0}")]
+    MalformedColumnarBatch(String),
     /// The sort descriptor handed to the writer cannot be recorded for this
     /// object because its shape would not decode (no key or more than four, an
     /// empty or repeated name, generation 0). Writer-side input validation,

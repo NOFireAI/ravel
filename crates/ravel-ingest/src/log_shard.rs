@@ -3988,6 +3988,46 @@ mod tests {
         h.shutdown().await;
     }
 
+    /// A malformed columnar batch is refused at push with its own error and
+    /// maps to `SegmentBuild`, not `StreamIdCollision`: the collision counter
+    /// stays at zero and the generic input-rejected counter moves once.
+    #[tokio::test]
+    async fn malformed_columnar_batch_flushes_to_segment_build_not_collision() {
+        let h = Harness::spawn(flush_on_first());
+        let tenant = TenantId::new("acme");
+        let mut batch = ColumnarLogBatch::from_records(&[to_logseg_record(norm_record(
+            &[("service.name", "api")],
+            "scope",
+            1_000,
+            "first",
+        ))]);
+        // A surplus blob keeps every `stream_refs` value in range, which the
+        // byte estimate at write time indexes without a check.
+        batch.stream_attrs.push(b"surplus".to_vec());
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+        h.tx.send(LogShardMsg::WriteColumnar {
+            tenant,
+            batch: Box::new(batch),
+            ack: Some(ack_tx),
+            charge: None,
+        })
+        .await
+        .expect("send columnar write");
+        let err = ack_rx
+            .await
+            .expect("ack sender not dropped")
+            .expect_err("a malformed batch fails the flush");
+        assert!(
+            matches!(&err, LogWriteError::SegmentBuild(msg) if msg.contains("malformed columnar batch")),
+            "MalformedColumnarBatch must map to SegmentBuild, got {err:?}"
+        );
+        let snap = h.metrics.snapshot();
+        assert_eq!(snap.stream_id_collisions, 0);
+        assert_eq!(snap.abandoned_input_rejected, 1);
+        h.shutdown().await;
+    }
+
     /// One log shard actor (index 3) whose scan-set check and hand-back target
     /// the test scripts, the log counterpart of `crate::shard`'s
     /// `HandBackRig`. The clock never advances, so only the test's
