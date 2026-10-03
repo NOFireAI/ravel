@@ -285,9 +285,6 @@ struct FakeState {
     /// this many requests are in flight or the grace period passes, so every
     /// request a client sends concurrently overlaps at the server.
     hold: Mutex<Option<(Vec<Op>, usize, Duration)>>,
-    /// For each held request, its op and the in-flight count its hold ended
-    /// on: the target once reached, else the count when the grace ran out.
-    hold_ends: Mutex<Vec<(Op, usize)>>,
 }
 
 /// One request's slot in [`FakeState::in_flight`], released on drop so a
@@ -311,16 +308,14 @@ impl Drop for InFlight<'_> {
 }
 
 impl FakeState {
-    /// Wait until at least `target` requests are in flight, and return the
-    /// count that satisfied it.
-    async fn wait_in_flight(&self, target: usize) -> usize {
+    /// Wait until at least `target` requests are in flight.
+    async fn wait_in_flight(&self, target: usize) {
         loop {
             let changed = self.in_flight_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            let now = self.in_flight.load(Ordering::SeqCst);
-            if now >= target {
-                return now;
+            if self.in_flight.load(Ordering::SeqCst) >= target {
+                return;
             }
             changed.await;
         }
@@ -515,17 +510,6 @@ impl FakeS3 {
     /// or `grace` passes, whichever comes first.
     fn hold(&self, ops: &[Op], target: usize, grace: Duration) {
         *self.state.hold.lock() = Some((ops.to_vec(), target, grace));
-    }
-
-    /// The in-flight count each held request of `op` was released on.
-    fn hold_ends(&self, op: Op) -> Vec<usize> {
-        self.state
-            .hold_ends
-            .lock()
-            .iter()
-            .filter(|(held, _)| *held == op)
-            .map(|(_, in_flight)| *in_flight)
-            .collect()
     }
 
     /// Wait until at least `target` requests are in flight.
@@ -834,10 +818,7 @@ async fn handle(
     if let Some((ops, target, grace)) = hold
         && ops.contains(&op)
     {
-        let ended_on = tokio::time::timeout(grace, state.wait_in_flight(target))
-            .await
-            .unwrap_or_else(|_| state.in_flight.load(Ordering::SeqCst));
-        state.hold_ends.lock().push((op, ended_on));
+        let _ = tokio::time::timeout(grace, state.wait_in_flight(target)).await;
     }
     if has_unsigned_amz_header(&headers) {
         return error_response(
@@ -3321,10 +3302,11 @@ async fn scheduled_large_put_keeps_requests_within_its_permits() {
 
 /// With upload integrity on, `S3Store` sends a large overwrite as one PUT, so a
 /// scheduled handle takes exactly one permit for it rather than the multipart
-/// fan-out. In a class of five permits, four GETs issued while the PUT is held
-/// at the endpoint all reach it alongside the PUT, so the PUT is released with
-/// five requests in flight; a put holding more than one permit would leave
-/// fewer than four for them.
+/// fan-out. In a class of five permits, four GETs are issued once the PUT
+/// reaches the endpoint, which holds every PUT and GET until five requests are
+/// in flight, so all five overlap there. A put holding more than one permit
+/// leaves fewer than four for the GETs beside it, and after it ends only the
+/// four GETs remain, so five are never in flight together.
 #[tokio::test]
 async fn scheduled_large_put_with_integrity_takes_one_permit() {
     const PERMITS: usize = 5;
@@ -3362,13 +3344,11 @@ async fn scheduled_large_put_with_integrity_takes_one_permit() {
         "integrity keeps one PUT"
     );
     assert_eq!(fake.count(Op::Put), 1, "exactly one PUT request");
-    let ends = fake.hold_ends(Op::Put);
-    assert_eq!(ends.len(), 1, "the one PUT was held");
+    let peak = fake.peak_in_flight();
     assert_eq!(
-        ends[0],
-        PERMITS,
-        "the put left {} of {PERMITS} permits for the GETs beside it",
-        ends[0].saturating_sub(1)
+        peak, PERMITS,
+        "at most {peak} of {PERMITS} requests were ever in flight together, so the put held \
+         permits its single PUT does not use"
     );
     assert_eq!(
         fake.object("scheduled/integrity").as_deref(),
