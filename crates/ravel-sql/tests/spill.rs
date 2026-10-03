@@ -163,9 +163,9 @@ const LONG_ROWS: i64 = 300_000;
 const SHORT_ROWS: i64 = 150_000;
 
 /// The eligible statement under test: integer `COUNT(*)` grouped by the
-/// non-float `ts` key. No `ORDER BY`: a `Sort` node is deliberately outside the
-/// spill-eligible plan shape (ADR-0954 requirement 4), so the results come back
-/// unordered and the comparison sorts both sides itself.
+/// non-float `ts` key. No `ORDER BY`, so the results come back unordered and
+/// the comparison sorts both sides itself; the tie-ordered `ORDER BY` shape
+/// has its own tests at the end of this file.
 const SPILLING_SQL: &str = "SELECT ts, count(*) AS n FROM samples GROUP BY ts";
 
 /// The ineligible statement: `SUM` over the `Float64` `value` column, whose

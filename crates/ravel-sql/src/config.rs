@@ -171,10 +171,12 @@ pub const DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 /// half the free space, capped at
 /// [`DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE`] times the memory budget, and
 /// floored at [`DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES`]. Half, not all, of free
-/// space so spill never claims the whole volume out from under whatever else
-/// shares it (another process, the OS itself); the memory-budget cap keeps
-/// the derived ceiling from outgrowing what a single query's spill could
-/// plausibly need; the floor keeps a nearly-full volume from deriving a
+/// space so spill leaves room for whatever else shares the volume (another
+/// process, the OS itself). Below 2 GiB free the floor wins instead, and at
+/// 1 GiB free or less the ceiling is everything that is free or more. The
+/// memory-budget cap keeps the derived ceiling from outgrowing what the
+/// process's spilling queries could plausibly need; the floor keeps a
+/// nearly-full volume from deriving a
 /// ceiling so small every spill attempt immediately exhausts its budget.
 pub fn derive_spill_max_bytes(free_bytes: u64, memory_budget_bytes: u64) -> u64 {
     let half_free = free_bytes / 2;

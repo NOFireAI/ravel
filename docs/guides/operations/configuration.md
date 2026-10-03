@@ -766,8 +766,10 @@ Under `--cache-dir` the layout is:
 <cache-dir>/sql-spill/<instance-id>/ravel-spill-<pid>-<nonce>-<n>/   one per spilling query
 ```
 
-`<instance-id>` is the process's maintenance worker id, a UUID drawn at each
-start, so every process and every restart gets its own directory. Before it serves a query, the process creates its
+`<instance-id>` is the process's worker id, a UUID drawn at each start in
+every mode (a `maintain`-mode process also heartbeats under it), so every
+process and every restart gets its own directory. Before it serves a query,
+the process creates its
 directory and holds an exclusive lock on `.owner.lock` until it shuts down;
 the operating system releases the lock however the process exits. It then
 sweeps once: another directory under `<cache-dir>/sql-spill` is deleted only
