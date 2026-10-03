@@ -1087,8 +1087,9 @@ report is written with every statement's figures, and the bench exits 1. A
 violation is any of:
 
 - a statement missing from the report, repeated, or not in the suite;
-- a stamp missing from the log or present more than once, or differing from
-  `--sql-max-query-bytes` or `--sql-tenant-max-bytes`;
+- a stamp differing from `--sql-max-query-bytes` or `--sql-tenant-max-bytes`
+  (a stamp missing from the log or present more than once is refused at
+  setup, so a run never reaches the report check with one);
 - `sql_max_query_bytes` differing from `memory_cap_bytes`;
 - a statement that failed and is not in `failures`;
 - an answer that could not be compared with the reference, or whose verdict
