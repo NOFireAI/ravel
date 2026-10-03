@@ -478,10 +478,13 @@ import json, sys
 # half"). Re-register by editing exactly one line here. ---------------------
 CORPUS_BYTES        = 12.03e9      # total corpus size; the % bands are off this
 
-# Integrity (asserted BEFORE any band): 43 statements, one fails by design.
-EXPECTED_MEASURED   = 42
-EXPECTED_FAILED_Q   = {"q33"}      # by identity, not a count: q33 exhausts the
-                                   # 8 GiB per-query budget (#837)
+# Integrity (asserted BEFORE any band): all 43 statements measure, none fails.
+# q33 fits since the derived per-query SQL pool became the tenant's share
+# (50% of memory, 16,451,897,344 bytes on the reference box, against its
+# 10,855,811,936-byte peak); measured 43 of 43 at main 4aa5293bb602.
+EXPECTED_MEASURED   = 43
+EXPECTED_FAILED_Q   = set()        # by identity, not a count: a statement that
+                                   # fails is named, never summed away
 
 # Class M (metadata-decomposable): answerable from metadata, no data read.
 M_Q01_DATA_GETS_MAX = 0            # q01 issues zero data (scan-phase) reads
