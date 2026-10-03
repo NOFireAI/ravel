@@ -38,9 +38,13 @@
 #     spec is never patched). Its status subresource: patch only (patch_status
 #     is a merge PATCH; the status is never read back or replaced).
 #   - Secrets: get only, and NEVER granted by this cluster-wide ClusterRole
-#     (issue #126). The operator reads the credentials, tenant-token, and
-#     deployment-key Secrets to resolve tenant names; it never lists, writes, or
-#     watches them. The cluster-wide secrets rule is gone. The read is carried by
+#     (issue #126). The operator reads the credentials, tenant-token,
+#     deployment-key, audit-token-key, and the four distributed-query Secrets
+#     (fragment TLS, fragment CA, fragment key, SQL ticket key) a RavelCluster
+#     references; it loads values only where it must (tenant names, the
+#     deployment and audit-token keys) and otherwise reads metadata for the
+#     resourceVersion alone, and never lists, writes, or watches them. The
+#     cluster-wide secrets rule is gone. The read is carried by
 #     a separate ravel-operator-secrets ClusterRole bound ONLY by namespaced
 #     RoleBindings (never a ClusterRoleBinding), so the grant is per namespace:
 #     the block at the bottom of this file binds it in ravel-system, and
@@ -159,15 +163,18 @@ subjects:
     namespace: ravel-system
 ---
 # Secrets: get only, granted per namespace and never cluster-wide (issue #126).
-# The operator reads the credentials, tenant-token, deployment-key, and
-# audit-token-key Secrets a RavelCluster references (crate::controller
-# resolves them via Api::<Secret>::namespaced on the RavelCluster's OWN
-# namespace) to resolve tenant names and stamp resource versions; it never
-# lists, writes, or watches them. The Secret names are user-chosen CRD fields
-# (credentialsSecretRef/tenantTokensSecretRef/deploymentKeySecretRef/
-# auditTokenKeySecretRef and the per-tier credential overrides), not a fixed
-# set, so resourceNames cannot enumerate them; a bare `secrets get` bound per
-# namespace is the tightest grant that still works.
+# The operator reads the credentials, tenant-token, deployment-key,
+# audit-token-key, and the four distributed-query Secrets (fragment TLS,
+# fragment CA, fragment key, SQL ticket key) a RavelCluster references
+# (crate::controller resolves them via Api::<Secret>::namespaced on the
+# RavelCluster's OWN namespace) to resolve tenant names and stamp resource
+# versions; it never lists, writes, or watches them. The Secret names are
+# user-chosen CRD fields (credentialsSecretRef/tenantTokensSecretRef/
+# deploymentKeySecretRef/auditTokenKeySecretRef, the per-tier credential
+# overrides, and the distributedQuery fragmentTlsSecretRef/fragmentCaSecretRef/
+# fragmentKeySecretRef/sqlTicketKeySecretRef), not a fixed set, so resourceNames
+# cannot enumerate them; a bare `secrets get` bound per namespace is the
+# tightest grant that still works.
 #
 # The rule lives in a ClusterRole so a single definition can be reused in every
 # served namespace (a RoleBinding cannot reference a Role in another namespace,

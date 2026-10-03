@@ -322,6 +322,13 @@ pub struct RenderCtx {
     /// the query tier's checksum: gateway and maintain never read this
     /// Secret, so their checksums must not move when it rotates.
     pub audit_token_key_resource_version: Option<String>,
+
+    /// `resourceVersion` of each distributed-query Secret, in
+    /// [`distributed_query_secret_refs`] order, or empty when distributed
+    /// query does not render. `ravel-server` reads these Secrets once at
+    /// startup, so a rotation must roll the query pods; folded only into the
+    /// query tier's checksum, since no other tier mounts them.
+    pub distributed_query_resource_versions: Vec<String>,
 }
 
 /// Resolve the credential Secret name a tier consumes: its own
@@ -363,6 +370,21 @@ pub fn secrets_checksum(
     deployment_key_rv: Option<&str>,
     audit_token_key_rv: Option<&str>,
 ) -> String {
+    blake3_hex(&secrets_checksum_fields(
+        token_rv,
+        credentials_rv,
+        deployment_key_rv,
+        audit_token_key_rv,
+    ))
+}
+
+/// The ordered fields [`secrets_checksum`] hashes.
+fn secrets_checksum_fields<'a>(
+    token_rv: Option<&'a str>,
+    credentials_rv: Option<&'a str>,
+    deployment_key_rv: Option<&'a str>,
+    audit_token_key_rv: Option<&'a str>,
+) -> Vec<&'a str> {
     // The audit-token-key field is folded in only when `Some` (#1487 rework):
     // a cluster with no audit-token-key Secret in play must hash the same
     // three fields main did before this field existed, or every such
@@ -379,7 +401,7 @@ pub fn secrets_checksum(
     if let Some(rv) = audit_token_key_rv {
         fields.push(rv);
     }
-    blake3_hex(&fields)
+    fields
 }
 
 /// A stable hex digest of an ordered list of string fields, using `blake3`
@@ -405,24 +427,29 @@ fn blake3_hex(fields: &[&str]) -> String {
 /// `audit_key_rv` is folded in only by the query tier's call site (#1487):
 /// gateway and maintain always pass `None` here regardless of
 /// `ctx.audit_token_key_resource_version`, so a rotation of that Secret never
-/// moves their checksum.
+/// moves their checksum. `distributed_query_rvs` follows the same rule: only
+/// the query tier passes `ctx.distributed_query_resource_versions`, and an
+/// empty slice hashes exactly the fields [`secrets_checksum`] does.
 fn tier_secrets_checksum(
     spec: &RavelClusterSpec,
     ctx: &RenderCtx,
     tier_override: Option<&LocalSecretRef>,
     audit_key_rv: Option<&str>,
+    distributed_query_rvs: &[String],
 ) -> String {
     let secret_name = tier_credentials_secret_name(spec, tier_override);
     let credentials_rv = ctx
         .credential_resource_versions
         .get(secret_name)
         .map(String::as_str);
-    secrets_checksum(
+    let mut fields = secrets_checksum_fields(
         ctx.token_resource_version.as_deref(),
         credentials_rv,
         ctx.deployment_key_resource_version.as_deref(),
         audit_key_rv,
-    )
+    );
+    fields.extend(distributed_query_rvs.iter().map(String::as_str));
+    blake3_hex(&fields)
 }
 
 /// Standard object labels for a component of a named `RavelCluster`.
@@ -815,6 +842,29 @@ fn distributed_query_secrets(
             Err(RenderError::DistributedQuerySecretRefMissing { missing })
         }
     }
+}
+
+/// The distributed-query Secrets the query pods mount, as `(name, spec
+/// field)` pairs in a fixed order (fragment TLS, fragment CA, fragment key,
+/// SQL ticket key), or empty when [`distributed_query_secrets`] renders none.
+/// The controller reads each one's `resourceVersion` into
+/// [`RenderCtx::distributed_query_resource_versions`].
+pub fn distributed_query_secret_refs(spec: &RavelClusterSpec) -> Vec<(&str, &'static str)> {
+    let Ok(Some(secrets)) = distributed_query_secrets(spec) else {
+        return Vec::new();
+    };
+    vec![
+        (secrets.tls, "query.distributedQuery.fragmentTlsSecretRef"),
+        (secrets.ca, "query.distributedQuery.fragmentCaSecretRef"),
+        (
+            secrets.fragment_key,
+            "query.distributedQuery.fragmentKeySecretRef",
+        ),
+        (
+            secrets.sql_ticket_key,
+            "query.distributedQuery.sqlTicketKeySecretRef",
+        ),
+    ]
 }
 
 /// A read-only Secret volume projecting `keys` and its container mount at
@@ -1264,7 +1314,7 @@ pub fn desired_gateway_deployment(
         spec.gateway.resources.as_ref(),
         (GATEWAY_DEFAULT_CPU_REQUEST, GATEWAY_DEFAULT_MEMORY_REQUEST),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override, None),
+        &tier_secrets_checksum(spec, ctx, tier_override, None, &[]),
         Vec::new(),
     )
 }
@@ -1353,6 +1403,7 @@ pub fn desired_query_deployment(
             ctx,
             tier_override,
             ctx.audit_token_key_resource_version.as_deref(),
+            &ctx.distributed_query_resource_versions,
         ),
         extra_volumes,
     )
@@ -1473,7 +1524,7 @@ pub fn desired_maintain_deployment(
             MAINTAIN_DEFAULT_MEMORY_REQUEST,
         ),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override, None),
+        &tier_secrets_checksum(spec, ctx, tier_override, None, &[]),
         Vec::new(),
     )))
 }
@@ -3312,23 +3363,19 @@ pub fn desired_query_network_policy(
     query_deployment: &Deployment,
 ) -> Option<NetworkPolicy> {
     distributed_query_secrets(spec).ok().flatten()?;
+    Some(fragment_network_policy(
+        instance,
+        non_fragment_ports(query_deployment),
+    ))
+}
+
+/// The query tier's fragment NetworkPolicy admitting [`FRAGMENT_PORT`] from the
+/// query pods and `open_ports` from any source. Shared by
+/// [`desired_query_network_policy`] and
+/// [`query_fragment_policy_hold_while_disabling`] so the held and exact
+/// policies carry the same name, labels, and pod selector.
+fn fragment_network_policy(instance: &str, open_ports: Vec<i32>) -> NetworkPolicy {
     let query_pods = labels(instance, DeploymentTier::Query.component());
-    let tcp = |port: i32| NetworkPolicyPort {
-        port: Some(IntOrString::Int(port)),
-        protocol: Some("TCP".to_string()),
-        end_port: None,
-    };
-    let other_ports: Vec<NetworkPolicyPort> = query_deployment
-        .spec
-        .as_ref()
-        .and_then(|s| s.template.spec.as_ref())
-        .into_iter()
-        .flat_map(|pod| pod.containers.iter())
-        .flat_map(|c| c.ports.iter().flatten())
-        .map(|p| p.container_port)
-        .filter(|port| *port != FRAGMENT_PORT)
-        .map(tcp)
-        .collect();
     let mut ingress = vec![NetworkPolicyIngressRule {
         from: Some(vec![NetworkPolicyPeer {
             pod_selector: Some(LabelSelector {
@@ -3337,15 +3384,15 @@ pub fn desired_query_network_policy(
             }),
             ..Default::default()
         }]),
-        ports: Some(vec![tcp(FRAGMENT_PORT)]),
+        ports: Some(vec![tcp_policy_port(FRAGMENT_PORT)]),
     }];
-    if !other_ports.is_empty() {
+    if !open_ports.is_empty() {
         ingress.push(NetworkPolicyIngressRule {
             from: None,
-            ports: Some(other_ports),
+            ports: Some(open_ports.into_iter().map(tcp_policy_port).collect()),
         });
     }
-    Some(NetworkPolicy {
+    NetworkPolicy {
         metadata: ObjectMeta {
             name: Some(child_name(instance, QUERY_FRAGMENT_POLICY_COMPONENT)),
             labels: Some(labels(instance, QUERY_FRAGMENT_POLICY_COMPONENT)),
@@ -3360,7 +3407,164 @@ pub fn desired_query_network_policy(
             ingress: Some(ingress),
             egress: None,
         }),
-    })
+    }
+}
+
+/// Whether `deployment`'s pod template declares [`FRAGMENT_PORT`]: the signal
+/// that distributed query was on and a fragment NetworkPolicy still guards the
+/// query pods.
+fn deployment_opens_fragment_port(deployment: &Deployment) -> bool {
+    deployment
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .into_iter()
+        .flat_map(|pod| pod.containers.iter())
+        .flat_map(|c| c.ports.iter().flatten())
+        .any(|p| p.container_port == FRAGMENT_PORT)
+}
+
+/// A TCP [`NetworkPolicyPort`] for `port`.
+fn tcp_policy_port(port: i32) -> NetworkPolicyPort {
+    NetworkPolicyPort {
+        port: Some(IntOrString::Int(port)),
+        protocol: Some("TCP".to_string()),
+        end_port: None,
+    }
+}
+
+/// Every container port `deployment`'s pod template declares, other than
+/// [`FRAGMENT_PORT`], in declaration order.
+fn non_fragment_ports(deployment: &Deployment) -> Vec<i32> {
+    deployment
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .into_iter()
+        .flat_map(|pod| pod.containers.iter())
+        .flat_map(|c| c.ports.iter().flatten())
+        .map(|p| p.container_port)
+        .filter(|port| *port != FRAGMENT_PORT)
+        .collect()
+}
+
+/// Every port other than [`FRAGMENT_PORT`] a query pod listens on under some
+/// spec: [`HTTP_PORT`] always, [`HEALTH_PORT`] under
+/// `spec.probes.dedicatedHealthPort`.
+const QUERY_POD_PORTS_ANY_SPEC: [i32; 2] = [HTTP_PORT, HEALTH_PORT];
+
+/// Whether `deployment` has no pods left on an older spec: the controller has
+/// observed its current generation, every replica is updated, none is
+/// unavailable, and no terminating pod remains. False while the status is
+/// missing or behind.
+///
+/// `status.replicas` counts only pods without a `deletionTimestamp`, so
+/// `updated == replicas` can hold while the last old pod is still terminating
+/// through its `preStop` sleep and grace period, still listening on
+/// [`FRAGMENT_PORT`]. `status.terminatingReplicas` counts those pods when the
+/// cluster reports the field (Kubernetes 1.33+ with the feature gate on), so it
+/// must be zero when present. When it is absent the operator cannot see
+/// terminating pods: this predicate can report complete while an old pod keeps
+/// the fragment port open for up to that pod's termination grace period
+/// ([`termination_grace_period_seconds`]). The window is not closed, only
+/// narrowed by the fragment listener's own mutual TLS, which still refuses a
+/// peer presenting no certificate from the fragment CA.
+pub fn deployment_rollout_complete(deployment: &Deployment) -> bool {
+    let Some(status) = deployment.status.as_ref() else {
+        return false;
+    };
+    deployment.metadata.generation.is_some()
+        && status.observed_generation == deployment.metadata.generation
+        && status.updated_replicas.unwrap_or(0) == status.replicas.unwrap_or(0)
+        && status.unavailable_replicas.unwrap_or(0) == 0
+        && status.terminating_replicas.unwrap_or(0) == 0
+}
+
+/// The fragment NetworkPolicy to hold while the live query Deployment
+/// `live_query` may still run pods on an older spec: `policy` with its open
+/// rule widened to every port those pods can listen on, so narrowing the
+/// policy (turning the dedicated health port off, say) never cuts off a pod
+/// the rollout has not replaced yet.
+///
+/// With no live Deployment, `policy` is returned unchanged. With a complete
+/// rollout the live pods all run the live template, so its ports are added.
+/// With an incomplete one the older pods' template is not on the Deployment,
+/// so every port a query pod can listen on is added as well. The controller
+/// applies [`desired_query_network_policy`] itself once the rollout of the
+/// Deployment it applied completes.
+pub fn query_network_policy_during_rollout(
+    policy: &NetworkPolicy,
+    live_query: Option<&Deployment>,
+) -> NetworkPolicy {
+    let Some(live) = live_query else {
+        return policy.clone();
+    };
+    let mut held = non_fragment_ports(live);
+    if !deployment_rollout_complete(live) {
+        held.extend(QUERY_POD_PORTS_ANY_SPEC);
+    }
+    let mut widened = policy.clone();
+    if held.is_empty() {
+        return widened;
+    }
+    let ingress = widened
+        .spec
+        .get_or_insert_with(Default::default)
+        .ingress
+        .get_or_insert_with(Vec::new);
+    let open_rule = match ingress.iter().position(|rule| rule.from.is_none()) {
+        Some(index) => &mut ingress[index],
+        None => {
+            ingress.push(NetworkPolicyIngressRule {
+                from: None,
+                ports: Some(Vec::new()),
+            });
+            let last = ingress.len() - 1;
+            &mut ingress[last]
+        }
+    };
+    let ports = open_rule.ports.get_or_insert_with(Vec::new);
+    for port in held {
+        let wanted = tcp_policy_port(port);
+        if !ports.contains(&wanted) {
+            ports.push(wanted);
+        }
+    }
+    widened
+}
+
+/// The wider fragment NetworkPolicy to hold while distributed query is being
+/// turned off but the query Deployment `live_query` (read before this pass's
+/// apply) still opens the fragment port, so its pods still serve fragments and
+/// a fragment policy still guards them.
+///
+/// Disabling renders no desired policy, so without this the controller would
+/// leave the policy exactly as it was until the rollout completes. A spec that
+/// disables distributed query and opens a new port in the same change (the
+/// dedicated health port) would then have that port blocked on the new pods by
+/// the stale policy, wedging the rollout. This admits every port a query pod
+/// can listen on under any spec ([`QUERY_POD_PORTS_ANY_SPEC`]) plus the live
+/// template's own non-fragment ports, from any source, and the fragment port
+/// from the query pods, the same wider shape the narrowing case holds.
+///
+/// Returns `None` with no live Deployment, or once the live query Deployment
+/// no longer opens the fragment port: the rollout has moved the pods onto the
+/// new spec, so the controller deletes the policy rather than holding it.
+pub fn query_fragment_policy_hold_while_disabling(
+    instance: &str,
+    live_query: Option<&Deployment>,
+) -> Option<NetworkPolicy> {
+    let live = live_query?;
+    if !deployment_opens_fragment_port(live) {
+        return None;
+    }
+    let mut open: Vec<i32> = QUERY_POD_PORTS_ANY_SPEC.to_vec();
+    for port in non_fragment_ports(live) {
+        if !open.contains(&port) {
+            open.push(port);
+        }
+    }
+    Some(fragment_network_policy(instance, open))
 }
 
 /// Every NetworkPolicy name the render can produce for `instance`. The
@@ -3685,6 +3889,7 @@ mod tests {
             )]),
             deployment_key_resource_version: None,
             audit_token_key_resource_version: None,
+            distributed_query_resource_versions: Vec::new(),
         }
     }
 
@@ -5255,6 +5460,7 @@ mod tests {
             ]),
             deployment_key_resource_version: None,
             audit_token_key_resource_version: None,
+            distributed_query_resource_versions: Vec::new(),
         };
 
         let g = desired_gateway_deployment(&spec, "prod", &ctx);
@@ -5376,6 +5582,7 @@ mod tests {
             credential_resource_versions: base_versions.clone(),
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
+            distributed_query_resource_versions: Vec::new(),
         };
         // Rotate ONLY the gateway credential Secret.
         let mut after_versions = base_versions.clone();
@@ -5386,6 +5593,7 @@ mod tests {
             credential_resource_versions: after_versions,
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
+            distributed_query_resource_versions: Vec::new(),
         };
 
         let g_before = desired_gateway_deployment(&over_spec, "prod", &before);
@@ -5426,6 +5634,7 @@ mod tests {
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
+            distributed_query_resource_versions: Vec::new(),
         };
         let shared_after = RenderCtx {
             tenant_names: vec!["acme".to_string()],
@@ -5436,6 +5645,7 @@ mod tests {
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
+            distributed_query_resource_versions: Vec::new(),
         };
         let gb = desired_gateway_deployment(&shared_spec, "prod", &shared_before);
         let ga = desired_gateway_deployment(&shared_spec, "prod", &shared_after);
@@ -6492,6 +6702,7 @@ mod tests {
             )]),
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
+            distributed_query_resource_versions: Vec::new(),
         };
         let after = RenderCtx {
             deployment_key_resource_version: Some("dk-2".to_string()),
@@ -9001,6 +9212,65 @@ mod tests {
         desired_objects(spec, "rc", "ns", &ctx()).expect("spec renders")
     }
 
+    /// A rotation of any one of the four distributed-query Secrets rolls the
+    /// query pods: the query checksum moves when that Secret's resourceVersion
+    /// changes and stays put when none does. No other tier mounts them, so
+    /// neither the gateway nor the maintain checksum ever moves.
+    #[test]
+    fn query_checksum_follows_each_distributed_query_secret() {
+        let spec = distributed_query_spec(true);
+        let names: Vec<&str> = distributed_query_secret_refs(&spec)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["frag-tls", "frag-ca", "frag-keys", "sql-keys"]);
+        let with = |rvs: [&str; 4]| RenderCtx {
+            distributed_query_resource_versions: rvs.map(String::from).to_vec(),
+            ..ctx()
+        };
+        let query_checksum =
+            |rvs: [&str; 4]| checksum_of(&desired_query_deployment(&spec, "rc", &with(rvs)));
+        let gateway_checksum =
+            |rvs: [&str; 4]| checksum_of(&desired_gateway_deployment(&spec, "rc", &with(rvs)));
+        let maintain_checksum = |rvs: [&str; 4]| {
+            checksum_of(
+                &desired_maintain_deployment(&spec, "rc", &with(rvs))
+                    .expect("maintain renders")
+                    .expect("maintain is enabled"),
+            )
+        };
+        let base = ["t1", "c1", "k1", "s1"];
+        let before = query_checksum(base);
+        assert!(before.is_some());
+        assert_eq!(
+            query_checksum(base),
+            before,
+            "unchanged Secrets must not roll the query pods"
+        );
+        for (index, name) in names.iter().enumerate() {
+            let mut rotated = base;
+            rotated[index] = "rotated";
+            assert_ne!(
+                query_checksum(rotated),
+                before,
+                "rotating {name} must roll the query pods"
+            );
+            // Guarding line: `tier_secrets_checksum` for gateway and maintain
+            // never reads `ctx.distributed_query_resource_versions`. Add that
+            // slice to either tier's checksum and these two assertions fail.
+            assert_eq!(
+                gateway_checksum(rotated),
+                gateway_checksum(base),
+                "rotating {name} must not roll the gateway pods"
+            );
+            assert_eq!(
+                maintain_checksum(rotated),
+                maintain_checksum(base),
+                "rotating {name} must not roll the maintain pods"
+            );
+        }
+    }
+
     /// Enabled and complete: the query Deployment is the baseline plus exactly
     /// the distributed-query flags, the pod-IP env var, the fragment port, and
     /// the four Secret mounts, and a NetworkPolicy admits the fragment port only
@@ -9289,5 +9559,164 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// A query Deployment carrying `ports`, a generation, and a status whose
+    /// counts mark the rollout as `complete()` describes.
+    fn query_deployment_with(generation: i64, complete: bool, ports: &[i32]) -> Deployment {
+        use k8s_openapi::api::apps::v1::DeploymentStatus;
+        Deployment {
+            metadata: ObjectMeta {
+                name: Some("rc-query".to_string()),
+                generation: Some(generation),
+                ..Default::default()
+            },
+            spec: Some(DeploymentSpec {
+                template: PodTemplateSpec {
+                    spec: Some(PodSpec {
+                        containers: vec![Container {
+                            name: "ravel".to_string(),
+                            ports: Some(
+                                ports
+                                    .iter()
+                                    .map(|port| ContainerPort {
+                                        container_port: *port,
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                            ),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            status: Some(DeploymentStatus {
+                observed_generation: Some(generation),
+                replicas: Some(3),
+                updated_replicas: Some(3),
+                unavailable_replicas: Some(0),
+                terminating_replicas: if complete { Some(0) } else { None },
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// `terminatingReplicas` above zero holds the rollout open; zero or absent
+    /// does not. Guarding line: the
+    /// `status.terminating_replicas.unwrap_or(0) == 0` conjunct in
+    /// `deployment_rollout_complete`. Remove it and the first assertion flips to
+    /// complete while an old pod is still terminating on the fragment port.
+    #[test]
+    fn terminating_replicas_hold_the_rollout_open() {
+        use k8s_openapi::api::apps::v1::DeploymentStatus;
+        let with_terminating = |terminating: Option<i32>| Deployment {
+            status: Some(DeploymentStatus {
+                observed_generation: Some(1),
+                replicas: Some(3),
+                updated_replicas: Some(3),
+                unavailable_replicas: Some(0),
+                terminating_replicas: terminating,
+                ..Default::default()
+            }),
+            ..query_deployment_with(1, true, &[HTTP_PORT])
+        };
+        assert!(
+            !deployment_rollout_complete(&with_terminating(Some(1))),
+            "a terminating pod (still on the fragment port) keeps the rollout open"
+        );
+        assert!(
+            deployment_rollout_complete(&with_terminating(Some(0))),
+            "zero terminating pods is complete"
+        );
+        assert!(
+            deployment_rollout_complete(&with_terminating(None)),
+            "an absent field (cluster does not report it) does not block completion"
+        );
+    }
+
+    /// `QUERY_POD_PORTS_ANY_SPEC` covers every port `desired_query_deployment`
+    /// can render except the fragment port, across every spec that changes its
+    /// port set (the dedicated health port and distributed query, independently).
+    /// Guarding line: `const QUERY_POD_PORTS_ANY_SPEC`. Drop `HEALTH_PORT` from
+    /// it and the dedicated-health-port variant renders a port the constant does
+    /// not cover, so this fails.
+    #[test]
+    fn query_pod_ports_any_spec_covers_every_renderable_non_fragment_port() {
+        let mut rendered: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+        for dedicated_health in [false, true] {
+            for distributed in [false, true] {
+                let mut spec = if distributed {
+                    distributed_query_spec(true)
+                } else {
+                    base_spec()
+                };
+                spec.probes.dedicated_health_port = dedicated_health;
+                let dep = desired_query_deployment(&spec, "rc", &ctx());
+                rendered.extend(
+                    dep.spec
+                        .as_ref()
+                        .and_then(|s| s.template.spec.as_ref())
+                        .into_iter()
+                        .flat_map(|pod| pod.containers.iter())
+                        .flat_map(|c| c.ports.iter().flatten())
+                        .map(|p| p.container_port),
+                );
+            }
+        }
+        rendered.remove(&FRAGMENT_PORT);
+        let covered: std::collections::BTreeSet<i32> =
+            QUERY_POD_PORTS_ANY_SPEC.iter().copied().collect();
+        assert_eq!(
+            rendered, covered,
+            "QUERY_POD_PORTS_ANY_SPEC must list exactly the non-fragment ports a query pod can open"
+        );
+    }
+
+    /// The disable-hold synthesizes a wider policy only while the live query
+    /// Deployment still opens the fragment port, and that policy admits every
+    /// port a query pod can open under any spec (so a port the new pods open is
+    /// not blocked). Guarding line: the
+    /// `if !deployment_opens_fragment_port(live) { return None }` guard and the
+    /// `QUERY_POD_PORTS_ANY_SPEC` seed in
+    /// `query_fragment_policy_hold_while_disabling`.
+    #[test]
+    fn disable_hold_widens_only_while_the_fragment_port_is_still_open() {
+        assert!(
+            query_fragment_policy_hold_while_disabling("rc", None).is_none(),
+            "no live Deployment means no policy to hold"
+        );
+        let no_fragment = query_deployment_with(5, true, &[HTTP_PORT, HEALTH_PORT]);
+        assert!(
+            query_fragment_policy_hold_while_disabling("rc", Some(&no_fragment)).is_none(),
+            "a live Deployment past the fragment port is deleted, not held"
+        );
+        // Old spec still opens the fragment port but only HTTP otherwise; the new
+        // spec (not visible here) turns the health port on, so the held policy
+        // must open it regardless of the live template's own ports.
+        let live = query_deployment_with(5, true, &[HTTP_PORT, FRAGMENT_PORT]);
+        let policy = query_fragment_policy_hold_while_disabling("rc", Some(&live))
+            .expect("the policy is held while the old pods still open the fragment port");
+        let open: std::collections::BTreeSet<i32> = policy
+            .spec
+            .iter()
+            .flat_map(|spec| spec.ingress.iter().flatten())
+            .filter(|rule| rule.from.is_none())
+            .flat_map(|rule| rule.ports.iter().flatten())
+            .filter_map(|port| match port.port {
+                Some(IntOrString::Int(port)) => Some(port),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            open.contains(&HTTP_PORT) && open.contains(&HEALTH_PORT),
+            "the held policy admits every port a query pod can open: {open:?}"
+        );
+        assert!(
+            !open.contains(&FRAGMENT_PORT),
+            "the fragment port is admitted from the query pods, not from any source"
+        );
     }
 }
