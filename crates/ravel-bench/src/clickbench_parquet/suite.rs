@@ -416,14 +416,17 @@ mod tests {
     }
 
     /// The checked-in statement 4 override declares the sequential-fold avg
-    /// tolerance at exactly 2 ULPs.
+    /// tolerance at exactly 3 ULPs.
     #[test]
     fn statement_4_float_tolerance_loads() {
         let suite = load_default().expect("pinned corpus loads");
         let over = suite.override_for(4).expect("Q4 override present");
         let tolerance = over.float_tolerance().expect("Q4 declares a tolerance");
-        assert_eq!(tolerance.reason, "Ravel sequential-fold avg (ADR-0022)");
-        assert_eq!(tolerance.max_ulps, 2);
+        assert_eq!(
+            tolerance.reason,
+            "Ravel sequential-fold avg (ADR-0022); measured 1 and 2 ULPs, plus 1 ULP headroom"
+        );
+        assert_eq!(tolerance.max_ulps, 3);
     }
 
     /// The checked-in statement 19 override declares its expected error text

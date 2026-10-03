@@ -90,11 +90,16 @@ compare = "cardinality"
 reason = "ORDER BY key not projected; rows past a tie on EventTime cannot be identified from the output"
 
 # Q4: `AVG("UserID")` over the fixture differs from the reference by 1 ULP on
-# the four-part layout and 2 ULPs on the single-file layout.
+# the four-part layout and 2 ULPs on the single-file layout, measured with
+# both engines at engine::PLAN_PARTITIONS target partitions; the acceptance
+# test asserts both distances exactly. The bound is 3, one ULP above the
+# measured maximum: a summation-order change that moves the last bit once more
+# then fails that exact assert, which names the new distance, instead of
+# surfacing as an unexplained float mismatch that reads like a wrong answer.
 [[statement]]
 number = 4
-float_reason = "Ravel sequential-fold avg (ADR-0022)"
-float_max_ulps = 2
+float_reason = "Ravel sequential-fold avg (ADR-0022); measured 1 and 2 ULPs, plus 1 ULP headroom"
+float_max_ulps = 3
 
 # Q19: `extract(minute FROM ...)` does not plan. The workspace links
 # datafusion 54 with default features off, so no datetime ExprPlanner is

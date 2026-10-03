@@ -354,8 +354,21 @@ fn judge(
     .map_err(|e| format!("comparator: {e}"))
 }
 
+/// The largest bit distance between any mismatching float pair in `report`,
+/// 0 when every float cell matched. For a same-sign pair, the only kind a
+/// declared tolerance can explain, this is the comparator's ULP distance.
+fn max_ulp_distance(report: &ComparisonReport) -> u64 {
+    report
+        .float_mismatches
+        .iter()
+        .map(|m| m.reference_bits.abs_diff(m.subject_bits))
+        .max()
+        .unwrap_or(0)
+}
+
 /// One line of the verdict table, and a failure message when the line is
-/// not what [`expected_verdict`] says it must be.
+/// not what [`expected_verdict`] says it must be. Every compared statement
+/// also appends `(arm, number, max ulp distance)` to `ulps`.
 fn check_statement(
     suite: &Suite,
     arm: &str,
@@ -363,6 +376,7 @@ fn check_statement(
     reference: &StatementResult,
     subject: &StatementResult,
     totals: &mut (u64, u64),
+    ulps: &mut Vec<(String, u32, u64)>,
 ) -> (String, Option<String>) {
     let number = statement.number;
     let over = suite.override_for(number);
@@ -400,9 +414,10 @@ fn check_statement(
         Ok(report) => {
             totals.0 += report.tie_rows_reduced;
             totals.1 += report.float_cells_compared;
+            ulps.push((arm.to_string(), number, max_ulp_distance(&report)));
             let line = format!(
                 "Q{number} arm {arm}: {:?} (tie_rows_reduced {}, float_cells_compared {}, \
-                 explained float mismatches {})",
+                 explained float mismatches {}, max ulp distance {})",
                 report.verdict,
                 report.tie_rows_reduced,
                 report.float_cells_compared,
@@ -411,6 +426,7 @@ fn check_statement(
                     .iter()
                     .filter(|m| m.explanation.is_some())
                     .count(),
+                ulps.last().map_or(0, |u| u.2),
             );
             let failure = (report.verdict != expected).then(|| {
                 format!(
@@ -483,6 +499,7 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
     let mut table = Vec::new();
     let mut failures = Vec::new();
     let mut totals = (0u64, 0u64);
+    let mut ulps = Vec::new();
     for (arm, subject, reference) in [("A", &arm_a, &reference_a), ("B", &arm_b, &reference_b)] {
         for (i, statement) in suite.statements.iter().enumerate() {
             let (line, failure) = check_statement(
@@ -492,6 +509,7 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
                 &reference[i],
                 &subject[i],
                 &mut totals,
+                &mut ulps,
             );
             table.push(line);
             failures.extend(failure);
@@ -509,8 +527,22 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
         failures.len(),
         failures.join("\n")
     );
-    // The fixture seed is fixed, so these are exact: a comparator that stops
-    // reducing ties or comparing floats on any statement-arm changes them.
+    // These figures are exact because everything they depend on is fixed: the
+    // fixture (FIXTURE_SEED) and both engines' plan partition count
+    // (engine::PLAN_PARTITIONS), which sets how many partial aggregates the
+    // floating-point sums are combined from. A comparator that stops reducing
+    // ties or comparing floats on any statement-arm changes the totals.
+    let q4_ulps: Vec<(&str, u64)> = ulps
+        .iter()
+        .filter(|(_, number, _)| *number == 4)
+        .map(|(arm, _, distance)| (arm.as_str(), *distance))
+        .collect();
+    assert_eq!(
+        q4_ulps,
+        [("A", 1), ("B", 2)],
+        "Q4's ulp distance per arm changed; suite.toml's float_max_ulps for Q4 is \
+         declared against these"
+    );
     assert_eq!(
         totals.0, 588,
         "summed tie_rows_reduced across both arms changed"
