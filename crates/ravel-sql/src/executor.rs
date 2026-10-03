@@ -4139,9 +4139,10 @@ fn missing_group_key_tiebreak_terms(aggregate: &Aggregate, sort: &Sort) -> Optio
     let mut missing = Vec::new();
     for index in 0..aggregate.group_expr.len() {
         let (_, field) = aggregate.schema.qualified_field(index);
-        let already_present = sort.expr.iter().any(|term| {
-            matches!(&term.expr, Expr::Column(column) if column.name == *field.name())
-        });
+        let already_present = sort
+            .expr
+            .iter()
+            .any(|term| matches!(&term.expr, Expr::Column(column) if column.name == *field.name()));
         if already_present {
             continue;
         }

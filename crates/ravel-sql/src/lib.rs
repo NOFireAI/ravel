@@ -121,10 +121,12 @@ pub use audit_schema::{
 pub use bounded_topk::{BOUNDED_TOPK_AGGREGATE_RULE, BoundedTopKAggregate};
 pub use complexity_guard::{MAX_STATEMENT_COMPLEXITY, StatementTooComplex, structural_count};
 pub use config::{
-    DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,
-    DEFAULT_MAX_QUERY_BYTES, ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES, GROUP_VALUES_CEILING_COMPENSATION,
-    GROUP_VALUES_RESIZE_TRANSIENT_FACTOR, GROUP_VALUES_UNDERCOUNT_FACTOR, SpillConfig,
-    SpillConfigError, SqlConfig, compensated_group_values_ceiling,
+    CacheDirSpill, DEFAULT_BOUNDED_TOPK_MAX_LIMIT, DEFAULT_LATE_MATERIALIZATION_EXTRA_COLUMNS,
+    DEFAULT_MAX_QUERY_BYTES, DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES,
+    DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE, ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES,
+    GROUP_VALUES_CEILING_COMPENSATION, GROUP_VALUES_RESIZE_TRANSIENT_FACTOR,
+    GROUP_VALUES_UNDERCOUNT_FACTOR, SQL_SPILL_SUBDIR, SpillConfig, SpillConfigError, SqlConfig,
+    cache_spill_dir, compensated_group_values_ceiling, derive_spill_max_bytes, measure_free_bytes,
 };
 pub use ddl::{DEFAULT_MIN_GRACE_MS, DdlErrorClass, DdlExecuteError, DdlOutcome};
 pub use ddl_cost::{
