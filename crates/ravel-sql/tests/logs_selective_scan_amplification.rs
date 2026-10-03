@@ -944,13 +944,11 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "q37: the plan phase counted survivors from the skip index, fetching no \
          block"
     );
-    // Exact GET count, 56 per 8 segments, 7 per segment:
+    // Exact GET count, 48 per 8 segments, 6 per segment:
     // - the plan probe;
-    // - FIELD_DIR alone, which the plan phase reads to resolve the numeric arm
-    //   and caches under its own key;
-    // - STREAM_DIR alone, the scan's front-section GET: FIELD_DIR is served
-    //   from the plan's cache entry, so the combined front GET (ADR-2066
-    //   decision 1) has only STREAM_DIR left to fetch;
+    // - the plan phase's one combined STREAM_DIR + FIELD_DIR front GET
+    //   (ADR-2066 decision 1): the plan decodes all four directories once per
+    //   segment (ADR-2414 decision A1) and the scan reads none of them again;
     // - 4 chunk runs. Under version 4 the surviving block's bytes are one page
     //   per projected column chunk of its row group. At gap 0 they form 6
     //   disjoint runs per segment, because the pruned blocks' pages for the
@@ -958,7 +956,7 @@ async fn selective_numeric_reads_only_surviving_blocks() {
     //   (`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`) bridges the two smallest gaps
     //   to leave 4.
     // Every tail section is absorbed by the probe. No whole-object GET anywhere.
-    assert_eq!(q37.gets, 56, "q37: exact GET count with no eviction");
+    assert_eq!(q37.gets, 48, "q37: exact GET count with no eviction");
     assert_eq!(
         q37.blocks_scanned, SEGMENTS,
         "q37 decodes exactly one block per segment"
@@ -1007,13 +1005,14 @@ async fn selective_numeric_reads_only_surviving_blocks() {
     );
     assert_eq!(q20.full_gets, 0, "q20: no whole-object GET");
     assert_eq!(q20.plan_full_reads, 0, "q20: skip-index plan");
-    // Same shape as q37, 56: per segment the probe, FIELD_DIR, STREAM_DIR and
+    // Same shape as q37, 48: per segment the probe, the plan's combined front
+    // directory GET and
     // 4 chunk runs. q20's second surviving block per segment is ADJACENT to
     // the first, so its page sits next to the first's in every chunk and the
     // pair coalesces even at gap 0 -- still 6 runs per segment before the L0
     // cap bridges them to 4, so the range count is unchanged and only the
     // bytes grow.
-    assert_eq!(q20.gets, 56, "q20: exact GET count with no eviction");
+    assert_eq!(q20.gets, 48, "q20: exact GET count with no eviction");
     assert_eq!(
         q20.blocks_scanned,
         SEGMENTS * 2,
@@ -1181,25 +1180,23 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     // 264,375 with no eviction: the figure
     // `selective_numeric_reads_only_surviving_blocks` decomposes for q20.
     //
-    // 479,083 under pressure =
+    // 305,335 under pressure =
     //   65,536 (8 plan probes, 8 KiB each)
-    // + 65,536 (8 probe-window range re-reads of an evicted tail, 8 KiB each)
-    // +    176 (8 plan FIELD_DIR GETs, 22 each)
-    // +    672 (8 combined STREAM_DIR+FIELD_DIR front GETs, 84 each, where
-    //           eviction left both sections cold)
-    // +    372 (6 lone STREAM_DIR front GETs, 62 each)
-    // + 346,791 (56 chunk-run GETs: 14 sets of 4 runs, because 6 of the 8
-    //           segments have their runs fetched twice -- the two partitions
-    //           owning that segment's two surviving blocks each read runs that
-    //           span both blocks' pages, and the first copy is evicted before
-    //           the second read; each set carries its segment's 4 bridged gap
-    //           bytes).
-    // Pages are re-read under pressure, so the bound is one full pass, not
-    // the no-eviction figure: both stay under the 630,401 a full pass moves.
+    // +    672 (8 plan STREAM_DIR+FIELD_DIR front GETs, 84 each)
+    // + 40,960 (5 probe-window range re-reads of an evicted tail, 8 KiB each)
+    // + 198,167 (32 chunk-run GETs: 8 sets of 4 runs, one set per segment,
+    //           the same chunk-run bytes as with no eviction -- the striped
+    //           route deals a row group whole to one partition, so a segment's
+    //           surviving blocks no longer have their runs fetched by two
+    //           partitions, and nothing is read twice to be evicted in
+    //           between).
+    // Only the tail re-reads are repeated under pressure, so the bound is one
+    // full pass, not the no-eviction figure: both stay under the 630,401 a
+    // full pass moves.
     assert_eq!(big.bytes, 264_375, "q20 with no eviction");
     assert_eq!(
-        small.bytes, 479_083,
-        "q20 under eviction: directory and chunk-run re-reads, still under one full pass"
+        small.bytes, 305_335,
+        "q20 under eviction: tail re-reads only, still under one full pass"
     );
 }
 
@@ -1482,23 +1479,24 @@ async fn plan_carry_peak_bytes_bounded_by_plan_concurrency() {
          segment, unaffected by the carry budget"
     );
     // Each of the SEGMENTS - BUDGET (6) dropped segments falls back to a
-    // normal (uncarried) segment open: one data read whose own metadata GETs
-    // (suffix probe + front directories, `QueryPhase::Probe`) precede its
-    // block-data range read (`QueryPhase::Scan`). Empirically 2 probe GETs
-    // and 1 scan GET per dropped segment (measured directly, not derived --
-    // the exact shape of a data read's own metadata fetch is this fetcher
-    // configuration's business, not this test's).
+    // normal (uncarried) segment open: one data read whose own metadata GET
+    // (the suffix probe, `QueryPhase::Probe`) precedes its block-data range
+    // read (`QueryPhase::Scan`). The front directories are not fetched again:
+    // the plan phase decoded them and the open takes them from the carried
+    // directories (ADR-2414 decision A1). 1 probe GET and 1 scan GET per
+    // dropped segment (measured directly, not derived).
     assert_eq!(
         s.probe_phase_gets,
-        2 * (SEGMENTS - BUDGET) as u64,
+        (SEGMENTS - BUDGET) as u64,
         "probe phase: each of the SEGMENTS - BUDGET segments the carry \
          budget dropped re-derives its own open metadata from the wire"
     );
     assert_eq!(
         s.scan_phase_gets,
-        (SEGMENTS - BUDGET) as u64,
-        "scan phase: exactly one block-data wire GET per segment the \
-         budget dropped, zero for the BUDGET segments whose carry survived"
+        RUNS_PER_REOPENED_SEGMENT * (SEGMENTS - BUDGET) as u64,
+        "scan phase: exactly RUNS_PER_REOPENED_SEGMENT block-data wire GETs \
+         per segment the budget dropped, zero for the BUDGET segments whose \
+         carry survived"
     );
     assert_eq!(
         s.gets,
@@ -1602,20 +1600,22 @@ async fn plan_carry_skips_zero_survivor_segment_budget() {
     // probe/scan GETs whether or not its carry was retained. Segments 1 and 2
     // are carried and reused for free. The remaining SEGMENTS - 1 - BUDGET
     // (5) segments (3..SEGMENTS) have a surviving block but no carry left,
-    // so each pays a real re-fetch: 2 probe GETs (suffix + front directories)
-    // and 1 scan GET (block data), the same per-dropped-segment shape
+    // so each pays a real re-fetch: 1 probe GET (the suffix probe; the front
+    // directories come from the carried directories) and 1 scan GET (block
+    // data), the same per-dropped-segment shape
     // `plan_carry_peak_bytes_bounded_by_plan_concurrency` measures.
     assert_eq!(
         s.probe_phase_gets,
-        2 * (SEGMENTS - 1 - BUDGET) as u64,
+        (SEGMENTS - 1 - BUDGET) as u64,
         "each of the SEGMENTS - 1 - BUDGET real segments the carry budget \
          dropped re-derives its own open metadata from the wire"
     );
     assert_eq!(
         s.scan_phase_gets,
-        (SEGMENTS - 1 - BUDGET) as u64,
-        "one block-data wire GET per real segment the budget dropped, zero \
-         for segment 0 (never opened) and zero for segments 1-2 (carried)"
+        RUNS_PER_REOPENED_SEGMENT * (SEGMENTS - 1 - BUDGET) as u64,
+        "RUNS_PER_REOPENED_SEGMENT block-data wire GETs per real segment \
+         the budget dropped, zero for segment 0 (never opened) and zero for \
+         segments 1-2 (carried)"
     );
     assert_eq!(
         s.gets,
@@ -1690,15 +1690,17 @@ async fn carried_object_reopen_does_not_double_charge_reused_bytes() {
         sum_metric(&plan, "rowpath_batches"),
     );
 
-    // 5: the plan phase's one whole-object GET for the segment, plus the
+    // 4: the plan phase's one whole-object GET for the segment, plus the
     // attrs_raw reopen's own suffix probe and BLOCKS-range GETs for block 1 --
     // block 0's fast columnar open pays none of these, since it opens from
-    // the carry. If the reopen ever started drawing from the carried buffer
+    // the carry. The reopen takes the directories from the plan phase's
+    // decode, so it no longer fetches the front sections (ADR-2414 decision
+    // A1). If the reopen ever started drawing from the carried buffer
     // instead of paying for its own re-fetch, this count would drop and
     // `bytes_reused` above would grow past `object_size`.
     assert_eq!(
         counting.gets(),
-        5,
+        4,
         "the attrs_raw reopen re-fetches its own metadata and block data \
          rather than drawing a second time on the carried buffer"
     );
@@ -1768,6 +1770,13 @@ fn compressible_record(blk: usize) -> LogRecord {
         attrs: Vec::new(),
     }
 }
+
+/// Block-data wire GETs an uncarried segment open issues for its own
+/// surviving block: the open's ranged plan covers only the partition's own
+/// blocks (ADR-2414 decision A1), so it stays below the coverage crossover and
+/// reads the projected chunk runs, which the L0 run cap holds at 4, instead of
+/// the whole object.
+const RUNS_PER_REOPENED_SEGMENT: u64 = 4;
 
 /// Blocks in the decompressed-accounting fixture: one record per block, distinct
 /// `ts_ns` per block, so a ts range prunes an exact block subset at the skip

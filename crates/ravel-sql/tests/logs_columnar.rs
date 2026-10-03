@@ -302,6 +302,10 @@ fn encode_object(records: &[LogRecord], cfg: RlogConfig) -> Vec<u8> {
 fn small_blocks() -> RlogConfig {
     RlogConfig {
         block_target_records: 3,
+        // One block per row group: the striped route deals whole row groups
+        // to partitions, so a fixture that wants its blocks spread across
+        // partitions needs row groups no larger than a block.
+        group_target_blocks: 1,
         ..RlogConfig::default()
     }
 }
@@ -1345,6 +1349,7 @@ async fn a_strided_fallback_across_partitions_neither_drops_nor_repeats_rows() {
     let cfg = RlogConfig {
         block_target_records: 2,
         max_dynamic_columns: 1,
+        group_target_blocks: 1,
         ..RlogConfig::default()
     };
 
@@ -1461,6 +1466,7 @@ async fn block_striping_is_row_identical_to_single_partition() {
     let cfg = RlogConfig {
         block_target_records: 3,
         max_dynamic_columns: 1,
+        group_target_blocks: 1,
         ..RlogConfig::default()
     };
 
