@@ -606,7 +606,7 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
     // bits. A comparator that stops reducing ties or comparing floats on any
     // statement-arm changes them.
     assert_eq!(
-        totals.0, 588,
+        totals.0, 624,
         "summed tie_rows_reduced across both arms changed"
     );
     assert_eq!(

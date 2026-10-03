@@ -443,23 +443,12 @@ mod tests {
         assert_eq!(tolerance.max_ulps, 3);
     }
 
-    /// The checked-in statement 19 override declares its expected error text
-    /// together with a reason.
+    /// Statement 19 (`EXTRACT`) plans since #2458, so it carries no override
+    /// and is compared like any other statement.
     #[test]
-    fn statement_19_expected_error_loads() {
+    fn statement_19_has_no_override() {
         let suite = load_default().expect("pinned corpus loads");
-        let over = suite.override_for(19).expect("Q19 override present");
-        assert_eq!(
-            over.ci_expected_error.as_deref(),
-            Some("This feature is not implemented: Extract not supported by ExprPlanner")
-        );
-        assert_eq!(
-            over.reason.as_deref(),
-            Some(
-                "EXTRACT has no ExprPlanner: datafusion is built without its datetime \
-                 expressions (issue #2458)"
-            )
-        );
+        assert!(suite.override_for(19).is_none());
     }
 
     /// The checked-in statement 24 override compares columns by name, with

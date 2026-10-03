@@ -22,15 +22,16 @@
 #     it has a LIMIT and no ORDER BY at all, which the comparator already
 #     treats as cardinality-only.
 #
-# Two more statements carry overrides for where Ravel's answer differs from
-# the reference engine's:
+# Two more override kinds cover where Ravel's answer differs from the
+# reference engine's:
 #
 #   * `float_reason` with `float_max_ulps`: an AVG column whose value differs
 #     from the reference only in its last bits (Q4).
 #   * `ci_expected_error` with a required `reason`: Ravel fails the statement;
 #     the acceptance test asserts each Ravel arm's error contains this text
-#     instead of comparing results (Q19). It is matched as a substring because
-#     each engine wraps the same failure in its own prefix.
+#     instead of comparing results. It is matched as a substring because
+#     each engine wraps the same failure in its own prefix. No statement
+#     declares it today.
 #
 # One statement's columns come back in a different order on each engine:
 #
@@ -107,11 +108,3 @@ reason = "ORDER BY key not projected; rows past a tie on EventTime cannot be ide
 number = 4
 float_reason = "Ravel sequential-fold avg (ADR-0022); measured 1 and 2 ULPs, plus 1 ULP headroom"
 float_max_ulps = 3
-
-# Q19: `extract(minute FROM ...)` does not plan. The workspace links
-# datafusion 54 with default features off, so no datetime ExprPlanner is
-# registered for EXTRACT.
-[[statement]]
-number = 19
-ci_expected_error = "This feature is not implemented: Extract not supported by ExprPlanner"
-reason = "EXTRACT has no ExprPlanner: datafusion is built without its datetime expressions (issue #2458)"
