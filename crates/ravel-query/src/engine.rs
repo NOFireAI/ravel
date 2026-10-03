@@ -3376,6 +3376,7 @@ impl QueryDeadline {
                 unix_ns: now_ns
                     .saturating_add(i64::try_from(deadline.as_nanos()).unwrap_or(i64::MAX)),
                 request: deadline,
+                instant: tokio::time::Instant::now() + remaining,
             },
         }
     }
@@ -10523,6 +10524,7 @@ mod log_prefetch_deadline_tests {
                     wall: WallDeadline {
                         unix_ns: i64::MAX,
                         request: Duration::MAX,
+                        instant: tokio::time::Instant::from_std(eval_deadline),
                     },
                 },
             )

@@ -266,6 +266,19 @@ pub trait SliceFetcher: Send + Sync {
     /// Dispatches one slice request and collects its full response.
     async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError>;
 
+    /// [`fetch`](Self::fetch) for a query whose own deadline is `deadline` on
+    /// the coordinator's monotonic clock. A fetcher that re-dispatches uses it
+    /// to tell a worker's `TIMEOUT` before that deadline, which is clock skew
+    /// between the two processes, from the query's end. The default ignores
+    /// it.
+    async fn fetch_within(
+        &self,
+        request: pb::FetchRequest,
+        _deadline: tokio::time::Instant,
+    ) -> Result<SliceResponse, DistribError> {
+        self.fetch(request).await
+    }
+
     /// Dispatches one RLOG-family (Logs/Alerts/Audit) slice request and collects
     /// its decoded records (#284).
     ///

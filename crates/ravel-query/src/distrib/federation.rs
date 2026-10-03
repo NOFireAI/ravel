@@ -245,9 +245,11 @@ impl Federation {
     ///   (`TooManyBytesScanned`/`TooManySeries`/`TooManySamples`/
     ///   `TooManySegments`) when it refused under this coordinator's budget,
     ///   so a remote-side refusal renders 422 rather than a retryable 503.
-    /// - [`QueryError::DeadlineExceeded`] when a remote stopped at
-    ///   `deadline.unix_ns`, regardless of `skip_unavailable`, carrying
-    ///   `deadline.request`.
+    /// - [`QueryError::DeadlineExceeded`] when a remote answered `TIMEOUT` and
+    ///   `deadline.instant` has passed on this coordinator, regardless of
+    ///   `skip_unavailable`, carrying `deadline.request`. A `TIMEOUT` before
+    ///   `deadline.instant` is the remote's clock running ahead, and is
+    ///   handled like an unavailable remote.
     ///
     /// `deadline.unix_ns` is the query's absolute deadline, carried on every
     /// Resolve request so a remote stops reading for the query when the query
@@ -547,12 +549,32 @@ impl Federation {
                     )?;
                 }
                 pb::status::Code::Timeout => {
-                    // The remote stopped at this query's own deadline, so the
-                    // query is over whatever `skip_unavailable` says: skipping
-                    // the remote would answer past the deadline. Its spend
-                    // before the stop is folded first.
+                    // The remote compared the query's wall-clock deadline on
+                    // its own clock. Only this coordinator's monotonic
+                    // deadline decides that the query is over: once it has
+                    // passed, skipping the remote would answer past it, so the
+                    // query fails whatever `skip_unavailable` says. Before it,
+                    // the remote's clock runs ahead of this one, and the
+                    // remote is unavailable to this query like one that never
+                    // answered. Its spend is folded either way.
                     fold_remote(&accounting, &mut running, &mut outcome.stats, &response);
-                    return Err(super::slice_deadline_exceeded(deadline));
+                    if deadline.has_passed() {
+                        return Err(super::slice_deadline_exceeded(deadline));
+                    }
+                    tracing::warn!(
+                        cluster = %name,
+                        "federated remote answered TIMEOUT before this query's deadline; \
+                         its clock runs ahead of this coordinator's"
+                    );
+                    handle_unavailable(
+                        &name,
+                        skip_unavailable,
+                        format!(
+                            "remote answered TIMEOUT before the query's deadline: {}",
+                            response.status_message
+                        ),
+                        &mut outcome,
+                    )?;
                 }
                 other => {
                     // SnapshotInvalidated/Corrupt/etc. A remote resolves its own
@@ -644,11 +666,14 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
-    /// A deadline the wall clock never reaches.
-    const TEST_DEADLINE: WallDeadline = WallDeadline {
-        unix_ns: i64::MAX,
-        request: Duration::from_secs(60),
-    };
+    /// A deadline neither clock reaches.
+    fn test_deadline() -> WallDeadline {
+        WallDeadline {
+            unix_ns: i64::MAX,
+            request: Duration::from_secs(60),
+            instant: tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600),
+        }
+    }
 
     /// A remote whose fetch always fails at transport, carrying a message that
     /// embeds internal identifiers (IP:port, errno) exactly as a real tonic
@@ -730,7 +755,7 @@ mod tests {
             Vec::new(),
             QueryAccounting::new(),
             EngineConfig::default(),
-            TEST_DEADLINE,
+            test_deadline(),
         )
         .await
     }
@@ -1284,7 +1309,7 @@ mod tests {
                 Vec::new(),
                 QueryAccounting::new(),
                 EngineConfig::default(),
-                TEST_DEADLINE,
+                test_deadline(),
             )
             .await
             .expect("an unmapped tenant is answered locally, not failed");
@@ -1406,6 +1431,9 @@ mod tests {
                 WallDeadline {
                     unix_ns: DEADLINE_NS,
                     request: Duration::from_secs(5),
+                    // The query's own deadline has passed on this coordinator
+                    // too, so the remote's TIMEOUT ends it.
+                    instant: tokio::time::Instant::now(),
                 },
             )
             .await

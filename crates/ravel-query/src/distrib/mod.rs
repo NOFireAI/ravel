@@ -81,6 +81,19 @@ pub struct WallDeadline {
     /// The request's own deadline, which a slice stopped at `unix_ns` fails its
     /// query with.
     pub request: Duration,
+    /// The same deadline on this coordinator's monotonic clock, the one its
+    /// engine timeout runs on. Only this decides that the query is over: a
+    /// remote `TIMEOUT` that arrives before it compares `unix_ns` on a clock
+    /// running ahead of this one, and is retried or skipped, not terminal.
+    pub instant: tokio::time::Instant,
+}
+
+impl WallDeadline {
+    /// Whether the query's own deadline has passed on this coordinator's
+    /// monotonic clock.
+    pub fn has_passed(&self) -> bool {
+        tokio::time::Instant::now() >= self.instant
+    }
 }
 
 /// The closed event-time envelope `[min, max]` of a slice's pinned segments,
@@ -252,7 +265,7 @@ impl Distributed {
                     partial_aggregate,
                 };
                 let fetcher = Arc::clone(&self.fetcher);
-                async move { fetcher.fetch(request).await }
+                async move { fetcher.fetch_within(request, deadline.instant).await }
             })
             .buffer_unordered(concurrency);
 
@@ -435,10 +448,11 @@ impl Distributed {
                 pb::status::Code::Timeout => {
                     // The worker stopped the slice at the query's deadline, or
                     // refused it because the deadline had already passed. The
-                    // query is over, so this is terminal: the slice's fetcher
-                    // neither re-dispatches nor runs it locally, and the spend
-                    // the worker made before it stopped is folded first (issue
-                    // #1723).
+                    // slice's fetcher re-dispatches a `TIMEOUT` that arrived
+                    // before `deadline.instant` (clock skew, see
+                    // `SliceFetcher::fetch_within`), so this one is terminal,
+                    // and the spend the worker made before it stopped is
+                    // folded first (issue #1723).
                     fold_slice(accounting, &mut running, &mut stats, &response);
                     return Err(slice_deadline_exceeded(deadline));
                 }
