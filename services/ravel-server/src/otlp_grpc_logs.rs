@@ -93,6 +93,11 @@ impl LogsService for GrpcLogsService {
             LogIngestRequestError::Write(
                 write_err @ ravel_ingest::LogWriteError::BufferBudgetExceeded,
             ) => Status::resource_exhausted(write_err.to_string()),
+            // A shard at the flush deferral cap refused the write before
+            // buffering it: the same backpressure class as the budget shed.
+            LogIngestRequestError::Write(
+                write_err @ ravel_ingest::LogWriteError::DeferralCapReached,
+            ) => Status::resource_exhausted(write_err.to_string()),
             LogIngestRequestError::Write(write_err) if write_err.is_retryable() => {
                 Status::unavailable(write_err.to_string())
             }

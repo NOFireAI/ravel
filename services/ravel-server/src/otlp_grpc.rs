@@ -130,6 +130,11 @@ impl MetricsService for GrpcMetricsService {
             IngestRequestError::Write(WriteError::BufferBudgetExceeded) => {
                 Status::resource_exhausted(WriteError::BufferBudgetExceeded.to_string())
             }
+            // A shard at the flush deferral cap refused the write before
+            // buffering it: the same backpressure class as the budget shed.
+            IngestRequestError::Write(WriteError::DeferralCapReached) => {
+                Status::resource_exhausted(WriteError::DeferralCapReached.to_string())
+            }
             IngestRequestError::Write(write_err) if write_err.is_retryable() => {
                 Status::unavailable(write_err.to_string())
             }

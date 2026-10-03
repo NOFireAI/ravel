@@ -21,6 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
+use crate::deferral::DeferralCapFlag;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
 use crate::router::WriteMode;
 use crate::span_error::SpanWriteError;
@@ -82,6 +83,10 @@ struct SpanShardHandle {
     /// the `shard_deaths` and `shards_condemned` counters to one increment
     /// per shard per generation.
     dead: AtomicBool,
+    /// The shard's at-cap flag (ADR-1642 deferral cap amendment), set and
+    /// cleared by the actor and read here before enqueue, the only place a
+    /// buffered-mode write can be refused.
+    cap_flag: DeferralCapFlag,
 }
 
 /// Routes span writes to generation-versioned shard-actor sets (ADR-0052), the
@@ -133,6 +138,7 @@ impl SpanIngestRouter {
                 (0..shard_count)
                     .map(|shard| {
                         let (tx, rx) = mpsc::channel(config.channel_depth);
+                        let cap_flag = DeferralCapFlag::new(config.flush_deferral_cap_ns());
                         let actor = SpanShardActor::new(
                             shard,
                             writer_id,
@@ -144,11 +150,13 @@ impl SpanIngestRouter {
                             Arc::clone(&metrics),
                             rx,
                             backstop_ceiling.clone(),
+                            cap_flag.clone(),
                         );
                         tokio::spawn(actor.run());
                         SpanShardHandle {
                             tx,
                             dead: AtomicBool::new(false),
+                            cap_flag,
                         }
                     })
                     .collect()
@@ -311,6 +319,22 @@ impl SpanIngestRouter {
 
         let mut shard_ids: Vec<u32> = by_shard.keys().copied().collect();
         shard_ids.sort_unstable();
+
+        // The flush deferral cap (ADR-1642 deferral cap amendment): refuse the
+        // whole write before any shard is sent anything if one of its shards
+        // has a flush deferred for the whole cap. This is the only refusal a
+        // buffered-mode write can get, since it is acknowledged at enqueue.
+        let now_ns = self.clock.now_ns();
+        if let Some(&capped) = shard_ids
+            .iter()
+            .find(|&&shard| set[shard as usize].cap_flag.reached(now_ns))
+        {
+            self.metrics.record_deferral_cap_refused();
+            set[capped as usize]
+                .cap_flag
+                .note_refusal(ravel_types::Signal::Spans, capped);
+            return Err(SpanWriteError::DeferralCapReached);
+        }
 
         // Parallel to `ack_rxs`: the shard each receiver belongs to, so a
         // closed ack channel is attributed to the right shard and counted as

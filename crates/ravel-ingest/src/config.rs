@@ -756,6 +756,50 @@ impl IngestConfig {
     pub(crate) fn queued_flush_cap(&self) -> usize {
         self.max_queued_flushes.max(1)
     }
+
+    /// The largest age a buffer holding a strict-mode waiter can reach before
+    /// its flush opens when no deferral intervenes, plus one `flush_tick`. A
+    /// strict waiter puts its buffer on the fast clock (each actor's
+    /// `age_threshold_ns`), so the threshold is `max_flush_delay`, or with
+    /// `adaptive_flush_delay` on the metrics actor's adaptive corridor ceiling
+    /// at its widest (`strict_visibility_budget_ns` less one
+    /// `put_retry_base_delay`, the ceiling at a zero PUT round trip) when that
+    /// is larger. The tick is added because the age check runs on a tick
+    /// rather than at the instant the threshold is crossed. Neither the idle
+    /// clock nor the sub-floor hold of ADR-1737 enters: a buffer waits for
+    /// those only while it has no strict waiter.
+    pub fn strict_ack_age_bound_ns(&self) -> i64 {
+        let floor_ns = self.max_flush_delay.as_nanos() as i64;
+        let threshold_ns = if self.adaptive_flush_delay {
+            let widest_ns = self
+                .strict_visibility_budget_ns
+                .saturating_sub(self.put_retry_base_delay.as_nanos() as i64);
+            floor_ns.max(widest_ns)
+        } else {
+            floor_ns
+        };
+        threshold_ns.saturating_add(self.flush_tick.as_nanos() as i64)
+    }
+
+    /// How long a refused flush trigger may stay deferred before its shard
+    /// refuses new appends (ADR-1642 deferral cap amendment). It is what the
+    /// read-side slack `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` has left for a
+    /// strict-mode row once the rest of its span is paid for: the slack less
+    /// `max_flush_lifetime` (the term the frozen derivation reserves for the
+    /// flush itself) less [`Self::strict_ack_age_bound_ns`]. A strict row
+    /// reaches a deferred buffer at most that bound before the deferral
+    /// starts, and its waiter is only acknowledged from a flush that opens
+    /// inside the cap, so its routing-to-pin span plus the flush lifetime stays
+    /// inside the slack. 3597.8 s at the shipped defaults, whatever
+    /// `idle_flush_byte_floor` holds; it saturates at 0 for a configuration
+    /// whose own bounds already spend the slack.
+    pub fn flush_deferral_cap_ns(&self) -> i64 {
+        let slack_ns = i64::from(ravel_catalog::FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR;
+        slack_ns
+            .saturating_sub(self.max_flush_lifetime.as_nanos() as i64)
+            .saturating_sub(self.strict_ack_age_bound_ns())
+            .max(0)
+    }
 }
 
 #[cfg(test)]
@@ -982,6 +1026,43 @@ mod tests {
             ..IngestConfig::default()
         };
         assert_eq!(three.queued_flush_cap(), 3);
+    }
+
+    /// The deferral cap is what the slack leaves a strict-mode row: at the
+    /// shipped defaults 7200 s less the 3600 s lifetime less the 2 s
+    /// `max_flush_delay` and one 200 ms tick. A non-zero idle flush byte floor
+    /// leaves it unchanged, since a strict waiter never waits out the
+    /// sub-floor hold, and the adaptive corridor widens the strict threshold
+    /// to its 2.4 s ceiling.
+    #[test]
+    fn flush_deferral_cap_is_what_the_slack_leaves_a_strict_row() {
+        let shipped = IngestConfig::default();
+        assert_eq!(shipped.strict_ack_age_bound_ns(), 2_200_000_000);
+        assert_eq!(shipped.flush_deferral_cap_ns(), 3_597_800_000_000);
+        assert_eq!(
+            shipped.flush_deferral_cap_ns()
+                + shipped.strict_ack_age_bound_ns()
+                + shipped.max_flush_lifetime.as_nanos() as i64,
+            i64::from(ravel_catalog::FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
+        );
+        let floored = IngestConfig {
+            idle_flush_byte_floor: 64 * 1024,
+            ..shipped
+        };
+        assert_eq!(floored.validate(), Ok(()));
+        assert_eq!(floored.strict_ack_age_bound_ns(), 2_200_000_000);
+        assert_eq!(floored.flush_deferral_cap_ns(), 3_597_800_000_000);
+        let adaptive = IngestConfig {
+            adaptive_flush_delay: true,
+            ..shipped
+        };
+        assert_eq!(adaptive.strict_ack_age_bound_ns(), 2_600_000_000);
+        assert_eq!(adaptive.flush_deferral_cap_ns(), 3_597_400_000_000);
+        let spent = IngestConfig {
+            max_flush_lifetime: Duration::from_secs(7200),
+            ..shipped
+        };
+        assert_eq!(spent.flush_deferral_cap_ns(), 0);
     }
 
     #[test]

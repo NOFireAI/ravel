@@ -255,7 +255,8 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
                     // buffer-budget shed (ADR-0069) is specifically
                     // RESOURCE_EXHAUSTED, matching the byte-rate rejection.
                     let code = match err {
-                        ravel_ingest::WriteError::BufferBudgetExceeded => {
+                        ravel_ingest::WriteError::BufferBudgetExceeded
+                        | ravel_ingest::WriteError::DeferralCapReached => {
                             StatusCode::ResourceExhausted
                         }
                         _ if err.is_retryable() => StatusCode::Unavailable,

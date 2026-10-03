@@ -95,6 +95,11 @@ impl TraceService for GrpcTraceService {
             err @ SpanIngestRequestError::Write(
                 ravel_ingest::SpanWriteError::BufferBudgetExceeded,
             ) => Status::resource_exhausted(err.to_string()),
+            // A shard at the flush deferral cap refused the write before
+            // buffering it: the same backpressure class as the budget shed.
+            err @ SpanIngestRequestError::Write(
+                ravel_ingest::SpanWriteError::DeferralCapReached,
+            ) => Status::resource_exhausted(err.to_string()),
             err if err.is_retryable() => Status::unavailable(err.to_string()),
             err => Status::internal(err.to_string()),
         })?;

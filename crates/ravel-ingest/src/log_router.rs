@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
+use crate::deferral::DeferralCapFlag;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
 use crate::indexed_fields::IndexedFieldsOverlay;
 use crate::log_error::LogWriteError;
@@ -76,6 +77,10 @@ struct LogShardHandle {
     /// the `shard_deaths` and `shards_condemned` counters to one increment
     /// per shard per generation.
     dead: AtomicBool,
+    /// The shard's at-cap flag (ADR-1642 deferral cap amendment), set and
+    /// cleared by the actor and read here before enqueue, the only place a
+    /// buffered-mode write can be refused.
+    cap_flag: DeferralCapFlag,
 }
 
 /// Routes log writes to generation-versioned shard-actor sets (ADR-0052), the
@@ -181,6 +186,7 @@ impl LogIngestRouter {
                 (0..shard_count)
                     .map(|shard| {
                         let (tx, rx) = mpsc::channel(config.channel_depth);
+                        let cap_flag = DeferralCapFlag::new(config.flush_deferral_cap_ns());
                         let actor = LogShardActor::new(
                             shard,
                             writer_id,
@@ -193,6 +199,7 @@ impl LogIngestRouter {
                             rx,
                             Arc::clone(&indexed_fields),
                             backstop_ceiling.clone(),
+                            cap_flag.clone(),
                             #[cfg(feature = "stage-timing")]
                             Arc::clone(&stage_timings),
                         );
@@ -200,6 +207,7 @@ impl LogIngestRouter {
                         LogShardHandle {
                             tx,
                             dead: AtomicBool::new(false),
+                            cap_flag,
                         }
                     })
                     .collect()
@@ -388,6 +396,7 @@ impl LogIngestRouter {
 
         let mut shard_ids: Vec<u32> = by_shard.keys().copied().collect();
         shard_ids.sort_unstable();
+        self.refuse_at_deferral_cap(&set, shard_ids.iter().copied())?;
 
         // Parallel to `ack_rxs`: the shard each receiver belongs to, so a
         // closed ack channel is attributed to the right shard and counted as
@@ -556,6 +565,7 @@ impl LogIngestRouter {
         if by_shard.is_empty() {
             return Ok(LogWriteReceipt::default());
         }
+        self.refuse_at_deferral_cap(&set, by_shard.iter().map(|(shard, _)| *shard))?;
 
         let mut ack_shards = Vec::with_capacity(by_shard.len());
         let mut ack_rxs = Vec::with_capacity(by_shard.len());
@@ -594,6 +604,28 @@ impl LogIngestRouter {
 
         self.await_strict_acks(&set, ack_shards, ack_rxs, ack_deadline)
             .await
+    }
+
+    /// Refuses the whole write, before any shard is sent anything, when one of
+    /// `shards` has a flush deferred for the whole flush deferral cap (ADR-1642
+    /// deferral cap amendment). This is the only refusal a buffered-mode write
+    /// can get, since it is acknowledged at enqueue.
+    fn refuse_at_deferral_cap(
+        &self,
+        set: &[LogShardHandle],
+        mut shards: impl Iterator<Item = u32>,
+    ) -> Result<(), LogWriteError> {
+        let now_ns = self.clock.now_ns();
+        match shards.find(|&shard| set[shard as usize].cap_flag.reached(now_ns)) {
+            Some(capped) => {
+                self.metrics.record_deferral_cap_refused();
+                set[capped as usize]
+                    .cap_flag
+                    .note_refusal(ravel_types::Signal::Logs, capped);
+                Err(LogWriteError::DeferralCapReached)
+            }
+            None => Ok(()),
+        }
     }
 
     /// Records the first observation of a shard actor's death, deduped so a
