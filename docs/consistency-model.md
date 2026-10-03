@@ -309,12 +309,19 @@ to any other: a replay still costs wire bytes, and a tenant well over its
 byte-rate budget can still see a replayed retry rejected at layer 2 before
 the marker lookup ever runs.
 
-**Fail-open, never a lost ack.** A corrupt or unparseable marker, or a store
-error on the lookup, is treated as a miss: the request proceeds down the
-normal path (at-least-once), it is never surfaced as an error to the caller.
-A `write_marker` failure after a durable commit is logged and the request
-still acks success, because the data is already committed; the retry then
-reingests (at-least-once) since no marker exists.
+**Fail-open on a bad marker, fail-closed on a failed lookup, never a lost
+ack.** A corrupt or unparseable marker is treated as a miss: the request
+proceeds down the normal path (at-least-once), it is never surfaced as an
+error to the caller. A store error on the lookup itself (the LIST refused,
+`AccessDenied` included, or any other store failure; a missing marker is a
+miss, not an error) means the gateway cannot tell whether the request already
+landed, so the keyed request is not acknowledged: it fails with the retryable
+store error a failed flush returns (HTTP 503 / gRPC `UNAVAILABLE`), naming the
+refused request, and writes nothing, so it is safe to retry. A request without
+a key performs no lookup and is unaffected. A `write_marker` failure after a
+durable commit is logged and the request still acks success, because the data
+is already committed; the retry then reingests (at-least-once) since no marker
+exists.
 
 **Honest residuals** (unchanged from ADR-0051 §5): a crash after the commit
 PUT but before the marker PUT still yields a duplicate on retry; two

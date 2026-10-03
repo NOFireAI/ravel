@@ -401,6 +401,19 @@ mod tests {
         }
     }
 
+    /// The exact prefix `read_marker` lists, as one literal. The gateway IAM
+    /// template grants a list of this shape, and
+    /// `gateway_template_admits_exactly_the_idempotency_marker_lookup` in
+    /// `crates/ravel-commit/tests/iam_templates.rs` pins its own mirror of
+    /// `marker_prefix` to this same literal.
+    #[test]
+    fn marker_prefix_is_the_shape_the_gateway_template_grants() {
+        assert_eq!(
+            marker_prefix(&tenant("acme"), Signal::Logs, b"client-key-1"),
+            "t/86bc967f6b7c19288226b362b9a7b013/l/idem/2fc38ed8fb3f5e9c1ed3eb38b4e0d1bc."
+        );
+    }
+
     #[tokio::test]
     async fn marker_replay_returns_stored_receipt() {
         let store = MemoryStore::new();

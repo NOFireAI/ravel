@@ -8,12 +8,14 @@ use std::time::Duration;
 use opentelemetry_proto::tonic::collector::logs::v1::{
     ExportLogsPartialSuccess, ExportLogsServiceRequest, ExportLogsServiceResponse,
 };
+use ravel_commit::keys::ingest_hour_string;
 use ravel_ingest::{
     AdmissionController, IdempotencyReceipt, LogIngestRouter, LogWriteError, LookupOutcome,
-    RequestRejection, WriteMode, plausible_ingest_clock, read_marker, write_marker,
+    MARKER_SUFFIX, RequestRejection, WriteMode, marker_key, plausible_ingest_clock, read_marker,
+    write_marker,
 };
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
-use ravel_object_store::ObjectStoreBackend;
+use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize_logs};
 use ravel_types::logstream::LogStreamId;
 use ravel_types::{CommitToken, Signal, TenantId};
@@ -130,6 +132,26 @@ impl LogIngestRequestError {
     }
 }
 
+/// The message a keyed write fails with when its marker lookup hits a store
+/// error (`read_marker` maps `NotFound` to a miss, so this is never absence).
+/// Names the refused request: the LIST of the key's marker prefix, the
+/// prefix being the marker key without its `<ingest_hour>.idm` tail.
+pub(crate) fn marker_lookup_failure(
+    tenant: &TenantId,
+    signal: Signal,
+    key: &[u8],
+    bucket: u32,
+    err: &StoreError,
+) -> String {
+    let marker = marker_key(tenant, signal, key, bucket);
+    let tail = format!("{}.{MARKER_SUFFIX}", ingest_hour_string(bucket));
+    let prefix = marker.strip_suffix(&tail).unwrap_or(&marker);
+    format!(
+        "idempotency marker lookup (LIST {prefix}) failed: {err}; nothing was written, \
+         the request is safe to retry"
+    )
+}
+
 /// Upper bound on the assembled `error_message` byte length, the same cap and
 /// for the same reason as [`crate::ingest`]'s metrics equivalent: a
 /// request rejected across many distinct reasons would otherwise produce an
@@ -217,14 +239,14 @@ pub async fn handle_export_logs(
             Ok(LookupOutcome::Corrupt) => {
                 tracing::warn!("idempotency marker found but failed to decode; treating as a miss");
             }
-            // A genuine store error on the lookup is fail-open too: nothing
-            // is written yet, so proceeding re-ingests (safe at-least-once)
-            // rather than failing a retry the client can only repeat.
+            // A store error on the lookup fails the write closed: writing
+            // anyway would store a duplicate whenever the marker exists and
+            // the lookup could not see it. Nothing is written yet, so the
+            // retryable error is safe for the client to retry.
             Err(err) => {
-                tracing::warn!(
-                    %err,
-                    "idempotency marker lookup failed; proceeding as a normal write"
-                );
+                return Err(LogIngestRequestError::Write(LogWriteError::Abandoned(
+                    marker_lookup_failure(&tenant, Signal::Logs, key, bucket, &err),
+                )));
             }
         }
     }
@@ -1186,6 +1208,155 @@ mod tests {
         assert!(
             matches!(lookup, LookupOutcome::Miss),
             "a partial commit must not write an idempotency marker, got {lookup:?}"
+        );
+    }
+
+    /// More passthrough steps than any one test's PUTs, so the `Op::Put`
+    /// sequence's progress is the exact PUT count.
+    const PUT_COUNTER_STEPS: usize = 256;
+
+    /// A store that counts every PUT (sequence 0) and, when
+    /// `refuse_marker_list` is set, refuses every LIST under an `idem/`
+    /// prefix the way S3 refuses a ListBucket the policy does not grant.
+    fn marker_list_store(
+        refuse_marker_list: bool,
+    ) -> Arc<ravel_object_store::fault::FaultStore<MemoryStore>> {
+        use ravel_object_store::fault::{
+            FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence, SequenceStep,
+        };
+        let mut plan = FaultPlan::empty().with_sequence(
+            Sequence::new(Op::Put).with_steps(vec![SequenceStep::Passthrough; PUT_COUNTER_STEPS]),
+        );
+        if refuse_marker_list {
+            plan = plan.with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Permanent("AccessDenied: s3:ListBucket".into()),
+                )
+                .with_key_contains("/idem/"),
+            );
+        }
+        Arc::new(FaultStore::new(MemoryStore::new(), plan))
+    }
+
+    fn put_count(store: &ravel_object_store::fault::FaultStore<MemoryStore>) -> u64 {
+        let puts = store.sequence_progress(0);
+        assert!(
+            (puts as usize) < PUT_COUNTER_STEPS,
+            "the PUT counter saturated at {puts}"
+        );
+        puts
+    }
+
+    fn marker_list_refusals(store: &ravel_object_store::fault::FaultStore<MemoryStore>) -> u64 {
+        use ravel_object_store::fault::{FaultKind, Op};
+        store.fault_count(Op::List, FaultKind::Permanent)
+    }
+
+    /// Issue #2462: a keyed write whose marker lookup the store refuses fails
+    /// with the retryable `Abandoned` error, names the refused LIST, and
+    /// writes nothing.
+    ///
+    /// Non-vacuity: restoring the old `Err(err) => { tracing::warn!(..) }` arm
+    /// in `handle_export_logs` makes the write succeed, so `expect_err` fails.
+    #[tokio::test]
+    async fn keyed_write_whose_marker_lookup_is_refused_fails_retryable_and_writes_nothing() {
+        let store = marker_list_store(true);
+        let state = state_with_store(1, store.clone());
+        let tenant = TenantId::new("acme");
+        let key = b"idem-2462".to_vec();
+
+        let err = handle_export_logs(
+            &state,
+            tenant.clone(),
+            WriteMode::Strict,
+            request(vec![record("hello", Vec::new())]),
+            BASE_TS_NS,
+            Some(key.clone()),
+        )
+        .await
+        .expect_err("a refused marker lookup must fail the keyed write");
+
+        let LogIngestRequestError::Write(LogWriteError::Abandoned(message)) = &err else {
+            panic!("expected the retryable Abandoned write error, got {err:?}");
+        };
+        assert!(err.is_retryable(), "{err:?} must be retryable");
+        let prefix = format!(
+            "t/{}/l/idem/{}.",
+            tenant.hash().to_hex(),
+            ravel_ingest::keyhash32(&tenant, &key)
+        );
+        assert!(
+            message.contains(&format!("LIST {prefix})")) && message.contains("AccessDenied"),
+            "the error must name the refused LIST of {prefix:?} and the store error: {message}"
+        );
+        assert_eq!(marker_list_refusals(&store), 1, "the LIST fault must fire");
+        assert_eq!(put_count(&store), 0, "a refused lookup must write nothing");
+    }
+
+    /// The same refusal does not touch a request without a key: it never
+    /// looks a marker up, so it writes as before.
+    #[tokio::test]
+    async fn unkeyed_write_is_unaffected_by_a_refused_marker_listing() {
+        let store = marker_list_store(true);
+        let state = state_with_store(1, store.clone());
+
+        let outcome = handle_export_logs(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![record("hello", Vec::new())]),
+            BASE_TS_NS,
+            None,
+        )
+        .await
+        .expect("an unkeyed write never lists a marker prefix");
+
+        assert_eq!(outcome.tokens.len(), 1);
+        assert_eq!(marker_list_refusals(&store), 0);
+        assert!(
+            put_count(&store) > 0,
+            "the unkeyed write must store its data"
+        );
+    }
+
+    /// A keyed write whose lookup succeeds and finds no marker writes its data
+    /// and then its marker: absence is a miss, not a store error.
+    #[tokio::test]
+    async fn keyed_write_whose_marker_lookup_finds_nothing_still_writes() {
+        let store = marker_list_store(false);
+        let state = state_with_store(1, store.clone());
+        let tenant = TenantId::new("acme");
+        let key = b"idem-2462".to_vec();
+
+        let outcome = handle_export_logs(
+            &state,
+            tenant.clone(),
+            WriteMode::Strict,
+            request(vec![record("hello", Vec::new())]),
+            BASE_TS_NS,
+            Some(key.clone()),
+        )
+        .await
+        .expect("a lookup that finds no marker proceeds to the write");
+
+        assert_eq!(outcome.tokens.len(), 1);
+        assert!(outcome.replayed_commit_token.is_none());
+        assert!(put_count(&store) > 0, "the keyed write must store its data");
+        let bucket = request_ingest_hour_bucket(BASE_TS_NS).expect("valid ingest ts");
+        let lookup = read_marker(
+            state.store.as_ref(),
+            &tenant,
+            Signal::Logs,
+            &key,
+            bucket,
+            DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
+        )
+        .await
+        .expect("marker lookup");
+        assert!(
+            matches!(lookup, LookupOutcome::Hit(_)),
+            "the write must leave its marker, got {lookup:?}"
         );
     }
 }

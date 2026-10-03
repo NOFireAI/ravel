@@ -767,11 +767,39 @@ nor a deeper key, a listing prefix, a 31- or 33-character tenant segment, or
 Some keys are deliberately left out. `sys/t/<tenant_hash>`, the alert lease
 and the compaction claims are written with a create-if-absent PUT first and
 read only once that PUT reports the object exists. The idempotency markers are
-found by listing a prefix, not by a single-key read. The gateway holds no list
-grant on that prefix either, so on AWS S3 the lookup is refused and keyed
-ingest falls back to a plain write; that is issue #2462. A data object that a
-concurrent compaction deleted is a race, not a bootstrap state, and naming
-those keys would need a `*`.
+found by listing a prefix, not by a single-key read, so they need no bootstrap
+grant: `GatewayList` grants that listing, as the next section describes. A
+data object that a concurrent compaction deleted is a race, not a bootstrap
+state, and naming those keys would need a `*`.
+
+## Idempotency markers: the keyed-ingest lookup
+
+A log or span request carrying `x-ravel-idempotency-key` looks up its marker
+before writing anything, and writes the marker after its data commits. The
+lookup lists one prefix, because the marker key ends in the ingest hour the
+original request pinned and a retry cannot know that hour. The calls are in
+`crates/ravel-ingest/src/idempotency.rs`:
+
+| Call | Mode | S3 operation | Grant |
+|---|---|---|---|
+| `read_marker` `list_all(store, &marker_prefix(tenant, signal, key))` | `gateway`, `all` | `s3:ListBucket` with `prefix=t/<tenant_hash>/<signal>/idem/<keyhash32>.`, signal `l` or `s` | `GatewayList` `s3:prefix` `t/????????????????????????????????/l/idem/????????????????????????????????.` and the same with `s` |
+| `read_marker_at` GETs the newest in-window marker the listing returned, and `write_marker` GETs the winner's marker after losing a create race | `gateway`, `all` | `s3:GetObject` | `GatewayRead` `t/*/*/idem/*` |
+| `write_marker` PUTs `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` (`CreateIfAbsent`) | `gateway`, `all` | `s3:PutObject` | `GatewayWrite` `t/*/*/idem/*` |
+
+The list grant spells the tenant hash and the 32-character keyhash as one `?`
+per character, then the literal `.` the prefix ends in, so it admits exactly
+the lookup's prefix: not a listing of a tenant's whole `idem/` directory, not
+another signal's markers, and not a tenant segment wider or narrower than a
+tenant hash. Metrics requests take no key and do no lookup.
+
+If the store refuses the lookup anyway, on a bucket whose policy predates this
+grant or under a hand-edited one, a keyed request fails with HTTP 503 or gRPC
+`UNAVAILABLE`, naming the refused LIST, and writes nothing, so the client's
+retry is safe. It never writes without the lookup, since that would store a
+duplicate of a request that already landed. A request without a key is
+unaffected.
+`crates/ravel-commit/tests/iam_templates.rs` pins the list grant and checks
+that it admits none of those sibling prefixes.
 
 ## Bucket-configuration reads: granted by no template
 
