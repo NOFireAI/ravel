@@ -755,8 +755,10 @@ pub fn build_session(
 
     // `with_default_features()` only installs the `EXTRACT(field FROM expr)`
     // planner under the facade's `datetime_expressions` feature, which this
-    // crate leaves off. The planner only rewrites to `date_part`, an admitted
-    // scalar, so registering it widens no allowlist.
+    // crate leaves off. The planner builds its `date_part` call from the UDF
+    // value, not by name, so the scalar allowlist below does not gate this
+    // path: re-read the planner on every DataFusion upgrade, since a new
+    // rewrite target in it would not fail closed.
     ctx.register_expr_planner(Arc::new(DatetimeFunctionPlanner))?;
 
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration

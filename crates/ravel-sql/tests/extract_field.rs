@@ -141,12 +141,14 @@ fn rows(outcome: &SqlOutcome) -> Vec<String> {
     out
 }
 
-/// Three timestamps a second, a minute, and an hour apart, so minute/hour/year
-/// extraction is exercised against values that actually move each field.
-const TS_NS: [i64; 3] = [
+/// 2023-11-14T22:13:20Z, then a minute, an hour, and about seven weeks later
+/// (2024-01-01T00:00:00Z), so each of minute, hour and year takes more than
+/// one value across the rows.
+const TS_NS: [i64; 4] = [
     1_700_000_000_000_000_000,
     1_700_000_060_000_000_000,
     1_700_003_600_000_000_000,
+    1_704_067_200_000_000_000,
 ];
 
 async fn executor_over_fixture() -> (TenantId, SqlExecutor) {
@@ -184,7 +186,7 @@ async fn assert_extract_matches_date_part(
     assert_eq!(
         actual_rows.len(),
         TS_NS.len(),
-        "all three records must be returned"
+        "every fixture record must be returned"
     );
 }
 
