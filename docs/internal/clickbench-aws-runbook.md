@@ -423,7 +423,7 @@ LD_PRELOAD="$TCMALLOC" "$PINNED" \
   --sql-max-segments 1000000 --deadline-secs 900 --continue-on-error \
   --cache-bytes "$CACHE_BYTES" \
   --sql-tenant-max-bytes 17179869184 \
-  --sql-max-query-bytes 8589934592 \
+  --sql-max-query-bytes 16451897344 \
   --fetch-concurrency 128 \
   --explain --explain-dir /root/explain \
   --corpus /root/ravel/benchmarks/clickbench/hits.corpus.json \
@@ -446,8 +446,11 @@ Flags that change what is measured:
 | `--continue-on-error` | One failing statement does not abandon the pass. |
 
 **The exit code is not the pass/fail signal.** It is non-zero whenever any
-statement fails, and one statement fails by design on this corpus. Assert the
-measured and failed counts instead, as step 9 does.
+statement fails. No statement fails by design on this corpus any more: the
+per-query pool above (16,451,897,344 bytes, the server's derived 50% share on
+the reference box) holds q33's 10,855,811,936-byte peak, where the earlier
+8 GiB pin did not. Assert the measured and failed identities instead, as step
+9 does; a non-zero exit is a statement to name, not a known cost.
 
 ## 9. Check the report before reading the headline
 
@@ -709,10 +712,10 @@ print(f"cold {colds:.2f} s")
 # --- Integrity FIRST: a total over a different statement count, or over a run
 # with unexpected failures, is not comparable and no band on it stands. -----
 #
-# Counts alone are not integrity. They are satisfied by the wrong 42 rows: an
+# Counts alone are not integrity. They are satisfied by the wrong 43 rows: an
 # omitted Class-F statement replaced by an unrecognised `q` row keeps the count
-# at 42, and "at most one failure" is also satisfied by zero failures plus one
-# statement that never ran. So the IDENTITIES are checked, not the totals.
+# at 43, and "no failures" is also satisfied by a statement that never ran. So
+# the IDENTITIES are checked, not the totals.
 if dup_id:
     fails.append(f"duplicate report rows for {sorted(dup_id)}; "
                  "a later row overwrote an earlier one")
