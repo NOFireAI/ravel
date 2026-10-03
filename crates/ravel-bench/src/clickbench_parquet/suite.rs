@@ -2,6 +2,7 @@
 //! queries.sql`), tamper-evidence over it, and the Ravel-side DDL template
 //! and per-statement comparator overrides from `suite.toml`.
 
+use crate::clickbench_parquet::comparator::FloatTolerance;
 use serde::Deserialize;
 
 /// The exact upstream `queries.sql` text, embedded at compile time so the
@@ -60,6 +61,14 @@ pub enum SuiteError {
     /// `suite.toml` failed to parse.
     #[error("benchmarks/clickbench/parquet/suite.toml: {0}")]
     InvalidToml(String),
+    /// A `[[statement]]` override declared exactly one of `float_reason` /
+    /// `float_max_ulps`: a float tolerance needs both, since a reason with
+    /// no bound or a bound with no explanation is not a usable declaration.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares float_reason \
+         without float_max_ulps, or vice versa; a float tolerance needs both"
+    )]
+    IncompleteFloatDeclaration { number: u32 },
 }
 
 /// `suite.toml`'s `[table]` section: the Ravel DDL template that mounts the
@@ -89,6 +98,32 @@ pub struct StatementOverride {
     /// when the statement's ORDER BY clause does not resolve to a
     /// projection index under the comparator's own textual rules.
     pub order_key: Vec<usize>,
+    /// Why this statement's float cells are allowed to differ by up to
+    /// `float_max_ulps` (e.g. a sequential-fold `avg`, ADR-0022). Declaring
+    /// one of `float_reason`/`float_max_ulps` without the other is a typed
+    /// load error ([`SuiteError::IncompleteFloatDeclaration`]).
+    #[serde(default)]
+    pub float_reason: Option<String>,
+    /// The declared float tolerance, in ULPs of the ordered bit
+    /// representation (same sign, both finite required; see
+    /// [`FloatTolerance`]).
+    #[serde(default)]
+    pub float_max_ulps: Option<u32>,
+}
+
+impl StatementOverride {
+    /// This override's declared [`FloatTolerance`], when it declares one.
+    /// `load` already rejects a one-sided declaration, so by the time a
+    /// caller sees a loaded `Suite` this is "both fields set" or "neither".
+    pub fn float_tolerance(&self) -> Option<FloatTolerance> {
+        match (&self.float_reason, self.float_max_ulps) {
+            (Some(reason), Some(max_ulps)) => Some(FloatTolerance {
+                reason: reason.clone(),
+                max_ulps,
+            }),
+            _ => None,
+        }
+    }
 }
 
 /// The on-disk shape of `suite.toml`, deserialized directly by serde before
@@ -155,6 +190,13 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
     }
     let doc: SuiteTomlDoc =
         toml::from_str(suite_toml).map_err(|e| SuiteError::InvalidToml(e.to_string()))?;
+    for over in &doc.statements {
+        if over.float_reason.is_some() != over.float_max_ulps.is_some() {
+            return Err(SuiteError::IncompleteFloatDeclaration {
+                number: over.number,
+            });
+        }
+    }
     Ok(Suite {
         statements: parse_statements(queries_sql),
         table: doc.table,
@@ -227,12 +269,76 @@ mod tests {
     }
 
     /// `suite.toml`'s one override (statement 43) loads with the exact key
-    /// the comparator consumes.
+    /// the comparator consumes, and declares no float tolerance (none of
+    /// the frozen corpus's statements do yet).
     #[test]
     fn statement_43_override_loads() {
         let suite = load_default().expect("pinned corpus loads");
         let over = suite.override_for(43).expect("Q43 override present");
         assert_eq!(over.order_key, vec![0]);
         assert!(suite.override_for(1).is_none());
+        assert_eq!(over.float_tolerance(), None);
+    }
+
+    /// A `[[statement]]` block declaring only `float_reason` (no
+    /// `float_max_ulps`) is a typed load error, not a silently-ignored
+    /// field or a panic.
+    #[test]
+    fn float_reason_without_max_ulps_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 1
+            order_key = [0]
+            float_reason = "test"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("one-sided float declaration is refused");
+        assert!(matches!(
+            err,
+            SuiteError::IncompleteFloatDeclaration { number: 1 }
+        ));
+    }
+
+    /// The mirror of the above: `float_max_ulps` with no `float_reason` is
+    /// refused the same way.
+    #[test]
+    fn float_max_ulps_without_reason_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 1
+            order_key = [0]
+            float_max_ulps = 1
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("one-sided float declaration is refused");
+        assert!(matches!(
+            err,
+            SuiteError::IncompleteFloatDeclaration { number: 1 }
+        ));
+    }
+
+    /// A complete `float_reason`/`float_max_ulps` pair loads and builds the
+    /// comparator's `FloatTolerance` from it.
+    #[test]
+    fn complete_float_declaration_builds_tolerance() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 1
+            order_key = [0]
+            float_reason = "sequential-fold avg rounding"
+            float_max_ulps = 4
+        "#;
+        let suite = load(QUERIES_SQL, toml).expect("complete declaration loads");
+        let over = suite.override_for(1).expect("override present");
+        let tolerance = over.float_tolerance().expect("both fields set");
+        assert_eq!(tolerance.reason, "sequential-fold avg rounding");
+        assert_eq!(tolerance.max_ulps, 4);
     }
 }
