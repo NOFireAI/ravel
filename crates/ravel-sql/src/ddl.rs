@@ -34,7 +34,9 @@
 //!
 //! A `CREATE` is not checked against `max_s3_requests` or any byte budget:
 //! grants-and-DDL work is outside query-cost accounting (ADR-2040
-//! grants-and-DDL-cost amendment, 2026-10-01). `deadline` bounds the wall
+//! grants-and-DDL-cost amendment, 2026-10-01). Its store traffic is
+//! reported instead, per phase, in the [`crate::DdlCost`] every call
+//! returns (see [`crate::ddl_cost`]). `deadline` bounds the wall
 //! time of the whole statement -- the grants read, both qualification
 //! probes, the snapshot read, and the manifest write, not only the snapshot
 //! step within it ([`DdlExecuteError::Deadline`] on expiry). The snapshot
@@ -56,9 +58,9 @@ use ravel_parquet::snapshot::{
 use ravel_pqtable::grants::{self, Grant, GrantsError, KeyPrefix};
 use ravel_pqtable::resolve;
 use ravel_pqtable::writer::{self, WriteError};
-use ravel_query::PhaseAccounting;
 use ravel_types::TenantHash;
 
+use crate::ddl_cost::{DdlCost, DdlCostRecorder, DdlExecution};
 use crate::executor::SqlExecutor;
 use crate::parquet::ExternalStoreError;
 use crate::validate::{DdlIntent, DdlValidationError, validate_ddl};
@@ -638,25 +640,44 @@ impl SqlExecutor {
     ///
     /// A `CREATE` is not checked against `max_s3_requests` or any byte
     /// budget: grants-and-DDL work is outside query-cost accounting
-    /// (ADR-2040 grants-and-DDL-cost amendment, 2026-10-01).
+    /// (ADR-2040 grants-and-DDL-cost amendment, 2026-10-01). Its store
+    /// traffic is still reported: the returned [`DdlExecution`] carries the
+    /// statement's [`crate::DdlCost`] per phase beside its result, on failure
+    /// as on success. A statement refused by validation issued no request
+    /// and reports zero.
     pub async fn execute_ddl(
         &self,
         tenant: TenantHash,
         statement: &str,
         created_by: &str,
         deadline: Duration,
-    ) -> Result<DdlOutcome, DdlExecuteError> {
+    ) -> DdlExecution {
         // Validation is CPU over the statement text and touches no store, so
         // it runs before the timer: a refusal is never reported as a deadline.
-        let intent = validate_ddl(statement)?;
-        match tokio::time::timeout(
+        let intent = match validate_ddl(statement) {
+            Ok(intent) => intent,
+            Err(err) => {
+                return DdlExecution {
+                    result: Err(err.into()),
+                    cost: DdlCost::default(),
+                };
+            }
+        };
+        let recorder = DdlCostRecorder::new();
+        let result = match tokio::time::timeout(
             deadline,
-            self.execute_ddl_within_deadline(tenant, intent, statement, created_by, deadline),
+            self.execute_ddl_within_deadline(
+                &recorder, tenant, intent, statement, created_by, deadline,
+            ),
         )
         .await
         {
             Ok(result) => result,
             Err(_elapsed) => Err(DdlExecuteError::Deadline { deadline }),
+        };
+        DdlExecution {
+            result,
+            cost: recorder.cost(),
         }
     }
 
@@ -666,6 +687,7 @@ impl SqlExecutor {
     /// doc comment for how the two compose.
     async fn execute_ddl_within_deadline(
         &self,
+        recorder: &DdlCostRecorder,
         tenant: TenantHash,
         intent: DdlIntent,
         statement: &str,
@@ -675,7 +697,8 @@ impl SqlExecutor {
         let parquet = self
             .parquet_sources()
             .ok_or(DdlExecuteError::NotConfigured)?;
-        let ravel_store = parquet.ravel_store().as_ref();
+        let ravel_store = parquet.ravel_store();
+        let write_store = recorder.write_store(ravel_store);
         let clock = self.clock().as_ref();
 
         match intent {
@@ -694,7 +717,7 @@ impl SqlExecutor {
                 // NoOp/TableExists verdict itself, but only after paying for
                 // the whole snapshot first.
                 if !or_replace {
-                    let existing = resolve::newest(ravel_store, &tenant, &name)
+                    let existing = resolve::newest(&write_store, &tenant, &name)
                         .await
                         .map_err(WriteError::from)?;
                     if existing.is_some_and(|manifest| manifest.is_live()) {
@@ -711,7 +734,8 @@ impl SqlExecutor {
                     .external_stores()
                     .ok_or(DdlExecuteError::NotConfigured)?;
 
-                let tenant_grants = grants::list(ravel_store, &tenant).await?;
+                let tenant_grants =
+                    grants::list(&recorder.grant_store(ravel_store), &tenant).await?;
                 let (grant, key) = grants::resolve_location(&tenant_grants, &location)?;
 
                 let external = external_stores
@@ -720,8 +744,9 @@ impl SqlExecutor {
                         profile: grant.profile.clone(),
                         source,
                     })?;
+                let probe_external = recorder.probe_store(&external);
 
-                let probe_key = match one_object_under(external.as_ref(), &grant, &key).await? {
+                let probe_key = match one_object_under(&probe_external, &grant, &key).await? {
                     ProbeObject::Found(key) => key,
                     ProbeObject::Empty => {
                         return Err(DdlExecuteError::ProbeObjectEmpty { location });
@@ -736,13 +761,13 @@ impl SqlExecutor {
                 // Both qualification probes run here, before `snapshot_location`
                 // below issues its first footer GET: a probe refusal must cost
                 // only the HEAD/listing above, never a footer read.
-                probe_preconditions(external.as_ref(), &probe_key)
+                probe_preconditions(&probe_external, &probe_key)
                     .await
                     .map_err(|source| DdlExecuteError::PreconditionProbe {
                         location: location.clone(),
                         source,
                     })?;
-                probe_not_ravel_bucket(ravel_store, external.as_ref())
+                probe_not_ravel_bucket(&recorder.probe_store(ravel_store), &probe_external)
                     .await
                     .map_err(|source| DdlExecuteError::RavelBucketProbe {
                         location: location.clone(),
@@ -751,7 +776,6 @@ impl SqlExecutor {
 
                 let grant_url = grant.url();
                 let granted_location = GrantedLocation { grant, key };
-                let phase_accounting = PhaseAccounting::new();
                 let LocationSnapshot {
                     files,
                     schema,
@@ -763,7 +787,7 @@ impl SqlExecutor {
                     parquet.get_limiter(),
                     self.process_memory_budget(),
                     deadline,
-                    &phase_accounting,
+                    recorder.snapshot_accounting(),
                 )
                 .await
                 .map_err(|source| DdlExecuteError::Snapshot {
@@ -809,7 +833,7 @@ impl SqlExecutor {
                 };
 
                 let outcome = writer::apply(
-                    ravel_store,
+                    &write_store,
                     &tenant,
                     &name,
                     write_intent,
@@ -836,7 +860,7 @@ impl SqlExecutor {
                     statement: statement.to_string(),
                 };
                 let outcome = writer::apply(
-                    ravel_store,
+                    &write_store,
                     &tenant,
                     &name,
                     write_intent,
