@@ -7918,7 +7918,10 @@ mod owned_work_tests {
             .iter()
             .map(|p| p.iter().map(|(_, b)| b.len() / GROUP_BLOCKS).sum())
             .collect();
-        let (lo, hi) = (groups.iter().min().unwrap(), groups.iter().max().unwrap());
+        let (lo, hi) = (
+            groups.iter().min().expect("partitions"),
+            groups.iter().max().expect("partitions"),
+        );
         assert!(hi - lo <= 1, "group counts are balanced: {groups:?}");
     }
 
