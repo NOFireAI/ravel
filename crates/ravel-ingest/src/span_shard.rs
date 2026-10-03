@@ -50,7 +50,7 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::traces_normalize::NormalizedSpan;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_rspan::{ObjectIdentity, RspanConfig, RspanWriter, SpanRecord};
-use ravel_types::{CommitToken, Signal, TenantId};
+use ravel_types::{CommitToken, Signal, TenantHash, TenantId};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Duration;
@@ -65,9 +65,13 @@ use crate::config::{
     store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
+use crate::generation::{
+    FlushScope, HandBackArrival, SCAN_SET_HANDBACK_ABANDONED, ScanCheck, reread_and_check,
+};
 use crate::metrics::FlushTrigger;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
+use crate::span_router::shard_for_span;
 
 pub(crate) type SpanAck = oneshot::Sender<Result<CommitToken, SpanWriteError>>;
 
@@ -82,6 +86,16 @@ pub(crate) enum SpanShardMsg {
         /// bypasses the budget; production charges via
         /// [`crate::SpanIngestRouter`].
         charge: Option<Arc<IngestByteCharge>>,
+    },
+    /// Spans a retiring shard handed back at flush open instead of writing
+    /// them outside the scan set of the hour they would have pinned (ADR-1642
+    /// scan-set amendment), routed to this shard under the tenant's current
+    /// generation. Already admitted and charged; no strict waiter rides along.
+    HandBack {
+        tenant: TenantId,
+        spans: Vec<NormalizedSpan>,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
     FlushNow { done: oneshot::Sender<()> },
@@ -184,6 +198,10 @@ struct SpanTenantBuf {
     /// cap, carried across every later refusal (issue #1916); see
     /// [`crate::shard`]'s `TenantBuf::deferred_since_ns`.
     deferred_since_ns: Option<i64>,
+    /// See [`crate::shard`]'s `TenantBuf::stale_view_counted`.
+    stale_view_counted: bool,
+    /// See [`crate::shard`]'s `TenantBuf::hand_back_blocked`.
+    hand_back_blocked: bool,
 }
 
 impl SpanTenantBuf {
@@ -204,6 +222,12 @@ impl SpanTenantBuf {
     /// metrics one this never fails: there is no identity check to reject on.
     fn merge(&mut self, spans: Vec<NormalizedSpan>, arrival_ns: i64) -> usize {
         self.note_arrival(arrival_ns);
+        self.merge_unstamped(spans)
+    }
+
+    /// [`Self::merge`] without the arrival stamp, for handed-back spans whose
+    /// arrival bookkeeping travels with them ([`HandBackArrival`]).
+    fn merge_unstamped(&mut self, spans: Vec<NormalizedSpan>) -> usize {
         let bytes_added: usize = spans.iter().map(est_span_bytes).sum();
         let object_bytes_added: usize = spans.iter().map(est_span_object_bytes).sum();
         self.spans.extend(spans);
@@ -629,6 +653,14 @@ pub(crate) struct SpanShardActor {
     /// so the router refuses a write to a shard at the deferral cap before
     /// enqueue, buffered mode included.
     cap_flag: DeferralCapFlag,
+    /// The router's generation state, for the scan-set check at flush open
+    /// and the hand-back it may lead to (ADR-1642 scan-set amendment).
+    scope: Arc<dyn FlushScope<SpanShardMsg>>,
+    /// Set by a hand-back and cleared by the next flush that opens in place,
+    /// so a run of hand-backs on this shard logs one WARN.
+    handing_back: bool,
+    /// See [`crate::shard`]'s `ShardActor::drain_rereads`.
+    drain_rereads: Option<HashSet<TenantHash>>,
 }
 
 impl SpanShardActor {
@@ -645,6 +677,7 @@ impl SpanShardActor {
         rx: mpsc::Receiver<SpanShardMsg>,
         backstop_ceiling: BufferBudgetCeiling,
         cap_flag: DeferralCapFlag,
+        scope: Arc<dyn FlushScope<SpanShardMsg>>,
     ) -> Self {
         cap_flag.publish(None, clock.now_ns());
         let ctx = Arc::new(SpanFlushCtx {
@@ -675,6 +708,9 @@ impl SpanShardActor {
             deferral_cap_ns: config.flush_deferral_cap_ns(),
             oldest_deferral_ns: None,
             cap_flag,
+            scope,
+            handing_back: false,
+            drain_rereads: None,
         }
     }
 
@@ -705,6 +741,9 @@ impl SpanShardActor {
                             let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
+                        }
+                        Some(SpanShardMsg::HandBack { tenant, spans, charges, arrival }) => {
+                            self.handle_hand_back(tenant, spans, charges, arrival).await;
                         }
                         Some(SpanShardMsg::FlushNow { done }) => {
                             // Not a teardown: this arm does not break, so the
@@ -800,6 +839,191 @@ impl SpanShardActor {
             self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
                 .await;
         }
+    }
+
+    /// Merges spans another shard handed back at flush open (ADR-1642 scan-set
+    /// amendment), the span counterpart of
+    /// `shard::ShardActor::handle_hand_back`: no deferral-cap refusal, their
+    /// charges join this buffer's, and their arrival bookkeeping widens it.
+    async fn handle_hand_back(
+        &mut self,
+        tenant: TenantId,
+        spans: Vec<NormalizedSpan>,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
+    ) {
+        let buf = self.absorb_spans(&tenant, spans, charges, arrival);
+        let (flush_est_bytes, est_bytes) = (buf.flush_est_bytes, buf.est_bytes);
+        let should_flush = size_trigger_fires(
+            flush_est_bytes,
+            est_bytes,
+            &self.config,
+            self.backstop_ceiling.get(),
+        );
+        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
+            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                .await;
+        }
+    }
+
+    /// Merges spans that are already admitted and charged into `tenant`'s
+    /// buffer: a hand-back arriving here, or spans a failed hand-back send
+    /// returned to this shard.
+    fn absorb_spans(
+        &mut self,
+        tenant: &TenantId,
+        spans: Vec<NormalizedSpan>,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
+    ) -> &mut SpanTenantBuf {
+        let buf = self.tenants.entry(tenant.clone()).or_default();
+        buf.merge_unstamped(spans);
+        buf.charges.extend(charges);
+        arrival.fold_into(
+            &mut buf.oldest_arrival_ns,
+            &mut buf.min_ingest_ts_ns,
+            &mut buf.max_ingest_ts_ns,
+        );
+        buf
+    }
+
+    /// Hands `buf`'s spans to the shards of the `count`-shard set that
+    /// `shard_for_span` routes them to, the span counterpart of
+    /// `shard::ShardActor::hand_back`: every target's liveness first, the
+    /// buffer back untouched if one is not live, then strict waiters answered
+    /// `Abandoned` and a clone of every charge to each target. A failed send
+    /// returns its spans and charges to this shard's buffer, as in the metrics
+    /// actor. Returns whether any target took spans.
+    async fn hand_back(
+        &mut self,
+        tenant: &TenantId,
+        mut buf: SpanTenantBuf,
+        count: u32,
+    ) -> Result<bool, SpanTenantBuf> {
+        let mut targets: Vec<u32> = buf
+            .spans
+            .iter()
+            .map(|s| shard_for_span(&s.trace_id, count))
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        let mut senders = Vec::with_capacity(targets.len());
+        for &target in &targets {
+            match self.scope.live_sender(count, target) {
+                Some(tx) => senders.push(tx),
+                None => return Err(buf),
+            }
+        }
+
+        let waiters = std::mem::take(&mut buf.waiters);
+        self.ctx.ack_waiters(
+            waiters,
+            Err(SpanWriteError::Abandoned(
+                SCAN_SET_HANDBACK_ABANDONED.into(),
+            )),
+        );
+        let SpanTenantBuf {
+            spans,
+            oldest_arrival_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            charges,
+            deferred_since_ns,
+            hand_back_blocked,
+            ..
+        } = buf;
+        let arrival = HandBackArrival {
+            oldest_arrival_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        };
+        let mut by_target: HashMap<u32, Vec<NormalizedSpan>> = HashMap::new();
+        for span in spans {
+            by_target
+                .entry(shard_for_span(&span.trace_id, count))
+                .or_default()
+                .push(span);
+        }
+        let mut delivered = false;
+        let mut kept = false;
+        for (target, tx) in targets.into_iter().zip(senders) {
+            let msg = SpanShardMsg::HandBack {
+                tenant: tenant.clone(),
+                spans: by_target.remove(&target).unwrap_or_default(),
+                charges: charges.clone(),
+                arrival,
+            };
+            let Err(mpsc::error::SendError(msg)) = tx.send(msg).await else {
+                delivered = true;
+                continue;
+            };
+            let SpanShardMsg::HandBack {
+                spans,
+                charges: returned,
+                ..
+            } = msg
+            else {
+                continue;
+            };
+            let charges = if kept { Vec::new() } else { returned };
+            let buf = self.absorb_spans(tenant, spans, charges, arrival);
+            buf.deferred_since_ns = buf.deferred_since_ns.or(deferred_since_ns);
+            buf.hand_back_blocked = true;
+            if !kept && !hand_back_blocked {
+                self.metrics.record_hand_back_failure();
+                tracing::error!(
+                    signal = ?Signal::Spans,
+                    shard = self.shard,
+                    target,
+                    tenant_hash = %tenant.hash().to_hex(),
+                    "ravel-ingest: hand-back target span shard closed before its spans \
+                     arrived; keeping them in this shard's buffer for the next flush to retry"
+                );
+            }
+            kept = true;
+        }
+        Ok(delivered)
+    }
+
+    /// The scan-set check at flush open, re-reading an untrusted view once per
+    /// drain; see `shard::ShardActor::scan_check`.
+    async fn scan_check(&mut self, tenant: TenantHash, hour: u32, now_ns: i64) -> ScanCheck {
+        let verdict = self.scope.check(tenant, self.shard, hour, now_ns);
+        if verdict != ScanCheck::Unknown
+            || !self
+                .drain_rereads
+                .as_mut()
+                .is_some_and(|reread| reread.insert(tenant))
+        {
+            return verdict;
+        }
+        reread_and_check(
+            self.scope.as_ref(),
+            self.clock.as_ref(),
+            self.config.max_flush_lifetime,
+            tenant,
+            self.shard,
+            hour,
+            now_ns,
+        )
+        .await
+    }
+
+    /// Whether a flush on a generation view this router cannot trust stays
+    /// unopened, its buffer kept whole for a later trigger; see
+    /// `shard::ShardActor::keeps_unconfirmed_flush`.
+    fn keeps_unconfirmed_flush(&self, lag_check: LagCheck, reason: &str) -> bool {
+        if matches!(lag_check, LagCheck::Enforced) {
+            return true;
+        }
+        tracing::warn!(
+            signal = ?Signal::Spans,
+            shard = self.shard,
+            reason,
+            "ravel-ingest: teardown bypass pass: writing a flush in place although it could \
+             not be confirmed inside the read-side scan set"
+        );
+        false
     }
 
     /// A buffer with a strict-mode waiter, or one whose flush would write at
@@ -933,6 +1157,7 @@ impl SpanShardActor {
     /// the residue is still in the tenant map with its arrival bookkeeping and
     /// the actor is still running to flush it.
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
+        self.drain_rereads = Some(HashSet::new());
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
             self.flush_all_pass(trigger, LagCheck::Enforced).await;
@@ -976,6 +1201,7 @@ impl SpanShardActor {
                 }
             }
         }
+        self.drain_rereads = None;
         self.join_all_flushes().await;
         self.refresh_oldest_deferral();
     }
@@ -1276,6 +1502,96 @@ impl SpanShardActor {
             }
         };
         let tenant_hash = tenant.hash();
+        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
+            Ok(bucket) => bucket,
+            Err(msg) => {
+                // Defensive: `flush_open_ns` was already hour-bucket-validated;
+                // if it ever fails here it is fail-loud like InvalidReading.
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(SpanWriteError::SegmentBuild(msg)));
+                return;
+            }
+        };
+        // ADR-1642 scan-set amendment: write under this shard index only if
+        // the read side scans it for the hour this flush is about to pin.
+        let buf = match self
+            .scan_check(tenant_hash, ingest_hour_bucket, raw_ns)
+            .await
+        {
+            ScanCheck::InScanSet => {
+                self.handing_back = false;
+                buf
+            }
+            ScanCheck::HandBack {
+                scan_count,
+                active_count,
+            } => match self.hand_back(&tenant, buf, active_count).await {
+                Ok(delivered) => {
+                    if delivered {
+                        self.metrics.record_rerouted_flush();
+                        if !std::mem::replace(&mut self.handing_back, true) {
+                            tracing::warn!(
+                                signal = ?Signal::Spans,
+                                shard = self.shard,
+                                ingest_hour_bucket,
+                                scan_count,
+                                active_count,
+                                "ravel-ingest: flush would write outside the read-side scan set \
+                                 of its ingest hour; handing its rows to the current shard generation"
+                            );
+                        }
+                    }
+                    return;
+                }
+                Err(mut buf) => {
+                    buf.stale_view_counted = false;
+                    if matches!(lag_check, LagCheck::Enforced) {
+                        if !std::mem::replace(&mut buf.hand_back_blocked, true) {
+                            self.metrics.record_hand_back_failure();
+                            tracing::error!(
+                                signal = ?Signal::Spans,
+                                shard = self.shard,
+                                tenant_hash = %tenant_hash.to_hex(),
+                                ingest_hour_bucket,
+                                active_count,
+                                "ravel-ingest: a hand-back target span shard of the tenant's \
+                                 current generation is dead or condemned; keeping the spans in \
+                                 this shard's buffer, where they stay until a target is live or \
+                                 the teardown drain writes them"
+                            );
+                        }
+                        self.tenants.insert(tenant, buf);
+                        return;
+                    }
+                    self.metrics.record_teardown_unscanned_write();
+                    tracing::error!(
+                        signal = ?Signal::Spans,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        scan_count,
+                        active_count,
+                        "ravel-ingest: teardown bypass pass: writing a flush in place under a \
+                         shard index readers do not scan for its ingest hour, because a \
+                         hand-back target shard is dead or condemned; the spans are stored \
+                         but no query returns them"
+                    );
+                    buf
+                }
+            },
+            ScanCheck::Unknown => {
+                let mut buf = buf;
+                if !std::mem::replace(&mut buf.stale_view_counted, true) {
+                    self.metrics.record_stale_provisioning_flush();
+                }
+                if self.keeps_unconfirmed_flush(lag_check, "no trusted generation view") {
+                    self.tenants.insert(tenant, buf);
+                    return;
+                }
+                buf
+            }
+        };
         let seq = self.next_seq;
         self.next_seq += 1;
         let SpanTenantBuf {
@@ -1286,17 +1602,6 @@ impl SpanShardActor {
             charges,
             ..
         } = buf;
-        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
-            Ok(bucket) => bucket,
-            Err(msg) => {
-                // Defensive: `flush_open_ns` was already hour-bucket-validated;
-                // if it ever fails here it is fail-loud like InvalidReading.
-                self.metrics.record_abandoned_input_rejected();
-                self.ctx
-                    .ack_waiters(waiters, Err(SpanWriteError::SegmentBuild(msg)));
-                return;
-            }
-        };
         self.metrics.record_flush(trigger);
         // The deadline pinned here is the flush-open deadline. It bounds how
         // long the flush may sit queued for a permit: the spawned task checks it
@@ -1542,6 +1847,7 @@ mod tests {
                 rx,
                 BufferBudgetCeiling::unlimited(),
                 DeferralCapFlag::new(config.flush_deferral_cap_ns()),
+                Arc::new(crate::generation::AlwaysInScope),
             );
             let task = tokio::spawn(actor.run());
             Harness {
@@ -2123,6 +2429,7 @@ mod tests {
             rx,
             BufferBudgetCeiling::unlimited(),
             DeferralCapFlag::new(exhaustion_config(4).flush_deferral_cap_ns()),
+            Arc::new(crate::generation::AlwaysInScope),
         );
         let task = tokio::spawn(actor.run());
 
@@ -2308,6 +2615,206 @@ mod tests {
         );
 
         h.shutdown().await;
+    }
+
+    /// One span shard actor (index 3) whose scan-set check and hand-back target
+    /// the test scripts, the span counterpart of `crate::shard`'s
+    /// `HandBackRig`. The clock never advances, so only the test's
+    /// `FlushNow`/`Shutdown` messages flush.
+    struct HandBackRig {
+        tx: mpsc::Sender<SpanShardMsg>,
+        scope: Arc<crate::generation::ScriptedScope<SpanShardMsg>>,
+        metrics: Arc<SpanIngestMetrics>,
+        store: Arc<dyn ObjectStoreBackend>,
+        budget: Arc<IngestByteBudget>,
+        task: JoinHandle<()>,
+    }
+
+    const HAND_BACK: ScanCheck = ScanCheck::HandBack {
+        scan_count: 3,
+        active_count: 2,
+    };
+
+    impl HandBackRig {
+        fn new(target: Option<mpsc::Sender<SpanShardMsg>>) -> Self {
+            let scope = crate::generation::ScriptedScope::new(HAND_BACK, target);
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let metrics = Arc::new(SpanIngestMetrics::new(4));
+            let config = IngestConfig {
+                shard_count: 4,
+                ..IngestConfig::default()
+            };
+            let (tx, rx) = mpsc::channel(64);
+            let actor = SpanShardActor::new(
+                3,
+                Uuid::new_v4(),
+                1,
+                Arc::clone(&store),
+                TestClock::new(BASE_NS),
+                Arc::new(ravel_commit::rng::SystemRng),
+                config,
+                Arc::clone(&metrics),
+                rx,
+                BufferBudgetCeiling::unlimited(),
+                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
+                scope.clone(),
+            );
+            HandBackRig {
+                tx,
+                scope,
+                metrics,
+                store,
+                budget: IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1 << 30)),
+                task: tokio::spawn(actor.run()),
+            }
+        }
+
+        /// Buffers six spans of tenant `acme` on six traces, under one charge
+        /// of `bytes`.
+        async fn write(&self, bytes: u64) -> Arc<IngestByteCharge> {
+            let spans: Vec<NormalizedSpan> =
+                (0..6u8).map(|i| norm_span(i + 1, 1, 1_000, "op")).collect();
+            let targets: HashSet<u32> = spans
+                .iter()
+                .map(|s| shard_for_span(&s.trace_id, 2))
+                .collect();
+            assert_eq!(targets.len(), 2, "the spans split across both targets");
+            let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
+            self.tx
+                .send(SpanShardMsg::Write {
+                    tenant: TenantId::new("acme"),
+                    spans,
+                    ack: None,
+                    charge: Some(Arc::clone(&charge)),
+                })
+                .await
+                .expect("send write");
+            charge
+        }
+
+        async fn flush_now(&self) {
+            let (done, wait) = oneshot::channel();
+            self.tx
+                .send(SpanShardMsg::FlushNow { done })
+                .await
+                .expect("send FlushNow");
+            wait.await.expect("FlushNow answered");
+        }
+
+        /// Hands the buffer to a live test-owned target and returns every
+        /// span and charge the actor sends it.
+        async fn drain_to_live_target(&self) -> (usize, Vec<Arc<IngestByteCharge>>) {
+            let (target, mut inbox) = mpsc::channel(16);
+            self.scope.set(HAND_BACK, Some(target));
+            self.flush_now().await;
+            let (mut records, mut charges) = (0, Vec::new());
+            while let Ok(msg) = inbox.try_recv() {
+                if let SpanShardMsg::HandBack {
+                    spans, charges: c, ..
+                } = msg
+                {
+                    records += spans.len();
+                    charges.extend(c);
+                }
+            }
+            (records, charges)
+        }
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_target_closed_after_the_liveness_check_returns_the_rows`.
+    ///
+    /// Guard: the `self.absorb_spans(..)` call in `hand_back`'s failed-send
+    /// branch.
+    #[tokio::test]
+    async fn a_target_closed_after_the_liveness_check_returns_the_spans() {
+        let (closed, inbox) = mpsc::channel(16);
+        drop(inbox);
+        let rig = HandBackRig::new(Some(closed));
+        let charge = rig.write(4_096).await;
+        let charge_ptr = Arc::as_ptr(&charge);
+        drop(charge);
+
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            4_096,
+            "the charge is still held"
+        );
+        assert_eq!(snap.hand_back_failures, 1);
+        assert_eq!(snap.rerouted_flushes, 0);
+
+        let (spans, charges) = rig.drain_to_live_target().await;
+        assert_eq!(spans, 6, "every span stayed in the source buffer");
+        assert_eq!(charges.len(), 2, "one clone per target message");
+        assert!(
+            charges
+                .iter()
+                .all(|c| std::ptr::eq(Arc::as_ptr(c), charge_ptr))
+        );
+        drop(charges);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A dead or condemned target keeps the whole buffer, counted once.
+    ///
+    /// Guard: `self.tenants.insert(tenant, buf)` in `flush_tenant`'s
+    /// `Err(mut buf)` arm.
+    #[tokio::test]
+    async fn a_dead_target_keeps_the_whole_source_buffer() {
+        let rig = HandBackRig::new(None);
+        drop(rig.write(4_096).await);
+
+        rig.flush_now().await;
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().hand_back_failures, 1);
+        assert_eq!(rig.budget.in_flight_bytes(), 4_096);
+        let (spans, charges) = rig.drain_to_live_target().await;
+        assert_eq!(spans, 6);
+        drop(charges);
+        assert!(
+            list_all(rig.store.as_ref(), "t/")
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A teardown whose hand-back target is not live writes in place and
+    /// counts it.
+    ///
+    /// Guard: `self.metrics.record_teardown_unscanned_write()` in
+    /// `flush_tenant`'s `Err(mut buf)` arm, and the `buf` it falls through
+    /// with.
+    #[tokio::test]
+    async fn a_teardown_with_a_dead_target_writes_in_place_and_counts_it() {
+        let rig = HandBackRig::new(None);
+        drop(rig.write(4_096).await);
+
+        let (done, wait) = oneshot::channel();
+        rig.tx
+            .send(SpanShardMsg::Shutdown { done })
+            .await
+            .expect("send Shutdown");
+        wait.await.expect("Shutdown answered");
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.teardown_unscanned_writes, 1);
+        assert_eq!(snap.flush_all_residue_tenants, 0);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+        let commits: Vec<String> = list_all(rig.store.as_ref(), "t/")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|o| o.key)
+            .filter(|k| k.contains("/c/0003/"))
+            .collect();
+        assert_eq!(commits.len(), 1, "one commit under shard 3, {commits:?}");
+        rig.task.await.expect("actor ends");
     }
 }
 

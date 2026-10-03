@@ -8,8 +8,8 @@
 //! unused parameter would only invite a wrong value.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use ravel_commit::rng::{RngSource, SystemRng};
@@ -22,7 +22,10 @@ use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit
 use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
-use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
+use crate::generation::{
+    DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
+    load_generations,
+};
 use crate::router::WriteMode;
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
@@ -89,13 +92,24 @@ struct SpanShardHandle {
     cap_flag: DeferralCapFlag,
 }
 
+impl LiveSender<SpanShardMsg> for SpanShardHandle {
+    /// The actor's mailbox unless the shard is dead or the mailbox closed. A
+    /// dead span shard is never respawned, so a hand-back to it waits for
+    /// teardown.
+    fn live_sender(&self) -> Option<mpsc::Sender<SpanShardMsg>> {
+        (!self.dead.load(Ordering::Relaxed) && !self.tx.is_closed()).then(|| self.tx.clone())
+    }
+}
+
 /// Routes span writes to generation-versioned shard-actor sets (ADR-0052), the
 /// span-pipeline counterpart of [`crate::router::IngestRouter`]. The
 /// generation-0 set is spawned at construction; a reshard's activation spawns
 /// the new set lazily via the [`GenerationSwitch`] factory while the old set
 /// drains.
 pub struct SpanIngestRouter {
-    switch: GenerationSwitch<SpanShardHandle>,
+    /// Shared with every shard actor through a weak [`SwitchScope`], which the
+    /// scan-set check at flush open reads (ADR-1642 scan-set amendment).
+    switch: Arc<GenerationSwitch<SpanShardHandle>>,
     store: Arc<dyn ObjectStoreBackend>,
     clock: Arc<dyn Clock>,
     metrics: Arc<SpanIngestMetrics>,
@@ -125,13 +139,16 @@ impl SpanIngestRouter {
         // `rand::rng()` and `Uuid::new_v4()` off this production path.
         let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
-        let factory = {
+        let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<SpanShardHandle>>| {
+            let scope: Arc<dyn FlushScope<SpanShardMsg>> = Arc::new(SwitchScope::new(weak.clone()));
             let store = Arc::clone(&store);
+            let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
+            let refresh_clock = Arc::clone(&clock);
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             let backstop_ceiling = backstop_ceiling.clone();
-            move |shard_count: u32| -> Vec<SpanShardHandle> {
+            let factory = move |shard_count: u32| -> Vec<SpanShardHandle> {
                 let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
@@ -151,6 +168,7 @@ impl SpanIngestRouter {
                             rx,
                             backstop_ceiling.clone(),
                             cap_flag.clone(),
+                            Arc::clone(&scope),
                         );
                         tokio::spawn(actor.run());
                         SpanShardHandle {
@@ -160,10 +178,10 @@ impl SpanIngestRouter {
                         }
                     })
                     .collect()
-            }
-        };
-        let switch =
-            GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory);
+            };
+            GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
+                .with_refresh_source(refresh_store, ravel_types::Signal::Spans, refresh_clock)
+        });
 
         SpanIngestRouter {
             switch,
@@ -458,8 +476,19 @@ impl SpanIngestRouter {
 
     /// Forces every shard to flush all buffered tenants now, for tests and
     /// graceful shutdown paths that need durability without waiting on
-    /// `max_flush_delay`.
+    /// `max_flush_delay`. Repeats while a pass handed spans back, as
+    /// [`crate::IngestRouter::flush_all`] does.
     pub async fn flush_all(&self) {
+        for _ in 0..crate::router::HAND_BACK_DRAIN_PASSES {
+            let handed_back = self.metrics.rerouted_flushes();
+            self.flush_all_pass().await;
+            if self.metrics.rerouted_flushes() == handed_back {
+                break;
+            }
+        }
+    }
+
+    async fn flush_all_pass(&self) {
         let sets = self.switch.all_sets();
         let mut dones = Vec::new();
         for set in &sets {
@@ -483,19 +512,24 @@ impl SpanIngestRouter {
     /// Flushes every live generation's span shard actors so a retiring
     /// generation's buffers drain too (ADR-0052 section 2). The detached actor
     /// tasks end on their own after the drain; the `done` acknowledgement fires
-    /// after the flush, so durability holds without joining them.
+    /// after the flush, so durability holds without joining them. Sets drain
+    /// largest first, each finished before the next is signalled, so spans a
+    /// retiring set hands back land in a set still running; the sets are
+    /// listed again after each one, since a hand-back can construct the
+    /// current generation's set during the drain.
     pub async fn shutdown(self) {
-        let sets = self.switch.all_sets();
-        let mut dones = Vec::new();
-        for set in &sets {
+        let mut drained = Vec::new();
+        while let Some((count, set)) = self.switch.largest_undrained_set(&drained) {
+            drained.push(count);
+            let mut dones = Vec::new();
             for shard in set.iter() {
                 let (tx, rx) = oneshot::channel();
                 let _ = shard.tx.send(SpanShardMsg::Shutdown { done: tx }).await;
                 dones.push(rx);
             }
-        }
-        for rx in dones {
-            let _ = rx.await;
+            for rx in dones {
+                let _ = rx.await;
+            }
         }
     }
 }

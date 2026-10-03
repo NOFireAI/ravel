@@ -35,18 +35,37 @@
 //! Nothing here moves, rewrites, or re-keys existing data: a switch only
 //! changes which shard-actor set *new* records route to (ADR-0052, "No data
 //! movement anywhere").
+//!
+//! **The scan-set check at flush open (ADR-1642 scan-set amendment).** Each
+//! shard actor holds a [`FlushScope`] onto its router's switch. Before a flush
+//! pins ingest hour `h`, the actor asks [`GenerationSwitch::scan_check`]
+//! whether its shard index is inside `ravel_catalog::scan_count(h)` for the
+//! tenant, the read side's own rule, on the same cached view routing uses and
+//! trusted only inside the grace-window horizon. Outside it, the rows are
+//! handed back to the shard set of the tenant's current generation through
+//! [`FlushScope::live_sender`]; on a view it cannot trust, the flush does not
+//! open and the switch starts one background re-read of the record. A drain
+//! waits for that re-read instead ([`reread_and_check`]), so one drain flushes
+//! every buffer whose view the re-read confirms.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use prost::Message;
 use ravel_catalog::{
-    ShardGeneration, active_shard_count, provisioning_key, read_generations_checked,
+    DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, active_shard_count, provisioning_key,
+    read_generations_checked, scan_count,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::sys::v1 as sysproto;
 use ravel_types::{Signal, TenantHash};
+use tokio::sync::{mpsc, watch};
+
+use crate::clock::Clock;
 
 /// Default router refresh interval `C` (ADR-0052 section 3, an open question
 /// the ADR left to the implementing task). 60 seconds: frequent enough that a
@@ -121,6 +140,234 @@ pub enum Routed<H> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationLoadError;
 
+/// What the scan-set check at flush open found (ADR-1642 scan-set amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanCheck {
+    /// The shard index is inside the scan set of the hour: write in place.
+    InScanSet,
+    /// The shard index is outside it. Write nothing under it and hand the rows
+    /// back to the `active_count`-shard set, the tenant's current generation.
+    HandBack { scan_count: u32, active_count: u32 },
+    /// No view this router can trust for the hour: do not open the flush.
+    Unknown,
+}
+
+/// The `Abandoned` message a strict waiter gets when its buffer is handed back
+/// at flush open. Its rows are written, by a shard of the current generation,
+/// so the outcome is unknown to this waiter rather than failed.
+pub(crate) const SCAN_SET_HANDBACK_ABANDONED: &str = "strict ack withheld: the flush would \
+     have written under a shard index outside the read-side scan set of its ingest hour; \
+     its rows were handed to the tenant's current shard generation and are written there";
+
+/// The arrival bookkeeping of handed-back rows, carried so the receiving
+/// buffer's age trigger and ingest bounds reflect when the rows really arrived
+/// rather than when they were handed over.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HandBackArrival {
+    pub(crate) oldest_arrival_ns: Option<i64>,
+    pub(crate) min_ingest_ts_ns: Option<i64>,
+    pub(crate) max_ingest_ts_ns: Option<i64>,
+}
+
+impl HandBackArrival {
+    /// Widen a receiving buffer's bookkeeping to cover these rows.
+    pub(crate) fn fold_into(
+        self,
+        oldest_arrival_ns: &mut Option<i64>,
+        min_ingest_ts_ns: &mut Option<i64>,
+        max_ingest_ts_ns: &mut Option<i64>,
+    ) {
+        fn widen(slot: &mut Option<i64>, other: Option<i64>, pick: fn(i64, i64) -> i64) {
+            *slot = match (*slot, other) {
+                (Some(a), Some(b)) => Some(pick(a, b)),
+                (a, b) => a.or(b),
+            };
+        }
+        widen(oldest_arrival_ns, self.oldest_arrival_ns, i64::min);
+        widen(min_ingest_ts_ns, self.min_ingest_ts_ns, i64::min);
+        widen(max_ingest_ts_ns, self.max_ingest_ts_ns, i64::max);
+    }
+}
+
+/// A router's shard handle as the hand-back path sees it.
+pub(crate) trait LiveSender<M>: Send + Sync {
+    /// The live actor's mailbox, or `None` when the actor is dead or its
+    /// mailbox closed: a hand-back never sends to a dead shard.
+    fn live_sender(&self) -> Option<mpsc::Sender<M>>;
+}
+
+/// A shard actor's handle on its router's generation state, consulted at
+/// flush open (ADR-1642 scan-set amendment).
+pub(crate) trait FlushScope<M>: Send + Sync {
+    /// Whether shard `shard` may write the tenant's flush that is about to pin
+    /// ingest hour `hour`. `now_ns` is the flush-open clock reading, which
+    /// selects the generation a hand-back routes under.
+    fn check(&self, tenant: TenantHash, shard: u32, hour: u32, now_ns: i64) -> ScanCheck;
+    /// The live mailbox of shard `shard` in the `count`-shard set.
+    fn live_sender(&self, count: u32, shard: u32) -> Option<mpsc::Sender<M>>;
+    /// Re-read the tenant's provisioning record, joining a read already in
+    /// flight. Resolves `true` once a read succeeded and its view is installed.
+    fn reread(&self, tenant: TenantHash) -> Reread;
+}
+
+/// A pending [`FlushScope::reread`].
+pub(crate) type Reread = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+/// How many synchronous re-reads one drain makes for one tenant. The second
+/// covers joining a read issued long enough ago that the view it installs is
+/// already past its horizon.
+const DRAIN_REREADS: usize = 2;
+
+/// The scan-set check a drain applies after a flush found no view it can
+/// trust: re-read the tenant's record, waiting at most `bound` on `clock` for
+/// each read, and check again. Returns [`ScanCheck::Unknown`] only when a
+/// re-read failed, timed out, or installed a view still past its horizon.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn reread_and_check<M>(
+    scope: &dyn FlushScope<M>,
+    clock: &dyn Clock,
+    bound: Duration,
+    tenant: TenantHash,
+    shard: u32,
+    hour: u32,
+    now_ns: i64,
+) -> ScanCheck {
+    let mut verdict = ScanCheck::Unknown;
+    for _ in 0..DRAIN_REREADS {
+        let reread = scope.reread(tenant);
+        let installed = tokio::select! {
+            installed = reread => installed,
+            () = clock.sleep(bound) => false,
+        };
+        if !installed {
+            break;
+        }
+        verdict = scope.check(tenant, shard, hour, now_ns);
+        if verdict != ScanCheck::Unknown {
+            break;
+        }
+    }
+    verdict
+}
+
+/// The production [`FlushScope`]: a weak reference to the router's switch, so
+/// an actor never keeps its router's shard sets (and with them every actor's
+/// mailbox) alive after the router is dropped.
+pub(crate) struct SwitchScope<H> {
+    switch: Weak<GenerationSwitch<H>>,
+}
+
+impl<H> SwitchScope<H> {
+    pub(crate) fn new(switch: Weak<GenerationSwitch<H>>) -> Self {
+        SwitchScope { switch }
+    }
+}
+
+impl<H, M> FlushScope<M> for SwitchScope<H>
+where
+    H: LiveSender<M> + 'static,
+    M: Send + 'static,
+{
+    fn check(&self, tenant: TenantHash, shard: u32, hour: u32, now_ns: i64) -> ScanCheck {
+        match self.switch.upgrade() {
+            Some(switch) => switch.scan_check(tenant, shard, hour, now_ns),
+            None => ScanCheck::Unknown,
+        }
+    }
+
+    fn live_sender(&self, count: u32, shard: u32) -> Option<mpsc::Sender<M>> {
+        let switch = self.switch.upgrade()?;
+        let set = switch.set_for_count(count);
+        set.get(shard as usize)?.live_sender()
+    }
+
+    fn reread(&self, tenant: TenantHash) -> Reread {
+        match self.switch.upgrade() {
+            Some(switch) => switch.reread(tenant),
+            None => Box::pin(std::future::ready(false)),
+        }
+    }
+}
+
+/// A [`FlushScope`] that finds every flush inside the scan set, for unit tests
+/// that drive one actor with no router behind it.
+#[cfg(test)]
+pub(crate) struct AlwaysInScope;
+
+#[cfg(test)]
+impl<M> FlushScope<M> for AlwaysInScope {
+    fn check(&self, _tenant: TenantHash, _shard: u32, _hour: u32, _now_ns: i64) -> ScanCheck {
+        ScanCheck::InScanSet
+    }
+
+    fn live_sender(&self, _count: u32, _shard: u32) -> Option<mpsc::Sender<M>> {
+        None
+    }
+
+    fn reread(&self, _tenant: TenantHash) -> Reread {
+        Box::pin(std::future::ready(true))
+    }
+}
+
+/// A [`FlushScope`] whose verdict and hand-back target a unit test sets, so a
+/// test can hand an actor a closed or absent target and read what it sends.
+#[cfg(test)]
+pub(crate) struct ScriptedScope<M> {
+    verdict: Mutex<ScanCheck>,
+    target: Mutex<Option<mpsc::Sender<M>>>,
+}
+
+#[cfg(test)]
+impl<M> ScriptedScope<M> {
+    pub(crate) fn new(verdict: ScanCheck, target: Option<mpsc::Sender<M>>) -> Arc<Self> {
+        Arc::new(ScriptedScope {
+            verdict: Mutex::new(verdict),
+            target: Mutex::new(target),
+        })
+    }
+
+    pub(crate) fn set(&self, verdict: ScanCheck, target: Option<mpsc::Sender<M>>) {
+        *self.verdict.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
+        *self.target.lock().unwrap_or_else(|p| p.into_inner()) = target;
+    }
+}
+
+#[cfg(test)]
+impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
+    fn check(&self, _tenant: TenantHash, _shard: u32, _hour: u32, _now_ns: i64) -> ScanCheck {
+        *self.verdict.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Every shard of every set is this one target, returned even when its
+    /// mailbox is closed: a target that closes after the liveness check.
+    fn live_sender(&self, _count: u32, _shard: u32) -> Option<mpsc::Sender<M>> {
+        self.target
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    fn reread(&self, _tenant: TenantHash) -> Reread {
+        Box::pin(std::future::ready(false))
+    }
+}
+
+/// Where the switch re-reads a tenant's provisioning record when a flush finds
+/// no view it can trust.
+struct RefreshSource {
+    store: Arc<dyn ObjectStoreBackend>,
+    signal: Signal,
+    clock: Arc<dyn Clock>,
+}
+
+/// The last ingest hour a view refreshed at `refreshed_at_ns` is trusted for,
+/// exclusive: the grace-window horizon [`GenerationSwitch::try_grace_extend`]
+/// routes inside. A generation appended after the refresh cannot shrink the
+/// scan set of any hour before it (ADR-1642 scan-set amendment).
+fn trust_horizon(refreshed_at_ns: i64, refresh_interval_ns: i64) -> u32 {
+    hour_of(refreshed_at_ns).saturating_add(min_lead_hours(refresh_interval_ns))
+}
+
 struct Inner<H> {
     /// The count a tenant with no persisted record routes at: the process's
     /// configured `shard_count`, which is generation 0's count for every tenant
@@ -132,6 +379,11 @@ struct Inner<H> {
     sets: HashMap<u32, Arc<Vec<H>>>,
     /// Per-tenant cached generation history and last-refresh time.
     views: HashMap<TenantHash, TenantView>,
+    /// Tenants with a flush-open re-read in flight, so a flush retried every
+    /// tick against a stalled store starts one read, not one per tick, and a
+    /// drain waiting for a re-read joins the one in flight. The receiver
+    /// reads `Some(installed)` once the read ends.
+    refreshing: HashMap<TenantHash, watch::Receiver<Option<bool>>>,
 }
 
 /// The generation-versioned shard-actor topology of one router (ADR-0052
@@ -147,6 +399,10 @@ pub struct GenerationSwitch<H> {
     /// The refresh interval `C`: a cached tenant view older than this is
     /// re-read before routing.
     refresh_interval_ns: i64,
+    /// Where a flush-open check that found no trusted view re-reads the
+    /// record. `None` only for a switch built without one (unit tests), whose
+    /// untrusted views stay untrusted until the router refreshes them.
+    refresh_source: Option<RefreshSource>,
 }
 
 impl<H> GenerationSwitch<H> {
@@ -165,10 +421,30 @@ impl<H> GenerationSwitch<H> {
                 default_count,
                 sets,
                 views: HashMap::new(),
+                refreshing: HashMap::new(),
             }),
             factory: Box::new(factory),
             refresh_interval_ns,
+            refresh_source: None,
         }
+    }
+
+    /// Give the switch the store, signal and clock its flush-open check
+    /// re-reads a tenant's provisioning record with when it finds no view it
+    /// can trust (ADR-1642 scan-set amendment).
+    #[must_use]
+    pub(crate) fn with_refresh_source(
+        mut self,
+        store: Arc<dyn ObjectStoreBackend>,
+        signal: Signal,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        self.refresh_source = Some(RefreshSource {
+            store,
+            signal,
+            clock,
+        });
+        self
     }
 
     /// The refresh interval `C` this switch enforces.
@@ -263,9 +539,7 @@ impl<H> GenerationSwitch<H> {
     pub fn try_grace_extend(&self, tenant: TenantHash, now_ns: i64) -> Option<Arc<Vec<H>>> {
         let mut inner = self.lock();
         let refreshed_at_ns = inner.views.get(&tenant)?.refreshed_at_ns;
-        let horizon =
-            hour_of(refreshed_at_ns).saturating_add(min_lead_hours(self.refresh_interval_ns));
-        if hour_of(now_ns) >= horizon {
+        if hour_of(now_ns) >= trust_horizon(refreshed_at_ns, self.refresh_interval_ns) {
             return None;
         }
         let count = {
@@ -347,6 +621,28 @@ impl<H> GenerationSwitch<H> {
         inner.sets.values().cloned().collect()
     }
 
+    /// The largest live shard-actor set whose count is not in `drained`, for a
+    /// shutdown that drains one set at a time. A hand-back always goes from a
+    /// set to a strictly smaller one, and may construct that set mid-drain, so
+    /// the caller asks again after each set rather than draining a list taken
+    /// once: every set is drained, and none before a larger one.
+    pub(crate) fn largest_undrained_set(&self, drained: &[u32]) -> Option<(u32, Arc<Vec<H>>)> {
+        let inner = self.lock();
+        inner
+            .sets
+            .iter()
+            .filter(|(count, _)| !drained.contains(count))
+            .max_by_key(|(count, _)| **count)
+            .map(|(count, set)| (*count, Arc::clone(set)))
+    }
+
+    /// The shard-actor set for `count`, constructed if no tenant has routed at
+    /// that count yet.
+    pub(crate) fn set_for_count(&self, count: u32) -> Arc<Vec<H>> {
+        let mut inner = self.lock();
+        self.ensure_set(&mut inner, count)
+    }
+
     /// Get or lazily construct the shard-actor set for `count`.
     fn ensure_set(&self, inner: &mut Inner<H>, count: u32) -> Arc<Vec<H>> {
         if let Some(set) = inner.sets.get(&count) {
@@ -355,6 +651,150 @@ impl<H> GenerationSwitch<H> {
         let set = Arc::new((self.factory)(count));
         inner.sets.insert(count, Arc::clone(&set));
         set
+    }
+}
+
+impl<H: Send + Sync + 'static> GenerationSwitch<H> {
+    /// The scan-set check at flush open (ADR-1642 scan-set amendment): whether
+    /// shard `shard` may write a flush of `tenant` that is about to pin ingest
+    /// hour `hour`, by the read side's own rule, `ravel_catalog::scan_count`
+    /// with [`DEFAULT_SCAN_SLACK_HOURS`].
+    ///
+    /// The cached view is trusted for `hour` only before [`trust_horizon`], the
+    /// grace-window horizon routing uses, so a view younger than `C` always
+    /// qualifies. A tenant with no view, or one past its horizon, is
+    /// [`ScanCheck::Unknown`]: the caller does not open the flush, and this
+    /// starts one background re-read of the tenant's record. An index outside
+    /// the scan set is [`ScanCheck::HandBack`] to the count active at
+    /// `now_ns`, which is never above `scan_count(hour)` because the latest
+    /// generation activated by `now_ns` stays in the scan set of every later
+    /// hour until `S` hours past its successor; a view that claimed otherwise
+    /// is treated as untrusted rather than handed a loop.
+    pub(crate) fn scan_check(
+        self: &Arc<Self>,
+        tenant: TenantHash,
+        shard: u32,
+        hour: u32,
+        now_ns: i64,
+    ) -> ScanCheck {
+        let verdict = {
+            let inner = self.lock();
+            match inner.views.get(&tenant) {
+                Some(view)
+                    if hour < trust_horizon(view.refreshed_at_ns, self.refresh_interval_ns) =>
+                {
+                    let scan = scan_count(&view.generations, hour, DEFAULT_SCAN_SLACK_HOURS);
+                    let active = active_shard_count(&view.generations, hour_of(now_ns));
+                    if shard < scan {
+                        ScanCheck::InScanSet
+                    } else if active <= shard {
+                        ScanCheck::HandBack {
+                            scan_count: scan,
+                            active_count: active,
+                        }
+                    } else {
+                        ScanCheck::Unknown
+                    }
+                }
+                Some(_) | None => ScanCheck::Unknown,
+            }
+        };
+        if verdict == ScanCheck::Unknown {
+            self.request_refresh(tenant);
+        }
+        verdict
+    }
+
+    /// Start one background re-read of `tenant`'s provisioning record unless
+    /// one is already in flight.
+    fn request_refresh(self: &Arc<Self>, tenant: TenantHash) {
+        let _ = self.start_refresh(tenant);
+    }
+
+    /// Re-read `tenant`'s provisioning record, joining a read already in
+    /// flight, and resolve `true` once a read succeeded and its view is
+    /// installed. A switch with no refresh source resolves `false`.
+    pub(crate) fn reread(self: &Arc<Self>, tenant: TenantHash) -> Reread {
+        let Some(mut done) = self.start_refresh(tenant) else {
+            return Box::pin(std::future::ready(false));
+        };
+        Box::pin(async move {
+            match done.wait_for(Option::is_some).await {
+                Ok(outcome) => *outcome == Some(true),
+                Err(_) => false,
+            }
+        })
+    }
+
+    /// The in-flight re-read of `tenant`'s record, started here if none is. A
+    /// successful read is installed stamped with the time the read was issued,
+    /// not when it returned, since the record may have been appended to while
+    /// the read was in flight. The task holds only a weak reference, so a
+    /// store that never answers cannot keep the router's shard sets alive
+    /// after the router is dropped.
+    fn start_refresh(
+        self: &Arc<Self>,
+        tenant: TenantHash,
+    ) -> Option<watch::Receiver<Option<bool>>> {
+        let source = self.refresh_source.as_ref()?;
+        let (default_count, done_tx, done_rx) = {
+            let mut inner = self.lock();
+            if let Some(in_flight) = inner.refreshing.get(&tenant) {
+                return Some(in_flight.clone());
+            }
+            let (done_tx, done_rx) = watch::channel(None);
+            inner.refreshing.insert(tenant, done_rx.clone());
+            (inner.default_count, done_tx, done_rx)
+        };
+        let store = Arc::clone(&source.store);
+        let clock = Arc::clone(&source.clock);
+        let signal = source.signal;
+        let switch = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let issued_ns = clock.now_ns();
+            let loaded = load_generations(store.as_ref(), signal, &tenant, default_count).await;
+            let installed = loaded.is_ok();
+            if let Some(switch) = switch.upgrade() {
+                let mut inner = switch.lock();
+                inner.refreshing.remove(&tenant);
+                if let Ok(generations) = loaded {
+                    install_if_newer(&mut inner.views, tenant, generations, issued_ns);
+                }
+            }
+            done_tx.send_replace(Some(installed));
+        });
+        Some(done_rx)
+    }
+}
+
+/// Install a re-read view unless the cache already holds one refreshed at or
+/// after `refreshed_at_ns`: a router write may have refreshed the tenant while
+/// the background read was in flight.
+fn install_if_newer(
+    views: &mut HashMap<TenantHash, TenantView>,
+    tenant: TenantHash,
+    generations: Vec<ShardGeneration>,
+    refreshed_at_ns: i64,
+) {
+    if generations.is_empty() {
+        return;
+    }
+    match views.get_mut(&tenant) {
+        Some(view) if view.refreshed_at_ns >= refreshed_at_ns => {}
+        Some(view) => {
+            view.generations = generations;
+            view.refreshed_at_ns = refreshed_at_ns;
+        }
+        None => {
+            views.insert(
+                tenant,
+                TenantView {
+                    generations,
+                    refreshed_at_ns,
+                    last_touched_ns: refreshed_at_ns,
+                },
+            );
+        }
     }
 }
 
@@ -676,6 +1116,59 @@ mod tests {
             8,
             "a known future generation is honored even through the grace window"
         );
+    }
+
+    /// The flush-open check against a 4 to 3 decrease activating at hour 100,
+    /// on a view refreshed at hour 102 (trusted before hour 104): the retired
+    /// index 3 is in the scan set through hour 102 (`S` = 3), handed back to
+    /// the 3-shard set from hour 103, an index the successor covers is never
+    /// handed back, and an hour past the trust horizon or a tenant with no
+    /// view is unknown.
+    #[test]
+    fn scan_check_follows_the_read_side_rule_inside_the_trust_horizon() {
+        let sw = Arc::new(index_switch(4, DEFAULT_REFRESH_INTERVAL_NS));
+        let t = tenant(9);
+        sw.refresh(t, vec![gen0(4), gen1(3, 100)], 102 * NS_PER_HOUR);
+        assert_eq!(
+            sw.scan_check(t, 3, 102, 102 * NS_PER_HOUR),
+            ScanCheck::InScanSet
+        );
+        assert_eq!(
+            sw.scan_check(t, 3, 103, 103 * NS_PER_HOUR),
+            ScanCheck::HandBack {
+                scan_count: 3,
+                active_count: 3
+            }
+        );
+        assert_eq!(
+            sw.scan_check(t, 2, 103, 103 * NS_PER_HOUR),
+            ScanCheck::InScanSet
+        );
+        assert_eq!(
+            sw.scan_check(t, 3, 104, 104 * NS_PER_HOUR),
+            ScanCheck::Unknown
+        );
+        assert_eq!(
+            sw.scan_check(tenant(10), 0, 102, 102 * NS_PER_HOUR),
+            ScanCheck::Unknown
+        );
+    }
+
+    /// Handed-back rows widen the receiving buffer's arrival bookkeeping in
+    /// the direction each field means: oldest and min down, max up.
+    #[test]
+    fn hand_back_arrival_widens_the_receiving_buffer() {
+        let arrival = HandBackArrival {
+            oldest_arrival_ns: Some(10),
+            min_ingest_ts_ns: Some(10),
+            max_ingest_ts_ns: Some(20),
+        };
+        let (mut oldest, mut min, mut max) = (Some(15), Some(15), Some(15));
+        arrival.fold_into(&mut oldest, &mut min, &mut max);
+        assert_eq!((oldest, min, max), (Some(10), Some(10), Some(20)));
+        let (mut oldest, mut min, mut max) = (None, None, None);
+        arrival.fold_into(&mut oldest, &mut min, &mut max);
+        assert_eq!((oldest, min, max), (Some(10), Some(10), Some(20)));
     }
 
     /// `all_sets` exposes every live generation's set for the flush/shutdown

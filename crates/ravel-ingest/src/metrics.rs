@@ -286,11 +286,16 @@ pub struct IngestMetrics {
     /// until the process is replaced, which nothing does automatically: this is
     /// the counter to alert on.
     shards_condemned: AtomicU64,
-    /// Flushes failed closed because the router's cached provisioning view for
-    /// the tenant was older than the refresh interval `C` (ADR-0052 section 3).
-    /// The load-bearing staleness signal: a nonzero, growing value means the
-    /// background refresher is not keeping views current and writes are being
-    /// refused rather than routed on a possibly-missed activation.
+    /// Refusals on a provisioning view the router cannot trust, from two
+    /// places. On the write path (ADR-0052 section 3): a write whose cached
+    /// view was older than the refresh interval `C`, whose re-read failed, and
+    /// that the grace window could not cover, counted once per refused write.
+    /// At flush open (ADR-1642 scan-set amendment): a buffer whose view is
+    /// missing or past its trust horizon, kept unflushed until a re-read
+    /// confirms it, counted once per buffer per stale-view episode however
+    /// many triggers retry it. A nonzero, growing value means views are not
+    /// being kept current and rows are being refused or held rather than
+    /// routed or written on a possibly-missed activation.
     stale_provisioning_flushes: AtomicU64,
     /// Flushes routed on a last-known-good provisioning view past the refresh
     /// interval `C`, inside the bounded grace window, because the
@@ -301,6 +306,21 @@ pub struct IngestMetrics {
     /// the store is slow/throttled and this router is degraded-but-available
     /// rather than fleet-wide-outed.
     grace_extended_stale_flushes: AtomicU64,
+    /// Flushes that would have written under a shard index outside the scan
+    /// set of the hour they pinned, and handed their rows back to be routed
+    /// under the tenant's current generation instead (ADR-1642 scan-set
+    /// amendment).
+    rerouted_flushes: AtomicU64,
+    /// Hand-back episodes that could not deliver rows to a target shard of the
+    /// tenant's current generation, because the target was dead, condemned or
+    /// its mailbox closed, at the liveness check or at the send. The rows stay
+    /// in the source buffer and the next flush attempt retries the hand-back.
+    /// Counted once per buffer until a hand-back from it delivers.
+    hand_back_failures: AtomicU64,
+    /// Flushes a teardown drain wrote in place under a shard index the read
+    /// side does not scan for the hour they pinned, because a hand-back target
+    /// was not live. Stored, and invisible to every query.
+    teardown_unscanned_writes: AtomicU64,
     /// Per-shard count of flushes the actor has handed to a spawned flush task
     /// and that have not yet finished, counted from the moment the buffer
     /// leaves the actor: a task still waiting for its `max_inflight_flushes`
@@ -762,6 +782,16 @@ pub struct IngestMetricsSnapshot {
     pub exemplars_dropped_total: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    /// Flushes handed back instead of written outside the scan set (ADR-1642
+    /// scan-set amendment).
+    pub rerouted_flushes: u64,
+    /// Hand-back episodes that left rows in the source buffer because a
+    /// target shard was not live. Exported as
+    /// `ravel_ingest_hand_back_failures_total`.
+    pub hand_back_failures: u64,
+    /// Teardown flushes written in place outside the scan set. Exported as
+    /// `ravel_ingest_teardown_unscanned_writes_total`.
+    pub teardown_unscanned_writes: u64,
     /// `ingest_metadata_flush_gets_total` (ADR-0085 decision 1).
     pub metadata_flush_gets_total: u64,
     /// `ingest_metadata_flush_puts_total` (ADR-0085 decision 1). Counts PUT
@@ -1094,9 +1124,8 @@ impl IngestMetrics {
         self.shards_condemned.load(Ordering::Relaxed)
     }
 
-    /// One flush refused because the router's cached provisioning view for the
-    /// tenant exceeded the refresh interval `C` (ADR-0052 section 3, fail
-    /// closed).
+    /// One write refused, or one buffer's stale-view episode at flush open,
+    /// on a provisioning view the router cannot trust (fail closed).
     pub(crate) fn record_stale_provisioning_flush(&self) {
         self.stale_provisioning_flushes
             .fetch_add(1, Ordering::Relaxed);
@@ -1106,6 +1135,30 @@ impl IngestMetrics {
     /// bounded grace window (ADR-0052 degraded-safe fallback).
     pub(crate) fn record_grace_extended_stale_flush(&self) {
         self.grace_extended_stale_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush handed back instead of written outside the scan set
+    /// (ADR-1642 scan-set amendment).
+    pub(crate) fn record_rerouted_flush(&self) {
+        self.rerouted_flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flushes handed back so far, read by the router's drain to tell whether
+    /// a pass moved rows into a set that already drained.
+    pub(crate) fn rerouted_flushes(&self) -> u64 {
+        self.rerouted_flushes.load(Ordering::Relaxed)
+    }
+
+    /// One hand-back episode that kept rows in the source buffer because a
+    /// target shard was not live.
+    pub(crate) fn record_hand_back_failure(&self) {
+        self.hand_back_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One teardown flush written in place outside the scan set.
+    pub(crate) fn record_teardown_unscanned_write(&self) {
+        self.teardown_unscanned_writes
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1166,6 +1219,9 @@ impl IngestMetrics {
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
+            hand_back_failures: self.hand_back_failures.load(Ordering::Relaxed),
+            teardown_unscanned_writes: self.teardown_unscanned_writes.load(Ordering::Relaxed),
             metadata_flush_gets_total: self.metadata_flush_gets.load(Ordering::Relaxed),
             metadata_flush_puts_total: self.metadata_flush_puts.load(Ordering::Relaxed),
             metadata_flush_dropped_total: self.metadata_flush_dropped.load(Ordering::Relaxed),

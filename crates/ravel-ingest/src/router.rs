@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicI64;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use ravel_commit::rng::{RngSource, SystemRng};
@@ -17,7 +17,10 @@ use crate::clock::Clock;
 use crate::config::IngestConfig;
 use crate::deferral::DeferralCapFlag;
 use crate::error::WriteError;
-use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
+use crate::generation::{
+    DEFAULT_REFRESH_INTERVAL_NS, FlushScope, GenerationSwitch, LiveSender, Routed, SwitchScope,
+    load_generations,
+};
 use crate::metrics::IngestMetrics;
 use crate::shard::{ShardActor, ShardMsg};
 #[cfg(feature = "stage-timing")]
@@ -123,6 +126,16 @@ impl ShardHandle {
     }
 }
 
+impl LiveSender<ShardMsg> for ShardHandle {
+    /// The current incarnation's mailbox unless it is closed or the shard is
+    /// condemned. A closed mailbox is left for the next write to observe and
+    /// respawn; the hand-back keeps its rows until then.
+    fn live_sender(&self) -> Option<mpsc::Sender<ShardMsg>> {
+        let inner = self.lock();
+        (!inner.condemned && !inner.tx.is_closed()).then(|| inner.tx.clone())
+    }
+}
+
 /// Routes writes to generation-versioned shard-actor sets (ADR-0052).
 ///
 /// The generation-0 set of `config.shard_count` shard actors is spawned once at
@@ -132,7 +145,9 @@ impl ShardHandle {
 /// generations' shard counts, not by write volume: no path spawns a task per
 /// message or per point.
 pub struct IngestRouter {
-    switch: GenerationSwitch<ShardHandle>,
+    /// Shared with every shard actor through a weak [`SwitchScope`], which the
+    /// scan-set check at flush open reads (ADR-1642 scan-set amendment).
+    switch: Arc<GenerationSwitch<ShardHandle>>,
     store: Arc<dyn ObjectStoreBackend>,
     signal: Signal,
     clock: Arc<dyn Clock>,
@@ -243,15 +258,18 @@ impl IngestRouter {
         let stage_timings = Arc::new(MetricStageTimings::new());
         // Each generation's shard-actor set gets a fresh writer identity, so
         // two sets never collide on a commit key for the same shard index.
-        let factory = {
+        let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<ShardHandle>>| {
+            let scope: Arc<dyn FlushScope<ShardMsg>> = Arc::new(SwitchScope::new(weak.clone()));
             let store = Arc::clone(&store);
+            let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
+            let refresh_clock = Arc::clone(&clock);
             let rng = Arc::clone(&rng);
             let metrics = Arc::clone(&metrics);
             let backstop_ceiling = backstop_ceiling.clone();
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
-            move |shard_count: u32| -> Vec<ShardHandle> {
+            let factory = move |shard_count: u32| -> Vec<ShardHandle> {
                 let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
@@ -276,6 +294,7 @@ impl IngestRouter {
                             Arc::clone(&flush_floor_ns),
                             backstop_ceiling.clone(),
                             cap_flag.clone(),
+                            Arc::clone(&scope),
                             #[cfg(feature = "stage-timing")]
                             Arc::clone(&stage_timings),
                         );
@@ -283,10 +302,10 @@ impl IngestRouter {
                         ShardHandle::new(tx, flush_floor_ns, cap_flag)
                     })
                     .collect()
-            }
-        };
-        let switch =
-            GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory);
+            };
+            GenerationSwitch::new(config.shard_count, DEFAULT_REFRESH_INTERVAL_NS, factory)
+                .with_refresh_source(refresh_store, signal, refresh_clock)
+        });
 
         IngestRouter {
             switch,
@@ -765,6 +784,7 @@ impl IngestRouter {
             flush_floor_ns,
             self.backstop_ceiling.clone(),
             cap_flag,
+            Arc::new(SwitchScope::new(Arc::downgrade(&self.switch))),
             #[cfg(feature = "stage-timing")]
             Arc::clone(&self.stage_timings),
         );
@@ -797,7 +817,23 @@ impl IngestRouter {
     /// Forces every shard to flush all buffered tenants now, for tests and
     /// graceful shutdown paths that need durability without waiting on
     /// `max_flush_delay`.
+    ///
+    /// A pass that handed rows back (ADR-1642 scan-set amendment) may have
+    /// delivered them to a shard that had already answered its own flush, so
+    /// the fan-out repeats until a pass hands nothing back. Handed-back rows
+    /// land in the tenant's current generation, which does not hand them back
+    /// again, so the bound is never what ends it in practice.
     pub async fn flush_all(&self) {
+        for _ in 0..HAND_BACK_DRAIN_PASSES {
+            let handed_back = self.metrics.rerouted_flushes();
+            self.flush_all_pass().await;
+            if self.metrics.rerouted_flushes() == handed_back {
+                break;
+            }
+        }
+    }
+
+    async fn flush_all_pass(&self) {
         let sets = self.switch.all_sets();
         let mut dones = Vec::new();
         for set in &sets {
@@ -823,22 +859,34 @@ impl IngestRouter {
     /// tasks end on their own once their channels close after the drain; the
     /// `done` acknowledgement fires after the flush, so durability holds without
     /// joining the detached tasks.
+    ///
+    /// Sets drain largest first, each finished before the next is signalled:
+    /// a retiring set's drain may hand rows back (ADR-1642 scan-set
+    /// amendment), always to a smaller set, which must still be running to
+    /// take them. The sets are listed again after each one, since a hand-back
+    /// can construct the current generation's set during the drain.
     pub async fn shutdown(self) {
-        let sets = self.switch.all_sets();
-        let mut dones = Vec::new();
-        for set in &sets {
+        let mut drained = Vec::new();
+        while let Some((count, set)) = self.switch.largest_undrained_set(&drained) {
+            drained.push(count);
+            let mut dones = Vec::new();
             for shard in set.iter() {
                 let (done_tx, done_rx) = oneshot::channel();
                 let (shard_tx, _) = shard.send_target();
                 let _ = shard_tx.send(ShardMsg::Shutdown { done: done_tx }).await;
                 dones.push(done_rx);
             }
-        }
-        for rx in dones {
-            let _ = rx.await;
+            for rx in dones {
+                let _ = rx.await;
+            }
         }
     }
 }
+
+/// How many fan-outs a router's `flush_all` makes at most while passes keep
+/// handing rows back. Two always suffice when every hand-back goes to the
+/// current generation; the third covers a reshard activating mid-drain.
+pub(crate) const HAND_BACK_DRAIN_PASSES: usize = 3;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

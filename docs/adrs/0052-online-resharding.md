@@ -219,6 +219,9 @@ window costs little. `CatalogConfig.shard_count` and the server/CLI
 `--shards` flag stop being the source of truth per the provisioning
 record's design; the generation history from the provisioning record is.
 
+Writers keep every flush inside this set at the hour it pins, however
+late the flush opens (see the scan-set writer amendment below).
+
 Query correctness across the boundary needs nothing beyond the scan
 rule: the query engine already merges a series's samples from any set
 of segments by series identity. A series that hashed to shard 1 under
@@ -413,3 +416,27 @@ New assumption (normative). Under clock skew between the reshard-append process 
 Clock-skew-covering read slack. Section 3 always named "max tolerated clock skew" as a term of the read-side slack S, but the shipped value had silently dropped it (S = 2 hours, flush-bound only). S is corrected to S = FLUSH_BOUND_SLACK_HOURS + TOLERATED_CLOCK_SKEW_HOURS = 2 + 1 = 3 hours, recorded here normatively. This widens the read-side scan set so that a straggler routed under either the retiring or the activating generation near a boundary -- worst on a shard-count decrease, where the retiring generation's wider range is exactly what covers the straggler -- is always inside the scan set. The invariant restored: no acknowledged write is ever routed to a shard index the read-side scan set for its hour does not cover.
 
 Coupling. The grace overshoot past an activation is bounded by the append-vs-router skew; the read slack S = 3 budgets flush timing (~1 hour real) plus that skew (1 hour) with a full hour of margin. Reverting the read slack while keeping the grace window reopens the split-brain; reverting the grace window while keeping the read slack only over-scans harmlessly. Section 2's fail-closed MUST and section 3's safety argument are to be read as amended by this section.
+
+## Amendment (2026-10-03): writers keep every flush inside the scan set (issue #2410)
+
+<!-- amendment-applies: sections="4. Scan rule (read side)" pointer="scan-set writer amendment" -->
+
+Section 3 sizes `S` for a flush that opens within its flush-timing bound of
+the records it holds. A flush deferred past that bound (ADR-1642: the
+queued-flush cap, the sub-floor hold) pins a later hour, and on a decrease a
+retiring shard index could then write into an hour whose scan set no longer
+holds it. The slack is not widened; the writer closes it instead.
+
+Normatively: no flush writes under a shard index outside the scan set of the
+ingest hour it pins. At flush open, a shard actor about to pin hour `h` writes
+only if its index is below `scan_count(h)` computed with
+`DEFAULT_SCAN_SLACK_HOURS` over the tenant's generation history, read from the
+router's cached view and trusted only inside the same horizon the
+degraded-grace amendment above allows routing. Otherwise it writes nothing
+under that index and hands the rows back to be routed under the tenant's
+current generation, whose shards are in the scan set of every hour they pin;
+on a view it cannot trust it does not open the flush at all. ADR-1642's
+scan-set amendment (2026-10-03) records the mechanism, the treatment of strict
+waiters and byte charges, and what stays unbounded. Sections 3 and 4 are
+otherwise unchanged: `S`, `FLUSH_BOUND_SLACK_HOURS`,
+`TOLERATED_CLOCK_SKEW_HOURS` and `scan_count` keep their values and meaning.
