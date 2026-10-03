@@ -79,6 +79,10 @@ across all five iterations.
 The largest sample is a lower bound on the true peak, so each share is an
 upper bound.
 
+The peaks and shares in this table, and the "at most 1.55%" below, were
+measured with a formula that miscounts reallocations; see the correction below
+for the figures that replace them. The map bytes stand.
+
 Both sets of figures were pre-registered on #2425 before their runs. Every
 median landed inside its band. The 1-stream time share was marginal: its band
 was under 0.5%, its median 0.49%, and one of its five runs read 0.55%. The
@@ -205,3 +209,36 @@ flowchart LR
   material for decision 5. The paper's throughput figures were taken with
   intrinsics on integer keys and do not transfer to a safe-Rust implementation
   without a fresh benchmark.
+
+## Correction (2026-10-04): the memory peaks were measured with a formula that counts reallocations twice
+
+<!-- amendment-applies: sections="Stage 0b: what the map costs in memory" pointer="correction below" -->
+
+The Stage 0b peaks came from `stats_alloc`, with live bytes computed as bytes
+allocated, minus bytes deallocated, plus bytes reallocated. That crate's
+`realloc` already adds a reallocation's growth to bytes allocated, so the
+formula counts the growth of every `Vec` and `HashMap` twice. Issue #2480 found
+it by comparing against a heap profiler, which measured the block loop's added
+live bytes at a quarter to a seventh of what the formula reported.
+
+The map bytes in the table are unaffected: the map is one allocation of fixed
+size, and the profiler reads the same 100, 43,024 and 688,144 bytes at its
+allocation site. The peaks they were divided by are replaced by the profiler's
+reading of the heap at its global maximum (issue #2485, result branch
+`task/3213b1d4-5565-4ea0-8fa1-039c1d4f7f97/result`, file
+`stage0f-true-peak.md`), row path, 20,000 records, input records included:
+
+| Streams per object | Map bytes | Peak live bytes | Map share |
+|---|---|---|---|
+| 1 | 100 | 28,644,048 | 0.00035% |
+| 1,000 | 43,024 | 30,296,064 | 0.14% |
+| 20,000 | 688,144 | 41,444,889 | 1.66% |
+
+The profiler's per-site figures sum exactly to its own total in every run, and
+the peak is identical across four runs of the same arm.
+
+The sentence "encode memory by at most 1.55%" should read 1.66%, and it is a
+measured share, not an upper bound. The pre-registered bar for this figure was
+10% at 20,000 streams, so the conclusion drawn from it, that the map is not a
+memory bottleneck, is unchanged, and so is every decision above. The time
+measurement (Stage 0) did not use the formula and is unaffected.
