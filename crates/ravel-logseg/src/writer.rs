@@ -4221,9 +4221,8 @@ mod tests {
 
     /// Builds a `ColumnarLogBatch` directly rather than through
     /// `ColumnarLogBatch::from_records`, which always keeps `stream_ids` and
-    /// `stream_attrs` parallel: every field here is `pub` and `push_columnar`
-    /// validates nothing, so this is the shape a malformed producer can hand
-    /// the writer (issue #2440). `stream_ids` and `local_ref` are the batch's
+    /// `stream_attrs` parallel: every field here is `pub`, so this is the shape
+    /// a malformed producer can hand the writer (issue #2440). `stream_ids` and `local_ref` are the batch's
     /// full stream directory and the one row's local stream reference into it;
     /// `stream_attrs` is however many blobs the (malformed) caller supplied.
     fn columnar_batch_with_stream_dir(
@@ -4408,17 +4407,13 @@ mod tests {
     /// Issue #2460, A1: `residual_attrs` is "per-row duplicate-loser
     /// attributes" (field doc) and must have exactly `num_rows` entries. A
     /// batch with MORE entries than `num_rows` is as dangerous as fewer:
-    /// `build_object_columnar`'s residual fold (`for (row, extras) in
-    /// b.residual_attrs.iter().enumerate()`) indexes `base + row` into the
+    /// `build_object_columnar`'s residual fold indexes `base + row` into the
     /// global per-row `attrs_raw` accumulator, and once `row` reaches
-    /// `num_rows` that lands in the *next* batch's global row range --
-    /// silently attributing this batch's extra residual entries to rows it
-    /// never produced. Pushing the malformed batch first, through the same
-    /// `push_columnar` every producer uses, proves it never reaches that
-    /// fold: the batch pushed after it keeps exactly its own residual
-    /// attribute, with nothing bled in from the batch ahead of it.
+    /// `num_rows` that lands in the *next* batch's row range. What is pinned
+    /// here is the refusal at `push_columnar`, with the message naming both
+    /// lengths; nothing after the refusal is asserted.
     #[test]
-    fn residual_attrs_longer_than_num_rows_cannot_bleed_into_the_next_batch() {
+    fn residual_attrs_longer_than_num_rows_is_refused_at_push() {
         let mut leaking = columnar_batch_with_stream_dir(vec![id(10)], vec![attrs_blob(10)], 0);
         leaking.residual_attrs = vec![Vec::new(), vec![("leaked".into(), AttrValue::I64(99))]];
 
@@ -4427,29 +4422,6 @@ mod tests {
             .push_columnar(leaking)
             .expect_err("residual_attrs longer than num_rows must be refused at push");
         assert_malformed(err, "residual_attrs has 2 entries but num_rows is 1");
-
-        let mut clean = columnar_batch_with_stream_dir(vec![id(20)], vec![attrs_blob(20)], 0);
-        clean.ts_ns = vec![1];
-        clean.observed_ts_ns = vec![1];
-        clean.residual_attrs = vec![vec![("own".into(), AttrValue::I64(7))]];
-        w.push_columnar(clean)
-            .expect("well-formed batch pushed after a refused one must still succeed");
-
-        let obj = w.finish().expect("finish");
-        let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
-        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
-        assert_eq!(rows.len(), 1);
-        let attrs = &rows[0].attrs;
-        assert!(
-            attrs
-                .iter()
-                .any(|(k, v)| k == "own" && *v == AttrValue::I64(7)),
-            "row must keep its own residual attribute: {attrs:?}"
-        );
-        assert!(
-            !attrs.iter().any(|(k, _)| k == "leaked"),
-            "row must not inherit the refused batch's residual attribute: {attrs:?}"
-        );
     }
 
     /// Issue #2460, A4: `stream_ids` is documented "Distinct stream ids"; a

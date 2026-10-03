@@ -540,14 +540,15 @@ async fn write_columnar_rejects_a_stream_ref_past_stream_ids_end() {
 
     // The router must stay usable: a well-formed write after the rejection
     // still commits.
+    let good = ColumnarLogBatch::from_records(&[to_logrecord(&norm_record(
+        &[("service.name", "api")],
+        2_000,
+        "still works",
+    ))]);
     let receipt = router
-        .write(
+        .write_columnar(
             tenant.clone(),
-            vec![norm_record(
-                &[("service.name", "api")],
-                2_000,
-                "still works",
-            )],
+            good,
             WriteMode::Strict,
             Duration::from_secs(5),
         )

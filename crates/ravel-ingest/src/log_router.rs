@@ -546,9 +546,8 @@ impl LogIngestRouter {
     /// layout, `WriteMode::Strict` ack contract, flush triggers, and RLOG format
     /// are unchanged; only the buffered input shape differs.
     ///
-    /// Until #605 wires the Parquet bulk loader, no shipping binary constructs a
-    /// [`ColumnarLogBatch`] to hand here; this is the router seam that loader
-    /// will call, reachable today only from tests.
+    /// The bulk loader (`services/ravel-cli/src/load/logs.rs`) is the
+    /// non-test caller; tests reach it too.
     pub async fn write_columnar(
         &self,
         tenant: ravel_types::TenantId,

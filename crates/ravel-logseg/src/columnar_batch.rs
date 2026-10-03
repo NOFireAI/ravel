@@ -243,6 +243,18 @@ pub struct ColumnarLogBatch {
     pub residual_attrs: Vec<Vec<(String, AttrValue)>>,
 }
 
+/// The [`FieldType`] a cell's column must have: the type half of the writer's
+/// `resolve_value` (`record.rs`), where `List` and `Map` resolve to `Bytes`.
+fn attr_field_type(value: &AttrValue) -> FieldType {
+    match value {
+        AttrValue::Str(_) => FieldType::Str,
+        AttrValue::I64(_) => FieldType::I64,
+        AttrValue::F64(_) => FieldType::F64,
+        AttrValue::Bool(_) => FieldType::Bool,
+        AttrValue::Bytes(_) | AttrValue::List(_) | AttrValue::Map(_) => FieldType::Bytes,
+    }
+}
+
 impl ColumnarLogBatch {
     /// An empty batch describing zero rows.
     pub fn new() -> Self {
@@ -272,14 +284,16 @@ impl ColumnarLogBatch {
         self.num_rows == 0
     }
 
-    /// Checks every cross-field invariant the columnar build path
+    /// Checks the cross-field invariants the columnar build path
     /// (`build_object_columnar` and what it calls, `crates/ravel-logseg/src/writer.rs`)
     /// relies on when it indexes a batch's fields, so a malformed batch is
-    /// refused here instead of making that path index out of range or
-    /// misattribute a row's data. Exactly the following are enforced, each
-    /// returning [`LogSegError::MalformedColumnarBatch`] naming the condition
-    /// and the offending column name, row index, or id (ids and slot indexes
-    /// in hex):
+    /// refused here instead of making that path index out of range or write
+    /// data under the wrong attribution. The conditions below, and only
+    /// these, are enforced, each returning
+    /// [`LogSegError::MalformedColumnarBatch`] naming the condition and the
+    /// offending column name, row, or id. Row indexes, counts, and the
+    /// `stream_attrs` index print in decimal; `stream_ids` indexes, dyn column
+    /// indexes, dictionary slots, and dictionary ids print in hex (`0x`).
     ///
     /// - `ts_ns`, `observed_ts_ns`, `severity_num`, `flags`, `severity_text`,
     ///   `body`, `trace_id_validity`, `span_id_validity`, `stream_refs`, and
@@ -291,15 +305,33 @@ impl ColumnarLogBatch {
     /// - Every `stream_refs` entry is a valid index into `stream_ids`.
     /// - Every `dyn_columns` entry's `validity` describes `num_rows` rows, and
     ///   its `cells` has exactly as many entries as `validity` marks present.
+    /// - Every cell of a dyn column has the column's `field_type`, using the
+    ///   writer's own mapping (`resolve_value`, `record.rs`): `Str`, `I64`,
+    ///   `F64`, `Bool` and `Bytes` map to themselves, and `List` and `Map`
+    ///   map to `Bytes`.
     /// - `dyn_col_dicts`, when non-empty, has exactly one entry per
     ///   `dyn_columns` entry; a present (`Some`) entry's `ids` has exactly one
     ///   id per present cell in its column, and every id is a valid index into
     ///   that entry's own `distinct`.
+    /// - For a present dictionary on a `Str` column, and on a `Bytes` column
+    ///   for its `Str` and `Bytes` cells, `distinct[ids[slot]]` equals the
+    ///   cell's own bytes.
     ///
-    /// Does not check (the writer's own concern, not a precondition the index
-    /// math above depends on): `dyn_columns` name/type uniqueness,
-    /// `stream_attrs`/`residual_attrs`/`AttrValue` payload content, or
-    /// `dyn_col_dicts` entries unreferenced by any id.
+    /// Does not check:
+    ///
+    /// - Two `dyn_columns` entries with the same `(name, field_type)`: the
+    ///   writer does not check this either, and nothing here compares column
+    ///   identities.
+    /// - More than 4 GiB of text in one `VarBytes` column, which wraps its
+    ///   `u32` offsets: `VarBytes` has no checked append path to detect it from.
+    /// - A dictionary entry's equality with its cell when the cell is a `List`
+    ///   or `Map` in a `Bytes` column: the cell's bytes exist only as
+    ///   `canonical_value_bytes`, which allocates, and this pass allocates
+    ///   nothing per cell.
+    /// - A dictionary on an `I64`, `F64` or `Bool` column: the writer never
+    ///   reads it.
+    /// - `distinct` entries no id references, and the payload content of
+    ///   `stream_attrs`, `residual_attrs` and `AttrValue`s.
     pub fn validate(&self) -> Result<(), LogSegError> {
         let malformed = |message: String| Err(LogSegError::MalformedColumnarBatch(message));
         let n = self.num_rows;
@@ -392,6 +424,15 @@ impl ColumnarLogBatch {
                     c.cells.len(),
                 ));
             }
+            for (cell, value) in c.cells.iter().enumerate() {
+                let found = attr_field_type(value);
+                if found != c.field_type {
+                    return malformed(format!(
+                        "dyn column {:?} (index {ci:#x}) cell {cell} has type {found:?} but the column's field_type is {:?}",
+                        c.name, c.field_type,
+                    ));
+                }
+            }
         }
 
         if !self.dyn_col_dicts.is_empty() {
@@ -424,6 +465,19 @@ impl ColumnarLogBatch {
                         c.name,
                         dict.distinct.len(),
                     ));
+                }
+                for (slot, (cell, id)) in c.cells.iter().zip(&dict.ids).enumerate() {
+                    let cell_bytes: &[u8] = match (c.field_type, cell) {
+                        (FieldType::Str | FieldType::Bytes, AttrValue::Str(s)) => s.as_bytes(),
+                        (FieldType::Str | FieldType::Bytes, AttrValue::Bytes(b)) => b,
+                        _ => continue,
+                    };
+                    if dict.distinct[*id as usize] != cell_bytes {
+                        return malformed(format!(
+                            "dyn column {:?} (index {ci:#x}) dictionary id[{slot:#x}] is {id:#x} but distinct[{id:#x}] differs from the cell's bytes",
+                            c.name,
+                        ));
+                    }
                 }
             }
         }
@@ -613,6 +667,7 @@ impl Default for ColumnarLogBatch {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::record::stream_attrs_bytes;
@@ -734,13 +789,27 @@ mod tests {
     }
 
     /// One row-length violation at a time: builds an otherwise-valid
-    /// `N`-row batch, then makes exactly the named field one row short.
-    /// Every field `validate` checks for row-count parity must be caught
-    /// individually -- a check with one name quietly dropped from the list
-    /// would pass a batch this test refuses.
+    /// `N`-row batch, then makes exactly the named field one row short and,
+    /// separately, one row long. Both directions are tried for each of the
+    /// nine fields, so a check written as `len < n` or `len > n` passes
+    /// neither half.
     #[test]
-    fn each_per_row_field_length_is_checked() {
-        const N: usize = 2;
+    fn each_per_row_field_length_is_checked_in_both_directions() {
+        const N: usize = 3;
+        fn bitmap(len: usize) -> Bitmap {
+            let mut v = Bitmap::new();
+            for _ in 0..len {
+                v.push(false);
+            }
+            v
+        }
+        fn var_bytes(len: usize) -> VarBytes {
+            let mut v = VarBytes::new();
+            for _ in 0..len {
+                v.push(b"");
+            }
+            v
+        }
         let fields = [
             "ts_ns",
             "observed_ts_ns",
@@ -753,46 +822,25 @@ mod tests {
             "stream_refs",
         ];
         for field in fields {
-            let mut batch = minimal_batch(N);
-            let short = N - 1;
-            match field {
-                "ts_ns" => batch.ts_ns.truncate(short),
-                "observed_ts_ns" => batch.observed_ts_ns.truncate(short),
-                "severity_num" => batch.severity_num.truncate(short),
-                "flags" => batch.flags.truncate(short),
-                "severity_text" => {
-                    batch.severity_text = VarBytes::new();
-                    for _ in 0..short {
-                        batch.severity_text.push(b"");
-                    }
+            for len in [N - 1, N + 1] {
+                let mut batch = minimal_batch(N);
+                match field {
+                    "ts_ns" => batch.ts_ns.resize(len, 0),
+                    "observed_ts_ns" => batch.observed_ts_ns.resize(len, 0),
+                    "severity_num" => batch.severity_num.resize(len, 0),
+                    "flags" => batch.flags.resize(len, 0),
+                    "severity_text" => batch.severity_text = var_bytes(len),
+                    "body" => batch.body = var_bytes(len),
+                    "trace_id_validity" => batch.trace_id_validity = bitmap(len),
+                    "span_id_validity" => batch.span_id_validity = bitmap(len),
+                    "stream_refs" => batch.stream_refs.resize(len, 0),
+                    _ => unreachable!("every named field has a case above"),
                 }
-                "body" => {
-                    batch.body = VarBytes::new();
-                    for _ in 0..short {
-                        batch.body.push(b"");
-                    }
-                }
-                "trace_id_validity" => {
-                    let mut v = Bitmap::new();
-                    for _ in 0..short {
-                        v.push(false);
-                    }
-                    batch.trace_id_validity = v;
-                }
-                "span_id_validity" => {
-                    let mut v = Bitmap::new();
-                    for _ in 0..short {
-                        v.push(false);
-                    }
-                    batch.span_id_validity = v;
-                }
-                "stream_refs" => batch.stream_refs.truncate(short),
-                _ => unreachable!("every named field has a case above"),
+                assert_malformed(
+                    batch.validate(),
+                    &format!("{field} has {len} entries but num_rows is {N}"),
+                );
             }
-            assert_malformed(
-                batch.validate(),
-                &format!("{field} has {short} entries but num_rows is {N}"),
-            );
         }
     }
 
@@ -803,6 +851,16 @@ mod tests {
         assert_malformed(
             batch.validate(),
             "residual_attrs has 1 entries but num_rows is 2",
+        );
+    }
+
+    #[test]
+    fn residual_attrs_longer_than_num_rows_is_rejected() {
+        let mut batch = minimal_batch(2);
+        batch.residual_attrs.push(Vec::new());
+        assert_malformed(
+            batch.validate(),
+            "residual_attrs has 3 entries but num_rows is 2",
         );
     }
 
@@ -938,5 +996,209 @@ mod tests {
             batch.validate(),
             "severity_text has 0 entries but num_rows is 1",
         );
+    }
+
+    /// A one-row batch with one dynamic column over a single present cell.
+    fn one_cell_batch(field_type: FieldType, cell: AttrValue) -> ColumnarLogBatch {
+        let mut batch = minimal_batch(1);
+        let mut validity = Bitmap::new();
+        validity.push(true);
+        batch.dyn_columns.push(DynColumn {
+            name: "k".into(),
+            field_type,
+            cells: vec![cell],
+            validity,
+        });
+        batch
+    }
+
+    #[test]
+    fn well_formed_columns_of_every_type_pass() {
+        for (ty, cell) in [
+            (FieldType::Str, AttrValue::Str("v".into())),
+            (FieldType::I64, AttrValue::I64(1)),
+            (FieldType::F64, AttrValue::F64(1.5)),
+            (FieldType::Bool, AttrValue::Bool(true)),
+            (FieldType::Bytes, AttrValue::Bytes(vec![1])),
+            (FieldType::Bytes, AttrValue::List(vec![AttrValue::I64(1)])),
+            (
+                FieldType::Bytes,
+                AttrValue::Map(vec![("a".into(), AttrValue::I64(1))]),
+            ),
+        ] {
+            one_cell_batch(ty, cell).validate().expect("well-formed");
+        }
+    }
+
+    /// A Bool column with two present rows and cells `[Bool, I64]`. Before
+    /// the type check, this passed validate; `write_block_columnar` kept two
+    /// present bits but wrote one value (it filters cells by the column's
+    /// type), and the second row read back `false` from an immutable object.
+    #[test]
+    fn bool_column_with_a_non_bool_cell_is_rejected() {
+        let mut batch = minimal_batch(2);
+        let mut validity = Bitmap::new();
+        validity.push(true);
+        validity.push(true);
+        batch.dyn_columns.push(DynColumn {
+            name: "flag".into(),
+            field_type: FieldType::Bool,
+            cells: vec![AttrValue::Bool(true), AttrValue::I64(1)],
+            validity,
+        });
+        assert_malformed(
+            batch.validate(),
+            "dyn column \"flag\" (index 0x0) cell 1 has type I64 but the column's field_type is Bool",
+        );
+    }
+
+    #[test]
+    fn i64_column_with_a_non_i64_cell_is_rejected() {
+        let batch = one_cell_batch(FieldType::I64, AttrValue::Str("x".into()));
+        assert_malformed(
+            batch.validate(),
+            "dyn column \"k\" (index 0x0) cell 0 has type Str but the column's field_type is I64",
+        );
+    }
+
+    #[test]
+    fn str_column_with_a_list_cell_is_rejected() {
+        let batch = one_cell_batch(FieldType::Str, AttrValue::List(Vec::new()));
+        assert_malformed(
+            batch.validate(),
+            "cell 0 has type Bytes but the column's field_type is Str",
+        );
+    }
+
+    fn with_dict(
+        mut batch: ColumnarLogBatch,
+        distinct: Vec<&[u8]>,
+        ids: Vec<u32>,
+    ) -> ColumnarLogBatch {
+        batch.dyn_col_dicts = vec![Some(StrColumnDict {
+            distinct: distinct.into_iter().map(<[u8]>::to_vec).collect(),
+            ids,
+        })];
+        batch
+    }
+
+    /// The dictionary names a value other than its cell's: the value page
+    /// would hold "other" while postings and stats are computed from "v".
+    #[test]
+    fn dictionary_entry_differing_from_its_cell_is_rejected() {
+        let batch = with_dict(
+            one_cell_batch(FieldType::Str, AttrValue::Str("v".into())),
+            vec![b"other"],
+            vec![0],
+        );
+        assert_malformed(
+            batch.validate(),
+            "dyn column \"k\" (index 0x0) dictionary id[0x0] is 0x0 but distinct[0x0] differs from the cell's bytes",
+        );
+        let batch = with_dict(
+            one_cell_batch(FieldType::Bytes, AttrValue::Bytes(vec![1, 2])),
+            vec![&[1, 3]],
+            vec![0],
+        );
+        assert_malformed(batch.validate(), "differs from the cell's bytes");
+    }
+
+    #[test]
+    fn matching_dictionary_passes_and_list_cells_are_not_compared() {
+        with_dict(
+            one_cell_batch(FieldType::Str, AttrValue::Str("v".into())),
+            vec![b"v", b"unused"],
+            vec![0],
+        )
+        .validate()
+        .expect("matching dictionary");
+        with_dict(
+            one_cell_batch(FieldType::Bytes, AttrValue::List(Vec::new())),
+            vec![b"whatever"],
+            vec![0],
+        )
+        .validate()
+        .expect("List cell in a Bytes column is documented as unchecked");
+    }
+
+    #[test]
+    fn dictionary_with_more_ids_than_cells_is_rejected() {
+        let batch = with_dict(
+            one_cell_batch(FieldType::Str, AttrValue::Str("v".into())),
+            vec![b"v"],
+            vec![0, 0],
+        );
+        assert_malformed(batch.validate(), "dictionary has 2 ids but 1 present cells");
+    }
+
+    #[test]
+    fn fewer_dictionaries_than_columns_is_rejected() {
+        let mut batch = one_cell_batch(FieldType::Str, AttrValue::Str("v".into()));
+        batch.dyn_columns.push(batch.dyn_columns[0].clone());
+        batch.dyn_col_dicts = vec![None];
+        assert_malformed(
+            batch.validate(),
+            "dyn_col_dicts has 1 entries but dyn_columns has 2",
+        );
+    }
+
+    #[test]
+    fn dyn_column_with_more_cells_than_present_bits_is_rejected() {
+        let mut batch = one_cell_batch(FieldType::I64, AttrValue::I64(1));
+        batch.dyn_columns[0].cells.push(AttrValue::I64(2));
+        assert_malformed(
+            batch.validate(),
+            "has 2 cells but validity marks 1 rows present",
+        );
+    }
+
+    #[test]
+    fn dyn_column_validity_shorter_than_num_rows_is_rejected() {
+        let mut batch = minimal_batch(2);
+        let mut validity = Bitmap::new();
+        validity.push(true);
+        batch.dyn_columns.push(DynColumn {
+            name: "k".into(),
+            field_type: FieldType::I64,
+            cells: vec![AttrValue::I64(1)],
+            validity,
+        });
+        assert_malformed(
+            batch.validate(),
+            "validity describes 1 rows but num_rows is 2",
+        );
+    }
+
+    #[test]
+    fn duplicate_stream_id_with_identical_blobs_is_rejected() {
+        let mut batch = minimal_batch(1);
+        batch.stream_ids = vec![wide_id(0), wide_id(0)];
+        batch.stream_attrs = vec![wide_attrs_blob(0), wide_attrs_blob(0)];
+        assert_malformed(batch.validate(), "stream_ids[0x1] repeats stream");
+    }
+
+    /// Trace ids are 16 bytes per present row: one byte too few and one too
+    /// many must each be refused, so a comparison with the wrong direction
+    /// fails one of the two.
+    #[test]
+    fn trace_id_one_byte_off_either_way_is_rejected() {
+        for bytes in [15usize, 17] {
+            let mut batch = minimal_batch(1);
+            batch.trace_id_validity = Bitmap::new();
+            batch.trace_id_validity.push(true);
+            batch.trace_id = vec![0u8; bytes];
+            assert_malformed(batch.validate(), &format!("trace_id holds {bytes} bytes"));
+        }
+    }
+
+    #[test]
+    fn span_id_one_byte_off_either_way_is_rejected() {
+        for bytes in [7usize, 9] {
+            let mut batch = minimal_batch(1);
+            batch.span_id_validity = Bitmap::new();
+            batch.span_id_validity.push(true);
+            batch.span_id = vec![0u8; bytes];
+            assert_malformed(batch.validate(), &format!("span_id holds {bytes} bytes"));
+        }
     }
 }

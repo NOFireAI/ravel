@@ -54,12 +54,17 @@ pub enum LogSegError {
     /// does not match its present rows; `stream_ids` and `stream_attrs` of
     /// different lengths; a repeated id within `stream_ids`; a `stream_refs`
     /// value at or past `stream_ids.len()`; a `dyn_columns` entry whose
-    /// `validity` does not describe `num_rows` rows or whose `cells` count
-    /// does not match `validity`'s present count; a `dyn_col_dicts` that is
-    /// non-empty but not one entry per dyn column, or a present dictionary
-    /// whose `ids` is not parallel to its column's present cells or holds an
-    /// id at or past its own `distinct.len()`. A caller-side input error, not
-    /// a stream id collision and not object corruption.
+    /// `validity` does not describe `num_rows` rows, whose `cells` count does
+    /// not match `validity`'s present count, or one of whose cells has a type
+    /// other than the column's `field_type`; a `dyn_col_dicts` that is
+    /// non-empty but not one entry per dyn column; a present dictionary whose
+    /// `ids` is not parallel to its column's present cells, holds an id at or
+    /// past its own `distinct.len()`, or names a `distinct` entry that differs
+    /// from its cell's bytes (`Str` cells, and `Bytes` cells that are not a
+    /// `List` or `Map`). Not covered, see `validate`: duplicate
+    /// `(name, field_type)` columns, more than 4 GiB in one `VarBytes`, and
+    /// dictionary contents for `List`/`Map` cells. A caller-side input error,
+    /// not a stream id collision and not object corruption.
     #[error("malformed columnar batch: {0}")]
     MalformedColumnarBatch(String),
     /// The sort descriptor handed to the writer cannot be recorded for this
