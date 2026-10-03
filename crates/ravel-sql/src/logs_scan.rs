@@ -8916,3 +8916,434 @@ mod carried_directory_reservation_tests {
         assert_eq!(budget.reserved(), 0);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod fast_path_prefetch_tests {
+    //! ADR-2414 decision A2: on the ranged whole-segment fast path a partition
+    //! issues its next owned segments' opens while the current one opens and
+    //! decodes, at most its share of the GET permits at once, and consumes
+    //! them in owned order.
+
+    use std::time::Duration;
+
+    use super::*;
+    use datafusion::arrow::array::TimestampNanosecondArray;
+    use datafusion::physical_plan::ExecutionPlan;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_logseg::{ObjectIdentity, RlogConfig, RlogWriter};
+    use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_query::BlockRangeFetcher;
+    use ravel_types::accounting::QueryAccountingSnapshot;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([9u8; 16]);
+    const BLOCKS: i64 = 4;
+    const SEGMENTS: usize = 6;
+    /// Segment `i` holds timestamps `i * SPAN .. i * SPAN + BLOCKS`.
+    const SPAN: i64 = 100;
+
+    /// Segment `seq`'s object: `BLOCKS` one-record blocks. With
+    /// `overflow_last`, the last block carries a second attribute past a
+    /// one-column dynamic budget, so it alone has an `attrs_raw` page and the
+    /// columnar drain falls back to one row-path reopen on it.
+    fn object(seq: usize, overflow_last: bool) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            max_dynamic_columns: 1,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: TENANT.0,
+            shard: 0,
+            writer_id: [4u8; 16],
+            writer_epoch: 1,
+            writer_seq: seq as u64 + 1,
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut writer = RlogWriter::new(cfg, identity);
+        for j in 0..BLOCKS {
+            let ts = seq as i64 * SPAN + j;
+            let mut attrs = vec![("a".to_string(), AttrValue::Str(format!("a{ts}")))];
+            if overflow_last && j == BLOCKS - 1 {
+                attrs.push(("b".to_string(), AttrValue::Str(format!("b{ts}"))));
+            }
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("row {ts} {}", "payload ".repeat(16)),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs,
+                })
+                .expect("push");
+        }
+        writer.finish().expect("finish")
+    }
+
+    fn key(seq: usize) -> String {
+        format!("t/pf{seq}.rlog")
+    }
+
+    /// `SEGMENTS` segments in one store, segment `overflow` (if any) built
+    /// with an overflowing last block.
+    async fn fixture(overflow: Option<usize>) -> (Arc<FaultStore<MemoryStore>>, Vec<SegmentRef>) {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let mut segments = Vec::new();
+        for seq in 0..SEGMENTS {
+            let obj = object(seq, overflow == Some(seq));
+            store
+                .put(
+                    &key(seq),
+                    bytes::Bytes::from(obj.clone()),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+            segments.push(SegmentRef {
+                data_object_key: key(seq),
+                object_size: obj.len() as u64,
+                min_event_ts_ns: seq as i64 * SPAN,
+                max_event_ts_ns: seq as i64 * SPAN + BLOCKS - 1,
+                ingest_hour_bucket: 0,
+                sample_count: BLOCKS as u64,
+                series_count: 0,
+                shard: 0,
+                content_hash: [seq as u8 + 1; 32],
+                writer_id: Uuid::from_u128(4),
+                writer_epoch: 1,
+                writer_seq: seq as u64 + 1,
+                created_unix_ns: 0,
+                level: SegmentLevel::L0,
+                segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+                declared_column_stats: Default::default(),
+            });
+        }
+        (store, segments)
+    }
+
+    /// A `ts`-only scan over `segments` at `partitions` partitions, whose
+    /// fetcher has `permits` GET permits and routes every segment ranged.
+    /// The window contains every segment and there is no predicate, so the
+    /// whole-segment fast path runs; partition 0 owns segments 0, 2 and 4
+    /// at two partitions.
+    fn exec(
+        store: &Arc<FaultStore<MemoryStore>>,
+        segments: &[SegmentRef],
+        partitions: usize,
+        permits: usize,
+        accounting: PhaseAccounting,
+    ) -> LogsScanExec {
+        let store = Arc::clone(store) as Arc<dyn ObjectStoreBackend>;
+        let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
+            .with_block_range(
+                BlockRangeFetcher::new(store)
+                    .with_suffix_len(256)
+                    .with_whole_object_threshold(0),
+            )
+            .with_block_range_threshold(0)
+            .with_max_concurrent_gets(permits);
+        LogsScanExec::new(
+            TENANT,
+            fetcher,
+            segments,
+            partitions,
+            0,
+            SEGMENTS as i64 * SPAN,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Some(&vec![crate::logs_schema::LOG_COL_TS]),
+            accounting,
+            crate::logs_schema::logs_schema_with_declared(&[]),
+            Arc::new(Vec::new()),
+        )
+        .expect("scan")
+        .with_segment_timing(true)
+    }
+
+    fn timestamps(batches: &[RecordBatch]) -> Vec<i64> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("ts column")
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn metric_total(plan: &dyn ExecutionPlan, name: &str) -> usize {
+        plan.metrics()
+            .expect("metrics")
+            .iter()
+            .filter(|m| m.value().name() == name && m.labels().is_empty())
+            .map(|m| m.value().as_usize())
+            .sum()
+    }
+
+    /// Whether segment `ordinal`'s open has resolved: its
+    /// `seg_open_ready_offset` timeline point exists.
+    fn opened(plan: &dyn ExecutionPlan, ordinal: usize) -> bool {
+        let label = ordinal.to_string();
+        plan.metrics().expect("metrics").iter().any(|m| {
+            m.value().name() == "seg_open_ready_offset"
+                && m.labels()
+                    .iter()
+                    .any(|l| l.name() == "segment" && l.value() == label)
+        })
+    }
+
+    fn held_on(gate: &GateHandle, seq: usize) -> bool {
+        let k = key(seq);
+        gate.held_details().iter().any(|(_, _, held)| *held == k)
+    }
+
+    /// Yields to the partition task until segment `ordinal` has opened.
+    async fn wait_opened(plan: &dyn ExecutionPlan, ordinal: usize) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !opened(plan, ordinal) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("segment {ordinal} never opened"));
+    }
+
+    /// Releases every held call until the task it is spawned beside ends.
+    fn release_all(gate: GateHandle) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                gate.wait_until_held(1).await;
+                for id in gate.held() {
+                    gate.release(id);
+                }
+            }
+        })
+    }
+
+    /// Partition 0's rows and scan-phase accounting with the pipeline off: a
+    /// pushed fetch no row count reaches disables it, and stops nothing.
+    async fn sequential(
+        overflow: Option<usize>,
+        permits: usize,
+    ) -> (Vec<i64>, usize, QueryAccountingSnapshot) {
+        let (store, segments) = fixture(overflow).await;
+        let accounting = PhaseAccounting::new();
+        let plan = exec(&store, &segments, 2, permits, accounting.clone())
+            .with_fetch(Some(usize::MAX))
+            .expect("fetch pushdown");
+        let batches: Vec<RecordBatch> = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .map(|b| b.expect("batch"))
+            .collect()
+            .await;
+        (
+            timestamps(&batches),
+            metric_total(plan.as_ref(), "segments_opened"),
+            accounting.scan().snapshot(),
+        )
+    }
+
+    /// With the first segment's GETs held, the second segment opens
+    /// completely and the third is not issued: two opens, the share, are
+    /// held at once. Released, the rows, the segments opened and the
+    /// scan-phase accounting equal the sequential walk's, rows first segment
+    /// first.
+    ///
+    /// Fails against no prefetch (segment 2 never opens under the hold),
+    /// against unbounded prefetch (segment 4's GET is held), and against
+    /// emitting segments in completion order (segment 2, opened first, would
+    /// lead the rows).
+    async fn prefetches_within_the_share(partitions: usize, permits: usize) {
+        let (store, segments) = fixture(None).await;
+        let gate = store.hold(Op::Get, Some(key(0)), Occurrence::Always);
+        store.hold(Op::Get, Some(key(4)), Occurrence::Always);
+        let accounting = PhaseAccounting::new();
+        let plan = Arc::new(exec(
+            &store,
+            &segments,
+            partitions,
+            permits,
+            accounting.clone(),
+        ));
+        let stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let task =
+            tokio::spawn(
+                async move { stream.map(|b| b.expect("batch")).collect::<Vec<_>>().await },
+            );
+
+        gate.wait_until_held(1).await;
+        assert!(held_on(&gate, 0), "segment 0's first GET is held");
+        wait_opened(plan.as_ref(), 2).await;
+        for _ in 0..64 {
+            tokio::task::yield_now().await;
+        }
+        assert!(held_on(&gate, 0), "segment 0 is still held");
+        assert!(
+            !held_on(&gate, 4) && !opened(plan.as_ref(), 4),
+            "segment 4 is not issued while segments 0 and 2 hold the share"
+        );
+
+        let releaser = release_all(gate);
+        let batches = task.await.expect("partition task");
+        releaser.abort();
+
+        let (rows, opened_segments, scan) = sequential(None, permits).await;
+        assert_eq!(
+            rows,
+            vec![0, 1, 2, 3, 200, 201, 202, 203, 400, 401, 402, 403],
+            "the sequential walk's rows, segment 0 first"
+        );
+        assert_eq!(timestamps(&batches), rows);
+        assert_eq!(metric_total(plan.as_ref(), "segments_opened"), 3);
+        assert_eq!(opened_segments, 3);
+        let piped = accounting.scan().snapshot();
+        assert_eq!(piped.data_objects_touched, 3);
+        assert_eq!(piped.logs_ranged_opens, 3);
+        assert_eq!(
+            piped, scan,
+            "scan-phase accounting equals the sequential walk's"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_partition_prefetches_its_next_segments_ranges() {
+        // Four permits at two partitions: a share of 2, with permits to spare
+        // so the limiter cannot be what stops segment 4.
+        assert_eq!(fast_path_prefetch_share(4, 2), 2);
+        prefetches_within_the_share(2, 4).await;
+    }
+
+    /// Two permits at two partitions is a share of 1, floored at 2: the next
+    /// segment still opens under the hold. Fails against a share without the
+    /// floor, where segment 2 never opens.
+    #[tokio::test]
+    async fn the_share_is_at_least_two() {
+        assert_eq!(fast_path_prefetch_share(2, 2), 2);
+        prefetches_within_the_share(2, 2).await;
+    }
+
+    /// With the second segment's GETs held, every row of the first is emitted:
+    /// its decode is not waiting on the prefetch.
+    ///
+    /// Fails against an implementation that waits for the prefetches before
+    /// draining the current segment (the first batch never arrives).
+    #[tokio::test]
+    async fn the_current_segment_drains_while_the_next_is_held() {
+        let (store, segments) = fixture(None).await;
+        let gate = store.hold(Op::Get, Some(key(2)), Occurrence::Always);
+        let plan = exec(&store, &segments, 2, 4, PhaseAccounting::new());
+        let mut stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let mut rows = Vec::new();
+        while rows.len() < BLOCKS as usize {
+            let batch = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("segment 0 drains under the hold")
+                .expect("a batch")
+                .expect("batch");
+            rows.extend(timestamps(&[batch]));
+        }
+        assert_eq!(rows, vec![0, 1, 2, 3]);
+        assert!(held_on(&gate, 2), "segment 2's GET is still held");
+
+        let releaser = release_all(gate);
+        let rest: Vec<RecordBatch> = stream.map(|b| b.expect("batch")).collect().await;
+        releaser.abort();
+        assert_eq!(
+            timestamps(&rest),
+            vec![200, 201, 202, 203, 400, 401, 402, 403]
+        );
+    }
+
+    /// The second owned segment falls back to the row path for its last block
+    /// while the third's open is in flight behind it: the reopen is the one
+    /// sequential open, the third segment's prefetch is consumed after it, and
+    /// every row comes once, in order.
+    ///
+    /// Fails against a reopen that drops the in-flight prefetches (segment 4's
+    /// rows are missing) and against counting the reopened segment again
+    /// (`segments_opened` reads 4).
+    #[tokio::test]
+    async fn a_fallback_reopen_drains_the_prefetches_behind_it() {
+        let (store, segments) = fixture(Some(2)).await;
+        let gate = store.hold(Op::Get, Some(key(4)), Occurrence::Always);
+        let plan = exec(&store, &segments, 2, 4, PhaseAccounting::new());
+        let mut stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let mut rows = Vec::new();
+        while rows.len() < 2 * BLOCKS as usize {
+            let batch = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("segments 0 and 2 drain under the hold")
+                .expect("a batch")
+                .expect("batch");
+            rows.extend(timestamps(&[batch]));
+        }
+        assert!(
+            held_on(&gate, 4),
+            "segment 4's open was issued before segment 2 finished"
+        );
+        assert_eq!(
+            metric_total(&plan, "reopens"),
+            1,
+            "one reopen, on segment 2"
+        );
+
+        let releaser = release_all(gate);
+        let rest: Vec<RecordBatch> = stream.map(|b| b.expect("batch")).collect().await;
+        releaser.abort();
+        rows.extend(timestamps(&rest));
+        assert_eq!(
+            rows,
+            vec![0, 1, 2, 3, 200, 201, 202, 203, 400, 401, 402, 403]
+        );
+        assert_eq!(metric_total(&plan, "reopens"), 1);
+        assert_eq!(metric_total(&plan, "segments_opened"), 3);
+        let (sequential_rows, _, _) = sequential(Some(2), 4).await;
+        assert_eq!(rows, sequential_rows);
+    }
+
+    /// A prefetched open's error surfaces at that segment's turn, after the
+    /// segments before it have emitted every row.
+    #[tokio::test]
+    async fn a_prefetch_error_surfaces_at_its_own_segment() {
+        let (store, mut segments) = fixture(None).await;
+        segments[2].segment_format_version = u32::MAX;
+        let plan = exec(&store, &segments, 2, 4, PhaseAccounting::new());
+        let mut stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let mut rows = Vec::new();
+        let err = loop {
+            match stream.next().await.expect("an item before the end") {
+                Ok(batch) => rows.extend(timestamps(&[batch])),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(rows, vec![0, 1, 2, 3], "segment 0 is emitted whole first");
+        assert!(
+            err.to_string().contains(&key(2)),
+            "the error names segment 2: {err}"
+        );
+    }
+}
