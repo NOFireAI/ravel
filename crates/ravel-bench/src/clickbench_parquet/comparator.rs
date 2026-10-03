@@ -124,6 +124,15 @@ pub enum ComparatorError {
     },
     #[error("ORDER BY key column index {index} is out of range for a {width}-column result")]
     OrderKeyIndexOutOfRange { index: usize, width: usize },
+    #[error(
+        "order_key_columns names column {column:?}, which appears more than once in the {side} \
+         output schema and so cannot be resolved to a single position"
+    )]
+    DuplicateOrderKeyColumn { column: String, side: &'static str },
+    #[error(
+        "column {index}: decimal scale {scale} is negative, which this comparator does not support"
+    )]
+    NegativeDecimalScale { index: usize, scale: i8 },
 }
 
 /// The tie-breaking key and truncation shape ADR-2040 D7 compares under: the
@@ -536,6 +545,9 @@ fn parse_rfc3339_to_ns(index: usize, value: &str) -> Result<i64, ComparatorError
 /// fractional digits is a precision loss this comparator refuses rather
 /// than silently rounding.
 fn parse_decimal_text(index: usize, text: &str, scale: i8) -> Result<i128, ComparatorError> {
+    if scale < 0 {
+        return Err(ComparatorError::NegativeDecimalScale { index, scale });
+    }
     let fail = || ComparatorError::InvalidJsonCell {
         index,
         value: text.to_string(),
@@ -595,6 +607,13 @@ pub fn json_cell(
         ColumnKind::Int => {
             if let Some(i) = value.as_i64() {
                 Ok(Cell::Int(i as i128))
+            } else if let Some(u) = value.as_u64() {
+                // A JSON integer above `i64::MAX` still fits an unsigned
+                // column's width (e.g. `UInt64`, widened to `i128` the same
+                // as every other integer width): accept it rather than
+                // refusing solely because it overflowed the signed probe
+                // above.
+                Ok(Cell::Int(u as i128))
             } else {
                 value
                     .as_str()
@@ -859,6 +878,18 @@ pub fn resolve_order_key_columns(
     names
         .iter()
         .map(|name| {
+            if subject_columns.iter().filter(|c| *c == name).count() > 1 {
+                return Err(ComparatorError::DuplicateOrderKeyColumn {
+                    column: name.clone(),
+                    side: "subject",
+                });
+            }
+            if reference_columns.iter().filter(|c| *c == name).count() > 1 {
+                return Err(ComparatorError::DuplicateOrderKeyColumn {
+                    column: name.clone(),
+                    side: "reference",
+                });
+            }
             let subject_index =
                 subject_columns
                     .iter()
@@ -2445,6 +2476,102 @@ mod tests {
             "a bit-equal tie at the cut is exempt from content comparison"
         );
         assert_eq!(report.tie_rows_reduced, 2);
+    }
+
+    /// Required test (D2b): the declared-reason cardinality path (Q25/Q27's
+    /// `compare = "cardinality"` form, where `cardinality_reason` is `Some`
+    /// regardless of `limit`/`key`) still fails on a differing row count,
+    /// same as the LIMIT-with-no-key cardinality path already covered by
+    /// `cardinality_only_with_different_row_counts_fails`.
+    #[test]
+    fn declared_cardinality_reason_with_different_row_counts_fails() {
+        let reference = vec![vec![Cell::Int(1)], vec![Cell::Int(2)], vec![Cell::Int(3)]];
+        let subject = vec![vec![Cell::Int(1)], vec![Cell::Int(2)]];
+        let tie = TieSpec {
+            key: vec![0],
+            limit: Some(3),
+            offset: 0,
+            cardinality_reason: Some("ORDER BY key not projected".to_string()),
+        };
+        let report = compare(&reference, &subject, &tie, None).expect("compare");
+        assert_eq!(report.verdict, Verdict::Fail);
+    }
+
+    /// Required test (D2c): the same float multiset fed on the subject side
+    /// in two different row orders (as an unordered `GROUP BY` may return
+    /// them) must pair identically and produce the same verdict and
+    /// mismatches. Must go red if pairing used subject arrival order instead
+    /// of the shape-grouped, bit-sorted pairing `compare_multiset` performs.
+    #[test]
+    fn float_pairing_is_independent_of_subject_row_order() {
+        let reference = vec![
+            vec![Cell::Int(1), Cell::Float(1.0_f64.to_bits())],
+            vec![Cell::Int(1), Cell::Float(2.0_f64.to_bits())],
+            vec![Cell::Int(1), Cell::Float(3.0_f64.to_bits())],
+        ];
+        let subject_order_a = vec![
+            vec![Cell::Int(1), Cell::Float(1.5_f64.to_bits())],
+            vec![Cell::Int(1), Cell::Float(2.5_f64.to_bits())],
+            vec![Cell::Int(1), Cell::Float(3.5_f64.to_bits())],
+        ];
+        let subject_order_b = vec![
+            vec![Cell::Int(1), Cell::Float(3.5_f64.to_bits())],
+            vec![Cell::Int(1), Cell::Float(1.5_f64.to_bits())],
+            vec![Cell::Int(1), Cell::Float(2.5_f64.to_bits())],
+        ];
+        let report_a =
+            compare(&reference, &subject_order_a, &tie(vec![], None, 0), None).expect("compare");
+        let report_b =
+            compare(&reference, &subject_order_b, &tie(vec![], None, 0), None).expect("compare");
+        assert_eq!(
+            report_a, report_b,
+            "pairing must depend on sorted float bits within a shared shape, not arrival order"
+        );
+    }
+
+    /// Required test (D2d): `order_key_columns` naming a column that appears
+    /// more than once in a schema is a typed error, never silently resolved
+    /// to the first match (which could be the wrong position on a schema
+    /// that genuinely has two same-named columns).
+    #[test]
+    fn duplicate_order_key_column_name_is_typed_error() {
+        let subject_columns = vec!["a".to_string(), "b".to_string(), "b".to_string()];
+        let reference_columns = vec!["a".to_string(), "b".to_string()];
+        let err =
+            resolve_order_key_columns(&["b".to_string()], &subject_columns, &reference_columns)
+                .expect_err("b appears twice in the subject schema");
+        assert_eq!(
+            err,
+            ComparatorError::DuplicateOrderKeyColumn {
+                column: "b".to_string(),
+                side: "subject",
+            }
+        );
+    }
+
+    /// Required test (D2e): a negative `Decimal128` scale is a typed error,
+    /// never `scale as usize`, which wraps a negative `i8` into an enormous
+    /// `usize` and would try to pad the digit string to that length.
+    #[test]
+    fn negative_decimal_scale_is_typed_error_not_panic() {
+        let err = parse_decimal_text(0, "123", -2).expect_err("negative scale is refused");
+        assert_eq!(
+            err,
+            ComparatorError::NegativeDecimalScale {
+                index: 0,
+                scale: -2
+            }
+        );
+    }
+
+    /// Required test (D2f): a JSON integer above `i64::MAX` that still fits
+    /// a `u64`-width column is accepted, not refused merely because the
+    /// signed probe overflowed.
+    #[test]
+    fn json_integer_above_i64_max_fitting_u64_is_accepted() {
+        let value: serde_json::Value = serde_json::from_str("18446744073709551615").unwrap();
+        let cell = json_cell(0, &value, ColumnKind::Int).expect("fits a u64 column");
+        assert_eq!(cell, Cell::Int(u64::MAX as i128));
     }
 
     /// D3d: build every one of the frozen corpus's 43 statements' `TieSpec`
