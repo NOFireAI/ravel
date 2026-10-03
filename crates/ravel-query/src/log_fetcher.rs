@@ -1155,6 +1155,24 @@ impl LogSegmentFetcher {
             })
     }
 
+    /// Reserves [`SegmentDirectories::decoded_bytes`] of `dirs` against this
+    /// fetcher's memory budget, the budget a [`CarriedWholeObject`]'s bytes
+    /// are reserved against, for a caller that keeps `dirs` resident across a
+    /// query (ADR-2414 decision A1: `ravel_sql::logs_scan` holds each planned
+    /// segment's directories for the opens that follow). The guard releases
+    /// the bytes when it drops, so the holder keeps it for as long as it keeps
+    /// `dirs`. A refusal is [`LogFetchError::FetchMemoryExhausted`], the error
+    /// a refused whole-object reservation reports.
+    ///
+    /// Taken after the decode, not before as a whole-object GET's is, because
+    /// the directories' size is known only once they are decoded.
+    pub fn reserve_carried_directories(
+        &self,
+        dirs: &SegmentDirectories,
+    ) -> Result<ravel_memory::Reservation, LogFetchError> {
+        self.reserve_fetch(dirs.decoded_bytes())
+    }
+
     /// This fetcher's own limiter (bounds `fetch_accounted` and
     /// `whole_object_bytes`), for a test to `Arc::ptr_eq` against another
     /// fetcher's or an engine's, proving two fetchers actually share one
