@@ -297,21 +297,45 @@ fn cell_from_array(array: &dyn Array, row: usize, index: usize) -> Result<Cell, 
         LargeBinary => Cell::Bytes(array.as_binary::<i64>().value(row).to_vec()),
         BinaryView => Cell::Bytes(array.as_binary_view().value(row).to_vec()),
         Date32 => Cell::Date(array.as_primitive::<Date32Type>().value(row)),
-        // Date64 is milliseconds since the epoch; narrowed to whole days.
-        Date64 => Cell::Date((array.as_primitive::<Date64Type>().value(row) / 86_400_000) as i32),
+        Date64 => {
+            // Date64 is milliseconds since the epoch; narrowed to whole days
+            // by floor division (`div_euclid`, not `/`, so a negative
+            // millisecond value narrows toward the earlier day rather than
+            // toward zero).
+            let ms = array.as_primitive::<Date64Type>().value(row);
+            let days = ms.div_euclid(86_400_000);
+            let days32 = i32::try_from(days).map_err(|_| ComparatorError::InvalidDate {
+                index,
+                value: ms.to_string(),
+                reason: "day count out of range for a 32-bit day index".to_string(),
+            })?;
+            Cell::Date(days32)
+        }
         Timestamp(unit, _tz) => {
-            let ns = match unit {
-                TimeUnit::Second => {
-                    array.as_primitive::<TimestampSecondType>().value(row) * 1_000_000_000
+            let (raw, factor): (i64, i64) = match unit {
+                TimeUnit::Second => (
+                    array.as_primitive::<TimestampSecondType>().value(row),
+                    1_000_000_000,
+                ),
+                TimeUnit::Millisecond => (
+                    array.as_primitive::<TimestampMillisecondType>().value(row),
+                    1_000_000,
+                ),
+                TimeUnit::Microsecond => (
+                    array.as_primitive::<TimestampMicrosecondType>().value(row),
+                    1_000,
+                ),
+                TimeUnit::Nanosecond => {
+                    (array.as_primitive::<TimestampNanosecondType>().value(row), 1)
                 }
-                TimeUnit::Millisecond => {
-                    array.as_primitive::<TimestampMillisecondType>().value(row) * 1_000_000
-                }
-                TimeUnit::Microsecond => {
-                    array.as_primitive::<TimestampMicrosecondType>().value(row) * 1_000
-                }
-                TimeUnit::Nanosecond => array.as_primitive::<TimestampNanosecondType>().value(row),
             };
+            let ns = raw
+                .checked_mul(factor)
+                .ok_or_else(|| ComparatorError::InvalidTimestamp {
+                    index,
+                    value: raw.to_string(),
+                    reason: "scaling to nanoseconds overflowed i64".to_string(),
+                })?;
             Cell::Ts(ns)
         }
         Decimal128(_, scale) => {
@@ -358,15 +382,33 @@ pub fn schema_kinds(batch: &RecordBatch) -> Result<Vec<ColumnKind>, ComparatorEr
 /// Howard Hinnant's `days_from_civil`: days since the Unix epoch for a
 /// proleptic-Gregorian calendar date. No dependency on a calendar crate
 /// (`chrono` is not a workspace dependency); this is the standard
-/// constant-time algorithm, valid for every `i64` year.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
+/// constant-time algorithm. Every intermediate step is checked: a year far
+/// enough from the epoch makes the era or day-of-era multiplication overflow
+/// `i64`, and that is reported as `None` rather than wrapping, so the caller
+/// can turn it into a typed error instead of returning a wrong day count.
+fn days_from_civil_checked(y: i64, m: i64, d: i64) -> Option<i64> {
+    let y_adj = if m <= 2 { y.checked_sub(1)? } else { y };
+    let era_base = if y_adj >= 0 {
+        y_adj
+    } else {
+        y_adj.checked_sub(399)?
+    };
+    let era = era_base / 400;
+    let yoe = y_adj.checked_sub(era.checked_mul(400)?)?;
     let mp = (m + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    let doy = (153i64.checked_mul(mp)?.checked_add(2)?) / 5 + d - 1;
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe / 4)?
+        .checked_sub(yoe / 100)?
+        .checked_add(doy)?;
+    era.checked_mul(146097)?.checked_add(doe)?.checked_sub(719468)
+}
+
+const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
 fn parse_date_to_days(index: usize, value: &str) -> Result<i32, ComparatorError> {
@@ -382,7 +424,20 @@ fn parse_date_to_days(index: usize, value: &str) -> Result<i32, ComparatorError>
     let y: i64 = parts[0].parse().map_err(|_| fail("non-numeric year"))?;
     let m: i64 = parts[1].parse().map_err(|_| fail("non-numeric month"))?;
     let d: i64 = parts[2].parse().map_err(|_| fail("non-numeric day"))?;
-    Ok(days_from_civil(y, m, d) as i32)
+    if !(1..=12).contains(&m) {
+        return Err(fail("month out of range 1..=12"));
+    }
+    let max_day = if m == 2 && is_leap_year(y) {
+        29
+    } else {
+        DAYS_IN_MONTH[(m - 1) as usize]
+    };
+    if d < 1 || d > max_day {
+        return Err(fail("day out of range for its month"));
+    }
+    let days =
+        days_from_civil_checked(y, m, d).ok_or_else(|| fail("date arithmetic overflowed i64"))?;
+    i32::try_from(days).map_err(|_| fail("day count out of range for a 32-bit day index"))
 }
 
 /// Strip a trailing `Z`/`z` or a `+00:00`/`-00:00` offset. D7 compares
@@ -395,7 +450,7 @@ fn strip_zero_offset(index: usize, time_part: &str) -> Result<&str, ComparatorEr
     }
     if let Some(pos) = time_part.rfind(['+', '-']) {
         let offset = &time_part[pos..];
-        if offset == "+00:00" || offset == "-00:00" {
+        if offset == "+00:00" || offset == "-00:00" || offset == "+0000" || offset == "-0000" {
             return Ok(&time_part[..pos]);
         }
         return Err(ComparatorError::InvalidTimestamp {
@@ -419,6 +474,15 @@ fn parse_rfc3339_to_ns(index: usize, value: &str) -> Result<i64, ComparatorError
     let days = parse_date_to_days(index, date_part)?;
     let (hms, nanos) = match time_part.split_once('.') {
         Some((hms, frac)) => {
+            // Validate every byte is an ASCII digit before slicing: frac may
+            // legitimately carry more than 9 digits (truncated to ns below),
+            // but a non-ASCII byte in it must never be sliced through (that
+            // can land mid-character and panic), and trailing non-digit
+            // junk must be refused rather than silently dropped by the
+            // truncation.
+            if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(fail("fraction must be one or more ASCII digits"));
+            }
             let digits = &frac[..frac.len().min(9)];
             let padded = format!("{digits:0<9}");
             (
@@ -435,15 +499,76 @@ fn parse_rfc3339_to_ns(index: usize, value: &str) -> Result<i64, ComparatorError
     let h: i64 = parts[0].parse().map_err(|_| fail("bad hour"))?;
     let mi: i64 = parts[1].parse().map_err(|_| fail("bad minute"))?;
     let s: i64 = parts[2].parse().map_err(|_| fail("bad second"))?;
-    let day_ns = days as i64 * 86_400_000_000_000;
-    let time_ns = (h * 3600 + mi * 60 + s) * 1_000_000_000 + nanos;
-    Ok(day_ns + time_ns)
+    if !(0..=23).contains(&h) {
+        return Err(fail("hour out of range 0..=23"));
+    }
+    if !(0..=59).contains(&mi) {
+        return Err(fail("minute out of range 0..=59"));
+    }
+    if !(0..=59).contains(&s) {
+        return Err(fail("second out of range 0..=59"));
+    }
+    let day_ns = (days as i64)
+        .checked_mul(86_400_000_000_000)
+        .ok_or_else(|| fail("date too far from the epoch to represent in nanoseconds"))?;
+    let time_ns = (h * 3600 + mi * 60 + s)
+        .checked_mul(1_000_000_000)
+        .and_then(|v| v.checked_add(nanos))
+        .ok_or_else(|| fail("time-of-day arithmetic overflowed i64"))?;
+    day_ns
+        .checked_add(time_ns)
+        .ok_or_else(|| fail("timestamp arithmetic overflowed i64"))
+}
+
+/// Parse decimal text (`[-]digits[.digits]`) directly into an unscaled
+/// `i128` at `scale`, never through `f64`: an `f64` round-trip loses
+/// precision past about 17 significant digits, which a decimal reference
+/// value can exceed. The text's fractional part must fit within `scale`
+/// digits (padded with trailing zeros if shorter); more than `scale`
+/// fractional digits is a precision loss this comparator refuses rather
+/// than silently rounding.
+fn parse_decimal_text(index: usize, text: &str, scale: i8) -> Result<i128, ComparatorError> {
+    let fail = || ComparatorError::InvalidJsonCell {
+        index,
+        value: text.to_string(),
+        kind: ColumnKind::Decimal(scale),
+    };
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (int_part, frac_part) = match unsigned.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (unsigned, ""),
+    };
+    if int_part.is_empty() || !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(fail());
+    }
+    if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(fail());
+    }
+    let scale_digits = scale as usize;
+    if frac_part.len() > scale_digits {
+        return Err(fail());
+    }
+    let mut digits = String::with_capacity(int_part.len() + scale_digits);
+    digits.push_str(int_part);
+    digits.push_str(frac_part);
+    for _ in frac_part.len()..scale_digits {
+        digits.push('0');
+    }
+    let magnitude: i128 = digits.parse().map_err(|_| fail())?;
+    Ok(if negative { -magnitude } else { magnitude })
 }
 
 /// Read one JSON reference cell, typed per `kind` (the corresponding
 /// subject column's normalized kind): a JSON number becomes `Float` when
 /// `kind` is `Float`, else `Int`; a `YYYY-MM-DD` string becomes `Date`; an
-/// RFC 3339 string becomes `Ts`.
+/// RFC 3339 string becomes `Ts`. A JSON string is never read as `Bytes`:
+/// JSON has no byte-string literal, so a `Binary` subject column paired
+/// with a JSON string reference is refused rather than silently encoding
+/// the string's UTF-8 bytes, which is how a `binary_as_string` option that
+/// did not fire on the subject side would otherwise stay invisible.
 pub fn json_cell(
     index: usize,
     value: &serde_json::Value,
@@ -478,10 +603,11 @@ pub fn json_cell(
             .as_str()
             .map(|s| Cell::Str(s.to_string()))
             .ok_or_else(invalid),
-        ColumnKind::Bytes => value
-            .as_str()
-            .map(|s| Cell::Bytes(s.as_bytes().to_vec()))
-            .ok_or_else(invalid),
+        // A JSON reference has no way to express raw bytes: a JSON string is
+        // always text, never the Binary subject column's byte string. See
+        // the function doc comment for why this must fail rather than
+        // coerce.
+        ColumnKind::Bytes => Err(invalid()),
         ColumnKind::Date => value
             .as_str()
             .ok_or_else(invalid)
@@ -493,9 +619,10 @@ pub fn json_cell(
             .and_then(|s| parse_rfc3339_to_ns(index, s))
             .map(Cell::Ts),
         ColumnKind::Decimal(scale) => value
-            .as_f64()
+            .as_str()
             .ok_or_else(invalid)
-            .map(|f| Cell::Decimal((f * 10f64.powi(scale as i32)).round() as i128, scale)),
+            .and_then(|s| parse_decimal_text(index, s, scale))
+            .map(|unscaled| Cell::Decimal(unscaled, scale)),
     }
 }
 
@@ -1317,24 +1444,249 @@ mod tests {
     }
 
     /// Required test, and distinguishing test for wrong implementation (c):
-    /// Int16 vs Int64 passes (integer width is erased by normalization),
-    /// but Utf8 vs Binary fails (treating them as the same kind would make
-    /// `binary_as_string` silently unobservable).
+    /// Int16 vs Int64 passes (integer width is erased by normalization), but
+    /// Utf8 vs Binary fails (treating them as the same kind would make
+    /// `binary_as_string` silently unobservable). Built from real Arrow
+    /// arrays of the two actual widths/types (not hand-built `Cell`
+    /// literals), so the assertion exercises `cell_from_array`'s own
+    /// width-erasure and Str/Bytes split, not just `Cell`'s `PartialEq`.
     #[test]
     fn int_width_agnostic_but_str_vs_bytes_distinct() {
-        let reference = vec![vec![Cell::Int(5)]];
-        let subject = vec![vec![Cell::Int(5)]];
+        use datafusion::arrow::array::{BinaryArray, Int16Array, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let narrow_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int16, false)]));
+        let narrow_batch = RecordBatch::try_new(
+            narrow_schema,
+            vec![Arc::new(Int16Array::from(vec![5])) as Arc<dyn Array>],
+        )
+        .expect("build Int16 batch");
+        let wide_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+        let wide_batch = RecordBatch::try_new(
+            wide_schema,
+            vec![Arc::new(Int64Array::from(vec![5])) as Arc<dyn Array>],
+        )
+        .expect("build Int64 batch");
+        let reference = rows_from_arrow(std::slice::from_ref(&narrow_batch)).expect("normalize");
+        let subject = rows_from_arrow(std::slice::from_ref(&wide_batch)).expect("normalize");
+        assert_eq!(reference, vec![vec![Cell::Int(5)]]);
+        assert_eq!(subject, vec![vec![Cell::Int(5)]]);
         let report = compare(&reference, &subject, &tie(vec![], None, 0), None).expect("compare");
         assert_eq!(report.verdict, Verdict::Pass);
 
-        let reference = vec![vec![Cell::Str("x".to_string())]];
-        let subject = vec![vec![Cell::Bytes(b"x".to_vec())]];
+        let str_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let str_batch = RecordBatch::try_new(
+            str_schema,
+            vec![Arc::new(StringArray::from(vec!["x"])) as Arc<dyn Array>],
+        )
+        .expect("build Utf8 batch");
+        let bin_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Binary, false)]));
+        let bin_batch = RecordBatch::try_new(
+            bin_schema,
+            vec![Arc::new(BinaryArray::from(vec![b"x".as_slice()])) as Arc<dyn Array>],
+        )
+        .expect("build Binary batch");
+        let reference = rows_from_arrow(std::slice::from_ref(&str_batch)).expect("normalize");
+        let subject = rows_from_arrow(std::slice::from_ref(&bin_batch)).expect("normalize");
+        assert_eq!(reference, vec![vec![Cell::Str("x".to_string())]]);
+        assert_eq!(subject, vec![vec![Cell::Bytes(b"x".to_vec())]]);
         let report = compare(&reference, &subject, &tie(vec![], None, 0), None).expect("compare");
         assert_eq!(
             report.verdict,
             Verdict::Fail,
             "Utf8 and Binary must not compare equal"
         );
+    }
+
+    /// Distinguishing test for deliverable 4a: a `Binary` subject column
+    /// paired with a JSON string reference must fail as a typed error, not
+    /// silently succeed by encoding the string as bytes. Red against the
+    /// pre-fix `json_cell`, which converted any JSON string into
+    /// `Cell::Bytes` whenever `kind` was `Bytes`, so a `binary_as_string`
+    /// option that never fired on the subject side (leaving it `Binary`)
+    /// stayed invisible: both sides would normalize to the identical
+    /// `Cell::Bytes`.
+    #[test]
+    fn json_string_against_binary_subject_is_refused() {
+        let err = json_cell(0, &serde_json::json!("hello"), ColumnKind::Bytes)
+            .expect_err("a JSON string can never be read as Bytes");
+        assert!(matches!(
+            err,
+            ComparatorError::InvalidJsonCell {
+                kind: ColumnKind::Bytes,
+                ..
+            }
+        ));
+    }
+
+    /// Distinguishing test for deliverable 4c: a fraction containing a
+    /// multi-byte UTF-8 character whose bytes straddle the 9-byte
+    /// truncation point must never panic. Red against the pre-fix
+    /// `parse_rfc3339_to_ns`, which sliced `frac[..frac.len().min(9)]` by
+    /// byte index without checking char boundaries: 8 ASCII digits followed
+    /// by the 2-byte character `é` puts a char boundary at byte 8 and
+    /// another at byte 10, so slicing at byte 9 lands inside `é` and panics
+    /// ("byte index 9 is not a char boundary").
+    #[test]
+    fn multibyte_fraction_is_typed_error_not_panic() {
+        let err = parse_rfc3339_to_ns(0, "2013-07-15T01:02:03.12345678é9")
+            .expect_err("a non-ASCII fraction must be refused, not sliced through");
+        assert!(matches!(err, ComparatorError::InvalidTimestamp { .. }));
+    }
+
+    /// Distinguishing test for deliverable 4c: trailing non-digit junk
+    /// beyond the 9th fraction digit was silently dropped by the pre-fix
+    /// truncation (`frac[..frac.len().min(9)]` keeps only the first 9
+    /// bytes, discarding anything after). Must now be a typed error.
+    #[test]
+    fn trailing_junk_after_fraction_is_rejected() {
+        let err = parse_rfc3339_to_ns(0, "2013-07-15T01:02:03.123456789XYZ")
+            .expect_err("trailing non-digit characters after the fraction must be refused");
+        assert!(matches!(err, ComparatorError::InvalidTimestamp { .. }));
+    }
+
+    /// Required test (4e): year 99999 is a plausible, in-range date and must
+    /// produce the correct day count via checked arithmetic, not an error.
+    #[test]
+    fn year_99999_produces_correct_day_count() {
+        let days = parse_date_to_days(0, "99999-01-01").expect("year 99999 is in range");
+        assert_eq!(
+            days,
+            days_from_civil_checked(99999, 1, 1).expect("checked arithmetic fits i64") as i32
+        );
+    }
+
+    /// Required test (4e): an hour of 99 is not a valid time of day.
+    #[test]
+    fn hour_99_is_typed_error() {
+        let err = parse_rfc3339_to_ns(0, "2013-07-15T99:02:03Z")
+            .expect_err("hour 99 is out of range 0..=23");
+        assert!(matches!(err, ComparatorError::InvalidTimestamp { .. }));
+    }
+
+    /// Distinguishing test for deliverable 4b: an `i64::MAX` year overflows
+    /// the day-of-era/era arithmetic in `i64`. Red against the pre-fix
+    /// `days_from_civil`, which used plain (wrapping-in-release,
+    /// panicking-in-debug) arithmetic and either produced a wrong value or
+    /// aborted the process instead of returning a typed error.
+    #[test]
+    fn i64_max_year_is_typed_error() {
+        let err = parse_date_to_days(0, &format!("{}-01-01", i64::MAX))
+            .expect_err("i64::MAX year overflows the date arithmetic");
+        assert!(matches!(err, ComparatorError::InvalidDate { .. }));
+    }
+
+    /// Required test (4e): month 13 is invalid.
+    #[test]
+    fn month_13_is_typed_error() {
+        let err =
+            parse_date_to_days(0, "2013-13-01").expect_err("month 13 is out of range 1..=12");
+        assert!(matches!(err, ComparatorError::InvalidDate { .. }));
+    }
+
+    /// Required test (4e): day 45 is invalid for any month.
+    #[test]
+    fn day_45_is_typed_error() {
+        let err = parse_date_to_days(0, "2013-07-45").expect_err("day 45 is out of range");
+        assert!(matches!(err, ComparatorError::InvalidDate { .. }));
+    }
+
+    /// Required test (4e): a 10-digit year produces a day count far beyond
+    /// what fits in a 32-bit day index (`Cell::Date` is `i32`); the i64
+    /// arithmetic itself does not overflow, but the final cast must.
+    #[test]
+    fn year_9999999999_is_typed_error() {
+        let err = parse_date_to_days(0, "9999999999-01-01")
+            .expect_err("day count for this year does not fit in i32");
+        assert!(matches!(err, ComparatorError::InvalidDate { .. }));
+    }
+
+    /// Required test (4e): `TimestampSecond(i64::MAX / 2)` overflows when
+    /// scaled to nanoseconds (`* 1_000_000_000`). Red against the pre-fix
+    /// `cell_from_array`, which multiplied with a plain `*` and would wrap
+    /// (release) or panic (debug) instead of returning a typed error.
+    #[test]
+    fn timestamp_second_i64_max_half_is_typed_error_not_panic() {
+        use datafusion::arrow::array::TimestampSecondArray;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampSecondArray::from(vec![i64::MAX / 2])) as Arc<dyn Array>],
+        )
+        .expect("build batch");
+        let err = rows_from_arrow(std::slice::from_ref(&batch))
+            .expect_err("scaling i64::MAX / 2 seconds to nanoseconds overflows i64");
+        assert!(matches!(err, ComparatorError::InvalidTimestamp { .. }));
+    }
+
+    /// Required test (4e): a bare numeric `+0000` offset (no colon) is
+    /// accepted as UTC, same as `+00:00` and `Z`.
+    #[test]
+    fn plus_zero_zero_zero_zero_offset_accepted() {
+        let ns = parse_rfc3339_to_ns(0, "2013-07-15T01:02:03+0000").expect("+0000 is UTC");
+        let z_ns = parse_rfc3339_to_ns(0, "2013-07-15T01:02:03Z").expect("Z is UTC");
+        assert_eq!(ns, z_ns);
+    }
+
+    /// Required test (4e): a non-zero offset is still refused, naming the
+    /// offset in the error.
+    #[test]
+    fn non_zero_offset_is_typed_error_naming_offset() {
+        let err = parse_rfc3339_to_ns(0, "2013-07-15T01:02:03+05:00")
+            .expect_err("a non-zero offset is not supported");
+        match err {
+            ComparatorError::InvalidTimestamp { reason, .. } => {
+                assert!(
+                    reason.contains("+05:00"),
+                    "error must name the offset: {reason}"
+                );
+            }
+            other => panic!("expected InvalidTimestamp, got {other:?}"),
+        }
+    }
+
+    /// Required test (4e)/distinguishing test for deliverable 4d: a decimal
+    /// with 20 significant digits, well past `f64`'s ~17-digit precision,
+    /// parses exactly. Red against the pre-fix implementation, which
+    /// rounded through `f64` and would not reproduce this exact unscaled
+    /// value.
+    #[test]
+    fn large_decimal_parses_exact() {
+        let cell = json_cell(
+            0,
+            &serde_json::json!("12345678901234567890.12"),
+            ColumnKind::Decimal(2),
+        )
+        .expect("exact decimal parse");
+        assert_eq!(cell, Cell::Decimal(1234567890123456789012, 2));
+    }
+
+    /// Required test (4e): `Date64` of -1 ms narrows to day -1 (floor
+    /// division), not day 0 (truncation toward zero). Red against the
+    /// pre-fix `cell_from_array`, which used `/` (truncating) instead of
+    /// `div_euclid` (flooring).
+    #[test]
+    fn date64_negative_one_ms_is_day_negative_one() {
+        use datafusion::arrow::array::Date64Array;
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("d", DataType::Date64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Date64Array::from(vec![-1])) as Arc<dyn Array>],
+        )
+        .expect("build batch");
+        let rows = rows_from_arrow(std::slice::from_ref(&batch)).expect("normalize");
+        assert_eq!(rows, vec![vec![Cell::Date(-1)]]);
     }
 
     /// Required test (D7 rule 1a): a subject missing the last row of a
@@ -1522,9 +1874,11 @@ mod tests {
                 Arc::new(Float64Array::from(vec![1.5])),
                 Arc::new(datafusion::arrow::array::StringArray::from(vec!["hi"])),
                 Arc::new(BinaryArray::from(vec![b"hi".as_slice()])),
-                Arc::new(Date32Array::from(vec![days_from_civil(2013, 7, 15) as i32])),
+                Arc::new(Date32Array::from(vec![
+                    days_from_civil_checked(2013, 7, 15).expect("valid date") as i32,
+                ])),
                 Arc::new(TimestampSecondArray::from(vec![
-                    days_from_civil(2013, 7, 15) * 86_400 + 3723,
+                    days_from_civil_checked(2013, 7, 15).expect("valid date") * 86_400 + 3723,
                 ])),
             ],
         )
