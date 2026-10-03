@@ -266,7 +266,62 @@ fn expected_verdict(suite: &Suite, number: u32) -> Verdict {
     }
 }
 
+/// Statements that return no rows on the fixture, so their Pass compares
+/// nothing: Q28 and Q29 keep only groups with `HAVING COUNT(*) > 100000`,
+/// more rows than the whole fixture holds. [`check_row_counts`] asserts both
+/// engines really return zero rows for these on both arms, so a fixture
+/// resize that makes them non-empty is noticed, and that every other
+/// statement (except one declaring `ci_expected_error`) returns at least one
+/// row on the reference.
+const ZERO_ROWS_ON_FIXTURE: &[u32] = &[28, 29];
+const _: () = assert!(
+    fixture::TOTAL_ROWS <= 100_000,
+    "a fixture over 100,000 rows can give Q28/Q29 a group past their HAVING"
+);
+
 type StatementResult = Result<Vec<RecordBatch>, EngineError>;
+
+fn row_count(result: &StatementResult) -> Result<usize, String> {
+    result
+        .as_ref()
+        .map(|batches| batches.iter().map(RecordBatch::num_rows).sum())
+        .map_err(ToString::to_string)
+}
+
+/// Failure messages for every statement whose row counts break
+/// [`ZERO_ROWS_ON_FIXTURE`]'s contract on `arm`.
+fn check_row_counts(
+    suite: &Suite,
+    arm: &str,
+    reference: &[StatementResult],
+    subject: &[StatementResult],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for (i, statement) in suite.statements.iter().enumerate() {
+        let number = statement.number;
+        let reference_rows = row_count(&reference[i]);
+        if ZERO_ROWS_ON_FIXTURE.contains(&number) {
+            let subject_rows = row_count(&subject[i]);
+            if reference_rows != Ok(0) || subject_rows != Ok(0) {
+                failures.push(format!(
+                    "Q{number} arm {arm}: listed in ZERO_ROWS_ON_FIXTURE, but reference \
+                     returned {reference_rows:?} and ravel {subject_rows:?} rows"
+                ));
+            }
+            continue;
+        }
+        let expects_error = suite
+            .override_for(number)
+            .is_some_and(|o| o.ci_expected_error.is_some());
+        if !expects_error && !matches!(reference_rows, Ok(n) if n > 0) {
+            failures.push(format!(
+                "Q{number} arm {arm}: reference returned {reference_rows:?} rows; only \
+                 ZERO_ROWS_ON_FIXTURE statements may return none"
+            ));
+        }
+    }
+    failures
+}
 
 async fn run_suite(engine: &dyn SuiteEngine, suite: &Suite) -> Vec<StatementResult> {
     let mut results = Vec::with_capacity(suite.statements.len());
@@ -514,6 +569,7 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
             table.push(line);
             failures.extend(failure);
         }
+        failures.extend(check_row_counts(&suite, arm, reference, subject));
     }
     println!("{}", table.join("\n"));
     println!(
@@ -523,7 +579,7 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
 
     assert!(
         failures.is_empty(),
-        "{} statement(s) did not reach their expected verdict:\n{}",
+        "{} statement check(s) failed (verdict or row count):\n{}",
         failures.len(),
         failures.join("\n")
     );

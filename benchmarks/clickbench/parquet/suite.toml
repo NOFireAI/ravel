@@ -40,6 +40,13 @@
 #     order. Both sides must hold exactly the same column names, each once.
 #     Every value is still compared exactly (Q24). Without it, columns are
 #     compared by position.
+#
+# Two statements need no override but compare nothing on the fixture: Q28 and
+# Q29 keep only groups with `HAVING COUNT(*) > 100000`, and the fixture holds
+# fewer rows than that in total, so both engines return zero rows and their
+# Pass is vacuous. The acceptance test lists them in ZERO_ROWS_ON_FIXTURE and
+# asserts they stay empty on both engines, so a fixture large enough to give
+# them rows is noticed.
 
 [table]
 # `{location}` is substituted with the fixture's hits.parquet object URL.
