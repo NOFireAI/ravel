@@ -596,6 +596,8 @@ impl RlogWriter {
         // A corrupt blob fails the write rather than silently dropping
         // stream-level values, since an under-populated posting list or an
         // under-bounded stat would prune a block a merged-view query needs.
+        let row_sample = stage0::row_sample_enabled();
+        let row_setup_before = row_sample.then(stage0::sample);
         let mut stream_seeds: HashMap<LogStreamId, StreamSeed> = HashMap::new();
         if !tracked_names.is_empty() {
             for (id, blob) in &streams {
@@ -610,8 +612,6 @@ impl RlogWriter {
         // its per-name NumStat winners, both read off the one resolved merged
         // view seeded from `stream_seeds`. One scratch serves every record: it is
         // cleared per record, never rebuilt (#1135).
-        let row_sample = stage0::row_sample_enabled();
-        let row_setup_before = row_sample.then(stage0::sample);
         let mut stamp = StampScratch::default();
         stamp.prepare(stamp_index.slots());
         let mut rows: Vec<ResolvedRow> = Vec::with_capacity(self.records.len());
@@ -6153,13 +6153,16 @@ pub mod stage0 {
     pub static ROW_ORDER_BYTES: AtomicI64 = AtomicI64::new(0);
     pub static ROW_ORDER_ALLOCS: AtomicU64 = AtomicU64::new(0);
 
-    /// Cost of the one-time setup done once per encode, before the per-row
-    /// loop starts: `StampScratch::prepare` and `rows:
-    /// Vec::with_capacity(self.records.len())`. Not a `ResolvedRow` field
-    /// (the row Vec's backing buffer holds every row, it is not part of
-    /// any one of them) and not per-row, so it cannot be amortized into the
-    /// buckets above without dividing a single allocation across 20,000
-    /// samples.
+    /// Cost of the one-time setup done once per encode, after `after_columns`
+    /// fires and before the per-row loop starts: building `stream_seeds`
+    /// (one `StreamSeed` per distinct stream, not per row -- this is the
+    /// dominant term at high stream counts), `StampScratch::prepare`, and
+    /// `rows: Vec::with_capacity(self.records.len())`. Not a `ResolvedRow`
+    /// field (the row Vec's backing buffer holds every row, it is not part
+    /// of any one of them; `stream_seeds` is keyed by stream, not by row)
+    /// and not per-row, so none of it can be amortized into the buckets
+    /// above without dividing a handful of allocations across 20,000
+    /// samples in a way that would not track row count at all.
     pub static ROW_SETUP_BYTES: AtomicI64 = AtomicI64::new(0);
     pub static ROW_SETUP_ALLOCS: AtomicU64 = AtomicU64::new(0);
 

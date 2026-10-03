@@ -405,44 +405,53 @@ fn main() {
         "The step delta's window (`after_columns` to `after_resolve_rows` in \
          `build_object`) covers the per-row loop (which `resolve_row`'s per-component \
          sampling and the per-row whole-call sampling both measure) plus two things \
-         outside it: the once-per-encode setup immediately before the loop \
-         (`StampScratch::prepare` and `rows: Vec::with_capacity(self.records.len())`), and \
-         the row-ordering step that runs once after the loop (`rows.sort_by(...)` in the \
-         unclustered path, or `clustered_permutation` plus `permute` in the clustered \
-         path). The first run against `1_stream` found the sum of per-row whole-call \
-         deltas undershooting the step delta by far more than 5% (7,367,670 vs 11,368,286 \
-         bytes, a 4,000,616 byte gap). `size_of::<ResolvedRow>()` is {resolved_row_size} \
-         bytes; {resolved_row_size} * {RECORDS_PER_OBJECT} = {} bytes, matching the gap to \
-         within 616 bytes -- initially read as corroborating a stable-sort auxiliary-buffer \
+         outside it: the once-per-encode setup between `after_columns` firing and the \
+         loop starting (building `stream_seeds`, one `StreamSeed` per distinct stream, \
+         then `StampScratch::prepare` and `rows: Vec::with_capacity(self.records.len())`), \
+         and the row-ordering step that runs once after the loop (`rows.sort_by(...)` in \
+         the unclustered path, or `clustered_permutation` plus `permute` in the clustered \
+         path).\n\n\
+         The first run against `1_stream` found the sum of per-row whole-call deltas \
+         undershooting the step delta by far more than 5% (7,367,670 vs 11,368,286 bytes, \
+         a 4,000,616 byte gap). `size_of::<ResolvedRow>()` is {resolved_row_size} bytes; \
+         {resolved_row_size} * {RECORDS_PER_OBJECT} = {} bytes, matching the gap to within \
+         616 bytes -- initially read as corroborating a stable-sort auxiliary-buffer \
          hypothesis, since that buffer is also sized `size_of::<ResolvedRow>() * \
          records.len()`. Measuring the sort/permute step directly (sampling immediately \
          around the `match &cluster {{ ... }}` block) found it contributes close to zero \
          net live bytes: a transient buffer that is allocated and freed within the same \
-         call nets to zero in a live-bytes delta by construction, which the two \
-         candidate explanations cannot be told apart by magnitude alone, since \
+         call nets to zero in a live-bytes delta by construction, which the two candidate \
+         explanations cannot be told apart by magnitude alone, since \
          `Vec::with_capacity(records.len())` for `ResolvedRow` elements is sized \
-         identically. Measuring the row Vec's upfront allocation directly (sampling around \
-         `StampScratch::prepare` and `Vec::with_capacity` before the loop starts) \
-         accounts for the gap instead: that buffer is still live when \
-         `after_resolve_rows` fires, so it shows up as net-positive bytes in the step \
-         delta the way a transient, already-freed buffer cannot.\n\n\
-         Neither cost is a `ResolvedRow` field or a per-row cost, so neither belongs in \
+         identically. Measuring the pre-loop setup directly instead accounted for the \
+         `1_stream` gap: `rows`'s backing buffer is still live when `after_resolve_rows` \
+         fires, so it shows up as net-positive bytes in the step delta the way a transient, \
+         already-freed buffer cannot, and `stream_seeds` is trivial at one stream.\n\n\
+         A second run against `20000_streams`, with the fix in place, still undershot (sum \
+         of per-row and pre-loop-setup deltas 11,400,400 vs step delta 19,050,336, a \
+         7,649,936 byte gap) because the first fix's sampling window started after \
+         `stream_seeds` was already built. `stream_seeds` holds one `StreamSeed` per \
+         distinct stream, so its cost scales with stream count, not row count, and is \
+         negligible at 1 stream but dominant at 20,000: moving the sampling window to \
+         start immediately after `after_columns` fires, before `stream_seeds` is built, \
+         closed this gap too.\n\n\
+         None of this is a `ResolvedRow` field or a per-row cost, so none of it belongs in \
          the five `ResolvedRow`-field buckets without misattributing it: the row Vec's \
-         backing buffer holds every row, it is not part of any one of them, and dividing \
-         it across 20,000 samples would understate what resolving a single row actually \
-         costs. Rather than restructure `resolve_row` or add a second hook mechanism, \
-         `build_object` now also samples directly around the `match &cluster {{ ... }}` \
-         block and around the pre-loop setup (both gated by the same `ROW_SAMPLE` flag, \
-         accumulated into two new `stage0` pairs -- `ROW_ORDER_BYTES`/`ROW_ORDER_ALLOCS` \
-         and `ROW_SETUP_BYTES`/`ROW_SETUP_ALLOCS` -- distinct from the five \
-         `ResolvedRow`-field buckets). The per-shape sections below report both as their \
-         own lines, and the \"sum of per-row whole-call deltas equals the step delta \
-         within 5%\" assertion now compares the step delta against the per-row sum plus \
-         both directly-measured costs, not the per-row sum alone. This is a deviation from \
-         the dispatch's literal assertion wording (which did not anticipate step-delta \
-         components outside `resolve_row`), made because the alternative was either a \
-         false failure on correct instrumentation or silently misattributing non-row cost \
-         to a `ResolvedRow` field.\n\n",
+         backing buffer holds every row, it is not part of any one of them; \
+         `stream_seeds` is keyed by stream, not row. Rather than restructure `resolve_row` \
+         or add a second hook mechanism, `build_object` now also samples directly around \
+         the `match &cluster {{ ... }}` block and around the pre-loop setup, starting right \
+         after `after_columns` fires (both gated by the same `ROW_SAMPLE` flag, accumulated \
+         into two new `stage0` pairs -- `ROW_ORDER_BYTES`/`ROW_ORDER_ALLOCS` and \
+         `ROW_SETUP_BYTES`/`ROW_SETUP_ALLOCS` -- distinct from the five `ResolvedRow`-field \
+         buckets). The per-shape sections below report both as their own lines, and the \
+         \"sum of per-row whole-call deltas equals the step delta within 5%\" assertion now \
+         compares the step delta against the per-row sum plus both directly-measured \
+         costs, not the per-row sum alone. This is a deviation from the dispatch's literal \
+         assertion wording (which did not anticipate step-delta components outside \
+         `resolve_row`), made because the alternative was either a false failure on correct \
+         instrumentation or silently misattributing non-row cost to a `ResolvedRow` \
+         field.\n\n",
         resolved_row_size * RECORDS_PER_OBJECT
     ));
 
@@ -497,8 +506,10 @@ fn main() {
             r.row_order.bytes, r.row_order.allocs
         ));
         md.push_str(&format!(
-            "Per-encode setup (`StampScratch::prepare` + row `Vec::with_capacity`, before the \
-             loop, not a `ResolvedRow` field): {} bytes, {} allocations\n\n",
+            "Per-encode setup (`stream_seeds` build, one `StreamSeed` per distinct stream, \
+             plus `StampScratch::prepare` and the row `Vec::with_capacity`; scales with \
+             stream count not row count; not a `ResolvedRow` field): {} bytes, {} \
+             allocations\n\n",
             r.row_setup.bytes, r.row_setup.allocs
         ));
 
@@ -555,9 +566,10 @@ fn main() {
         let row_setup_share = r.row_setup.share_pct(r.step_delta);
         let row_setup_per_row = r.row_setup.per_row_allocs(r.rows_sampled);
         md.push_str(&format!(
-            "| per-encode setup (not a `ResolvedRow` field, see deviation note above) | {} | \
-             {row_setup_share:.2}% | {row_setup_per_row:.3} | no pre-registered band (outside \
-             the epic's `ResolvedRow`-bucket expectations) | n/a |\n",
+            "| per-encode setup: stream_seeds + stamp/row-vec init (not a `ResolvedRow` \
+             field, see deviation note above) | {} | {row_setup_share:.2}% | \
+             {row_setup_per_row:.3} | no pre-registered band (outside the epic's \
+             `ResolvedRow`-bucket expectations) | n/a |\n",
             r.row_setup.bytes
         ));
         md.push_str(&format!(
