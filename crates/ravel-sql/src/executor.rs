@@ -94,7 +94,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::disk_manager::DiskManager;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
 use datafusion::logical_expr::{
-    Aggregate, Distinct, Expr, ExprSchemable, Filter, LogicalPlan, lit,
+    Aggregate, Distinct, Expr, ExprSchemable, Filter, LogicalPlan, Sort, SortExpr, lit,
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
@@ -1854,6 +1854,23 @@ impl SqlExecutor {
         } else {
             None
         };
+        // ADR-0954 (issue #2416): make a `Sort` over a spill-exact aggregate
+        // spill-eligible before the scratch/decision below reads the plan, by
+        // proving its sort key total -- append the aggregate's own GROUP BY
+        // expressions as trailing tiebreak terms where they are not already
+        // present. Gated on `plan_is_spill_eligible_ignoring_sort_order` so a
+        // plan disqualified for a reason no rewrite can fix (a `Join`, a
+        // float GROUP BY key, a non-exact aggregate) is left untouched.
+        // Reassigning `analyzed` here is transparent to every other reader
+        // below (`exact_typed_aggregates`'s `plan_is_exact_typed` finds the
+        // same aggregates and distincts either way; rewriting a `Sort` node
+        // changes no `Aggregate` or `Distinct` node).
+        let analyzed = match analyzed {
+            Some(plan) if wants_spill_gate && plan_is_spill_eligible_ignoring_sort_order(&plan) => {
+                Some(rewrite_sort_group_key_tie_order(plan).map_err(plan_error)?)
+            }
+            other => other,
+        };
         // ADR-0954: spill needs BOTH an operator-configured scratch area and a
         // plan whose every aggregate is exact under a changed folding order.
         // Fail closed the same way: an unbuildable plan is not eligible, so it
@@ -2030,6 +2047,19 @@ impl SqlExecutor {
         let ctx = build_session(config, pool, table, exact_typed_aggregates, decision)
             .map_err(plan_error)?;
         let mut frame = ctx.sql(sql).await.map_err(plan_error)?;
+        // ADR-0954 (issue #2416): the same tiebreak rewrite applied to
+        // `analyzed` above, now applied to the plan this session actually
+        // executes. `analyzed` comes from a separate, throwaway parse
+        // (`analyzed_classification_plan`) used only to decide `decision`;
+        // reaching `Enabled` here already proves `plan_is_spill_eligible` held
+        // for the rewritten `analyzed`, which has the same shape `ctx.sql`
+        // just produced, so this rewrite is expected to find the same `Sort`
+        // nodes and append the same terms.
+        if matches!(decision, SpillDecision::Enabled { .. }) {
+            let plan = rewrite_sort_group_key_tie_order(frame.logical_plan().clone())
+                .map_err(plan_error)?;
+            frame = DataFrame::new(ctx.state(), plan);
+        }
         // The row window (ADR-1374 decision 3, prerequisite 2), inserted into
         // the plan `ctx.sql` just produced -- before any optimizer pass, and
         // before the schema is read, so the reported schema is the one the
@@ -3928,11 +3958,21 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
 ///   enabling spill could only benefit an operator it never classified.
 /// - every node is one of the shapes below. This is an allowlist, so a
 ///   DataFusion release that adds a `LogicalPlan` variant makes plans using it
-///   ineligible rather than silently spillable. `Sort` is deliberately outside
-///   it: an external merge sort returns the same rows, but this ADR has no
-///   proof its tie order equals the in-memory sort's, and row order is part of
-///   an `ORDER BY` result. `Join` and `Window` are outside it for the same
-///   reason, one level up: nothing here has classified their spill behavior.
+///   ineligible rather than silently spillable. An external merge sort
+///   returns the same rows as an in-memory one, but nothing proves their tie
+///   order agrees, and row order is part of an `ORDER BY` result; `Sort` is
+///   therefore admitted only when its sort key is already total over the
+///   aggregate it orders. The planner
+///   ([`rewrite_sort_group_key_tie_order`]) makes it total first, whenever it
+///   can: it appends the aggregate's own GROUP BY expressions, in group
+///   order, ascending with nulls last, as trailing sort terms, unless they
+///   are already present, to every `Sort` whose input is that `Aggregate` (or
+///   a `Projection` over it). A `Sort` the rewrite cannot reach this way --
+///   its input is not that shape, or a group key cannot be resolved by name
+///   in the sort's own input schema -- is left unchanged and stays
+///   ineligible. `Join` and `Window` are outside the allowlist for the
+///   original reason, one level up: nothing here has classified their spill
+///   behavior.
 /// - every aggregate expression is exactness-preserving under spill
 ///   ([`aggregate_expr_is_spill_exact`]) and no GROUP BY or DISTINCT key is a
 ///   float ([`aggregate_node_is_spill_exact`], [`distinct_node_is_exact`]).
@@ -3961,30 +4001,76 @@ fn plan_is_spill_eligible(plan: &LogicalPlan) -> bool {
         && distincts.iter().all(distinct_node_is_exact)
 }
 
+/// [`plan_is_spill_eligible`], except a `Sort` is always treated as a
+/// classifiable shape rather than requiring an already-total sort key.
+///
+/// Used only to decide whether [`rewrite_sort_group_key_tie_order`] is worth
+/// attempting on a plan: a plan this predicate rejects cannot become eligible
+/// no matter what the rewrite appends to its `Sort` nodes (a disqualifying
+/// `Join`, `Window`, non-exact aggregate, or float GROUP BY key is unaffected
+/// by sort order), so there is nothing for the rewrite to fix. The actual
+/// enable/disable decision always goes through the real, total-order-checking
+/// [`plan_is_spill_eligible`] on the plan the rewrite has already run over,
+/// never through this predicate: it would admit a `Sort` whose group key
+/// turns out unresolvable just as readily as one the rewrite can fix, which
+/// would spill a query with no proof its tie order is reproduced.
+fn plan_is_spill_eligible_ignoring_sort_order(plan: &LogicalPlan) -> bool {
+    if !plan_nodes_are_spill_classifiable_with(plan, &|_| true) {
+        return false;
+    }
+    let mut aggregates = Vec::new();
+    let mut distincts = Vec::new();
+    collect_aggregate_exprs(plan, &mut aggregates, &mut distincts);
+    !aggregates.is_empty()
+        && aggregates.iter().all(aggregate_node_is_spill_exact)
+        && distincts.iter().all(distinct_node_is_exact)
+}
+
 /// Whether every node in `plan` is a shape [`plan_is_spill_eligible`] has
 /// classified. Walks inputs and embedded subquery plans with the same reach
-/// [`collect_aggregate_exprs`] uses, so a `Sort` hidden inside a scalar
-/// subquery disqualifies the query exactly as a top-level one does.
+/// [`collect_aggregate_exprs`] uses: a `Sort` hidden inside a scalar
+/// subquery is held to the same total-order test, but
+/// [`rewrite_sort_group_key_tie_order`] does not reach into subquery plans,
+/// so a subquery `Sort` is eligible only when the query itself already wrote
+/// a total order.
 fn plan_nodes_are_spill_classifiable(plan: &LogicalPlan) -> bool {
-    let classifiable = matches!(
-        plan,
-        LogicalPlan::Projection(_)
-            | LogicalPlan::Filter(_)
-            | LogicalPlan::Aggregate(_)
-            | LogicalPlan::Distinct(_)
-            | LogicalPlan::TableScan(_)
-            | LogicalPlan::SubqueryAlias(_)
-            | LogicalPlan::Limit(_)
-            | LogicalPlan::EmptyRelation(_)
-            | LogicalPlan::Values(_)
-    );
+    plan_nodes_are_spill_classifiable_with(plan, &|sort| {
+        sort_input_aggregate(sort.input.as_ref())
+            .and_then(|aggregate| missing_group_key_tiebreak_terms(aggregate, sort))
+            .is_some_and(|missing| missing.is_empty())
+    })
+}
+
+/// Shared recursive walk behind [`plan_nodes_are_spill_classifiable`] and
+/// [`plan_is_spill_eligible_ignoring_sort_order`]; `sort_admits` is the only
+/// difference between the two: whether a `Sort` node's own sort key is
+/// accepted as it stands.
+fn plan_nodes_are_spill_classifiable_with(
+    plan: &LogicalPlan,
+    sort_admits: &impl Fn(&Sort) -> bool,
+) -> bool {
+    let classifiable = match plan {
+        LogicalPlan::Sort(sort) => sort_admits(sort),
+        _ => matches!(
+            plan,
+            LogicalPlan::Projection(_)
+                | LogicalPlan::Filter(_)
+                | LogicalPlan::Aggregate(_)
+                | LogicalPlan::Distinct(_)
+                | LogicalPlan::TableScan(_)
+                | LogicalPlan::SubqueryAlias(_)
+                | LogicalPlan::Limit(_)
+                | LogicalPlan::EmptyRelation(_)
+                | LogicalPlan::Values(_)
+        ),
+    };
     if !classifiable {
         return false;
     }
     if !plan
         .inputs()
         .iter()
-        .all(|input| plan_nodes_are_spill_classifiable(input))
+        .all(|input| plan_nodes_are_spill_classifiable_with(input, sort_admits))
     {
         return false;
     }
@@ -3999,7 +4085,7 @@ fn plan_nodes_are_spill_classifiable(plan: &LogicalPlan) -> bool {
                 _ => None,
             };
             if let Some(nested) = nested
-                && !plan_nodes_are_spill_classifiable(nested)
+                && !plan_nodes_are_spill_classifiable_with(nested, sort_admits)
             {
                 ok = false;
                 return Ok(TreeNodeRecursion::Stop);
@@ -4011,6 +4097,101 @@ fn plan_nodes_are_spill_classifiable(plan: &LogicalPlan) -> bool {
         }
     }
     true
+}
+
+/// The `Aggregate` a `Sort` orders, when its input is that `Aggregate`
+/// directly or a `Projection` sitting over one (the `SELECT a, b, COUNT(*) ...
+/// GROUP BY a, b ORDER BY ...` shape). Any other input shape returns `None`:
+/// there is no aggregate here for a tie order to protect.
+fn sort_input_aggregate(input: &LogicalPlan) -> Option<&Aggregate> {
+    match input {
+        LogicalPlan::Aggregate(aggregate) => Some(aggregate),
+        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
+            LogicalPlan::Aggregate(aggregate) => Some(aggregate),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The trailing [`SortExpr`] terms [`rewrite_sort_group_key_tie_order`] needs
+/// to append to `sort` so its key is total over `aggregate`'s GROUP BY
+/// expressions, in group order, ascending with nulls last -- or `None` when
+/// that cannot be proven.
+///
+/// An empty `Some` means the key is already total (every group expression has
+/// a matching sort term already): both the rewrite and
+/// [`plan_nodes_are_spill_classifiable`] treat that as "nothing to do",
+/// `Sort` admitted as it stands. `None` means a group key's output column
+/// could not be resolved, by name, in `sort`'s own input schema -- a grouping
+/// set (whose synthetic columns this does not attempt to match) or a
+/// `Projection` that renamed the column -- and fails closed: the `Sort` stays
+/// ineligible rather than guessing.
+fn missing_group_key_tiebreak_terms(aggregate: &Aggregate, sort: &Sort) -> Option<Vec<SortExpr>> {
+    if aggregate
+        .group_expr
+        .iter()
+        .any(|key| matches!(key, Expr::GroupingSet(_)))
+    {
+        return None;
+    }
+    let input_schema = sort.input.schema();
+    let mut missing = Vec::new();
+    for index in 0..aggregate.group_expr.len() {
+        let (_, field) = aggregate.schema.qualified_field(index);
+        let already_present = sort.expr.iter().any(|term| {
+            matches!(&term.expr, Expr::Column(column) if column.name == *field.name())
+        });
+        if already_present {
+            continue;
+        }
+        let (qualifier, _) = input_schema
+            .qualified_field_with_unqualified_name(field.name())
+            .ok()?;
+        missing.push(SortExpr::new(
+            Expr::Column(Column::new(qualifier.cloned(), field.name().clone())),
+            true,
+            false,
+        ));
+    }
+    Some(missing)
+}
+
+/// Rewrites every `Sort` whose input is an `Aggregate` (or a `Projection` over
+/// one) to append that aggregate's missing GROUP BY tiebreak terms
+/// ([`missing_group_key_tiebreak_terms`]), leaving `fetch` unchanged. A `Sort`
+/// the helper cannot resolve, or whose key is already total, is returned
+/// unchanged.
+///
+/// Infallible in practice: the closure below never returns `Err`, so neither
+/// does `transform_down`. The `Result` stays in the signature because
+/// `TreeNode::transform_down` requires it; callers propagate it exactly like
+/// any other DataFusion planning error rather than unwrapping a result that
+/// cannot fail today but is not provably unable to in a later DataFusion
+/// release.
+fn rewrite_sort_group_key_tie_order(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
+    Ok(plan
+        .transform_down(|node| {
+            let missing = match &node {
+                LogicalPlan::Sort(sort) => sort_input_aggregate(sort.input.as_ref())
+                    .and_then(|aggregate| missing_group_key_tiebreak_terms(aggregate, sort)),
+                _ => None,
+            };
+            let Some(missing) = missing.filter(|missing| !missing.is_empty()) else {
+                return Ok(Transformed::no(node));
+            };
+            let LogicalPlan::Sort(sort) = node else {
+                unreachable!("matched LogicalPlan::Sort above")
+            };
+            let mut expr = sort.expr;
+            expr.extend(missing);
+            Ok(Transformed::yes(LogicalPlan::Sort(Sort {
+                expr,
+                input: sort.input,
+                fetch: sort.fetch,
+            })))
+        })?
+        .data)
 }
 
 /// Classify one [`Aggregate`] node for spill (ADR-0954): every GROUP BY key
