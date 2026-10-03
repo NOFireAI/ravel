@@ -312,7 +312,11 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// This reader's already-decoded directories, as a [`SegmentDirectories`]
     /// a later open of the same (immutable) object can reuse via
     /// [`RlogReader::from_decoded`] (ADR-2414 decision A1). A clone of fields
-    /// decoded once at construction, never a re-decode.
+    /// decoded once at construction, never a re-decode. The returned
+    /// [`SegmentDirectories::open_decompressed_bytes`] is the figure this
+    /// reader was seeded with: the decode's total for a reader built by
+    /// [`RlogReader::from_source`], zero for one built by
+    /// [`RlogReader::from_decoded`].
     pub fn directories(&self) -> SegmentDirectories {
         SegmentDirectories {
             stream_dir: self.stream_dir.clone(),
