@@ -30,6 +30,7 @@
 
 use blake3::Hasher;
 use bytes::Bytes;
+use futures::StreamExt;
 use ravel_commit::keys::ingest_hour_string;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError, UploadChecksum};
 use ravel_types::{Signal, TenantId};
@@ -51,6 +52,13 @@ pub const MARKER_SUFFIX: &str = "idm";
 /// honor is never swept out from under it by a sweeper whose clock lags an
 /// ingest node's by up to this much.
 pub const IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS: u32 = 1;
+
+/// Most marker GETs [`read_marker`] keeps in flight at once. Its first batch
+/// (the forward skew hours, the current hour and the one before it) is
+/// smaller than this; the rest of the window fans out under this bound, so a
+/// miss at the default window costs about four round trips of latency rather
+/// than twenty-six.
+pub const IDEM_MARKER_PROBE_CONCURRENCY: usize = 8;
 
 const MAGIC: &[u8; 4] = b"RIDM";
 const VERSION: u16 = 1;
@@ -325,13 +333,20 @@ pub async fn write_marker(
 /// Look up a marker for a retried request by probing the exact marker key
 /// for each ingest hour of the closed window
 /// `[now_ingest_hour_bucket - dedup_window_hours,
-/// now_ingest_hour_bucket + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS]`,
-/// newest first, stopping at the first object found (ADR-0051 section 5 and
-/// its 2026-10-03 probe amendment). A retry cannot know the hour the original
-/// request pinned, so every hour of the window is a candidate. The forward
-/// tolerance absorbs the original writer's clock running slightly ahead of
-/// the reader's across an hour boundary; a marker further in the future than
-/// that is never probed and is left for the sweep.
+/// now_ingest_hour_bucket + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS]`
+/// (ADR-0051 section 5 and its 2026-10-03 probe amendment). A retry cannot
+/// know the hour the original request pinned, so every hour of the window is
+/// a candidate. The forward tolerance absorbs the original writer's clock
+/// running slightly ahead of the reader's across an hour boundary; a marker
+/// further in the future than that is never probed and is left for the sweep.
+///
+/// The probes run in two batches, each with at most
+/// [`IDEM_MARKER_PROBE_CONCURRENCY`] GETs in flight: first the forward skew
+/// hours, the current hour and the hour before it, where a retry's marker
+/// almost always sits; then, only if that batch found nothing, every remaining
+/// hour of the window. Within a batch the newest object found wins, so the
+/// result for a given store state is the one a sequential newest-first scan
+/// stopping at the first object would return.
 ///
 /// The probes are GETs, not a listing of the key's `<keyhash32>.` prefix: the
 /// S3 adapter appends `/` to every list prefix, so that listing finds no
@@ -339,8 +354,10 @@ pub async fn write_marker(
 ///
 /// Returns [`LookupOutcome::Miss`] when every probe answers `NotFound`, and
 /// [`LookupOutcome::Corrupt`] when the newest marker found fails to decode.
-/// Any other store error on any probe fails the whole lookup, since the
-/// lookup cannot tell a marker it could not read from none.
+/// Any other store error on any probe of a batch fails the whole lookup, even
+/// when another probe of that batch found a marker, since the lookup cannot
+/// tell a marker it could not read from none. This function sets no deadline
+/// of its own; the caller bounds it.
 pub async fn read_marker(
     store: &dyn ObjectStoreBackend,
     tenant_id: &TenantId,
@@ -351,15 +368,59 @@ pub async fn read_marker(
 ) -> Result<LookupOutcome, MarkerLookupError> {
     let oldest = now_ingest_hour_bucket.saturating_sub(dedup_window_hours);
     let newest = now_ingest_hour_bucket.saturating_add(IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS);
-    for hour in (oldest..=newest).rev() {
-        let key = marker_key(tenant_id, signal, client_key, hour);
-        match read_marker_at(store, &key).await {
-            Ok(LookupOutcome::Miss) => {}
-            Ok(found) => return Ok(found),
-            Err(source) => return Err(MarkerLookupError { key, source }),
+    let hours: Vec<u32> = (oldest..=newest).rev().collect();
+    let first_batch_floor = now_ingest_hour_bucket.saturating_sub(1);
+    let split = hours.partition_point(|&hour| hour >= first_batch_floor);
+    let (first, rest) = hours.split_at(split);
+    for batch in [first, rest] {
+        match probe_batch(store, tenant_id, signal, client_key, batch).await? {
+            LookupOutcome::Miss => {}
+            found => return Ok(found),
         }
     }
     Ok(LookupOutcome::Miss)
+}
+
+/// Probe every hour of `hours` (newest first), at most
+/// [`IDEM_MARKER_PROBE_CONCURRENCY`] at a time, and decide only once all of
+/// them answered: a store error anywhere fails the batch, otherwise the newest
+/// object found is the outcome.
+async fn probe_batch(
+    store: &dyn ObjectStoreBackend,
+    tenant_id: &TenantId,
+    signal: Signal,
+    client_key: &[u8],
+    hours: &[u32],
+) -> Result<LookupOutcome, MarkerLookupError> {
+    // Built before the first await so the stream holds named futures, not the
+    // mapping closure, which keeps the lookup future `Send` for the handlers.
+    let probes: Vec<_> = hours
+        .iter()
+        .map(|&hour| probe_key(store, marker_key(tenant_id, signal, client_key, hour)))
+        .collect();
+    let results: Vec<(String, Result<LookupOutcome, StoreError>)> = futures::stream::iter(probes)
+        .buffered(IDEM_MARKER_PROBE_CONCURRENCY)
+        .collect()
+        .await;
+    let mut newest_found = None;
+    for (key, result) in results {
+        match result {
+            Err(source) => return Err(MarkerLookupError { key, source }),
+            Ok(LookupOutcome::Miss) => {}
+            Ok(found) => {
+                newest_found.get_or_insert(found);
+            }
+        }
+    }
+    Ok(newest_found.unwrap_or(LookupOutcome::Miss))
+}
+
+async fn probe_key(
+    store: &dyn ObjectStoreBackend,
+    key: String,
+) -> (String, Result<LookupOutcome, StoreError>) {
+    let result = read_marker_at(store, &key).await;
+    (key, result)
 }
 
 #[cfg(test)]
@@ -550,11 +611,24 @@ mod tests {
         }
     }
 
-    /// The probes run newest first and stop at the first hit: with markers at
-    /// two hours the newer receipt is returned, and nothing below its hour is
-    /// read.
+    /// Sorted, so a batch's GETs compare as a set: the probes of one batch
+    /// run concurrently and their issue order is not part of the contract.
+    fn sorted(mut keys: Vec<String>) -> Vec<String> {
+        keys.sort();
+        keys
+    }
+
+    /// The hours of the first batch at reader hour `now`: the forward skew
+    /// hours, `now` and `now - 1`.
+    fn first_batch_hours(now: u32) -> Vec<u32> {
+        (now - 1..=now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS).collect()
+    }
+
+    /// A hit in the first batch costs exactly that batch's GETs and reads
+    /// nothing older: with markers at `now - 1` and `now - 3`, the newer
+    /// receipt is returned after three GETs at the default skew.
     #[tokio::test]
-    async fn probes_stop_at_the_newest_hit() {
+    async fn a_hit_near_now_costs_only_the_first_batch() {
         let store = SegmentAlignedStore::new();
         let tenant = tenant("acme");
         let now = 495_972u32;
@@ -573,19 +647,46 @@ mod tests {
 
         assert_eq!(looked_up, LookupOutcome::Hit(newer));
         let probe = |hour| marker_key(&tenant, Signal::Spans, b"two-hours", hour);
+        let gets = store.take_gets();
+        assert_eq!(gets.len(), 3);
         assert_eq!(
-            store.take_gets(),
-            vec![
-                probe(now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS),
-                probe(now),
-                probe(now - 1),
-            ]
+            sorted(gets),
+            sorted(first_batch_hours(now).into_iter().map(probe).collect())
         );
     }
 
-    /// A miss probes every hour of the window exactly once, newest first:
+    /// A hit at `now - 10` misses the first batch and is found by the
+    /// fan-out, which probes every remaining hour once: 26 GETs at the
+    /// 24-hour default, the newest of the fan-out's markers winning.
+    #[tokio::test]
+    async fn a_hit_below_the_first_batch_costs_the_full_fan_out() {
+        let store = SegmentAlignedStore::new();
+        let tenant = tenant("acme");
+        let now = 495_972u32;
+        let newest = receipt(10, "v2:token-ten");
+        for (hour, receipt) in [
+            (now - 20, receipt(20, "v2:token-twenty")),
+            (now - 10, newest.clone()),
+            (now - 14, receipt(14, "v2:token-fourteen")),
+        ] {
+            write_marker(&store, &tenant, Signal::Logs, b"fan-out", hour, &receipt)
+                .await
+                .expect("write");
+        }
+        store.take_gets();
+
+        let looked_up = read_marker(&store, &tenant, Signal::Logs, b"fan-out", now, 24)
+            .await
+            .expect("lookup");
+
+        assert_eq!(looked_up, LookupOutcome::Hit(newest));
+        assert_eq!(store.take_gets().len(), 26);
+    }
+
+    /// A miss probes every hour of the window exactly once:
     /// `dedup_window_hours + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS + 1`
-    /// GETs, 26 at the 24-hour default.
+    /// GETs, 26 at the 24-hour default. The first batch's GETs are all issued
+    /// before any of the fan-out's.
     #[tokio::test]
     async fn a_miss_probes_each_hour_of_the_window_once() {
         let store = SegmentAlignedStore::new();
@@ -597,18 +698,199 @@ mod tests {
             .expect("lookup");
 
         assert_eq!(looked_up, LookupOutcome::Miss);
+        let probe = |hour| marker_key(&tenant, Signal::Logs, b"absent", hour);
         let expected: Vec<String> = (now - 24..=now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS)
-            .rev()
-            .map(|hour| marker_key(&tenant, Signal::Logs, b"absent", hour))
+            .map(probe)
             .collect();
         assert_eq!(expected.len(), 26);
-        assert_eq!(store.take_gets(), expected);
+        let gets = store.take_gets();
+        assert_eq!(sorted(gets.clone()), sorted(expected));
+        assert_eq!(
+            sorted(gets[..3].to_vec()),
+            sorted(first_batch_hours(now).into_iter().map(probe).collect())
+        );
+    }
+
+    /// The batched lookup returns, for every store state tried, exactly what
+    /// a sequential newest-first scan stopping at the first object returns:
+    /// markers at several hours, some of them corrupt, read from reader hours
+    /// on both sides of each.
+    #[tokio::test]
+    async fn batched_lookup_matches_a_sequential_newest_first_scan() {
+        async fn sequential(
+            store: &dyn ObjectStoreBackend,
+            tenant: &TenantId,
+            now: u32,
+            window: u32,
+        ) -> LookupOutcome {
+            let newest = now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS;
+            for hour in (now.saturating_sub(window)..=newest).rev() {
+                let key = marker_key(tenant, Signal::Logs, b"same", hour);
+                match read_marker_at(store, &key).await.expect("probe") {
+                    LookupOutcome::Miss => {}
+                    found => return found,
+                }
+            }
+            LookupOutcome::Miss
+        }
+
+        let tenant = tenant("acme");
+        let base = 495_972u32;
+        // (marker hour offsets from base, offsets whose marker is corrupt)
+        let states: [(&[u32], &[u32]); 5] = [
+            (&[0], &[]),
+            (&[0, 1, 2, 5, 11, 23], &[]),
+            (&[3, 9, 17], &[9]),
+            (&[2, 7, 30], &[2]),
+            (&[], &[]),
+        ];
+        for (markers, corrupt) in states {
+            let store = MemoryStore::new();
+            for &offset in markers {
+                let hour = base + offset;
+                let key = marker_key(&tenant, Signal::Logs, b"same", hour);
+                let body = if corrupt.contains(&offset) {
+                    b"RIDM-not-a-marker".to_vec()
+                } else {
+                    encode_marker(&receipt(u64::from(offset), &format!("v2:token-{offset}")))
+                        .expect("encode")
+                };
+                store
+                    .put(&key, Bytes::from(body), PutOptions::create_if_absent())
+                    .await
+                    .expect("seed marker");
+            }
+            for window in [0u32, 1, 2, 5, 24] {
+                for now in base..=base + 40 {
+                    let batched = read_marker(&store, &tenant, Signal::Logs, b"same", now, window)
+                        .await
+                        .expect("lookup");
+                    let expected = sequential(&store, &tenant, now, window).await;
+                    assert_eq!(
+                        batched, expected,
+                        "markers {markers:?}, corrupt {corrupt:?}, reader {now}, window {window}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A store whose GET records how many GETs are in flight, then yields a
+    /// few times before answering, so concurrently issued probes overlap.
+    struct InFlightStore {
+        inner: MemoryStore,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for InFlightStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            use std::sync::atomic::Ordering;
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The probes run concurrently and never more than
+    /// `IDEM_MARKER_PROBE_CONCURRENCY` at once: a miss over the default window
+    /// reaches exactly that many GETs in flight, and a hit at `now` reaches
+    /// the first batch's three.
+    #[tokio::test]
+    async fn probes_run_concurrently_up_to_the_bound() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tenant = tenant("acme");
+        let now = 495_972u32;
+        let store = InFlightStore {
+            inner: MemoryStore::new(),
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+        };
+
+        let missed = read_marker(&store, &tenant, Signal::Logs, b"bound", now, 24)
+            .await
+            .expect("lookup");
+        assert_eq!(missed, LookupOutcome::Miss);
+        assert_eq!(
+            store.max_in_flight.swap(0, Ordering::SeqCst),
+            IDEM_MARKER_PROBE_CONCURRENCY
+        );
+
+        write_marker(
+            &store,
+            &tenant,
+            Signal::Logs,
+            b"bound",
+            now,
+            &receipt(1, "v2:token-now"),
+        )
+        .await
+        .expect("write");
+        let hit = read_marker(&store, &tenant, Signal::Logs, b"bound", now, 24)
+            .await
+            .expect("lookup");
+        assert!(matches!(hit, LookupOutcome::Hit(_)), "{hit:?}");
+        assert_eq!(store.max_in_flight.load(Ordering::SeqCst), 3);
     }
 
     /// A probe that fails with anything but `NotFound` fails the lookup, even
-    /// when an older hour holds a marker: the lookup cannot tell a newer
-    /// marker from none at the hour it could not read. The error names the
-    /// key whose GET failed and carries the store error.
+    /// when an older hour of the same batch holds a marker that batch read:
+    /// the lookup cannot tell a newer marker from none at the hour it could
+    /// not read. The error names the key whose GET failed and carries the
+    /// store error.
     #[tokio::test]
     async fn a_failed_probe_fails_the_lookup() {
         use ravel_object_store::fault::{
@@ -623,6 +905,7 @@ mod tests {
                 .with_key_contains(failing.clone()),
         );
         let store = FaultStore::new(SegmentAlignedStore::new(), plan);
+        let below = marker_key(&tenant, Signal::Logs, b"faulted", now - 5);
         write_marker(
             &store,
             &tenant,
@@ -644,17 +927,46 @@ mod tests {
             "the store error must propagate untouched, got {err:?}"
         );
         assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
-        // The fault answers the failed probe before the wrapped store sees it,
-        // so the wrapped store saw exactly the hours above it and none below.
-        let probe = |hour| marker_key(&tenant, Signal::Logs, b"faulted", hour);
-        assert_eq!(
-            store.inner().take_gets(),
-            vec![
-                probe(now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS),
-                probe(now),
-                probe(now - 1),
-            ]
+        // The fault answers the failed probe before the wrapped store sees it.
+        // The marker below it was read, and still did not mask the failure.
+        let gets = store.inner().take_gets();
+        assert_eq!(gets.len(), 25);
+        assert!(!gets.contains(&failing));
+        assert!(gets.contains(&below));
+    }
+
+    /// An error in the first batch fails the lookup even when a newer probe
+    /// of that same batch found a marker: the batch is collected before it is
+    /// decided, so a hit at `now + 1` does not mask a refused GET at `now`.
+    #[tokio::test]
+    async fn a_hit_does_not_mask_an_error_in_the_same_batch() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+        let tenant = tenant("acme");
+        let now = 495_972u32;
+        let failing = marker_key(&tenant, Signal::Logs, b"masked", now);
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("AccessDenied".into()))
+                .with_key_contains(failing.clone()),
         );
+        let store = FaultStore::new(SegmentAlignedStore::new(), plan);
+        write_marker(
+            &store,
+            &tenant,
+            Signal::Logs,
+            b"masked",
+            now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS,
+            &receipt(1, "v2:token-ahead"),
+        )
+        .await
+        .expect("write");
+
+        let err = read_marker(&store, &tenant, Signal::Logs, b"masked", now, 24)
+            .await
+            .expect_err("an error beside a hit in one batch must fail the lookup");
+
+        assert_eq!(err.key, failing);
+        assert_eq!(store.inner().take_gets().len(), 2);
     }
 
     #[tokio::test]

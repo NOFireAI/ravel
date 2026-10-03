@@ -781,12 +781,28 @@ why every test passed. Keyed dedup on S3 has never deduplicated.
 The lookup now lists nothing. `read_marker`
 (`crates/ravel-ingest/src/idempotency.rs`) GETs the exact marker key for each
 ingest hour from `now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` down to
-`now - dedup_window`, newest first, and stops at the first object it finds. A
+`now - dedup_window`, in two batches. The first batch is the forward
+tolerance hours, `now` and `now - 1`, GET together, where a retry's marker
+almost always sits; only if none of them holds an object does the second
+batch GET every remaining hour of the window, at most
+`IDEM_MARKER_PROBE_CONCURRENCY` (8) in flight. Within a batch the newest
+object found wins, so the outcome for a given store state is the one a
+sequential newest-first scan stopping at the first object would return. A
 `NotFound` means no marker at that hour. Any other store error on any probe
-fails the lookup, and the keyed write is not acknowledged: it fails with a
-retryable 503 / gRPC `UNAVAILABLE` before the request's own data is written,
-so the retry is safe. At the default 24-hour window and one hour of forward
-tolerance a miss costs 26 GETs and a hit at the current hour costs 2.
+of a batch fails the lookup, even when another probe of that batch found a
+marker, and the keyed write is not acknowledged: it fails with a retryable
+503 / gRPC `UNAVAILABLE` before the request's own data is written, so the
+retry is safe. At the default 24-hour window and one hour of forward
+tolerance a hit at `now + 1`, `now` or `now - 1` costs 3 GETs and one round
+trip; any other hit, or a miss, costs 26 GETs in about four round trips.
+
+The lookup is bounded by the same `ack_deadline` the router write gets: the
+gateway wraps it in a timeout of that length (`lookup_marker_within` in
+`services/ravel-server/src/logs_ingest.rs`), so under S3 throttling a lookup
+cannot run past the budget of the write it gates. A lookup still running at
+the deadline is refused exactly like a failed probe (the same retryable
+error, client message and `ravel_ingest_idempotency_lookup_failures_total`
+count), with a WARN line that names the deadline rather than a key.
 
 Why exact-key GETs and not a segment-aligned listing:
 
@@ -801,14 +817,14 @@ Why exact-key GETs and not a segment-aligned listing:
   403 unless a list grant covers that exact key, so the gateway template names
   the marker key shape in its per-tenant bootstrap-key list statement; ADR-0055's
   marker lookup amendment records that grant, which admits a list of one
-  marker key and no listing of the directory.
+  marker key and adds no listing of the directory beyond the gateway's
+  pre-existing `t/` list prefix.
 
-The probes run one after another, so a keyed write that finds no marker
-waits for 26 GET round trips before its own write starts. Section 5's
-honest residuals are unchanged.
+Section 5's honest residuals are unchanged.
 
 Net effect on section 5: "one prefix LIST" becomes one GET per hour of the
-window, newest first, and "one LIST plus one PUT" becomes up to
+window, the hours nearest `now` first, bounded by the write's `ack_deadline`,
+and "one LIST plus one PUT" becomes up to
 `dedup_window + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS + 1` GETs plus one
 PUT. Recorded as an appended amendment, with an inline pointer added to
 section 5.

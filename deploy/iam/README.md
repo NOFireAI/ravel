@@ -776,10 +776,11 @@ those keys would need a `*`.
 A log or span request carrying `x-ravel-idempotency-key` looks up its marker
 before its own data is written, and writes the marker after its data commits.
 The marker key ends in the ingest hour the original request pinned, which a
-retry cannot know, so the lookup is a GET per hour of the dedup window: it GETs
-the exact marker key for each hour from one hour ahead of the current hour
-back 24 hours, newest first, and stops at the first marker it finds. A miss is
-26 GETs. It lists nothing. The calls are in
+retry cannot know, so the lookup is a GET per hour of the dedup window, from
+one hour ahead of the current hour back 24 hours. It GETs the hour ahead, the
+current hour and the one before it together, and stops there if any holds a
+marker (3 GETs); otherwise it GETs the other 23 hours, at most 8 at a time. The
+newest marker found wins. A miss is 26 GETs. It lists nothing. The calls are in
 `crates/ravel-ingest/src/idempotency.rs`:
 
 | Call | Mode | S3 operation | Grant |
@@ -789,23 +790,28 @@ back 24 hours, newest first, and stops at the first marker it finds. A miss is
 | `write_marker` PUTs `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` (`CreateIfAbsent`) | `gateway`, `all` | `s3:PutObject` | `GatewayWrite` `t/*/*/idem/*` |
 
 The list grant names a marker key exactly, as the bootstrap keys above do, so
-a list request it admits returns at most that one key: it admits no listing of
-a tenant's `idem/` directory, of one key's markers across hours, or of another
-signal's markers. Metrics requests take no key and do no lookup.
+a list request it admits returns at most that one marker key. It adds no
+listing of the `idem/` directory beyond what `GatewayList`'s pre-existing `t/`
+prefix already allows: a list of `t/` returns every key under it, markers
+included. Metrics requests take no key and do no lookup.
 
 If a probe fails with a store error other than not-found, on a bucket whose
 policy predates the list grant (where an absent marker answers 403) or for any
 other reason, the keyed request fails with HTTP 503 or gRPC `UNAVAILABLE`
-before its own data is written, so the client's retry is safe. The response
+before its own data is written, so the client's retry is safe. The same
+happens when the lookup has not finished within the write's acknowledgement
+deadline (`ack_deadline`, the budget the write itself gets), for instance
+because S3 is throttling the probes. The response
 says that the idempotency marker lookup failed and the write is safe to
 retry, and nothing about the store; the gateway logs the
-failed GET, its key and the store error at WARN and counts the refusal on
+failed GET, its key and the store error (or, past the deadline, the deadline)
+at WARN and counts the refusal on
 `ravel_ingest_idempotency_lookup_failures_total`. It never writes without the
 lookup, since that would store a duplicate of a request that already landed. A
 request without a key is unaffected.
 `crates/ravel-commit/tests/iam_templates.rs` pins both grants for the marker
-key and checks that no gateway list grant admits the `idem/` directory or any
-other prefix beside a marker key.
+key and checks that no gateway list grant's `s3:prefix` admits a list request
+for the `idem/` directory or any other prefix beside a marker key.
 
 ## Bucket-configuration reads: granted by no template
 
