@@ -885,3 +885,233 @@ secondary time column `EventDate`: because it is declared `i64` in epoch-days,
 and `MIN`/`MAX` over it return epoch-day integers rather than `DATE` values. This
 is the epoch-integer-comparison consequence ADR-0100 decision 3 requires be
 flagged. The affected statements are Q7 and Q37–Q43.
+
+## ClickBench Parquet lane
+
+Everything above loads `hits` into Ravel's own log format. This lane queries
+the upstream Parquet files in place instead (ADR-2040 D7, issue #2055): the
+upstream `create.sql` and the 43 statements of `queries.sql`, unrewritten,
+through `ravel-server`, every answer compared with datafusion-cli 54.1.0's.
+It lives under `benchmarks/clickbench/parquet/`:
+
+| File | What it is |
+|---|---|
+| `create.sql`, `queries.sql` | upstream text, never edited |
+| `suite.toml` | Ravel's `CREATE EXTERNAL TABLE` template and the per-statement comparator overrides |
+| `prereg.toml` | the pre-registered bar every report is judged against |
+| `make-reference.sh` | writes datafusion-cli's answers to `ref/` |
+| `ref/` | those answers, checked in once generated |
+
+The table has two arms. Arm A mounts a prefix holding the 100
+`hits_N.parquet` files; arm B mounts the single-file `hits.parquet`. The
+bench drops and creates `hits` itself (`DROP TABLE IF EXISTS hits`, then the
+`suite.toml` template), and refuses to go on unless the server reports 100
+mounted files for arm A and 1 for arm B.
+
+### What CI covers and what it does not
+
+CI runs `cargo test -p ravel-bench --features sql-latency`, which includes
+`parquet_lane_runs_the_upstream_suite_verbatim` in
+`crates/ravel-bench/tests/clickbench_corpus.rs`: the 43 statements over a
+synthetic fixture of about 22,000 rows in four parts, both arms,
+in process, compared with an in-process DataFusion reference. The same run
+covers the report's D7 check against hand-built reports, the concurrency
+phase against scripted clocks, and the binary's own refusals.
+`make-reference.test.sh` runs `make-reference.sh` against a stub
+datafusion-cli.
+
+Only the reference machine produces anything D7 judges: the real
+datafusion-cli reference, the real 100-file and single-file layouts, the
+timings, the stamped server settings and the concurrency figures. No CI job
+runs `clickbench_parquet_bench` against a server.
+
+### 1. The box
+
+Stand the box up with
+[clickbench-aws-runbook.md](clickbench-aws-runbook.md) sections 1 to 6. D7
+measures against loopback RustFS on that box, not against S3: run RustFS
+1.0.0 there, serving `http://127.0.0.1:9000`, holding Ravel's own bucket and
+a second bucket for the Parquet files, here `clickbench-parquet`. Ravel never
+reads a Parquet table from its own bucket (ADR-2040 D4), so the two must
+differ. Both startup preconditions in that runbook's section 7 apply to the
+server here too.
+
+Put the files in the second bucket, with RustFS's keys in
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`:
+
+```sh
+mkdir -p /root/hits && cd /root/hits
+for i in $(seq 0 99); do
+  wget -q "https://datasets.clickhouse.com/hits_compatible/athena_partitioned/hits_$i.parquet"
+done
+aws s3 cp --endpoint-url http://127.0.0.1:9000 --recursive /root/hits/ \
+  s3://clickbench-parquet/hits/
+aws s3 cp --endpoint-url http://127.0.0.1:9000 /root/hits.parquet \
+  s3://clickbench-parquet/hits.parquet
+```
+
+### 2. The reference and the DESCRIBE check
+
+Install datafusion-cli 54.1.0 and generate the reference from the local
+single-file copy, which is arm B's definition of `hits`:
+
+```sh
+cargo install --locked datafusion-cli --version 54.1.0
+benchmarks/clickbench/parquet/make-reference.sh /root/hits.parquet
+```
+
+It refuses any other datafusion-cli version before writing anything. It
+writes `ref/q01.json` to `ref/q43.json`, `ref/describe.json` (the output of
+`DESCRIBE hits` over the same `create.sql`), and `ref/VERSION` last, only once
+every statement succeeded; it exits 1 naming each statement that failed. The
+bench refuses a reference directory whose `VERSION` is not
+`datafusion-cli 54.1.0` or that lacks any `qNN.json`.
+
+Before trusting the reference, read `ref/describe.json`. `EventDate` must be
+a `Date32`, which is what both upstream's view and Ravel's
+`ravel.cast.EventDate` `date-from-days` option produce, and the text columns
+(`URL`, `Title`, `Referer`, `SearchPhrase`) must be string types, not
+`Binary`, which is what `binary_as_string` produces on both sides. A
+reference that differs here compares Ravel with a different table. Commit
+`ref/` once it passes.
+
+### 3. Fill prereg.toml before any Ravel run
+
+`prereg.toml` ships with `memory_cap_bytes`, `arm_b_hot_s` and `arm_b_cold_s`
+set to a placeholder string, and the bench refuses the file, naming each key,
+until all three are numbers. Fill them before the first suite run and commit
+the filled file with the reports:
+
+- `memory_cap_bytes` is the per-query memory cap the pre-registered failures
+  are stated against. Start the server once (step 5) and copy the
+  `sql_max_query_bytes` value its startup log names; every report's server
+  log must show exactly this value.
+- `arm_b_hot_s` and `arm_b_cold_s` are your predictions of arm B's hot and
+  cold sums. Every report, arm B's own included, fails if its sum exceeds
+  1.25x the prediction.
+
+`failures`, `rlog_hot_ceiling_s`, `concurrency_qps_floor` and
+`concurrency_error_ratio_ceiling` already hold D7's figures; change them
+only with a reason recorded on #2055.
+
+### 4. Build at one SHA
+
+Build every binary from the commit the runbook's bootstrap pinned in
+`/root/CLONE_SHA`, and run the bench from that checkout: the report's
+`provenance.git_sha` is the `HEAD` of the directory the bench runs in.
+
+```sh
+cd /root/ravel
+git checkout -q --detach "$(cat /root/CLONE_SHA)"
+cargo build --release -p ravel-server --features sql
+cargo build --release -p ravel-cli
+cargo build --release -p ravel-bench --features sql-latency --bin clickbench_parquet_bench
+```
+
+### 5. Grant the locations and start the server
+
+The tenant here is `clickbench`. Write a credential profile file,
+`profiles.json`, with one S3 profile named `rustfs` reaching
+`http://127.0.0.1:9000` (the
+shape is in [ravel-server-flags.md](../reference/ravel-server-flags.md),
+`--parquet-profiles`, and ADR-2040 D1; it names where the secret is, never
+the secret), then grant both arms' locations:
+
+```sh
+for loc in s3://clickbench-parquet/hits/ s3://clickbench-parquet/hits.parquet; do
+  target/release/ravel-cli --parquet-profiles profiles.json \
+    tenant parquet-grant add --tenant clickbench --location "$loc" --profile rustfs
+done
+```
+
+Generate the bearer token into an environment variable and start the server
+with a fresh log file. The `;ddl` suffix gives the token the right to create
+and drop tables:
+
+```sh
+export TOKEN="$(openssl rand -hex 16)"
+target/release/ravel-server --store s3 <the --s3-* flags for Ravel's bucket> \
+  --parquet-profiles profiles.json \
+  --tenant-token "$TOKEN=clickbench;ddl" > server.log 2>&1 &
+```
+
+Pass no performance flags. The bench reads five startup lines from
+`server.log`, each like
+
+```
+INFO ravel_server::config: performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
+```
+
+for `cache_max_bytes`, `catalog_cache_max_bytes`, `fetch_concurrency`,
+`sql_max_query_bytes` and `sql_tenant_max_bytes`, and stamps the report with
+them. Each must appear exactly once, so give every server start its own log
+file rather than appending.
+
+### 6. Arms A and B
+
+For each arm, restart the server with a new log and drop the page cache
+(`sync; echo 3 > /proc/sys/vm/drop_caches`) first, then:
+
+```sh
+target/release/clickbench_parquet_bench \
+  --server http://127.0.0.1:4318 --token-env TOKEN \
+  --arm b --location s3://clickbench-parquet/hits.parquet \
+  --reference benchmarks/clickbench/parquet/ref \
+  --prereg benchmarks/clickbench/parquet/prereg.toml \
+  --server-log server.log --out arm-b.json \
+  --sql-max-query-bytes <from server.log> --sql-tenant-max-bytes <from server.log>
+```
+
+and the same with `--arm a --location s3://clickbench-parquet/hits/ --out
+arm-a.json`. `--token-env` takes the variable's name; there is no flag that
+takes the token itself.
+
+Each statement runs three times. Try 1 is the cold figure and the faster of
+tries 2 and 3 the hot one; the sums leave out failed statements. The binary
+runs the statements back to back and drops no cache, so only q01's first try
+is cold in ClickBench's sense; every later statement's first try starts with
+what the statements before it left cached. Try 1's answer is compared with
+the reference.
+
+The bench exits 0 when the report meets the bar, 1 when it does not, after
+printing each violation, and 2 on a setup error (an unfilled prereg, a bad
+token variable, a location that does not fit the arm, a refused reference,
+an unreadable log, a failed `CREATE`, a concurrency phase that could not
+run, an unwritable `--out`). Past setup it writes the report before judging
+it. A violation is any of:
+
+- a statement missing from the report, repeated, or not in the suite;
+- a stamp missing from the log or present more than once, or differing from
+  `--sql-max-query-bytes` or `--sql-tenant-max-bytes`;
+- `sql_max_query_bytes` differing from `memory_cap_bytes`;
+- a statement that failed and is not in `failures`;
+- an answer that could not be compared with the reference, or whose verdict
+  is neither a pass nor the verdict `suite.toml` declares for it, or
+  `suite.toml`'s declared verdicts not loading;
+- hot or cold sum above 1.25x the arm B prediction, or a hot sum not under
+  `rlog_hot_ceiling_s`;
+- in the concurrency phase, queries per second under the floor, an error
+  ratio over the ceiling, or an error from a statement not in `failures`.
+
+A pre-registered failure that answered is printed as a finding, not a
+violation. The 1.25x bar against the *measured* arm B is not mechanical:
+compare `totals.hot_sum_s` and `totals.cold_sum_s` in `arm-a.json` with
+`arm-b.json` by hand, and explain any arm A figure above arm B's on #2055.
+
+### 7. The concurrency phase
+
+Add `--concurrency-seconds 600` to an arm's command for D7's phase: ten
+connections (`--concurrency-tasks`, default 10), each its own HTTP client,
+cycling the 43 statements, task `i` starting `4i` statements into the suite.
+The report's
+`concurrency` block holds queries per second (completed queries over the
+phase's length), the error ratio (errors over completed plus errors), and
+per-statement counts, nearest-rank p50 and p95, and the first error. Without
+the flag the phase does not run and none of D7's concurrency bar is checked.
+
+### 8. Post the reports
+
+Post each arm's report on #2055 with the filled `prereg.toml`, the server
+log, the `CLONE_SHA` and the bench's exit code. A report is stamped when its
+`provenance` carries the five server settings, the reference's `VERSION`,
+and the mounted file count; one that exited 2 has no report to post.
