@@ -45,15 +45,21 @@ pub enum LogSegError {
     #[error("inconsistent stream attrs: {0}")]
     InconsistentStreamAttrs(String),
     /// A [`crate::columnar_batch::ColumnarLogBatch`] whose fields contradict
-    /// each other, refused when it is pushed (or, for the directory checks,
-    /// when the object is built). Covers: `stream_ids` and `stream_attrs` of
-    /// different lengths; a `stream_refs` value at or past `stream_ids.len()`;
-    /// `stream_refs`, `ts_ns`, `observed_ts_ns`, `severity_num`, `flags`,
-    /// `severity_text`, `body` or a validity bitmap whose length is not
-    /// `num_rows`; a packed `trace_id` or `span_id` buffer whose length does
-    /// not match its present rows; a stream id missing from the object's
-    /// directory. A caller-side input error, not a stream id collision and not
-    /// object corruption.
+    /// each other or its own `num_rows`, refused by
+    /// [`crate::columnar_batch::ColumnarLogBatch::validate`] before the
+    /// columnar build path indexes into it. Covers: `ts_ns`, `observed_ts_ns`,
+    /// `severity_num`, `flags`, `severity_text`, `body`, `trace_id_validity`,
+    /// `span_id_validity`, `stream_refs`, or `residual_attrs` whose length is
+    /// not `num_rows`; a packed `trace_id` or `span_id` buffer whose length
+    /// does not match its present rows; `stream_ids` and `stream_attrs` of
+    /// different lengths; a repeated id within `stream_ids`; a `stream_refs`
+    /// value at or past `stream_ids.len()`; a `dyn_columns` entry whose
+    /// `validity` does not describe `num_rows` rows or whose `cells` count
+    /// does not match `validity`'s present count; a `dyn_col_dicts` that is
+    /// non-empty but not one entry per dyn column, or a present dictionary
+    /// whose `ids` is not parallel to its column's present cells or holds an
+    /// id at or past its own `distinct.len()`. A caller-side input error, not
+    /// a stream id collision and not object corruption.
     #[error("malformed columnar batch: {0}")]
     MalformedColumnarBatch(String),
     /// The sort descriptor handed to the writer cannot be recorded for this

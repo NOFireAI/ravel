@@ -556,6 +556,18 @@ impl LogIngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<LogWriteReceipt, LogWriteError> {
+        // Caller-side input rejection, before anything else: a malformed batch
+        // must not reach `est_columnar_bytes` (which indexes `stream_attrs` by
+        // `stream_refs` with no bound check of its own) or `partition_columnar`,
+        // and must not be counted as a `stream_id_collisions` hit the way a
+        // batch that reached the writer's directory merge would be. Maps to
+        // `SegmentBuild`, the same variant the shard actor's own flush-time
+        // `LogSegError::MalformedColumnarBatch` maps to (log_shard.rs), so a
+        // caller sees one failure shape whichever point rejects its input.
+        batch
+            .validate()
+            .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))?;
+
         if batch.is_empty() {
             return Ok(LogWriteReceipt::default());
         }

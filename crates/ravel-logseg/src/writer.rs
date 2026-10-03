@@ -4405,6 +4405,74 @@ mod tests {
         assert_malformed(err, "trace_id holds 0 bytes");
     }
 
+    /// Issue #2460, A1: `residual_attrs` is "per-row duplicate-loser
+    /// attributes" (field doc) and must have exactly `num_rows` entries. A
+    /// batch with MORE entries than `num_rows` is as dangerous as fewer:
+    /// `build_object_columnar`'s residual fold (`for (row, extras) in
+    /// b.residual_attrs.iter().enumerate()`) indexes `base + row` into the
+    /// global per-row `attrs_raw` accumulator, and once `row` reaches
+    /// `num_rows` that lands in the *next* batch's global row range --
+    /// silently attributing this batch's extra residual entries to rows it
+    /// never produced. Pushing the malformed batch first, through the same
+    /// `push_columnar` every producer uses, proves it never reaches that
+    /// fold: the batch pushed after it keeps exactly its own residual
+    /// attribute, with nothing bled in from the batch ahead of it.
+    #[test]
+    fn residual_attrs_longer_than_num_rows_cannot_bleed_into_the_next_batch() {
+        let mut leaking = columnar_batch_with_stream_dir(vec![id(10)], vec![attrs_blob(10)], 0);
+        leaking.residual_attrs = vec![Vec::new(), vec![("leaked".into(), AttrValue::I64(99))]];
+
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let err = w
+            .push_columnar(leaking)
+            .expect_err("residual_attrs longer than num_rows must be refused at push");
+        assert_malformed(err, "residual_attrs has 2 entries but num_rows is 1");
+
+        let mut clean = columnar_batch_with_stream_dir(vec![id(20)], vec![attrs_blob(20)], 0);
+        clean.ts_ns = vec![1];
+        clean.observed_ts_ns = vec![1];
+        clean.residual_attrs = vec![vec![("own".into(), AttrValue::I64(7))]];
+        w.push_columnar(clean)
+            .expect("well-formed batch pushed after a refused one must still succeed");
+
+        let obj = w.finish().expect("finish");
+        let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), 1);
+        let attrs = &rows[0].attrs;
+        assert!(
+            attrs
+                .iter()
+                .any(|(k, v)| k == "own" && *v == AttrValue::I64(7)),
+            "row must keep its own residual attribute: {attrs:?}"
+        );
+        assert!(
+            !attrs.iter().any(|(k, _)| k == "leaked"),
+            "row must not inherit the refused batch's residual attribute: {attrs:?}"
+        );
+    }
+
+    /// Issue #2460, A4: `stream_ids` is documented "Distinct stream ids"; a
+    /// repeated id with a different blob must be refused as malformed input
+    /// at push, never reach the writer's cross-batch directory merge, and
+    /// never be misreported as `InconsistentStreamAttrs` (a stream-id hash
+    /// collision) -- which is what a within-batch duplicate used to look
+    /// like once it fell through to the two-blob check there.
+    #[test]
+    fn duplicate_stream_id_with_different_blobs_is_malformed_not_a_collision() {
+        let dup = id(10);
+        let batch =
+            columnar_batch_with_stream_dir(vec![dup, dup], vec![attrs_blob(10), attrs_blob(20)], 0);
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        let err = w
+            .push_columnar(batch)
+            .expect_err("a duplicate stream id must be refused at push");
+        assert_malformed(
+            err,
+            &format!("stream_ids[0x1] repeats stream {}", dup.to_hex()),
+        );
+    }
+
     #[test]
     fn empty_stream_attrs_is_a_valid_blob() {
         // An empty resource+scope still has a non-empty canonical blob (two
