@@ -295,8 +295,10 @@ unlike the CLI's `load` path, which does report them); the gateway logs
 them at `warn` for operators instead.
 
 **Replay contract.** A retry that supplies the same key first consults the
-marker (one prefix LIST over the dedup window, default 24 h, shared with
-`ravel-maintain`'s sweep so the read path and the sweep agree on the window).
+marker by GETting its exact key for each ingest hour of the dedup window,
+newest first (default 24 h, shared with `ravel-maintain`'s sweep so the read
+path and the sweep agree on the window, plus one hour of forward clock-skew
+tolerance), stopping at the first marker found.
 On a hit inside the window the retry skips layer-3/4 admission (structural
 bounds and active-series/stream caps), normalization, and the router write
 entirely, and replays the stored receipt: the original commit-token header
@@ -309,12 +311,23 @@ to any other: a replay still costs wire bytes, and a tenant well over its
 byte-rate budget can still see a replayed retry rejected at layer 2 before
 the marker lookup ever runs.
 
-**Fail-open, never a lost ack.** A corrupt or unparseable marker, or a store
-error on the lookup, is treated as a miss: the request proceeds down the
-normal path (at-least-once), it is never surfaced as an error to the caller.
-A `write_marker` failure after a durable commit is logged and the request
-still acks success, because the data is already committed; the retry then
-reingests (at-least-once) since no marker exists.
+**Fail-open on a bad marker, fail-closed on a failed lookup, never a lost
+ack.** A corrupt or unparseable marker is treated as a miss: the request
+proceeds down the normal path (at-least-once), it is never surfaced as an
+error to the caller. A store error on a probe of the lookup (a marker GET
+refused, `AccessDenied` included, or any other store failure; a missing marker
+is a miss, not an error) at an hour newer than every marker found means the
+gateway cannot tell whether the request already landed, so the keyed request
+is not acknowledged: it fails with the retryable error a failed flush returns
+(HTTP 503 / gRPC `UNAVAILABLE`) before the request's own data is written, so
+it is safe to retry. A marker found at a newer hour than the failing probe
+still replays its receipt. The response says
+only that the idempotency marker lookup failed; the store error and the marker
+key go to the gateway's log. A request without a key performs no lookup and is
+unaffected. A `write_marker` failure after a
+durable commit is logged and the request still acks success, because the data
+is already committed; the retry then reingests (at-least-once) since no marker
+exists.
 
 **Honest residuals** (unchanged from ADR-0051 §5): a crash after the commit
 PUT but before the marker PUT still yields a duplicate on retry; two

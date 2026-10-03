@@ -2200,6 +2200,41 @@ fn render_ingest_shard_family(out: &mut String, mode: Mode, pipelines: &[IngestP
     }
 }
 
+/// Keyed log and span writes refused because an idempotency marker lookup
+/// probe failed with a store error (issue #2462), read from the process-global
+/// counters in [`crate::logs_ingest`]. Rendered only for the logs and spans
+/// pipelines this process runs: metrics take no idempotency key, so that
+/// sample is structurally absent, not zero.
+fn render_idempotency_lookup_family(
+    out: &mut String,
+    mode: Mode,
+    pipelines: &[IngestPipelineSnapshot],
+) {
+    const NAME: &str = "ravel_ingest_idempotency_lookup_failures_total";
+    let signals: Vec<Signal> = pipelines
+        .iter()
+        .map(|pipeline| pipeline.signal)
+        .filter(|signal| matches!(signal, Signal::Logs | Signal::Spans))
+        .collect();
+    if signals.is_empty() {
+        return;
+    }
+    write_header(
+        out,
+        NAME,
+        "Keyed log and span writes refused with a retryable 503 / UNAVAILABLE because their idempotency marker lookup failed, by signal: a GET of a marker key failed with a store error other than not-found, or the lookup was still running at the request's ack deadline. Each refusal also logs a WARN line naming the key and the store error, or the deadline.",
+        "counter",
+    );
+    for signal in signals {
+        write_sample(
+            out,
+            NAME,
+            &[Label::Mode(mode), Label::Signal(signal)],
+            crate::logs_ingest::idempotency_lookup_failures(signal),
+        );
+    }
+}
+
 /// The write-side POSTINGS counters (ADR-0049 decision 4): section
 /// bytes and per-field distinct-value counts per indexed object, and the
 /// cap-exceeded counter.
@@ -7064,6 +7099,7 @@ pub fn render(
         render_ingest_family(&mut out, mode, ingest);
         render_ingest_shard_family(&mut out, mode, ingest);
         render_logs_postings_family(&mut out, mode, ingest);
+        render_idempotency_lookup_family(&mut out, mode, ingest);
     }
     render_catalog_family(&mut out, mode, catalog);
     // Process-global reads, like `crate::tenancy::v1_unkeyed_adoption_count`
@@ -8922,6 +8958,33 @@ mod tests {
             ),
             "the spans pipeline must render its driven condemned count"
         );
+    }
+
+    /// The idempotency lookup-failure counter renders one sample per marker
+    /// signal the process ingests, and none for metrics, which takes no key.
+    /// Values are process-global, so this pins the shape, not the count; the
+    /// logs and traces ingest tests pin the count.
+    #[test]
+    fn idempotency_lookup_failures_render_for_logs_and_spans_only() {
+        const NAME: &str = "ravel_ingest_idempotency_lookup_failures_total";
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        let mut body = String::new();
+        render_idempotency_lookup_family(&mut body, Mode::Gateway, &ingest);
+
+        assert_eq!(body.matches(&format!("# TYPE {NAME} counter")).count(), 1);
+        for signal in ["logs", "spans"] {
+            let sample = format!("{NAME}{{mode=\"gateway\",signal=\"{signal}\"}} ");
+            assert_eq!(body.matches(&sample).count(), 1, "{signal}:\n{body}");
+        }
+        assert!(!body.contains("signal=\"metrics\""), "{body}");
+
+        let mut metrics_only = String::new();
+        render_idempotency_lookup_family(&mut metrics_only, Mode::Gateway, &ingest[..1]);
+        assert_eq!(metrics_only, "");
     }
 
     /// The two exemplar counters render one sample each, with the family's
