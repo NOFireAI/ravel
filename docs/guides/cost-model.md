@@ -274,11 +274,12 @@ that "the default" is not a no-op. On an egress-billed deployment it replaces a
 derived rate at that deployment's own dollar break-even with one three orders of
 magnitude above it, buying requests with bytes the deployment is billed for. On
 a transfer-free deployment under `cost-based` it replaces the time term's
-6,300,000 bytes, and the projection break-even of five request costs moves with
-it, so 1,887,437 lowers the break-even to 9,437,185 bytes and sends objects
-between that and 31,500,000 bytes down the ranged path the time term keeps them
-off. Leave the flag unset unless a measurement on your own deployment says the
-derived value is wrong for it.
+6,300,000 bytes and drops the projection break-even that comes with a derived
+rate, so the routing threshold is the break-even again, exactly as before
+there was a time term: a narrow projection that skips more than 524,288 bytes
+reads ranged, including objects up to 31,500,000 bytes the time term reads
+whole. Leave the flag unset unless a measurement on your own deployment says
+the derived value is wrong for it.
 
 Startup says which way it resolved, so none of this has to be inferred from
 this page. The `logs fetch policy resolved` line carries the effective request
@@ -326,14 +327,15 @@ raising the value does. `ravel-server` always hands the fetcher its resolved
 `--logs-block-range-threshold`, and the fetcher then uses that threshold
 verbatim as the pre-probe crossover instead of deriving five request costs from
 this value, except where the resolution also hands it a projection break-even.
-It does so under `cost-based` with a finite rate, the shipped flag set: the
-break-even is the larger of the routing threshold and five request costs, and
-it replaces the threshold in the second and third decisions, so there they
-follow this value again (31,500,000 bytes at the reference profile). Under
-`byte-minimal` and `latency-first` the two decisions follow the routing
-threshold, and raising this value without also raising
-`--logs-block-range-threshold` moves the coalescing gap and leaves the other two
-where the threshold puts them. A saturated rate saturates the routing threshold
+It does so when `cost-based` derives a finite rate from the profile, the
+shipped flag set: the break-even is the larger of the routing threshold and
+five request costs, and it replaces the threshold in the second and third
+decisions, so there they follow the derived rate (31,500,000 bytes at the
+reference profile). Under `byte-minimal` and `latency-first`, and wherever this
+flag is set explicitly, the two decisions follow the routing threshold, and
+raising this value without also raising `--logs-block-range-threshold` moves
+the coalescing gap and leaves the other two where the threshold puts them. A
+saturated rate saturates the routing threshold
 too, which turns both decisions into whole-object reads.
 
 Two properties follow from what the number is:
@@ -413,19 +415,17 @@ deployment's billing shape, which is why this is a flag and not a constant.
 3. **Raise it on a request-billed, transfer-free backend** (same-region S3)
    when you want every object read whole. On the shipped `cost-based` policy at
    the reference profile, option 1 already reads whole every object the
-   31,500,000-byte break-even covers, and raising the flag raises that
-   break-even with it, five request costs, so there the flag alone moves the
-   routing. Under `byte-minimal` or `latency-first`, or under `cost-based`
-   against a profile whose bytes carry a price, the resolution leaves its own
-   finite rate in place. Set it at or above the largest segment object *any* tenant this
+   31,500,000-byte break-even covers; setting the flag replaces the derived
+   rate and drops that break-even, so the routing threshold decides again.
+   Set it at or above the largest segment object *any* tenant this
    process serves writes. The flag is process-wide, so a single tenant's largest
    object is the wrong unit, and any tenant holding bigger objects keeps
    routing ranged. There is no format-level object-size cap to read this from;
    object size comes from `--batch-rows` and `--target-bytes` at write time
-   and is observable per tenant, so measure it and round up. Outside
-   `cost-based`, raise `--logs-block-range-threshold` with it, because on the
-   server that threshold, not the five-request-costs derivation, is the
-   pre-probe crossover there; a raise here alone moves the coalescing gap and
+   and is observable per tenant, so measure it and round up. Raise
+   `--logs-block-range-threshold` with it, because with the flag set that
+   threshold, not the five-request-costs derivation, is the pre-probe
+   crossover on the server; a raise here alone moves the coalescing gap and
    leaves the routing where the threshold puts it. With both raised, every candidate segment at or under
    `--logs-max-fetch-run-bytes` becomes one GET, and a larger one becomes a
    few sequential covering GETs. What it costs

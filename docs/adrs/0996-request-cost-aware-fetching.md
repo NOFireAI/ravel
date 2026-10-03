@@ -797,10 +797,12 @@ neither a byte price nor timings; a profile without timings keeps the
 price-only rate. The reference profile records 70 ms and 90 MB/s, so its rate
 is 6,300,000 bytes from the time term instead of `u64::MAX`, the routing
 threshold keeps its configured value, and an explicit
-`--logs-block-range-threshold` is no longer overridden there. Under
-`cost-based` with a finite rate the projection break-even becomes the larger of
-the routing threshold and five request costs (31,500,000 bytes at the reference
-profile), so narrow projections of large objects read ranged while objects at
-or below the break-even read whole. `request-minimal`, `byte-minimal` and
-`latency-first` resolve as before. The startup stamp names the term
+`--logs-block-range-threshold` is no longer overridden there. When
+`cost-based` derives a finite rate the projection break-even becomes the larger
+of the routing threshold and five request costs (31,500,000 bytes at the
+reference profile), so narrow projections of large objects read ranged while
+objects at or below the break-even read whole. `request-minimal`,
+`byte-minimal` and `latency-first` resolve as before, and so does an explicit
+`--logs-request-cost-bytes`, whose deployment keeps the routing threshold as
+its break-even. The startup stamp names the term
 (`rate_term`) and the break-even (`projection_break_even_bytes`).

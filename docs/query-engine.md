@@ -416,8 +416,9 @@ routing threshold and that crossover, so under `byte-minimal` and
 `latency-first` at its 512 KiB default the effective break-even is 512 KiB of
 saving, not the request-cost-derived 8.9 MiB.
 
-Under `cost-based`, and only there, a finite rate also resolves a projection
-break-even (ADR-2414 decision A3): the larger of the routing threshold and
+Under `cost-based`, and only there, a finite rate derived from the store cost
+profile (not one an explicit `--logs-request-cost-bytes` set) also resolves a
+projection break-even (ADR-2414 decision A3): the larger of the routing threshold and
 `WHOLE_OBJECT_REQUEST_MULTIPLE` request costs, carried as
 `EngineConfig::logs_projection_break_even_bytes` and handed to the fetcher with
 `LogSegmentFetcher::with_projection_break_even_bytes`. When it is set,

@@ -2792,7 +2792,8 @@ pub struct LogsFetchStamp {
     /// The resolved logs routing threshold.
     pub block_range_threshold: u64,
     /// The projection break-even in force (ADR-2414 decision A3): `Some` only
-    /// under `cost-based` with a finite rate. `None` means the routing
+    /// when `cost-based` derived a finite rate from the profile, not under an
+    /// explicit `--logs-request-cost-bytes`. `None` means the routing
     /// threshold serves as the break-even, and [`Self::emit`] prints it as 0.
     pub projection_break_even_bytes: Option<u64>,
     /// The operator's `--logs-block-range-threshold` when the resolution
@@ -11976,9 +11977,12 @@ mod tests {
         assert_eq!(stamp.projection_break_even_bytes, None);
         assert_eq!(engine_from(&cli).logs_projection_break_even_bytes, None);
 
+        // An explicit rate keeps ADR-0904's routing: no break-even.
         let cli = Cli::try_parse_from(["ravel-server", "--logs-request-cost-bytes", "123456"])
             .expect("flag parses");
-        assert_eq!(stamp_from(&cli).rate_term, "flag");
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.rate_term, "flag");
+        assert_eq!(stamp.projection_break_even_bytes, None);
     }
 
     /// ADR-2023 decision 1: `--logs-fetch-policy` unset resolves `cost-based`
