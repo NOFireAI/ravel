@@ -70,6 +70,7 @@
 //! exemplar-assignment batching (this metrics path writes a single part, so a
 //! flat filter suffices).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use bytes::Bytes;
@@ -86,9 +87,10 @@ use ravel_proto::commit::v1::{
     ErasureRequest, RewriteDrop, RewriteRecord,
 };
 use ravel_segment::{
-    CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunEntry, RunInputV4,
-    RunValuePageV4, SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, ValueKind,
-    decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
+    CompactionMetaV4, ExemplarInput, IngestBounds, ReaderLimits, RunEntry, RunInputV4, RunInputV7,
+    RunValuePageV4, SampleProvenance, SegmentIdentity, SegmentWriter, SeriesInputV7, SeriesValues,
+    ValueKind, decode_catalog_v5, decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
+    open_from_full,
 };
 use ravel_types::{LabelSet, Sample, Signal, TenantHash};
 
@@ -436,13 +438,6 @@ impl LiveRecordBody {
         }
     }
 
-    fn created_unix_ns(&self) -> i64 {
-        match self {
-            LiveRecordBody::Compaction(r) => r.created_unix_ns,
-            LiveRecordBody::Rewrite(r) => r.created_unix_ns,
-        }
-    }
-
     fn reconstruct_part_key(
         &self,
         part: &ravel_proto::commit::v1::CompactionPart,
@@ -712,10 +707,10 @@ fn live_rewrite_applied_request_ids(live: &LiveInputs) -> Option<HashSet<String>
 /// `RewriteRecord` names: the raw L0 inputs' own catalogs plus their
 /// identities if the bucket was never compacted, or the live
 /// compaction/rewrite record's own parts' catalogs plus its own key
-/// otherwise. An L1/rewrite part carries no writer identity of its own, so
-/// its catalog's runs are stamped with the live record's `created_unix_ns`
-/// and zeroed epoch/seq -- the same nil-writer-identity convention
-/// [`crate::read::load_catalog_from_object`]'s own doc comment names.
+/// otherwise. A part's runs are loaded with a zero triple: [`build_rewrite`]
+/// restamps each from the part's own stored catalog
+/// ([`RunProvenance::Stored`]), since a part's runs keep the provenance of the
+/// writes they came from, not the record's.
 async fn load_live_catalogs_and_target(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -747,19 +742,12 @@ async fn load_live_catalogs_and_target(
             Ok((catalogs, RewriteSupersession::RawL0(identities)))
         }
         LiveInputs::Existing { key, body } => {
-            let created_unix_ns = body.created_unix_ns();
             let mut catalogs = Vec::with_capacity(body.parts().len());
             for part in body.parts() {
                 let object_key = body.reconstruct_part_key(part)?;
-                let catalog = crate::read::load_catalog_from_object(
-                    store,
-                    config,
-                    object_key,
-                    created_unix_ns,
-                    0,
-                    0,
-                )
-                .await?;
+                let catalog =
+                    crate::read::load_catalog_from_object(store, config, object_key, 0, 0, 0)
+                        .await?;
                 catalogs.push(catalog);
             }
             Ok((catalogs, RewriteSupersession::Existing(key)))
@@ -880,6 +868,79 @@ fn slice_whole(whole: &Bytes, range: (u64, u64)) -> Result<Bytes> {
     Ok(whole.slice(offset..end_usize))
 }
 
+/// One run's dedup provenance as its part's own catalog stores it.
+struct StoredRun {
+    created_unix_ns: i64,
+    writer_epoch: u64,
+    writer_seq: u64,
+    samples: Option<Vec<SampleProvenance>>,
+}
+
+/// Every run's stored dedup provenance in a whole fetched part, keyed by series
+/// id, runs in catalog order ([`RunProvenance::Stored`]).
+fn stored_run_provenance(object: &Bytes) -> Result<HashMap<[u8; 16], Vec<StoredRun>>> {
+    let limits = ReaderLimits::default();
+    let loc = open_from_full(object, limits)?;
+    let entries = decode_catalog_v5(&loc.footer, object, limits)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| {
+            let mut columns = entry.per_sample_provenance.into_iter();
+            let runs = entry
+                .runs
+                .iter()
+                .map(|run| StoredRun {
+                    created_unix_ns: run.created_unix_ns,
+                    writer_epoch: run.writer_epoch,
+                    writer_seq: run.writer_seq,
+                    samples: columns.next().flatten(),
+                })
+                .collect();
+            (entry.entry.series_id.0, runs)
+        })
+        .collect())
+}
+
+/// The per-sample provenance column for the survivors of a filtered run, whose
+/// original in-page indexes are `kept` out of `decoded` samples. A run with a
+/// column keeps each survivor's entry. A run without one keeps none when
+/// nothing was dropped, and otherwise gets a column of its run-wide triple
+/// plus each survivor's original index: after a drop, array position no
+/// longer reconstructs the fourth element of the dedup key.
+fn survivor_provenance(
+    run: &RunPlan,
+    column: Option<&Vec<SampleProvenance>>,
+    kept: &[usize],
+    decoded: usize,
+) -> Result<Option<Vec<SampleProvenance>>> {
+    match column {
+        Some(column) => {
+            if column.len() != decoded {
+                return Err(MaintainError::Invariant(format!(
+                    "a run's provenance column holds {} entries for {decoded} samples",
+                    column.len()
+                )));
+            }
+            Ok(Some(kept.iter().map(|&i| column[i]).collect()))
+        }
+        None if kept.len() == decoded => Ok(None),
+        None => kept
+            .iter()
+            .map(|&i| {
+                Ok(SampleProvenance {
+                    created_unix_ns: run.created_unix_ns,
+                    writer_epoch: run.writer_epoch,
+                    writer_seq: run.writer_seq,
+                    in_page_index: u32::try_from(i).map_err(|_| {
+                        MaintainError::Invariant("run sample index exceeds u32".into())
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some),
+    }
+}
+
 /// Copy one run's TS and VAL-or-HIST pages verbatim (no decode) out of its
 /// whole fetched object. Used for a run whose series matches no applicable
 /// request's labels at all: every sample survives, so there is nothing to
@@ -964,6 +1025,11 @@ pub struct RewriteBuild {
 /// dropped from the output entirely (never emitted as an empty run). A
 /// series with zero surviving runs is likewise dropped from the output
 /// series list.
+///
+/// Every surviving sample keeps its dedup key, taken from where `provenance`
+/// says: each output run carries its input run's triple and, when the input
+/// run has one, the per-sample provenance column filtered to the survivors
+/// ([`survivor_provenance`]).
 pub async fn build_rewrite(
     store: &dyn ObjectStoreBackend,
     bucket: &Bucket,
@@ -971,9 +1037,22 @@ pub async fn build_rewrite(
     catalogs: &[InputCatalog],
     requests: &[ApplicableRequest],
     input_set_hash: &[u8; 32],
+    provenance: RunProvenance,
 ) -> Result<RewriteBuild> {
     let whole = fetch_whole_objects(store, catalogs).await?;
     let limits = ReaderLimits::default();
+    let stored = match provenance {
+        RunProvenance::CommitRecord => catalogs.iter().map(|_| None).collect::<Vec<_>>(),
+        RunProvenance::Stored => catalogs
+            .iter()
+            .map(|c| {
+                let object = whole.get(&c.object_key).ok_or_else(|| {
+                    MaintainError::Invariant(format!("no fetched object for {}", c.object_key))
+                })?;
+                stored_run_provenance(object).map(Some)
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
 
     let mut input_sample_count: u64 = 0;
     let mut output_sample_count: u64 = 0;
@@ -998,7 +1077,7 @@ pub async fn build_rewrite(
         }
     }
 
-    let mut series_out: Vec<SeriesInputV4> = Vec::with_capacity(by_series.len());
+    let mut series_out: Vec<SeriesInputV7> = Vec::with_capacity(by_series.len());
 
     // Per-series labels and applicable-request set, keyed by series_id, so the
     // exemplar carry-forward below can run the SAME per-record matcher the
@@ -1039,7 +1118,37 @@ pub async fn build_rewrite(
             let object = whole.get(&catalog.object_key).ok_or_else(|| {
                 MaintainError::Invariant(format!("no fetched object for {}", catalog.object_key))
             })?;
-            for run in &series.runs {
+            let stored_runs = match &stored[*idx] {
+                None => None,
+                Some(by_series) => Some(
+                    by_series
+                        .get(&series_id.0)
+                        .filter(|runs| runs.len() == series.runs.len())
+                        .ok_or_else(|| {
+                            MaintainError::Invariant(format!(
+                                "stored catalog of {} disagrees with its loaded catalog \
+                                 for series {}",
+                                catalog.object_key,
+                                hex::encode(series_id.0)
+                            ))
+                        })?,
+                ),
+            };
+            for (run_index, run) in series.runs.iter().enumerate() {
+                let (run, column) = match stored_runs {
+                    None => (Cow::Borrowed(run), None),
+                    Some(runs) => {
+                        let s = &runs[run_index];
+                        let restamped = RunPlan {
+                            created_unix_ns: s.created_unix_ns,
+                            writer_epoch: s.writer_epoch,
+                            writer_seq: s.writer_seq,
+                            ..run.clone()
+                        };
+                        (Cow::Owned(restamped), s.samples.as_ref())
+                    }
+                };
+                let run = run.as_ref();
                 input_sample_count = input_sample_count
                     .checked_add(u64::from(run.sample_count))
                     .ok_or_else(|| {
@@ -1056,7 +1165,10 @@ pub async fn build_rewrite(
                                 "output_sample_count sum overflowed u64".to_string(),
                             )
                         })?;
-                    runs_out.push(copy_run_verbatim(object, run)?);
+                    runs_out.push(RunInputV7 {
+                        run: copy_run_verbatim(object, run)?,
+                        provenance: column.cloned(),
+                    });
                     continue;
                 }
 
@@ -1089,11 +1201,18 @@ pub async fn build_rewrite(
                             &mut timestamps,
                             &mut values,
                         )?;
-                        let mut survivors = Vec::with_capacity(timestamps.len());
-                        for (ts, value) in timestamps.into_iter().zip(values) {
+                        let decoded = timestamps.len();
+                        let mut survivors = Vec::with_capacity(decoded);
+                        let mut kept = Vec::with_capacity(decoded);
+                        for (in_page_index, (ts, value)) in
+                            timestamps.into_iter().zip(values).enumerate()
+                        {
                             match first_dropping_request(&applicable, requests, &labels, ts) {
                                 Some(i) => dropped_counts[i] += 1,
-                                None => survivors.push(Sample { ts_ns: ts, value }),
+                                None => {
+                                    survivors.push(Sample { ts_ns: ts, value });
+                                    kept.push(in_page_index);
+                                }
                             }
                         }
                         if !survivors.is_empty() {
@@ -1104,13 +1223,16 @@ pub async fn build_rewrite(
                                         "output_sample_count sum overflowed u64".to_string(),
                                     )
                                 })?;
-                            runs_out.push(encode_run_v4(
-                                &series_id,
-                                run.created_unix_ns,
-                                run.writer_epoch,
-                                run.writer_seq,
-                                &SeriesValues::Scalar(survivors),
-                            )?);
+                            runs_out.push(RunInputV7 {
+                                run: encode_run_v4(
+                                    &series_id,
+                                    run.created_unix_ns,
+                                    run.writer_epoch,
+                                    run.writer_seq,
+                                    &SeriesValues::Scalar(survivors),
+                                )?,
+                                provenance: survivor_provenance(run, column, &kept, decoded)?,
+                            });
                         }
                     }
                     ValueKind::Histogram => {
@@ -1121,11 +1243,16 @@ pub async fn build_rewrite(
                             val_page.as_ref(),
                             limits,
                         )?;
-                        let mut survivors = Vec::with_capacity(samples.len());
-                        for s in samples {
+                        let decoded = samples.len();
+                        let mut survivors = Vec::with_capacity(decoded);
+                        let mut kept = Vec::with_capacity(decoded);
+                        for (in_page_index, s) in samples.into_iter().enumerate() {
                             match first_dropping_request(&applicable, requests, &labels, s.ts_ns) {
                                 Some(i) => dropped_counts[i] += 1,
-                                None => survivors.push(s),
+                                None => {
+                                    survivors.push(s);
+                                    kept.push(in_page_index);
+                                }
                             }
                         }
                         if !survivors.is_empty() {
@@ -1136,13 +1263,16 @@ pub async fn build_rewrite(
                                         "output_sample_count sum overflowed u64".to_string(),
                                     )
                                 })?;
-                            runs_out.push(encode_run_v4(
-                                &series_id,
-                                run.created_unix_ns,
-                                run.writer_epoch,
-                                run.writer_seq,
-                                &SeriesValues::Histogram(survivors),
-                            )?);
+                            runs_out.push(RunInputV7 {
+                                run: encode_run_v4(
+                                    &series_id,
+                                    run.created_unix_ns,
+                                    run.writer_epoch,
+                                    run.writer_seq,
+                                    &SeriesValues::Histogram(survivors),
+                                )?,
+                                provenance: survivor_provenance(run, column, &kept, decoded)?,
+                            });
                         }
                     }
                 }
@@ -1150,7 +1280,7 @@ pub async fn build_rewrite(
         }
 
         if !runs_out.is_empty() {
-            series_out.push(SeriesInputV4 {
+            series_out.push(SeriesInputV7 {
                 series_id,
                 labels,
                 runs: runs_out,
@@ -1263,8 +1393,9 @@ pub async fn build_rewrite(
 ///
 /// `exemplars` are the surviving input exemplars, already filtered by
 /// [`build_rewrite`] against the erasure predicate (ADR-0064 §4) and to series
-/// that survive into `batch`; `write_v5_with_exemplars` resolves each record's
-/// `series_index` against this part's own SERIES_IDS ordering.
+/// that survive into `batch`; `write_v7_with_provenance` resolves each record's
+/// `series_index` against this part's own SERIES_IDS ordering, and stores the
+/// per-sample provenance column of every run that carries one.
 ///
 /// `exemplars_kept` is [`build_rewrite`]'s own tally of `exemplars.len()`,
 /// threaded through separately so a caller that starts passing the wrong
@@ -1276,7 +1407,7 @@ fn build_rewrite_part(
     bucket: &Bucket,
     config: &CompactorConfig,
     input_set_hash: &[u8; 32],
-    batch: Vec<SeriesInputV4>,
+    batch: Vec<SeriesInputV7>,
     exemplars: Vec<ExemplarInput>,
     exemplars_kept: u64,
 ) -> Result<BuiltPart> {
@@ -1309,7 +1440,8 @@ fn build_rewrite_part(
         min_ingest_ts_ns: 0,
         max_ingest_ts_ns: 0,
     };
-    let written = SegmentWriter::write_v5_with_exemplars(batch, identity, ingest, meta, exemplars)?;
+    let written =
+        SegmentWriter::write_v7_with_provenance(batch, identity, ingest, meta, exemplars)?;
     let content_hash = written.summary.blake3;
     let hash16 = hex::encode(&content_hash[..8]);
     let input_set_hash16 = hex::encode(&input_set_hash[..8]);
@@ -1627,12 +1759,41 @@ pub async fn build_rewrite_spans(
 /// rewritten). Exactly one of `RewriteRecord.inputs` /
 /// `.superseded_record_key` is ever set (`ravel_commit::erasure::validate_rewrite`),
 /// and which one is a property of [`resolve_live_record`]'s result at the
-/// point [`build_rewrite`] ran -- the driver threads it through
-/// unchanged since [`build_rewrite`] itself does not need to know.
+/// point [`build_rewrite`] ran. [`build_rewrite`] needs only its
+/// [`RewriteSupersession::run_provenance`], which says where each input run's
+/// dedup key comes from.
 #[derive(Debug, Clone)]
 pub enum RewriteSupersession {
     RawL0(Vec<CompactionInputIdentity>),
     Existing(String),
+}
+
+impl RewriteSupersession {
+    /// The dedup provenance source of the catalogs
+    /// [`load_live_catalogs_and_target`] resolved alongside this target.
+    pub fn run_provenance(&self) -> RunProvenance {
+        match self {
+            RewriteSupersession::RawL0(_) => RunProvenance::CommitRecord,
+            RewriteSupersession::Existing(_) => RunProvenance::Stored,
+        }
+    }
+}
+
+/// Where [`build_rewrite`] takes each input run's dedup key
+/// (docs/catalog-and-mvcc.md "Cross-segment duplicate samples") from. The
+/// rewrite carries that key through unchanged for every surviving sample
+/// (ADR-0064 decision 3): a query resolves a rewritten sample against the
+/// bucket's other records, and any later commit, by that key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunProvenance {
+    /// Raw L0 inputs: the catalog loader already stamped every run with its
+    /// commit record's `(created_unix_ns, writer_epoch, writer_seq)`, which is
+    /// what a query resolves an L0 object by.
+    CommitRecord,
+    /// The parts of a live compaction or rewrite record: each run keeps the
+    /// run-wide triple its part's catalog stores and, for a run-merged run
+    /// (ADR-0092 decision 1), its per-sample provenance column.
+    Stored,
 }
 
 /// Input-side record-count conservation gate for logs/spans:
@@ -2282,6 +2443,7 @@ async fn build_and_publish_rewrite(
                 &catalogs,
                 &applicable,
                 &input_set_hash,
+                supersession.run_provenance(),
             )
             .await?;
             (supersession, build)
@@ -3364,18 +3526,34 @@ mod tests {
 
         let clock = FixedClock::new(0);
 
-        let build1 = build_rewrite(&store, &b, &config, &catalogs, &applicable, &input_set_hash)
-            .await
-            .expect("build 1");
+        let build1 = build_rewrite(
+            &store,
+            &b,
+            &config,
+            &catalogs,
+            &applicable,
+            &input_set_hash,
+            supersession.run_provenance(),
+        )
+        .await
+        .expect("build 1");
         let outcome1 =
             publish_rewrite_record(&store, &config, &clock, &b, supersession.clone(), build1, 0)
                 .await
                 .expect("publish 1");
         assert_eq!(outcome1, PublishOutcome::Published);
 
-        let build2 = build_rewrite(&store, &b, &config, &catalogs, &applicable, &input_set_hash)
-            .await
-            .expect("build 2");
+        let build2 = build_rewrite(
+            &store,
+            &b,
+            &config,
+            &catalogs,
+            &applicable,
+            &input_set_hash,
+            supersession.run_provenance(),
+        )
+        .await
+        .expect("build 2");
         let outcome2 = publish_rewrite_record(&store, &config, &clock, &b, supersession, build2, 0)
             .await
             .expect("publish 2");
@@ -3543,6 +3721,7 @@ mod tests {
             &[catalog],
             &[],
             &[0u8; 32],
+            RunProvenance::CommitRecord,
         )
         .await
         .expect_err("a page range beyond the object's length must not decode");
@@ -6998,8 +7177,8 @@ mod tests {
     /// and timestamps intact.
     ///
     /// Flip-line proof: this fails against the pre-fix code. Reverting
-    /// `build_rewrite_part`'s `write_v5_with_exemplars(..., exemplars)` back to
-    /// `write_v5_with_exemplars(..., Vec::new())` drops every exemplar, so
+    /// `build_rewrite_part`'s `write_v7_with_provenance(..., exemplars)` back to
+    /// `write_v7_with_provenance(..., Vec::new())` drops every exemplar, so
     /// `read_output_exemplars` returns an empty vec and the `expected` (3
     /// records) assertion fails. That is the exact line the pre-fix bug lived
     /// on.
@@ -7149,7 +7328,7 @@ mod tests {
     /// Flip-line proof: an implementation that carries everything (deleting the
     /// whole exemplar filter in `build_rewrite`, both the `surviving_series`
     /// guard and the per-record predicate) hands `alpha`'s exemplar -- naming a
-    /// series absent from the output -- to `write_v5_with_exemplars`, which
+    /// series absent from the output -- to `write_v7_with_provenance`, which
     /// fails with `WriteError::ExemplarUnknownSeries`; the rewrite then errors
     /// and the `.expect("rewrite")` below panics.
     ///
@@ -7348,7 +7527,7 @@ mod tests {
     ///
     /// With the guard, `alpha`'s exemplar is dropped (its series is absent from
     /// `surviving_series`) and only `beta`'s survives. Without the guard, the
-    /// predicate keeps `alpha`'s exemplar, `write_v5_with_exemplars` is handed a
+    /// predicate keeps `alpha`'s exemplar, `write_v7_with_provenance` is handed a
     /// record naming a series absent from the output part, and it fails with
     /// `WriteError::ExemplarUnknownSeries` -- the rewrite errors and the
     /// `.expect("rewrite")` below panics. Deleting the guard leaves the four
@@ -7467,9 +7646,17 @@ mod tests {
             }
         };
 
-        let build = build_rewrite(&store, &b, &config, &catalogs, &applicable, &input_set_hash)
-            .await
-            .expect("build");
+        let build = build_rewrite(
+            &store,
+            &b,
+            &config,
+            &catalogs,
+            &applicable,
+            &input_set_hash,
+            supersession.run_provenance(),
+        )
+        .await
+        .expect("build");
         assert_eq!(
             build.exemplars_dropped, 1,
             "exactly the in-window exemplar (ts 20) is dropped"

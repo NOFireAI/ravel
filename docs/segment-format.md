@@ -336,8 +336,11 @@ A run may carry an explicit per-sample dedup key
 (`created_unix_ns`, `writer_epoch`, `writer_seq`, in-page index) instead of
 sharing its run-wide triple (blocks 5-7) plus array position. This is what a
 run-merged L1 run needs, since merging several writes' samples into one run
-destroys the array-position reconstruction of the fourth key element. Every
-object an L0 flush produces, and any write that does not merge runs, omits these
+destroys the array-position reconstruction of the fourth key element. An
+erasure rewrite that drops samples from an unmerged run needs it for the same
+reason: removing a sample shifts the positions after it, so the rewrite writes
+the survivors' original positions. Every object an L0 flush produces, and any
+other write that neither merges runs nor removes samples from one, omits these
 columns entirely; absence is the canonical "no provenance" representation.
 
 The columns are **optional per run**, and their absence costs zero bytes: when
