@@ -51,11 +51,13 @@ use crate::reconcile::{
     RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY, STORE_QUALIFIED_FAILED_REASON,
     STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON, STORE_QUALIFIED_SUCCEEDED_REASON,
     STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
-    audit_token_key_missing, desired_objects, desired_qualify_job, grpcroute_api_resource,
-    httproute_api_resource, plan_qualify_gate, possible_gateway_route_names,
-    possible_ingest_ingress_names, possible_network_policy_names,
-    possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
-    qualify_job_input_hash, qualify_job_phase, s3_allow_http,
+    audit_token_key_missing, deployment_rollout_complete, desired_objects, desired_qualify_job,
+    distributed_query_secret_refs, grpcroute_api_resource, httproute_api_resource,
+    plan_qualify_gate, possible_gateway_route_names, possible_ingest_ingress_names,
+    possible_network_policy_names, possible_pod_disruption_budget_names,
+    possible_router_object_names, qualification_decision, qualify_job_input_hash,
+    qualify_job_phase, query_fragment_policy_hold_while_disabling,
+    query_network_policy_during_rollout, s3_allow_http,
 };
 
 /// Server-side-apply field manager name.
@@ -284,8 +286,14 @@ async fn resolve_token_secret(
 }
 
 /// Read a Secret's `resourceVersion` without pulling its values into operator
-/// memory. Used for the credentials Secret, whose keys are fixed
-/// (`accessKeyId`/`secretAccessKey`) so only change-detection is needed.
+/// memory. Used for every Secret that only needs change detection: the
+/// credential Secrets (fixed `accessKeyId`/`secretAccessKey` keys) and the four
+/// distributed-query Secrets (the fragment TLS key, the fragment key file, and
+/// the SQL ticket key), whose values the operator must never load.
+///
+/// `Api::get_metadata` issues the same `get` verb against the Secret but asks
+/// the apiserver for metadata only, so the response carries the
+/// `resourceVersion` without `data` or `stringData`.
 async fn secret_resource_version(
     client: &Client,
     namespace: &str,
@@ -293,11 +301,80 @@ async fn secret_resource_version(
     field: &str,
 ) -> Result<Option<String>, Error> {
     let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-    let secret = api
-        .get(name)
+    let meta = api
+        .get_metadata(name)
         .await
         .map_err(|err| secret_error(err, name, namespace, field))?;
-    Ok(secret.resource_version())
+    Ok(meta.resource_version())
+}
+
+/// The outcome of resolving the distributed-query Secrets' `resourceVersion`s.
+enum DistributedQueryResolution {
+    /// Every referenced Secret exists; its `resourceVersion` in
+    /// [`distributed_query_secret_refs`] order (empty when distributed query
+    /// does not render).
+    Resolved(Vec<String>),
+    /// A referenced Secret does not exist. Unlike a missing credential, this
+    /// soft-degrades: the query tier is held back and a `Degraded` condition
+    /// names the Secret, but every other tier still reconciles.
+    SecretMissing { name: String, reason: String },
+}
+
+impl DistributedQueryResolution {
+    /// The `resourceVersion`s to stamp into the query pod template's checksum:
+    /// the resolved ones, or empty when a Secret is missing (the query tier is
+    /// held back this pass, so the checksum it would carry is never applied).
+    fn resource_versions(&self) -> Vec<String> {
+        match self {
+            Self::Resolved(versions) => versions.clone(),
+            Self::SecretMissing { .. } => Vec::new(),
+        }
+    }
+
+    /// The `Degraded` reason and message when a referenced Secret is missing,
+    /// `None` when every Secret resolved.
+    fn secret_missing_degrade(&self) -> Option<(String, String)> {
+        match self {
+            Self::SecretMissing { name, reason } => Some(degraded_reason(&Error::SecretNotFound {
+                name: name.clone(),
+                reason: reason.clone(),
+            })),
+            Self::Resolved(_) => None,
+        }
+    }
+
+    /// Whether the query tier's Deployment apply is withheld this pass.
+    fn holds_query_tier(&self) -> bool {
+        matches!(self, Self::SecretMissing { .. })
+    }
+}
+
+/// Read the `resourceVersion` of each distributed-query Secret the query pods
+/// mount, in [`distributed_query_secret_refs`] order, for the query tier's
+/// pod-template checksum.
+///
+/// A missing Secret does NOT fail the reconcile (unlike the deployment key):
+/// one absent fragment Secret must not stop the gateway and maintain tiers from
+/// reconciling. It returns [`DistributedQueryResolution::SecretMissing`] so the
+/// caller holds back only the query tier (its running pods keep serving) and
+/// records a `Degraded` condition naming the Secret. Any other read error (a
+/// 403, a transport failure) still propagates.
+async fn resolve_distributed_query_resource_versions(
+    client: &Client,
+    namespace: &str,
+    spec: &RavelClusterSpec,
+) -> Result<DistributedQueryResolution, Error> {
+    let mut versions = Vec::new();
+    for (name, field) in distributed_query_secret_refs(spec) {
+        match secret_resource_version(client, namespace, name, field).await {
+            Ok(rv) => versions.push(rv.unwrap_or_default()),
+            Err(Error::SecretNotFound { name, reason }) => {
+                return Ok(DistributedQueryResolution::SecretMissing { name, reason });
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Ok(DistributedQueryResolution::Resolved(versions))
 }
 
 /// Read the `resourceVersion` of every credential Secret the spec references,
@@ -573,15 +650,21 @@ async fn resolve_audit_token_key(
     Ok(AuditTokenKeyResolution::Missing)
 }
 
-/// The query tier's `Deployment` to apply this pass, or `None` when
-/// [`audit_token_key_missing`] withholds it (#1487 rework): a cluster with
-/// neither `auditTokenKeySecretRef` nor `deploymentKeySecretRef` cannot
-/// render a query Deployment the server will start cleanly, so this pass
-/// leaves any existing query Deployment as it is rather than rolling it to a
-/// spec missing the env var the server requires to start with audit
-/// tokenization enabled.
-fn query_tier_apply_target(spec: &RavelClusterSpec, rendered: Deployment) -> Option<Deployment> {
-    if audit_token_key_missing(spec) {
+/// The query tier's `Deployment` to apply this pass, or `None` when it is held
+/// back. Two cases withhold it, and both leave any existing query Deployment
+/// exactly as it is rather than rolling it to a spec whose pods cannot serve:
+///
+/// - [`audit_token_key_missing`] (#1487 rework): a cluster with neither
+///   `auditTokenKeySecretRef` nor `deploymentKeySecretRef` cannot render a
+///   query Deployment that starts cleanly with audit tokenization enabled.
+/// - `distributed_query_secret_missing` (#2403): a referenced distributed-query
+///   Secret does not exist, so a rolled pod would fail to mount it.
+fn query_tier_apply_target(
+    spec: &RavelClusterSpec,
+    distributed_query_secret_missing: bool,
+    rendered: Deployment,
+) -> Option<Deployment> {
+    if audit_token_key_missing(spec) || distributed_query_secret_missing {
         None
     } else {
         Some(rendered)
@@ -590,8 +673,9 @@ fn query_tier_apply_target(spec: &RavelClusterSpec, rendered: Deployment) -> Opt
 
 /// The query tier's ready-replica count to report on `.status` this pass.
 ///
-/// When [`query_tier_apply_target`] withheld the apply (`audit_key_missing`),
-/// this pass never touched the query Deployment, so `applied_ready` (which
+/// When [`query_tier_apply_target`] withheld the apply (`query_held`: a missing
+/// audit-token key, or a missing distributed-query Secret), this pass never
+/// touched the query Deployment, so `applied_ready` (which
 /// [`TierDeployments::apply_tier`] leaves `None` for a tier it never applied)
 /// says nothing about whether the cluster is actually serving; `live_ready`,
 /// read straight off the existing Deployment the same way
@@ -601,11 +685,11 @@ fn query_tier_apply_target(spec: &RavelClusterSpec, rendered: Deployment) -> Opt
 /// could not roll their spec. Otherwise `applied_ready` is exactly what this
 /// pass's own apply observed, as before #1487.
 fn effective_query_ready(
-    audit_key_missing: bool,
+    query_held: bool,
     applied_ready: Option<i32>,
     live_ready: Option<i32>,
 ) -> Option<i32> {
-    if audit_key_missing {
+    if query_held {
         live_ready
     } else {
         applied_ready
@@ -1145,36 +1229,53 @@ where
 
 /// Converge the fragment-port NetworkPolicy around the Deployment applies.
 ///
-/// A rendered `policy` is applied before `apply_deployments` runs, so a query
-/// pod never opens the fragment port without the policy covering it. Every
-/// other name in `possible_names` is deleted only after `apply_deployments`
-/// reports that it applied the query Deployment, so a pass that holds the
-/// query apply back (a missing audit-token key, or the bootstrap order
-/// waiting on maintain) keeps the policy. The apply does not wait for the
-/// rollout: pods of the old ReplicaSet can still listen on the port for the
-/// rest of the rolling update after the delete, guarded then only by the
-/// fragment listener's mutual TLS. The callbacks are injected so tests can
-/// record the order.
+/// `held`, the policy to keep present while the query rollout is in flight, is
+/// applied before `apply_deployments` runs, so a query pod never opens the
+/// fragment port without a policy covering it and a port a new pod opens is
+/// never blocked by a narrower policy. The caller computes `held` from the live
+/// query Deployment: the `desired` policy widened to the ports the old pods
+/// still listen on ([`query_network_policy_during_rollout`]), or, when `desired`
+/// is `None` because distributed query is being turned off, the wider hold that
+/// keeps the old pods covered through the disabling rollout
+/// ([`query_fragment_policy_hold_while_disabling`]).
+///
+/// The exact `desired` policy replaces `held`, and every other name in
+/// `possible_names` is deleted, only once `apply_deployments` returns the
+/// applied query Deployment with no pods left on an older spec
+/// ([`deployment_rollout_complete`]). A pass that holds the query apply back
+/// (a missing audit-token key, a missing distributed-query Secret, or the
+/// bootstrap order waiting on maintain), or that finds the rollout still in
+/// progress, keeps the policy as it is; the owned-Deployment watch re-runs the
+/// reconcile as the rollout's status moves. The callbacks are injected so tests
+/// can record the order.
 async fn converge_query_network_policy<A, AF, D, DF>(
-    policy: Option<NetworkPolicy>,
+    desired: Option<NetworkPolicy>,
+    held: Option<NetworkPolicy>,
     possible_names: Vec<String>,
-    apply_policy: A,
+    mut apply_policy: A,
     mut delete_policy: D,
-    apply_deployments: impl Future<Output = Result<bool, Error>>,
+    apply_deployments: impl Future<Output = Result<Option<Deployment>, Error>>,
 ) -> Result<(), Error>
 where
-    A: FnOnce(String, NetworkPolicy) -> AF,
+    A: FnMut(String, NetworkPolicy) -> AF,
     AF: Future<Output = Result<(), Error>>,
     D: FnMut(String) -> DF,
     DF: Future<Output = Result<(), Error>>,
 {
-    let desired_name = policy.as_ref().map(ResourceExt::name_any);
-    if let (Some(name), Some(policy)) = (desired_name.clone(), policy) {
-        apply_policy(name, policy).await?;
+    let desired_name = desired.as_ref().map(ResourceExt::name_any);
+    if let Some(held) = held.clone() {
+        apply_policy(held.name_any(), held).await?;
     }
-    let query_applied = apply_deployments.await?;
-    if !query_applied {
+    let Some(applied_query) = apply_deployments.await? else {
         return Ok(());
+    };
+    if !deployment_rollout_complete(&applied_query) {
+        return Ok(());
+    }
+    if let (Some(name), Some(desired)) = (desired_name.clone(), desired)
+        && held.as_ref() != Some(&desired)
+    {
+        apply_policy(name, desired).await?;
     }
     for name in possible_names {
         if desired_name.as_deref() == Some(name.as_str()) {
@@ -1725,12 +1826,26 @@ async fn reconcile_inner(
     // got rendered and applied for the query tier.
     let audit_key_missing = audit_token_key_missing(&obj.spec);
 
+    // Resolve the distributed-query Secrets' resourceVersions. A missing one
+    // does not abort the reconcile: it holds back only the query tier (see
+    // `query_tier_apply_target`) and records a `Degraded` condition, so the
+    // gateway and maintain tiers still reconcile and the running query pods
+    // keep serving.
+    let distributed_query = resolve_distributed_query_resource_versions(
+        client,
+        namespace,
+        &obj.spec,
+    )
+    .await?;
+    let distributed_query_secret_missing = distributed_query.holds_query_tier();
+
     let render_ctx = RenderCtx {
         tenant_names: token_secret.tenant_names,
         token_resource_version: token_secret.resource_version,
         credential_resource_versions,
         deployment_key_resource_version: deployment_key_secret.resource_version,
         audit_token_key_resource_version,
+        distributed_query_resource_versions: distributed_query.resource_versions(),
     };
 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -1847,6 +1962,7 @@ async fn reconcile_inner(
     // causes.
     let mut degraded = render_degraded(
         audit_key_missing,
+        distributed_query.secret_missing_degrade(),
         desired.distributed_query_render_error,
         desired.router_render_error,
     );
@@ -1956,11 +2072,15 @@ async fn reconcile_inner(
 
     let mut tiers = TierDeployments {
         gateway: Some(desired.gateway_deployment),
-        // Withheld (`None`) when the audit-token-key is missing (#1487
-        // rework): any existing query Deployment is left exactly as it is
-        // rather than rolled to a spec missing the env var the server needs
-        // to start with audit tokenization enabled.
-        query: query_tier_apply_target(&obj.spec, desired.query_deployment),
+        // Withheld (`None`) when the audit-token-key is missing (#1487 rework)
+        // or a referenced distributed-query Secret does not exist (#2403): any
+        // existing query Deployment is left exactly as it is rather than rolled
+        // to a spec whose pods could not start.
+        query: query_tier_apply_target(
+            &obj.spec,
+            distributed_query_secret_missing,
+            desired.query_deployment,
+        ),
         maintain: desired.maintain_deployment,
         applied: BTreeMap::new(),
     };
@@ -1976,9 +2096,29 @@ async fn reconcile_inner(
         policy.metadata.owner_references = owner.clone();
         policy
     });
+    // The live query Deployment, read before this pass's apply. Needed in both
+    // policy cases: to widen the desired policy through a narrowing rollout, and
+    // (when distributed query is being turned off) to hold a wider policy until
+    // the old pods that still open the fragment port are gone.
+    let live_query = live_deployment(&deployments, &child(instance, "query")).await?;
+    // The policy to keep present while the query rollout is in flight: the
+    // desired policy widened to the ports the old pods still listen on, or (when
+    // the desired policy is gone) the wider hold that keeps a newly opened port
+    // from being blocked on the new pods through the disabling rollout.
+    let held_policy = match &query_policy {
+        Some(policy) => Some(query_network_policy_during_rollout(policy, live_query.as_ref())),
+        None => query_fragment_policy_hold_while_disabling(instance, live_query.as_ref()).map(
+            |mut policy| {
+                policy.metadata.namespace = Some(namespace.to_string());
+                policy.metadata.owner_references = owner.clone();
+                policy
+            },
+        ),
+    };
     let network_policies = &network_policies;
     converge_query_network_policy(
         query_policy,
+        held_policy,
         possible_network_policy_names(instance),
         |name, policy| async move {
             apply(network_policies, &name, &policy).await?;
@@ -1991,7 +2131,7 @@ async fn reconcile_inner(
                     .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
                     .await?;
             }
-            Ok(tiers.applied(DeploymentTier::Query).is_some())
+            Ok(tiers.applied(DeploymentTier::Query).cloned())
         },
     )
     .await?;
@@ -2009,20 +2149,20 @@ async fn reconcile_inner(
     let applied_query_ready = tiers
         .applied(DeploymentTier::Query)
         .and_then(ready_replicas);
-    // The live GET only runs when the query tier's apply was withheld
-    // (`audit_key_missing`): every other pass already has its answer from
-    // the apply it just made, and paying for an extra round trip on every
-    // reconcile of every cluster for a case that only applies to unkeyed
-    // clusters missing their audit-token-key ref would be wasted cost.
-    let live_query_ready = if audit_key_missing {
+    // The live GET only runs when the query tier's apply was withheld (a
+    // missing audit-token key, or a missing distributed-query Secret): every
+    // other pass already has its answer from the apply it just made, and paying
+    // for an extra round trip on every reconcile of every cluster for a case
+    // that only applies to a held-back query tier would be wasted cost.
+    let query_held = audit_key_missing || distributed_query_secret_missing;
+    let live_query_ready = if query_held {
         live_replica_counts(&deployments, &child(instance, "query"))
             .await?
             .0
     } else {
         None
     };
-    let query_ready =
-        effective_query_ready(audit_key_missing, applied_query_ready, live_query_ready);
+    let query_ready = effective_query_ready(query_held, applied_query_ready, live_query_ready);
     let waiting = plan.waiting_for_bootstrap(maintain_ready_before, request_serving_exists);
 
     // Bootstrap-wait stall tracking (#1097). The operator is disposable, so it
@@ -2198,6 +2338,15 @@ async fn live_replica_counts(
             unavailable_replicas(&deployment),
         )),
         Err(err) if is_not_found(&err) => Ok((None, None)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The live Deployment `name`, or `None` when it does not exist.
+async fn live_deployment(api: &Api<Deployment>, name: &str) -> Result<Option<Deployment>, Error> {
+    match api.get(name).await {
+        Ok(deployment) => Ok(Some(deployment)),
+        Err(err) if is_not_found(&err) => Ok(None),
         Err(err) => Err(err.into()),
     }
 }
@@ -2691,12 +2840,16 @@ fn degraded_reason(err: &Error) -> (String, String) {
 
 /// The pass's `Degraded` entry from the render, before the `sys/gc` bootstrap
 /// check can override it. A missing audit-token-key (#1487 rework) ranks first:
-/// the query tier cannot be rolled at all. An incomplete
-/// `spec.query.distributedQuery` ranks next: the query tier runs, but without
-/// the distribution its spec asks for. A router render error ranks last, since
-/// it only stops ingest routing.
+/// the query tier cannot be rolled at all. A referenced distributed-query
+/// Secret that does not exist ranks next: it holds the query tier back the same
+/// way, and outranks a router error whose blast radius is only ingest routing.
+/// An incomplete `spec.query.distributedQuery` ranks next (the query tier runs,
+/// but without the distribution its spec asks for); it and the missing-Secret
+/// case are mutually exclusive (an incomplete block references no Secret to
+/// miss). A router render error ranks last.
 fn render_degraded(
     audit_key_missing: bool,
+    query_secret_missing: Option<(String, String)>,
     distributed_query_error: Option<RenderError>,
     router_error: Option<RenderError>,
 ) -> Option<(String, String)> {
@@ -2705,6 +2858,9 @@ fn render_degraded(
             AUDIT_TOKEN_KEY_MISSING_REASON.to_string(),
             AUDIT_TOKEN_KEY_MISSING_MESSAGE.to_string(),
         ));
+    }
+    if let Some(degrade) = query_secret_missing {
+        return Some(degrade);
     }
     distributed_query_error
         .or(router_error)
@@ -3171,6 +3327,7 @@ mod tests {
         };
         let (reason, message) = render_degraded(
             false,
+            None,
             Some(missing()),
             Some(RenderError::RouterImageMissing),
         )
@@ -3181,12 +3338,37 @@ mod tests {
             "{message}"
         );
 
-        let (reason, _) = render_degraded(true, Some(missing()), None).expect("a Degraded entry");
+        let (reason, _) =
+            render_degraded(true, None, Some(missing()), None).expect("a Degraded entry");
         assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
-        let (reason, _) = render_degraded(false, None, Some(RenderError::RouterImageMissing))
+        let (reason, _) = render_degraded(false, None, None, Some(RenderError::RouterImageMissing))
             .expect("a Degraded entry");
         assert_eq!(reason, "RouterImageMissing");
-        assert_eq!(render_degraded(false, None, None), None);
+        assert_eq!(render_degraded(false, None, None, None), None);
+
+        // A missing distributed-query Secret ranks below the audit key and above
+        // a router error, and names the Secret. Guarding line: the
+        // `if let Some(degrade) = query_secret_missing` return in
+        // `render_degraded`. Remove it and the router error wins instead.
+        let secret_missing = || {
+            Some((
+                "SecretNotFound".to_string(),
+                "Secret \"frag-ca\" not found".to_string(),
+            ))
+        };
+        let (reason, message) = render_degraded(
+            false,
+            secret_missing(),
+            None,
+            Some(RenderError::RouterImageMissing),
+        )
+        .expect("a Degraded entry");
+        assert_eq!(reason, "SecretNotFound");
+        assert!(message.contains("frag-ca"), "{message}");
+        // The audit key still outranks it.
+        let (reason, _) =
+            render_degraded(true, secret_missing(), None, None).expect("a Degraded entry");
+        assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
     }
 
     /// ADR-1693: a cluster still carrying `spec.gateway.fold` learns that the
@@ -4227,26 +4409,119 @@ mod tests {
         }
     }
 
+    /// A query Deployment at `generation` whose status reports
+    /// `observed_generation`, `updated` of `replicas` updated and `unavailable`
+    /// unavailable, declaring `ports` on its container.
+    fn query_rollout(
+        generation: i64,
+        observed_generation: Option<i64>,
+        replicas: i32,
+        updated: i32,
+        unavailable: Option<i32>,
+        ports: &[i32],
+    ) -> Deployment {
+        use k8s_openapi::api::apps::v1::{DeploymentSpec, DeploymentStatus};
+        use k8s_openapi::api::core::v1::{Container, ContainerPort, PodSpec, PodTemplateSpec};
+        Deployment {
+            metadata: kube::api::ObjectMeta {
+                name: Some("rc-query".to_string()),
+                generation: Some(generation),
+                ..Default::default()
+            },
+            spec: Some(DeploymentSpec {
+                template: PodTemplateSpec {
+                    spec: Some(PodSpec {
+                        containers: vec![Container {
+                            name: "ravel".to_string(),
+                            ports: Some(
+                                ports
+                                    .iter()
+                                    .map(|port| ContainerPort {
+                                        container_port: *port,
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                            ),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            status: Some(DeploymentStatus {
+                observed_generation,
+                replicas: Some(replicas),
+                updated_replicas: Some(updated),
+                unavailable_replicas: unavailable,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A query Deployment whose rollout is complete.
+    fn rolled_out() -> Deployment {
+        use crate::reconcile::{FRAGMENT_PORT, HTTP_PORT};
+        query_rollout(2, Some(2), 3, 3, None, &[HTTP_PORT, FRAGMENT_PORT])
+    }
+
     /// Run `converge_query_network_policy` with recording callbacks and return
-    /// the calls in the order they ran. `query_applied` is what the Deployment
-    /// step reports: whether it applied the query Deployment this pass.
-    async fn converge_events(policy: Option<NetworkPolicy>, query_applied: bool) -> Vec<String> {
+    /// the calls in the order they ran. `applied_query` is what the Deployment
+    /// step returns: the query Deployment it applied this pass, if any.
+    async fn converge_events(
+        policy: Option<NetworkPolicy>,
+        applied_query: Option<Deployment>,
+    ) -> Vec<String> {
+        converge_with_live(policy, None, applied_query)
+            .await
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect()
+    }
+
+    /// [`converge_events`] with the pre-apply live query Deployment, also
+    /// returning the policy each apply wrote. The held policy is derived the
+    /// same way the controller derives it when a desired policy is present: the
+    /// desired policy widened to the live pods' ports.
+    async fn converge_with_live(
+        policy: Option<NetworkPolicy>,
+        live_query: Option<Deployment>,
+        applied_query: Option<Deployment>,
+    ) -> Vec<(String, Option<NetworkPolicy>)> {
+        let held = policy
+            .as_ref()
+            .map(|p| query_network_policy_during_rollout(p, live_query.as_ref()));
+        converge_raw(policy, held, applied_query).await
+    }
+
+    /// Drive `converge_query_network_policy` with recording callbacks against an
+    /// explicit `desired`/`held` pair, returning the (event, written policy)
+    /// trace. Used directly for the disable-hold, whose held policy is not the
+    /// desired one widened (there is no desired policy).
+    async fn converge_raw(
+        desired: Option<NetworkPolicy>,
+        held: Option<NetworkPolicy>,
+        applied_query: Option<Deployment>,
+    ) -> Vec<(String, Option<NetworkPolicy>)> {
         let events = std::cell::RefCell::new(Vec::new());
         let log = &events;
         converge_query_network_policy(
-            policy,
+            desired,
+            held,
             vec!["rc-query-fragment".to_string()],
-            |name, _policy| async move {
-                log.borrow_mut().push(format!("apply {name}"));
+            |name, policy| async move {
+                log.borrow_mut()
+                    .push((format!("apply {name}"), Some(policy)));
                 Ok(())
             },
             |name| async move {
-                log.borrow_mut().push(format!("delete {name}"));
+                log.borrow_mut().push((format!("delete {name}"), None));
                 Ok(())
             },
             async move {
-                log.borrow_mut().push("deployments".to_string());
-                Ok(query_applied)
+                log.borrow_mut().push(("deployments".to_string(), None));
+                Ok(applied_query)
             },
         )
         .await
@@ -4259,7 +4534,11 @@ mod tests {
     #[tokio::test]
     async fn fragment_policy_is_applied_before_the_query_deployment() {
         assert_eq!(
-            converge_events(Some(fragment_policy("rc-query-fragment")), true).await,
+            converge_events(
+                Some(fragment_policy("rc-query-fragment")),
+                Some(rolled_out())
+            )
+            .await,
             vec!["apply rc-query-fragment", "deployments"]
         );
     }
@@ -4269,7 +4548,7 @@ mod tests {
     #[tokio::test]
     async fn fragment_policy_is_deleted_after_the_query_deployment_is_applied() {
         assert_eq!(
-            converge_events(None, true).await,
+            converge_events(None, Some(rolled_out())).await,
             vec!["deployments", "delete rc-query-fragment"]
         );
     }
@@ -4278,7 +4557,265 @@ mod tests {
     /// open the fragment port, so the policy stays.
     #[tokio::test]
     async fn fragment_policy_is_kept_while_the_query_apply_is_held_back() {
-        assert_eq!(converge_events(None, false).await, vec!["deployments"]);
+        assert_eq!(converge_events(None, None).await, vec!["deployments"]);
+    }
+
+    /// Disabling while the applied query Deployment still runs pods on the old
+    /// spec: the policy stays, under each of the three status conditions that
+    /// mark the rollout incomplete.
+    #[tokio::test]
+    async fn fragment_policy_is_kept_until_the_query_rollout_completes() {
+        use crate::reconcile::{FRAGMENT_PORT, HTTP_PORT};
+        let ports = [HTTP_PORT, FRAGMENT_PORT];
+        let incomplete = [
+            (
+                "controller has not observed the new generation",
+                query_rollout(3, Some(2), 3, 3, None, &ports),
+            ),
+            (
+                "status not reported yet",
+                Deployment {
+                    status: None,
+                    ..query_rollout(3, None, 0, 0, None, &ports)
+                },
+            ),
+            (
+                "an old-spec replica is still running",
+                query_rollout(3, Some(3), 4, 3, None, &ports),
+            ),
+            (
+                "a replica is unavailable",
+                query_rollout(3, Some(3), 3, 3, Some(1), &ports),
+            ),
+        ];
+        for (why, applied) in incomplete {
+            assert_eq!(
+                converge_events(None, Some(applied)).await,
+                vec!["deployments"],
+                "{why}: the policy must outlive the old pods"
+            );
+        }
+        // Unavailable reported as zero, rather than absent, is complete.
+        assert_eq!(
+            converge_events(None, Some(query_rollout(3, Some(3), 3, 3, Some(0), &ports))).await,
+            vec!["deployments", "delete rc-query-fragment"]
+        );
+    }
+
+    /// A policy with the fragment rule and an open rule admitting `open`.
+    fn policy_open_on(open: &[i32]) -> NetworkPolicy {
+        use crate::reconcile::FRAGMENT_PORT;
+        use k8s_openapi::api::networking::v1::{
+            NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
+        };
+        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+        let tcp = |port: i32| NetworkPolicyPort {
+            port: Some(IntOrString::Int(port)),
+            protocol: Some("TCP".to_string()),
+            end_port: None,
+        };
+        NetworkPolicy {
+            spec: Some(NetworkPolicySpec {
+                ingress: Some(vec![
+                    NetworkPolicyIngressRule {
+                        from: Some(vec![NetworkPolicyPeer::default()]),
+                        ports: Some(vec![tcp(FRAGMENT_PORT)]),
+                    },
+                    NetworkPolicyIngressRule {
+                        from: None,
+                        ports: Some(open.iter().copied().map(tcp).collect()),
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..fragment_policy("rc-query-fragment")
+        }
+    }
+
+    /// The ports a policy's open rule admits, sorted.
+    fn open_ports(policy: &NetworkPolicy) -> Vec<i32> {
+        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+        let mut ports: Vec<i32> = policy
+            .spec
+            .iter()
+            .flat_map(|spec| spec.ingress.iter().flatten())
+            .filter(|rule| rule.from.is_none())
+            .flat_map(|rule| rule.ports.iter().flatten())
+            .filter_map(|port| match port.port {
+                Some(IntOrString::Int(port)) => Some(port),
+                _ => None,
+            })
+            .collect();
+        ports.sort_unstable();
+        ports
+    }
+
+    /// The (event, open ports) trace of a converge pass.
+    async fn narrowing_trace(
+        live_query: Option<Deployment>,
+        applied_query: Option<Deployment>,
+    ) -> Vec<(String, Option<Vec<i32>>)> {
+        use crate::reconcile::HTTP_PORT;
+        converge_with_live(
+            Some(policy_open_on(&[HTTP_PORT])),
+            live_query,
+            applied_query,
+        )
+        .await
+        .into_iter()
+        .map(|(event, policy)| (event, policy.as_ref().map(open_ports)))
+        .collect()
+    }
+
+    /// Narrowing while distributed query stays on (the dedicated health port
+    /// turned off): the wider policy is held until the rollout of the query
+    /// Deployment completes, then the exact one replaces it.
+    #[tokio::test]
+    async fn wider_fragment_policy_is_held_through_a_narrowing_rollout() {
+        use crate::reconcile::{FRAGMENT_PORT, HEALTH_PORT, HTTP_PORT};
+        let old_spec = [HTTP_PORT, HEALTH_PORT, FRAGMENT_PORT];
+        let new_spec = [HTTP_PORT, FRAGMENT_PORT];
+        let mut wide = vec![HTTP_PORT, HEALTH_PORT];
+        wide.sort_unstable();
+        let held = |event: &str| (event.to_string(), Some(wide.clone()));
+        let exact = |event: &str| (event.to_string(), Some(vec![HTTP_PORT]));
+        let deployments = ("deployments".to_string(), None);
+
+        // The pass that starts the rollout: the live Deployment is the old,
+        // fully rolled-out spec, and the apply bumps its generation.
+        assert_eq!(
+            narrowing_trace(
+                Some(query_rollout(2, Some(2), 3, 3, None, &old_spec)),
+                Some(query_rollout(3, Some(2), 3, 3, None, &new_spec)),
+            )
+            .await,
+            vec![held("apply rc-query-fragment"), deployments.clone()],
+        );
+        // A later pass mid-rollout: the live template is already the new
+        // spec, but old pods remain, so the policy stays wide.
+        let mid = query_rollout(3, Some(3), 4, 2, Some(1), &new_spec);
+        assert_eq!(
+            narrowing_trace(Some(mid.clone()), Some(mid)).await,
+            vec![held("apply rc-query-fragment"), deployments.clone()],
+        );
+        // The rollout completed between the read and the apply: narrow once
+        // the applied object says so.
+        assert_eq!(
+            narrowing_trace(
+                Some(query_rollout(3, Some(3), 3, 2, None, &new_spec)),
+                Some(query_rollout(3, Some(3), 3, 3, None, &new_spec)),
+            )
+            .await,
+            vec![
+                held("apply rc-query-fragment"),
+                deployments.clone(),
+                exact("apply rc-query-fragment"),
+            ],
+        );
+        // Steady state after the rollout: one apply, already exact.
+        let done = query_rollout(3, Some(3), 3, 3, None, &new_spec);
+        assert_eq!(
+            narrowing_trace(Some(done.clone()), Some(done)).await,
+            vec![exact("apply rc-query-fragment"), deployments],
+        );
+    }
+
+    /// Item 4: disabling distributed query while the query rollout is still in
+    /// flight holds the wider policy (applied before the deployment step) and
+    /// keeps it until the rollout completes, then deletes it. Guarding line: the
+    /// `if let Some(held)` apply in `converge_query_network_policy` fed by the
+    /// `None => query_fragment_policy_hold_while_disabling(...)` arm in
+    /// `reconcile_inner`. With no held policy the "apply" vanishes and the stale,
+    /// narrower policy blocks a port the new pods open through the rollout.
+    #[tokio::test]
+    async fn disabling_distributed_query_holds_the_wider_policy_through_the_rollout() {
+        use crate::reconcile::{FRAGMENT_PORT, HTTP_PORT};
+        // The live (pre-apply) query Deployment still opens the fragment port,
+        // so the disabling pass synthesizes a wider hold.
+        let live = query_rollout(2, Some(2), 3, 3, None, &[HTTP_PORT, FRAGMENT_PORT]);
+        let held = query_fragment_policy_hold_while_disabling("rc", Some(&live));
+        assert!(
+            held.is_some(),
+            "the hold is synthesized while the old pods still open the fragment port"
+        );
+
+        // Rollout incomplete: the held policy is applied before the deployments
+        // and is NOT deleted.
+        let incomplete = query_rollout(3, Some(2), 3, 3, None, &[HTTP_PORT]);
+        let events: Vec<String> = converge_raw(None, held.clone(), Some(incomplete))
+            .await
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect();
+        assert_eq!(events, vec!["apply rc-query-fragment", "deployments"]);
+
+        // Rollout complete: the held policy is applied, then deleted.
+        let complete = query_rollout(3, Some(3), 3, 3, Some(0), &[HTTP_PORT]);
+        let events: Vec<String> = converge_raw(None, held, Some(complete))
+            .await
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                "apply rc-query-fragment",
+                "deployments",
+                "delete rc-query-fragment",
+            ]
+        );
+    }
+
+    /// Item 5 wiring: the resolution's resourceVersions feed the query checksum
+    /// (they are what `RenderCtx.distributed_query_resource_versions` carries),
+    /// and a missing Secret holds ONLY the query tier while naming the Secret on
+    /// the Degraded condition. Guarding line: the `|| distributed_query_secret_missing`
+    /// disjunct in `query_tier_apply_target`; remove it and the missing-Secret
+    /// case rolls the query tier onto a spec that cannot mount the Secret.
+    #[test]
+    fn distributed_query_resolution_wires_versions_and_holds_only_query() {
+        let resolved = DistributedQueryResolution::Resolved(vec![
+            "v1".to_string(),
+            "v2".to_string(),
+            "v3".to_string(),
+            "v4".to_string(),
+        ]);
+        assert_eq!(resolved.resource_versions(), vec!["v1", "v2", "v3", "v4"]);
+        assert!(!resolved.holds_query_tier());
+        assert_eq!(resolved.secret_missing_degrade(), None);
+
+        let missing = DistributedQueryResolution::SecretMissing {
+            name: "frag-ca".to_string(),
+            reason: "referenced by spec.query.distributedQuery.fragmentCaSecretRef".to_string(),
+        };
+        assert!(
+            missing.resource_versions().is_empty(),
+            "a held query tier applies no checksum, so its versions are empty"
+        );
+        assert!(missing.holds_query_tier());
+        let (reason, message) = missing
+            .secret_missing_degrade()
+            .expect("a missing Secret degrades");
+        assert_eq!(reason, "SecretNotFound");
+        assert!(message.contains("frag-ca"), "{message}");
+
+        // Only the query tier is governed by this flag. With a deployment key
+        // set (audit key present) the flag alone holds the query tier back,
+        // while the gateway and maintain targets, built directly from the render,
+        // are untouched by it.
+        let mut keyed = spec_with_affinity(None);
+        keyed.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "dk".to_string(),
+        });
+        assert!(!audit_token_key_missing(&keyed));
+        assert!(
+            query_tier_apply_target(&keyed, true, Deployment::default()).is_none(),
+            "a missing distributed-query Secret holds the query tier back"
+        );
+        assert!(
+            query_tier_apply_target(&keyed, false, Deployment::default()).is_some(),
+            "with the Secret present the query tier applies normally"
+        );
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and
@@ -4585,7 +5122,7 @@ mod tests {
             "the Degraded message must name the field and the 64-hex requirement"
         );
         assert!(
-            query_tier_apply_target(&missing, Deployment::default()).is_none(),
+            query_tier_apply_target(&missing, false, Deployment::default()).is_none(),
             "the query tier's Deployment must be withheld from apply when the audit key is missing"
         );
 
@@ -4594,7 +5131,7 @@ mod tests {
             name: "audit-key".to_string(),
         });
         assert!(
-            query_tier_apply_target(&explicit_only, Deployment::default()).is_some(),
+            query_tier_apply_target(&explicit_only, false, Deployment::default()).is_some(),
             "an explicit ref must let the query tier apply normally"
         );
 
@@ -4603,7 +5140,7 @@ mod tests {
             name: "dk".to_string(),
         });
         assert!(
-            query_tier_apply_target(&keyed_only, Deployment::default()).is_some(),
+            query_tier_apply_target(&keyed_only, false, Deployment::default()).is_some(),
             "a deploymentKeySecretRef must let the query tier apply normally"
         );
 
@@ -4612,7 +5149,7 @@ mod tests {
             name: "audit-key".to_string(),
         });
         assert!(
-            query_tier_apply_target(&both, Deployment::default()).is_some(),
+            query_tier_apply_target(&both, false, Deployment::default()).is_some(),
             "both refs set must let the query tier apply normally"
         );
     }
