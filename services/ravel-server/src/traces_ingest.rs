@@ -9,9 +9,8 @@ use opentelemetry_proto::tonic::collector::trace::v1::{
 };
 use ravel_ingest::{
     AdmissionController, IdempotencyReceipt, LookupOutcome, SpanIngestRouter, SpanWriteError,
-    WriteMode, plausible_ingest_clock, read_marker, write_marker,
+    WriteMode, plausible_ingest_clock, write_marker,
 };
-use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::{NormalizeRejectCounts, SpanIngestLimits, SpanRejection, normalize_traces};
 use ravel_types::{CommitToken, Signal, TenantId};
@@ -169,13 +168,13 @@ pub async fn handle_export_traces(
     // the dedup window skips normalize and the router write and returns the
     // stored receipt directly. The lookup runs before any of that work.
     if let (Some(key), Some(bucket)) = (idempotency_key.as_deref(), hour_bucket) {
-        match read_marker(
+        match crate::logs_ingest::lookup_marker_within(
             state.store.as_ref(),
             &tenant,
             Signal::Spans,
             key,
             bucket,
-            DEFAULT_IDEM_DEDUP_WINDOW_HOURS,
+            state.ack_deadline,
         )
         .await
         {
@@ -199,12 +198,13 @@ pub async fn handle_export_traces(
             Ok(LookupOutcome::Corrupt) => {
                 tracing::warn!("idempotency marker found but failed to decode; treating as a miss");
             }
-            // A store error on the lookup fails the write closed, as in
-            // `crate::logs_ingest`: writing anyway would store a duplicate
-            // whenever the marker exists and the lookup could not see it.
-            Err(err) => {
+            // A store error on the lookup, or a lookup past the deadline,
+            // fails the write closed, as in `crate::logs_ingest`: writing
+            // anyway would store a duplicate whenever the marker exists and
+            // the lookup could not see it.
+            Err(message) => {
                 return Err(SpanIngestRequestError::Write(SpanWriteError::Abandoned(
-                    crate::logs_ingest::marker_lookup_failure(Signal::Spans, &err),
+                    message,
                 )));
             }
         }
@@ -373,13 +373,17 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue};
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
-    use ravel_ingest::{AdmissionController, AdmissionLimits, IngestConfig, SystemClock};
+    use ravel_ingest::{
+        AdmissionController, AdmissionLimits, IngestConfig, SystemClock, read_marker,
+    };
+    use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
     use crate::logs_ingest::marker_lookup_test_support::{
-        LookupFailureWarning, LookupFailureWarnings, STORE_ERROR_TEXT, marker_get_refusals,
-        marker_probe_store, put_count,
+        FIRST_BATCH_PROBES, LOOKUP_DEADLINE_WARNING, LOOKUP_FAILED_WARNING, LOOKUP_FAILURE_COUNTER,
+        LookupFailureWarning, LookupFailureWarnings, PAUSED_CLOCK_SLACK, STORE_ERROR_TEXT,
+        marker_get_refusals, marker_probe_store, put_count,
     };
     use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
@@ -856,12 +860,16 @@ mod tests {
     const MARKER_TEST_INGEST_TS_NS: i64 = BASE_TS_NS + 2_000;
 
     /// Issue #2462: a keyed span write whose marker probe the store refuses
-    /// fails with the retryable `Abandoned` error before any of its data is
-    /// written. The client-facing message names no key, tenant hash, LIST or
-    /// store error; the failed GET, its key and the store error go to one WARN
-    /// line and one count of `ravel_ingest_idempotency_lookup_failures_total`.
+    /// fails with the retryable `Abandoned` error before any of its own data
+    /// is written. The client-facing message names no key, tenant hash, LIST
+    /// or store error; the failed GET of the newest hour, its key and the
+    /// store error go to one WARN line and one count of
+    /// `ravel_ingest_idempotency_lookup_failures_total`. The recovery manifest
+    /// and provisioning record are created before the lookup on a tenant's
+    /// first write and are out of this assertion's scope (both are disabled in
+    /// this fixture).
     ///
-    /// Non-vacuity: restoring a log-and-write arm for `Err(err)` in
+    /// Non-vacuity: restoring a log-and-write arm for the lookup's `Err` in
     /// `handle_export_traces` makes the write succeed, so the `let Err`
     /// pattern panics; appending the store error to the message fails the
     /// message equality check; dropping the `tracing::warn!` or the
@@ -871,6 +879,7 @@ mod tests {
     async fn keyed_write_whose_marker_lookup_is_refused_fails_retryable_and_writes_nothing() {
         use tracing_subscriber::layer::SubscriberExt as _;
 
+        let _counter = LOOKUP_FAILURE_COUNTER.lock().await;
         let store = marker_probe_store(true);
         let state = state_with_store(store.clone());
         let tenant = TenantId::new("acme");
@@ -919,15 +928,25 @@ mod tests {
             );
         }
 
-        assert_eq!(marker_get_refusals(&store), 1, "the GET fault must fire");
-        assert_eq!(put_count(&store), 0, "a refused lookup must write nothing");
+        assert_eq!(
+            marker_get_refusals(&store),
+            FIRST_BATCH_PROBES,
+            "the GET fault must fire on each probe of the first batch"
+        );
+        assert_eq!(
+            put_count(&store),
+            0,
+            "none of the request's own data is written"
+        );
         assert_eq!(
             warnings.0.lock().as_slice(),
             &[LookupFailureWarning {
+                message: LOOKUP_FAILED_WARNING.to_string(),
                 signal: "s".to_string(),
                 request: "GET".to_string(),
                 key: first_probe,
                 error: format!("permanent error: {STORE_ERROR_TEXT}"),
+                deadline: String::new(),
             }],
             "exactly one WARN line, naming the GET, its key and the store error"
         );
@@ -935,6 +954,110 @@ mod tests {
             crate::logs_ingest::idempotency_lookup_failures(Signal::Spans) - failures_before,
             1,
             "the lookup failure must be counted exactly once"
+        );
+    }
+
+    /// Issue #2462: a keyed span write whose marker GETs never answer is
+    /// refused once the lookup has run for the write's `ack_deadline`, with
+    /// the same retryable message and counter as a refused GET and a WARN line
+    /// that names the deadline. None of the request's own data is written; the
+    /// recovery manifest and provisioning record are created before the
+    /// lookup on a tenant's first write and are out of this assertion's scope
+    /// (both are disabled in this fixture). The clock is paused, so the
+    /// elapsed time is the timer's, not the machine's.
+    ///
+    /// Non-vacuity: replacing `crate::logs_ingest::lookup_marker_within` in
+    /// `handle_export_traces` with an unbounded `read_marker` never returns,
+    /// so the test hangs.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_write_whose_marker_lookup_hangs_is_refused_at_the_deadline() {
+        use ravel_object_store::fault::{Occurrence, Op};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _counter = LOOKUP_FAILURE_COUNTER.lock().await;
+        let store = marker_probe_store(false);
+        let held = store.hold(Op::Get, Some("/idem/".to_string()), Occurrence::Always);
+        let state = state_with_store(store.clone());
+        let warnings = LookupFailureWarnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        let failures_before = crate::logs_ingest::idempotency_lookup_failures(Signal::Spans);
+
+        let started = tokio::time::Instant::now();
+        let Err(err) = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![span("GET /x", Vec::new())]),
+            MARKER_TEST_INGEST_TS_NS,
+            Some(b"idem-2462-deadline".to_vec()),
+        )
+        .await
+        else {
+            panic!("a lookup past the deadline must fail the keyed write");
+        };
+        let elapsed = started.elapsed();
+
+        let SpanIngestRequestError::Write(SpanWriteError::Abandoned(message)) = &err else {
+            panic!("expected the retryable Abandoned write error, got {err:?}");
+        };
+        assert!(err.is_retryable(), "{err:?} must be retryable");
+        assert_eq!(message, crate::logs_ingest::MARKER_LOOKUP_FAILED_MESSAGE);
+        assert!(
+            elapsed >= state.ack_deadline && elapsed <= state.ack_deadline + PAUSED_CLOCK_SLACK,
+            "refused after {elapsed:?}, deadline {:?}",
+            state.ack_deadline
+        );
+        assert_eq!(held.held_count(), FIRST_BATCH_PROBES as usize);
+        assert_eq!(
+            put_count(&store),
+            0,
+            "none of the request's own data is written"
+        );
+        assert_eq!(
+            warnings.0.lock().as_slice(),
+            &[LookupFailureWarning {
+                message: LOOKUP_DEADLINE_WARNING.to_string(),
+                signal: "s".to_string(),
+                request: "GET".to_string(),
+                deadline: format!("{:?}", state.ack_deadline),
+                ..LookupFailureWarning::default()
+            }],
+            "exactly one WARN line, naming the deadline"
+        );
+        assert_eq!(
+            crate::logs_ingest::idempotency_lookup_failures(Signal::Spans) - failures_before,
+            1,
+            "the deadline refusal must be counted exactly once"
+        );
+    }
+
+    /// A hanging marker GET does not touch a request without a key: it never
+    /// looks a marker up, so it writes as before.
+    #[tokio::test]
+    async fn unkeyed_write_is_unaffected_by_a_hanging_marker_probe() {
+        use ravel_object_store::fault::{Occurrence, Op};
+
+        let store = marker_probe_store(false);
+        let held = store.hold(Op::Get, Some("/idem/".to_string()), Occurrence::Always);
+        let state = state_with_store(store.clone());
+
+        let outcome = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![span("GET /x", Vec::new())]),
+            MARKER_TEST_INGEST_TS_NS,
+            None,
+        )
+        .await
+        .expect("an unkeyed write never probes a marker");
+
+        assert_eq!(outcome.tokens.len(), 1);
+        assert_eq!(held.held_count(), 0);
+        assert!(
+            put_count(&store) > 0,
+            "the unkeyed write must store its data"
         );
     }
 

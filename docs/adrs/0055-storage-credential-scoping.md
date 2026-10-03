@@ -1701,7 +1701,7 @@ listing work: the S3 adapter appends `/` to every list prefix, so S3 received
 `.../idem/<keyhash32>./`, under which no marker key sits. ADR-0051's marker
 probe amendment replaces the listing with a GET of the exact marker key
 (`marker_key` in `crates/ravel-ingest/src/idempotency.rs`) for each ingest hour
-of the dedup window, newest first.
+of the dedup window, the hours nearest the current one first.
 
 Decisions:
 
@@ -1716,25 +1716,28 @@ Decisions:
    `t/????????????????????????????????/l/idem/????????????????????????????????.????????T??.idm`
    and the same pattern with `s`. The tenant hash, the keyhash and the ingest
    hour are spelled one `?` per character around the literal `.`, `T` and
-   `.idm`, so a list request the grant admits returns at most that one key. It
-   admits no listing of the `idem/` directory, of one key's markers across
-   hours, or of another signal's markers. Metrics ingest takes no key and does
-   no lookup. No other statement changes and every `Deny` stays.
+   `.idm`, so a list request the grant admits returns at most that one marker
+   key. This change adds no listing of the `idem/` directory beyond what
+   `GatewayList`'s pre-existing `t/` prefix already allows, and a list of
+   `t/` returns every key under it, markers included. Metrics ingest takes no
+   key and does no lookup. No other statement changes and every `Deny` stays.
 3. A keyed write whose probe fails with a store error (anything but
    `NotFound`) is not acknowledged. It fails with the retryable error a failed
    flush returns (HTTP 503, gRPC `UNAVAILABLE`) before the request's own data
    is written, so the client's retry is safe. The client-facing message names
    no key, tenant hash or store error; the gateway logs the GET, the key and
    the store error at WARN and counts the refusal on
-   `ravel_ingest_idempotency_lookup_failures_total`. A write without a key
-   looks no marker up and is unaffected.
+   `ravel_ingest_idempotency_lookup_failures_total`. A lookup still running
+   at the write's `ack_deadline` is refused the same way (ADR-0051's probe
+   amendment). A write without a key looks no marker up and is unaffected.
 
 `crates/ravel-commit/tests/iam_templates.rs` builds the marker key the way
 `marker_key` does, pinned to the same literal a test beside `marker_key` pins,
 and checks for both signals that `GatewayRead` admits its GET, that
 `GatewayListTenantBootstrapKeys` admits a list of exactly that key, and that no
-`Deny` withdraws either. It also checks that no gateway list grant admits the
-`idem/` directory, a key's `<keyhash32>.` prefix, a marker key cut inside its
+`Deny` withdraws either. It also checks that no gateway list grant's
+`s3:prefix` admits a list request for the `idem/` directory, a key's
+`<keyhash32>.` prefix, a marker key cut inside its
 hour or extended past `.idm`, a tenant segment 31 or 33 characters wide, a
 keyhash one character short or long, or the marker key under another signal
 letter. The ingest tests in `services/ravel-server/src/logs_ingest.rs` and
