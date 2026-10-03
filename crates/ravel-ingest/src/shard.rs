@@ -2771,7 +2771,7 @@ mod tests {
 
         // Accepting again.
         let accepted = write(&globex, "g1");
-        until(|| buffered() > before).await;
+        until(|| accepted.is_finished() || buffered() > before).await;
         clock.advance_ns(TICK_ADVANCE_NS);
         let receipt = accepted
             .await

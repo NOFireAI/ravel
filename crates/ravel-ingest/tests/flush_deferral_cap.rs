@@ -165,7 +165,7 @@ macro_rules! deferral_cap_tests {
             .await;
 
             let accepted = $spawn(&router, &globex, 3);
-            until(|| buffered() > before).await;
+            until(|| accepted.is_finished() || buffered() > before).await;
             clock.advance_ns(TICK_ADVANCE_NS);
             let receipt = accepted
                 .await
