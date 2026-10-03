@@ -10,8 +10,6 @@
 //! [`FloatMismatch`] rather than a [`RowMismatch`]: informational, not fatal
 //! on its own.
 
-use std::collections::HashSet;
-
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::datatypes::{
     DataType, Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int8Type,
@@ -636,17 +634,12 @@ pub fn compare(
         }
     }
 
-    // A LIMIT with no resolvable ORDER BY key: row identity is genuinely
-    // unconstrained (any N rows may come back), so only cardinality can be
-    // asserted.
-    if tie.limit.is_some() && tie.key.is_empty() {
-        let verdict = if reference.len() == subject.len() {
-            Verdict::CardinalityOnly
-        } else {
-            Verdict::Fail
-        };
+    // Row counts must agree in every verdict mode (D7 rule 1a), including
+    // CardinalityOnly: a row-count mismatch is always a Fail, checked
+    // before anything else can mask it.
+    if reference.len() != subject.len() {
         return Ok(ComparisonReport {
-            verdict,
+            verdict: Verdict::Fail,
             float_mismatches: Vec::new(),
             row_mismatch: RowMismatch::default(),
             tie_rows_reduced: 0,
@@ -654,46 +647,80 @@ pub fn compare(
         });
     }
 
-    // Only a LIMIT truncates the result (an OFFSET alone, with no LIMIT, is
-    // not representable by this corpus's grammar; sqlparser requires a
-    // LIMIT for an OffsetCommaLimit and ADR-2040's statements never use
-    // OFFSET without LIMIT), so the boundary set is populated only when a
-    // LIMIT is present: without one, both reference and subject are the
-    // full deterministic multiset and no row sits at an arbitrary cut.
-    let boundary: HashSet<Vec<Cell>> = if tie.limit.is_some() && !tie.key.is_empty() {
-        let mut b = HashSet::new();
-        if let Some(first) = reference.first() {
-            b.insert(project(first, &tie.key));
-        }
-        if let Some(last) = reference.last() {
-            b.insert(project(last, &tie.key));
-        }
-        b
+    // A LIMIT with no resolvable ORDER BY key: row identity is genuinely
+    // unconstrained (any N rows may come back), so only cardinality can be
+    // asserted (already proven equal above).
+    if tie.limit.is_some() && tie.key.is_empty() {
+        return Ok(ComparisonReport {
+            verdict: Verdict::CardinalityOnly,
+            float_mismatches: Vec::new(),
+            row_mismatch: RowMismatch::default(),
+            tie_rows_reduced: 0,
+            float_cells_compared: 0,
+        });
+    }
+
+    // A top cut exists only when OFFSET > 0 (rule 1b): with no OFFSET, the
+    // reference's first row is not sitting at an arbitrary point in a tie,
+    // it is simply the first row, and must match exactly. A bottom cut
+    // exists only when the statement has a LIMIT AND the reference actually
+    // returned exactly LIMIT rows: true truncation. A result shorter than
+    // its LIMIT was never truncated and gets no reduction at all.
+    let top_cut_key = if tie.offset > 0 && !tie.key.is_empty() {
+        reference.first().map(|row| project(row, &tie.key))
     } else {
-        HashSet::new()
+        None
+    };
+    let bottom_cut_key = if !tie.key.is_empty()
+        && tie
+            .limit
+            .is_some_and(|limit| reference.len() as u64 == limit)
+    {
+        reference.last().map(|row| project(row, &tie.key))
+    } else {
+        None
     };
 
-    let is_boundary = |row: &[Cell]| -> bool {
-        !boundary.is_empty() && boundary.contains(&project(row, &tie.key))
-    };
+    let is_cut_key =
+        |k: &Vec<Cell>| Some(k) == top_cut_key.as_ref() || Some(k) == bottom_cut_key.as_ref();
 
+    // Rows whose key tuple equals a cut's key tuple reduce to the key
+    // tuple (rule 1c); all other rows are compared in full. The reduced
+    // tuples from both sides go into their own multiset, which must be
+    // equal (counted, never silently dropped), not merely tallied.
     let mut tie_rows_reduced = 0u64;
     let mut interior_ref = Vec::new();
+    let mut reduced_ref = Vec::new();
     for row in reference {
-        if is_boundary(row) {
+        let key = project(row, &tie.key);
+        if is_cut_key(&key) {
             tie_rows_reduced += 1;
+            reduced_ref.push(key);
         } else {
             interior_ref.push(row.clone());
         }
     }
     let mut interior_subj = Vec::new();
+    let mut reduced_subj = Vec::new();
     for row in subject {
-        if is_boundary(row) {
+        let key = project(row, &tie.key);
+        if is_cut_key(&key) {
             tie_rows_reduced += 1;
+            reduced_subj.push(key);
         } else {
             interior_subj.push(row.clone());
         }
     }
+
+    let mut reduced_counts: std::collections::HashMap<Vec<Cell>, i64> =
+        std::collections::HashMap::new();
+    for key in &reduced_ref {
+        *reduced_counts.entry(key.clone()).or_insert(0) += 1;
+    }
+    for key in &reduced_subj {
+        *reduced_counts.entry(key.clone()).or_insert(0) -= 1;
+    }
+    let reduced_mismatch = reduced_counts.values().any(|&delta| delta != 0);
 
     let float_cells_compared: u64 = interior_ref
         .iter()
@@ -762,7 +789,8 @@ pub fn compare(
         .map(|(_, r)| r)
         .collect();
 
-    let verdict = if remaining_missing.is_empty() && remaining_extra.is_empty() {
+    let verdict = if !reduced_mismatch && remaining_missing.is_empty() && remaining_extra.is_empty()
+    {
         Verdict::Pass
     } else {
         Verdict::Fail
@@ -795,16 +823,17 @@ mod tests {
         TieSpec { key, limit, offset }
     }
 
-    /// Required test: tie cut by LIMIT passes when subject picked different
-    /// tied rows at the boundary (a GROUP BY ... ORDER BY c DESC LIMIT N
-    /// shape, where several groups share the smallest included count).
+    /// Required test: tie cut by LIMIT passes when subject picked a
+    /// different tied row at the bottom boundary (a GROUP BY ... ORDER BY c
+    /// DESC LIMIT N shape, where several groups share the smallest included
+    /// count).
     ///
-    /// key = column 0, rows ordered descending by it. Both the top row
-    /// (key=10) and the bottom row (key=1) are boundary key tuples (D7:
-    /// both ends are exempt, since OFFSET truncates the top edge the same
-    /// way LIMIT truncates the bottom), so rows at either end may legally
-    /// differ in content between reference and subject; the two interior
-    /// rows (key=8, key=5) are NOT boundary and must still match exactly.
+    /// key = column 0, rows ordered descending by it. With OFFSET 0 there
+    /// is no top cut (rule 1b), so the top row (key=10) must match exactly
+    /// and is kept identical on both sides; the bottom row (key=1) is the
+    /// true-truncation bottom cut (reference returned exactly LIMIT rows),
+    /// so it may legally differ in content. The interior rows (key=8,
+    /// key=5) are neither cut and must still match exactly.
     #[test]
     fn boundary_tie_with_different_rows_passes() {
         let reference = vec![
@@ -814,23 +843,23 @@ mod tests {
             vec![Cell::Int(1), Cell::Str("a".into())],
         ];
         let subject = vec![
-            // top row: different id, but key=10 is a boundary tuple.
-            vec![Cell::Int(10), Cell::Str("u2".into())],
+            vec![Cell::Int(10), Cell::Str("u".into())],
             vec![Cell::Int(8), Cell::Str("v".into())],
             vec![Cell::Int(5), Cell::Str("w".into())],
-            // bottom row: different id, but key=1 is a boundary tuple.
+            // bottom row: different content, but key=1 is the bottom cut.
             vec![Cell::Int(1), Cell::Str("b".into())],
         ];
         let report = compare(&reference, &subject, &tie(vec![0], Some(4), 0)).expect("compare");
         assert_eq!(report.verdict, Verdict::Pass);
-        // Both boundary rows on both sides: 2 (reference) + 2 (subject).
-        assert_eq!(report.tie_rows_reduced, 4);
+        // The bottom cut row on both sides: 1 (reference) + 1 (subject).
+        assert_eq!(report.tie_rows_reduced, 2);
     }
 
     /// Required test: fails when subject picked a row outside the tie (its
-    /// replacement row's key does not match either boundary key tuple at
+    /// replacement row's key does not match the bottom cut's key tuple at
     /// all, so it cannot be a legitimate tie-break variation of the bottom
-    /// edge).
+    /// edge). OFFSET is 0, so the top row carries no cut and is kept
+    /// identical on both sides to isolate the bottom-edge behavior.
     #[test]
     fn boundary_tie_with_row_outside_tie_fails() {
         let reference = vec![
@@ -840,11 +869,12 @@ mod tests {
             vec![Cell::Int(1), Cell::Str("a".into())],
         ];
         let subject = vec![
-            vec![Cell::Int(10), Cell::Str("u2".into())],
+            vec![Cell::Int(10), Cell::Str("u".into())],
             vec![Cell::Int(8), Cell::Str("v".into())],
             vec![Cell::Int(5), Cell::Str("w".into())],
-            // key=9 matches neither boundary tuple (10 or 1): not a
-            // legitimate tie-break variation, an interior row instead.
+            // key=9 matches neither cut key tuple (10 is not a cut at
+            // OFFSET 0, and 1 is the bottom cut): not a legitimate
+            // tie-break variation, an interior row instead.
             vec![Cell::Int(9), Cell::Str("z".into())],
         ];
         let report = compare(&reference, &subject, &tie(vec![0], Some(4), 0)).expect("compare");
@@ -993,6 +1023,141 @@ mod tests {
             Verdict::Fail,
             "Utf8 and Binary must not compare equal"
         );
+    }
+
+    /// Required test (D7 rule 1a): a subject missing the last row of a
+    /// LIMIT result fails. The missing row's key would sit at the bottom
+    /// cut, but a row-count mismatch must be caught regardless of where the
+    /// missing row's key falls.
+    #[test]
+    fn missing_last_limit_row_fails() {
+        let reference = vec![
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            vec![Cell::Int(1), Cell::Str("a".into())],
+        ];
+        let subject = vec![
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+        ];
+        let report = compare(&reference, &subject, &tie(vec![0], Some(4), 0)).expect("compare");
+        assert_eq!(report.verdict, Verdict::Fail);
+    }
+
+    /// Required test (D7 rule 1a): a subject returning LIMIT+2 rows whose
+    /// extras tie on the last key still fails, since row counts must be
+    /// equal regardless of tie reduction.
+    #[test]
+    fn extra_rows_tied_on_last_key_fails() {
+        let reference = vec![
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            vec![Cell::Int(1), Cell::Str("a".into())],
+        ];
+        let subject = vec![
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            vec![Cell::Int(1), Cell::Str("a".into())],
+            vec![Cell::Int(1), Cell::Str("extra1".into())],
+            vec![Cell::Int(1), Cell::Str("extra2".into())],
+        ];
+        let report = compare(&reference, &subject, &tie(vec![0], Some(4), 0)).expect("compare");
+        assert_eq!(report.verdict, Verdict::Fail);
+    }
+
+    /// Required test (D7 rule 1b): with OFFSET 0, there is no top cut, so
+    /// wrong content in the top row fails even though it shares its key
+    /// with the reference's first row.
+    #[test]
+    fn offset_zero_wrong_top_row_content_fails() {
+        let reference = vec![
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            vec![Cell::Int(1), Cell::Str("a".into())],
+        ];
+        let subject = vec![
+            // Same key (10) as reference's top row, but wrong content.
+            // With OFFSET 0 there is no top cut (rule 1b), so this row must
+            // be compared exactly, not exempted.
+            vec![Cell::Int(10), Cell::Str("WRONG".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            vec![Cell::Int(1), Cell::Str("b".into())],
+        ];
+        let report = compare(&reference, &subject, &tie(vec![0], Some(4), 0)).expect("compare");
+        assert_eq!(
+            report.verdict,
+            Verdict::Fail,
+            "OFFSET 0 means no top cut; the top row's wrong content must be caught"
+        );
+    }
+
+    /// Required test (D7 rule 1b): a result shorter than its LIMIT was
+    /// never truncated, so it gets no bottom-cut reduction at all; a wrong
+    /// last row must still be caught.
+    #[test]
+    fn short_of_limit_gets_no_reduction() {
+        let reference = vec![
+            vec![Cell::Int(3), Cell::Str("n".into())],
+            vec![Cell::Int(2), Cell::Str("p".into())],
+            vec![Cell::Int(1), Cell::Str("a".into())],
+        ];
+        let subject = vec![
+            vec![Cell::Int(3), Cell::Str("n".into())],
+            vec![Cell::Int(2), Cell::Str("p".into())],
+            // Wrong content on what would be the "last row"; since the
+            // reference returned only 3 rows against a LIMIT of 10, there
+            // was no true truncation and this row is not a bottom cut.
+            vec![Cell::Int(1), Cell::Str("WRONG".into())],
+        ];
+        let report = compare(&reference, &subject, &tie(vec![0], Some(10), 0)).expect("compare");
+        assert_eq!(
+            report.verdict,
+            Verdict::Fail,
+            "a result shorter than its LIMIT was not truncated; no row is exempt"
+        );
+        assert_eq!(report.tie_rows_reduced, 0);
+    }
+
+    /// Required test (D7 rule 1b/1c): with OFFSET > 0, different rows tied
+    /// on the first key pass, since the top cut is exempt from exact
+    /// comparison.
+    #[test]
+    fn offset_positive_top_tie_with_different_rows_passes() {
+        let reference = vec![
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            vec![Cell::Int(1), Cell::Str("a".into())],
+        ];
+        let subject = vec![
+            // Different content, but key=10 is the top cut key (OFFSET>0).
+            vec![Cell::Int(10), Cell::Str("different".into())],
+            vec![Cell::Int(8), Cell::Str("v".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            // Different content, but key=1 is the bottom cut key (true
+            // truncation: reference.len() == limit).
+            vec![Cell::Int(1), Cell::Str("also-different".into())],
+        ];
+        let report = compare(&reference, &subject, &tie(vec![0], Some(4), 2)).expect("compare");
+        assert_eq!(report.verdict, Verdict::Pass);
+        assert_eq!(report.tie_rows_reduced, 4);
+    }
+
+    /// Required test (D7 rule 1a): `CardinalityOnly` (a LIMIT with no
+    /// resolvable ORDER BY key) still fails on a row-count mismatch rather
+    /// than ignoring it.
+    #[test]
+    fn cardinality_only_with_different_row_counts_fails() {
+        let reference = vec![vec![Cell::Int(1)], vec![Cell::Int(2)], vec![Cell::Int(3)]];
+        let subject = vec![vec![Cell::Int(1)], vec![Cell::Int(2)]];
+        let report = compare(&reference, &subject, &tie(vec![], Some(3), 0)).expect("compare");
+        assert_eq!(report.verdict, Verdict::Fail);
     }
 
     /// Required test: a JSON reference row parses to the same cells as the
