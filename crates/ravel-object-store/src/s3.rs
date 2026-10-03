@@ -210,6 +210,22 @@ const _: () = assert!(crate::MULTIPART_MAX_PARTS * MULTIPART_PART_SIZE >= 64 * 1
 /// number of connections per object.
 const MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
 
+/// The most requests [`S3Store::put`] can have in flight at once for a
+/// `len`-byte payload under `mode`: up to [`MULTIPART_UPLOAD_CONCURRENCY`] part
+/// uploads for an `Overwrite` above [`MULTIPART_THRESHOLD`], otherwise one.
+/// Upload integrity is not consulted, so for a store with integrity on, which
+/// keeps every put on the single-PUT path, this overstates a large overwrite.
+/// A scheduled handle sizes its permits from this
+/// ([`crate::scheduling`], "Ops that fan out").
+pub fn put_fan_out(len: usize, mode: &PutMode) -> usize {
+    if matches!(mode, PutMode::Overwrite) && len > MULTIPART_THRESHOLD {
+        len.div_ceil(MULTIPART_PART_SIZE)
+            .min(MULTIPART_UPLOAD_CONCURRENCY)
+    } else {
+        1
+    }
+}
+
 /// How many of a bounded whole-object read's ranged GETs
 /// ([`S3Store::get_whole_object`]) are in flight at once. Same reasoning and
 /// same value as [`MULTIPART_UPLOAD_CONCURRENCY`] on the write side: enough
@@ -2142,7 +2158,8 @@ impl S3Store {
 
     /// The [`MULTIPART_THRESHOLD`] path of [`ObjectStoreBackend::put`]: cut the
     /// buffer into [`MULTIPART_PART_SIZE`] parts, upload at most
-    /// [`MULTIPART_UPLOAD_CONCURRENCY`] of them at a time, then complete. Any
+    /// [`MULTIPART_UPLOAD_CONCURRENCY`] of them at a time (fewer when a
+    /// scheduled handle admitted the put with fewer permits), then complete. Any
     /// failure aborts the upload best-effort (so parts are not left billed)
     /// and surfaces the original error, never a partial object.
     async fn put_via_multipart(&self, key: &str, data: Bytes) -> Result<PutOutcome, StoreError> {
@@ -2185,10 +2202,13 @@ impl S3Store {
         // bounded concurrency after all of them have been handed out; part
         // numbers were fixed by the `put_part` call order above, so completing
         // out of order does not reorder the object.
+        let concurrency = crate::scheduling::request_budget()
+            .map_or(MULTIPART_UPLOAD_CONCURRENCY, |budget| {
+                budget.clamp(1, MULTIPART_UPLOAD_CONCURRENCY)
+            });
         let mut failure = None;
         {
-            let mut inflight =
-                futures::stream::iter(pending).buffer_unordered(MULTIPART_UPLOAD_CONCURRENCY);
+            let mut inflight = futures::stream::iter(pending).buffer_unordered(concurrency);
             while let Some(result) = inflight.next().await {
                 if let Err(e) = result {
                     failure = Some(map_error_common(e));
