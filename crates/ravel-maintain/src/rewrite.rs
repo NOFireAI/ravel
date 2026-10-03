@@ -785,6 +785,8 @@ const RSEG_EXEMPLARS: u32 = 10;
 
 /// The result of a [`reencode_compaction_parts`] call. Every variant except
 /// [`ReencodeOutcome::Reencoded`] published nothing, and names why.
+/// `Reencoded` itself publishes only when its `publish` says so, as
+/// [`crate::CompactionOutcome::Compacted`]'s does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReencodeOutcome {
     /// [`CompactorConfig::reencode_writer_enabled`] is off. No store request
@@ -811,7 +813,11 @@ pub enum ReencodeOutcome {
     UpToDate,
     /// The parts of the record at `superseded_record_key` were re-encoded into
     /// `parts` current-version parts, and the version 2 record naming it
-    /// resolved as `publish` says.
+    /// resolved as `publish` says. `publish` carries the result: with
+    /// [`PublishOutcome::Abandoned`] the run passed its
+    /// `max_compaction_lifetime_ns` deadline before the record PUT, published
+    /// nothing, and the predecessor is still the record served. Only
+    /// `Published` and `Converged` leave a version 2 record in the bucket.
     Reencoded {
         superseded_record_key: String,
         parts: usize,
