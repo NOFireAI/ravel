@@ -497,8 +497,8 @@ pub struct FamilyMigrateReport {
 
 impl FamilyMigrateReport {
     /// Whether this invocation completed the walk but the fresh re-audit refused
-    /// to raise the floor because stragglers remain. Callers use this to exit
-    /// nonzero (the CLI) or log an alert (the maintain loop).
+    /// to raise the floor because stragglers remain. The CLI uses this to exit
+    /// nonzero.
     pub fn stragglers_found(&self) -> bool {
         matches!(&self.verification, Some(v) if v.refused())
     }
@@ -1600,10 +1600,10 @@ fn record_reencode(
 /// [`Verification::FloorRaised`] with the existing floor rather than surfacing
 /// that refusal as an error.
 ///
-/// This is the entry point both `ravel-cli maintain migrate` and the server
-/// maintain loop call; it takes only a store, an injected clock, and plain
-/// parameters, matching the per-`(tenant, signal)` shape of the crate's other
-/// maintenance drivers ([`crate::scan::scan_and_maintain`]).
+/// This is the entry point `ravel-cli maintain migrate` calls (the server
+/// maintain loop does not run migrations); it takes only a store, an injected
+/// clock, and plain parameters, matching the per-`(tenant, signal)` shape of
+/// the crate's other maintenance drivers ([`crate::scan::scan_and_maintain`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate_family(
     store: &dyn ObjectStoreBackend,

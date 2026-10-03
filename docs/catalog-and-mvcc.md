@@ -13,6 +13,7 @@ t/<tenant_hash>/m/c/<shard>/<ingest_hour>/l1.<input_set_hash16>.cmt       compac
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/rw.<input_set_hash16>.cmt       rewrite record (selective erasure; ADR-0064)
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/retire.tmb                      retention tombstone
 t/<tenant_hash>/m/maint/<shard>/cursor                                    advisory scan cursor
+t/<tenant_hash>/<signal>/maint/migrate/<family>/cursor                  advisory migrate cursor (one per tenant, signal and format family; CAS-mutable)
 t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/retire.unn     retention unnamed-since marker (CreateIfAbsent, immutable; ADR-1133)
 t/<tenant_hash>/<signal>/maint/unn/<shard>/<ingest_hour>/<l1|rw>.<input_set_hash16>.unn   superseded-input unnamed-since marker (CreateIfAbsent, immutable; ADR-1133)
 t/<tenant_hash>/a/state/latest                                            derived alert-state memo (per-tenant, Overwrite, versioned body, advisory; ADR-1294)
@@ -584,6 +585,12 @@ and the CAS read/write helpers.
   updated by CAS, the same exemption from the immutability rule that the
   ADR-0003 HEAD pointer has. Losing or corrupting it costs a rescan, never
   correctness; it carries no durability role and is not a manifest.
+- The migrate cursor (`<signal>/maint/migrate/<family>/cursor`) is the
+  advisory position of `ravel-cli maintain migrate` for one tenant, signal
+  and format family: the last `(shard, hour)` bucket the walk finished. It
+  sits on a path disjoint from the maint cursor (a shard segment is always
+  numeric, `migrate` never is) and has the same CAS exemption; losing or
+  corrupting it costs a rescan from the start.
 - The unnamed-since markers (`<signal>/maint/unn/...`, ADR-1133) record when
   a sweep first found a delete candidate past its protection horizon that the
   live HEAD does not name. The retention marker `retire.unn` is one per

@@ -2309,9 +2309,8 @@ fn migrate_report_text(
 
 /// `maintain migrate`: raise a `(tenant, signal, format family)`'s recorded
 /// format floor to `target_version`, migrating every live record still below it
-/// first. The same operation the server
-/// maintain loop can call via [`migrate_family`]; this is its one-shot CLI
-/// driver.
+/// first, via [`migrate_family`]. This command is that function's only
+/// caller; the server maintain loop does not run migrations.
 ///
 /// Resumable and bounded: one invocation migrates at most `--budget-records` L0
 /// records (0 = unlimited) before persisting its durable cursor and returning,
