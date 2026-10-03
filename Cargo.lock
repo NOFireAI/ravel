@@ -4631,6 +4631,7 @@ dependencies = [
  "futures",
  "lz4_flex 0.14.0",
  "object_store 0.13.2",
+ "parquet 58.4.0",
  "parquet 59.1.0",
  "pprof",
  "proptest",
