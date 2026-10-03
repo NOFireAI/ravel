@@ -133,6 +133,8 @@ pub enum ComparatorError {
         "column {index}: decimal scale {scale} is negative, which this comparator does not support"
     )]
     NegativeDecimalScale { index: usize, scale: i8 },
+    #[error("could not parse JSON reference as an array of row arrays: {0}")]
+    JsonReferenceParse(String),
 }
 
 /// The tie-breaking key and truncation shape ADR-2040 D7 compares under: the
@@ -653,22 +655,57 @@ pub fn json_cell(
     }
 }
 
-/// Normalize a JSON reference (an array of arrays, one inner array of
-/// column values per row) using `subject_kinds` to type each column.
+/// Read one JSON reference cell from its exact, unparsed source text
+/// (`raw`, a `RawValue`'s [`serde_json::value::RawValue::get`] slice).
+///
+/// `serde_json::Value`'s `Number` (without the `float_roundtrip` or
+/// `arbitrary_precision` features, neither of which this crate enables
+/// since both would change `serde_json::Value` parsing for every crate in
+/// the workspace build) is not guaranteed to reproduce the exact `f64` a
+/// decimal literal denotes once the literal is already behind `as_f64`: the
+/// source digits are gone by then. A `ColumnKind::Float` cell is instead
+/// parsed straight from its own source text with `str::parse::<f64>`,
+/// which Rust guarantees is correctly rounded; every other kind is
+/// unaffected by this and is parsed the same way [`json_cell`] always has,
+/// via an ordinary `serde_json::Value` built from the same text.
+fn json_cell_raw(index: usize, raw: &str, kind: ColumnKind) -> Result<Cell, ComparatorError> {
+    let trimmed = raw.trim();
+    if trimmed == "null" {
+        return Ok(Cell::Null);
+    }
+    if kind == ColumnKind::Float {
+        return trimmed
+            .parse::<f64>()
+            .map(|f| Cell::Float(f.to_bits()))
+            .map_err(|_| ComparatorError::InvalidJsonCell {
+                index,
+                value: raw.to_string(),
+                kind,
+            });
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| ComparatorError::InvalidJsonCell {
+            index,
+            value: raw.to_string(),
+            kind,
+        })?;
+    json_cell(index, &value, kind)
+}
+
+/// Normalize a JSON reference (`reference_json`, the raw source text of an
+/// array of row arrays) using `subject_kinds` to type each column. Takes
+/// raw text rather than an already-parsed `serde_json::Value` so that a
+/// `ColumnKind::Float` cell can be read via [`json_cell_raw`] from its own
+/// exact source digits instead of through `Value`'s lossy `as_f64` (see
+/// that function's doc comment).
 pub fn rows_from_json(
-    reference: &[serde_json::Value],
+    reference_json: &str,
     subject_kinds: &[ColumnKind],
 ) -> Result<Vec<Vec<Cell>>, ComparatorError> {
-    reference
-        .iter()
-        .map(|row| {
-            let cells = row
-                .as_array()
-                .ok_or_else(|| ComparatorError::InvalidJsonCell {
-                    index: 0,
-                    value: row.to_string(),
-                    kind: subject_kinds.first().copied().unwrap_or(ColumnKind::Str),
-                })?;
+    let rows: Vec<Vec<Box<serde_json::value::RawValue>>> = serde_json::from_str(reference_json)
+        .map_err(|e| ComparatorError::JsonReferenceParse(e.to_string()))?;
+    rows.iter()
+        .map(|cells| {
             if cells.len() != subject_kinds.len() {
                 return Err(ComparatorError::ColumnCountMismatch {
                     reference: cells.len(),
@@ -679,7 +716,7 @@ pub fn rows_from_json(
                 .iter()
                 .zip(subject_kinds)
                 .enumerate()
-                .map(|(index, (value, kind))| json_cell(index, value, *kind))
+                .map(|(index, (raw, kind))| json_cell_raw(index, raw.get(), *kind))
                 .collect()
         })
         .collect()
@@ -2118,14 +2155,9 @@ mod tests {
                 ColumnKind::Ts,
             ]
         );
-        let json_rows: Vec<serde_json::Value> = vec![serde_json::json!([
-            true,
-            42,
-            1.5,
-            "hi",
-            "2013-07-15",
-            "2013-07-15T01:02:03Z"
-        ])];
+        let json_rows =
+            serde_json::json!([[true, 42, 1.5, "hi", "2013-07-15", "2013-07-15T01:02:03Z"]])
+                .to_string();
         let json_normalized = rows_from_json(&json_rows, &kinds).expect("normalize json");
         assert_eq!(arrow_rows, json_normalized);
     }
@@ -2572,6 +2604,45 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str("18446744073709551615").unwrap();
         let cell = json_cell(0, &value, ColumnKind::Int).expect("fits a u64 column");
         assert_eq!(cell, Cell::Int(u64::MAX as i128));
+    }
+
+    /// Required test (D3): 10,000 seeded `f64` doubles across the full
+    /// exponent range, printed with `{:?}` (Rust's shortest round-trip
+    /// decimal formatting) into JSON reference rows, must all parse back to
+    /// identical bits through `rows_from_json`. Red against `Value::as_f64`,
+    /// which is not guaranteed correctly rounded without the
+    /// `float_roundtrip` feature this crate does not enable (see
+    /// `json_cell_raw`'s doc comment).
+    #[test]
+    fn json_float_round_trips_exact_bits_for_10000_seeded_doubles() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+
+        let mut rng = StdRng::seed_from_u64(0x5a17_5a17_5a17_5a17);
+        let mut rows_text = String::from("[");
+        let mut expected = Vec::with_capacity(10_000);
+        for i in 0..10_000u32 {
+            let bits = loop {
+                let candidate = rng.random::<u64>();
+                if f64::from_bits(candidate).is_finite() {
+                    break candidate;
+                }
+            };
+            let value = f64::from_bits(bits);
+            if i > 0 {
+                rows_text.push(',');
+            }
+            rows_text.push_str(&format!("[{value:?}]"));
+            expected.push(bits);
+        }
+        rows_text.push(']');
+
+        let normalized =
+            rows_from_json(&rows_text, &[ColumnKind::Float]).expect("normalize json floats");
+        assert_eq!(normalized.len(), 10_000);
+        for (row, expected_bits) in normalized.iter().zip(&expected) {
+            assert_eq!(row, &vec![Cell::Float(*expected_bits)]);
+        }
     }
 
     /// D3d: build every one of the frozen corpus's 43 statements' `TieSpec`

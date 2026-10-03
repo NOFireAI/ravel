@@ -60,7 +60,7 @@ rand = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 # The cost-regression gate (ADR-0996 task 996-7) loads its per-figure bands from
 # a checked-in TOML document (`cost_regression_bands.toml`). `toml` is not in the
 # workspace `[workspace.dependencies]`; it is named by version here exactly as
