@@ -41,7 +41,6 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/idem/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/admission/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
@@ -50,6 +49,17 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/enc",
         "arn:aws:s3:::my-ravel-bucket/t/*/m/meta"
       ]
+    },
+    {
+      "Sid": "GatewayProvCreate",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*"
+        }
+      }
     },
     {
       "Sid": "GatewayAdmissionDelete",

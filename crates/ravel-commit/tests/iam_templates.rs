@@ -731,8 +731,8 @@ struct Policy {
 /// Effect, Action, and Resource are read directly (see `statement_actions`,
 /// `statement_resources`, `key_patterns_for`, `kms_statement_resources`, ...);
 /// Condition is read for the `s3:prefix` ListBucket block
-/// (`list_prefix_patterns`) and for the create-only PutObject block
-/// (`create_only_put_patterns`). Nothing else is examined by any guard.
+/// (`list_prefix_patterns`) and for the create-only and CAS-only PutObject
+/// blocks (`conditioned_put_patterns`). Nothing else is examined by any guard.
 ///
 /// This list is the guard's contract: a statement carrying any key outside it
 /// is one no guard reasons about, so it must fail closed at `load_policy`
@@ -741,8 +741,8 @@ const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource",
 
 /// The complete set of `Condition` operators any guard in this file reads on a
 /// list statement: `list_prefix_patterns` reads only its `StringLike` block.
-/// (The create-only PutObject Condition has its own one-shape check,
-/// `validate_create_only_put_condition`.) A list statement whose Condition
+/// (The conditioned PutObject Conditions have their own exact-shape check,
+/// `validate_put_condition`.) A list statement whose Condition
 /// names any other operator -- a different comparison such as `StringNotLike`,
 /// or a set-qualified form such as `ForAnyValue:StringLike` -- carries a
 /// constraint no guard reasons about, so it must fail closed at
@@ -760,11 +760,29 @@ const HANDLED_CONDITION_KEYS: &[&str] = &["s3:prefix"];
 /// `If-None-Match: *` header. S3 evaluates `s3:if-none-match` on PutObject, and
 /// a PUT without the header has no value for the key, so `StringEquals` fails
 /// and the PUT is refused: the statement grants create and never overwrite.
-/// `create_only_put_patterns` reads it; any other operator, key, value, Effect
-/// or Action set fails closed in `validate_create_only_put_condition`.
+/// `conditioned_put_patterns` reads it; any other operator, key, value, Effect
+/// or Action set fails closed in `validate_put_condition`.
 const CREATE_ONLY_CONDITION_OPERATOR: &str = "StringEquals";
 const CREATE_ONLY_CONDITION_KEY: &str = "s3:if-none-match";
 const CREATE_ONLY_CONDITION_VALUE: &str = "*";
+
+/// The second Condition shape a PutObject-only `Allow` may carry: the request
+/// must send an `If-Match` header. `PutMode::CasVersion` is sent as `If-Match:
+/// <etag>`, so the statement grants a compare-and-swap and never a create or an
+/// unconditional overwrite (checked against AWS on 2026-10-03). `"true"` would
+/// invert it into "only PUTs without If-Match", so the value is pinned too.
+const CAS_ONLY_CONDITION_OPERATOR: &str = "Null";
+const CAS_ONLY_CONDITION_KEY: &str = "s3:if-match";
+const CAS_ONLY_CONDITION_VALUE: &str = "false";
+
+/// The conditional write a PutObject-only `Allow` statement's Condition admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PutCondition {
+    /// `{"StringEquals": {"s3:if-none-match": "*"}}`: `PutMode::CreateIfAbsent`.
+    CreateOnly,
+    /// `{"Null": {"s3:if-match": "false"}}`: `PutMode::CasVersion`.
+    CasOnly,
+}
 
 /// Keys that describe a statement shape these guards deliberately cannot
 /// reason about: `NotAction`/`NotResource` invert the set the Action/Resource
@@ -806,9 +824,10 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 ///   an object prefix) is accepted because both classes are granted;
 /// - a `Condition` on a list statement, whose sub-shape is the one
 ///   `StringLike`/`s3:prefix` block `list_prefix_patterns` reads; on any other
-///   statement, no `Condition` unless it is the create-only PutObject shape
-///   `create_only_put_patterns` reads (an `Allow` granting exactly
-///   `s3:PutObject`, conditioned on `StringEquals` `s3:if-none-match` `*`).
+///   statement, no `Condition` unless it is one of the two PutObject shapes
+///   `conditioned_put_patterns` reads (an `Allow` granting exactly
+///   `s3:PutObject`, conditioned on `StringEquals` `s3:if-none-match` `*` or
+///   on `Null` `s3:if-match` `false`).
 ///
 /// A helper downstream therefore cannot meet a shape it does not understand.
 /// `object_key_patterns` matches all four `ResourceShape` variants:
@@ -901,7 +920,7 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 /// - a Condition whose presence does not track the ListBucket action: a
 ///   ListBucket statement with no Condition (an unconstrained bucket-wide list),
 ///   or a Condition on any non-ListBucket statement (read by no guard) other
-///   than the exact create-only PutObject shape;
+///   than the exact create-only or CAS-only PutObject shape;
 /// - a `Condition` whose sub-shape is anything other than the one block a guard
 ///   reads: it must be a non-empty JSON object of handled operators
 ///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike`), each a non-empty map of
@@ -1002,12 +1021,12 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     validate_actions_and_resources(role, sid, index, effect, &actions, &resources)?;
 
     // Two guards read a Condition: `list_prefix_patterns`, on a statement
-    // whose Action grants s3:ListBucket, and `create_only_put_patterns`, on an
+    // whose Action grants s3:ListBucket, and `conditioned_put_patterns`, on an
     // Allow whose every Action is exactly s3:PutObject. So:
     //  - a list statement MUST carry a Condition (an unconstrained bucket-wide
     //    list is rejected, exactly like a missing Resource);
     //  - a PutObject-only statement may carry one, and only the create-only
-    //    shape `validate_create_only_put_condition` accepts; and
+    //    or CAS-only shape `validate_put_condition` accepts; and
     //  - any other statement must carry NONE (a Condition there is read by no
     //    guard: a StringLike/s3:prefix on the protected-delete Deny would pass
     //    validation while, in AWS, a DeleteObject request carries no s3:prefix
@@ -1022,12 +1041,13 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
             if grants_list {
                 validate_condition(role, sid, index, effect, condition)?;
             } else if is_put_object_only(&actions) {
-                validate_create_only_put_condition(role, sid, index, effect, condition)?;
+                validate_put_condition(role, sid, index, effect, condition)?;
             } else {
                 return Err(format!(
                     "{role}/{sid} (statement #{index}): statement carries a Condition but \
                      its Action does not include s3:ListBucket -- only the ListBucket \
-                     s3:prefix Condition and the create-only s3:PutObject Condition are \
+                     s3:prefix Condition and the create-only and CAS-only s3:PutObject \
+                     Conditions are \
                      read by any guard, so a Condition on any other statement sits \
                      unexamined and must fail closed"
                 ));
@@ -1302,31 +1322,51 @@ fn validate_condition(
 }
 
 /// True when every action names exactly `s3:PutObject`. A wildcard that also
-/// grants it (`s3:Put*`, `s3:*`) is not this shape: the create-only Condition
-/// would then also gate operations no guard here reads it for.
+/// grants it (`s3:Put*`, `s3:*`) is not this shape: a conditioned-write
+/// Condition would then also gate operations no guard here reads it for.
 fn is_put_object_only(actions: &[String]) -> bool {
     actions
         .iter()
         .all(|a| a.eq_ignore_ascii_case("s3:PutObject"))
 }
 
-/// Validate the create-only PutObject Condition: an `Allow` whose Condition is
-/// exactly `{"StringEquals": {"s3:if-none-match": "*"}}` (the value as a bare
-/// string or a one-element array). On a `Deny` the same Condition would
-/// withdraw only the creates and leave overwrites standing, which no guard
-/// reads, so it is refused; so is every other operator, key, or value.
-fn validate_create_only_put_condition(
+/// Validate a PutObject-only statement's Condition: an `Allow` whose Condition
+/// is exactly `{"StringEquals": {"s3:if-none-match": "*"}}` (create-only) or
+/// exactly `{"Null": {"s3:if-match": "false"}}` (CAS-only), the value as a bare
+/// string or a one-element array. A Condition whose one operator is `Null` is
+/// held to the CAS-only shape; every other Condition is held to the create-only
+/// shape, so a refusal names what differs from it. On a `Deny` either Condition
+/// would withdraw one kind of write and leave the others standing, which no
+/// guard reads, so it is refused; so is every other operator, key, or value.
+fn validate_put_condition(
     role: &str,
     sid: &str,
     index: usize,
     effect: &str,
     condition: &serde_json::Value,
 ) -> Result<(), String> {
+    let cas = condition
+        .as_object()
+        .is_some_and(|c| c.len() == 1 && c.contains_key(CAS_ONLY_CONDITION_OPERATOR));
+    let (shape, operator, cond_key, expected) = if cas {
+        (
+            "CAS-only",
+            CAS_ONLY_CONDITION_OPERATOR,
+            CAS_ONLY_CONDITION_KEY,
+            CAS_ONLY_CONDITION_VALUE,
+        )
+    } else {
+        (
+            "create-only",
+            CREATE_ONLY_CONDITION_OPERATOR,
+            CREATE_ONLY_CONDITION_KEY,
+            CREATE_ONLY_CONDITION_VALUE,
+        )
+    };
     let refuse = |why: &str| {
         Err(format!(
             "{role}/{sid} (statement #{index}): s3:PutObject Condition {condition} is not \
-             the create-only shape {{\"{CREATE_ONLY_CONDITION_OPERATOR}\": \
-             {{\"{CREATE_ONLY_CONDITION_KEY}\": \"{CREATE_ONLY_CONDITION_VALUE}\"}}}} on an \
+             the {shape} shape {{\"{operator}\": {{\"{cond_key}\": \"{expected}\"}}}} on an \
              Allow: {why}"
         ))
     };
@@ -1339,39 +1379,77 @@ fn validate_create_only_put_condition(
     if cond_obj.len() != 1 {
         return refuse("it must name exactly one operator");
     }
-    let Some(keys) = cond_obj
-        .get(CREATE_ONLY_CONDITION_OPERATOR)
-        .and_then(|k| k.as_object())
-    else {
-        return refuse("its operator is not StringEquals over a JSON object");
+    let Some(keys) = cond_obj.get(operator).and_then(|k| k.as_object()) else {
+        return refuse(&format!(
+            "its operator is not {operator} over a JSON object"
+        ));
     };
     if keys.len() != 1 {
         return refuse("it must name exactly one condition key");
     }
-    let Some(value) = keys.get(CREATE_ONLY_CONDITION_KEY) else {
-        return refuse("its condition key is not s3:if-none-match");
+    let Some(value) = keys.get(cond_key) else {
+        return refuse(&format!("its condition key is not {cond_key}"));
     };
-    if !is_string_or_string_array(Some(value))
-        || condition_value_strings(value) != [CREATE_ONLY_CONDITION_VALUE]
-    {
-        return refuse("its value is not exactly \"*\"");
+    if !is_string_or_string_array(Some(value)) || condition_value_strings(value) != [expected] {
+        return refuse(&format!("its value is not exactly \"{expected}\""));
     }
     Ok(())
 }
 
+/// The conditioned write an `Allow` PutObject-only statement grants, or `None`
+/// for any other statement. The choke point admits a Condition on such a
+/// statement in the two `validate_put_condition` shapes alone, so the `Null`
+/// operator is what tells them apart.
+fn put_condition_of(stmt: &serde_json::Value) -> Option<PutCondition> {
+    let allow = stmt["Effect"]
+        .as_str()
+        .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+    if !allow || !is_put_object_only(&statement_actions(stmt)) {
+        return None;
+    }
+    let condition = stmt.get("Condition")?;
+    if condition.get(CAS_ONLY_CONDITION_OPERATOR).is_some() {
+        Some(PutCondition::CasOnly)
+    } else {
+        Some(PutCondition::CreateOnly)
+    }
+}
+
 /// Bucket-relative key patterns from every `Allow` PutObject statement carrying
-/// the create-only Condition. The choke point admits a Condition on a
-/// PutObject-only statement in that one shape alone, so a Condition's presence
-/// on such a statement is what selects it.
+/// the `kind` Condition.
+fn conditioned_put_patterns(policy: &Policy, kind: PutCondition) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        if put_condition_of(stmt) != Some(kind) {
+            continue;
+        }
+        out.extend(object_key_patterns(
+            policy.role,
+            statement_sid(stmt),
+            &statement_resources(stmt),
+        ));
+    }
+    out
+}
+
+/// Bucket-relative key patterns from every `Allow` PutObject statement carrying
+/// the create-only Condition.
 fn create_only_put_patterns(policy: &Policy) -> Vec<String> {
+    conditioned_put_patterns(policy, PutCondition::CreateOnly)
+}
+
+/// Bucket-relative key patterns from every `Allow` statement that grants
+/// `s3:PutObject` with neither conditioned-write Condition, so the PUTs it
+/// allows include an unconditional overwrite.
+fn unconditioned_put_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy_statements(policy) {
         let allow = stmt["Effect"]
             .as_str()
             .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
         if !allow
-            || stmt.get("Condition").is_none()
-            || !is_put_object_only(&statement_actions(stmt))
+            || !any_action_grants_any(&statement_actions(stmt), &["s3:PutObject"])
+            || put_condition_of(stmt).is_some()
         {
             continue;
         }
@@ -2156,7 +2234,6 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/*/idem/*",
             "t/*/*/admission/*",
-            "t/*/*/prov",
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/HEAD",
             "t/*/catalog/*/idx/*",
@@ -2164,8 +2241,11 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/t/*",
             "t/*/enc",
             "t/*/m/meta",
+            "t/*/*/prov",
         ],
-        put_actions: &["s3:PutObject"],
+        // One entry per statement: GatewayWrite, then the create-only
+        // GatewayProvCreate (prov_put_grants_carry_exactly_the_expected_conditions).
+        put_actions: &["s3:PutObject", "s3:PutObject"],
         deletes: &["t/????????????????????????????????/?/admission/*"],
         delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
@@ -2234,8 +2314,12 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/a/state/latest",
             "sys/pq-probe/*",
             "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
+            "t/*/*/prov",
         ],
-        put_actions: &["s3:PutObject", "s3:PutObject"],
+        // QueryWrite, QueryManifestCreate, then the create-only QueryProvCreate
+        // the startup provisioning adopt path needs
+        // (every_prov_write_call_site_has_a_grant_of_its_kind).
+        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
         deletes: &["sys/pq-probe/*"],
         delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
@@ -2396,8 +2480,13 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "t/*/catalog/*/HEAD",
+            "t/*/*/prov",
+            "t/*/*/prov",
         ],
-        put_actions: &["s3:PutObject"],
+        // MaintainWrite, then MaintainProvCreate (create-only, the maintain
+        // tick's adopt) and MaintainProvCas (CAS-only, the maintain migrate
+        // floor raise): every_prov_write_call_site_has_a_grant_of_its_kind.
+        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
         deletes: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -2445,15 +2534,18 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualify/*",
             "sys/gc",
             "sys/auth",
-            "t/*/*/prov",
             "t/*/*/c/*",
             "t/*/u/*",
             "t/*/*/del/*.dreq",
             "t/*/config",
             "t/*/pq/grants",
             "sys/pq-probe/*",
+            "t/*/*/prov",
+            "t/*/*/prov",
         ],
-        put_actions: &["s3:PutObject"],
+        // AdminWrite, then AdminProvCreate (create-only, provision adopt) and
+        // AdminProvCas (CAS-only, provision reshard).
+        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
         deletes: ADMIN_SCRATCH_DELETES,
         // Narrower than the Deny, which names both operations. Legitimate, and
         // the reason the overlap property is asserted as containment rather than
@@ -5216,11 +5308,15 @@ fn query_manifest_write_is_create_only() {
 #[test]
 fn query_manifest_create_grant_reaches_only_manifest_keys() {
     let query = load_policy("query");
-    let create_only = create_only_put_patterns(&query);
+    let create_only: Vec<String> = create_only_put_patterns(&query)
+        .into_iter()
+        .filter(|p| p != PROV_PATTERN)
+        .collect();
     assert_eq!(
         create_only,
         ["t/????????????????????????????????/pq/t/*/v/????????????????????.pqm"],
-        "query: the create-only grant must be exactly the manifest key pattern"
+        "query: besides the provisioning record, the create-only grant must be \
+         exactly the manifest key pattern"
     );
     let tenant = parquet_tenant_manifest_prefix();
     let reached = [
@@ -5399,6 +5495,275 @@ fn create_only_put_condition_shape_fails_closed_on_every_variant() {
             err.contains("its operator is not StringEquals"),
             "{name}: must be refused by the operator check; got {err:?}"
         );
+    }
+}
+
+/// The CAS-only Condition passes the choke point in its one exact shape and
+/// every variant fails closed. `"true"` is the dangerous one: it admits only a
+/// PUT that sends no `If-Match`, which is every unconditional overwrite.
+#[test]
+fn cas_only_put_condition_shape_fails_closed_on_every_variant() {
+    let stmt = |effect: &str, action: serde_json::Value, condition: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "CasOnly",
+            "Effect": effect,
+            "Action": action,
+            "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+            "Condition": condition,
+        })
+    };
+    let good = serde_json::json!({"Null": {"s3:if-match": "false"}});
+    let put = serde_json::json!("s3:PutObject");
+    for ok in [
+        stmt("Allow", put.clone(), good.clone()),
+        stmt(
+            "Allow",
+            serde_json::json!(["s3:PutObject"]),
+            serde_json::json!({"Null": {"s3:if-match": ["false"]}}),
+        ),
+    ] {
+        assert!(
+            validate_statement("fixture", 0, &ok).is_ok(),
+            "the CAS-only shape must pass: {ok}"
+        );
+        assert_eq!(put_condition_of(&ok), Some(PutCondition::CasOnly));
+    }
+
+    let cases = [
+        (
+            "true value",
+            serde_json::json!({"Null": {"s3:if-match": "true"}}),
+            "its value is not exactly \"false\"",
+        ),
+        (
+            "two values",
+            serde_json::json!({"Null": {"s3:if-match": ["false", "true"]}}),
+            "its value is not exactly \"false\"",
+        ),
+        (
+            "if-none-match key",
+            serde_json::json!({"Null": {"s3:if-none-match": "false"}}),
+            "its condition key is not s3:if-match",
+        ),
+        (
+            "extra key",
+            serde_json::json!({"Null": {"s3:if-match": "false", "aws:SourceIp": "false"}}),
+            "it must name exactly one condition key",
+        ),
+        (
+            "StringLike operator",
+            serde_json::json!({"StringLike": {"s3:if-match": "*"}}),
+            "its operator is not StringEquals",
+        ),
+        (
+            "extra operator",
+            serde_json::json!({
+                "Null": {"s3:if-match": "false"},
+                "StringEquals": {"s3:if-none-match": "*"}
+            }),
+            "it must name exactly one operator",
+        ),
+    ];
+    for (name, condition, why) in &cases {
+        let case = stmt("Allow", put.clone(), condition.clone());
+        let err = validate_statement("fixture", 0, &case)
+            .expect_err(&format!("validate_statement must reject the {name} case"));
+        assert!(
+            err.contains("CasOnly") && err.contains(why),
+            "{name}: rejection must name the Sid and say {why:?}; got {err:?}"
+        );
+    }
+    for (name, case) in [
+        ("on a Deny", stmt("Deny", put.clone(), good.clone())),
+        (
+            "wildcard action",
+            stmt("Allow", serde_json::json!("s3:Put*"), good.clone()),
+        ),
+        (
+            "mixed actions",
+            stmt(
+                "Allow",
+                serde_json::json!(["s3:PutObject", "s3:GetObject"]),
+                good.clone(),
+            ),
+        ),
+    ] {
+        validate_statement("fixture", 0, &case)
+            .expect_err(&format!("validate_statement must reject the {name} case"));
+    }
+}
+
+/// The provisioning record's key, `t/<hash>/<signal>/prov`
+/// (`provisioning_key` in `crates/ravel-catalog/src/provisioning.rs`, which
+/// this crate cannot depend on), for each signal that has one: the server's
+/// `PROVISIONED_SIGNALS` and the `ravel-cli` provision and migrate signal
+/// arguments are all metrics, logs and spans.
+fn prov_witness_keys() -> Vec<String> {
+    let hash = test_tenant().to_hex();
+    [Signal::Metrics, Signal::Logs, Signal::Spans]
+        .iter()
+        .map(|signal| format!("t/{hash}/{}/prov", signal.key_prefix()))
+        .collect()
+}
+
+/// The one resource every template's provisioning-record statements name.
+const PROV_PATTERN: &str = "t/*/*/prov";
+
+/// Every production write of the provisioning record, the role whose
+/// credential issues it, and the conditional write it sends. Writes go through
+/// three functions in `crates/ravel-catalog/src/provisioning.rs`:
+/// `write_record_race_safe` (`PutMode::CreateIfAbsent`, reached from
+/// `validate_or_adopt` under `CreateFromConfig` or `AdoptIfData`),
+/// `append_generation` and `raise_format_floor` (both `PutMode::CasVersion`).
+/// No production path writes the record unconditionally.
+const PROV_WRITE_CALL_SITES: &[(&str, &str, PutCondition)] = &[
+    (
+        "ProvisioningRecordWriter::ensure (services/ravel-server/src/provisioning.rs), \
+         validate_or_adopt CreateFromConfig on a tenant's first ingest write",
+        "gateway",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "validate_static_provisioning (services/ravel-server/src/provisioning.rs, \
+         called from main.rs at startup in every mode), validate_or_adopt AdoptIfData",
+        "gateway",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "validate_static_provisioning at startup in every mode",
+        "query",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "validate_static_provisioning at startup in every mode",
+        "maintain",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "the maintain tick (services/ravel-server/src/maintain.rs), validate_or_adopt \
+         AdoptIfData per tenant and signal",
+        "maintain",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "ravel-cli maintain migrate, raise_format_floor after a clean re-audit \
+         (crates/ravel-maintain/src/migrate.rs)",
+        "maintain",
+        PutCondition::CasOnly,
+    ),
+    (
+        "ravel-cli provision adopt, validate_or_adopt AdoptIfData",
+        "admin",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "ravel-cli provision reshard, append_generation",
+        "admin",
+        PutCondition::CasOnly,
+    ),
+];
+
+/// Per role, the conditions of the statements that write the provisioning
+/// record, in template order.
+const EXPECTED_PROV_PUT_CONDITIONS: &[(&str, &[PutCondition])] = &[
+    ("gateway", &[PutCondition::CreateOnly]),
+    ("query", &[PutCondition::CreateOnly]),
+    (
+        "maintain",
+        &[PutCondition::CreateOnly, PutCondition::CasOnly],
+    ),
+    ("admin", &[PutCondition::CreateOnly, PutCondition::CasOnly]),
+];
+
+/// Every role writes the provisioning record only through conditioned
+/// statements naming exactly `t/*/*/prov`, carrying exactly the conditions
+/// `EXPECTED_PROV_PUT_CONDITIONS` lists, and keeps its deny-delete on it. An
+/// unconditioned PutObject reaching the record would let a compromised
+/// credential overwrite or replace any tenant's shard generations and format
+/// floors outright, where CAS-only still has to name the current version.
+#[test]
+fn prov_put_grants_carry_exactly_the_expected_conditions() {
+    let mut roles: Vec<&str> = EXPECTED_PROV_PUT_CONDITIONS
+        .iter()
+        .map(|(r, _)| *r)
+        .collect();
+    roles.sort_unstable();
+    let mut all_roles: Vec<&str> = ALL_ROLES.to_vec();
+    all_roles.sort_unstable();
+    assert_eq!(
+        roles, all_roles,
+        "one EXPECTED_PROV_PUT_CONDITIONS row per role"
+    );
+
+    let keys = prov_witness_keys();
+    for (role, expected) in EXPECTED_PROV_PUT_CONDITIONS {
+        let policy = load_policy(role);
+        let unconditioned = unconditioned_put_patterns(&policy);
+        for key in &keys {
+            assert!(
+                !unconditioned.iter().any(|p| glob_matches(p, key)),
+                "{role}: an unconditioned PutObject Allow reaches the provisioning \
+                 record {key:?}; every prov write must be create-only or CAS-only. \
+                 Unconditioned patterns: {unconditioned:?}"
+            );
+        }
+
+        let mut conditions = Vec::new();
+        for stmt in policy_statements(&policy) {
+            let patterns =
+                object_key_patterns(policy.role, statement_sid(stmt), &statement_resources(stmt));
+            let Some(kind) = put_condition_of(stmt) else {
+                continue;
+            };
+            if !keys
+                .iter()
+                .any(|k| patterns.iter().any(|p| glob_matches(p, k)))
+            {
+                continue;
+            }
+            assert_eq!(
+                patterns,
+                [PROV_PATTERN],
+                "{role}/{}: a conditioned prov statement must name the provisioning \
+                 record and nothing else",
+                statement_sid(stmt)
+            );
+            conditions.push(kind);
+        }
+        assert_eq!(
+            conditions.as_slice(),
+            *expected,
+            "{role}: the conditioned PutObject statements reaching the provisioning \
+             record are not the expected set"
+        );
+
+        let protected = delete_key_patterns(&policy, "Deny");
+        for key in &keys {
+            assert!(
+                protected.iter().any(|p| glob_matches(p, key)),
+                "{role}: DenyDeleteProtected no longer covers {key:?}"
+            );
+        }
+    }
+}
+
+/// Each production write of the provisioning record in `PROV_WRITE_CALL_SITES`
+/// is matched by a grant of its own kind on the role that issues it, for every
+/// signal. A create-only grant does not cover a `CasVersion` write, and a
+/// CAS-only grant does not cover a `CreateIfAbsent` one: IAM refuses each
+/// conditional kind under the other's Condition.
+#[test]
+fn every_prov_write_call_site_has_a_grant_of_its_kind() {
+    for (call, role, kind) in PROV_WRITE_CALL_SITES {
+        let policy = load_policy(role);
+        let granted = conditioned_put_patterns(&policy, *kind);
+        for key in prov_witness_keys() {
+            assert!(
+                granted.iter().any(|p| glob_matches(p, &key)),
+                "{role}: no {kind:?} PutObject Allow reaches {key:?}, which {call} \
+                 writes. {kind:?} patterns: {granted:?}"
+            );
+        }
     }
 }
 
@@ -8006,6 +8371,12 @@ fn empty_routed_write_set_is_not_a_skip() {
     let statements = json["Statement"]
         .as_array_mut()
         .expect("maintain.json Statement is an array");
+    // The two conditioned prov statements route through the tenant key too, so
+    // they go with the narrowing.
+    statements.retain(|stmt| {
+        stmt["Sid"] != serde_json::json!("MaintainProvCreate")
+            && stmt["Sid"] != serde_json::json!("MaintainProvCas")
+    });
     let target = statements
         .iter_mut()
         .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainWrite"))
@@ -8959,6 +9330,10 @@ fn shipped_gateway_write_mutated_to_wildcard_action_fails_closed() {
     let statements = json["Statement"]
         .as_array_mut()
         .expect("gateway.json Statement is an array");
+    // GatewayProvCreate is a second PutObject grant round three would have
+    // read; dropping it leaves GatewayWrite as the only put statement, which is
+    // the shape the reviewer mutated.
+    statements.retain(|stmt| stmt["Sid"] != serde_json::json!("GatewayProvCreate"));
     let target = statements
         .iter_mut()
         .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayWrite"))
