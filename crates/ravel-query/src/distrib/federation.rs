@@ -99,7 +99,7 @@ use ravel_types::{SeriesId, Signal, TenantHash};
 
 use crate::config::EngineConfig;
 use crate::distrib::client::{DistribError, SliceFetcher, SliceResponse};
-use crate::distrib::{codec, encode_budgets, typed_budget_refusal};
+use crate::distrib::{WallDeadline, codec, encode_budgets, typed_budget_refusal};
 use crate::engine::bytes_scanned_exceeded;
 use crate::erasure::ErasurePredicate;
 use crate::error::QueryError;
@@ -246,9 +246,10 @@ impl Federation {
     ///   `TooManySegments`) when it refused under this coordinator's budget,
     ///   so a remote-side refusal renders 422 rather than a retryable 503.
     /// - [`QueryError::DeadlineExceeded`] when a remote stopped at
-    ///   `deadline_unix_ns`, regardless of `skip_unavailable`.
+    ///   `deadline.unix_ns`, regardless of `skip_unavailable`, carrying
+    ///   `deadline.request`.
     ///
-    /// `deadline_unix_ns` is the query's absolute deadline, carried on every
+    /// `deadline.unix_ns` is the query's absolute deadline, carried on every
     /// Resolve request so a remote stops reading for the query when the query
     /// itself stops.
     ///
@@ -275,7 +276,7 @@ impl Federation {
         min_commit_tokens: Vec<String>,
         accounting: QueryAccounting,
         config: EngineConfig,
-        deadline_unix_ns: i64,
+        deadline: WallDeadline,
     ) -> Result<FederationOutcome, QueryError> {
         let mut outcome = FederationOutcome::default();
         // Only the remotes mapped to THIS local tenant. A remote's fetcher
@@ -341,7 +342,7 @@ impl Federation {
                 budgets: Some(budgets),
                 // The query's own deadline, so the remote stops reading for
                 // it when the query stops (ADR-1133 bounded readers).
-                deadline_unix_ns,
+                deadline_unix_ns: deadline.unix_ns,
                 erasure: encoded_erasure.clone(),
                 trace_context: String::new(),
                 // A Resolve (federation) request carries no fragment capability
@@ -551,7 +552,7 @@ impl Federation {
                     // the remote would answer past the deadline. Its spend
                     // before the stop is folded first.
                     fold_remote(&accounting, &mut running, &mut outcome.stats, &response);
-                    return Err(super::slice_deadline_exceeded());
+                    return Err(super::slice_deadline_exceeded(deadline));
                 }
                 other => {
                     // SnapshotInvalidated/Corrupt/etc. A remote resolves its own
@@ -643,6 +644,12 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
 
+    /// A deadline the wall clock never reaches.
+    const TEST_DEADLINE: WallDeadline = WallDeadline {
+        unix_ns: i64::MAX,
+        request: Duration::from_secs(60),
+    };
+
     /// A remote whose fetch always fails at transport, carrying a message that
     /// embeds internal identifiers (IP:port, errno) exactly as a real tonic
     /// transport error would. The redaction boundary must keep all of it out of
@@ -723,7 +730,7 @@ mod tests {
             Vec::new(),
             QueryAccounting::new(),
             EngineConfig::default(),
-            i64::MAX,
+            TEST_DEADLINE,
         )
         .await
     }
@@ -1277,7 +1284,7 @@ mod tests {
                 Vec::new(),
                 QueryAccounting::new(),
                 EngineConfig::default(),
-                i64::MAX,
+                TEST_DEADLINE,
             )
             .await
             .expect("an unmapped tenant is answered locally, not failed");
@@ -1366,11 +1373,12 @@ mod tests {
 
     /// Issue #2385: the Resolve request carries the deadline the caller
     /// passed, and a remote that stopped at it fails the query with
-    /// `DeadlineExceeded` even under `skip_unavailable`, after its spend is
-    /// folded into the query's handle.
+    /// `DeadlineExceeded` naming the request's own deadline even under
+    /// `skip_unavailable`, after its spend is folded into the query's handle.
     ///
     /// Mutation proof: `deadline_unix_ns: 0` on the request records 0;
-    /// deleting the `Timeout` arm fails the query with `Federation` instead.
+    /// deleting the `Timeout` arm fails the query with `Federation` instead;
+    /// a `Duration::ZERO` in `slice_deadline_exceeded` names zero.
     #[tokio::test]
     async fn a_remote_stopped_at_the_deadline_fails_the_query_and_reports_its_spend() {
         const DEADLINE_NS: i64 = 1_700_000_005_000_000_000;
@@ -1395,13 +1403,16 @@ mod tests {
                 Vec::new(),
                 accounting.clone(),
                 EngineConfig::default(),
-                DEADLINE_NS,
+                WallDeadline {
+                    unix_ns: DEADLINE_NS,
+                    request: Duration::from_secs(5),
+                },
             )
             .await
             .expect_err("a remote stopped at the deadline is never skipped");
 
         assert!(
-            matches!(err, QueryError::DeadlineExceeded { .. }),
+            matches!(err, QueryError::DeadlineExceeded { deadline } if deadline == Duration::from_secs(5)),
             "{err:?}"
         );
         assert_eq!(
