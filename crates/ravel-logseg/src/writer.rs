@@ -419,10 +419,28 @@ impl RlogWriter {
             }
         }
         let sorted_ids: Vec<LogStreamId> = streams.keys().copied().collect();
-        let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(sorted_ids.len());
-        for (i, id) in sorted_ids.iter().enumerate() {
-            ref_of.insert(*id, i as u32);
-        }
+        let stage0_mode = stage0::MODE.load(std::sync::atomic::Ordering::Relaxed);
+        let ref_of: Option<HashMap<LogStreamId, u32>> = if stage0_mode == 2 {
+            None
+        } else {
+            let t0 = (stage0_mode == 1).then(std::time::Instant::now);
+            let mut m: HashMap<LogStreamId, u32> = HashMap::with_capacity(sorted_ids.len());
+            for (i, id) in sorted_ids.iter().enumerate() {
+                m.insert(*id, i as u32);
+            }
+            if let Some(t0) = t0 {
+                use std::sync::atomic::Ordering::Relaxed;
+                stage0::BUILD_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+                stage0::ENTRIES.store(m.len() as u64, Relaxed);
+                let t1 = std::time::Instant::now();
+                for r in &self.records {
+                    std::hint::black_box(m.get(&r.stream_id));
+                }
+                stage0::REPLAY_NS.fetch_add(t1.elapsed().as_nanos() as u64, Relaxed);
+                stage0::LOOKUPS.fetch_add(self.records.len() as u64, Relaxed);
+            }
+            Some(m)
+        };
 
         // Each clustering key's value per record, in push order, read off the
         // per-record layer only (ADR-2135 decision 1).
@@ -595,7 +613,8 @@ impl RlogWriter {
         for r in &self.records {
             rows.push(resolve_row(
                 r,
-                &ref_of,
+                ref_of.as_ref(),
+                &sorted_ids,
                 &column_of,
                 &tracked_slot,
                 &stamp_index,
@@ -1880,14 +1899,18 @@ fn stream_level_column_eligible(
 /// the two paths cannot drift.
 fn resolve_row(
     r: &LogRecord,
-    ref_of: &HashMap<LogStreamId, u32>,
+    ref_of: Option<&HashMap<LogStreamId, u32>>,
+    sorted_ids: &[LogStreamId],
     column_of: &ColumnIndex,
     slot_of: &HashMap<&str, u32>,
     index: &StampIndex,
     stream_seeds: &HashMap<LogStreamId, StreamSeed>,
     stamp: &mut StampScratch,
 ) -> ResolvedRow {
-    let stream_ref = ref_of.get(&r.stream_id).copied().unwrap_or(0);
+    let stream_ref = match ref_of {
+        Some(m) => m.get(&r.stream_id).copied().unwrap_or(0),
+        None => sorted_ids.binary_search(&r.stream_id).map_or(0, |i| i as u32),
+    };
     let mut cols: BTreeMap<u32, ColumnValue> = BTreeMap::new();
     let mut overflow: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
     // Each *tracked* name this record carries -- indexed (POSTINGS) or
@@ -5975,4 +5998,15 @@ mod row_order_tests {
         }
         permute(Vec::<char>::new(), &[]).expect("empty is a permutation of nothing");
     }
+}
+
+/// Stage 0 measurement scaffolding (issue #2426); never merged.
+#[doc(hidden)]
+pub mod stage0 {
+    use std::sync::atomic::{AtomicU8, AtomicU64};
+    pub static MODE: AtomicU8 = AtomicU8::new(0);
+    pub static BUILD_NS: AtomicU64 = AtomicU64::new(0);
+    pub static REPLAY_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LOOKUPS: AtomicU64 = AtomicU64::new(0);
+    pub static ENTRIES: AtomicU64 = AtomicU64::new(0);
 }
