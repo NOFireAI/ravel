@@ -7408,7 +7408,8 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     ///
     /// Mutation proof: answering a slice `run_until_deadline` stopped with a
     /// gRPC `deadline_exceeded` status again, as before #2385, fails the
-    /// `expect` on the in-band response.
+    /// `expect` on the in-band response; deleting the `record_deadline_stop`
+    /// call in `run_until_deadline` leaves the `pinned` stop counter at 0.
     #[tokio::test]
     async fn a_capability_that_expires_mid_run_stops_the_slice_before_its_next_store_request() {
         use ravel_object_store::fault::{Occurrence, Op};
@@ -7542,7 +7543,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// request, with its deadline still ahead, is served `Ok`.
     ///
     /// Mutation proof: as for the refusal test above, an unbounded Resolve run
-    /// ends `Ok` with the series instead of `TIMEOUT`.
+    /// ends `Ok` with the series instead of `TIMEOUT`; deleting the
+    /// `record_deadline_stop` call in `run_until_deadline`, or recording every
+    /// stop as `Pinned`, leaves the `resolve` stop counter at 0.
     #[tokio::test]
     async fn a_federated_fetch_stops_at_its_deadline_and_reports_its_spend() {
         use ravel_object_store::fault::{Occurrence, Op};

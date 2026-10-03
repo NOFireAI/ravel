@@ -7410,9 +7410,7 @@ mod prefetch_tests {
     ///
     /// Mutation proof: deleting the `Timeout` arm from `Distributed::fetch`
     /// (`distrib/mod.rs`) fails the instant query with `Distrib`; deleting it
-    /// from `Federation::fetch` fails discovery with `Federation`; putting
-    /// discovery's `map_err` back in `resolve_series_with_stats` in place of
-    /// `unify_deadline` reports a zero deadline.
+    /// from `Federation::fetch` fails discovery with `Federation`.
     #[tokio::test]
     async fn a_slice_stopped_at_the_deadline_fails_the_query_with_its_deadline() {
         let store = Arc::new(MemoryStore::new());
