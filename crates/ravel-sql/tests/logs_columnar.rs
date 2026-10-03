@@ -1415,120 +1415,15 @@ async fn a_strided_fallback_across_partitions_neither_drops_nor_repeats_rows() {
 /// being the one this item exists to fix.
 #[tokio::test]
 async fn block_striping_is_row_identical_to_single_partition() {
-    let declared = declared_columns();
-    // Vary block counts per segment so the stride crosses segment boundaries at
-    // non-trivial offsets (block_target_records = 3, see `small_blocks`).
-    let seg_sizes = [7usize, 4, 11, 5];
-    let mut all_records: Vec<Vec<LogRecord>> = Vec::new();
-    let mut ts = 0i64;
-    for &size in &seg_sizes {
-        let mut recs = Vec::with_capacity(size);
-        for _ in 0..size {
-            let spilled = ts % 3 == 0;
-            recs.push(LogRecord {
-                stream_id: log_stream_id(
-                    &[("service.name".to_string(), AttrValue::Str("api".into()))],
-                    "scope",
-                    "1.0",
-                    &[],
-                ),
-                stream_attrs: stream_attrs_bytes(
-                    &[("service.name".to_string(), AttrValue::Str("api".into()))],
-                    "scope",
-                    "1.0",
-                    &[],
-                ),
-                ts_ns: ts,
-                observed_ts_ns: ts,
-                severity_num: (ts % 5) as u8,
-                severity_text: "INFO".into(),
-                body: format!("body-{ts}"),
-                trace_id: None,
-                span_id: None,
-                flags: ts as u32,
-                attrs: {
-                    let mut a = vec![("filler".to_string(), AttrValue::Str("f".into()))];
-                    if spilled {
-                        // Overflow into attrs_raw for some blocks so the run also
-                        // exercises the fallback path under striping.
-                        a.push(("tags".to_string(), AttrValue::Str(format!("t-{ts}"))));
-                    }
-                    a
-                },
-            });
-            ts += 1;
-        }
-        all_records.push(recs);
-    }
-
-    // max_dynamic_columns = 1 so `tags` overflows into attrs_raw wherever it is
-    // set, forcing the columnar->row fallback on those blocks.
+    // One block per row group: the stride crosses segment boundaries block by
+    // block, which the pinned `blocks_scanned` figures below depend on.
     let cfg = RlogConfig {
         block_target_records: 3,
         max_dynamic_columns: 1,
         group_target_blocks: 1,
         ..RlogConfig::default()
     };
-
-    let store = MemoryStore::new();
-    let mut segments = Vec::new();
-    for (i, recs) in all_records.iter().enumerate() {
-        segments.push(write_object(&store, &format!("logs/diff-{i}.rlog"), recs, cfg).await);
-    }
-    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
-
-    let projection = vec![0usize, 4usize, FIRST_DECLARED_COL + 1];
-
-    let baseline = run_scan_tp(
-        Arc::clone(&store),
-        segments.clone(),
-        declared.clone(),
-        Some(projection.clone()),
-        Vec::new(),
-        Vec::new(),
-        1,
-    )
-    .await;
-    let baseline_rows = rows(&baseline.batches, &projection, &declared);
-
-    // Adequately partitioned: 4 segments, target_partitions = 4.
-    let adequate = run_scan_tp(
-        Arc::clone(&store),
-        segments.clone(),
-        declared.clone(),
-        Some(projection.clone()),
-        Vec::new(),
-        Vec::new(),
-        4,
-    )
-    .await;
-    assert_eq!(
-        rows(&adequate.batches, &projection, &declared),
-        baseline_rows,
-        "block striping at target_partitions=4 (>= segment count) must be \
-         row-identical to a single partition"
-    );
-
-    // Undersubscribed: 4 segments, target_partitions = 12 (the case this fixes).
-    let under = run_scan_tp(
-        Arc::clone(&store),
-        segments.clone(),
-        declared.clone(),
-        Some(projection.clone()),
-        Vec::new(),
-        Vec::new(),
-        12,
-    )
-    .await;
-    assert_eq!(
-        rows(&under.batches, &projection, &declared),
-        baseline_rows,
-        "block striping at target_partitions=12 (< nothing; > segment count) \
-         must be row-identical to a single partition"
-    );
-
-    // The whole-segment prune totals are counted once regardless of how many
-    // partitions stripe a segment: blocks_total is stable across the sweep.
+    let (baseline, adequate, under) = striping_runs(cfg).await;
     assert_eq!(
         baseline.blocks_total, adequate.blocks_total,
         "blocks_total is a whole-object figure, counted once, not per partition"
@@ -1591,6 +1486,142 @@ async fn block_striping_is_row_identical_to_single_partition() {
         under.blocks_scanned,
         baseline.blocks_scanned
     );
+}
+
+/// The same differential as [`block_striping_is_row_identical_to_single_partition`]
+/// over objects written with the writer's default row group size, so each
+/// segment's blocks form one multi-block row group that the deal hands whole to
+/// one partition. Rows must be identical to the single-partition run, and the
+/// whole-object `blocks_total` stable; the reopen-cost figures of the one-block
+/// groups case do not carry over, because a partition now owns a segment's
+/// blocks as a unit.
+#[tokio::test]
+async fn default_row_groups_are_row_identical_to_single_partition() {
+    let cfg = RlogConfig {
+        block_target_records: 3,
+        max_dynamic_columns: 1,
+        ..RlogConfig::default()
+    };
+    let (baseline, adequate, under) = striping_runs(cfg).await;
+    assert_eq!(baseline.blocks_total, adequate.blocks_total);
+    assert_eq!(baseline.blocks_total, under.blocks_total);
+    assert!(
+        under.blocks_scanned >= baseline.blocks_scanned,
+        "bounded per-(partition, segment) reopen overhead can only add: under={} baseline={}",
+        under.blocks_scanned,
+        baseline.blocks_scanned
+    );
+}
+
+/// Run the striping corpus under one, four and twelve partitions, asserting
+/// every run returns the single-partition run's rows, and return the three.
+async fn striping_runs(cfg: RlogConfig) -> (MultiRun, MultiRun, MultiRun) {
+    let declared = declared_columns();
+    // Vary block counts per segment so the stride crosses segment boundaries at
+    // non-trivial offsets (block_target_records = 3, see `small_blocks`).
+    let seg_sizes = [7usize, 4, 11, 5];
+    let mut all_records: Vec<Vec<LogRecord>> = Vec::new();
+    let mut ts = 0i64;
+    for &size in &seg_sizes {
+        let mut recs = Vec::with_capacity(size);
+        for _ in 0..size {
+            let spilled = ts % 3 == 0;
+            recs.push(LogRecord {
+                stream_id: log_stream_id(
+                    &[("service.name".to_string(), AttrValue::Str("api".into()))],
+                    "scope",
+                    "1.0",
+                    &[],
+                ),
+                stream_attrs: stream_attrs_bytes(
+                    &[("service.name".to_string(), AttrValue::Str("api".into()))],
+                    "scope",
+                    "1.0",
+                    &[],
+                ),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: (ts % 5) as u8,
+                severity_text: "INFO".into(),
+                body: format!("body-{ts}"),
+                trace_id: None,
+                span_id: None,
+                flags: ts as u32,
+                attrs: {
+                    let mut a = vec![("filler".to_string(), AttrValue::Str("f".into()))];
+                    if spilled {
+                        // Overflow into attrs_raw for some blocks so the run also
+                        // exercises the fallback path under striping.
+                        a.push(("tags".to_string(), AttrValue::Str(format!("t-{ts}"))));
+                    }
+                    a
+                },
+            });
+            ts += 1;
+        }
+        all_records.push(recs);
+    }
+
+    // `cfg` sets max_dynamic_columns = 1 so `tags` overflows into attrs_raw
+    // wherever it is set, forcing the columnar->row fallback on those blocks.
+    let store = MemoryStore::new();
+    let mut segments = Vec::new();
+    for (i, recs) in all_records.iter().enumerate() {
+        segments.push(write_object(&store, &format!("logs/diff-{i}.rlog"), recs, cfg).await);
+    }
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+
+    let projection = vec![0usize, 4usize, FIRST_DECLARED_COL + 1];
+
+    let baseline = run_scan_tp(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+        1,
+    )
+    .await;
+    let baseline_rows = rows(&baseline.batches, &projection, &declared);
+
+    // Adequately partitioned: 4 segments, target_partitions = 4.
+    let adequate = run_scan_tp(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+        4,
+    )
+    .await;
+    assert_eq!(
+        rows(&adequate.batches, &projection, &declared),
+        baseline_rows,
+        "block striping at target_partitions=4 (>= segment count) must be \
+         row-identical to a single partition"
+    );
+
+    // Undersubscribed: 4 segments, target_partitions = 12 (the case this fixes).
+    let under = run_scan_tp(
+        Arc::clone(&store),
+        segments.clone(),
+        declared.clone(),
+        Some(projection.clone()),
+        Vec::new(),
+        Vec::new(),
+        12,
+    )
+    .await;
+    assert_eq!(
+        rows(&under.batches, &projection, &declared),
+        baseline_rows,
+        "block striping at target_partitions=12 (< nothing; > segment count) \
+         must be row-identical to a single partition"
+    );
+
+    (baseline, adequate, under)
 }
 
 /// The capability this item adds (ADR-0102): in the undersubscribed case
