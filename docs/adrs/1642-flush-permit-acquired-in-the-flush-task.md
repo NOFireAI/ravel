@@ -3,8 +3,10 @@
 Status: Accepted (2026-09-12). Amended 2026-09-20 (issue #1740, see
 "Amendment: the queued-flush cap" below), 2026-10-03 (issue #1916, see
 "Amendment (2026-10-03): the deferral cap" below) and 2026-10-03 (issue
-#2410, see "Amendment (2026-10-03): the scan-set check at flush open" below).
-Supersedes ADR-0067 decision 2. Issues #1292, #1641, #1740, #1916, and #2410.
+#2410, see "Amendment (2026-10-03): the scan-set check at flush open" below),
+and 2026-10-03 (issue #2438, see "Amendment (2026-10-03): the zero deferral cap
+refusal binds the library entry" below). Supersedes ADR-0067 decision 2.
+Issues #1292, #1641, #1740, #1916, #2410, and #2438.
 
 ## Context
 
@@ -732,7 +734,8 @@ the arithmetic. The `FLUSH_BOUND_SLACK_HOURS` check beside it admits an idle
 delay plus the flush lifetime equal to the slack, such as
 `--max-flush-delay-idle 3600s`, and the trigger bound's extra flush tick then
 takes the cap to 0, which would refuse every write to a shard from the first
-trigger its full queue deferred.
+trigger its full queue deferred. The refusal now binds the library entry
+point too (see the library-entry amendment below).
 
 **Tests.** `crates/ravel-ingest/tests/scan_set_handback.rs` runs each case on
 the metrics, log and span routers over a `FaultStore`, with the provisioning
@@ -755,3 +758,42 @@ target writes in place and counts it. `generation::tests` pins the check's
 verdicts at the window and horizon edges. `ravel-server`'s
 `a_flush_cadence_leaving_no_deferral_cap_is_rejected_at_startup` pins the
 startup refusal.
+
+## Amendment (2026-10-03): the zero deferral cap refusal binds the library entry (issue #2438)
+
+<!-- amendment-applies: sections="Amendment (2026-10-03): the scan-set check at flush open (issue #2410)" pointer="library-entry amendment" -->
+
+The scan-set amendment placed the zero deferral cap refusal in `Cli::validate`
+alone. `ravel_server::start` validated its ingest configuration through
+`IngestConfig::validate`, which carries only the idle-floor rule, so a caller
+that built a `ServerConfig` in code with a cadence leaving the cap at 0 still
+started, and its shards then refused every write from the first trigger a full
+queue deferred.
+
+**Decision.** The refusal is one function, `validate_flush_deferral_cap` in
+`ravel-server`'s `lib.rs`, called by both `Cli::validate` and
+`start_with_heartbeat` (which `start` calls), beside the idle-floor rule, in
+every mode. It computes the cap from the same terms as before: the configured
+`max_flush_delay`, `max_flush_delay_idle` and `adaptive_flush_delay`, the
+strict visibility budget derived from `max_flush_delay`, and every other term
+at its `IngestConfig` default. Its error is the typed
+`FlushCadenceError::ZeroFlushDeferralCap`, with the same text naming the flags
+and the terms. The arithmetic and the cap's value are unchanged. The
+`FLUSH_BOUND_SLACK_HOURS` check beside it was CLI-only for the same reason and
+moves the same way, as `validate_flush_bound_slack` returning
+`FlushCadenceError::FlushBoundExceedsSlack`. Through the library entry it now
+refuses cadences that entry did not refuse before: the cap check does not cover
+every configuration the slack check refuses, because
+`IngestConfig::flush_trigger_age_bound_ns` truncates the delays with an `as
+i64` cast, so an idle delay past `i64::MAX` nanoseconds (a 1000-year one, say)
+wraps negative and leaves a positive cap, and only the slack check refuses it.
+Refusing more configurations at startup is the safer direction.
+
+**Tests.** `services/ravel-server/tests/flush_deferral_cap_startup.rs` builds
+a `ServerConfig` in code: a 3600 s idle delay is refused by `start` with the
+typed variant in `Mode::All` and `Mode::Query`, 3599 s starts, and 3601 s is
+refused with the slack variant. With `max_flush_delay` and
+`max_flush_delay_idle` both 3599.5 s, `adaptive_flush_delay` on is refused with
+the cap variant and off starts, which pins the adaptive flag and the strict
+visibility reserve in the cap computation; the CLI refuses that cadence earlier,
+by `MAX_STRICT_VISIBILITY_BUDGET_NS`.

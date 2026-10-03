@@ -3987,7 +3987,8 @@ pub struct FlushConcurrency {
 /// compensate -- a straggler flush pinned under a retiring generation could
 /// then land outside the window the read side still scans, an invisibility
 /// hazard. `ravel_ingest::IngestConfig::max_flush_lifetime` is not itself an
-/// operator-facing flag in this ADR's scope, so [`Cli::validate`] uses its
+/// operator-facing flag in this ADR's scope, so `validate_flush_bound_slack`
+/// in `lib.rs`, called by both [`Cli::validate`] and `start`, uses its
 /// compiled-in default (1h) as the fixed half of the sum. That two-term sum is
 /// not the whole worst case: issue #1740's queued-flush cap adds a deferral
 /// term to it, which [`Cli::validate`] explains it does not carry and
@@ -6202,23 +6203,7 @@ impl Cli {
         // that spends the deferral out of the catalog's sealed-hour margin,
         // where a late record is never read again rather than missed by one
         // generation of a shard-count decrease.
-        let flush_bound_ns = duration_nanos_saturating(flush_cadence.max_flush_delay_idle)
-            .saturating_add(duration_nanos_saturating(
-                ravel_ingest::IngestConfig::default().max_flush_lifetime,
-            ));
-        if flush_bound_ns > FLUSH_BOUND_SLACK_HOURS_NS {
-            anyhow::bail!(
-                "--max-flush-delay-idle {:?} plus the ingest pipeline's max_flush_lifetime ({:?}) \
-                 exceeds FLUSH_BOUND_SLACK_HOURS ({} h): the read-side scan slack \
-                 ravel_catalog::FLUSH_BOUND_SLACK_HOURS encodes would no longer cover a \
-                 straggler flush pinned under a retiring shard-count generation, an \
-                 invisibility hazard. Lower --max-flush-delay-idle, or revisit \
-                 FLUSH_BOUND_SLACK_HOURS in ravel-catalog in lockstep (ADR-0076 decision 4).",
-                flush_cadence.max_flush_delay_idle,
-                ravel_ingest::IngestConfig::default().max_flush_lifetime,
-                ravel_catalog::FLUSH_BOUND_SLACK_HOURS,
-            );
-        }
+        crate::validate_flush_bound_slack(flush_cadence.max_flush_delay_idle)?;
 
         let strict_visibility_budget_ns = duration_nanos_saturating(flush_cadence.max_flush_delay)
             .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS);
@@ -6241,38 +6226,11 @@ impl Cli {
         // are paid for. A cadence that spends the whole slack leaves a cap of
         // 0, and a shard would refuse every write from the first trigger its
         // full queue defers. The check above admits that at equality.
-        let ingest = ravel_ingest::IngestConfig {
-            max_flush_delay: flush_cadence.max_flush_delay,
-            max_flush_delay_idle: flush_cadence.max_flush_delay_idle,
-            min_flush_bytes: flush_cadence.min_flush_bytes,
-            adaptive_flush_delay: self.adaptive_flush_delay,
-            strict_visibility_budget_ns,
-            ..ravel_ingest::IngestConfig::default()
-        };
-        if ingest.flush_deferral_cap_ns() == 0 {
-            anyhow::bail!(
-                "--max-flush-delay-idle {:?} with --max-flush-delay {:?}{} leaves the flush \
-                 deferral cap at 0: FLUSH_BOUND_SLACK_HOURS ({} h) less max_flush_lifetime \
-                 ({:?}) less the flush trigger age bound ({} ns: the largest of \
-                 --max-flush-delay, --max-flush-delay-idle and, with --adaptive-flush-delay, \
-                 the adaptive ceiling, plus one flush_tick of {:?}) is not positive. A shard \
-                 whose flush queue filled would refuse every write from the first deferred \
-                 trigger (ADR-1642 deferral cap amendment). Lower --max-flush-delay-idle so \
-                 that it plus max_flush_lifetime plus one flush_tick stays below \
-                 FLUSH_BOUND_SLACK_HOURS.",
-                flush_cadence.max_flush_delay_idle,
-                flush_cadence.max_flush_delay,
-                if self.adaptive_flush_delay {
-                    " and --adaptive-flush-delay"
-                } else {
-                    ""
-                },
-                ravel_catalog::FLUSH_BOUND_SLACK_HOURS,
-                ingest.max_flush_lifetime,
-                ingest.flush_trigger_age_bound_ns(),
-                ingest.flush_tick,
-            );
-        }
+        crate::validate_flush_deferral_cap(
+            flush_cadence.max_flush_delay,
+            flush_cadence.max_flush_delay_idle,
+            self.adaptive_flush_delay,
+        )?;
 
         // `target_bytes` (8 MiB default, ADR-0076's size-trigger that never
         // fires at realistic loads) is not itself an operator-facing flag in
@@ -11930,8 +11888,11 @@ mod tests {
             "startup must reject --max-flush-delay-idle 3601s: exceeds FLUSH_BOUND_SLACK_HOURS",
         );
         assert!(
-            err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
-            "expected a FLUSH_BOUND_SLACK_HOURS error, got: {err}"
+            matches!(
+                err.downcast_ref::<crate::FlushCadenceError>(),
+                Some(crate::FlushCadenceError::FlushBoundExceedsSlack { .. })
+            ),
+            "expected FlushCadenceError::FlushBoundExceedsSlack, got: {err:#}"
         );
     }
 
@@ -11958,8 +11919,11 @@ mod tests {
             "startup must reject --max-flush-delay-idle 5h: exceeds FLUSH_BOUND_SLACK_HOURS",
         );
         assert!(
-            err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
-            "expected a FLUSH_BOUND_SLACK_HOURS error, got: {err}"
+            matches!(
+                err.downcast_ref::<crate::FlushCadenceError>(),
+                Some(crate::FlushCadenceError::FlushBoundExceedsSlack { .. })
+            ),
+            "expected FlushCadenceError::FlushBoundExceedsSlack, got: {err:#}"
         );
     }
 
@@ -12073,10 +12037,13 @@ mod tests {
     /// deferral cap at 0 must fail startup even where the
     /// FLUSH_BOUND_SLACK_HOURS check admits it. A 3600s idle delay plus the
     /// 3600s flush lifetime is exactly the 7200s slack, which that check
-    /// accepts at equality, and the trigger bound's one flush tick takes the
-    /// cap below zero. 3599s leaves 0.8s of cap and is accepted. Deleting the
-    /// `flush_deferral_cap_ns() == 0` bail in `Cli::validate` fails the first
-    /// half.
+    /// accepts at equality, and leaves a cap of exactly 0 before the trigger
+    /// bound adds its flush tick. 3599s leaves 0.8s of cap (1s less the 200ms
+    /// tick) and is accepted. Deleting the
+    /// `crate::validate_flush_deferral_cap` call in `Cli::validate`, or the
+    /// `flush_deferral_cap_ns() == 0` refusal inside it, fails the first half.
+    /// `tests/flush_deferral_cap_startup.rs` pins the same refusal through
+    /// `ravel_server::start`.
     #[test]
     fn a_flush_cadence_leaving_no_deferral_cap_is_rejected_at_startup() {
         let cli = |idle: &str| {
