@@ -1821,7 +1821,8 @@ impl LogSegmentFetcher {
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
     ///
     /// Issue #796: every GET this method issues -- the fast path's footer
-    /// probe, the skip-decidable path's `fetch_plan_sections`, and the
+    /// probe and directory reads, the skip-decidable path's
+    /// `fetch_plan_directories`, and the
     /// fallback's whole-object read (a planning read here, not a scan, per
     /// its own comment below) -- is `plan` phase. Buffered through a
     /// disposable [`PhaseAccounting`](crate::phase_accounting::PhaseAccounting)
@@ -1852,8 +1853,10 @@ impl LogSegmentFetcher {
             // Fast path (#693): a query with no block-level predicate whose ts
             // window fully CONTAINS the segment's span prunes nothing -- every block
             // survives -- so the survivor count is the footer's `block_count` and no
-            // block-range fetch or decode is needed. Only the ADR-0107 suffix probe
-            // runs, to read the footer. Containment is strictly stronger than
+            // block-range fetch or decode is needed. The ADR-0107 suffix probe runs
+            // to read the footer, and `fetch_plan_directories` reads and decodes the
+            // four directories it did not cover; no BLOCKS byte is read. Containment
+            // is strictly stronger than
             // `ts_range_relevant`'s overlap (a partially-overlapping window still
             // needs real ts pruning), and it implies relevance, so the fast path
             // never has to return the irrelevant-`None`. A zero object size cannot
@@ -1882,7 +1885,7 @@ impl LogSegmentFetcher {
                 // Footer-carrying branch: no block byte is read here, so the
                 // touch is the scan that follows a nonzero survivor count.
                 // No whole-object bytes to carry either: this branch reads
-                // only the footer, never a block.
+                // the footer and the four directories, never a block.
                 let touched = !indices.is_empty();
                 return Ok(Some((indices, dirs, stats, Some(footer), touched, None)));
             }
@@ -2078,7 +2081,7 @@ impl LogSegmentFetcher {
         // - `Ok(None)`: the catalog summary proved the segment irrelevant with
         //   no fetch at all.
         // - `Ok(Some((0, .., Some(footer))))`: the skip-decidable branch (#761)
-        //   read only the probe, SKIP_IDX and FIELD_DIR and pruned every block
+        //   read the probe and the four directories and pruned every block
         //   away. `owned_work` assigns a zero-survivor segment to no partition,
         //   so no scan GET ever follows and not one block byte moves.
         //
@@ -2150,9 +2153,10 @@ impl LogSegmentFetcher {
                 .all(|p| matches!(p, Predicate::NumRange { .. }))
     }
 
-    /// The predicate-free plan fast path (#693): read only the footer via the
-    /// ADR-0107 suffix probe and derive the whole-segment plan counts from
-    /// `footer.block_count` without fetching or decoding any block. Returns the
+    /// The predicate-free plan fast path (#693): read the footer via the
+    /// ADR-0107 suffix probe, read and decode the four directories, and derive
+    /// the whole-segment plan counts from `footer.block_count` without fetching
+    /// or decoding any block. Returns the
     /// parsed [`footer::LogFooter`] alongside the counts so the per-partition
     /// subset opens can reuse it and skip re-probing (#693 part 3, deliverable
     /// 2; see [`fetch_object_with_footer`](Self::fetch_object_with_footer)).
@@ -2160,7 +2164,7 @@ impl LogSegmentFetcher {
     /// For a genuinely predicate-free, ts-contained query these are exactly the
     /// counts real pruning would compute: every block survives every stage, so
     /// `blocks_total`/`blocks_after_skip`/`blocks_after_postings`/
-    /// `blocks_after_bloom` all equal the block count, nothing is scanned or
+    /// `blocks_after_bloom` all equal the block count, no block is scanned or
     /// decoded, and neither pruning stage degrades. `footer.block_count` equals
     /// the read-time `ScanStats.blocks_total` (`skip.l0.len()`) on every
     /// well-formed object: both are stamped from the writer's one-entry-per-block
@@ -2362,15 +2366,9 @@ impl LogSegmentFetcher {
     /// returned [`LogSegmentScan`] drains only the named subset of the
     /// segment's surviving blocks.
     ///
-    /// `indices` are whole-object block indices (ADR-2414 decision A1), the
-    /// partition's share of the segment's row groups as
-    /// `ravel_sql::logs_scan::owned_work` deals them, not ordinal positions
-    /// into a survivor list: a row group is dealt whole across partitions, so
-    /// a partition's raw block indices are a subset of the PLAN phase's own
-    /// survivor list (pruning's output), not positions into a pruning result
-    /// this open computes fresh. The returned scan's whole-segment stats totals
-    /// are reported by [`plan_segment`](Self::plan_segment) instead, to keep
-    /// one segment's totals from being counted once per partition (see
+    /// The returned scan's whole-segment stats totals are reported by
+    /// [`plan_segment`](Self::plan_segment) instead, to keep one segment's
+    /// totals from being counted once per partition (see
     /// `ravel_sql::logs_scan`).
     ///
     /// `footer`, when `Some`, is the [`footer::LogFooter`] a prior
@@ -2711,8 +2709,8 @@ impl LogSegmentFetcher {
             // (#883, issue #885 review). `plan_segment` has exactly two
             // footer-carrying branches, and since ADR-2414 decision A1 both
             // read the segment's directories through
-            // `fetch_plan_directories` / `fetch_plan_sections`, which count the
-            // SKIP_IDX and PAGE_DIR probe misses into the plan phase. A footer
+            // `fetch_plan_directories`, which counts the SKIP_IDX and PAGE_DIR
+            // probe misses into the plan phase. A footer
             // carried for this (segment, query) pair therefore always
             // arrives with its tail misses already counted.
             let carried = footer.map(|f| CarriedFooter {
@@ -7931,11 +7929,11 @@ mod plan_fast_path_tests {
     /// block that `return`s `plan_segment_fast(...)`) routes this same query
     /// through the block-range slow path, whose all-block candidate set trips
     /// the coverage crossover into a whole-object GET, so `total_s3_bytes` jumps
-    /// from `tail` to roughly `tail + object_size`. The `read == tail` assertion
-    /// then fails. The `predicate_present_cases_take_the_slow_path` test below
+    /// from `tail + front` to roughly `tail + object_size`. The
+    /// `read == tail + front` assertion then fails. The `predicate_present_cases_take_the_slow_path` test below
     /// exercises exactly that slow path and shows the larger byte count directly.
     #[tokio::test]
-    async fn fast_path_reads_only_footer_probe() {
+    async fn fast_path_reads_the_probe_and_the_front_directory_sections() {
         const N: usize = 6;
         let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
         let bytes = build_object(&records);

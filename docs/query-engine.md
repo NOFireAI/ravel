@@ -426,30 +426,58 @@ pages turn out to cover the object after all. `LogsScanExec` publishes
 
 ## The striped route: directories once per segment, row groups whole
 
-The plan-then-stripe route (every logs statement the whole-segment fast path
-declines, which includes every one whose partition count exceeds its segment
-count) opens a segment once per partition that owns some of its blocks.
-ADR-2414 decision A1 makes the directory decode independent of how many
-partitions open the same segment, and deals each row group to one partition:
+The plan-then-stripe route opens a segment once per partition that owns some of
+its blocks. It runs for every logs statement the whole-segment fast path
+declines, and that fast path refuses on a pending erasure, on any block-level
+predicate, on a segment the window only partly contains, and on fewer relevant
+segments than partitions (`FastPathRejection`). So the plan route, the row-group
+deal and the owned-block ranged plans below apply to every predicated statement,
+and to every partially-windowed one, not only to statements whose partition
+count exceeds the segment count; the whole-segment fast path itself is
+unchanged. ADR-2414 decision A1 makes the directory decode independent of how
+many partitions open the same segment, and deals each row group to one
+partition:
 
-- **Directories decode once per (query, segment).** `plan_segment` reads and
-  decodes STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR for each relevant segment
-  (`SegmentDirectories`) and carries them with the footer to every
-  per-partition subset open. The open builds its reader from them
-  (`RlogReader::from_decoded`), resolves stream-attribute filters and the read
-  gate's job size from them, and its ranged fetch neither decodes any of the
-  four sections nor requests the two front ones (STREAM_DIR and FIELD_DIR).
+- **Directories decode once per (query, segment).** `plan_segment` decodes
+  STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR for each relevant segment
+  (`SegmentDirectories`) and carries them to every per-partition subset open
+  that follows. On the two footer-carrying branches (the predicate-free fast
+  branch and the skip-decidable branch) it also carries the footer; the
+  whole-object fallback branch carries no footer and carries the directories its
+  own open decoded. The subset open builds its reader from the carried
+  directories (`RlogReader::from_decoded`), resolves stream-attribute filters and
+  the read gate's job size from them, and its ranged fetch neither decodes any of
+  the four sections nor requests the two front ones (STREAM_DIR and FIELD_DIR).
+  The four sections are shared by `Arc` between the plan, each reader and each
+  block scan, never copied per open.
   The plan phase charges the decode to `decompressed_bytes` once, where it
   happens; a reader built from carried directories does not seed its scans with
-  it again. For a predicate-free projection, the plan phase's
+  it again. On the footer-carrying branches, which a predicate-free statement
+  takes when its window fully contains the segment, the plan phase's
   `decompressed_bytes` is the four sections' `uncomp_len` and the scan phase's
-  is the projected block pages alone
-  (`striped_projection_decompresses_once_per_segment`). The suffix probe
-  reaches the front sections only when its window covers them, so otherwise the
-  plan phase reads them itself and a predicate-free statement's plan-phase wire
-  bytes are the footer probe plus those two sections
-  (`fast_path_reads_only_footer_probe`), in exchange for the scan phase
-  requesting none of them.
+  is the projected block pages alone, on the ranged route and on the route that
+  reads whole objects
+  (`striped_projection_decompresses_once_per_segment`,
+  `whole_object_route_decompresses_once_per_segment`). Where the suffix probe
+  covers SKIP_IDX and PAGE_DIR but not the two front sections, the plan phase
+  reads those two itself and the plan-phase wire bytes of the predicate-free fast
+  branch are the probe plus them
+  (`fast_path_reads_the_probe_and_the_front_directory_sections`), in exchange
+  for the scan phase requesting none of them.
+- **The carried directories are reserved.** A segment with at least one
+  surviving block keeps its directories resident until the query's plan counts
+  drop, and reserves their decoded length (`SegmentDirectories::decoded_bytes`,
+  the four sections' `uncomp_len`) against the fetch memory budget a carried
+  whole object is reserved against; a refusal fails the statement with the same
+  typed error. A relevant segment with no surviving block keeps nothing and
+  reserves nothing
+  (`carried_directories_reserve_decoded_bytes_for_segments_with_survivors`).
+- **An open must reproduce the plan's survivor list.** A partition's share is a
+  subset of the survivor list the plan phase produced, and a row-ref position is
+  taken from that list. The open prunes again over the same immutable object; if
+  its survivor list differs from the plan's, the open fails with a typed
+  `Corrupted` error naming a survivor mismatch instead of reading the
+  intersection (`an_open_that_prunes_differently_from_the_plan_fails_closed`).
 - **Row groups are dealt whole.** With a read cache wired, `owned_work` numbers
   every surviving row group in segment-then-group order across the whole scan,
   where a row group is the PAGE_DIR group (`group_target_blocks` consecutive
@@ -469,6 +497,26 @@ partitions open the same segment, and deals each row group to one partition:
   (`owned_block_plan_tests`). The coverage crossover therefore weighs the
   partition's own footprint, and an open that owns a small share of a segment
   stays on ranged reads where a whole-object read would otherwise have won.
+- **A partition's runs never cross another partition's row group.** The pages
+  that row groups held by other partitions have in the projected columns are
+  fences: neither the coalescing of holes under the coalesce gap nor the bridging
+  that holds an L0 object to `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs joins two
+  runs across one. Partitions therefore fetch disjoint spans of an object, and
+  the block bytes they move for one object sum to at most the object's BLOCKS
+  section (`partitions_dealt_interleaved_groups_fetch_disjoint_spans`,
+  `interleaved_groups_move_each_groups_span_once`; the fence rule itself is
+  `a_fence_stops_coalescing_and_bridging`). Holes inside a partition's own
+  groups are still bridged.
+  What this costs in requests: a partition issues one GET per run of its own
+  groups' projected chunks. With the default coalesce gap and projected chunks
+  within the gap of each other that is one GET per owned group, so a partition
+  owning `g` groups issues `g` of them. An L0 object's runs are capped at
+  `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` per partition, and a partition issues more
+  than that only when a fence forbids a bridge the cap would otherwise have made;
+  an L1 segment's runs are not capped. Partitions no longer issue identical range
+  sets for the read cache to merge, so an object's chunk requests are the sum
+  over its partitions of their own runs, and the section reads the plan did not
+  carry (the BLOOM section, in the fixtures above) come on top.
 - A row-ref names a block by its position in the segment's surviving-block
   list, not by its whole-object index; the scan resolves the position through
   that list, so late materialization reopens the block the scan decoded.
