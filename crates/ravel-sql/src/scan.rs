@@ -302,7 +302,10 @@ impl Run {
                 in_page,
             } => {
                 let in_page = match in_page {
-                    Some(idx) => idx.get(offset).copied().unwrap_or(u32::MAX),
+                    // Unreachable while `from_soa` keeps the indices parallel
+                    // to the samples; a sample with no index must lose every
+                    // duplicate in its run, as a keyless per-sample one does.
+                    Some(idx) => idx.get(offset).copied().unwrap_or(0),
                     None => u32::try_from(offset).unwrap_or(u32::MAX),
                 };
                 (*created_unix_ns, *writer_epoch, *writer_seq, in_page)
@@ -1111,6 +1114,26 @@ mod tests {
             keys: RunKeys::PerSample(vec![priority(5, 1, 1, 0)]),
         };
         assert_eq!(run.priority_at(1), (i64::MIN, 0, 0, 0));
+        assert!(run.priority_at(1) < run.priority_at(0));
+    }
+
+    /// A run-wide run with no in-page index at an offset ranks that sample
+    /// below every indexed sample of the run, the same direction a missing
+    /// per-sample key fails in.
+    #[test]
+    fn a_missing_run_wide_in_page_index_ranks_least() {
+        let run = Run {
+            series_id: [1; 16],
+            ts: vec![10, 10].into(),
+            values: vec![1.0, 2.0].into(),
+            keys: RunKeys::RunWide {
+                created_unix_ns: 5,
+                writer_epoch: 1,
+                writer_seq: 1,
+                in_page: Some(vec![1]),
+            },
+        };
+        assert_eq!(run.priority_at(1), (5, 1, 1, 0));
         assert!(run.priority_at(1) < run.priority_at(0));
     }
 
