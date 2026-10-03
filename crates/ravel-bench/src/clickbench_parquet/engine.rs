@@ -48,6 +48,16 @@ pub trait SuiteEngine: Send + Sync {
     async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, EngineError>;
 }
 
+/// DataFusion `target_partitions` for both [`InProcessEngine`] and
+/// [`ReferenceEngine`]. The partial/final aggregation split combines one
+/// partial per partition, so this fixes the floating-point accumulation
+/// order the comparator's ULP tolerances and exact totals are measured
+/// under; left to DataFusion's default, the reference would follow the
+/// host's available parallelism. 8 is what `SqlConfig::default()` already
+/// resolves to (`ravel_query::DEFAULT_FETCH_CONCURRENCY`), so pinning it
+/// leaves Ravel's plan the shape its default configuration produces.
+pub const PLAN_PARTITIONS: usize = 8;
+
 /// In-process `SqlExecutor`, wired to a second "lake" `MemoryStore` the way
 /// `ravel-sql`'s own `tests/parquet_ddl.rs` wires one, with the ClickBench
 /// fixture uploaded under a grant this engine mounts (ADR-2040).
@@ -65,14 +75,14 @@ mod in_process {
     use ravel_object_store::{ObjectStoreBackend, PutOptions};
     use ravel_pqtable::clock::FixedClock;
     use ravel_pqtable::grants;
-    use ravel_query::{GetLimiter, LogSegmentFetcher, SegmentFetcher};
+    use ravel_query::{EngineConfig, GetLimiter, LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{
         DEFAULT_PARQUET_METADATA_CACHE_BYTES, DdlOutcome, ExternalStoreMap, ExternalStores,
         ParquetSources, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
     };
     use ravel_types::{TenantHash, TenantId, TimeRange};
 
-    use super::{DdlReceipt, EngineError, RecordBatch, SuiteEngine};
+    use super::{DdlReceipt, EngineError, PLAN_PARTITIONS, RecordBatch, SuiteEngine};
 
     const PROFILE: &str = "lake";
     const BUCKET: &str = "clickbench";
@@ -152,7 +162,13 @@ mod in_process {
                     SegmentFetcher::new(Arc::clone(&ravel_store)),
                     LogSegmentFetcher::new(Arc::clone(&ravel_store)),
                     SpanSegmentFetcher::new(Arc::clone(&ravel_store)),
-                    SqlConfig::default(),
+                    SqlConfig {
+                        engine: EngineConfig {
+                            sql_partition_count: Some(PLAN_PARTITIONS),
+                            ..EngineConfig::default()
+                        },
+                        ..SqlConfig::default()
+                    },
                     1 << 30,
                 )
                 .with_parquet_sources(sources)
@@ -595,10 +611,10 @@ mod reference {
     use datafusion::datasource::listing::{
         ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
     };
-    use datafusion::prelude::SessionContext;
+    use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_datasource_parquet::ParquetFormat;
 
-    use super::{DdlReceipt, EngineError, RecordBatch, SuiteEngine};
+    use super::{DdlReceipt, EngineError, PLAN_PARTITIONS, RecordBatch, SuiteEngine};
 
     /// The checked-in `create.sql` text, embedded at compile time. Its first
     /// statement (`CREATE EXTERNAL TABLE hits_raw ... LOCATION
@@ -633,9 +649,12 @@ mod reference {
         /// directory holding the four fixture parts, or the single combined
         /// file, whichever `location` names -- using
         /// `ParquetFormat::default().with_binary_as_string(true)`, then runs
-        /// `create.sql`'s `CREATE VIEW hits` statement on top of it.
+        /// `create.sql`'s `CREATE VIEW hits` statement on top of it. The
+        /// session runs at [`PLAN_PARTITIONS`] target partitions.
         pub async fn new(location: &Path) -> Result<Self, EngineError> {
-            let ctx = SessionContext::new();
+            let ctx = SessionContext::new_with_config(
+                SessionConfig::new().with_target_partitions(PLAN_PARTITIONS),
+            );
             let format = Arc::new(ParquetFormat::default().with_binary_as_string(true));
             let options = ListingOptions::new(format);
             let url = ListingTableUrl::parse(location.to_string_lossy())
@@ -686,3 +705,21 @@ mod reference {
 
 #[cfg(feature = "sql-latency")]
 pub use reference::ReferenceEngine;
+
+#[cfg(all(test, feature = "sql-latency"))]
+mod tests {
+    use ravel_sql::SqlConfig;
+
+    use super::PLAN_PARTITIONS;
+
+    /// [`PLAN_PARTITIONS`] equals the partition count `SqlConfig::default()`
+    /// resolves to, as its doc states; a change to that default fails here
+    /// rather than leaving the doc stale.
+    #[test]
+    fn plan_partitions_matches_the_default_sql_partition_count() {
+        assert_eq!(
+            SqlConfig::default().engine.sql_partition_count(),
+            PLAN_PARTITIONS
+        );
+    }
+}
