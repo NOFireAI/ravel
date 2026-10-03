@@ -92,8 +92,9 @@ async fn bytes_under(store: &dyn ObjectStoreBackend, prefix: &str) -> u64 {
 ///
 /// Where each expected integer comes from (two L0 `.rlog` inputs, one part):
 ///
-/// - `list` 1: one listing page over the bucket's commit prefix (2 keys, well
-///   under `MemoryStore`'s default page size).
+/// - `list` 2: one listing page over the bucket's commit prefix (2 keys, well
+///   under `MemoryStore`'s default page size) to plan from, and one more for
+///   the pre-publish re-list (ADR-1029, the 2026-10-03 amendment).
 /// - `record_read` 2: one whole-object GET per input commit record.
 /// - `catalog_read` 10: per input, the footer suffix probe plus the four
 ///   whole-read directory sections the RLOG merge needs (STREAM_DIR, FIELD_DIR,
@@ -116,7 +117,7 @@ async fn bytes_under(store: &dyn ObjectStoreBackend, prefix: &str) -> u64 {
 ///   against the expected 2, so the pinned split, not just the total, is what
 ///   holds attribution in place.
 /// - making `rewrite_and_publish` reset unconditionally instead of
-///   `reset_for_run_unless_open`: `list` reads 0 against the expected 1,
+///   `reset_for_run_unless_open`: `list` falls below the expected 2,
 ///   because the rewrite would wipe the LIST its driver had already counted.
 ///
 /// The reconciliation assertion is proved non-vacuous separately, in
@@ -143,7 +144,10 @@ async fn per_phase_counts_match_the_instrumented_oracle_exactly() {
     let after = metrics.snapshot();
     let report = ledger.report();
 
-    assert_eq!(report.list.requests, 1, "one listing page");
+    assert_eq!(
+        report.list.requests, 2,
+        "one listing page to plan from, one for the pre-publish re-list"
+    );
     assert_eq!(report.record_read.requests, 2, "one GET per commit record");
     assert_eq!(
         report.catalog_read.requests, 10,
@@ -155,7 +159,7 @@ async fn per_phase_counts_match_the_instrumented_oracle_exactly() {
     );
     assert_eq!(report.part_put.requests, 1, "one L1 part PUT");
     assert_eq!(report.publish.requests, 1, "the compaction record PUT");
-    assert_eq!(report.total_requests(), 19);
+    assert_eq!(report.total_requests(), 20);
 
     assert_reconciles(&report, &before, &after);
 
@@ -319,7 +323,7 @@ async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
     let after = metrics.snapshot();
     let report = ledger.report();
 
-    assert_eq!(report.list.requests, 1);
+    assert_eq!(report.list.requests, 2);
     assert_eq!(report.record_read.requests, 2);
     assert_eq!(
         report.catalog_read.requests, 11,
@@ -328,7 +332,7 @@ async fn the_bloom_scope_read_is_one_catalog_get_of_the_list_prefix() {
     assert_eq!(report.block_read.requests, 4);
     assert_eq!(report.part_put.requests, 1);
     assert_eq!(report.publish.requests, 1);
-    assert_eq!(report.total_requests(), 20);
+    assert_eq!(report.total_requests(), 21);
     assert_reconciles(&report, &before, &after);
 
     let probe = CompactorConfig::default().footer_probe_bytes;
@@ -452,13 +456,14 @@ async fn wire_bytes_track_the_fixtures_real_object_sizes() {
 }
 
 /// One LIST request per listing PAGE, not per listing. Driving the same
-/// compaction over a store paginating at one key per page turns the fixture's
-/// single `list` request into three (a page per commit record, then the
-/// terminating empty page), and every other phase is unchanged.
+/// compaction over a store paginating at one key per page turns each of the
+/// fixture's two listings (the one it plans from and the pre-publish re-list)
+/// into three requests (a page per commit record, then the terminating empty
+/// page), six in all, and every other phase is unchanged.
 ///
-/// Flip proof (run): moving the `note_metadata` in `read.rs`'s
-/// `list_all_counted` out of the loop to after it reports 1 here against the
-/// expected 3.
+/// Flip proof: moving the `note_metadata` in `read.rs`'s `list_all_counted`
+/// out of the loop to after it counts one request per listing, 2 here
+/// against the expected 6.
 #[tokio::test]
 async fn list_counts_every_page_of_a_paginated_drain() {
     let store = InstrumentedStore::new(MemoryStore::with_page_size(1));
@@ -475,8 +480,8 @@ async fn list_counts_every_page_of_a_paginated_drain() {
     let report = ledger.report();
 
     assert_eq!(
-        report.list.requests, 3,
-        "two single-key pages plus the terminating page"
+        report.list.requests, 6,
+        "per listing, two single-key pages plus the terminating page"
     );
     assert_eq!(report.record_read.requests, 2);
     assert_eq!(report.catalog_read.requests, 10);
@@ -614,16 +619,17 @@ async fn a_conservation_abort_reports_zero_publish_requests() {
 
 /// Run scoping: a second run reports only its own figures. The rerun here is
 /// gated `AlreadyCompacted` after its LIST, so its report is exactly one
-/// listing request and nothing else -- none of the first run's 19 requests
+/// listing request and nothing else -- none of the first run's 20 requests
 /// survive into it.
 ///
-/// Flip proofs, both run against this test:
+/// Flip proofs, both run against this test before the pre-publish re-list
+/// added the first run's second LIST:
 ///
 /// - making `RequestLedger::reset_for_run` clear nothing: the second run's
-///   `list` reads 2 against the expected 1, the accumulation this scoping
+///   `list` reads more than the expected 1, the accumulation this scoping
 ///   exists to prevent.
 /// - removing `compact_bucket`'s `reset_for_run` entirely: the FIRST run's
-///   `list` reads 0 against the expected 1, because `rewrite_and_publish`
+///   `list` reads below the expected 2, because `rewrite_and_publish`
 ///   then finds no open scope and resets over the LIST its driver counted.
 #[tokio::test]
 async fn a_second_run_reports_only_its_own_figures() {
@@ -638,10 +644,10 @@ async fn a_second_run_reports_only_its_own_figures() {
         .expect("first compaction");
     let first = ledger.report();
     assert_eq!(
-        first.list.requests, 1,
-        "the driver's LIST survives the rewrite"
+        first.list.requests, 2,
+        "the driver's LIST survives the rewrite, beside the pre-publish re-list"
     );
-    assert_eq!(first.total_requests(), 19);
+    assert_eq!(first.total_requests(), 20);
 
     let outcome = compact_bucket(&store, &clock, &config, &bucket)
         .await
@@ -716,7 +722,10 @@ async fn the_rseg_and_rspan_paths_report_under_the_same_phases() {
         let after = metrics.snapshot();
         let report = ledger.report();
 
-        assert_eq!(report.list.requests, 1, "{signal}: one listing page");
+        assert_eq!(
+            report.list.requests, 2,
+            "{signal}: one listing page, and one for the pre-publish re-list"
+        );
         assert_eq!(
             report.record_read.requests, 2,
             "{signal}: two commit records"
@@ -858,11 +867,13 @@ async fn a_bad_rlog_zstd_level_is_refused_before_any_store_request() {
 
 /// The control for the refusal test: at the default level each entry point
 /// issues requests over the same fixture. Figures are the oracle's, pinned as
-/// measured on this fixture: compaction's 19 is the headline test's figure,
-/// and the bare rewrite's 18 is that less the LIST its caller already did.
+/// measured on this fixture: compaction's 20 is the headline test's figure,
+/// and the bare rewrite's 18 is that less the two LISTs a compaction issues
+/// around it (the listing it plans from and the pre-publish re-list). The
+/// erasure rewrite's 20 includes its own pre-publish re-list.
 #[tokio::test]
 async fn the_default_level_runs_each_rlog_entry_point_against_the_store() {
-    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([19, 21, 18, 19]) {
+    for (entry, expected) in RLOG_ENTRIES.into_iter().zip([20, 21, 18, 20]) {
         let (result, oracle, _) = run_rlog_entry_at(entry, 9).await;
         assert!(result.is_ok(), "{entry:?}: {result:?}");
         assert_eq!(oracle, expected, "{entry:?}: store requests");

@@ -3633,8 +3633,9 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// than losing the claim, since process start. Backs
     /// `ravel_maintain_claim_renew_failures_total`.
     pub claim_renew_failures: u64,
-    /// Bucket evaluations that did not compact because an unexpired claim held
-    /// the bucket, one per pass while the hold lasts, since process start (the
+    /// Bucket evaluations that did not compact, or erasure rewrites that backed
+    /// off, because a claim held the bucket, one per pass while the hold
+    /// lasts, since process start (the
     /// Consequences list's
     /// `claimed_buckets_skipped`). Backs
     /// `ravel_maintain_claims_skipped_total`.
@@ -4249,8 +4250,9 @@ fn render_maintain_safety_family(
     write_header(
         out,
         "ravel_maintain_claims_skipped_total",
-        "Bucket evaluations in which this process did not compact because of a claim, by \
-         signal, since process start: an unexpired claim held the bucket, another contender \
+        "Bucket evaluations in which this process did not compact, or did not publish an \
+         erasure rewrite, because of a claim, by signal, since process start: an unexpired \
+         claim held the bucket, another contender \
          won the steal, the claim could not be read, or it vanished twice. A held bucket adds \
          one per maintenance pass until its claim expires. Counted from shard passes that \
          complete.",

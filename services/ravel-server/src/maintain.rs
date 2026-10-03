@@ -2218,8 +2218,9 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
     // Advisory-claim participation (ADR-1029 decision 5). The supervisor is one
     // of the two actors the ADR names, so every per-unit tick below claims the
     // buckets it merges, inside the ownership gate that already decides which
-    // units this process looks at. Claims still only cost anything on a bucket
-    // at or above `claim_min_input_bytes` with `coordination` on.
+    // units this process looks at. With `coordination` on, every bucket it
+    // compacts or rewrites for erasure takes the claim, whatever its size
+    // (ADR-1029, the compaction-fence amendment).
     //
     // It is installed only when the caller left the slot empty, and on a clone
     // of this tick's own clock, so the claim decisions read the same time as
@@ -2664,11 +2665,12 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
         // EVERY shard in `scan_shards`, not just the ones this process owns:
         // an erasure request is scoped to a whole (tenant, signal), so its
         // completion condition (below) is only sound when one process has
-        // observed every shard's buckets. Correctness does not depend on the
-        // resulting cross-worker interleaving with another replica's
-        // compaction of a non-owned shard: every publish is `CreateIfAbsent`
-        // and races resolve exactly as compaction's do (ADR-0064 decision 3
-        // point 5 -- the serialization is an efficiency measure).
+        // observed every shard's buckets. Another replica's compaction of a
+        // non-owned shard is fenced against this pass by the bucket's
+        // compaction claim, which both passes take, and by the re-list each
+        // runs before it publishes (ADR-1029, the compaction-fence
+        // amendment); `CreateIfAbsent` alone does not fence them, since the
+        // two records have different keys.
         if worker.owns_unit(live_set, tenant, signal, 0) {
             run_erasure_pass(
                 store,
@@ -3192,6 +3194,11 @@ struct ErasureRewritePass {
     /// Buckets whose live `RewriteRecord` already named every overlapping
     /// request, so nothing was republished (the idempotence guard).
     already_applied: usize,
+    /// Buckets whose rewrite backed off under the bucket claim fence
+    /// (ADR-1029, the 2026-10-03 amendment): `Rewritten` with zero parts and
+    /// an abandoned publish. Counted into `ravel_maintain_claims_skipped_total`,
+    /// as a compaction refused the claim is; `deferred` is set too.
+    claim_backoffs: usize,
     /// Buckets that contribute nothing to any pending request: no pending
     /// request's event-time range overlaps them, or they are tombstoned.
     out_of_scope: usize,
@@ -3287,6 +3294,25 @@ async fn erasure_rewrite_pass(
                 match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
                     .await
                 {
+                    // Zero parts and an abandoned publish is the bucket claim
+                    // fence backing off: another pass held the claim (or took
+                    // it over, or the re-list saw the record set move), so
+                    // nothing was built or published and a later tick retries.
+                    Ok(ErasureRewriteOutcome::Rewritten {
+                        parts: 0,
+                        publish: ravel_maintain::PublishOutcome::Abandoned,
+                    }) => {
+                        pass.claim_backoffs += 1;
+                        pass.deferred = true;
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            "maintenance: erasure rewrite backed off a bucket under its \
+                             compaction claim; nothing published, the request stays pending"
+                        );
+                    }
                     Ok(ErasureRewriteOutcome::Rewritten { parts, publish }) => {
                         pass.rewritten += 1;
                         // An abandoned publish wrote no record, so this bucket
@@ -3536,11 +3562,14 @@ async fn run_erasure_pass(
                 memo,
             )
             .await;
+            safety.claims_skipped[signal_index(signal)]
+                .fetch_add(pass.claim_backoffs as u64, Ordering::Relaxed);
             tracing::info!(
                 tenant = %tenant.to_hex(),
                 signal = ?signal,
                 pending = pending.len(),
                 rewritten = pass.rewritten,
+                claim_backoffs = pass.claim_backoffs,
                 already_applied = pass.already_applied,
                 out_of_scope = pass.out_of_scope,
                 not_sealed = pass.not_sealed,
@@ -3953,7 +3982,8 @@ mod tests {
     }
 
     /// The ADR-1029 acceptance test: two supervisors whose ownership overlaps
-    /// merge one bucket ONCE when coordination is on, and twice when it is off.
+    /// pay for one merge of a bucket when coordination is on, and for two when
+    /// it is off. Either way only one of them publishes it.
     ///
     /// `two_replicas_partition_units_without_double_pay` above cannot show
     /// this. It seeds one below-threshold bucket per shard and asserts only on
@@ -3977,8 +4007,10 @@ mod tests {
     /// Three phases, each asserting on summed `compacted` AND on the request
     /// counters:
     ///
-    /// 1. coordination off: `compacted` sums to 2 and both replicas pay a full
-    ///    four-part merge.
+    /// 1. coordination off: both replicas pay a full four-part merge, but
+    ///    `compacted` sums to 1. B publishes while A is paused, and A's
+    ///    pre-publish re-list (the 2026-10-03 amendment) finds B's record, so A
+    ///    reports the bucket already compacted and publishes nothing.
     /// 2. coordination on, no steal: `compacted` sums to 1, only A's ledger
     ///    shows part PUTs, B reports the bucket `claim_skipped`, and each
     ///    replica's coordinate phase shows exactly the claim requests it made.
@@ -3998,12 +4030,23 @@ mod tests {
     ///   because A pays the whole merge before stopping.
     #[tokio::test]
     async fn two_supervisors_with_overlapping_ownership_merge_once() {
-        // Phase 1, coordination off: the pre-ADR-1029 behaviour.
+        // Phase 1, coordination off: no claim, so both replicas merge. The
+        // pre-publish re-list still stops the second publish: B published
+        // while A was paused mid-merge, A's re-list after its merge sees B's
+        // compaction record, and A reports the bucket already compacted.
         let off = overlapping_supervisor_tick(Coordination::Off, Interleave::Pause).await;
         assert_eq!(
-            off.a.compacted + off.b.compacted,
-            2,
-            "without claims both replicas merge the same bucket"
+            (off.a.compacted, off.b.compacted),
+            (0, 1),
+            "without claims only B, which published first, is credited the merge"
+        );
+        assert_eq!(
+            off.a.already_done, 1,
+            "A's re-list found B's record and reported the bucket already compacted"
+        );
+        assert_eq!(
+            off.a_ledger.publish.requests, 0,
+            "A never reached the publish protocol"
         );
         assert_eq!(
             (
@@ -4497,8 +4540,8 @@ mod tests {
         const SHARDS: u32 = 1;
         // A lease long enough that a `MemoryStore` merge never renews inside
         // it, and short enough that the acquisition jitter (10% of the lease)
-        // costs the test milliseconds. The shipped 300 s default is pinned by
-        // ravel-maintain's `the_cost_gate_decides_whether_a_bucket_is_claimed_at_all`.
+        // costs the test milliseconds. The shipped default is ravel-maintain's
+        // `DEFAULT_CLAIM_LEASE_DURATION` (300 s).
         const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
         // A modern instant: ingest hour 0 is long sealed by it, and it is the
         // store's clock too, so a claim written now is not already expired.
@@ -6530,6 +6573,135 @@ mod tests {
         assert!(
             store.get(&dreq_key, GetRange::Full).await.is_ok(),
             "the request stays pending while the hold is in force"
+        );
+    }
+
+    /// An erasure rewrite refused the bucket claim (ADR-1029, the 2026-10-03
+    /// amendment) reports `Rewritten { parts: 0, publish: Abandoned }`. The
+    /// pass counts that as a back-off on `ravel_maintain_claims_skipped_total`,
+    /// as it counts a compaction refused the claim, logs the back-off, and
+    /// never logs it as a published rewrite. The request stays pending.
+    #[tokio::test]
+    async fn an_erasure_rewrite_refused_the_claim_counts_a_back_off_not_a_publish() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct Messages(Arc<parking_lot::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                #[derive(Default)]
+                struct Visitor(String);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut visitor = Visitor::default();
+                event.record(&mut visitor);
+                self.0.lock().push(visitor.0);
+            }
+        }
+
+        let store = MemoryStore::new();
+        store.set_clock_ms((TEST_ERASURE_NOW_NS / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+        let request_id = Uuid::from_u128(0x2199);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        // Another process holds the bucket's claim, live by the pass's clock.
+        let clock = FixedClock::new(TEST_ERASURE_NOW_NS);
+        let holder = ravel_maintain::claim_guard::ClaimGuard::new(
+            &Bucket::new(tenant, Signal::Metrics, 0, 0),
+            &ClaimParticipant::new(
+                Uuid::from_u128(0xC1A1),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            ),
+            ravel_fleet::claim::ClaimConfig::default(),
+            None,
+        );
+        assert!(matches!(
+            holder.acquire(&store).await.expect("holder acquires"),
+            ravel_maintain::claim_guard::Acquire::Acquired
+        ));
+
+        let compactor = CompactorConfig {
+            coordination: Coordination::On,
+            claim_participant: Some(ClaimParticipant::new(
+                Uuid::from_u128(0xE2A5),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let messages: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let subscriber = tracing_subscriber::registry().with(Messages(messages.clone()));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            run_erasure_pass(
+                &store,
+                &clock,
+                &compactor,
+                &ravel_maintain::NoLeases,
+                &tenant,
+                Signal::Metrics,
+                1,
+                &mut memo,
+                &safety,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            safety.claims_skipped(Signal::Metrics),
+            1,
+            "the back-off is counted as a claim skip"
+        );
+        let messages = messages.lock().clone();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("erasure rewrite backed off a bucket")),
+            "the back-off is logged: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("erasure rewrite published")),
+            "nothing is logged as published: {messages:?}"
+        );
+        assert!(
+            rewrite_records(&store, &tenant).await.is_empty(),
+            "a pass refused the claim publishes no rewrite record"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "a backed-off request must not be marked complete"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the request stays pending for a later pass"
         );
     }
 

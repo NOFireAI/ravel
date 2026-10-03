@@ -19,12 +19,14 @@ use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
+use ravel_fleet::claim::{WorkIdentity, compaction_claim_key};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{
     CompactionInputIdentity, CompactionPart, CompactionRecord, RetentionTombstone,
 };
+use ravel_proto::sys::v1::{ClaimState, CompactionClaim};
 use ravel_segment::VERSION_V7;
 use ravel_types::{Signal, TenantId};
 use uuid::Uuid;
@@ -372,8 +374,8 @@ async fn seed_two_l0_logs(store: &MemoryStore, tenant: &str, shard: u32, hour: u
 /// The CLI `compact-bucket` path publishes a compaction record with no
 /// worker-ownership check and no heartbeat write: `sys/maintain/workers/` (the
 /// worker-set liveness prefix, docs/catalog-and-mvcc.md) stays empty across the
-/// whole run. The advisory compaction claim the path now takes above the cost
-/// gate (#1034) is a different keyspace and says nothing about worker
+/// whole run. The compaction claim the path takes on every bucket (#1034,
+/// #2199) is a different keyspace and says nothing about worker
 /// membership, which is exactly the separation this pins.
 #[tokio::test]
 async fn cli_compact_bucket_publishes_without_holding_ownership() {
@@ -417,22 +419,19 @@ async fn cli_compact_bucket_publishes_without_holding_ownership() {
     );
 }
 
-/// A `compact-bucket` run BELOW the claim cost gate writes no advisory
-/// compaction claim (`sys/maintain/claims/compaction/`, ADR-1029): claiming
-/// with a default `ClaimOptions` is on, but the two-record fixture here is a
-/// few hundred bytes, far under the 64 MiB `claim_min_input_bytes` default, so
-/// the bucket is merged unclaimed and the claim prefix stays empty.
-///
-/// This is the below-gate half of the CLI claim behaviour. The claimed half
-/// lives in `tests/compact_tenant.rs`, which lowers the gate to one byte:
-/// `compact_bucket_skips_a_claimed_bucket_and_no_claim_compacts_it` covers the
-/// same `compact-bucket` entry point with a claim actually taken.
+/// A `compact-bucket` run below the retired claim cost gate still takes the
+/// bucket's compaction claim (`sys/maintain/claims/compaction/`, ADR-1029 and
+/// its 2026-10-03 amendment): the two-record fixture here is a few hundred
+/// bytes, far under the 64 MiB `claim_min_input_bytes` default, which no
+/// longer decides anything, so the run claims the bucket, merges it, and
+/// leaves exactly one claim, completed, under its own process id.
 #[tokio::test]
-async fn cli_compact_bucket_below_the_claim_gate_takes_no_claim() {
+async fn cli_compact_bucket_below_the_retired_claim_gate_takes_the_claim() {
     let store = MemoryStore::new();
     let tenant = "acme";
     seed_two_l0_logs(&store, tenant, 0, 100).await;
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+    let claims = ClaimOptions::fresh();
 
     compact(
         store.clone(),
@@ -444,7 +443,7 @@ async fn cli_compact_bucket_below_the_claim_gate_takes_no_claim() {
         false,
         None,
         None,
-        &ClaimOptions::fresh(),
+        &claims,
     )
     .await
     .expect("compaction runs");
@@ -460,12 +459,32 @@ async fn cli_compact_bucket_below_the_claim_gate_takes_no_claim() {
         "the CLI compaction published a compaction record"
     );
 
-    let claims = list_all(store.as_ref(), "sys/maintain/claims/compaction/")
+    let claim_keys = list_all(store.as_ref(), "sys/maintain/claims/compaction/")
         .await
         .expect("list claims prefix");
-    assert!(
-        claims.is_empty(),
-        "a bucket below the claim cost gate wrote no compaction claim: {claims:?}"
+    let work_id = WorkIdentity::new(tenant_hash, Signal::Logs, 0, 100).work_id();
+    assert_eq!(
+        claim_keys
+            .iter()
+            .map(|meta| meta.key.clone())
+            .collect::<Vec<_>>(),
+        vec![compaction_claim_key(&work_id)],
+        "a bucket below the retired cost gate wrote exactly its own compaction claim"
+    );
+    let got = store
+        .get(&claim_keys[0].key, GetRange::Full)
+        .await
+        .expect("get claim");
+    let claim = CompactionClaim::decode(got.data).expect("decode claim");
+    assert_eq!(
+        claim.owner_process_id,
+        claims.process_id.as_bytes().to_vec(),
+        "the claim is this run's"
+    );
+    assert_eq!(
+        claim.state,
+        ClaimState::Completed as i32,
+        "and the run marked it completed after publishing"
     );
 }
 

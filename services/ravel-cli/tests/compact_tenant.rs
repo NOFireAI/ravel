@@ -2011,21 +2011,39 @@ async fn a_bucket_whose_claim_is_taken_over_mid_merge_is_reported_cancelled() {
     assert_eq!(store.requests_on("put", &key), 2);
 }
 
-/// A bucket below the claim threshold is merged unclaimed: at the default
-/// 64 MiB gate, the fixture's few-hundred-byte buckets issue zero requests
-/// against the claim key space and all four compact.
+/// A bucket below the retired claim threshold is claimed (ADR-1029, the
+/// 2026-10-03 amendment): at the default 64 MiB `claim_min_input_bytes`, which
+/// no longer decides anything, the fixture's few-hundred-byte buckets are each
+/// claimed, compacted, and their claims completed under this invocation's
+/// process id.
 #[tokio::test]
-async fn a_bucket_below_the_claim_threshold_is_merged_unclaimed() {
+async fn a_bucket_below_the_retired_claim_threshold_is_claimed() {
     let (mem, _) = claim_fixture().await;
     let store = CountingStore::new(mem.clone());
+    let claims = ClaimOptions::fresh();
 
-    let (result, text) = run_claim_walk(store.clone(), false, 1, &ClaimOptions::fresh()).await;
+    let (result, text) = run_claim_walk(store.clone(), false, 1, &claims).await;
     let report = result.expect("walk runs");
     assert_eq!(report.compacted, 4, "{text}");
-    assert_eq!(store.claim_requests(), 0, "no claim request below the gate");
+    assert_eq!(report.claim_skipped, 0, "{text}");
+    // Four uncontended buckets pay a create and a completion each.
+    assert_eq!(
+        store.claim_requests(),
+        4 * 2,
+        "every bucket is claimed below the retired gate"
+    );
+    let objects = claim_objects(mem.as_ref()).await;
+    assert_eq!(objects.len(), 4, "one claim per bucket: {objects:?}");
+    for claim in objects.values() {
+        assert_eq!(
+            claim.owner_process_id,
+            claims.process_id.as_bytes().to_vec()
+        );
+        assert_eq!(claim.state, ClaimState::Completed as i32);
+    }
     assert!(
         text.contains("\nclaims: on process_id=") && text.contains(" min_input_bytes=67108864 "),
-        "header names the default gate: {text}"
+        "header still names the configured value: {text}"
     );
 }
 
