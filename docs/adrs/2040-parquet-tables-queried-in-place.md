@@ -115,8 +115,9 @@ t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm            table manifest versi
 
 A **table** is a name matching `[a-z_][a-z0-9_]{0,62}` that is not a
 built-in table (`samples`, `logs`, `spans`, `alerts`, `audit`) and not a
-signal name (`profiles`). Its state is a sequence of immutable manifest
-versions.
+signal name (`profiles`), nor a key segment an IAM template grants after a
+wildcard (see the IAM segment amendment below). Its state is a sequence of
+immutable manifest versions.
 
 **Location grants.** An operator grants each tenant the blob-storage
 locations its tables may read. A grant is a credential profile plus a
@@ -1004,3 +1005,39 @@ a malformed request. D4's test list named 400 for this case; the status is
 
 **Cost.** DDL appears in no `ravel_query_*` usage or cost family (follow-up
 issue #2374).
+
+## Amendment (2026-10-03): table names an IAM template grants after a wildcard are reserved
+
+<!-- amendment-applies: sections="D1. A table is a pinned snapshot of Parquet files where they already are" pointer="IAM segment amendment" -->
+
+D1's name rule reserved the built-in tables and the signal names only. That
+was not enough (issue #2362). A manifest key is
+`t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm`, and IAM's `*` matches
+across `/`, so a template pattern such as `t/*/*/l0/*` or `t/*/u/*` also
+matches the manifests of a table named `l0` or `u`, and an `s3:prefix`
+value such as `t/*/a/` lets a role list the manifests of a table named `a`.
+A table with such a name would put its definitions under grants meant for
+another role's objects.
+
+A table name is therefore also refused when it equals one of these key
+segments, which the shipped templates in `deploy/iam/` grant after a
+wildcard: `l0`, `c`, `l1`, `idem`, `maint`, `admission`, `u`, `catalog`,
+`del`, `a`. `validate_table` in `crates/ravel-pqtable/src/names.rs` refuses
+them as it refuses the built-in names, and its error names the reserved
+word.
+
+No migration is needed: this lands before DDL over HTTP ships in a
+release, so no released binary could create a table with one of these
+names.
+
+The set is kept in step with the templates by a test,
+`every_segment_a_template_grants_after_a_wildcard_is_reserved`, which reads
+every template under `deploy/iam/` at test time, takes each segment that
+follows a `*/` in a `t/` resource or `s3:prefix` value, and keeps those
+whose pattern matches that table's manifest key or a listing prefix that
+selects only that table. The kept set must equal the reserved set exactly,
+so a new template grant fails the test until its segment is reserved.
+Patterns that reach every table, such as `t/*/pq/t/*`, grant the tenant's
+whole table space on purpose and are skipped; segments that follow a
+wildcard but cannot reach a manifest (`prov`, `config`, `snap` under
+`catalog/*/`) are not reserved.
