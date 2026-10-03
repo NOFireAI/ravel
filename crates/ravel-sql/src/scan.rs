@@ -219,12 +219,11 @@ impl Run {
         if let Some(column) = &per_sample_priorities
             && column.len() != timestamps.len()
         {
-            return Err(SqlError::Internal(
+            return Err(SqlError::RunInvariant(
                 ravel_query::QueryError::PrioritySampleCountMismatch {
                     priorities: column.len(),
                     samples: timestamps.len(),
-                }
-                .to_string(),
+                },
             ));
         }
         // A series whose two SoA vectors disagree in length carries no
@@ -308,9 +307,11 @@ impl Run {
                 };
                 (*created_unix_ns, *writer_epoch, *writer_seq, in_page)
             }
+            // Unreachable while `from_soa` keeps the column parallel to the
+            // samples; a sample with no key must lose every duplicate.
             RunKeys::PerSample(column) => column
                 .get(offset)
-                .map_or((i64::MAX, u64::MAX, u64::MAX, u32::MAX), |p| p.as_tuple()),
+                .map_or((i64::MIN, 0, 0, 0), |p| p.as_tuple()),
         }
     }
 
@@ -1014,6 +1015,7 @@ mod tests {
     use ravel_types::SeriesId;
 
     use super::*;
+    use crate::error::{ErrorClass, MSG_UNAVAILABLE};
     use crate::schema::{COL_CREATED_UNIX_NS, COL_IN_PAGE_INDEX, COL_WRITER_EPOCH, COL_WRITER_SEQ};
 
     fn priority(created: i64, epoch: u64, seq: u64, in_page: u32) -> SamplePriority {
@@ -1047,10 +1049,10 @@ mod tests {
     type Priority = (i64, u64, u64, u32);
 
     fn mismatch(priorities: usize, samples: usize) -> String {
-        ravel_query::QueryError::PrioritySampleCountMismatch {
+        SqlError::RunInvariant(ravel_query::QueryError::PrioritySampleCountMismatch {
             priorities,
             samples,
-        }
+        })
         .to_string()
     }
 
@@ -1065,8 +1067,11 @@ mod tests {
             Some(vec![priority(5, 1, 1, 0), priority(5, 1, 2, 0)]),
         );
         match Run::from_soa([1; 16], fs) {
-            Err(SqlError::Internal(msg)) => assert_eq!(msg, mismatch(2, 3)),
-            Err(other) => panic!("expected the count mismatch, got {other}"),
+            Err(err) => {
+                assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+                assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
+                assert_eq!(err.to_string(), mismatch(2, 3));
+            }
             Ok(run) => panic!("short column accepted, run of {}", run.len()),
         }
     }
@@ -1086,10 +1091,27 @@ mod tests {
             ]),
         );
         match Run::from_soa([1; 16], fs) {
-            Err(SqlError::Internal(msg)) => assert_eq!(msg, mismatch(3, 2)),
-            Err(other) => panic!("expected the count mismatch, got {other}"),
+            Err(err) => {
+                assert_eq!(err.class(), ErrorClass::Unavailable, "{err}");
+                assert_eq!(err.client_message(), MSG_UNAVAILABLE, "{err}");
+                assert_eq!(err.to_string(), mismatch(3, 2));
+            }
             Ok(run) => panic!("long column accepted, run of {}", run.len()),
         }
+    }
+
+    /// A per-sample run with no key at an offset ranks that sample below
+    /// every real key, so it loses any duplicate rather than winning it.
+    #[test]
+    fn a_missing_per_sample_key_ranks_least() {
+        let run = Run {
+            series_id: [1; 16],
+            ts: vec![10, 10].into(),
+            values: vec![1.0, 2.0].into(),
+            keys: RunKeys::PerSample(vec![priority(5, 1, 1, 0)]),
+        };
+        assert_eq!(run.priority_at(1), (i64::MIN, 0, 0, 0));
+        assert!(run.priority_at(1) < run.priority_at(0));
     }
 
     /// The provenance a scan batch emits never decreases inside one
