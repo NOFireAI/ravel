@@ -1076,9 +1076,13 @@ the reference.
 The bench exits 0 when the report meets the bar, 1 when it does not, after
 printing each violation, and 2 on a setup error (an unfilled prereg, a bad
 token variable, a location that does not fit the arm, a refused reference,
-an unreadable log, a failed `CREATE`, a concurrency phase that could not
-run, an unwritable `--out`). Past setup it writes the report before judging
-it. A violation is any of:
+an unreadable log, a failed `CREATE`, concurrency arguments the phase
+refuses, an unwritable `--out`). Concurrency arguments are checked before
+the first statement runs, so a refused `--concurrency-tasks` runs nothing.
+Past setup it writes the report before judging it: a concurrency phase that
+fails once started is recorded in the report's `concurrency_error`, the
+report is written with every statement's figures, and the bench exits 1. A
+violation is any of:
 
 - a statement missing from the report, repeated, or not in the suite;
 - a stamp missing from the log or present more than once, or differing from
@@ -1092,7 +1096,8 @@ it. A violation is any of:
   `rlog_hot_ceiling_s`;
 - in the concurrency phase, queries per second under the floor,
   `unregistered_error_ratio` over the ceiling, or an error from a statement
-  not in `failures`.
+  not in `failures`;
+- a concurrency phase that failed after it started (`concurrency_error`).
 
 A pre-registered failure that answered is printed as a finding, not a
 violation. The 1.25x bar against the *measured* arm B is not mechanical:

@@ -28,9 +28,10 @@ use ravel_bench::clickbench_parquet::concurrency::{
 };
 use ravel_bench::clickbench_parquet::engine::{HttpEngine, SuiteEngine};
 use ravel_bench::clickbench_parquet::report::{
-    self, Arm, ClickBenchParquetReport, Provenance, StatementFigures, Totals,
+    self, Arm, ClickBenchParquetReport, Prereg, Provenance, ServerSetting, StatementFigures,
+    Totals, Violation,
 };
-use ravel_bench::clickbench_parquet::suite::{self, STATEMENT_COUNT};
+use ravel_bench::clickbench_parquet::suite::{self, STATEMENT_COUNT, Suite};
 
 /// The datafusion-cli release D7 names for the reference outputs; the
 /// `VERSION` file `make-reference.sh` writes must hold exactly this.
@@ -137,9 +138,21 @@ fn check_reference_dir(dir: &Path) -> Result<String, String> {
     Ok(version)
 }
 
-async fn run(args: Args) -> Result<bool, String> {
+/// What setup established before anything reaches the server.
+struct Setup {
+    prereg: Prereg,
+    token: String,
+    reference_version: String,
+    server_settings: Vec<ServerSetting>,
+    suite: Suite,
+}
+
+/// Every refusal that needs no server, the concurrency phase's arguments
+/// included, so an invalid argument runs nothing. `env` reads the token's
+/// environment variable.
+fn prepare(args: &Args, env: impl Fn(&str) -> Option<String>) -> Result<Setup, String> {
     let prereg = report::load_prereg(&args.prereg).map_err(|e| e.to_string())?;
-    let token = read_token(&args.token_env, |name| std::env::var(name).ok())?;
+    let token = read_token(&args.token_env, env)?;
     args.arm.check_location(&args.location)?;
     if args.location.contains('\'') {
         return Err(format!(
@@ -152,8 +165,60 @@ async fn run(args: Args) -> Result<bool, String> {
         .map_err(|e| format!("cannot read {}: {e}", args.server_log.display()))?;
     let server_settings = report::parse_server_settings(&server_log);
     let suite = suite::load_default().map_err(|e| e.to_string())?;
+    if args.concurrency_seconds > 0 {
+        concurrency::check_shape(
+            args.concurrency_tasks,
+            suite.statements.len(),
+            Duration::from_secs(args.concurrency_seconds),
+        )
+        .map_err(|e| format!("--concurrency-tasks {}: {e}", args.concurrency_tasks))?;
+    }
+    Ok(Setup {
+        prereg,
+        token,
+        reference_version,
+        server_settings,
+        suite,
+    })
+}
 
-    let engine = HttpEngine::new(&args.server, &token);
+async fn run(args: Args) -> Result<Vec<Violation>, String> {
+    let setup = prepare(&args, |name| std::env::var(name).ok())?;
+    let engine = HttpEngine::new(&args.server, &setup.token);
+    let server = args.server.clone();
+    let token = setup.token.clone();
+    let phase_engine = move || Arc::new(HttpEngine::new(&server, &token)) as Arc<dyn SuiteEngine>;
+    measure(
+        &args,
+        setup,
+        &engine,
+        phase_engine,
+        Arc::new(MonotonicClock::new()),
+    )
+    .await
+}
+
+/// Mounts the table, runs the timed statements and the concurrency phase,
+/// writes the report and judges it. An error before the first timed
+/// statement is a setup error; past it, the report is written before it is
+/// judged, and the D7 violations are returned. A concurrency phase that
+/// fails once started is recorded in the report's `concurrency_error`, not
+/// returned as an error. `phase_engine` makes one engine per concurrency
+/// task.
+async fn measure(
+    args: &Args,
+    setup: Setup,
+    engine: &dyn SuiteEngine,
+    phase_engine: impl Fn() -> Arc<dyn SuiteEngine>,
+    clock: Arc<dyn Clock>,
+) -> Result<Vec<Violation>, String> {
+    let Setup {
+        prereg,
+        token: _,
+        reference_version,
+        server_settings,
+        suite,
+    } = setup;
     engine
         .ddl("DROP TABLE IF EXISTS hits")
         .await
@@ -220,35 +285,41 @@ async fn run(args: Args) -> Result<bool, String> {
         statements.push(figures);
     }
 
-    let concurrency = if args.concurrency_seconds == 0 {
-        None
+    let (concurrency, concurrency_error) = if args.concurrency_seconds == 0 {
+        (None, None)
     } else {
-        let clock: Arc<dyn Clock> = Arc::new(MonotonicClock::new());
         let tasks = (0..args.concurrency_tasks)
             .map(|_| PhaseTask {
-                engine: Arc::new(HttpEngine::new(&args.server, &token)) as Arc<dyn SuiteEngine>,
+                engine: phase_engine(),
                 clock: Arc::clone(&clock),
             })
             .collect();
-        let figures = concurrency::run(
+        match concurrency::run(
             tasks,
             &suite.statements,
             Duration::from_secs(args.concurrency_seconds),
             &prereg.failures,
         )
         .await
-        .map_err(|e| e.to_string())?;
-        eprintln!(
-            "concurrency: {} tasks, {} completed, {} errors, qps={}, error_ratio={}, \
-             unregistered_error_ratio={}",
-            figures.tasks,
-            figures.queries_completed,
-            figures.errors,
-            figures.qps,
-            figures.error_ratio,
-            figures.unregistered_error_ratio
-        );
-        Some(figures)
+        {
+            Ok(figures) => {
+                eprintln!(
+                    "concurrency: {} tasks, {} completed, {} errors, qps={}, error_ratio={}, \
+                     unregistered_error_ratio={}",
+                    figures.tasks,
+                    figures.queries_completed,
+                    figures.errors,
+                    figures.qps,
+                    figures.error_ratio,
+                    figures.unregistered_error_ratio
+                );
+                (Some(figures), None)
+            }
+            Err(error) => {
+                eprintln!("concurrency: phase failed: {error}");
+                (None, Some(error.to_string()))
+            }
+        }
     };
 
     let registered_failures_answered = report::registered_failures_answered(&statements, &prereg);
@@ -272,6 +343,7 @@ async fn run(args: Args) -> Result<bool, String> {
         statements,
         registered_failures_answered,
         concurrency,
+        concurrency_error,
     };
     let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
     std::fs::write(&args.out, json)
@@ -291,14 +363,14 @@ async fn run(args: Args) -> Result<bool, String> {
     match report::check(&report, &prereg) {
         Ok(()) => {
             eprintln!("D7 check: no violations");
-            Ok(true)
+            Ok(Vec::new())
         }
         Err(violations) => {
             for violation in &violations {
                 eprintln!("violation: {violation}");
             }
             eprintln!("D7 check: {} violations", violations.len());
-            Ok(false)
+            Ok(violations)
         }
     }
 }
@@ -307,8 +379,8 @@ async fn run(args: Args) -> Result<bool, String> {
 async fn main() -> ExitCode {
     let args = Args::parse();
     match run(args).await {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::from(1),
+        Ok(violations) if violations.is_empty() => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::from(1),
         Err(error) => {
             eprintln!("clickbench_parquet_bench: {error}");
             ExitCode::from(2)
@@ -320,6 +392,8 @@ async fn main() -> ExitCode {
 #[allow(clippy::expect_used)]
 mod tests {
     use clap::error::ErrorKind;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use ravel_bench::clickbench_parquet::engine::{DdlReceipt, EngineError};
 
     use super::*;
 
@@ -388,6 +462,125 @@ mod tests {
         );
         assert!(read_token("RAVEL_TOKEN", |_| None).is_err());
         assert!(read_token("RAVEL_TOKEN", |_| Some(String::new())).is_err());
+    }
+
+    /// Answers every statement with no rows and mounts arm A's 100 files;
+    /// with `panics`, panics on every query instead.
+    struct StubEngine {
+        panics: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl SuiteEngine for StubEngine {
+        async fn ddl(&self, _sql: &str) -> Result<DdlReceipt, EngineError> {
+            Ok(DdlReceipt {
+                outcome: "ok".to_string(),
+                files: Some(100),
+            })
+        }
+
+        async fn query(&self, _sql: &str) -> Result<Vec<RecordBatch>, EngineError> {
+            assert!(!self.panics, "stub concurrency task panics");
+            Ok(Vec::new())
+        }
+    }
+
+    /// A reference directory datafusion-cli 54.1.0 could have written, a
+    /// filled prereg and an empty server log under `dir`, with `args`
+    /// pointing at them.
+    fn stage_inputs(dir: &Path, args: &mut Args) {
+        let reference = dir.join("ref");
+        std::fs::create_dir(&reference).expect("mkdir");
+        std::fs::write(reference.join("VERSION"), "datafusion-cli 54.1.0\n").expect("write");
+        for n in 1..=43 {
+            std::fs::write(reference_path(&reference, n), "[]").expect("write");
+        }
+        let prereg = dir.join("prereg.toml");
+        std::fs::write(
+            &prereg,
+            "memory_cap_bytes = 1\narm_b_hot_s = 100.0\narm_b_cold_s = 100.0\n\
+             failures = [\"q19\", \"q29\", \"q33\", \"q34\", \"q35\"]\n\
+             rlog_hot_ceiling_s = 101.7\nconcurrency_qps_floor = 0.400\n\
+             concurrency_error_ratio_ceiling = 0.101\n",
+        )
+        .expect("write");
+        let server_log = dir.join("server.log");
+        std::fs::write(&server_log, "").expect("write");
+        args.reference = reference;
+        args.prereg = prereg;
+        args.server_log = server_log;
+        args.out = dir.join("report.json");
+    }
+
+    fn token_env(name: &str) -> Option<String> {
+        (name == "RAVEL_TOKEN").then(|| "devtoken".to_string())
+    }
+
+    #[test]
+    fn invalid_concurrency_tasks_are_a_setup_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = parse(
+            &["--concurrency-seconds", "1", "--concurrency-tasks", "0"],
+            None,
+        )
+        .expect("parses");
+        stage_inputs(dir.path(), &mut args);
+        let error = prepare(&args, token_env)
+            .err()
+            .expect("zero tasks refused at setup");
+        assert_eq!(
+            error,
+            "--concurrency-tasks 0: the concurrency phase needs at least one task"
+        );
+        args.concurrency_tasks = 1;
+        assert!(prepare(&args, token_env).is_ok());
+        args.concurrency_tasks = 0;
+        args.concurrency_seconds = 0;
+        assert!(
+            prepare(&args, token_env).is_ok(),
+            "no phase, nothing to refuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_concurrency_phase_still_writes_the_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = parse(&["--concurrency-seconds", "60"], None).expect("parses");
+        stage_inputs(dir.path(), &mut args);
+        let setup = prepare(&args, token_env).expect("setup passes");
+
+        let violations = measure(
+            &args,
+            setup,
+            &StubEngine { panics: false },
+            || Arc::new(StubEngine { panics: true }) as Arc<dyn SuiteEngine>,
+            Arc::new(MonotonicClock::new()),
+        )
+        .await
+        .expect("past setup the run returns its violations");
+
+        let failed: Vec<&Violation> = violations
+            .iter()
+            .filter(|v| matches!(v, Violation::ConcurrencyPhaseFailed { .. }))
+            .collect();
+        assert_eq!(failed.len(), 1, "{violations:#?}");
+        assert!(failed[0].to_string().contains("panicked"), "{}", failed[0]);
+
+        let text = std::fs::read_to_string(&args.out).expect("the report was written");
+        let report: ClickBenchParquetReport = serde_json::from_str(&text).expect("report parses");
+        let numbers: Vec<u32> = report.statements.iter().map(|s| s.number).collect();
+        assert_eq!(numbers, (1..=43).collect::<Vec<u32>>());
+        for statement in &report.statements {
+            assert_eq!(statement.error, None, "q{}", statement.number);
+            assert!(statement.cold_s.is_some(), "q{}", statement.number);
+            assert!(statement.hot_s.is_some(), "q{}", statement.number);
+        }
+        assert_eq!(report.concurrency, None);
+        let recorded = report
+            .concurrency_error
+            .as_deref()
+            .expect("the phase failure is recorded");
+        assert!(recorded.contains("panicked"), "{recorded}");
     }
 
     #[test]

@@ -380,8 +380,12 @@ pub struct ClickBenchParquetReport {
     /// Pre-registered failures that answered instead. Not a violation, but a
     /// finding to post with the report.
     pub registered_failures_answered: Vec<u32>,
-    /// `None` when no concurrency phase ran (`--concurrency-seconds 0`).
+    /// `None` when no concurrency phase ran (`--concurrency-seconds 0`) or
+    /// when it failed after it started.
     pub concurrency: Option<ConcurrencyFigures>,
+    /// Why the concurrency phase failed after it started (a task panicked
+    /// or stopped abnormally); `None` when it completed or did not run.
+    pub concurrency_error: Option<String>,
 }
 
 /// Statements in `prereg.failures` that the report shows answering.
@@ -663,6 +667,8 @@ pub enum Violation {
     },
     #[error("q{number} errored {errors} times in the concurrency phase and is not pre-registered")]
     ConcurrencyUnregisteredError { number: u32, errors: u64 },
+    #[error("the concurrency phase failed after it started: {error}")]
+    ConcurrencyPhaseFailed { error: String },
     #[error("the declared verdicts could not be derived from suite.toml: {error}")]
     DeclaredVerdictsUnavailable { error: String },
 }
@@ -846,6 +852,11 @@ fn check_against(
                 });
             }
         }
+    }
+    if let Some(error) = &report.concurrency_error {
+        violations.push(Violation::ConcurrencyPhaseFailed {
+            error: error.clone(),
+        });
     }
 
     if violations.is_empty() {
@@ -1132,6 +1143,7 @@ mod tests {
                     .collect(),
                 errored_statements: vec![33],
             }),
+            concurrency_error: None,
         }
     }
 
@@ -1504,6 +1516,19 @@ mod tests {
         let mut report = clean_report();
         report.concurrency = None;
         assert_eq!(check(&report, &prereg()), Ok(()));
+    }
+
+    #[test]
+    fn a_concurrency_phase_that_failed_after_it_started_is_named() {
+        let mut report = clean_report();
+        report.concurrency = None;
+        report.concurrency_error = Some("task 3 panicked".to_string());
+        assert_eq!(
+            only_violation(&report),
+            Violation::ConcurrencyPhaseFailed {
+                error: "task 3 panicked".to_string()
+            }
+        );
     }
 
     #[test]
