@@ -27,10 +27,15 @@
 //! `EXPLAIN ANALYZE` and a test can see which one ran instead of inferring it
 //! from output that is identical by construction.
 //!
-//! The three provenance columns `created_unix_ns`, `writer_epoch`, and
-//! `writer_seq` are constant within a run, so they are filled by run length.
-//! `in_page_index` is per sample: the offset within the run, which is the
-//! sample's position in the fetcher's on-disk order.
+//! The four provenance columns are each sample's ADR-0010 §5 dedup key, the
+//! same key the PromQL merge resolves duplicates by. For an ordinary run the
+//! three columns `created_unix_ns`, `writer_epoch`, and `writer_seq` are
+//! constant within the run, so they are filled by run length, and
+//! `in_page_index` is the sample's position in the fetcher's on-disk order.
+//! A run that merged several writes' samples carries an explicit per-sample
+//! key column instead (`FetchedSeriesSoa::per_sample_priorities`, ADR-0092
+//! decision 1), because merging destroys what the run-wide triple and position
+//! said; all four columns are read from it per row.
 //!
 //! Pushdown: label/series matchers are threaded into `fetch_soa` so the fetcher prunes
 //! series (and their page GETs) against SERIES_TABLE. A `series_id` allow-set
@@ -146,127 +151,205 @@ const BATCH_ROWS: usize = 8192;
 /// writer_seq, in_page_index)`.
 type SortKey = ([u8; 16], i64, i64, u64, u64, u32);
 
+/// Where one run's per-sample dedup keys come from, the same two shapes the
+/// PromQL merge distinguishes: a run-wide triple plus the sample's on-disk
+/// position, or an explicit per-sample column for a run that merged several
+/// writes' samples (ADR-0092 decision 1), where position no longer
+/// reconstructs the key.
+enum RunKeys {
+    RunWide {
+        created_unix_ns: i64,
+        writer_epoch: u64,
+        writer_seq: u64,
+        /// Per-sample in-page index, when it is not the offset itself. `None`
+        /// -- every run a segment in on-disk order produces -- means offset
+        /// `i` has in-page index `i`. `Some` carries the original positions of
+        /// a run whose timestamps did not arrive key-ascending and had to be
+        /// reordered here.
+        in_page: Option<Vec<u32>>,
+    },
+    /// `FetchedSeriesSoa::per_sample_priorities`, reordered with the run so
+    /// it stays parallel to `ts`/`values`.
+    PerSample(Vec<SamplePriority>),
+}
+
 /// One fetched series' samples from one segment, kept in the SoA form the
 /// fetcher decoded them into: one merge run, ordered by [`SortKey`].
 ///
-/// `series_id`, `created_unix_ns`, `writer_epoch` and `writer_seq` are
-/// constant across the run, so the key's ordering within a run is decided by
-/// `ts` then in-page index alone.
+/// `series_id` is constant across the run. A run-wide run's provenance is
+/// constant too, so its ordering is decided by `ts` then in-page index alone;
+/// a per-sample run orders equal timestamps by each sample's own key.
 struct Run {
     series_id: [u8; 16],
     /// Sample timestamps, key-ascending; `values[i]` is `ts[i]`'s sample.
     /// Adopted from `FetchedSeriesSoa::timestamps` without a copy.
     ts: ScalarBuffer<i64>,
     values: ScalarBuffer<f64>,
-    created_unix_ns: i64,
-    writer_epoch: u64,
-    writer_seq: u64,
-    /// Per-sample in-page index, when it is not the offset itself. `None` --
-    /// every run a segment in on-disk order produces -- means offset `i` has
-    /// in-page index `i`. `Some` carries the original positions of a run whose
-    /// timestamps did not arrive key-ascending and had to be reordered here.
-    in_page: Option<Vec<u32>>,
+    keys: RunKeys,
 }
 
 impl Run {
     /// Build a run from one fetched series, reordering only if the fetched
-    /// timestamps are not already key-ascending.
+    /// samples are not already key-ascending.
     ///
     /// A segment stores a run's samples in ascending ts order with ties in
     /// insertion order (docs/segment-format.md, "Sample order within a
-    /// page"), which is exactly [`SortKey`]'s order inside a run, so the
-    /// common path moves the fetched vectors into buffers untouched. The
+    /// page"), which is exactly [`SortKey`]'s order inside a run-wide run, so
+    /// the common path moves the fetched vectors into buffers untouched. The
     /// fetcher can still concatenate several runs of one series from one L0
-    /// object into a single SoA, and that concatenation is not ordered; the
-    /// merge and the scan's declared ordering both require a sorted run, so
-    /// such a run is stable-sorted here and keeps its original positions as
-    /// in-page indices.
-    fn from_soa(series_id: [u8; 16], fs: FetchedSeriesSoa) -> Run {
+    /// object into a single SoA, and that concatenation is not ordered; a
+    /// run-merged run's per-sample keys need not ascend within a timestamp
+    /// either. The merge and the scan's declared ordering both require a
+    /// sorted run, so such a run is stable-sorted here: a run-wide run keeps
+    /// its original positions as in-page indices, a per-sample run carries
+    /// its key column along.
+    ///
+    /// A per-sample column that is not parallel to the run's timestamps is
+    /// rejected, as the PromQL merge rejects it, rather than truncated.
+    fn from_soa(series_id: [u8; 16], fs: FetchedSeriesSoa) -> Result<Run, SqlError> {
         let FetchedSeriesSoa {
             mut timestamps,
             mut values,
             created_unix_ns,
             writer_epoch,
             writer_seq,
+            per_sample_priorities,
             ..
         } = fs;
+        if let Some(column) = &per_sample_priorities
+            && column.len() != timestamps.len()
+        {
+            return Err(SqlError::Internal(
+                ravel_query::QueryError::PrioritySampleCountMismatch {
+                    priorities: column.len(),
+                    samples: timestamps.len(),
+                }
+                .to_string(),
+            ));
+        }
         // A series whose two SoA vectors disagree in length carries no
         // sample past the shorter of the two, the same truncation the
         // zip over them did before this path was columnar.
         let n = timestamps.len().min(values.len());
         timestamps.truncate(n);
         values.truncate(n);
-        if timestamps.windows(2).all(|w| w[0] <= w[1]) {
-            return Run {
+
+        let Some(mut column) = per_sample_priorities else {
+            if timestamps.windows(2).all(|w| w[0] <= w[1]) {
+                return Ok(Run {
+                    series_id,
+                    ts: timestamps.into(),
+                    values: values.into(),
+                    keys: RunKeys::RunWide {
+                        created_unix_ns,
+                        writer_epoch,
+                        writer_seq,
+                        in_page: None,
+                    },
+                });
+            }
+            let mut order: Vec<usize> = (0..timestamps.len()).collect();
+            order.sort_by_key(|&i| timestamps[i]);
+            return Ok(Run {
+                series_id,
+                ts: gather(&timestamps, &order).into(),
+                values: gather(&values, &order).into(),
+                keys: RunKeys::RunWide {
+                    created_unix_ns,
+                    writer_epoch,
+                    writer_seq,
+                    in_page: Some(
+                        order
+                            .iter()
+                            .map(|&i| u32::try_from(i).unwrap_or(u32::MAX))
+                            .collect(),
+                    ),
+                },
+            });
+        };
+        column.truncate(n);
+        let key = |i: usize| (timestamps[i], column[i].as_tuple());
+        if (1..n).all(|i| key(i - 1) <= key(i)) {
+            return Ok(Run {
                 series_id,
                 ts: timestamps.into(),
                 values: values.into(),
-                created_unix_ns,
-                writer_epoch,
-                writer_seq,
-                in_page: None,
-            };
+                keys: RunKeys::PerSample(column),
+            });
         }
-        let mut order: Vec<usize> = (0..timestamps.len()).collect();
-        order.sort_by_key(|&i| timestamps[i]);
-        Run {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by_key(|&i| key(i));
+        Ok(Run {
             series_id,
-            ts: order
-                .iter()
-                .map(|&i| timestamps[i])
-                .collect::<Vec<_>>()
-                .into(),
-            values: order.iter().map(|&i| values[i]).collect::<Vec<_>>().into(),
-            created_unix_ns,
-            writer_epoch,
-            writer_seq,
-            in_page: Some(
-                order
-                    .iter()
-                    .map(|&i| u32::try_from(i).unwrap_or(u32::MAX))
-                    .collect(),
-            ),
-        }
+            ts: gather(&timestamps, &order).into(),
+            values: gather(&values, &order).into(),
+            keys: RunKeys::PerSample(gather(&column, &order)),
+        })
     }
 
     fn len(&self) -> usize {
         self.ts.len()
     }
 
-    /// The in-page index of the sample at `offset`, which is its position in
-    /// the fetcher's on-disk order.
-    fn in_page_at(&self, offset: usize) -> u32 {
-        match &self.in_page {
-            Some(idx) => idx.get(offset).copied().unwrap_or(u32::MAX),
-            None => u32::try_from(offset).unwrap_or(u32::MAX),
+    /// The `(created_unix_ns, writer_epoch, writer_seq, in_page_index)` dedup
+    /// key of the sample at `offset`. A run-wide run's in-page index is the
+    /// sample's position in the fetcher's on-disk order.
+    fn priority_at(&self, offset: usize) -> (i64, u64, u64, u32) {
+        match &self.keys {
+            RunKeys::RunWide {
+                created_unix_ns,
+                writer_epoch,
+                writer_seq,
+                in_page,
+            } => {
+                let in_page = match in_page {
+                    Some(idx) => idx.get(offset).copied().unwrap_or(u32::MAX),
+                    None => u32::try_from(offset).unwrap_or(u32::MAX),
+                };
+                (*created_unix_ns, *writer_epoch, *writer_seq, in_page)
+            }
+            RunKeys::PerSample(column) => column
+                .get(offset)
+                .map_or((i64::MAX, u64::MAX, u64::MAX, u32::MAX), |p| p.as_tuple()),
         }
     }
 
     /// The full sort key of the sample at `offset`. Callers hold an offset
     /// below `len()`.
     fn key_at(&self, offset: usize) -> SortKey {
+        let (created, epoch, seq, in_page) = self.priority_at(offset);
         (
             self.series_id,
             self.ts[offset],
-            self.created_unix_ns,
-            self.writer_epoch,
-            self.writer_seq,
-            self.in_page_at(offset),
+            created,
+            epoch,
+            seq,
+            in_page,
         )
     }
 
     /// Bytes this run holds: the two adopted sample buffers, plus the
-    /// explicit in-page indices when it has them.
+    /// explicit in-page indices or per-sample key column when it has them.
     fn soa_bytes(&self) -> usize {
-        let indices = self.in_page.as_ref().map_or(0, |idx| {
-            idx.len().saturating_mul(std::mem::size_of::<u32>())
-        });
+        let keys = match &self.keys {
+            RunKeys::RunWide { in_page, .. } => in_page.as_ref().map_or(0, |idx| {
+                idx.len().saturating_mul(std::mem::size_of::<u32>())
+            }),
+            RunKeys::PerSample(column) => column
+                .len()
+                .saturating_mul(std::mem::size_of::<SamplePriority>()),
+        };
         self.ts
             .len()
             .saturating_mul(std::mem::size_of::<i64>())
             .saturating_add(self.values.len().saturating_mul(std::mem::size_of::<f64>()))
-            .saturating_add(indices)
+            .saturating_add(keys)
     }
+}
+
+/// `src` permuted by `order`.
+fn gather<T: Copy>(src: &[T], order: &[usize]) -> Vec<T> {
+    order.iter().map(|&i| src[i]).collect()
 }
 
 /// Segment scan producing per-partition `(series_id, ts, provenance)`-sorted
@@ -621,14 +704,8 @@ async fn prepare_partition(
                 .into());
             }
             labels.entry(sid).or_insert_with(|| fs.labels.clone());
-            let priority_bytes = fs.per_sample_priorities.as_ref().map_or(0, |p| {
-                p.len()
-                    .saturating_mul(std::mem::size_of::<SamplePriority>())
-            });
-            let run = Run::from_soa(sid, fs);
-            segment_bytes = segment_bytes
-                .saturating_add(run.soa_bytes())
-                .saturating_add(priority_bytes);
+            let run = Run::from_soa(sid, fs)?;
+            segment_bytes = segment_bytes.saturating_add(run.soa_bytes());
             if run.len() > 0 {
                 runs.push(run);
             }
@@ -798,9 +875,10 @@ impl RecordBatchStream for ScanStream {
 /// reservation charge; see the module doc).
 ///
 /// `ts` and `value` are slices of one run's buffers when the batch is
-/// contiguous inside that run, and gathered copies otherwise. The three
-/// run-constant provenance columns are filled by run length either way;
-/// `in_page_index`, `series_id`, and the labels dictionary key are per row.
+/// contiguous inside that run, and gathered copies otherwise. A run-wide run's
+/// three constant provenance columns are filled by run length either way; a
+/// per-sample run's are read per row from its key column. `in_page_index`,
+/// `series_id`, and the labels dictionary key are per row.
 fn build_batch(
     merger: &Merger,
     schema: SchemaRef,
@@ -854,8 +932,8 @@ fn build_batch(
     let mut last_series: Option<[u8; 16]> = None;
     let mut key: i32 = -1;
 
-    // Walk the batch one run-length at a time: the provenance a run stamps on
-    // every one of its samples is written per run, never per row.
+    // Walk the batch one run-length at a time: the provenance a run-wide run
+    // stamps on every one of its samples is written per run, never per row.
     let mut i = 0;
     while i < rows {
         let (run, _) = cursors[i];
@@ -865,11 +943,29 @@ fn build_batch(
         }
         let len = end - i;
         let r = &merger.runs[run];
-        created.extend(std::iter::repeat_n(r.created_unix_ns, len));
-        epoch.extend(std::iter::repeat_n(r.writer_epoch, len));
-        seq.extend(std::iter::repeat_n(r.writer_seq, len));
-        for &(_, offset) in &cursors[i..end] {
-            in_page.push(r.in_page_at(offset));
+        match &r.keys {
+            RunKeys::RunWide {
+                created_unix_ns,
+                writer_epoch,
+                writer_seq,
+                ..
+            } => {
+                created.extend(std::iter::repeat_n(*created_unix_ns, len));
+                epoch.extend(std::iter::repeat_n(*writer_epoch, len));
+                seq.extend(std::iter::repeat_n(*writer_seq, len));
+                for &(_, offset) in &cursors[i..end] {
+                    in_page.push(r.priority_at(offset).3);
+                }
+            }
+            RunKeys::PerSample(_) => {
+                for &(_, offset) in &cursors[i..end] {
+                    let (c, e, s, p) = r.priority_at(offset);
+                    created.push(c);
+                    epoch.push(e);
+                    seq.push(s);
+                    in_page.push(p);
+                }
+            }
         }
         if last_series != Some(r.series_id) {
             distinct.push(merger.labels.get(&r.series_id).cloned().unwrap_or_default());
