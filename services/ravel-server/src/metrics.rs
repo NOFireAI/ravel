@@ -5219,79 +5219,91 @@ fn render_cache_family(
     );
 }
 
-/// Live (not cumulative) resident bytes and entry count for the ADR-0046
-/// fetcher read cache's tiers, plus each cache's resolved startup byte
-/// ceiling, so an operator can compare held-vs-budgeted (#1170) without
-/// deriving it from a cumulative counter that cannot answer "what is
-/// resident right now" -- [`render_cache_family`] above renders that other,
-/// cumulative half of the picture (hits, misses, evictions).
+/// Live (not cumulative) resident bytes and entry count for both ADR-0046
+/// read caches' tiers -- the query fetchers' RAM cache (`fetch`) and the
+/// catalog's content-addressed byte cache (`catalog`) -- plus each cache's
+/// resolved startup byte ceiling, so an operator can compare
+/// held-vs-budgeted (#1170) without deriving it from a cumulative counter
+/// that cannot answer "what is resident right now" -- [`render_cache_family`]
+/// above renders that other, cumulative half of the picture (hits, misses,
+/// evictions).
 ///
-/// The catalog byte cache's own live residency is deliberately NOT rendered
-/// here: reaching it requires a `pub` accessor on `crates/ravel-catalog`,
-/// outside this task's declared scope (`services/ravel-server` and
-/// `crates/ravel-cache` only). Only its resolved ceiling is exposed, under
-/// `cache="catalog"`, so the gap is a missing residency row, not a missing
-/// cache row.
+/// Each cache's residency is rendered only when it is attached (`Some`), the
+/// same per-family presence discipline `render_cache_family` uses, and every
+/// metric name's header is written once even when both caches are present.
+#[allow(clippy::too_many_arguments)]
 fn render_cache_residency_family(
     out: &mut String,
     mode: Mode,
     fetch_ram: Option<(usize, u64)>,
     fetch_disk: Option<(usize, u64)>,
     fetch_max_bytes: Option<u64>,
+    catalog_ram: Option<(usize, u64)>,
+    catalog_disk: Option<(usize, u64)>,
     catalog_max_bytes: Option<u64>,
 ) {
-    // Same disk-tier-present-or-not label discipline `render_cache_family`
-    // uses: with no disk tier, the RAM sample carries only `cache=`; with one,
-    // the RAM sample gains `tier="ram"` and the disk sample carries
-    // `tier="disk"`.
-    let mut emit_tier = |name: &str, help: &str, ram: Option<u64>, disk: Option<u64>| {
+    // Per family: (cache label, RAM-tier (entries, bytes), disk-tier (entries,
+    // bytes)). The disk reading is `Some` only when `--cache-dir` attached a
+    // disk tier to that family (#97).
+    let families = [
+        (CacheFamily::Fetch, fetch_ram, fetch_disk),
+        (CacheFamily::Catalog, catalog_ram, catalog_disk),
+    ];
+
+    // One metric name at a time: header once, then a sample per attached
+    // tier of each family. Same disk-tier-present-or-not label discipline
+    // `render_cache_family` uses: with no disk tier, the RAM sample carries
+    // only `cache=`; with one, the RAM sample gains `tier="ram"` and the disk
+    // sample carries `tier="disk"`. `field` picks entries vs. bytes out of
+    // each tier's `(len, bytes)` reading.
+    let mut emit = |name: &str, help: &str, field: fn((usize, u64)) -> u64| {
         write_header(out, name, help, "gauge");
-        if let Some(value) = ram {
-            if disk.is_some() {
+        for (family, ram, disk) in families {
+            if let Some(ram) = ram {
+                if disk.is_some() {
+                    write_sample(
+                        out,
+                        name,
+                        &[
+                            Label::Mode(mode),
+                            Label::Cache(family),
+                            Label::CacheTier(CacheTier::Ram),
+                        ],
+                        field(ram),
+                    );
+                } else {
+                    write_sample(
+                        out,
+                        name,
+                        &[Label::Mode(mode), Label::Cache(family)],
+                        field(ram),
+                    );
+                }
+            }
+            if let Some(disk) = disk {
                 write_sample(
                     out,
                     name,
                     &[
                         Label::Mode(mode),
-                        Label::Cache(CacheFamily::Fetch),
-                        Label::CacheTier(CacheTier::Ram),
+                        Label::Cache(family),
+                        Label::CacheTier(CacheTier::Disk),
                     ],
-                    value,
-                );
-            } else {
-                write_sample(
-                    out,
-                    name,
-                    &[Label::Mode(mode), Label::Cache(CacheFamily::Fetch)],
-                    value,
+                    field(disk),
                 );
             }
         }
-        if let Some(value) = disk {
-            write_sample(
-                out,
-                name,
-                &[
-                    Label::Mode(mode),
-                    Label::Cache(CacheFamily::Fetch),
-                    Label::CacheTier(CacheTier::Disk),
-                ],
-                value,
-            );
-        }
     };
 
-    emit_tier(
+    emit(
         "ravel_cache_resident_entries",
         "Entries currently held in this read-cache tier (ADR-0046), live rather than cumulative.",
-        fetch_ram.map(|(len, _)| len as u64),
-        fetch_disk.map(|(len, _)| len as u64),
+        |(len, _)| len as u64,
     );
-    emit_tier(
+    emit(
         "ravel_cache_resident_bytes",
         "Payload bytes currently held in this read-cache tier (ADR-0046), live rather than cumulative.",
-        fetch_ram.map(|(_, bytes)| bytes),
-        fetch_disk.map(|(_, bytes)| bytes),
+        |(_, bytes)| bytes,
     );
 
     write_header(
@@ -6779,6 +6791,8 @@ pub fn render(
     cache_disk_residency: Option<(usize, u64)>,
     cache_max_bytes: Option<u64>,
     catalog_cache_max_bytes: Option<u64>,
+    catalog_ram_residency: Option<(usize, u64)>,
+    catalog_disk_residency: Option<(usize, u64)>,
     audit_pipeline_metrics: Option<&AuditPipelineMetrics>,
     memory_budget: MemoryBudgetSnapshot,
     can_fold: bool,
@@ -6929,6 +6943,8 @@ pub fn render(
         || cache_disk_residency.is_some()
         || cache_max_bytes.is_some()
         || catalog_cache_max_bytes.is_some()
+        || catalog_ram_residency.is_some()
+        || catalog_disk_residency.is_some()
     {
         render_cache_residency_family(
             &mut out,
@@ -6936,6 +6952,8 @@ pub fn render(
             cache_ram_residency,
             cache_disk_residency,
             cache_max_bytes,
+            catalog_ram_residency,
+            catalog_disk_residency,
             catalog_cache_max_bytes,
         );
     }
@@ -7040,8 +7058,11 @@ pub struct MetricsState {
     /// (`ravel_server::query::build_catalog`'s `cache_max_bytes`, a SEPARATE
     /// ceiling from `cache_max_bytes` above), rendered under
     /// `cache="catalog"`. Meaningful only when `catalog_cache_metrics` is
-    /// `Some`. The catalog cache's live residency is not rendered (see
-    /// [`render_cache_residency_family`]'s doc comment for the scope gap).
+    /// `Some`. The catalog cache's live residency gauges (#2488) are read
+    /// straight off `catalog` above via
+    /// [`ravel_catalog::Catalog::byte_cache_ram_residency`]/
+    /// [`byte_cache_disk_residency`](ravel_catalog::Catalog::byte_cache_disk_residency)
+    /// at scrape time, not stored on this struct.
     pub catalog_cache_max_bytes: u64,
     /// The one process-wide admission controller (ADR-0051), shared with every
     /// ingest path. Always present (built in every mode); in a mode that
@@ -7298,6 +7319,13 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         .catalog_cache_metrics
         .is_some()
         .then_some(state.catalog_cache_max_bytes);
+    // Live (not cumulative) resident bytes/entries for the catalog byte
+    // cache's tiers (#1170, #2488), the same live-residency reading as
+    // `cache_ram_residency`/`cache_disk_residency` above but through
+    // `ravel_catalog::Catalog`'s own accessors rather than
+    // `ravel_query::ReadCache`'s.
+    let catalog_ram_residency = state.catalog.byte_cache_ram_residency();
+    let catalog_disk_residency = state.catalog.byte_cache_disk_residency();
 
     // This process's own allocator figures (#1170), read live via mallctl
     // (or named plainly when the allocator is not jemalloc) rather than
@@ -7429,6 +7457,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         cache_disk_residency,
         cache_max_bytes,
         catalog_cache_max_bytes,
+        catalog_ram_residency,
+        catalog_disk_residency,
         audit_pipeline_metrics.as_ref(),
         memory_budget_snapshot,
         state.can_fold,
@@ -7663,6 +7693,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -8085,6 +8117,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -8167,6 +8201,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -8310,6 +8346,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -8497,6 +8535,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -8578,6 +8618,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -8642,6 +8684,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -8723,6 +8767,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -8785,6 +8831,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -8908,6 +8956,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -8989,6 +9039,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -9102,6 +9154,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -9182,6 +9236,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -9277,6 +9333,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -9332,6 +9390,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -9413,6 +9473,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -9790,6 +9852,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -10006,6 +10070,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             can_fold,
         )
@@ -10036,6 +10102,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -10113,6 +10181,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             false,
         );
@@ -10171,6 +10241,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -10216,6 +10288,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -10338,6 +10412,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -10390,6 +10466,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -10494,6 +10572,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -10752,6 +10832,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -10847,6 +10929,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -11075,6 +11159,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             false,
         );
@@ -11209,6 +11295,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -11301,6 +11389,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -11363,6 +11453,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -11469,6 +11561,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -11658,6 +11752,8 @@ mod tests {
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -12053,6 +12149,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -12285,6 +12383,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -12325,6 +12425,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -12401,7 +12503,16 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
     #[test]
     fn cache_residency_family_reports_valid_zeros_on_empty_cache() {
         let mut out = String::new();
-        render_cache_residency_family(&mut out, Mode::Query, Some((0, 0)), None, Some(1000), None);
+        render_cache_residency_family(
+            &mut out,
+            Mode::Query,
+            Some((0, 0)),
+            None,
+            Some(1000),
+            None,
+            None,
+            None,
+        );
         assert!(out.contains("ravel_cache_resident_entries{mode=\"query\",cache=\"fetch\"} 0"));
         assert!(out.contains("ravel_cache_resident_bytes{mode=\"query\",cache=\"fetch\"} 0"));
         assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"fetch\"} 1000"));
@@ -12424,6 +12535,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             Some((3, 300)),
             Some((5, 500)),
             Some(1_000),
+            None,
+            None,
             Some(2_000),
         );
         assert!(out.contains(
@@ -12439,6 +12552,64 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             "ravel_cache_resident_bytes{mode=\"query\",cache=\"fetch\",tier=\"disk\"} 500"
         ));
         assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"fetch\"} 1000"));
+        assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"catalog\"} 2000"));
+    }
+
+    /// The catalog byte cache's residency (#2488), RAM-only (no `--cache-dir`
+    /// disk tier attached): its `ravel_cache_resident_entries`/
+    /// `ravel_cache_resident_bytes` rows render under `cache="catalog"` with
+    /// no `tier=` label, same as a RAM-only fetcher cache does.
+    #[test]
+    fn cache_residency_family_reports_catalog_rows_for_ram_only_cache() {
+        let mut out = String::new();
+        render_cache_residency_family(
+            &mut out,
+            Mode::Query,
+            None,
+            None,
+            None,
+            Some((2, 200)),
+            None,
+            Some(500),
+        );
+        assert!(out.contains("ravel_cache_resident_entries{mode=\"query\",cache=\"catalog\"} 2"));
+        assert!(out.contains("ravel_cache_resident_bytes{mode=\"query\",cache=\"catalog\"} 200"));
+        assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"catalog\"} 500"));
+        assert!(
+            !out.contains("tier="),
+            "a RAM-only catalog cache (no disk tier) must render without a tier label:\n{out}"
+        );
+    }
+
+    /// The catalog byte cache's residency, tiered (RAM over `--cache-dir`
+    /// disk): each tier's exact entry count and byte total render under its
+    /// own `tier=` label, under `cache="catalog"`, the same split
+    /// `render_cache_family`'s cumulative counters use for the fetcher cache.
+    #[test]
+    fn cache_residency_family_reports_catalog_rows_for_tiered_cache() {
+        let mut out = String::new();
+        render_cache_residency_family(
+            &mut out,
+            Mode::Query,
+            None,
+            None,
+            None,
+            Some((3, 300)),
+            Some((5, 500)),
+            Some(2_000),
+        );
+        assert!(out.contains(
+            "ravel_cache_resident_entries{mode=\"query\",cache=\"catalog\",tier=\"ram\"} 3"
+        ));
+        assert!(out.contains(
+            "ravel_cache_resident_bytes{mode=\"query\",cache=\"catalog\",tier=\"ram\"} 300"
+        ));
+        assert!(out.contains(
+            "ravel_cache_resident_entries{mode=\"query\",cache=\"catalog\",tier=\"disk\"} 5"
+        ));
+        assert!(out.contains(
+            "ravel_cache_resident_bytes{mode=\"query\",cache=\"catalog\",tier=\"disk\"} 500"
+        ));
         assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"catalog\"} 2000"));
     }
 
@@ -12525,6 +12696,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -12617,6 +12790,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -12703,6 +12878,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -12776,6 +12953,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -12877,6 +13056,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -13101,6 +13282,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             metadata_cache,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
@@ -13969,6 +14152,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             None,
             None,
             None,
+            None,
+            None,
             MemoryBudgetSnapshot::default(),
             true,
         );
@@ -14089,6 +14274,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             &[],
             None,
             crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
             None,
             None,
             None,
