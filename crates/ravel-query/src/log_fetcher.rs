@@ -1021,14 +1021,11 @@ impl LogSegmentFetcher {
         indices: &[usize],
         dirs: &Arc<SegmentDirectories>,
         block_sizes: bool,
-        accounting: &QueryAccounting,
         span: &tracing::Span,
     ) -> Result<(BlockScan, u64), LogFetchError> {
         let Some(gate) = &self.read_gate else {
             let scan = span.in_scope(|| {
-                self.open_scan_raw_subset_with_decoded(
-                    key, bytes, query, columns, indices, dirs, accounting,
-                )
+                self.open_scan_raw_subset_with_decoded(key, bytes, query, columns, indices, dirs)
             })?;
             let block_job_bytes = if block_sizes {
                 max_block_uncompressed_len_from_page_dir(dirs.page_dir())
@@ -1045,7 +1042,6 @@ impl LogSegmentFetcher {
         let columns = columns.clone();
         let indices = indices.to_vec();
         let dirs = Arc::clone(dirs);
-        let accounting = accounting.clone();
         let span = span.clone();
         gate.run(ReadSite::LogPostings, size, move || {
             span.in_scope(|| {
@@ -1056,7 +1052,6 @@ impl LogSegmentFetcher {
                     &columns,
                     &indices,
                     &dirs,
-                    &accounting,
                 )?;
                 let block_job_bytes = if block_sizes {
                     max_block_uncompressed_len_from_page_dir(dirs.page_dir())
@@ -1384,14 +1379,7 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Vec<LogStreamId>, LogSegError> {
         let dir = self.decode_stream_dir(bytes, accounting)?;
-        let needles: Vec<Vec<u8>> = filters.iter().map(stream_attr_needle).collect();
-        let mut out = Vec::new();
-        for entry in dir.entries() {
-            if needles.iter().all(|n| blob_contains(&entry.blob, n)) {
-                out.push(entry.stream_id);
-            }
-        }
-        Ok(out)
+        Ok(matching_streams_in(&dir, filters))
     }
 
     /// Fetches, prunes, and scans one segment for records matching `query`.
@@ -2430,7 +2418,10 @@ impl LogSegmentFetcher {
         // (ADR-2414 decision A1 deliverable 3): the ordinal case's indices are
         // positions into the pruned survivor list, a different index space
         // that must never restrict the object-level candidate set below.
-        let owned_blocks = raw.then_some(indices);
+        let owned_blocks = raw.then(|| OwnedBlocks {
+            blocks: indices,
+            dirs: dirs.map(|d| &**d),
+        });
         let Some((bytes, _blocks_read)) = self
             .tenant_bytes_with_footer(
                 seg_ref,
@@ -2452,7 +2443,7 @@ impl LogSegmentFetcher {
         let (scan, block_job_bytes) = match dirs {
             Some(dirs) if raw => {
                 self.open_scan_on_gate_from_decoded(
-                    key, &bytes, query, columns, indices, dirs, true, accounting, &span,
+                    key, &bytes, query, columns, indices, dirs, true, &span,
                 )
                 .await?
             }
@@ -2578,7 +2569,7 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         footer: Option<&footer::LogFooter>,
         carried_whole: Option<CarriedWholeObject>,
-        owned_blocks: Option<&[usize]>,
+        owned_blocks: Option<OwnedBlocks<'_>>,
         phase: ProbePhase,
         accounting: &QueryAccounting,
     ) -> Result<Option<(LogObjectBytes, Option<u64>)>, LogFetchError> {
@@ -2624,20 +2615,15 @@ impl LogSegmentFetcher {
             );
             // What the plan read that produced this footer already counted
             // (#883, issue #885 review). `plan_segment` has exactly two
-            // footer-carrying branches and they are mutually exclusive on the
-            // same predicate this asks: the fast path requires
-            // `is_block_predicate_free` (an empty `prune`), while
-            // `plan_skip_decidable` requires a non-empty all-NumRange `prune`.
-            // So a footer carried for this (segment, query) pair came from
-            // `fetch_plan_sections`, which counted the tail sections, exactly
-            // when `plan_skip_decidable` holds, and from `fetch_footer`, which
-            // counted nothing about them, otherwise. Asking the predicate
-            // `plan_segment` itself branches on keeps the two from drifting
-            // apart, and any answer this cannot place falls to `false`, the
-            // direction that counts a miss rather than hiding one.
+            // footer-carrying branches, and since ADR-2414 decision A1 both
+            // read the segment's directories through
+            // `fetch_plan_directories` / `fetch_plan_sections`, which count the
+            // SKIP_IDX and PAGE_DIR probe misses into the plan phase. A footer
+            // carried for this (segment, query) pair therefore always
+            // arrives with its tail misses already counted.
             let carried = footer.map(|f| CarriedFooter {
                 footer: f,
-                tail_misses_counted: Self::plan_skip_decidable(query),
+                tail_misses_counted: true,
             });
             let (bytes, stats) = async {
                 self.block_range
@@ -3128,9 +3114,13 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         indices: &[usize],
         dirs: &SegmentDirectories,
-        accounting: &QueryAccounting,
     ) -> Result<BlockScan, LogFetchError> {
-        let pred = self.combined_predicate(key, bytes, query, accounting)?;
+        let stream_ids = if query.stream_attrs.is_empty() {
+            None
+        } else {
+            Some(matching_streams_in(dirs.stream_dir(), &query.stream_attrs))
+        };
+        let pred = combined_predicate_with_streams(query, stream_ids);
         let reader = RlogReader::from_decoded(bytes, dirs);
         reader
             .scan_blocks_raw_subset(&pred, &query.prune, columns, indices)
@@ -3180,19 +3170,7 @@ impl LogSegmentFetcher {
             )
         };
 
-        let mut arms = Vec::with_capacity(2 + query.content.len());
-        arms.push(Predicate::TsRange {
-            min_ns: query.ts_min_ns,
-            max_ns: query.ts_max_ns,
-        });
-        if let Some(ids) = stream_ids {
-            // An empty set is intentional: it means no stream in this object
-            // satisfies the attribute filter, and the reader short-circuits an
-            // empty StreamIn to zero records.
-            arms.push(Predicate::StreamIn(ids));
-        }
-        arms.extend(query.content.iter().cloned());
-        Ok(Predicate::And(arms))
+        Ok(combined_predicate_with_streams(query, stream_ids))
     }
 
     /// Fetch and decode just the STREAM_DIR section (ADR-1103 decision 2's
@@ -3330,6 +3308,41 @@ impl LogSegmentFetcher {
         let raw = read_section_accounted_from(bytes, desc, &self.cfg, accounting)?;
         StreamDir::decode(&raw, MAX_STREAMS)
     }
+}
+
+/// The stream ids in `dir` whose attribute blob carries every filter's needle
+/// ([`LogSegmentFetcher::matching_streams`]'s resolution over an
+/// already-decoded STREAM_DIR).
+fn matching_streams_in(dir: &StreamDir, filters: &[StreamAttrEquals]) -> Vec<LogStreamId> {
+    let needles: Vec<Vec<u8>> = filters.iter().map(stream_attr_needle).collect();
+    let mut out = Vec::new();
+    for entry in dir.entries() {
+        if needles.iter().all(|n| blob_contains(&entry.blob, n)) {
+            out.push(entry.stream_id);
+        }
+    }
+    out
+}
+
+/// `ts range AND resolved streams AND content`, the predicate both
+/// scan-opening paths hand to the reader. `stream_ids` is `Some` when the query
+/// carries stream-attribute equalities; an empty set is intentional: it means
+/// no stream in the object satisfies the filter, and the reader short-circuits
+/// an empty StreamIn to zero records.
+fn combined_predicate_with_streams(
+    query: &LogQuery,
+    stream_ids: Option<Vec<LogStreamId>>,
+) -> Predicate {
+    let mut arms = Vec::with_capacity(2 + query.content.len());
+    arms.push(Predicate::TsRange {
+        min_ns: query.ts_min_ns,
+        max_ns: query.ts_max_ns,
+    });
+    if let Some(ids) = stream_ids {
+        arms.push(Predicate::StreamIn(ids));
+    }
+    arms.extend(query.content.iter().cloned());
+    Predicate::And(arms)
 }
 
 /// Default suffix length of the etag-establishing probe GET (ADR-0107 decision
@@ -3749,6 +3762,19 @@ pub struct CarriedFooter<'a> {
     /// this object's tail-section probe misses
     /// ([`BlockRangeStats::probe_misses`]).
     pub tail_misses_counted: bool,
+}
+
+/// What one per-partition subset open of a segment already knows about it
+/// (ADR-2414 decision A1): the whole-object block indices its partition owns,
+/// and, when the plan phase decoded them, the segment's directories.
+///
+/// `blocks` is ascending. With `dirs` the ranged read fetches and decodes none
+/// of STREAM_DIR, FIELD_DIR, SKIP_IDX or PAGE_DIR: the reader built over the
+/// result takes them from `dirs`.
+#[derive(Clone, Copy)]
+struct OwnedBlocks<'a> {
+    blocks: &'a [usize],
+    dirs: Option<&'a SegmentDirectories>,
 }
 
 /// The whole-object bytes [`LogSegmentFetcher::plan_segment`]'s whole-object
@@ -5280,16 +5306,17 @@ impl BlockRangeFetcher {
             .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
             .await?;
 
+        // SKIP_IDX and PAGE_DIR are the tail sections whose probe misses the
+        // plan phase counts (the same pair `fetch_plan_sections` counts). The
+        // front pair is brought through a scratch stats value: a front section
+        // is never inside the suffix probe, so counting it would add two
+        // misses per object that report a property of the section order, not
+        // of the probe length.
         self.ensure_tail_plan_sections(
             seg_ref,
             tenant_hash,
             &footer,
-            &[
-                kind::STREAM_DIR,
-                kind::FIELD_DIR,
-                kind::SKIP_IDX,
-                kind::PAGE_DIR,
-            ],
+            &[kind::SKIP_IDX, kind::PAGE_DIR],
             phase,
             &mut resident,
             &pin,
@@ -5297,6 +5324,20 @@ impl BlockRangeFetcher {
             &mut stats,
         )
         .await?;
+        let mut front_stats = BlockRangeStats::default();
+        self.ensure_tail_plan_sections(
+            seg_ref,
+            tenant_hash,
+            &footer,
+            &[kind::STREAM_DIR, kind::FIELD_DIR],
+            phase,
+            &mut resident,
+            &pin,
+            accounting,
+            &mut front_stats,
+        )
+        .await?;
+        stats.metadata_gets += front_stats.metadata_gets;
 
         let mut sparse = SparseObject::new(seg_ref.object_size);
         for (start, bytes) in resident {
@@ -5462,7 +5503,7 @@ impl BlockRangeFetcher {
         columns: &ColumnSelection,
         plan_footer: Option<CarriedFooter<'_>>,
         phases: ReadPhases,
-        owned_blocks: Option<&[usize]>,
+        owned_blocks: Option<OwnedBlocks<'_>>,
         accounting: &QueryAccounting,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         self.fetch_object_with_footer_impl(
@@ -5491,7 +5532,7 @@ impl BlockRangeFetcher {
         columns: &ColumnSelection,
         plan_footer: Option<CarriedFooter<'_>>,
         phases: ReadPhases,
-        owned_blocks: Option<&[usize]>,
+        owned_blocks: Option<OwnedBlocks<'_>>,
         accounting: &QueryAccounting,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
@@ -5980,12 +6021,14 @@ impl BlockRangeFetcher {
         mut asm: ObjectAssembler,
         pin: &EtagPin,
         phases: ReadPhases,
-        owned_blocks: Option<&[usize]>,
+        owned_blocks: Option<OwnedBlocks<'_>>,
         accounting: &QueryAccounting,
         mut stats: BlockRangeStats,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let total_size = seg_ref.object_size;
+        let dirs = owned_blocks.and_then(|o| o.dirs);
+        let owned_blocks = owned_blocks.map(|o| o.blocks);
         let blocks_desc = *footer
             .section(kind::BLOCKS)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing BLOCKS".into())))?;
@@ -6048,26 +6091,39 @@ impl BlockRangeFetcher {
         // The two are adjacent in the object -- the writer emits PAGE_DIR
         // immediately after SKIP_IDX -- so a probe that missed both costs one
         // coalesced GET rather than two.
-        self.place_sections_coalesced(
-            seg_ref,
-            tenant_hash,
-            &[skip_desc, page_desc],
-            phases.metadata,
-            pin,
-            &mut asm,
-            accounting,
-            &mut stats,
-        )
-        .await?;
-        let skip_raw = self
-            .placed_section_raw(key, &asm, &skip_desc, accounting)
+        //
+        // With `dirs` (ADR-2414 decision A1: the plan phase already decoded this
+        // segment's directories) none of the four sections is fetched or decoded
+        // here: the reader built over the result takes them from `dirs`, so
+        // placing them would only move bytes nobody reads, and decoding them
+        // would charge a second `decompressed_bytes` for the same sections.
+        let local_skip;
+        let local_page_dir;
+        let (skip, page_dir): (&SkipIndex, &PageDir) = if let Some(dirs) = dirs {
+            (dirs.skip_index(), &**dirs.page_dir())
+        } else {
+            self.place_sections_coalesced(
+                seg_ref,
+                tenant_hash,
+                &[skip_desc, page_desc],
+                phases.metadata,
+                pin,
+                &mut asm,
+                accounting,
+                &mut stats,
+            )
             .await?;
-        let skip =
-            SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
-        let page_raw = self
-            .placed_section_raw(key, &asm, &page_desc, accounting)
-            .await?;
-        let page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
+            let skip_raw = self
+                .placed_section_raw(key, &asm, &skip_desc, accounting)
+                .await?;
+            local_skip =
+                SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
+            let page_raw = self
+                .placed_section_raw(key, &asm, &page_desc, accounting)
+                .await?;
+            local_page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
+            (&local_skip, &local_page_dir)
+        };
         page_dir
             .validate_extents(blocks_desc.len)
             .map_err(|source| corrupt(key, source))?;
@@ -6081,18 +6137,24 @@ impl BlockRangeFetcher {
             .iter()
             .any(|p| matches!(p, Predicate::NumRange { .. }));
         let (numeric, selected) = if wants_numeric || !columns.is_all() {
-            let field_dir = self
-                .place_and_decode_field_dir(
-                    seg_ref,
-                    tenant_hash,
-                    footer,
-                    phases.metadata,
-                    pin,
-                    &mut asm,
-                    accounting,
-                    &mut stats,
-                )
-                .await?;
+            let local_field_dir;
+            let field_dir: &FieldDir = if let Some(dirs) = dirs {
+                dirs.field_dir()
+            } else {
+                local_field_dir = self
+                    .place_and_decode_field_dir(
+                        seg_ref,
+                        tenant_hash,
+                        footer,
+                        phases.metadata,
+                        pin,
+                        &mut asm,
+                        accounting,
+                        &mut stats,
+                    )
+                    .await?;
+                &local_field_dir
+            };
             let numeric = if wants_numeric {
                 let refs: Vec<&Predicate> = prune.iter().collect();
                 field_dir.numeric_range_arms(&refs)
@@ -6102,7 +6164,7 @@ impl BlockRangeFetcher {
             // The same resolution `RlogReader::scan_blocks` runs on the same
             // FIELD_DIR, so the pages fetched here are exactly the pages the
             // decode addresses.
-            (numeric, columns.resolve(&field_dir))
+            (numeric, columns.resolve(field_dir))
         } else {
             (Vec::new(), None)
         };
@@ -6216,27 +6278,33 @@ impl BlockRangeFetcher {
         // their adjacent span (ADR-2066 decision 1). On the narrow-projection
         // path `place_and_decode_field_dir` already brought both, so this is a
         // no-op there; on an all-columns v4 read it is the read's one front GET.
-        self.place_front_sections(
-            seg_ref,
-            tenant_hash,
-            footer,
-            phases.metadata,
-            pin,
-            &mut asm,
-            accounting,
-            &mut stats,
-        )
-        .await?;
+        // Skipped when `dirs` carries the decoded directories (ADR-2414
+        // decision A1): the reader takes both from it.
+        if dirs.is_none() {
+            self.place_front_sections(
+                seg_ref,
+                tenant_hash,
+                footer,
+                phases.metadata,
+                pin,
+                &mut asm,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        }
 
         // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
         // GET each, never coalesced with the front across the BLOCKS gap. The
         // reader re-verifies each section's crc on decode, so a corrupt section
-        // hit fails closed there (ADR-0046).
+        // hit fails closed there (ADR-0046). With `dirs`, SKIP_IDX and PAGE_DIR
+        // are not placed either: nothing reads them from the buffer.
         for section in &footer.sections {
             if matches!(
                 section.kind,
                 kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR
-            ) {
+            ) || (dirs.is_some() && matches!(section.kind, kind::SKIP_IDX | kind::PAGE_DIR))
+            {
                 continue;
             }
             self.place_section(
@@ -7594,6 +7662,19 @@ mod plan_fast_path_tests {
         bytes.len() as u64 - (b.offset + b.len)
     }
 
+    /// Stored bytes of the two front directory sections (STREAM_DIR and
+    /// FIELD_DIR): the part of a segment's directories the suffix probe does not
+    /// cover, which `plan_segment` reads with one extra range GET so the
+    /// segment's decoded directories can be carried to every later open
+    /// (ADR-2414 decision A1).
+    fn front_dirs_len(bytes: &[u8]) -> u64 {
+        let f = footer::open(bytes).expect("footer");
+        [kind::STREAM_DIR, kind::FIELD_DIR]
+            .iter()
+            .map(|k| f.section(*k).expect("front section").len)
+            .sum()
+    }
+
     async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         store
@@ -7619,8 +7700,8 @@ mod plan_fast_path_tests {
 
     /// (Test b) The fast path fires for a predicate-free, fully-contained query:
     /// the returned count is the block count, the stats show nothing scanned,
-    /// and only the tail probe crossed the wire -- never a block-range fetch
-    /// sized to the object.
+    /// and only the tail probe plus the two front directory sections crossed the
+    /// wire -- never a block-range fetch sized to the object.
     ///
     /// Non-vacuity: deleting the fast-path branch in `plan_segment` (the
     /// `if seg_ref.object_size > 0 && query.is_block_predicate_free() ...`
@@ -7637,6 +7718,7 @@ mod plan_fast_path_tests {
         let bytes = build_object(&records);
         let total = bytes.len() as u64;
         let tail = tail_len(&bytes);
+        let front = front_dirs_len(&bytes);
         assert!(
             tail < total,
             "the object must carry a nonempty BLOCKS section"
@@ -7667,8 +7749,10 @@ mod plan_fast_path_tests {
 
         let read = acc.snapshot().total_s3_bytes();
         assert_eq!(
-            read, tail,
-            "fast path reads only the footer probe ({tail} B), not the {total} B object"
+            read,
+            tail + front,
+            "fast path reads the footer probe ({tail} B) and the front directory \
+             sections ({front} B), not the {total} B object"
         );
     }
 
@@ -7681,6 +7765,7 @@ mod plan_fast_path_tests {
         let bytes = build_object(&records);
         let total = bytes.len() as u64;
         let tail = tail_len(&bytes);
+        let front = front_dirs_len(&bytes);
         let seg = seg_ref(total, &records);
         let store = store_with_object(bytes).await;
         let f = fetcher(store, tail);
@@ -7695,7 +7780,11 @@ mod plan_fast_path_tests {
             .expect("relevant segment");
         let count = indices.len();
         assert_eq!(count, N);
-        assert_eq!(acc.snapshot().total_s3_bytes(), tail, "fast path fired");
+        assert_eq!(
+            acc.snapshot().total_s3_bytes(),
+            tail + front,
+            "fast path fired"
+        );
     }
 
     /// (Test c) Every case that is NOT predicate-free-and-contained goes through
@@ -9537,19 +9626,16 @@ mod plan_skip_decidable_span_tests {
     /// exactly once across the pair -- by the plan phase when the plan read
     /// located those sections, and by the scan when it did not.
     ///
-    /// This is what pins the derivation in `tenant_bytes_with_footer`, which is
-    /// the only place that decides which of the two a carried footer came from.
-    /// The fetcher-level tests in `tests/log_block_range.rs` and
+    /// This is what pins the flag `tenant_bytes_with_footer` sets on a carried
+    /// footer. The fetcher-level tests in `tests/log_block_range.rs` and
     /// `tests/log_page_dir_fetch.rs` construct the [`CarriedFooter`] by hand and
     /// so cannot catch a wrong flag here.
     ///
-    /// Prove-the-test: inverting that derivation to
-    /// `tail_misses_counted: !Self::plan_skip_decidable(query)` swaps both
-    /// halves -- the predicate-free scan reads 0 against the expected 2, and the
-    /// NumRange scan reads 2 against the expected 0. Hardcoding it to `true`
-    /// (the previous commit's `plan_footer.is_some()` gate) fails the
-    /// predicate-free half alone; hardcoding it to `false` (no gate at all)
-    /// fails the NumRange half alone.
+    /// Both plan branches count the tail misses themselves (ADR-2414 decision
+    /// A1: each reads the segment's directories), so the flag is `true` for
+    /// every carried footer. Prove-the-test: hardcoding it to `false` makes the
+    /// scan count the same two sections again, so both cases read a scan-phase 2
+    /// against the expected 0 and a total of 4 against 2.
     #[tokio::test]
     // Holds the test_tracing serialization guard across `.await`; the
     // current-thread test runtime runs this future to completion with no other
@@ -9567,13 +9653,12 @@ mod plan_skip_decidable_span_tests {
         let _serial = crate::test_tracing::guard();
 
         // (query, plan-phase misses, scan-phase misses). The predicate-free
-        // query takes `plan_segment_fast`, whose `fetch_footer` reads no tail
-        // section and counts nothing, leaving both misses to the scan. The
-        // NumRange query takes the skip-decidable branch, whose
-        // `fetch_plan_sections` reads both tail sections and counts them, so the
+        // query takes `plan_segment_fast`, whose `fetch_plan_directories` reads
+        // and counts both tail sections. The NumRange query takes the
+        // skip-decidable branch, whose `fetch_plan_sections` does the same. The
         // scan must count neither. Either way the total is 2.
         let cases = [
-            (LogQuery::new(i64::MIN, i64::MAX), 0u64, 2u64),
+            (LogQuery::new(i64::MIN, i64::MAX), 2u64, 0u64),
             (
                 LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::NumRange {
                     field: FieldSel::Attr("code".into()),

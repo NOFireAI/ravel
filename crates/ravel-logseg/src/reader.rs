@@ -173,6 +173,12 @@ impl SegmentDirectories {
         &self.skip
     }
 
+    /// The object's decoded STREAM_DIR, for resolving stream-attribute
+    /// equalities without decoding the section again on every open.
+    pub fn stream_dir(&self) -> &StreamDir {
+        &self.stream_dir
+    }
+
     /// The object's decoded FIELD_DIR, for resolving
     /// [`FieldDir::numeric_range_arms`] against a prune channel without a
     /// full reader (same caller as [`Self::skip_index`]).
@@ -265,6 +271,12 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// [`crate::SparseObject`] over the same segment, holding only that
     /// partition's own ranged extents) -- only the directory CONTENT is
     /// shared, never the placed bytes.
+    ///
+    /// The reader's scans do NOT seed [`ScanStats::decompressed_bytes`] with
+    /// the directories' decode: that decode happened once, in
+    /// [`RlogReader::decode_directories`], and whoever ran it charges
+    /// [`SegmentDirectories::open_decompressed_bytes`] there. Seeding it here
+    /// too would charge the same decode once per reader built from `dirs`.
     pub fn from_decoded(source: &'a S, dirs: &SegmentDirectories) -> Self {
         RlogReader {
             source,
@@ -275,7 +287,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             page_dir: Arc::clone(&dirs.page_dir),
             bloom: dirs.bloom,
             postings: dirs.postings,
-            open_decompressed_bytes: dirs.open_decompressed_bytes,
+            open_decompressed_bytes: 0,
         }
     }
 
@@ -292,7 +304,9 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// reader with [`RlogReader::from_decoded`] (ADR-2414 decision A1).
     pub fn from_source(source: &'a S, cfg: &RlogConfig) -> Result<Self, LogSegError> {
         let dirs = Self::decode_directories(source, cfg)?;
-        Ok(Self::from_decoded(source, &dirs))
+        let mut reader = Self::from_decoded(source, &dirs);
+        reader.open_decompressed_bytes = dirs.open_decompressed_bytes;
+        Ok(reader)
     }
 
     /// This reader's already-decoded directories, as a [`SegmentDirectories`]

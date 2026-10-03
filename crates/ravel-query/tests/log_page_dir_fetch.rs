@@ -1294,12 +1294,14 @@ async fn plan_segment_on_a_version_4_object_fetches_no_page_bytes() {
 }
 
 /// The skip-decidable plan path's own directory decompression lands in the
-/// PLAN phase, not phase-less or pooled away: `plan_segment` decodes SKIP_IDX
-/// and FIELD_DIR through `plan_section_raw`, and both are always zstd (the
-/// writer stores every whole-read directory section COMP_ZSTD unconditionally,
-/// docs/log-segment-format.md), so a caller threading a [`PhaseAccounting`]'s
-/// `plan()` handle through must see the exact sum of their `uncomp_len` show up
-/// under `snapshot().plan.decompressed_bytes` (issue #1401 finding 2).
+/// PLAN phase, not phase-less or pooled away: `plan_segment` decodes the four
+/// directories (STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR) once and carries
+/// them to every later open of the segment (ADR-2414 decision A1), and all four
+/// are always zstd (the writer stores every whole-read directory section
+/// COMP_ZSTD unconditionally, docs/log-segment-format.md), so a caller
+/// threading a [`PhaseAccounting`]'s `plan()` handle through must see the exact
+/// sum of their `uncomp_len` show up under `snapshot().plan.decompressed_bytes`
+/// (issue #1401 finding 2).
 #[tokio::test]
 async fn plan_segment_charges_directory_decompression_to_the_plan_phase() {
     let recs = records();
@@ -1308,7 +1310,12 @@ async fn plan_segment_charges_directory_decompression_to_the_plan_phase() {
 
     let f = footer_of(&bytes);
     let mut expected = 0u64;
-    for k in [kind::SKIP_IDX, kind::FIELD_DIR] {
+    for k in [
+        kind::STREAM_DIR,
+        kind::FIELD_DIR,
+        kind::SKIP_IDX,
+        kind::PAGE_DIR,
+    ] {
         let desc = *f.section(k).expect("section present");
         assert_eq!(
             desc.comp,
@@ -1335,8 +1342,8 @@ async fn plan_segment_charges_directory_decompression_to_the_plan_phase() {
     let snap = phase.snapshot();
     assert_eq!(
         snap.plan.decompressed_bytes, expected,
-        "plan_segment's skip-decidable path charges exactly SKIP_IDX + \
-         FIELD_DIR's zstd uncomp_len to the plan phase"
+        "plan_segment's skip-decidable path charges exactly STREAM_DIR + \
+         FIELD_DIR + SKIP_IDX + PAGE_DIR's zstd uncomp_len to the plan phase"
     );
 }
 
