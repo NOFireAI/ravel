@@ -1382,3 +1382,43 @@ async fn an_order_by_alias_named_like_a_group_key_gives_the_same_top_ten_spilled
     assert_eq!(spilled.rows, in_memory.rows, "row for row");
     assert_eq!(spilled.column_f64(2), q33_expected_top_ten());
 }
+
+/// Issue #2416: a statement the tie-order rewrite cannot apply to (its own
+/// column already carries the reserved tiebreak name, so the rebuilt
+/// projection does not validate) still runs, with spill disabled. Under an
+/// ample budget it answers; under a budget the aggregate cannot fit in, it is
+/// refused with the memory-pool exhaustion a spill-disabled query gets, not
+/// with a planning error and not by spilling a Sort whose key is not total.
+#[tokio::test]
+async fn a_statement_the_rewrite_cannot_apply_to_runs_with_spill_disabled() {
+    let sql = "SELECT b, count(*) AS c, sum(x) AS __ravel_tiebreak_0 FROM q33 \
+               GROUP BY a, b ORDER BY c DESC LIMIT 10";
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes| {
+        spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            query_bytes,
+        )
+    };
+
+    let in_memory = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
+    assert_eq!(in_memory.rows.len(), 10);
+    assert_eq!(in_memory.spill_files, 0);
+
+    let budget = usize::try_from(in_memory.peak_pool_bytes / 4).expect("fits");
+    let err = q33_executor(config(budget), &file)
+        .await
+        .execute(q33_tenant(), &request(sql))
+        .await
+        .expect_err("with spill disabled the aggregate does not fit a quarter of its peak");
+    assert!(
+        matches!(err, SqlError::ResourcesExhausted(_)),
+        "a spill-disabled query over budget is refused by the pool; got {err:?}"
+    );
+    assert!(
+        spill_subdirs(scratch.path()).is_empty(),
+        "a spill-disabled query never creates a scratch directory"
+    );
+}
