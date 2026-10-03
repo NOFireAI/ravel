@@ -238,6 +238,12 @@ pub struct FragmentMetrics {
     /// `class` label; a class queuing does not mean it rejected anything (this
     /// admission never rejects), only that a caller waited for a permit.
     fragment_admission_waits_total: [AtomicU64; 2],
+    /// Admitted slices this worker stopped mid-run because their query's
+    /// deadline passed while they read, indexed by [`AdmissionClass`].
+    /// Rendered under the closed `class` label. A slice refused before it ran
+    /// is not counted here: a `Pinned` refusal counts under the `expired`
+    /// capability reject reason.
+    fragment_deadline_stops_total: [AtomicU64; 2],
     /// Record GETs this worker's pinned resolves issued (ADR-0071
     /// pinned-record amendment decision 5, and the record-GET counter
     /// amendment): one per pinned L0 segment, one per pinned L1 part, two for
@@ -290,6 +296,7 @@ impl Default for FragmentMetrics {
             fragment_capability_rejects: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_inflight: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_admission_waits_total: std::array::from_fn(|_| AtomicU64::new(0)),
+            fragment_deadline_stops_total: std::array::from_fn(|_| AtomicU64::new(0)),
             fragment_record_get_requests_total: AtomicU64::new(0),
             fragment_record_get_bytes_total: AtomicU64::new(0),
             slices_local_total: AtomicU64::new(0),
@@ -355,6 +362,12 @@ impl FragmentMetrics {
     /// and had to queue.
     fn record_admission_wait(&self, class: AdmissionClass) {
         self.fragment_admission_waits_total[class.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an admitted `class` slice was stopped mid-run at its
+    /// query's deadline.
+    fn record_deadline_stop(&self, class: AdmissionClass) {
+        self.fragment_deadline_stops_total[class.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_slice_local(&self) {
@@ -443,6 +456,17 @@ impl FragmentMetrics {
     /// per class under the `class` label.
     pub fn fragment_admission_waits_by_class(&self) -> [(AdmissionClass, u64); 2] {
         AdmissionClass::ALL.map(|class| (class, self.fragment_admission_waits_total(class)))
+    }
+
+    pub fn fragment_deadline_stops_total(&self, class: AdmissionClass) -> u64 {
+        self.fragment_deadline_stops_total[class.index()].load(Ordering::Relaxed)
+    }
+
+    /// The per-class mid-run deadline stop counts paired with their
+    /// [`AdmissionClass`], for the `/metrics` renderer to emit one series per
+    /// class under the `class` label.
+    pub fn fragment_deadline_stops_by_class(&self) -> [(AdmissionClass, u64); 2] {
+        AdmissionClass::ALL.map(|class| (class, self.fragment_deadline_stops_total(class)))
     }
 
     /// Record GETs this process's pinned resolves have issued.
@@ -947,13 +971,14 @@ impl FragmentService {
     /// or the deadline a federating coordinator put on a Resolve request.
     /// Reaching it drops the run, so the slice issues no store request once
     /// the timer fires (which, like the engine's own deadline, can be up to
-    /// the timer's resolution late) and returns no result. The slice then
-    /// ends in-band with a `TIMEOUT` summary carrying what it spent before the
-    /// stop, which the coordinator treats as terminal for the query: no
-    /// re-dispatch and no local read.
+    /// the timer's resolution late) and returns no result, and counts the stop
+    /// under `class`. The slice then ends in-band with a `TIMEOUT` summary
+    /// carrying what it spent before the stop, which the coordinator treats as
+    /// terminal for the query: no re-dispatch and no local read.
     async fn run_until_deadline(
         &self,
         request: pb::FetchRequest,
+        class: AdmissionClass,
         remaining: Duration,
     ) -> Vec<pb::FetchResponse> {
         let spent = QueryAccounting::new();
@@ -961,10 +986,13 @@ impl FragmentService {
             // Biased so a run that finishes in the same poll as the deadline
             // still loses: the deadline is exclusive.
             biased;
-            () = self.inner.clock.sleep(remaining) => vec![expired_slice_summary(
-                &spent.snapshot(),
-                "fragment slice stopped: the query's deadline passed while it ran".to_string(),
-            )],
+            () = self.inner.clock.sleep(remaining) => {
+                self.inner.metrics.record_deadline_stop(class);
+                vec![expired_slice_summary(
+                    &spent.snapshot(),
+                    "fragment slice stopped: the query's deadline passed while it ran".to_string(),
+                )]
+            }
             frames = self.resolve_and_run(request, false, spent.clone()) => frames,
         }
     }
@@ -1330,7 +1358,7 @@ impl SeriesFetch for FragmentService {
                     let remaining = Duration::from_nanos(
                         u64::try_from(deadline_unix_ns.saturating_sub(now_ns)).unwrap_or(0),
                     );
-                    self.run_until_deadline(inner, remaining).await
+                    self.run_until_deadline(inner, class, remaining).await
                 }
             }
             None => {
@@ -1877,15 +1905,12 @@ impl RoutingSliceFetcher {
                     stats: response.stats,
                 }))
             }
-            // The worker stopped the slice at the query's deadline, or refused
-            // it because that deadline had already passed. The worker is
-            // healthy and any other attempt, this coordinator's own included,
-            // would run past the same deadline, so this is terminal: no
-            // quarantine, no re-dispatch, no local read. The spend it made
-            // before the stop rides on the response.
-            Ok(response) if response.status == pb::status::Code::Timeout => {
-                Attempt::Keep(Box::new(Ok(response)))
-            }
+            // Every other summary is terminal, `TIMEOUT` included: the worker
+            // stopped the slice at the query's deadline, or refused it because
+            // that deadline had already passed. The worker is healthy and any
+            // other attempt, this coordinator's own included, would run past
+            // the same deadline, so no quarantine, no re-dispatch, no local
+            // read. The spend it made before the stop rides on the response.
             Ok(response) => Attempt::Keep(Box::new(Ok(response))),
             Err(DistribError::Transport(message)) => {
                 tracing::warn!(
