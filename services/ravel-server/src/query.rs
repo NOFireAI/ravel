@@ -2214,15 +2214,15 @@ mod tests {
         );
 
         // Unset: the HOST-DERIVED per-query pool reaches the executor (issue
-        // #1141), 25% of the injected reference host's 30 GB, not the
-        // compiled-in 256 MiB.
+        // #1141, raised to the tenant share by ADR-2414 decision B1), 50% of
+        // the injected reference host's 30 GB, not the compiled-in 256 MiB.
         let state = sql_state_from_cli(&["ravel-server"]);
         assert_eq!(
             state.executor.config().max_query_bytes,
-            8_053_063_680,
+            16_106_127_360,
             "an unset --sql-max-query-bytes must reach the executor as the host-derived pool"
         );
-        assert_ne!(8_053_063_680, ravel_sql::DEFAULT_MAX_QUERY_BYTES);
+        assert_ne!(16_106_127_360, ravel_sql::DEFAULT_MAX_QUERY_BYTES);
     }
 
     /// ADR-0094 reachability: `--sql-parallel-final-aggregation` must reach the

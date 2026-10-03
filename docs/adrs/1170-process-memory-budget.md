@@ -60,10 +60,12 @@ Verified against the tree at `4e5c0ea8`.
 - **Derivation** is one pure function, `resolve_performance_defaults`
   (`config.rs:1762-1865`), over `HostProfile { cores, mem_total_bytes }`, where
   `mem_total_bytes` is already capped by cgroup v2 `memory.max` or v1
-  `memory.limit_in_bytes` (`config.rs:1467-1513`). Shares: fetch cache 25%,
-  catalog cache 5%, SQL per-query 25%, SQL per-tenant 50%, with exact-integer
-  tests (`config.rs:4896-4904`). The per-query share nests inside the
-  per-tenant share (`crates/ravel-sql/src/memory.rs:321-336` charges the same
+  `memory.limit_in_bytes` (`config.rs:1467-1513`). Shares as of `4e5c0ea8`:
+  fetch cache 25%, catalog cache 5%, SQL per-query 25% (now 50%, see the
+  ADR-2414 per-query share amendment below), SQL per-tenant 50%, with
+  exact-integer tests (`config.rs:4896-4904`). The per-query share nests
+  inside the per-tenant share
+  (`crates/ravel-sql/src/memory.rs:321-336` charges the same
   bytes to both), so the sum for one tenant is 80%, not 135%. The per-tenant
   share is per `TenantHash` (`crates/ravel-sql/src/executor.rs:459-470`), so N
   active tenants can reserve N x 50%.
@@ -850,3 +852,19 @@ in place of the four budget figures. `ravel_memory_budget_bytes` on a gateway's
 `/metrics` reads `u64::MAX`, the unlimited value, since nothing reserves there.
 Every other mode derives, carves and refuses exactly as decision 3 and the
 amendments above describe, with the same message.
+
+## Amendment (2026-10-03, ADR-2414): the per-query SQL share is the tenant's share
+
+<!-- amendment-applies: sections="What the code does today" pointer="ADR-2414 per-query share amendment" -->
+<!-- amendment-supersedes: phrase="SQL per-query 25%" pointer="ADR-2414 per-query share amendment" -->
+
+ADR-2414 decision B1 raises `SQL_QUERY_MEMORY_PERCENT` from 25 to 50, equal to
+`SQL_TENANT_MEMORY_PERCENT`, so a lone statement may reserve the tenant's
+whole SQL share. The per-query share still nests inside the per-tenant share
+exactly as decision 1 states: the per-tenant pool refuses the byte that would
+carry one tenant past 50% regardless of how many statements share it, so
+concurrency is bounded exactly as before and one tenant's sum is still 80% of
+memory, not 105%. An explicit `--sql-max-query-bytes` still wins and is still
+clamped to the tenant ceiling. The operator who wants the old four-way split
+across concurrent statements sets `--sql-max-query-bytes` to a quarter of the
+tenant ceiling.
