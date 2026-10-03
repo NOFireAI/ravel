@@ -77,10 +77,10 @@ and stays conformant.
 
 ## Score
 
-- Supported and covered: 43
+- Supported and covered: 44
 - Intentionally rejected: 68
 - Unclassified / broken: 0
-- **Conformance: 111 / 111 = 100.0%**
+- **Conformance: 112 / 112 = 100.0%**
 
 ## Conformance table
 
@@ -133,6 +133,7 @@ and stays conformant.
 | Aggregate | `var_sample` | `SELECT var_sample(value) FROM samples` | Intentionally rejected | `ValidationError::ExcludedAggregate` | outside the six-aggregate allowlist (ADR-0022 decision 2) |
 | Clause / operator | `CASE` | `SELECT CASE WHEN value > 0 THEN 1 ELSE 0 END FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `DATE_TRUNC` | `SELECT date_trunc('hour', ts) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `EXTRACT(minute FROM ...)` | `SELECT EXTRACT(minute FROM ts) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `Filter (WHERE)` | `SELECT ts, value FROM samples WHERE value > 0 ORDER BY series_id, ts` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
 | Clause / operator | `GROUP BY` | `SELECT series_id, count(value) FROM samples GROUP BY series_id ORDER BY series_id` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
 | Clause / operator | `GROUP BY ordinal` | `SELECT series_id, count(value) FROM samples GROUP BY 1 ORDER BY series_id` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |

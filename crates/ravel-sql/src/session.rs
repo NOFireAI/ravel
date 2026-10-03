@@ -124,6 +124,7 @@ use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::functions::datetime::planner::DatetimeFunctionPlanner;
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -751,6 +752,22 @@ pub fn build_session(
     // `crate::trace_id_planner` module docs for why it exists and what it
     // covers.
     ctx.register_expr_planner(trace_id_hex_literal_planner())?;
+
+    // Register upstream's `EXTRACT(field FROM expr)` planner (issue #2458).
+    // `with_default_features()` above does not install this on its own:
+    // DataFusion's `SessionStateDefaults::default_expr_planners()` pushes
+    // `DatetimeFunctionPlanner` behind `#[cfg(feature = "datetime_expressions")]`
+    // on the *facade* `datafusion` crate itself
+    // (`session_state_defaults.rs`), and this crate's `Cargo.toml` never turns
+    // that facade feature on (`default-features = false, features = ["sql"]`).
+    // The underlying `datafusion-functions` crate compiles its datetime pack
+    // unconditionally regardless (ADR-0097: it is a mandatory dependency with
+    // its own `datetime_expressions` default), so the planner type is always
+    // available; only the facade's registration list is gated. The type
+    // implements exactly one method, `plan_extract`, rewriting
+    // `EXTRACT(field FROM expr)` into a `date_part(field, expr)` call --
+    // already in `ADMITTED_SCALARS` -- so no allowlist change is needed.
+    ctx.register_expr_planner(Arc::new(DatetimeFunctionPlanner))?;
 
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration
     // boundary behind the parse gate. Enumerate every aggregate UDAF the
