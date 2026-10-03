@@ -1,9 +1,8 @@
-//! The engine seam a later task's acceptance test drives (ADR-2040, issue
-//! #2055 task T5b). [`SuiteEngine`] is the only contract this module
-//! defines: no implementation lives here. A later task wires a concrete
-//! engine (an in-process DataFusion session, a running `ravel-server`'s
-//! Flight SQL endpoint, an upstream reference engine) against the suite and
-//! fixture this crate already ships.
+//! The engine seam the ClickBench Parquet lane drives (ADR-2040, issue
+//! #2055). [`SuiteEngine`] is the contract; [`InProcessEngine`] (Ravel's
+//! `SqlExecutor` over an in-memory lake store), [`HttpEngine`] (a running
+//! `ravel-server` over `POST /api/v1/sql`) and [`ReferenceEngine`] (plain
+//! DataFusion over the fixture on local disk) implement it.
 
 use datafusion::arrow::record_batch::RecordBatch;
 
@@ -34,9 +33,8 @@ pub enum EngineError {
     Unreachable(String),
 }
 
-/// One query engine under test. A later task implements this against each
-/// engine the acceptance test compares (ADR-2040 section D7): every
-/// implementation runs the exact same suite statements and DDL template,
+/// One query engine under test (ADR-2040 section D7): every implementation
+/// runs the exact same suite statements and DDL template,
 /// so the comparator in [`super::comparator`] is comparing engines, not
 /// comparing a hand-written harness against itself.
 #[async_trait::async_trait]
@@ -244,6 +242,340 @@ mod in_process {
 
 #[cfg(feature = "sql-latency")]
 pub use in_process::InProcessEngine;
+
+/// A running `ravel-server`, reached over `POST /api/v1/sql`. Request
+/// building and response decoding are plain functions so they can be tested
+/// without a server.
+#[cfg(feature = "sql-latency")]
+mod http {
+    use datafusion::arrow::ipc::reader::StreamReader;
+    use reqwest::header::{ACCEPT, HeaderValue};
+    use reqwest::{Client, Request, StatusCode};
+
+    use super::{DdlReceipt, EngineError, RecordBatch, SuiteEngine};
+
+    /// The media type that makes `/api/v1/sql` answer a query with an Arrow
+    /// IPC stream instead of JSON.
+    pub const ARROW_STREAM_MEDIA_TYPE: &str = "application/vnd.apache.arrow.stream";
+
+    /// Which of the two calls a request or response belongs to; picks the
+    /// `EngineError` variant a rejection maps to.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Call {
+        Ddl,
+        Query,
+    }
+
+    impl Call {
+        fn error(self, message: String) -> EngineError {
+            match self {
+                Call::Ddl => EngineError::Ddl(message),
+                Call::Query => EngineError::Query(message),
+            }
+        }
+    }
+
+    pub struct HttpEngine {
+        client: Client,
+        base_url: String,
+        token: String,
+    }
+
+    impl HttpEngine {
+        /// `base_url` is the server root (for example `http://127.0.0.1:9090`);
+        /// `token` is sent as `Authorization: Bearer <token>`.
+        pub fn new(base_url: &str, token: &str) -> Self {
+            HttpEngine {
+                client: Client::new(),
+                base_url: base_url.to_string(),
+                token: token.to_string(),
+            }
+        }
+
+        async fn send(&self, call: Call, sql: &str) -> Result<(StatusCode, Vec<u8>), EngineError> {
+            let request = build_request(&self.client, &self.base_url, &self.token, call, sql)?;
+            let response = self
+                .client
+                .execute(request)
+                .await
+                .map_err(|e| EngineError::Unreachable(format!("POST /api/v1/sql: {e}")))?;
+            let status = response.status();
+            let body = response
+                .bytes()
+                .await
+                .map_err(|e| EngineError::Unreachable(format!("read response body: {e}")))?;
+            Ok((status, body.to_vec()))
+        }
+    }
+
+    /// `<base_url>/api/v1/sql`, tolerating a trailing `/` on `base_url`.
+    pub fn sql_url(base_url: &str) -> String {
+        format!("{}/api/v1/sql", base_url.trim_end_matches('/'))
+    }
+
+    /// The `POST` a call sends: `{"query": sql}` as JSON, a bearer token,
+    /// and for a query, `Accept: application/vnd.apache.arrow.stream`.
+    pub fn build_request(
+        client: &Client,
+        base_url: &str,
+        token: &str,
+        call: Call,
+        sql: &str,
+    ) -> Result<Request, EngineError> {
+        let mut builder = client
+            .post(sql_url(base_url))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "query": sql }));
+        if call == Call::Query {
+            builder = builder.header(ACCEPT, HeaderValue::from_static(ARROW_STREAM_MEDIA_TYPE));
+        }
+        builder
+            .build()
+            .map_err(|e| call.error(format!("build request: {e}")))
+    }
+
+    /// A non-2xx status as the call's `EngineError`, carrying the status and
+    /// the body text; `Ok(())` for a 2xx.
+    pub fn check_status(call: Call, status: StatusCode, body: &[u8]) -> Result<(), EngineError> {
+        if status.is_success() {
+            return Ok(());
+        }
+        Err(call.error(format!("HTTP {status}: {}", String::from_utf8_lossy(body))))
+    }
+
+    /// `data.outcome` and `data.files` from a DDL success body
+    /// (`{"status":"success","data":{"outcome":"created","files":N,...}}`).
+    /// `files` is absent from a `dropped` or `noop` outcome, and reads as
+    /// `None` then.
+    pub fn parse_ddl_body(body: &[u8]) -> Result<DdlReceipt, EngineError> {
+        let value: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|e| EngineError::Ddl(format!("DDL response is not JSON: {e}")))?;
+        let data = value
+            .get("data")
+            .ok_or_else(|| EngineError::Ddl(format!("DDL response has no data: {value}")))?;
+        let outcome = data
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                EngineError::Ddl(format!("DDL response has no string data.outcome: {value}"))
+            })?;
+        let files = match data.get("files") {
+            None => None,
+            Some(files) => Some(files.as_u64().ok_or_else(|| {
+                EngineError::Ddl(format!("DDL response data.files is not a count: {value}"))
+            })?),
+        };
+        Ok(DdlReceipt {
+            outcome: outcome.to_string(),
+            files,
+        })
+    }
+
+    /// Every batch of an Arrow IPC stream body, in stream order.
+    pub fn decode_arrow_stream(body: &[u8]) -> Result<Vec<RecordBatch>, EngineError> {
+        let reader = StreamReader::try_new(body, None)
+            .map_err(|e| EngineError::Query(format!("Arrow IPC stream header: {e}")))?;
+        reader
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| EngineError::Query(format!("Arrow IPC stream batch: {e}")))
+    }
+
+    #[async_trait::async_trait]
+    impl SuiteEngine for HttpEngine {
+        async fn ddl(&self, sql: &str) -> Result<DdlReceipt, EngineError> {
+            let (status, body) = self.send(Call::Ddl, sql).await?;
+            check_status(Call::Ddl, status, &body)?;
+            parse_ddl_body(&body)
+        }
+
+        async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, EngineError> {
+            let (status, body) = self.send(Call::Query, sql).await?;
+            check_status(Call::Query, status, &body)?;
+            decode_arrow_stream(&body)
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::expect_used)]
+    mod tests {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::{Float64Array, Int64Array, StringArray};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::ipc::writer::StreamWriter;
+        use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
+
+        use super::*;
+
+        fn body_json(request: &Request) -> serde_json::Value {
+            let bytes = request
+                .body()
+                .and_then(reqwest::Body::as_bytes)
+                .expect("a JSON body is buffered, not streamed");
+            serde_json::from_slice(bytes).expect("body is JSON")
+        }
+
+        #[test]
+        fn a_query_posts_the_sql_with_a_bearer_token_and_asks_for_arrow() {
+            let client = Client::new();
+            let request = build_request(
+                &client,
+                "http://127.0.0.1:9090/",
+                "secret-token",
+                Call::Query,
+                "SELECT COUNT(*) FROM hits",
+            )
+            .expect("request builds");
+            assert_eq!(request.method(), reqwest::Method::POST);
+            assert_eq!(request.url().as_str(), "http://127.0.0.1:9090/api/v1/sql");
+            let headers = request.headers();
+            assert_eq!(
+                headers.get(AUTHORIZATION).expect("auth header"),
+                "Bearer secret-token"
+            );
+            assert_eq!(
+                headers.get(ACCEPT).expect("accept header"),
+                ARROW_STREAM_MEDIA_TYPE
+            );
+            assert_eq!(
+                headers.get(CONTENT_TYPE).expect("content type"),
+                "application/json"
+            );
+            assert_eq!(
+                body_json(&request),
+                serde_json::json!({ "query": "SELECT COUNT(*) FROM hits" })
+            );
+        }
+
+        #[test]
+        fn a_ddl_posts_the_sql_without_asking_for_arrow() {
+            let client = Client::new();
+            let sql = "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION 's3://b/hits/'";
+            let request =
+                build_request(&client, "http://h:1", "t", Call::Ddl, sql).expect("request builds");
+            assert_eq!(request.url().as_str(), "http://h:1/api/v1/sql");
+            assert_eq!(
+                request.headers().get(AUTHORIZATION).expect("auth header"),
+                "Bearer t"
+            );
+            assert!(request.headers().get(ACCEPT).is_none());
+            assert_eq!(body_json(&request), serde_json::json!({ "query": sql }));
+        }
+
+        /// The body shape `ravel-server`'s `ddl_outcome_json` writes for a
+        /// created table.
+        #[test]
+        fn a_recorded_create_body_parses_to_its_receipt() {
+            let body = br#"{"status":"success","data":{"outcome":"created","table":"hits","version":1,"files":4,"skipped_directory_markers":0,"skipped_other_suffixes":0}}"#;
+            assert_eq!(
+                parse_ddl_body(body).expect("parses"),
+                DdlReceipt {
+                    outcome: "created".to_string(),
+                    files: Some(4),
+                }
+            );
+        }
+
+        #[test]
+        fn a_recorded_drop_body_parses_with_no_file_count() {
+            let body =
+                br#"{"status":"success","data":{"outcome":"dropped","table":"hits","version":2}}"#;
+            assert_eq!(
+                parse_ddl_body(body).expect("parses"),
+                DdlReceipt {
+                    outcome: "dropped".to_string(),
+                    files: None,
+                }
+            );
+        }
+
+        #[test]
+        fn a_ddl_body_without_an_outcome_or_with_a_non_count_files_is_refused() {
+            assert!(matches!(
+                parse_ddl_body(br#"{"status":"success","data":{"files":1}}"#),
+                Err(EngineError::Ddl(_))
+            ));
+            assert!(matches!(
+                parse_ddl_body(br#"{"status":"success","data":{"outcome":"created","files":"4"}}"#),
+                Err(EngineError::Ddl(_))
+            ));
+            assert!(matches!(
+                parse_ddl_body(b"not json"),
+                Err(EngineError::Ddl(_))
+            ));
+        }
+
+        #[test]
+        fn a_non_success_status_carries_the_status_and_the_body_text() {
+            let err = check_status(
+                Call::Ddl,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                b"location outside grants",
+            )
+            .expect_err("422 is a rejection");
+            assert_eq!(
+                err,
+                EngineError::Ddl(
+                    "HTTP 422 Unprocessable Entity: location outside grants".to_string()
+                )
+            );
+            let err = check_status(Call::Query, StatusCode::BAD_REQUEST, b"bad sql")
+                .expect_err("400 is a rejection");
+            assert_eq!(
+                err,
+                EngineError::Query("HTTP 400 Bad Request: bad sql".to_string())
+            );
+            check_status(Call::Query, StatusCode::OK, b"").expect("200 passes");
+        }
+
+        #[test]
+        fn an_encoded_arrow_stream_decodes_to_the_same_batches() {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("n", DataType::Int64, false),
+                Field::new("s", DataType::Utf8, true),
+                Field::new("f", DataType::Float64, false),
+            ]));
+            let first = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![1, 2])),
+                    Arc::new(StringArray::from(vec![Some("a"), None])),
+                    Arc::new(Float64Array::from(vec![0.1, -0.0])),
+                ],
+            )
+            .expect("batch");
+            let second = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![3])),
+                    Arc::new(StringArray::from(vec![Some("c")])),
+                    Arc::new(Float64Array::from(vec![f64::NAN])),
+                ],
+            )
+            .expect("batch");
+            let mut buf = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut buf, &schema).expect("writer");
+                writer.write(&first).expect("write");
+                writer.write(&second).expect("write");
+                writer.finish().expect("finish");
+            }
+            let decoded = decode_arrow_stream(&buf).expect("decodes");
+            assert_eq!(decoded, vec![first, second]);
+        }
+
+        #[test]
+        fn a_truncated_arrow_stream_is_a_query_error() {
+            assert!(matches!(
+                decode_arrow_stream(b"\xff\xff"),
+                Err(EngineError::Query(_))
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "sql-latency")]
+pub use http::HttpEngine;
 
 /// In-process DataFusion over the ClickBench fixture on the local
 /// filesystem: the oracle the suite's engines are compared against. Shares
