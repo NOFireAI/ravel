@@ -67,8 +67,8 @@ produced identical object bytes; its whole-encode time against the map arm was
 Same corpus and shapes, live bytes sampled through `build_object` under the
 `stats_alloc` allocator (issue #2428; result branch
 `task/55ac5d93-7358-4891-8dea-dcec837285c7/result`, file
-`stage0b-ref-of-memory.md`). Host: x86_64 Linux, 8 cores. The figures were
-identical across all five iterations.
+`stage0b-ref-of-memory.md`). Host: x86_64 Linux. The figures were identical
+across all five iterations.
 
 | Streams per object | Map bytes | Largest live sample, bytes | Map share | Binary-search arm index bytes |
 |---|---|---|---|---|
@@ -98,7 +98,12 @@ index at all) and is indistinguishable from the map in time on this corpus.
    sorted ids they already hold.** The map and its build loop are removed. The
    sorted directory stays the single authority for ordinal assignment. The
    RSEG site keeps its refusal: a search that misses returns
-   `WriteError::ExemplarUnknownSeries`, as the map lookup did.
+   `WriteError::ExemplarUnknownSeries`, as the map lookup did. In
+   `build_object` and `from_records` the directory is built from the same
+   records the search then resolves, in the same call, so the search has
+   nothing to miss; `build_object` keeps the default of ref 0 it already had
+   for that case and returns no new error. The bulk loader's builder returns
+   a typed error there, where its map lookup would have panicked.
 
 3. **`build_object_columnar` stops resolving per row.** Each row already
    carries a batch-local stream ref. The function resolves each batch's stream
