@@ -136,14 +136,96 @@ fn create_scratch_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir(dir)
 }
 
+/// The smallest share of the process spill ceiling worth granting one query
+/// (ADR-0954 requirement 2, issue #2416), or the whole ceiling when that is
+/// smaller. A query that cannot reserve this much runs with spill disabled.
+pub const MIN_SPILL_RESERVATION_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The process-wide spill ceiling and the bytes of it live queries hold
+/// (ADR-0954 requirement 2, issue #2416). Each query granted spill reserves
+/// its scratch cap here before its disk manager is built, and releases it when
+/// its scratch directory is removed, so the caps of concurrent queries never
+/// sum past the ceiling.
+#[derive(Debug)]
+pub(crate) struct SpillBudget {
+    ceiling: u64,
+    reserved: Arc<AtomicU64>,
+}
+
+impl SpillBudget {
+    pub(crate) fn new(ceiling: u64) -> Self {
+        SpillBudget {
+            ceiling,
+            reserved: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Bytes currently reserved by live queries.
+    #[cfg(test)]
+    fn reserved(&self) -> u64 {
+        self.reserved.load(Ordering::Acquire)
+    }
+
+    /// Reserve `min(want, what remains of the ceiling)` in one atomic step, or
+    /// `None` when that is below [`MIN_SPILL_RESERVATION_BYTES`] (or below the
+    /// ceiling, when the ceiling itself is smaller).
+    pub(crate) fn reserve(&self, want: u64) -> Option<SpillReservation> {
+        let floor = MIN_SPILL_RESERVATION_BYTES.min(self.ceiling).max(1);
+        let mut current = self.reserved.load(Ordering::Acquire);
+        loop {
+            let grant = want.min(self.ceiling.saturating_sub(current));
+            if grant < floor {
+                return None;
+            }
+            match self.reserved.compare_exchange_weak(
+                current,
+                current + grant,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(SpillReservation {
+                        reserved: Arc::clone(&self.reserved),
+                        bytes: grant,
+                    });
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+/// One query's share of a [`SpillBudget`], returned to it on drop.
+#[derive(Debug)]
+pub(crate) struct SpillReservation {
+    reserved: Arc<AtomicU64>,
+    bytes: u64,
+}
+
+impl SpillReservation {
+    /// The scratch cap this reservation grants its query.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+impl Drop for SpillReservation {
+    fn drop(&mut self) {
+        self.reserved.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
 /// One query's scratch subdirectory, removed when this value drops.
 ///
 /// Held by the query's [`PinnedQuery`](crate::PinnedQuery) and moved into its
 /// [`PinnedStream`](crate::PinnedStream), declared last there so it drops after
-/// the `SessionContext` that owns the files inside it.
+/// the `SessionContext` that owns the files inside it. It also holds the
+/// query's [`SpillReservation`], which is released after the directory is
+/// removed.
 #[derive(Debug)]
 pub struct SpillScratch {
     dir: PathBuf,
+    _reservation: Option<SpillReservation>,
 }
 
 impl SpillScratch {
@@ -198,7 +280,12 @@ impl SpillScratch {
         for _ in 0..SCRATCH_NAME_ATTEMPTS {
             let dir = root.join(name());
             match create_scratch_dir(&dir) {
-                Ok(()) => return Ok(SpillScratch { dir }),
+                Ok(()) => {
+                    return Ok(SpillScratch {
+                        dir,
+                        _reservation: None,
+                    });
+                }
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                     collided.push(dir);
                 }
@@ -225,6 +312,12 @@ impl SpillScratch {
     /// The directory handed to DataFusion's disk manager.
     pub(crate) fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Hold `reservation` until this scratch directory is removed.
+    pub(crate) fn holding(mut self, reservation: SpillReservation) -> Self {
+        self._reservation = Some(reservation);
+        self
     }
 }
 
@@ -826,6 +919,74 @@ mod tests {
             unprovable_dir.is_dir(),
             "a sibling with no owner lock to test must be left in place, not guessed at"
         );
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// ADR-0954 requirement 2 (issue #2416): the ceiling bounds the sum of
+    /// live reservations. Two queries whose caps sum to the ceiling are both
+    /// granted, a third is refused while they live, and dropping one returns
+    /// its bytes so the next query is granted exactly those.
+    #[test]
+    fn reservations_never_sum_past_the_ceiling_and_return_on_drop() {
+        let budget = SpillBudget::new(192 * MIB);
+        let first = budget.reserve(128 * MIB).expect("the first query fits");
+        let second = budget
+            .reserve(128 * MIB)
+            .expect("64 MiB remain, which is the minimum");
+        assert_eq!((first.bytes(), second.bytes()), (128 * MIB, 64 * MIB));
+        assert_eq!(budget.reserved(), 192 * MIB);
+        assert!(budget.reserve(128 * MIB).is_none(), "nothing remains");
+
+        drop(first);
+        assert_eq!(budget.reserved(), 64 * MIB);
+        let third = budget
+            .reserve(192 * MIB)
+            .expect("the released bytes return");
+        assert_eq!(third.bytes(), 128 * MIB);
+        drop((second, third));
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Less than the minimum left is a refusal, not a sliver of a cap; a
+    /// ceiling below the minimum still grants one query the whole of it.
+    #[test]
+    fn a_remainder_below_the_minimum_is_refused() {
+        let budget = SpillBudget::new(128 * MIB);
+        let held = budget.reserve(128 * MIB - MIB).expect("fits");
+        assert!(
+            budget.reserve(128 * MIB).is_none(),
+            "1 MiB is below the minimum"
+        );
+        drop(held);
+
+        let small = SpillBudget::new(64 * 1024);
+        let only = small
+            .reserve(64 * 1024)
+            .expect("a small ceiling still grants");
+        assert_eq!(only.bytes(), 64 * 1024);
+        assert!(small.reserve(1).is_none());
+    }
+
+    /// The reservation a scratch directory holds is released when the
+    /// directory is removed, on the same drop.
+    #[test]
+    fn a_scratch_directory_releases_its_reservation_on_drop() {
+        let root = tempfile::tempdir().expect("root");
+        let budget = SpillBudget::new(256 * MIB);
+        let config = SpillConfig {
+            dir: root.path().to_path_buf(),
+            max_bytes: 256 * MIB,
+        };
+        let reservation = budget.reserve(256 * MIB).expect("fits");
+        let scratch = SpillScratch::create(&config)
+            .expect("scratch")
+            .holding(reservation);
+        assert_eq!(budget.reserved(), 256 * MIB);
+        let dir = scratch.dir().to_path_buf();
+        drop(scratch);
+        assert!(!dir.exists());
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// The sweep never touches its own root.

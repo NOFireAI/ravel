@@ -141,7 +141,9 @@ use crate::session::{
 };
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
-use crate::spill::{OperatorSpill, SpillCounts, SpillScratch, accumulate_spill_counts};
+use crate::spill::{
+    OperatorSpill, SpillBudget, SpillCounts, SpillScratch, accumulate_spill_counts,
+};
 use crate::validate::{referenced_base_tables, unreadable_table_reference, validate_query};
 
 /// Which of the five v1 tables (and thus which `Signal`) a query targets, or
@@ -1028,6 +1030,11 @@ pub struct SqlExecutor {
     /// [`SqlExecutor::new`] default) keeps that constant; the server installs
     /// the deployment's own sweep grace with [`Self::with_ddl_min_grace_ms`].
     ddl_min_grace_ms: Option<u64>,
+    /// The process spill ceiling every query granted spill reserves its
+    /// scratch cap from (ADR-0954 requirement 2, issue #2416): the configured
+    /// `spill.max_bytes`, shared by every query this executor serves. `None`
+    /// when spill is not configured.
+    spill_budget: Option<SpillBudget>,
     /// Replaces the plan a pinned statement executes after the tie-order
     /// rewrite, so a test can make it diverge from the classification plan.
     #[cfg(test)]
@@ -1054,11 +1061,16 @@ impl SqlExecutor {
         config: SqlConfig,
         max_tenant_bytes: usize,
     ) -> Self {
+        let spill_budget = config
+            .spill
+            .as_ref()
+            .map(|spill| SpillBudget::new(spill.max_bytes));
         SqlExecutor {
             catalog,
             fetcher,
             log_fetcher,
             span_fetcher,
+            spill_budget,
             config,
             max_tenant_bytes,
             tenants: Mutex::new(HashMap::new()),
@@ -1887,9 +1899,27 @@ impl SqlExecutor {
         // or unwritable spill area is a typed `SpillUnavailable` raised with
         // nothing written and no operator started, rather than an opaque IO
         // failure from inside a spilling operator half way through a query.
-        let scratch = match &config.spill {
-            Some(spill) if analyzed.as_ref().is_some_and(plan_is_spill_eligible) => {
-                Some((SpillScratch::create(spill)?, spill.max_bytes))
+        //
+        // ADR-0954 requirement 2 (issue #2416): the query's scratch cap is
+        // reserved from the process-wide ceiling first, and a query that
+        // cannot reserve the minimum runs with spill disabled.
+        let scratch = match (&config.spill, &self.spill_budget) {
+            (Some(spill), Some(budget))
+                if analyzed.as_ref().is_some_and(plan_is_spill_eligible) =>
+            {
+                match budget.reserve(spill.max_bytes) {
+                    Some(reservation) => {
+                        let cap = reservation.bytes();
+                        Some((SpillScratch::create(spill)?.holding(reservation), cap))
+                    }
+                    None => {
+                        tracing::warn!(
+                            "SQL spill disabled for this statement: less than the minimum \
+                             reservation remains of the process spill ceiling"
+                        );
+                        None
+                    }
+                }
             }
             _ => None,
         };
@@ -6212,55 +6242,15 @@ mod tests {
     /// spill granted.
     #[tokio::test]
     async fn an_executed_plan_that_is_not_eligible_runs_with_spill_disabled() {
-        use ravel_catalog::Catalog;
-
-        let sql = "SELECT ts, series_id, count(*) AS c FROM samples \
-                   GROUP BY ts, series_id ORDER BY c DESC LIMIT 10";
         let root = tempfile::tempdir().expect("spill root");
-        let pin = |tamper: Option<fn(LogicalPlan) -> LogicalPlan>| {
-            let store = Arc::new(MemoryStore::new());
-            let catalog =
-                Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
-            let mut executor = SqlExecutor::new(
-                catalog,
-                SegmentFetcher::new(store.clone()),
-                LogSegmentFetcher::new(store.clone()),
-                SpanSegmentFetcher::new(store),
-                SqlConfig {
-                    spill: Some(crate::config::SpillConfig {
-                        dir: root.path().to_path_buf(),
-                        max_bytes: 1 << 30,
-                    }),
-                    ..SqlConfig::default()
-                },
-                1 << 30,
-            );
-            executor.executed_plan_tamper = tamper;
-            async move {
-                let snapshot = Snapshot {
-                    segments: Vec::new(),
-                    segments_pruned: 0,
-                    pending_erasure: Vec::new(),
-                };
-                executor
-                    .plan_pinned(
-                        TenantHash([110u8; 16]),
-                        snapshot,
-                        sql,
-                        &QueryAccounting::new(),
-                        &[],
-                    )
-                    .await
-                    .expect("the statement plans")
-            }
-        };
-
-        let granted = pin(None).await;
+        let granted = pin_spill_eligible(&spill_test_executor(root.path(), 1 << 30)).await;
         assert!(granted.scratch.is_some(), "the control is granted spill");
         assert_eq!(sort_terms(granted.frame.logical_plan()).len(), 3);
         drop(granted);
 
-        let refused = pin(Some(keep_the_first_sort_term)).await;
+        let mut executor = spill_test_executor(root.path(), 1 << 30);
+        executor.executed_plan_tamper = Some(keep_the_first_sort_term);
+        let refused = pin_spill_eligible(&executor).await;
         assert!(
             refused.scratch.is_none(),
             "a diverged executed plan must not keep its spill grant"
@@ -6273,6 +6263,80 @@ mod tests {
             std::fs::read_dir(root.path()).expect("readable").count(),
             0,
             "the scratch directory the classification granted is removed"
+        );
+    }
+
+    /// An executor over an empty store with spill configured at `root` and a
+    /// process spill ceiling of `max_bytes`.
+    fn spill_test_executor(root: &std::path::Path, max_bytes: u64) -> SqlExecutor {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Arc::new(
+            ravel_catalog::Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"),
+        );
+        SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store),
+            SqlConfig {
+                spill: Some(crate::config::SpillConfig {
+                    dir: root.to_path_buf(),
+                    max_bytes,
+                }),
+                ..SqlConfig::default()
+            },
+            1 << 30,
+        )
+    }
+
+    /// Pin a spill-eligible statement over an empty `samples` snapshot.
+    async fn pin_spill_eligible(executor: &SqlExecutor) -> PinnedQuery {
+        let snapshot = Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        executor
+            .plan_pinned(
+                TenantHash([110u8; 16]),
+                snapshot,
+                "SELECT ts, series_id, count(*) AS c FROM samples \
+                 GROUP BY ts, series_id ORDER BY c DESC LIMIT 10",
+                &QueryAccounting::new(),
+                &[],
+            )
+            .await
+            .expect("the statement plans")
+    }
+
+    /// ADR-0954 requirement 2 (issue #2416): one executor's statements share
+    /// one spill ceiling. The first statement granted spill reserves all of it,
+    /// so a second pinned while the first lives runs with spill disabled, and
+    /// once the first is dropped a third is granted spill again.
+    #[tokio::test]
+    async fn concurrent_statements_share_the_process_spill_ceiling() {
+        let root = tempfile::tempdir().expect("spill root");
+        let executor = spill_test_executor(root.path(), 1 << 30);
+        let first = pin_spill_eligible(&executor).await;
+        assert!(
+            first.scratch.is_some(),
+            "the first statement is granted spill"
+        );
+        let second = pin_spill_eligible(&executor).await;
+        assert!(
+            second.scratch.is_none(),
+            "nothing remains of the ceiling for a concurrent statement"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("readable").count(),
+            1,
+            "only the first statement has a scratch directory"
+        );
+        drop((first, second));
+        let third = pin_spill_eligible(&executor).await;
+        assert!(
+            third.scratch.is_some(),
+            "the released ceiling is granted again"
         );
     }
 

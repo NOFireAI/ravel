@@ -204,7 +204,10 @@ drops the reason drops the requirement.
      live only for the process and are gone with it. Making the node-wide
      counter authoritative across processes that do not share memory is the
      open question flagged above; until it is settled the safe posture is one
-     spilling process per scratch volume (requirement 7).
+     spilling process per scratch volume (requirement 7). (Amended: see the
+     cache-dir spill default amendment below, which makes the configured
+     ceiling one process-wide bound that each query reserves its cap from;
+     per-tenant and cross-process quotas remain open.)
 
 3. **An explicitly configured spill directory, never DataFusion's
    accidental default.** ADR-0102's Context item 3 (lines 51-63) documented
@@ -541,8 +544,8 @@ flowchart TB
 
 <!-- amendment-applies: sections="Normative implementation requirements" pointer="cache-dir spill default amendment" -->
 
-This is the cache-dir spill default amendment. It changes requirements 3, 4
-and 7 as follows; everything else in the Decision stands.
+This is the cache-dir spill default amendment. It changes requirements 2,
+3, 4 and 7 as follows; everything else in the Decision stands.
 
 **Requirement 3: where the spill directory and its ceiling come from.** A
 deployment no longer has to name a spill directory for spill to be on.
@@ -577,10 +580,23 @@ Startup logs the outcome as two `performance default resolved` lines,
 `sql_spill_dir` and `sql_spill_max_bytes`, each with a `source` of `env`,
 `cache-dir`, `env-override`, `derived`, `flag-off` or `unset`.
 
-The derived figure is the per-query ceiling (`SpillConfig::max_bytes`).
-Requirement 2's per-tenant and node-wide quotas are not implemented by this
-amendment, so several queries spilling at once, or several processes
-sharing one cache volume, can together hold more than one derived ceiling.
+**Requirement 2: the ceiling is one process-wide bound.** The resolved
+ceiling (`SpillConfig::max_bytes`, derived or configured) bounds the scratch
+of all the queries one `SqlExecutor` serves together, which in `ravel-server`
+is the whole process. A query the eligibility gate admits reserves its own
+disk-manager cap from that ceiling before its scratch directory is created:
+the ceiling, or what remains of it if that is less. A query that would get
+less than 64 MiB (or less than the whole ceiling, when the ceiling is below
+64 MiB) runs with spill disabled, and the reason is logged at WARN. The
+reservation is released when the query's scratch directory is removed, on
+completion, error and cancellation alike. A query admitted while no other
+holds a reservation reserves the whole ceiling, so while it runs a
+concurrent eligible query runs with spill disabled; that is the price of
+the bound. The
+per-tenant quota is not implemented, and nothing bounds the sum across
+processes, so several processes sharing one cache volume can together hold
+more than one ceiling: one spilling process per volume stays the safe
+posture.
 
 **Requirement 4: a `Sort` over a spill-exact aggregate is eligible.** Before
 planning, `rewrite_sort_group_key_tie_order` appends to every `Sort` whose
