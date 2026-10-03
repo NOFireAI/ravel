@@ -69,10 +69,13 @@ fn identity() -> ObjectIdentity {
     }
 }
 
-/// Cut a block every 3 records so each 12-record object holds 4 blocks.
+/// Cut a block every 3 records so each 12-record object holds 4 blocks, in two
+/// row groups of 2 blocks: the cached route deals whole row groups, so a segment
+/// with two groups can still be split across partitions.
 fn small_blocks() -> RlogConfig {
     RlogConfig {
         block_target_records: 3,
+        group_target_blocks: 2,
         ..RlogConfig::default()
     }
 }
@@ -405,11 +408,12 @@ async fn uncached_segment_granular_returns_every_row_once() {
     );
 }
 
-/// With a read cache attached the intra-segment block striping is unchanged: a
-/// single segment's blocks are spread across partitions. This is asserted
-/// through the assignment (per-partition `blocks_scanned`), not the store: at
-/// least one partition scans a block count that is not a whole-segment multiple,
-/// which is only possible when a segment's four blocks land in more than one
+/// With a read cache attached the intra-segment striping is by whole row group
+/// (ADR-2414 decision A1): a single segment's row groups are spread across
+/// partitions. This is asserted through the assignment (per-partition
+/// `blocks_scanned`), not the store: at least one partition scans a block count
+/// that is not a whole-segment multiple, which is only possible when a
+/// segment's four blocks (two row groups of two) land in more than one
 /// partition. The cached GET count stays within the segment-granular bound
 /// (`<= 2 * 6`) because single-flight coalesces the re-opens.
 #[tokio::test]
