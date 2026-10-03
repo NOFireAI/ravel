@@ -102,15 +102,21 @@ index at all) and is indistinguishable from the map in time on this corpus.
    `build_object` and `from_records` the directory is built from the same
    records the search then resolves, in the same call, so the search has
    nothing to miss; `build_object` keeps the default of ref 0 it already had
-   for that case and returns no new error. The bulk loader's builder returns
-   a typed error there, where its map lookup would have panicked.
+   for that case and returns no new error, and `from_records` stays
+   infallible with the same default, since its signature returns no `Result`
+   and this ADR does not change it. The bulk loader's builder already returns
+   a `Result`, so it returns a typed error there, where its map lookup would
+   have panicked.
 
 3. **`build_object_columnar` stops resolving per row.** Each row already
    carries a batch-local stream ref. The function resolves each batch's stream
    ids once into a batch-local-to-global remap vector and indexes that vector
-   per row. A batch stream id that is absent from the object's directory is a
-   malformed batch and returns a typed error; it is never resolved to a
-   default ref.
+   per row. The directory is built by pairing each batch's `stream_ids` with
+   its `stream_attrs`, so a batch whose `stream_attrs` is shorter leaves ids
+   out of it. That batch is malformed and returns a typed error; such an id is
+   never resolved to a default ref. This covers that one condition. A row's
+   batch-local ref that points past the end of its batch's `stream_ids` is a
+   different malformed batch, panics today, and is left as it is by this ADR.
 
 4. **Each change is pinned by an output-equality test; the row path is also
    pinned by a bench.** The encoded bytes must be identical before and after,
@@ -183,8 +189,11 @@ flowchart LR
   20,000 streams on the row path today). No measurable change in encode time
   is expected or claimed on the row path.
 - A binary search costs time that grows with the logarithm of the key count,
-  where a map's probe does not. The time measurement and decision 4's bench
-  cover the row path up to 20,000 streams per object. The other four changes
+  where a map's probe does not. On the row path, decision 4's bench reaches
+  1,000 streams per object: `logseg_encode` builds at most 20,000 records at
+  20 per stream. The 20,000-stream shape, where the search is deepest and the
+  map's share was highest, is covered only by the Stage 0 measurement, whose
+  harness lives on its result branch and not on main. The other four changes
   have no bench. Their exposure is bounded by how often they search: the
   columnar writer searches once per stream per batch, not per row; the two
   batch builders search once per row, the same count the row path was
