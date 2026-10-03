@@ -56,6 +56,28 @@
       ]
     },
     {
+      "Sid": "MaintainProvCreate",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*"
+        }
+      }
+    },
+    {
+      "Sid": "MaintainProvCas",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+      "Condition": {
+        "Null": {
+          "s3:if-match": "false"
+        }
+      }
+    },
+    {
       "Sid": "MaintainDelete",
       "Effect": "Allow",
       "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],

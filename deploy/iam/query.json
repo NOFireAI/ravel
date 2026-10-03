@@ -69,6 +69,17 @@
       }
     },
     {
+      "Sid": "QueryProvCreate",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*"
+        }
+      }
+    },
+    {
       "Sid": "QueryProbeDelete",
       "Effect": "Allow",
       "Action": "s3:DeleteObject",
