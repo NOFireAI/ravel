@@ -108,6 +108,22 @@ pub enum ComparatorError {
          override for statement {statement_number}"
     )]
     UnresolvedOrderKey { statement_number: u32, expr: String },
+    #[error(
+        "order_key_columns names column {column:?}, which is not present in the {side} output \
+         schema"
+    )]
+    OrderKeyColumnNotFound { column: String, side: &'static str },
+    #[error(
+        "order_key_columns column {column:?} resolves to position {subject_index} in the \
+         subject output but position {reference_index} in the reference output"
+    )]
+    OrderKeyColumnPositionMismatch {
+        column: String,
+        subject_index: usize,
+        reference_index: usize,
+    },
+    #[error("ORDER BY key column index {index} is out of range for a {width}-column result")]
+    OrderKeyIndexOutOfRange { index: usize, width: usize },
 }
 
 /// The tie-breaking key and truncation shape ADR-2040 D7 compares under: the
@@ -119,16 +135,25 @@ pub struct TieSpec {
     pub key: Vec<usize>,
     pub limit: Option<u64>,
     pub offset: u64,
+    /// Set when `suite.toml` declares `compare = "cardinality"` for this
+    /// statement: `compare` skips key resolution and boundary-tie reduction
+    /// entirely and asserts only row and column counts, carrying this
+    /// reason into [`Verdict::CardinalityOnly`]. `None` leaves the ordinary
+    /// D7 rules (including the LIMIT-without-ORDER-BY cardinality-only
+    /// case) to decide the verdict from `key`/`limit` instead.
+    pub cardinality_reason: Option<String>,
 }
 
 /// Final judgement a comparison reaches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     /// Every row (after boundary-tie reduction) matched.
     Pass,
-    /// The statement has a LIMIT but no resolvable ORDER BY key, so row
-    /// identity is unconstrained; only row and column counts were checked.
-    CardinalityOnly,
+    /// Row identity could not be asserted, so only row and column counts
+    /// were checked: either the statement has a LIMIT but no resolvable
+    /// ORDER BY key (`None`), or `suite.toml` declares `compare =
+    /// "cardinality"` for it, carrying the declared reason (`Some`).
+    CardinalityOnly(Option<String>),
     /// A row mismatch survived boundary-tie reduction and float tolerance.
     Fail,
 }
@@ -596,10 +621,19 @@ fn parse_limit_clause(
 /// Resolve `sql`'s `TieSpec`: its ORDER BY key (by D7's textual rules, or
 /// `override_key` when given), its LIMIT, and its OFFSET. `statement_number`
 /// is used only to name the statement in [`ComparatorError::UnresolvedOrderKey`].
+///
+/// `cardinality_reason`, when `Some`, is `suite.toml`'s declared `compare =
+/// "cardinality"` reason for this statement: ORDER BY key resolution is
+/// skipped entirely (there is no row identity to resolve a key for) and the
+/// returned `TieSpec` carries the reason in
+/// [`TieSpec::cardinality_reason`], with an empty `key`. LIMIT/OFFSET are
+/// still parsed, since a cardinality-only statement's row count still
+/// matters to [`compare`].
 pub fn resolve_tie_spec(
     statement_number: u32,
     sql: &str,
     override_key: Option<&[usize]>,
+    cardinality_reason: Option<&str>,
 ) -> Result<TieSpec, ComparatorError> {
     let dialect = GenericDialect {};
     let mut statements =
@@ -616,11 +650,20 @@ pub fn resolve_tie_spec(
         ));
     };
     let (limit, offset) = parse_limit_clause(query.limit_clause.as_ref())?;
+    if let Some(reason) = cardinality_reason {
+        return Ok(TieSpec {
+            key: Vec::new(),
+            limit,
+            offset,
+            cardinality_reason: Some(reason.to_string()),
+        });
+    }
     let Some(order_by) = &query.order_by else {
         return Ok(TieSpec {
             key: Vec::new(),
             limit,
             offset,
+            cardinality_reason: None,
         });
     };
     let projection = select_projection(&query.body)?;
@@ -637,13 +680,19 @@ pub fn resolve_tie_spec(
         }
     }
     if all_resolved {
-        return Ok(TieSpec { key, limit, offset });
+        return Ok(TieSpec {
+            key,
+            limit,
+            offset,
+            cardinality_reason: None,
+        });
     }
     match override_key {
         Some(k) => Ok(TieSpec {
             key: k.to_vec(),
             limit,
             offset,
+            cardinality_reason: None,
         }),
         None => Err(ComparatorError::UnresolvedOrderKey {
             statement_number,
@@ -654,6 +703,52 @@ pub fn resolve_tie_spec(
                 .join(", "),
         }),
     }
+}
+
+/// Resolve `names` (`suite.toml`'s `order_key_columns`) to projection
+/// indices by matching each name against both `subject_columns` and
+/// `reference_columns` (the engines' actual output column names, in
+/// result-column order). Used when a statement's ORDER BY key cannot be
+/// found in the SQL text itself (e.g. Q24's `SELECT *`, where the
+/// projection is a wildcard rather than a list of named expressions), so
+/// the comparator resolves the name against each side's real result schema
+/// instead. Both sides must carry the name, and it must land at the same
+/// position on both: a name present only on one side, or that resolves to
+/// different positions on each, is a typed error rather than a silently
+/// wrong key.
+pub fn resolve_order_key_columns(
+    names: &[String],
+    subject_columns: &[String],
+    reference_columns: &[String],
+) -> Result<Vec<usize>, ComparatorError> {
+    names
+        .iter()
+        .map(|name| {
+            let subject_index =
+                subject_columns
+                    .iter()
+                    .position(|c| c == name)
+                    .ok_or_else(|| ComparatorError::OrderKeyColumnNotFound {
+                        column: name.clone(),
+                        side: "subject",
+                    })?;
+            let reference_index = reference_columns
+                .iter()
+                .position(|c| c == name)
+                .ok_or_else(|| ComparatorError::OrderKeyColumnNotFound {
+                    column: name.clone(),
+                    side: "reference",
+                })?;
+            if subject_index != reference_index {
+                return Err(ComparatorError::OrderKeyColumnPositionMismatch {
+                    column: name.clone(),
+                    subject_index,
+                    reference_index,
+                });
+            }
+            Ok(subject_index)
+        })
+        .collect()
 }
 
 fn project(row: &[Cell], key: &[usize]) -> Vec<Cell> {
@@ -819,6 +914,9 @@ pub fn compare(
                 });
             }
         }
+        if let Some(&index) = tie.key.iter().find(|&&i| i >= width) {
+            return Err(ComparatorError::OrderKeyIndexOutOfRange { index, width });
+        }
     }
 
     // Row counts must agree in every verdict mode (D7 rule 1a), including
@@ -834,12 +932,26 @@ pub fn compare(
         });
     }
 
+    // suite.toml declared this statement's row identity unrecoverable from
+    // its output (e.g. an ORDER BY column that is not projected): skip key
+    // resolution and boundary-tie reduction entirely, carrying the declared
+    // reason into the verdict.
+    if let Some(reason) = &tie.cardinality_reason {
+        return Ok(ComparisonReport {
+            verdict: Verdict::CardinalityOnly(Some(reason.clone())),
+            float_mismatches: Vec::new(),
+            row_mismatch: RowMismatch::default(),
+            tie_rows_reduced: 0,
+            float_cells_compared: 0,
+        });
+    }
+
     // A LIMIT with no resolvable ORDER BY key: row identity is genuinely
     // unconstrained (any N rows may come back), so only cardinality can be
     // asserted (already proven equal above).
     if tie.limit.is_some() && tie.key.is_empty() {
         return Ok(ComparisonReport {
-            verdict: Verdict::CardinalityOnly,
+            verdict: Verdict::CardinalityOnly(None),
             float_mismatches: Vec::new(),
             row_mismatch: RowMismatch::default(),
             tie_rows_reduced: 0,
@@ -963,7 +1075,12 @@ mod tests {
     use super::*;
 
     fn tie(key: Vec<usize>, limit: Option<u64>, offset: u64) -> TieSpec {
-        TieSpec { key, limit, offset }
+        TieSpec {
+            key,
+            limit,
+            offset,
+            cardinality_reason: None,
+        }
     }
 
     /// Required test: tie cut by LIMIT passes when subject picked a
@@ -1125,7 +1242,7 @@ mod tests {
             .expect("statement 43 present");
         let over = suite.override_for(43).expect("Q43 override present");
 
-        let without_override = resolve_tie_spec(43, &statement.sql, None);
+        let without_override = resolve_tie_spec(43, &statement.sql, None, None);
         assert!(
             matches!(
                 without_override,
@@ -1134,11 +1251,13 @@ mod tests {
             "Q43 must not resolve without the override: {without_override:?}"
         );
 
-        let with_override = resolve_tie_spec(43, &statement.sql, Some(&over.order_key))
+        let order_key = over.order_key.as_deref().expect("Q43 declares order_key");
+        let with_override = resolve_tie_spec(43, &statement.sql, Some(order_key), None)
             .expect("Q43 resolves with its override");
         assert_eq!(with_override.key, vec![0]);
         assert_eq!(with_override.limit, Some(10));
         assert_eq!(with_override.offset, 1000);
+        assert_eq!(with_override.cardinality_reason, None);
     }
 
     /// Required test: an unresolvable ORDER BY key without an override is
@@ -1146,8 +1265,55 @@ mod tests {
     #[test]
     fn unresolvable_order_key_without_override_is_refused() {
         let sql = r#"SELECT "a", "b" FROM t ORDER BY "c" LIMIT 5"#;
-        let err = resolve_tie_spec(999, sql, None).expect_err("c is neither selected nor aliased");
+        let err =
+            resolve_tie_spec(999, sql, None, None).expect_err("c is neither selected nor aliased");
         assert!(matches!(err, ComparatorError::UnresolvedOrderKey { .. }));
+    }
+
+    /// `resolve_order_key_columns` resolves a name present at the same
+    /// position on both sides.
+    #[test]
+    fn order_key_columns_resolve_by_name() {
+        let subject = vec!["a".to_string(), "EventTime".to_string()];
+        let reference = subject.clone();
+        let resolved = resolve_order_key_columns(&["EventTime".to_string()], &subject, &reference)
+            .expect("EventTime is present on both sides at the same position");
+        assert_eq!(resolved, vec![1]);
+    }
+
+    /// A name absent from one side is a typed error, not a silently wrong
+    /// (or default) index.
+    #[test]
+    fn order_key_columns_missing_name_is_refused() {
+        let subject = vec!["a".to_string(), "b".to_string()];
+        let reference = subject.clone();
+        let err = resolve_order_key_columns(&["EventTime".to_string()], &subject, &reference)
+            .expect_err("EventTime is not present on either side");
+        assert!(matches!(
+            err,
+            ComparatorError::OrderKeyColumnNotFound {
+                side: "subject",
+                ..
+            }
+        ));
+    }
+
+    /// A name present on both sides but at different positions is a typed
+    /// error: the comparator cannot tell which position is the real key.
+    #[test]
+    fn order_key_columns_position_mismatch_is_refused() {
+        let subject = vec!["EventTime".to_string(), "a".to_string()];
+        let reference = vec!["a".to_string(), "EventTime".to_string()];
+        let err = resolve_order_key_columns(&["EventTime".to_string()], &subject, &reference)
+            .expect_err("EventTime resolves to different positions on each side");
+        assert!(matches!(
+            err,
+            ComparatorError::OrderKeyColumnPositionMismatch {
+                subject_index: 0,
+                reference_index: 1,
+                ..
+            }
+        ));
     }
 
     /// Required test, and distinguishing test for wrong implementation (c):
@@ -1310,6 +1476,22 @@ mod tests {
         let report =
             compare(&reference, &subject, &tie(vec![], Some(3), 0), None).expect("compare");
         assert_eq!(report.verdict, Verdict::Fail);
+    }
+
+    /// Required (D3c): an out-of-range key index (from any override source:
+    /// a numeric `order_key`, a resolved `order_key_columns`, or a bad
+    /// textual resolution) is a typed error, never a panic through
+    /// `project`'s `row[i]` indexing.
+    #[test]
+    fn out_of_range_order_key_index_is_typed_error_not_panic() {
+        let reference = vec![vec![Cell::Int(1), Cell::Int(2)]];
+        let subject = vec![vec![Cell::Int(1), Cell::Int(2)]];
+        let err = compare(&reference, &subject, &tie(vec![5], Some(1), 0), None)
+            .expect_err("index 5 is out of range for a 2-column result");
+        assert_eq!(
+            err,
+            ComparatorError::OrderKeyIndexOutOfRange { index: 5, width: 2 }
+        );
     }
 
     /// Required test: a JSON reference row parses to the same cells as the
@@ -1537,5 +1719,91 @@ mod tests {
         );
         assert_eq!(fm.reference_bits, 20.0_f64.to_bits());
         assert_eq!(fm.subject_bits, bumped.to_bits());
+    }
+
+    /// D3d: build every one of the frozen corpus's 43 statements' `TieSpec`
+    /// the way a real comparison run would (suite.toml's `order_key` /
+    /// `order_key_columns` / `compare = "cardinality"` overrides, falling
+    /// back to the textual ORDER BY rules when a statement has none), and
+    /// classify each by what it can assert: a resolved key (full exact
+    /// comparison, D1/D2's boundary-tie rules apply), a LIMIT with no key
+    /// and no declared reason (Q18's existing cardinality-only rule), or a
+    /// declared cardinality reason (Q25/Q27). Asserts none of the 43
+    /// statements still returns `UnresolvedOrderKey`, and that exactly Q18,
+    /// Q25, and Q27 classify as cardinality-only.
+    ///
+    /// Q24's `SELECT *` needs a real output column list to resolve
+    /// `order_key_columns` against. `HITS_COLUMNS` is a stand-in for the
+    /// engines' actual result schema: no SQL engine is wired into this
+    /// crate yet (see `engine.rs`), so there is no live schema to resolve
+    /// against. Only `EventTime`'s presence and position matter to this
+    /// test; the rest of the list is illustrative, not asserted elsewhere.
+    #[test]
+    fn every_statement_resolves_and_only_q18_q25_q27_are_cardinality_only() {
+        const HITS_COLUMNS: &[&str] = &[
+            "WatchID",
+            "UserID",
+            "URLHash",
+            "RefererHash",
+            "CounterID",
+            "RegionID",
+            "ClientIP",
+            "AdvEngineID",
+            "ResolutionWidth",
+            "MobilePhone",
+            "SearchEngineID",
+            "TraficSourceID",
+            "IsRefresh",
+            "IsLink",
+            "IsDownload",
+            "DontCountHits",
+            "WindowClientWidth",
+            "WindowClientHeight",
+            "EventTime",
+            "EventDate",
+            "URL",
+            "Title",
+            "Referer",
+            "SearchPhrase",
+            "MobilePhoneModel",
+        ];
+        let columns: Vec<String> = HITS_COLUMNS.iter().map(|s| s.to_string()).collect();
+
+        let suite = crate::clickbench_parquet::suite::load_default().expect("suite loads");
+        assert_eq!(
+            suite.statements.len(),
+            crate::clickbench_parquet::suite::STATEMENT_COUNT
+        );
+
+        let mut cardinality_only = Vec::new();
+        for statement in &suite.statements {
+            let over = suite.override_for(statement.number);
+
+            let tie = if let Some(over) = over.filter(|o| o.is_cardinality_only()) {
+                resolve_tie_spec(
+                    statement.number,
+                    &statement.sql,
+                    None,
+                    over.reason.as_deref(),
+                )
+            } else if let Some(names) = over.and_then(|o| o.order_key_columns.as_deref()) {
+                let resolved = resolve_order_key_columns(names, &columns, &columns)
+                    .unwrap_or_else(|e| panic!("statement {}: {e}", statement.number));
+                resolve_tie_spec(statement.number, &statement.sql, Some(&resolved), None)
+            } else {
+                let numeric = over.and_then(|o| o.order_key.as_deref());
+                resolve_tie_spec(statement.number, &statement.sql, numeric, None)
+            };
+            let tie = tie
+                .unwrap_or_else(|e| panic!("statement {} did not resolve: {e}", statement.number));
+
+            let is_cardinality_only =
+                tie.cardinality_reason.is_some() || (tie.limit.is_some() && tie.key.is_empty());
+            if is_cardinality_only {
+                cardinality_only.push(statement.number);
+            }
+        }
+
+        assert_eq!(cardinality_only, vec![18, 25, 27]);
     }
 }

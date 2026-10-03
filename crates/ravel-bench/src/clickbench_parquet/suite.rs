@@ -69,6 +69,21 @@ pub enum SuiteError {
          without float_max_ulps, or vice versa; a float tolerance needs both"
     )]
     IncompleteFloatDeclaration { number: u32 },
+    /// A `[[statement]]` override declared `compare` as something other than
+    /// `"cardinality"`, the only supported value.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares compare = \
+         {value:?}; the only supported value is \"cardinality\""
+    )]
+    UnknownCompareMode { number: u32, value: String },
+    /// A `[[statement]]` override declared `compare = "cardinality"` with no
+    /// `reason`: a row-count-only comparison without a stated reason is not
+    /// distinguishable from an override nobody checked.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares compare = \
+         \"cardinality\" without a reason"
+    )]
+    CardinalityWithoutReason { number: u32 },
 }
 
 /// `suite.toml`'s `[table]` section: the Ravel DDL template that mounts the
@@ -96,8 +111,34 @@ pub struct StatementOverride {
     pub number: u32,
     /// 0-indexed projection columns the comparator ties on, in order, used
     /// when the statement's ORDER BY clause does not resolve to a
-    /// projection index under the comparator's own textual rules.
-    pub order_key: Vec<usize>,
+    /// projection index under the comparator's own textual rules and the
+    /// key cannot be named by [`Self::order_key_columns`] either (e.g. an
+    /// ORDER BY expression with no corresponding output column name, as
+    /// Q43's `DATE_TRUNC('minute', M)` has none under its alias `M`).
+    #[serde(default)]
+    pub order_key: Option<Vec<usize>>,
+    /// Output column names the comparator ties on, in order, resolved at
+    /// compare time by name against both the subject's and the reference's
+    /// actual result schemas (both must carry every name). Used when the
+    /// statement's projection is not textually stable enough for
+    /// `order_key`'s positional form (e.g. Q24's `SELECT *`, where the
+    /// column position a name lands on depends on the table's column order,
+    /// not on anything in the SQL text itself).
+    #[serde(default)]
+    pub order_key_columns: Option<Vec<String>>,
+    /// When set to `"cardinality"`, this statement compares only row and
+    /// column counts; `reason` is then required and explains why no row
+    /// identity can be recovered from the output (e.g. an ORDER BY column
+    /// that is not projected, so rows past a tie cannot be told apart).
+    /// `"cardinality"` is the only supported value; anything else is a
+    /// typed load error ([`SuiteError::UnknownCompareMode`]).
+    #[serde(default)]
+    pub compare: Option<String>,
+    /// Required alongside `compare = "cardinality"`
+    /// ([`SuiteError::CardinalityWithoutReason`] otherwise); unused
+    /// otherwise.
+    #[serde(default)]
+    pub reason: Option<String>,
     /// Why this statement's float cells are allowed to differ by up to
     /// `float_max_ulps` (e.g. a sequential-fold `avg`, ADR-0022). Declaring
     /// one of `float_reason`/`float_max_ulps` without the other is a typed
@@ -123,6 +164,14 @@ impl StatementOverride {
             }),
             _ => None,
         }
+    }
+
+    /// Whether this override declares `compare = "cardinality"`. `load`
+    /// already rejects that declaration without a `reason`, so by the time a
+    /// caller sees a loaded `Suite`, `true` here means [`Self::reason`] is
+    /// `Some`.
+    pub fn is_cardinality_only(&self) -> bool {
+        self.compare.as_deref() == Some("cardinality")
     }
 }
 
@@ -195,6 +244,19 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
             return Err(SuiteError::IncompleteFloatDeclaration {
                 number: over.number,
             });
+        }
+        if let Some(mode) = &over.compare {
+            if mode != "cardinality" {
+                return Err(SuiteError::UnknownCompareMode {
+                    number: over.number,
+                    value: mode.clone(),
+                });
+            }
+            if over.reason.is_none() {
+                return Err(SuiteError::CardinalityWithoutReason {
+                    number: over.number,
+                });
+            }
         }
     }
     Ok(Suite {
@@ -275,9 +337,10 @@ mod tests {
     fn statement_43_override_loads() {
         let suite = load_default().expect("pinned corpus loads");
         let over = suite.override_for(43).expect("Q43 override present");
-        assert_eq!(over.order_key, vec![0]);
+        assert_eq!(over.order_key, Some(vec![0]));
         assert!(suite.override_for(1).is_none());
         assert_eq!(over.float_tolerance(), None);
+        assert!(!over.is_cardinality_only());
     }
 
     /// A `[[statement]]` block declaring only `float_reason` (no
@@ -340,5 +403,81 @@ mod tests {
         let tolerance = over.float_tolerance().expect("both fields set");
         assert_eq!(tolerance.reason, "sequential-fold avg rounding");
         assert_eq!(tolerance.max_ulps, 4);
+    }
+
+    /// A `[[statement]]` block naming an `order_key_columns` list (rather
+    /// than a positional `order_key`) loads with no `order_key` at all.
+    #[test]
+    fn order_key_columns_override_loads() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 24
+            order_key_columns = ["EventTime"]
+        "#;
+        let suite = load(QUERIES_SQL, toml).expect("order_key_columns override loads");
+        let over = suite.override_for(24).expect("override present");
+        assert_eq!(over.order_key, None);
+        assert_eq!(over.order_key_columns, Some(vec!["EventTime".to_string()]));
+        assert!(!over.is_cardinality_only());
+    }
+
+    /// A `compare = "cardinality"` block with its required `reason` loads,
+    /// and `is_cardinality_only` reports it.
+    #[test]
+    fn cardinality_compare_override_loads() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 25
+            compare = "cardinality"
+            reason = "ORDER BY key not projected"
+        "#;
+        let suite = load(QUERIES_SQL, toml).expect("cardinality override loads");
+        let over = suite.override_for(25).expect("override present");
+        assert!(over.is_cardinality_only());
+        assert_eq!(over.reason.as_deref(), Some("ORDER BY key not projected"));
+    }
+
+    /// `compare = "cardinality"` with no `reason` is a typed load error, not
+    /// a silently-unexplained override.
+    #[test]
+    fn cardinality_compare_without_reason_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 25
+            compare = "cardinality"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("reason-less cardinality is refused");
+        assert!(matches!(
+            err,
+            SuiteError::CardinalityWithoutReason { number: 25 }
+        ));
+    }
+
+    /// A `compare` value other than `"cardinality"` is a typed load error.
+    #[test]
+    fn unknown_compare_mode_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 25
+            compare = "rowcount"
+            reason = "typo for cardinality"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("unknown compare mode is refused");
+        assert!(matches!(
+            err,
+            SuiteError::UnknownCompareMode { number: 25, .. }
+        ));
     }
 }

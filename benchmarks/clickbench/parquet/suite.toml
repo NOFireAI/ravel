@@ -2,10 +2,25 @@
 # Ravel CREATE EXTERNAL TABLE template that mounts the fixture's hits.parquet.
 #
 # `queries.sql` is upstream text (frozen; pinned by blake3 in suite.rs) and is
-# never edited for Ravel's grammar. Where a statement's ORDER BY clause does
-# not resolve to a projection index under the comparator's textual rules
-# (alias match, bare column, unaliased expression text match), its ORDER BY
-# key is given here instead.
+# never edited for Ravel's grammar. Four statements (24, 25, 27, 43) need an
+# override because their ORDER BY key does not resolve under the comparator's
+# own textual rules (alias match, bare column, unaliased expression text
+# match); each uses whichever of the three override forms below fits why it
+# does not resolve:
+#
+#   * `order_key = [...]`: the key as 0-indexed projection columns, for a
+#     statement whose key resolves to a real output column but not by text
+#     (Q43: a no-op ORDER BY expression over an already-truncated column).
+#   * `order_key_columns = [...]`: the key as output column names, resolved
+#     at compare time against both engines' actual result schemas, for a
+#     statement whose projection is not stable text to match against (Q24:
+#     `SELECT *`, where the projection is a wildcard, not a column list).
+#   * `compare = "cardinality"` with a required `reason`: the statement's
+#     ORDER BY key is not in its projection at all, so no row past a tie can
+#     be identified from the output; only row and column counts are checked
+#     (Q25, Q27). Q18 also compares by cardinality, but needs no override:
+#     it has a LIMIT and no ORDER BY at all, which the comparator already
+#     treats as cardinality-only.
 
 [table]
 # `{location}` is substituted with the fixture's hits.parquet object URL.
@@ -24,3 +39,27 @@ template = "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{location}' O
 [[statement]]
 number = 43
 order_key = [0]
+
+# Q24: `SELECT * ... ORDER BY "EventTime" LIMIT 10`. The projection is a
+# wildcard, so none of the textual rules has a projection item to match
+# against; `EventTime` is resolved by name against the engines' actual
+# output schemas instead.
+[[statement]]
+number = 24
+order_key_columns = ["EventTime"]
+
+# Q25 orders by `EventTime` alone; Q27 orders by `EventTime, SearchPhrase`,
+# but the comparator's key-resolution rules require every ORDER BY column to
+# resolve and stop at the first that does not, so `EventTime` not being
+# projected fails the whole key the same way for both. Neither selects nor
+# aliases `EventTime`, so no row past the LIMIT 10 cut can be told apart from
+# one just outside it by anything in the output.
+[[statement]]
+number = 25
+compare = "cardinality"
+reason = "ORDER BY key not projected; rows past a tie on EventTime cannot be identified from the output"
+
+[[statement]]
+number = 27
+compare = "cardinality"
+reason = "ORDER BY key not projected; rows past a tie on EventTime cannot be identified from the output"
