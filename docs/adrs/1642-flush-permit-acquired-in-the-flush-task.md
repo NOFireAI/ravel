@@ -702,3 +702,27 @@ knows the hour it is about to pin.
 **Rejected: writing in place and counting it.** A counter makes the loss
 visible and leaves it a loss for every query; the rows can be put where the
 read side looks for the price of one message per target shard.
+
+**A zero deferral cap is refused at startup.** `Cli::validate` in
+`ravel-server` builds the ingest configuration the flags describe and refuses
+one whose `flush_deferral_cap_ns()` is 0, naming the flags and the terms of
+the arithmetic. The `FLUSH_BOUND_SLACK_HOURS` check beside it admits an idle
+delay plus the flush lifetime equal to the slack, such as
+`--max-flush-delay-idle 3600s`, and the trigger bound's extra flush tick then
+takes the cap to 0, which would refuse every write to a shard from the first
+trigger its full queue deferred.
+
+**Tests.** `crates/ravel-ingest/tests/scan_set_handback.rs` runs each case on
+the metrics, log and span routers over a `FaultStore`, with the provisioning
+record written by `ravel-catalog`'s own functions, a hold gate parking one
+flush so the next on its shard is deferred, and an injected clock: a buffer on
+the retired index deferred to `S` hours past the activation writes nothing
+under that index and the scan rule finds every row once; one opening inside
+the window, and one on an index the successor still covers however late,
+write in place; a held re-read keeps the flush closed with nothing written or
+lost until it completes; the deferred rows' exact byte charge is held while
+they wait in the successor and returns to zero after; and a strict waiter on a
+handed-back buffer gets `Abandoned`. `generation::tests` pins the check's
+verdicts at the window and horizon edges. `ravel-server`'s
+`a_flush_cadence_leaving_no_deferral_cap_is_rejected_at_startup` pins the
+startup refusal.

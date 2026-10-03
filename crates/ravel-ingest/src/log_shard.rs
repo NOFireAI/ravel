@@ -52,7 +52,7 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_types::logstream::{AttrValue, LogStreamId};
-use ravel_types::{CommitToken, Signal, TenantId};
+use ravel_types::{CommitToken, Signal, TenantId, shard_for_log};
 
 use crate::indexed_fields::IndexedFieldsOverlay;
 use tokio::sync::{Semaphore, mpsc, oneshot};
@@ -68,9 +68,11 @@ use crate::config::{
     idle_age_threshold, memory_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
+use crate::generation::{FlushScope, HandBackArrival, SCAN_SET_HANDBACK_ABANDONED, ScanCheck};
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
+use crate::log_router::partition_columnar;
 use crate::metrics::FlushTrigger;
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{LogStage, LogStageTimings};
@@ -106,6 +108,16 @@ pub(crate) enum LogShardMsg {
         /// This request's ADR-0069 byte-budget charge, held until flush exactly
         /// as [`LogShardMsg::Write`]'s `charge` is.
         charge: Option<Arc<IngestByteCharge>>,
+    },
+    /// Records a retiring shard handed back at flush open instead of writing
+    /// them outside the scan set of the hour they would have pinned (ADR-1642
+    /// scan-set amendment), routed to this shard under the tenant's current
+    /// generation. Already admitted and charged; no strict waiter rides along.
+    HandBack {
+        tenant: TenantId,
+        payload: FlushPayload,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
     },
     /// Flush every buffered tenant now, regardless of size/age thresholds.
     FlushNow { done: oneshot::Sender<()> },
@@ -310,6 +322,17 @@ fn to_logseg_record(rec: NormalizedLogRecord) -> LogRecord {
     }
 }
 
+/// Row-major records as the one columnar batch `ColumnarLogBatch::from_records`
+/// builds from them.
+fn rows_to_batch(records: Vec<NormalizedLogRecord>) -> ColumnarLogBatch {
+    ColumnarLogBatch::from_records(
+        &records
+            .into_iter()
+            .map(to_logseg_record)
+            .collect::<Vec<_>>(),
+    )
+}
+
 /// A tenant's buffered payload: one representation at a time (ADR-0109 decision
 /// 5). `Empty` is the pre-first-write state that accepts either shape; once a
 /// write lands, the buffer is `Rows` or `Columnar` until it flushes, and the
@@ -379,6 +402,17 @@ impl LogTenantBuf {
         records: Vec<NormalizedLogRecord>,
         arrival_ns: i64,
     ) -> Result<usize, LogWriteError> {
+        let bytes_added = self.merge_rows_unstamped(records)?;
+        self.note_arrival(arrival_ns);
+        Ok(bytes_added)
+    }
+
+    /// [`Self::merge_rows`] without the arrival stamp, for handed-back records
+    /// whose arrival bookkeeping travels with them ([`HandBackArrival`]).
+    fn merge_rows_unstamped(
+        &mut self,
+        records: Vec<NormalizedLogRecord>,
+    ) -> Result<usize, LogWriteError> {
         let bytes_added: usize = records.iter().map(est_record_bytes).sum();
         let object_bytes_added: usize = records.iter().map(est_record_object_bytes).sum();
         // ADR-0873 wave 5a: fold this write's eligible declared-column extrema
@@ -401,7 +435,6 @@ impl LogTenantBuf {
                 existing.extend(records);
             }
         }
-        self.note_arrival(arrival_ns);
         self.est_bytes += bytes_added;
         self.flush_est_bytes += object_bytes_added;
         Ok(bytes_added)
@@ -417,6 +450,17 @@ impl LogTenantBuf {
         &mut self,
         batch: ColumnarLogBatch,
         arrival_ns: i64,
+    ) -> Result<usize, LogWriteError> {
+        let bytes_added = self.merge_columnar_unstamped(batch)?;
+        self.note_arrival(arrival_ns);
+        Ok(bytes_added)
+    }
+
+    /// [`Self::merge_columnar`] without the arrival stamp, for handed-back
+    /// batches.
+    fn merge_columnar_unstamped(
+        &mut self,
+        batch: ColumnarLogBatch,
     ) -> Result<usize, LogWriteError> {
         let bytes_added = est_columnar_bytes(&batch);
         let object_bytes_added = est_columnar_object_bytes(&batch);
@@ -438,10 +482,37 @@ impl LogTenantBuf {
                 existing.push(batch);
             }
         }
-        self.note_arrival(arrival_ns);
         self.est_bytes += bytes_added;
         self.flush_est_bytes += object_bytes_added;
         Ok(bytes_added)
+    }
+
+    /// Merges handed-back records (ADR-1642 scan-set amendment) whatever
+    /// representation this buffer holds. Rows and columnar batches never share
+    /// a buffer (ADR-0109 decision 5), and handed-back records have no writer
+    /// left to refuse, so a clash converts the row-major side into one
+    /// columnar batch, which writes the same object and carries the same
+    /// byte estimate.
+    fn merge_hand_back(&mut self, payload: FlushPayload) -> Result<(), LogWriteError> {
+        match payload {
+            FlushPayload::Rows(records) => {
+                if matches!(self.content, BufContent::Columnar(_)) {
+                    self.merge_columnar_unstamped(rows_to_batch(records))?;
+                } else {
+                    self.merge_rows_unstamped(records)?;
+                }
+            }
+            FlushPayload::Columnar(batches) => {
+                if let BufContent::Rows(records) = &mut self.content {
+                    let rows = std::mem::take(records);
+                    self.content = BufContent::Columnar(vec![rows_to_batch(rows)]);
+                }
+                for batch in batches {
+                    self.merge_columnar_unstamped(batch)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Total buffered record (row) count across whichever representation the
@@ -513,7 +584,7 @@ struct LogPinnedFlush {
 /// held (ADR-0109 decision 5). The row and columnar arms produce byte-identical
 /// RLOG objects for the same records; the writer-level differential test in
 /// `ravel-logseg` (#602) is the proof of that.
-enum FlushPayload {
+pub(crate) enum FlushPayload {
     Rows(Vec<NormalizedLogRecord>),
     Columnar(Vec<ColumnarLogBatch>),
 }
@@ -1063,6 +1134,12 @@ pub(crate) struct LogShardActor {
     /// the router refuses a write to a shard at the deferral cap before
     /// enqueue, buffered mode included.
     cap_flag: DeferralCapFlag,
+    /// The router's generation state, for the scan-set check at flush open
+    /// and the hand-back it may lead to (ADR-1642 scan-set amendment).
+    scope: Arc<dyn FlushScope<LogShardMsg>>,
+    /// Set by a hand-back and cleared by the next flush that opens in place,
+    /// so a run of hand-backs on this shard logs one WARN.
+    handing_back: bool,
 }
 
 impl LogShardActor {
@@ -1080,6 +1157,7 @@ impl LogShardActor {
         indexed_fields: Arc<IndexedFieldsOverlay>,
         backstop_ceiling: BufferBudgetCeiling,
         cap_flag: DeferralCapFlag,
+        scope: Arc<dyn FlushScope<LogShardMsg>>,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<LogStageTimings>,
     ) -> Self {
         cap_flag.publish(None, clock.now_ns());
@@ -1114,6 +1192,8 @@ impl LogShardActor {
             deferral_cap_ns: config.flush_deferral_cap_ns(),
             oldest_deferral_ns: None,
             cap_flag,
+            scope,
+            handing_back: false,
         }
     }
 
@@ -1157,6 +1237,9 @@ impl LogShardActor {
                             let on_actor_ns =
                                 self.clock.now_ns().saturating_sub(started_ns).max(0) as u64;
                             self.metrics.record_shard_processed(self.shard, on_actor_ns);
+                        }
+                        Some(LogShardMsg::HandBack { tenant, payload, charges, arrival }) => {
+                            self.handle_hand_back(tenant, payload, charges, arrival).await;
                         }
                         Some(LogShardMsg::FlushNow { done }) => {
                             // Not a teardown: this arm does not break, so the
@@ -1278,6 +1361,166 @@ impl LogShardActor {
             self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
                 .await;
         }
+    }
+
+    /// Merges records another shard handed back at flush open (ADR-1642
+    /// scan-set amendment), the log counterpart of
+    /// `shard::ShardActor::handle_hand_back`: no deferral-cap refusal, their
+    /// charges join this buffer's, and their arrival bookkeeping widens it.
+    async fn handle_hand_back(
+        &mut self,
+        tenant: TenantId,
+        payload: FlushPayload,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
+    ) {
+        let buf = self.tenants.entry(tenant.clone()).or_default();
+        if let Err(err) = buf.merge_hand_back(payload) {
+            tracing::error!(
+                shard = self.shard,
+                error = %err,
+                "ravel-ingest: handed-back log records could not merge into this shard's \
+                 buffer; dropping them"
+            );
+            return;
+        }
+        buf.charges.extend(charges);
+        arrival.fold_into(
+            &mut buf.oldest_arrival_ns,
+            &mut buf.min_ingest_ts_ns,
+            &mut buf.max_ingest_ts_ns,
+        );
+        let should_flush = size_trigger_fires(
+            buf.flush_est_bytes,
+            buf.est_bytes,
+            &self.config,
+            self.backstop_ceiling.get(),
+        );
+        if should_flush && let Some(buf) = self.tenants.remove(&tenant) {
+            self.flush_tenant(tenant, buf, FlushTrigger::Size, LagCheck::Enforced)
+                .await;
+        }
+    }
+
+    /// Hands `buf`'s records to the shards of the `count`-shard set that
+    /// `shard_for_log` routes them to, the log counterpart of
+    /// `shard::ShardActor::hand_back`: every target's liveness first, the
+    /// buffer back untouched if one is not live, then strict waiters answered
+    /// `Abandoned` and a clone of every charge to each target. Columnar batches
+    /// are re-partitioned by the same rule the router's columnar path uses.
+    async fn hand_back(
+        &mut self,
+        tenant: &TenantId,
+        mut buf: LogTenantBuf,
+        count: u32,
+    ) -> Result<(), LogTenantBuf> {
+        let mut targets: Vec<u32> = match &buf.content {
+            BufContent::Empty => Vec::new(),
+            BufContent::Rows(records) => records
+                .iter()
+                .map(|r| shard_for_log(&r.stream_id, count))
+                .collect(),
+            BufContent::Columnar(batches) => batches
+                .iter()
+                .flat_map(|b| {
+                    b.stream_refs
+                        .iter()
+                        .map(|&r| shard_for_log(&b.stream_ids[r as usize], count))
+                })
+                .collect(),
+        };
+        targets.sort_unstable();
+        targets.dedup();
+        let mut senders = Vec::with_capacity(targets.len());
+        for &target in &targets {
+            match self.scope.live_sender(count, target) {
+                Some(tx) => senders.push(tx),
+                None => return Err(buf),
+            }
+        }
+
+        let waiters = std::mem::take(&mut buf.waiters);
+        self.ctx.ack_waiters(
+            waiters,
+            Err(LogWriteError::Abandoned(SCAN_SET_HANDBACK_ABANDONED.into())),
+        );
+        let LogTenantBuf {
+            content,
+            oldest_arrival_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            charges,
+            ..
+        } = buf;
+        let arrival = HandBackArrival {
+            oldest_arrival_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        };
+        let mut payloads: HashMap<u32, FlushPayload> = HashMap::new();
+        match content {
+            BufContent::Empty => {}
+            BufContent::Rows(records) => {
+                for record in records {
+                    let target = shard_for_log(&record.stream_id, count);
+                    if let FlushPayload::Rows(into) = payloads
+                        .entry(target)
+                        .or_insert_with(|| FlushPayload::Rows(Vec::new()))
+                    {
+                        into.push(record);
+                    }
+                }
+            }
+            BufContent::Columnar(batches) => {
+                for batch in &batches {
+                    for (target, part) in partition_columnar(batch, count) {
+                        if let FlushPayload::Columnar(into) = payloads
+                            .entry(target)
+                            .or_insert_with(|| FlushPayload::Columnar(Vec::new()))
+                        {
+                            into.push(part);
+                        }
+                    }
+                }
+            }
+        }
+        for (target, tx) in targets.into_iter().zip(senders) {
+            let Some(payload) = payloads.remove(&target) else {
+                continue;
+            };
+            let msg = LogShardMsg::HandBack {
+                tenant: tenant.clone(),
+                payload,
+                charges: charges.clone(),
+                arrival,
+            };
+            if tx.send(msg).await.is_err() {
+                tracing::error!(
+                    shard = self.shard,
+                    target,
+                    "ravel-ingest: hand-back target log shard died before its records \
+                     arrived; they are lost with it"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a flush the scan-set check could not clear stays unopened, its
+    /// buffer kept whole for a later trigger; see
+    /// `shard::ShardActor::keeps_unconfirmed_flush`.
+    fn keeps_unconfirmed_flush(&self, lag_check: LagCheck, reason: &str) -> bool {
+        if matches!(lag_check, LagCheck::Enforced) {
+            return true;
+        }
+        tracing::warn!(
+            signal = ?Signal::Logs,
+            shard = self.shard,
+            reason,
+            "ravel-ingest: teardown bypass pass: writing a flush in place although it could \
+             not be confirmed inside the read-side scan set"
+        );
+        false
     }
 
     /// The columnar counterpart of [`Self::handle_write`] (ADR-0109 decision 5):
@@ -1834,6 +2077,63 @@ impl LogShardActor {
             }
         };
         let tenant_hash = tenant.hash();
+        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
+            Ok(bucket) => bucket,
+            Err(msg) => {
+                // Defensive: `flush_open_ns` was already hour-bucket-validated;
+                // if it ever fails here it is fail-loud like InvalidReading.
+                self.metrics.record_abandoned_input_rejected();
+                self.ctx
+                    .ack_waiters(buf.waiters, Err(LogWriteError::SegmentBuild(msg)));
+                return;
+            }
+        };
+        // ADR-1642 scan-set amendment: write under this shard index only if
+        // the read side scans it for the hour this flush is about to pin.
+        let buf = match self
+            .scope
+            .check(tenant_hash, self.shard, ingest_hour_bucket, raw_ns)
+        {
+            ScanCheck::InScanSet => {
+                self.handing_back = false;
+                buf
+            }
+            ScanCheck::HandBack {
+                scan_count,
+                active_count,
+            } => match self.hand_back(&tenant, buf, active_count).await {
+                Ok(()) => {
+                    self.metrics.record_rerouted_flush();
+                    if !std::mem::replace(&mut self.handing_back, true) {
+                        tracing::warn!(
+                            signal = ?Signal::Logs,
+                            shard = self.shard,
+                            ingest_hour_bucket,
+                            scan_count,
+                            active_count,
+                            "ravel-ingest: flush would write outside the read-side scan set \
+                             of its ingest hour; handing its rows to the current shard generation"
+                        );
+                    }
+                    return;
+                }
+                Err(buf) => {
+                    if self.keeps_unconfirmed_flush(lag_check, "a hand-back target is not live") {
+                        self.tenants.insert(tenant, buf);
+                        return;
+                    }
+                    buf
+                }
+            },
+            ScanCheck::Unknown => {
+                self.metrics.record_stale_provisioning_flush();
+                if self.keeps_unconfirmed_flush(lag_check, "no trusted generation view") {
+                    self.tenants.insert(tenant, buf);
+                    return;
+                }
+                buf
+            }
+        };
         let LogTenantBuf {
             content,
             min_ingest_ts_ns,
@@ -1864,17 +2164,6 @@ impl LogShardActor {
                         "empty log buffer reached the flush payload stage".to_string(),
                     )),
                 );
-                return;
-            }
-        };
-        let ingest_hour_bucket = match checked_ingest_hour_bucket(flush_open_ns) {
-            Ok(bucket) => bucket,
-            Err(msg) => {
-                // Defensive: `flush_open_ns` was already hour-bucket-validated;
-                // if it ever fails here it is fail-loud like InvalidReading.
-                self.metrics.record_abandoned_input_rejected();
-                self.ctx
-                    .ack_waiters(waiters, Err(LogWriteError::SegmentBuild(msg)));
                 return;
             }
         };
@@ -2143,6 +2432,7 @@ mod tests {
                 ))),
                 BufferBudgetCeiling::unlimited(),
                 DeferralCapFlag::new(config.flush_deferral_cap_ns()),
+                Arc::new(crate::generation::AlwaysInScope),
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             );
@@ -3004,6 +3294,7 @@ mod tests {
             ))),
             BufferBudgetCeiling::unlimited(),
             DeferralCapFlag::new(exhaustion_config(4).flush_deferral_cap_ns()),
+            Arc::new(crate::generation::AlwaysInScope),
             #[cfg(feature = "stage-timing")]
             Arc::new(LogStageTimings::new()),
         );

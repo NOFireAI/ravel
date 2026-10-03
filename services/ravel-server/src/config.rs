@@ -6222,6 +6222,44 @@ impl Cli {
             );
         }
 
+        // ADR-1642 deferral cap amendment: the cap is what the read-side
+        // slack leaves once the flush lifetime and the slowest flush trigger
+        // are paid for. A cadence that spends the whole slack leaves a cap of
+        // 0, and a shard would refuse every write from the first trigger its
+        // full queue defers. The check above admits that at equality.
+        let ingest = ravel_ingest::IngestConfig {
+            max_flush_delay: flush_cadence.max_flush_delay,
+            max_flush_delay_idle: flush_cadence.max_flush_delay_idle,
+            min_flush_bytes: flush_cadence.min_flush_bytes,
+            adaptive_flush_delay: self.adaptive_flush_delay,
+            strict_visibility_budget_ns,
+            ..ravel_ingest::IngestConfig::default()
+        };
+        if ingest.flush_deferral_cap_ns() == 0 {
+            anyhow::bail!(
+                "--max-flush-delay-idle {:?} with --max-flush-delay {:?}{} leaves the flush \
+                 deferral cap at 0: FLUSH_BOUND_SLACK_HOURS ({} h) less max_flush_lifetime \
+                 ({:?}) less the flush trigger age bound ({} ns: the largest of \
+                 --max-flush-delay, --max-flush-delay-idle and, with --adaptive-flush-delay, \
+                 the adaptive ceiling, plus one flush_tick of {:?}) is not positive. A shard \
+                 whose flush queue filled would refuse every write from the first deferred \
+                 trigger (ADR-1642 deferral cap amendment). Lower --max-flush-delay-idle so \
+                 that it plus max_flush_lifetime plus one flush_tick stays below \
+                 FLUSH_BOUND_SLACK_HOURS.",
+                flush_cadence.max_flush_delay_idle,
+                flush_cadence.max_flush_delay,
+                if self.adaptive_flush_delay {
+                    " and --adaptive-flush-delay"
+                } else {
+                    ""
+                },
+                ravel_catalog::FLUSH_BOUND_SLACK_HOURS,
+                ingest.max_flush_lifetime,
+                ingest.flush_trigger_age_bound_ns(),
+                ingest.flush_tick,
+            );
+        }
+
         // `target_bytes` (8 MiB default, ADR-0076's size-trigger that never
         // fires at realistic loads) is not itself an operator-facing flag in
         // this ADR's scope, so compare against its compiled-in default, the
@@ -11968,6 +12006,44 @@ mod tests {
         cli.validate().expect(
             "--max-flush-delay-idle == --max-flush-delay must be accepted (inclusive boundary)",
         );
+    }
+
+    /// ADR-1642 deferral cap amendment: a cadence that leaves the flush
+    /// deferral cap at 0 must fail startup even where the
+    /// FLUSH_BOUND_SLACK_HOURS check admits it. A 3600s idle delay plus the
+    /// 3600s flush lifetime is exactly the 7200s slack, which that check
+    /// accepts at equality, and the trigger bound's one flush tick takes the
+    /// cap below zero. 3599s leaves 0.8s of cap and is accepted. Deleting the
+    /// `flush_deferral_cap_ns() == 0` bail in `Cli::validate` fails the first
+    /// half.
+    #[test]
+    fn a_flush_cadence_leaving_no_deferral_cap_is_rejected_at_startup() {
+        let cli = |idle: &str| {
+            Cli::try_parse_from([
+                "ravel-server",
+                "--max-flush-delay",
+                "1s",
+                "--max-flush-delay-idle",
+                idle,
+                "--min-flush-bytes",
+                "131072",
+            ])
+            .expect("flags parse at the CLI layer")
+        };
+        let err = cli("3600s")
+            .validate()
+            .expect_err("startup must reject a cadence that leaves no deferral cap");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("flush deferral cap at 0")
+                && msg.contains("--max-flush-delay-idle")
+                && msg.contains("max_flush_lifetime")
+                && msg.contains("FLUSH_BOUND_SLACK_HOURS"),
+            "expected the deferral cap error naming the flags and terms, got: {err}"
+        );
+        cli("3599s")
+            .validate()
+            .expect("a cadence leaving a positive deferral cap is accepted");
     }
 
     /// Issue #1238 review round: `--catalog-resolve-concurrency 0` must be

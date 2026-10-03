@@ -837,6 +837,12 @@ async fn flush_now_is_still_refused_with_a_lagging_clock() {
     // Still recoverable: the rows were re-buffered, not dropped, so they
     // publish once the host clock converges.
     clock.set_ns(STORE_NS);
+    // Two hours passed with no write, so the router's generation view is past
+    // the horizon the flush-open scan-set check trusts (ADR-1642 scan-set
+    // amendment): the first drain keeps the rows and starts a re-read of the
+    // provisioning record, and the next one publishes.
+    router.flush_all().await;
+    tokio::task::yield_now().await;
     router.flush_all().await;
     assert_eq!(
         published_samples(store.as_ref(), &tenant).await,
@@ -1208,6 +1214,12 @@ async fn logs_flush_now_is_still_refused_with_a_lagging_clock() {
 
     // Re-buffered, not dropped: the record publishes once the clock converges.
     clock.set_ns(STORE_NS);
+    // Two hours passed with no write, so the router's generation view is past
+    // the horizon the flush-open scan-set check trusts (ADR-1642 scan-set
+    // amendment): the first drain keeps the rows and starts a re-read of the
+    // provisioning record, and the next one publishes.
+    router.flush_all().await;
+    tokio::task::yield_now().await;
     router.flush_all().await;
     assert_eq!(
         published_log_bodies(store.as_ref(), &tenant).await,
@@ -1260,6 +1272,12 @@ async fn spans_flush_now_is_still_refused_with_a_lagging_clock() {
     assert_eq!(snap.clock_lag_refused, DRAIN_REFUSALS);
 
     clock.set_ns(STORE_NS);
+    // Two hours passed with no write, so the router's generation view is past
+    // the horizon the flush-open scan-set check trusts (ADR-1642 scan-set
+    // amendment): the first drain keeps the rows and starts a re-read of the
+    // provisioning record, and the next one publishes.
+    router.flush_all().await;
+    tokio::task::yield_now().await;
     router.flush_all().await;
     assert_eq!(
         published_span_starts(store.as_ref(), &tenant).await,

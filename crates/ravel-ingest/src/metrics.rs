@@ -301,6 +301,11 @@ pub struct IngestMetrics {
     /// the store is slow/throttled and this router is degraded-but-available
     /// rather than fleet-wide-outed.
     grace_extended_stale_flushes: AtomicU64,
+    /// Flushes that would have written under a shard index outside the scan
+    /// set of the hour they pinned, and handed their rows back to be routed
+    /// under the tenant's current generation instead (ADR-1642 scan-set
+    /// amendment).
+    rerouted_flushes: AtomicU64,
     /// Per-shard count of flushes the actor has handed to a spawned flush task
     /// and that have not yet finished, counted from the moment the buffer
     /// leaves the actor: a task still waiting for its `max_inflight_flushes`
@@ -762,6 +767,9 @@ pub struct IngestMetricsSnapshot {
     pub exemplars_dropped_total: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    /// Flushes handed back instead of written outside the scan set (ADR-1642
+    /// scan-set amendment).
+    pub rerouted_flushes: u64,
     /// `ingest_metadata_flush_gets_total` (ADR-0085 decision 1).
     pub metadata_flush_gets_total: u64,
     /// `ingest_metadata_flush_puts_total` (ADR-0085 decision 1). Counts PUT
@@ -1109,6 +1117,18 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush handed back instead of written outside the scan set
+    /// (ADR-1642 scan-set amendment).
+    pub(crate) fn record_rerouted_flush(&self) {
+        self.rerouted_flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flushes handed back so far, read by the router's drain to tell whether
+    /// a pass moved rows into a set that already drained.
+    pub(crate) fn rerouted_flushes(&self) -> u64 {
+        self.rerouted_flushes.load(Ordering::Relaxed)
+    }
+
     /// One metadata-record GET issued by a flush window (ADR-0085 decision 1).
     pub(crate) fn record_metadata_flush_get(&self) {
         self.metadata_flush_gets.fetch_add(1, Ordering::Relaxed);
@@ -1166,6 +1186,7 @@ impl IngestMetrics {
             exemplars_dropped_total: self.exemplars_dropped_total.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
             metadata_flush_gets_total: self.metadata_flush_gets.load(Ordering::Relaxed),
             metadata_flush_puts_total: self.metadata_flush_puts.load(Ordering::Relaxed),
             metadata_flush_dropped_total: self.metadata_flush_dropped.load(Ordering::Relaxed),
