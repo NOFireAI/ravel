@@ -612,7 +612,7 @@ Print every field of every grant this tenant holds
 
 ## parquet
 
-Inspect and sweep a tenant's Parquet table manifests (ADR-2040)
+Inspect, sweep and repair a tenant's Parquet table manifests (ADR-2040)
 
 _No flags._
 
@@ -633,6 +633,16 @@ Delete manifest versions superseded for longer than `--grace`
 | --- | --- | --- | --- |
 | `--grace` |  |  | How long a superseded version is kept, as a humantime duration (`1h`, `90m`). Must be at least the deployment's stored `max_query_duration` |
 | `--tenant` |  |  | The tenant whose superseded manifest versions to delete |
+
+### parquet repair
+
+The repair for a forged manifest version: list one table's manifest versions and flag those above the version bound; with `--delete`, delete exactly the flagged ones
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--delete` |  |  | Delete every flagged version. Without it the command only lists |
+| `--table` |  |  | The table whose manifest versions to list |
+| `--tenant` |  |  | The tenant that owns the table |
 
 ## cache
 

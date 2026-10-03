@@ -2,16 +2,72 @@
 //! HEAD: a table's state is the highest version under its `v/` prefix. Ravel
 //! stores no data objects of its own for a Parquet table, so resolving a table
 //! never lists anything but that prefix.
+//!
+//! A version above [`MAX_MANIFEST_VERSION`] is never a table's newest: no
+//! writer creates one, so it was put by something else, and letting it win
+//! would hand the table to whoever put it. [`newest`] resolves the highest
+//! version at or below the bound instead, and reports the table once per
+//! process as an [`AboveBoundVersions`] warning.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
 
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_types::TenantHash;
 
 use crate::keys::{
-    KeyError, manifest_key, manifest_prefix, parse_manifest_key, tenant_manifest_prefix,
+    KeyError, MAX_MANIFEST_VERSION, manifest_key, manifest_prefix, parse_manifest_key,
+    tenant_manifest_prefix,
 };
 use crate::manifest::{Manifest, ManifestError, decode_manifest};
+
+/// A table whose listing holds manifest versions above
+/// [`MAX_MANIFEST_VERSION`], which [`newest`] ignored. Logged once per table
+/// per process; [`above_bound_resolves`] counts every listing that saw one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "Parquet table {table:?} of tenant {tenant_hash} has {count} manifest version(s) above the \
+     version bound {bound} (highest {highest}); they are ignored, and \
+     `ravel-cli parquet repair --tenant <tenant> --table {table} --delete` removes them"
+)]
+pub struct AboveBoundVersions {
+    /// The tenant hash, as 32 lowercase hex characters.
+    pub tenant_hash: String,
+    pub table: String,
+    pub count: usize,
+    pub highest: u64,
+    pub bound: u64,
+}
+
+/// Listings that saw a version above the bound, per (tenant hash, table).
+static ABOVE_BOUND: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+
+/// Count one listing of `warning.table` that saw versions above the bound.
+/// Returns true the first time this process records that table, which is when
+/// the caller logs it.
+fn record_above_bound(warning: &AboveBoundVersions) -> bool {
+    let mut seen = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    let count = seen
+        .entry((warning.tenant_hash.clone(), warning.table.clone()))
+        .or_insert(0);
+    *count = count.saturating_add(1);
+    *count == 1
+}
+
+/// How many listings of `table` in this process found a manifest version
+/// above [`MAX_MANIFEST_VERSION`].
+pub fn above_bound_resolves(tenant: &TenantHash, table: &str) -> u64 {
+    let seen = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    seen.get(&(tenant.to_hex(), table.to_string()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `versions` (ascending) up to and including [`MAX_MANIFEST_VERSION`], and
+/// the rest.
+pub fn split_at_bound(versions: &[u64]) -> (&[u64], &[u64]) {
+    versions.split_at(versions.partition_point(|&v| v <= MAX_MANIFEST_VERSION))
+}
 
 /// How many times [`newest`] re-lists when the version it listed is gone by
 /// the time it is read.
@@ -155,17 +211,41 @@ pub async fn read_version(
     }
 }
 
-/// The newest manifest version of `table`, or `None` if it has none. A
-/// returned manifest may be a dropped one ([`Manifest::is_live`] is false):
-/// the caller decides that a dropped table does not exist, and a writer needs
-/// the dropped version's number to write the next one.
+/// The newest manifest version of `table` at or below
+/// [`MAX_MANIFEST_VERSION`], or `None` if it has none. A returned manifest may
+/// be a dropped one ([`Manifest::is_live`] is false): the caller decides that
+/// a dropped table does not exist, and a writer needs the dropped version's
+/// number to write the next one.
+///
+/// Versions above the bound are not read. Each listing that holds one is
+/// counted ([`above_bound_resolves`]), and the first in this process for the
+/// table is logged at `warn` as an [`AboveBoundVersions`].
 pub async fn newest(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     table: &str,
 ) -> Result<Option<Manifest>, ResolveError> {
     for _ in 0..MAX_RESOLVE_ATTEMPTS {
-        let Some(&version) = versions(store, tenant, table).await?.last() else {
+        let listed = versions(store, tenant, table).await?;
+        let (bounded, above) = split_at_bound(&listed);
+        if let Some(&highest) = above.last() {
+            let warning = AboveBoundVersions {
+                tenant_hash: tenant.to_hex(),
+                table: table.to_string(),
+                count: above.len(),
+                highest,
+                bound: MAX_MANIFEST_VERSION,
+            };
+            if record_above_bound(&warning) {
+                tracing::warn!(
+                    tenant_hash = %warning.tenant_hash,
+                    table = %warning.table,
+                    highest = warning.highest,
+                    "{warning}"
+                );
+            }
+        }
+        let Some(&version) = bounded.last() else {
             return Ok(None);
         };
         if let Some(manifest) = read_version(store, tenant, table, version).await? {
@@ -242,6 +322,102 @@ mod tests {
         );
         let got = newest(&store, &TENANT_A, "hits").await.expect("resolve");
         assert_eq!(got, Some(live_manifest("hits", 12, &[12])));
+    }
+
+    /// Everything the `tracing` events of this thread format, from the moment
+    /// the returned guard is set until it drops.
+    fn capture_logs() -> (
+        std::sync::Arc<Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        struct Sink(std::sync::Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logs = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Sink(std::sync::Arc::clone(&sink)))
+            .finish();
+        (logs, tracing::subscriber::set_default(subscriber))
+    }
+
+    #[tokio::test]
+    async fn a_newest_version_above_the_bound_is_ignored_and_warned_once() {
+        // A tenant no other test uses: the warning state is per process.
+        const TENANT_C: TenantHash = TenantHash([0xc3; 16]);
+        let (logs, _guard) = capture_logs();
+        let store = MemoryStore::new();
+        for v in [1, 2, MAX_MANIFEST_VERSION + 1] {
+            put_version(&store, &TENANT_C, v).await;
+        }
+        // Not a manifest at all: resolving it would fail to decode, so the
+        // resolve below proves the version above the bound is never read.
+        store
+            .put(
+                &manifest_key(&TENANT_C, "hits", u64::MAX).expect("key"),
+                Bytes::from_static(b"forged"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put");
+        for _ in 0..3 {
+            let got = newest(&store, &TENANT_C, "hits").await.expect("resolve");
+            assert_eq!(got, Some(live_manifest("hits", 2, &[2])));
+        }
+        assert_eq!(above_bound_resolves(&TENANT_C, "hits"), 3);
+        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
+        assert_eq!(text.matches("above the version bound").count(), 1, "{text}");
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains("\"hits\""), "{text}");
+        assert!(text.contains(&u64::MAX.to_string()), "{text}");
+        assert!(text.contains(&TENANT_C.to_hex()), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_version_exactly_at_the_bound_is_the_newest() {
+        const TENANT_D: TenantHash = TenantHash([0xd4; 16]);
+        let store = MemoryStore::new();
+        for v in [1, MAX_MANIFEST_VERSION] {
+            put_version(&store, &TENANT_D, v).await;
+        }
+        let got = newest(&store, &TENANT_D, "hits").await.expect("resolve");
+        assert_eq!(got.map(|m| m.version), Some(MAX_MANIFEST_VERSION));
+        assert_eq!(above_bound_resolves(&TENANT_D, "hits"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_table_with_only_versions_above_the_bound_has_no_newest() {
+        const TENANT_E: TenantHash = TenantHash([0xe5; 16]);
+        let store = MemoryStore::new();
+        put_version(&store, &TENANT_E, u64::MAX).await;
+        assert_eq!(
+            newest(&store, &TENANT_E, "hits").await.expect("resolve"),
+            None
+        );
+        assert_eq!(above_bound_resolves(&TENANT_E, "hits"), 1);
+    }
+
+    #[test]
+    fn split_at_bound_keeps_the_bound_itself_below() {
+        let listed = [1, MAX_MANIFEST_VERSION, MAX_MANIFEST_VERSION + 1, u64::MAX];
+        assert_eq!(
+            split_at_bound(&listed),
+            (
+                &[1, MAX_MANIFEST_VERSION][..],
+                &[MAX_MANIFEST_VERSION + 1, u64::MAX][..]
+            )
+        );
     }
 
     #[tokio::test]

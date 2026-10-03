@@ -1310,6 +1310,56 @@ eviction on the running cache.
 cold start, not data loss: the next reads refetch from object storage, the same
 as any fresh node. The local cache is disposable by construction.
 
+## Repairing a forged Parquet table version
+
+A Parquet table's definition is its newest manifest version under
+`t/<hash>/pq/t/<table>/v/`, and each `CREATE`, `CREATE OR REPLACE` or `DROP`
+writes the next number. No statement writes a version above 4294967296
+(2^32). One there was put straight into the bucket, for example with a
+stolen Query credential, which can create manifest versions.
+
+Ravel ignores such a version: queries and DDL use the newest version at or
+below the bound, so the table keeps its last legitimate definition and DDL on
+it still works, and `parquet sweep` neither deletes it nor deletes the
+versions beneath it because of it. The first query or DDL in each server
+process that finds one logs a `warn` line naming the tenant hash, the table,
+the highest version and the repair command, and `parquet ls` prints a line
+for each table that has one.
+
+To remove it:
+
+1. List the table's versions under a credential that can read manifests,
+   such as the Query role, to see who wrote each one and with what
+   statement. Nothing is deleted without `--delete`:
+
+   ```sh
+   ravel-cli parquet repair --tenant acme --table clicks
+   ```
+
+   Each version prints its key, `created_by` and `statement`, and the ones
+   above the bound are marked `FLAGGED: above the version bound`. A key whose
+   twenty digits are too large to be a version number is flagged too.
+2. Rotate the credential the version was written with. The repair removes
+   the version, not the access that wrote it.
+3. Delete the flagged versions with the Maintain credential, the only role
+   that can delete manifest versions:
+
+   ```sh
+   ravel-cli parquet repair --tenant acme --table clicks --delete
+   ```
+
+   It deletes exactly the flagged versions and refuses to delete any version
+   at or below the bound. The Maintain role cannot read manifests, so this
+   run reports `created_by` and `statement` as unreadable; that does not
+   change which versions it deletes.
+
+A forged version at or below the bound looks like any other version and is
+not flagged. If `parquet repair` shows a newest version whose `created_by`
+and `statement` you do not recognise, delete that one key by hand with the
+Maintain credential before the next `parquet sweep`, which would otherwise
+delete the legitimate versions beneath it once it is past the grace, or
+restore the noncurrent object versions if the bucket keeps them.
+
 ## The maintenance and inspection commands
 
 Every subcommand shares the same store flags as `ravel-server`. The full flag
@@ -1329,6 +1379,7 @@ list is in [the generated CLI reference](../../reference/ravel-cli-flags.md).
 | `catalog inspect --tenant <t> [--signal <s>]` | Decodes and prints that signal's HEAD and every referenced snapshot part: watermark, keys, hashes, entry counts. It names the signal both as a word and as the numeric value read off the object, so a HEAD stamped with a different signal than the one asked for is visible. It reports rather than errors when no HEAD exists yet. |
 | `catalog verify` | Diffs the sealed record history against the snapshot. See [routine verification](#routine-verification). |
 | `commit reconstruct` | Rebuilds record-less L0 data objects' commit records from their own footers. Stop maintenance first; see [troubleshooting](troubleshooting.md#commit-records-were-deleted-out-of-band). |
+| `parquet repair --tenant <t> --table <name> [--delete]` | Lists one Parquet table's manifest versions and flags those above the version bound; `--delete` removes exactly the flagged ones. See [repairing a forged Parquet table version](#repairing-a-forged-parquet-table-version). |
 | `cache reclaim-legacy --cache-dir <dir> [--apply]` | Reclaims pre-namespacing local read-cache files. See [reclaiming a pre-namespacing cache directory](#reclaiming-a-pre-namespacing-cache-directory). Local filesystem only; dry run without `--apply`. |
 | `segment inspect <path-or-key>` | Parses one metric segment: trailer, footer fields, section list, decoded series count. |
 | `commit decode <key>` | Decodes one commit record: identity, referenced data object key, size and hash, sample and series counts, timestamps. |

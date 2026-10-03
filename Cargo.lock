@@ -5120,6 +5120,8 @@ dependencies = [
  "ravel-types",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

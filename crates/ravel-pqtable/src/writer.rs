@@ -13,6 +13,13 @@
 //! lost update. A dropped version counts as no table, and the next CREATE
 //! continues its numbering.
 //!
+//! No call writes a version above [`MAX_MANIFEST_VERSION`]: when the version
+//! an intent would write is above it, [`apply`] refuses with
+//! [`WriteError::VersionAboveBound`] before any put. An intent that writes
+//! nothing (`IF NOT EXISTS`, `IF EXISTS`) is still a no-op. The resolve it numbers from already ignores versions above
+//! the bound ([`resolve::newest`]), so only a table whose newest version sits
+//! at the bound itself is refused.
+//!
 //! Two mechanisms make a refused or failed write decidable. Every call carries
 //! an apply nonce, so two callers that would otherwise encode byte-identical
 //! manifests still produce different bodies and only the caller whose bytes
@@ -44,7 +51,7 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
 use ravel_types::TenantHash;
 
 use crate::clock::Clock;
-use crate::keys::{KeyError, manifest_key};
+use crate::keys::{KeyError, MAX_MANIFEST_VERSION, manifest_key};
 use crate::manifest::{APPLY_NONCE_LEN, Manifest, ManifestError, ParquetFile, encode_manifest};
 use crate::names::{NameError, validate_table};
 use crate::resolve::{self, ResolveError};
@@ -115,6 +122,17 @@ pub enum WriteError {
     NoPutBudget { min_grace_ms: u64 },
     #[error("table {table:?}: version {version} has no successor")]
     VersionOverflow { table: String, version: u64 },
+    /// The next version of `table` would be `version`, above
+    /// [`MAX_MANIFEST_VERSION`] (`bound`). Refused before any put.
+    #[error(
+        "table {table:?}: the next manifest version {version} is above the version bound \
+         {bound}, so no further DDL statement can be applied to this table"
+    )]
+    VersionAboveBound {
+        table: String,
+        version: u64,
+        bound: u64,
+    },
     /// A store failure on the manifest write. A retryable failure is reported
     /// only once this writer has checked that its bytes are not at the key.
     #[error("object store error on {key:?}: {source}")]
@@ -321,6 +339,13 @@ pub async fn apply(
             Step::Done(outcome) => return Ok(outcome),
             Step::Write(manifest) => manifest,
         };
+        if manifest.version > MAX_MANIFEST_VERSION {
+            return Err(WriteError::VersionAboveBound {
+                table: table.to_string(),
+                version: manifest.version,
+                bound: MAX_MANIFEST_VERSION,
+            });
+        }
         let key = manifest_key(tenant, table, manifest.version)?;
         let bytes = encode_manifest(tenant, &manifest)?;
         let remaining_ns = budget_ns.saturating_sub(clock.now_ns().saturating_sub(resolved_at));
@@ -388,6 +413,7 @@ mod tests {
     use std::time::Duration;
 
     use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault};
+    use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
     use ravel_object_store::memory::MemoryStore;
 
     use super::*;
@@ -693,6 +719,123 @@ mod tests {
             .expect("newest")
             .map(blank_nonce);
         assert_eq!(newest, Some(expected(&create(true, &[2], "b"), 3, 3)));
+    }
+
+    /// Put `manifest` straight into `store`, as a write that bypassed `apply`.
+    async fn put_direct(store: &dyn ObjectStoreBackend, manifest: &Manifest) {
+        let key = manifest_key(&TENANT_A, &manifest.table, manifest.version).expect("key");
+        let bytes = encode_manifest(&TENANT_A, manifest).expect("encode");
+        store
+            .put(&key, Bytes::from(bytes), PutOptions::create_if_absent())
+            .await
+            .expect("put");
+    }
+
+    #[tokio::test]
+    async fn a_write_above_the_version_bound_is_refused_and_puts_nothing() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        put_direct(
+            store.inner(),
+            &live_manifest("hits", MAX_MANIFEST_VERSION, &[1]),
+        )
+        .await;
+        for intent in [replace(&[2], "a"), drop_table(false, "a")] {
+            let got = apply_at(&store, "hits", intent, 1).await;
+            assert!(
+                matches!(
+                    got,
+                    Err(WriteError::VersionAboveBound { ref table, version, bound })
+                        if table == "hits"
+                            && version == MAX_MANIFEST_VERSION + 1
+                            && bound == MAX_MANIFEST_VERSION
+                ),
+                "{got:?}"
+            );
+        }
+        // A statement that writes nothing is still answered as before.
+        assert_eq!(
+            apply_at(&store, "hits", create(true, &[3], "a"), 1)
+                .await
+                .expect("if not exists"),
+            Outcome::NoOp
+        );
+        assert!(matches!(
+            apply_at(&store, "hits", create(false, &[3], "a"), 1).await,
+            Err(WriteError::TableExists { .. })
+        ));
+        assert_eq!(store.metrics().snapshot().op(StoreOp::Put).calls, 0);
+        assert_eq!(
+            resolve::versions(&store, &TENANT_A, "hits")
+                .await
+                .expect("versions"),
+            vec![MAX_MANIFEST_VERSION]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_exactly_at_the_version_bound_commits_and_the_next_is_refused() {
+        let store = MemoryStore::new();
+        put_direct(
+            &store,
+            &live_manifest("hits", MAX_MANIFEST_VERSION - 1, &[1]),
+        )
+        .await;
+        assert_eq!(
+            apply_at(&store, "hits", replace(&[2], "a"), 1)
+                .await
+                .expect("at the bound"),
+            Outcome::Committed {
+                version: MAX_MANIFEST_VERSION
+            }
+        );
+        let got = apply_at(&store, "hits", replace(&[3], "a"), 2).await;
+        assert!(
+            matches!(
+                got,
+                Err(WriteError::VersionAboveBound { version, .. })
+                    if version == MAX_MANIFEST_VERSION + 1
+            ),
+            "{got:?}"
+        );
+        assert_eq!(
+            resolve::versions(&store, &TENANT_A, "hits")
+                .await
+                .expect("versions"),
+            vec![MAX_MANIFEST_VERSION - 1, MAX_MANIFEST_VERSION]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forged_version_at_u64_max_does_not_block_the_next_statement() {
+        // Without the bound the writer numbers from u64::MAX and every DDL
+        // on the table fails with VersionOverflow.
+        let store = MemoryStore::new();
+        let t = "wedged";
+        assert_eq!(
+            apply_at(&store, t, create(false, &[1], "a"), 1)
+                .await
+                .expect("create"),
+            Outcome::Committed { version: 1 }
+        );
+        put_direct(&store, &live_manifest(t, u64::MAX, &[9])).await;
+        assert_eq!(
+            apply_at(&store, t, drop_table(false, "a"), 2)
+                .await
+                .expect("drop"),
+            Outcome::Committed { version: 2 }
+        );
+        assert_eq!(
+            apply_at(&store, t, create(false, &[2], "b"), 3)
+                .await
+                .expect("create"),
+            Outcome::Committed { version: 3 }
+        );
+        assert_eq!(
+            resolve::versions(&store, &TENANT_A, t)
+                .await
+                .expect("versions"),
+            vec![1, 2, 3, u64::MAX]
+        );
     }
 
     #[tokio::test]

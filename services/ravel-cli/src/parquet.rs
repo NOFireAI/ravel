@@ -1,11 +1,19 @@
-//! `ravel-cli parquet` (ADR-2040): inspect a tenant's Parquet table manifests
-//! and delete the manifest versions a sweep has made superseded.
+//! `ravel-cli parquet` (ADR-2040): inspect a tenant's Parquet table manifests,
+//! delete the manifest versions a sweep has made superseded, and remove
+//! forged versions above the manifest version bound.
 //!
-//! Both subcommands delegate to [`ravel_pqtable`]: `ls` reads through
-//! [`ravel_pqtable::resolve`], and `sweep` plans and executes through
+//! Every subcommand delegates to [`ravel_pqtable`]: `ls` reads through
+//! [`ravel_pqtable::resolve`], `sweep` plans and executes through
 //! [`ravel_pqtable::sweep`], which owns the age rule and the store-clock skew
-//! margin. Nothing about the key layout or the grace arithmetic is restated
-//! here.
+//! margin, and `repair` lists, flags and deletes through
+//! [`ravel_pqtable::repair`]. Nothing about the key layout, the grace
+//! arithmetic or the version bound is restated here.
+//!
+//! `repair` runs under the Maintain credential, which may list and delete
+//! manifest versions but not read them. Which versions it deletes is decided
+//! from the listing alone; the writer and statement of each version are
+//! printed when the credential can read them and reported unreadable
+//! otherwise.
 //!
 //! # Where the sweep's minimum grace comes from
 //!
@@ -35,7 +43,9 @@ use std::sync::Arc;
 
 use ravel_maintain::read_gc_config;
 use ravel_object_store::ObjectStoreBackend;
+use ravel_pqtable::keys::MAX_MANIFEST_VERSION;
 use ravel_pqtable::manifest::{Manifest, ParquetFile};
+use ravel_pqtable::repair::{self, Description, ListedVersion};
 use ravel_pqtable::{resolve, sweep};
 use ravel_types::TenantId;
 
@@ -119,8 +129,8 @@ fn print_manifest(manifest: &Manifest) {
     }
 }
 
-/// `parquet ls`: every table's newest manifest version, or every retained
-/// version of one named table.
+/// `parquet ls`: every table's newest manifest version at or below the
+/// manifest version bound, or every retained version of one named table.
 pub async fn ls(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
@@ -142,13 +152,22 @@ pub async fn ls(
     for (name, versions) in selected {
         // With `--table`, every version still under the tenant's prefix; a
         // version a sweep has already deleted is not retained and cannot be
-        // printed. Without it, only the newest.
+        // printed. Without it, only the newest, which is never one above the
+        // version bound.
+        let (bounded, above) = resolve::split_at_bound(versions);
         let wanted: &[u64] = if table.is_some() {
             versions
         } else {
-            versions.last().map(std::slice::from_ref).unwrap_or(&[])
+            bounded.last().map(std::slice::from_ref).unwrap_or(&[])
         };
         println!("table: {name} ({} retained versions)", versions.len());
+        if !above.is_empty() {
+            println!(
+                "  {} version(s) above the version bound {MAX_MANIFEST_VERSION}, ignored by \
+                 every reader: run `ravel-cli parquet repair --tenant {tenant} --table {name}`",
+                above.len()
+            );
+        }
         for &version in wanted {
             match resolve::read_version(store.as_ref(), &hash, name, version).await? {
                 Some(manifest) => print_manifest(&manifest),
@@ -184,6 +203,82 @@ pub async fn sweep(
     Ok(())
 }
 
+/// `parquet repair`: list every key under one table's `v/` prefix, flag the
+/// versions above the manifest version bound, and with `delete` remove
+/// exactly the flagged ones.
+pub async fn repair(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    table: &str,
+    delete: bool,
+) -> anyhow::Result<()> {
+    for line in repair_lines(store.as_ref(), tenant, table, delete).await? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What [`repair`] prints. The writer and statement fields are attacker
+/// supplied in a forged version, so they are printed quoted and escaped.
+async fn repair_lines(
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    table: &str,
+    delete: bool,
+) -> anyhow::Result<Vec<String>> {
+    let hash = TenantId::new(tenant).hash();
+    let entries = repair::list(store, &hash, table).await?;
+    let mut out = vec![format!(
+        "table: {table} ({} keys listed, version bound {MAX_MANIFEST_VERSION})",
+        entries.len()
+    )];
+    for entry in &entries {
+        let version = match &entry.version {
+            ListedVersion::Number(v) => v.to_string(),
+            ListedVersion::Overflow { digits } => format!("{digits} (does not fit in a u64)"),
+            ListedVersion::NotAVersion { reason } => format!("none ({reason})"),
+        };
+        let flag = if entry.flagged {
+            "  FLAGGED: above the version bound"
+        } else {
+            ""
+        };
+        out.push(format!("  version: {version}{flag}"));
+        out.push(format!("    key: {}", entry.key));
+        match repair::describe(store, entry).await {
+            Description::Manifest(manifest) => {
+                out.push(format!("    created_by: {:?}", manifest.created_by));
+                out.push(format!("    statement: {:?}", manifest.statement));
+                out.push(format!("    dropped: {}", manifest.dropped));
+            }
+            Description::Missing => out.push("    (deleted since it was listed)".to_string()),
+            Description::Unreadable { reason } => {
+                out.push(format!("    created_by, statement: unreadable ({reason})"));
+            }
+        }
+    }
+    let flagged: Vec<String> = entries
+        .iter()
+        .filter(|e| e.flagged)
+        .map(|e| e.key.clone())
+        .collect();
+    if flagged.is_empty() {
+        out.push("no versions above the version bound".to_string());
+        return Ok(out);
+    }
+    if !delete {
+        out.push(format!(
+            "{} version(s) flagged; rerun with --delete to remove exactly these",
+            flagged.len()
+        ));
+        return Ok(out);
+    }
+    let deleted = repair::delete_flagged(store, &hash, table, &flagged).await?;
+    out.push(format!("deleted {} manifest versions", deleted.len()));
+    out.extend(deleted.iter().map(|key| format!("  {key}")));
+    Ok(out)
+}
+
 /// The deployment's minimum sweep grace, in milliseconds: `sys/gc`'s
 /// `max_query_duration_ns`. Refuses a bucket with no `sys/gc`.
 async fn deployment_min_grace_ms(store: &dyn ObjectStoreBackend) -> anyhow::Result<u64> {
@@ -205,8 +300,14 @@ async fn deployment_min_grace_ms(store: &dyn ObjectStoreBackend) -> anyhow::Resu
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use bytes::Bytes;
     use ravel_maintain::{GcConfigValues, set_gc_config};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
     use ravel_object_store::memory::MemoryStore;
+    use ravel_pqtable::keys::manifest_key;
+    use ravel_pqtable::manifest::encode_manifest;
 
     use super::*;
 
@@ -325,6 +426,143 @@ mod tests {
                 "{expected:?} missing:\n{printed}"
             );
         }
+    }
+
+    /// Versions 1 and the bound of `acme`'s `hits` through the writer's
+    /// format, plus a forged version one above the bound and one at
+    /// `u64::MAX`, in a store that counts deletes.
+    async fn forged_table() -> InstrumentedStore<MemoryStore> {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let hash = TenantId::new("acme").hash();
+        for (version, by) in [
+            (1, "ddl"),
+            (MAX_MANIFEST_VERSION, "ddl"),
+            (MAX_MANIFEST_VERSION + 1, "forger"),
+            (u64::MAX, "forger"),
+        ] {
+            let manifest = Manifest {
+                table: "hits".into(),
+                version,
+                dropped: true,
+                location: String::new(),
+                grant: String::new(),
+                files: Vec::new(),
+                options: Default::default(),
+                created_by: by.into(),
+                created_unix_ns: NOW_NS,
+                statement: format!("DROP TABLE hits -- {by}\u{1b}[2J"),
+                apply_nonce: vec![0; ravel_pqtable::manifest::APPLY_NONCE_LEN],
+            };
+            store
+                .inner()
+                .put(
+                    &manifest_key(&hash, "hits", version).expect("key"),
+                    Bytes::from(encode_manifest(&hash, &manifest).expect("encode")),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put");
+        }
+        store
+    }
+
+    fn keys_left(lines: &[String]) -> Vec<String> {
+        lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("    key: "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn deletes(store: &InstrumentedStore<MemoryStore>) -> u64 {
+        store.metrics().snapshot().op(StoreOp::Delete).calls
+    }
+
+    #[tokio::test]
+    async fn repair_lists_and_flags_and_deletes_nothing_without_the_flag() {
+        let store = forged_table().await;
+        let lines = repair_lines(&store, "acme", "hits", false)
+            .await
+            .expect("repair");
+        let printed = lines.join("\n");
+        let flagged: Vec<&String> = lines.iter().filter(|l| l.contains("FLAGGED")).collect();
+        assert_eq!(
+            flagged,
+            vec![
+                &format!(
+                    "  version: {}  FLAGGED: above the version bound",
+                    MAX_MANIFEST_VERSION + 1
+                ),
+                &format!("  version: {}  FLAGGED: above the version bound", u64::MAX),
+            ],
+            "{printed}"
+        );
+        assert!(
+            printed.contains(&format!("  version: {MAX_MANIFEST_VERSION}\n")),
+            "{printed}"
+        );
+        assert_eq!(printed.matches("created_by: \"forger\"").count(), 2);
+        assert_eq!(printed.matches("created_by: \"ddl\"").count(), 2);
+        // The statement is escaped, so a forged one cannot drive the terminal.
+        assert!(printed.contains("statement: \"DROP TABLE hits -- forger\\u{1b}[2J\""));
+        assert!(!printed.contains('\u{1b}'), "{printed}");
+        assert!(
+            printed.ends_with("2 version(s) flagged; rerun with --delete to remove exactly these")
+        );
+        assert_eq!(deletes(&store), 0);
+        assert_eq!(keys_left(&lines).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn repair_with_the_flag_deletes_exactly_the_flagged_versions() {
+        let store = forged_table().await;
+        let lines = repair_lines(&store, "acme", "hits", true)
+            .await
+            .expect("repair");
+        let hash = TenantId::new("acme").hash();
+        let printed = lines.join("\n");
+        assert!(printed.contains("deleted 2 manifest versions"), "{printed}");
+        assert_eq!(deletes(&store), 2);
+        assert_eq!(
+            resolve::versions(&store, &hash, "hits")
+                .await
+                .expect("versions"),
+            vec![1, MAX_MANIFEST_VERSION]
+        );
+        // Run again: nothing is flagged and nothing more is deleted.
+        let lines = repair_lines(&store, "acme", "hits", true)
+            .await
+            .expect("repair");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("no versions above the version bound")
+        );
+        assert_eq!(deletes(&store), 2);
+    }
+
+    /// Under the Maintain credential no manifest read is allowed. The
+    /// listing still flags the forged versions and the delete still runs.
+    #[tokio::test]
+    async fn repair_decides_from_the_listing_when_reads_are_denied() {
+        let store = forged_table().await;
+        let denied = FaultStore::new(
+            store,
+            FaultPlan::empty().with_rule(Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("access denied".into()),
+            )),
+        );
+        let lines = repair_lines(&denied, "acme", "hits", true)
+            .await
+            .expect("repair");
+        let printed = lines.join("\n");
+        assert_eq!(
+            printed.matches("created_by, statement: unreadable").count(),
+            4,
+            "{printed}"
+        );
+        assert!(printed.contains("deleted 2 manifest versions"), "{printed}");
+        assert_eq!(deletes(denied.inner()), 2);
     }
 
     /// A bucket no server has bootstrapped has no deployment minimum, so the

@@ -119,7 +119,7 @@ fn command_hashes_tenant(command: &Command) -> bool {
         // its `--tenant`, exactly as `catalog list` does.
         | Command::Export { .. }
         // Every Parquet-table object is under `t/<tenant_hash>/pq/`
-        // (ADR-2040 decision D1), so both `parquet` subcommands hash a
+        // (ADR-2040 decision D1), so every `parquet` subcommand hashes a
         // tenant.
         | Command::Parquet { .. } => true,
         // `commit reconstruct` computes a `t/<tenant_hash>/` prefix from its
@@ -281,6 +281,9 @@ fn command_is_write(command: &Command) -> bool {
             // Deletes superseded manifest versions under
             // `t/<tenant_hash>/pq/t/`.
             ParquetCommand::Sweep { .. } => true,
+            // Deletes manifest versions above the version bound, and only
+            // with `--delete`.
+            ParquetCommand::Repair { delete, .. } => *delete,
         },
         // Pure inspection commands that take an explicit key/path or decode a
         // marker directly (`tenancy show`/`resolve` resolve the scheme
@@ -402,7 +405,7 @@ enum Command {
         #[command(subcommand)]
         command: TenantCommand,
     },
-    /// Inspect and sweep a tenant's Parquet table manifests (ADR-2040).
+    /// Inspect, sweep and repair a tenant's Parquet table manifests (ADR-2040).
     Parquet {
         #[command(subcommand)]
         command: ParquetCommand,
@@ -897,6 +900,29 @@ enum ParquetCommand {
         /// `max_query_duration`.
         #[arg(long)]
         grace: String,
+    },
+    /// The repair for a forged manifest version: list one table's manifest
+    /// versions and flag those above the version bound; with `--delete`,
+    /// delete exactly the flagged ones.
+    ///
+    /// No DDL statement writes a version above the bound (2^32), so one there
+    /// was put directly in the bucket, for example with a stolen Query
+    /// credential. Readers and the sweep already ignore it; this removes it.
+    /// Prints each version's key, `created_by` and `statement` (reported
+    /// unreadable when the credential may not read manifests), and marks the
+    /// flagged ones. Without `--delete` nothing is deleted. A version at or
+    /// below the bound is never deleted. Run it under the Maintain
+    /// credential, the only role that may delete manifest versions.
+    Repair {
+        /// The tenant that owns the table.
+        #[arg(long)]
+        tenant: String,
+        /// The table whose manifest versions to list.
+        #[arg(long)]
+        table: String,
+        /// Delete every flagged version. Without it the command only lists.
+        #[arg(long)]
+        delete: bool,
     },
 }
 
@@ -2561,6 +2587,17 @@ async fn main() -> anyhow::Result<()> {
             ravel_cli::parquet::sweep(store::build_store(&cli.store)?, &tenant, &grace, now_ns()?)
                 .await
         }
+        Command::Parquet {
+            command:
+                ParquetCommand::Repair {
+                    tenant,
+                    table,
+                    delete,
+                },
+        } => {
+            ravel_cli::parquet::repair(store::build_store(&cli.store)?, &tenant, &table, delete)
+                .await
+        }
         Command::Cache {
             command: CacheCommand::ReclaimLegacy { cache_dir, apply },
         } => cache_reclaim_legacy(&cache_dir, apply),
@@ -4100,6 +4137,18 @@ mod tests {
                 true,
             ),
             (&["ravel", "parquet", "ls", "--tenant", "t"], false),
+            (
+                &[
+                    "ravel", "parquet", "repair", "--tenant", "t", "--table", "hits",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel", "parquet", "repair", "--tenant", "t", "--table", "hits", "--delete",
+                ],
+                true,
+            ),
             (
                 &[
                     "ravel",
