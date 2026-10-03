@@ -939,6 +939,53 @@ fn slot_table_build_drops_all_null_columns() {
     );
 }
 
+/// 60 distinct streams, presented in row order `svc00`..`svc59` (first
+/// appearance is lexicographic column order, not id-ascending): the
+/// production build's binary-search ref resolution (#2441) must land on the
+/// same `stream_ids`/`stream_refs` as the reference's `HashMap` resolution,
+/// not just agree by accident on a batch small enough that the two orders
+/// happen to coincide.
+#[test]
+fn many_streams_out_of_order_match_reference() {
+    const N: usize = 60;
+    let ts = Arc::new(Int64Array::from(vec![NOW_NS; N])) as ArrayRef;
+    let res = Arc::new(StringArray::from_iter_values(
+        (0..N).map(|i| format!("svc{i:02}")),
+    )) as ArrayRef;
+    let spans = vec![(batch(vec![("ts", ts), ("res", res)]), 0u64)];
+
+    let mut mapping = base_mapping();
+    mapping.resource_attributes = vec![attr("service.name", "res", ColType::Str)];
+    let limits = LogIngestLimits::default();
+
+    let unwrap_batch = |result: Result<ColumnarLogBatch, ColBuildError>, who: &str| match result {
+        Ok(b) => b,
+        Err(ColBuildError::Batch(r)) => panic!("{who} build failed the batch: {r}"),
+        Err(ColBuildError::Row { row, reason }) => {
+            panic!("{who} build rejected row {row}: {reason}")
+        }
+    };
+    let got = unwrap_batch(
+        build_columnar_batch(&spans, &mapping, &limits, NOW_NS),
+        "production",
+    );
+    let want = unwrap_batch(
+        build_columnar_batch_reference(&spans, &mapping, &limits, NOW_NS),
+        "reference",
+    );
+
+    assert_eq!(want.stream_ids.len(), N, "every row's stream is distinct");
+    assert_ne!(
+        want.stream_refs,
+        (0..N as u32).collect::<Vec<u32>>(),
+        "fixture must present streams out of id-ascending order, or this test proves nothing"
+    );
+
+    assert_eq!(got.stream_ids, want.stream_ids, "stream directory ids");
+    assert_eq!(got.stream_refs, want.stream_refs, "per-row stream refs");
+    assert_eq!(got, want, "the whole batch");
+}
+
 proptest! {
     // 24 cases, not the default 256: a case at the top of the range
     // materializes 4096 x 120 cells twice, once per implementation, so the

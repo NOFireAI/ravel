@@ -330,13 +330,27 @@ pub(super) fn build_columnar_batch(
     }
 
     // Stream directory: id-ascending dense refs, matching `from_records`.
-    let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(stream_dir.len());
-    for (i, (id, blob)) in stream_dir.into_iter().enumerate() {
-        ref_of.insert(id, i as u32);
+    // `stream_dir` is a `BTreeMap`, so `batch.stream_ids` fills in ascending,
+    // duplicate-free order; a row's ref is its id's rank in that order,
+    // found by binary search instead of a HashMap (ADR-2425 decision 2).
+    for (id, blob) in stream_dir {
         batch.stream_ids.push(id);
         batch.stream_attrs.push(blob);
     }
-    batch.stream_refs = row_stream_id.iter().map(|id| ref_of[id]).collect();
+    batch.stream_refs = row_stream_id
+        .iter()
+        .map(|id| {
+            batch
+                .stream_ids
+                .binary_search(id)
+                .map(|idx| idx as u32)
+                .map_err(|_| {
+                    ColBuildError::Batch(format!(
+                        "row stream id {id:?} missing from its own stream directory"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<u32>, ColBuildError>>()?;
 
     // Materialize dynamic columns in (name, type) order; attach a StrColumnDict
     // to a Str/Bytes column whose every winning cell came from a dictionary
