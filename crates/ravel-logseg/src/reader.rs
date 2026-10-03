@@ -621,6 +621,38 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         Ok(scan)
     }
 
+    /// Like [`RlogReader::scan_blocks_subset`], but `wanted` names whole-object
+    /// block indices (the same space [`BlockScan::survivor_block_indices`]
+    /// reports), not ordinal positions into the survivor list.
+    ///
+    /// A caller dealing whole row groups to partitions (ADR-2414 decision A1,
+    /// `ravel_sql::logs_scan::owned_work`) groups the segment's blocks by
+    /// PAGE_DIR row-group boundaries before pruning runs, so it cannot name a
+    /// partition's share as ordinal survivor positions: which ordinal a given
+    /// raw block lands at depends on how many blocks ahead of it the skip,
+    /// POSTINGS, and bloom pruning removes, which the caller has not computed
+    /// and does not want to duplicate. Set membership has no such dependency:
+    /// a raw block index either belongs to the partition's row groups or it
+    /// does not, regardless of where pruning places it in the survivor order.
+    ///
+    /// A raw index that pruning removed (it is not in this call's own survivor
+    /// list) is silently absent from the result rather than an error: a row
+    /// group dealt whole to a partition is not guaranteed to have every block
+    /// survive, only every SURVIVING block kept together.
+    pub fn scan_blocks_raw_subset(
+        &self,
+        content: &Predicate,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+        wanted: &[usize],
+    ) -> Result<BlockScan, LogSegError> {
+        let mut scan = self.scan_blocks(content, prune, columns)?;
+        let wanted: std::collections::HashSet<usize> = wanted.iter().copied().collect();
+        scan.blocks.retain(|b| wanted.contains(&(b.block_index as usize)));
+        scan.next = 0;
+        Ok(scan)
+    }
+
     /// A cursor over zero surviving blocks, for the two pre-decode short
     /// circuits (an empty ts range, an empty resolved stream set). Draining it
     /// yields nothing, which is what those paths returned before.
