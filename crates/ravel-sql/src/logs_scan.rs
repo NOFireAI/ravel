@@ -3646,7 +3646,7 @@ struct Prefetch {
 enum PrefetchOpen {
     InFlight(OpenFuture),
     Ready {
-        opened: DFResult<Option<LogSegmentScan>>,
+        opened: Box<DFResult<Option<LogSegmentScan>>>,
         at: Instant,
     },
 }
@@ -4094,7 +4094,7 @@ impl LogScanStream {
                 && let Poll::Ready(opened) = fut.as_mut().poll(cx)
             {
                 prefetch.open = PrefetchOpen::Ready {
-                    opened,
+                    opened: Box::new(opened),
                     at: Instant::now(),
                 };
                 ready.push(prefetch.ordinal);
@@ -4413,7 +4413,7 @@ impl LogScanStream {
                             this.blocks
                                 .open_elapsed
                                 .add_duration(at.saturating_duration_since(issued));
-                            match opened {
+                            match *opened {
                                 Ok(Some(scan)) => {
                                     this.state = if this.columnar_eligible {
                                         LogScanState::Columnar(Box::new(scan))
