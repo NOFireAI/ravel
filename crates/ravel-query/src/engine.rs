@@ -1174,7 +1174,7 @@ impl QueryEngine {
     /// `deadline`, and `remaining` of it is left. The resolve stops after
     /// `remaining`, its distributed and federated reads carry the request's
     /// own wall clock deadline `now_ns + deadline`, and a deadline error
-    /// names `deadline`.
+    /// names `remaining`, the budget this resolve was given.
     #[allow(clippy::too_many_arguments)]
     pub async fn resolve_series_within(
         &self,
@@ -1240,7 +1240,7 @@ impl QueryEngine {
             ),
         )
         .await;
-        unify_deadline(outcome, deadline)
+        unify_deadline(outcome, remaining)
     }
 
     async fn resolve_series_inner(
