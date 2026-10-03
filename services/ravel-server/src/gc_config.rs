@@ -15,11 +15,13 @@
 //! fails startup for any process whose credential may create `sys/gc`; only a
 //! *present* object that a mode really violates refuses. Under per-role
 //! credentials Gateway and Query may not create it, and their refused create
-//! fails with [`bootstrap_failure_context`]'s start-order fix. On S3 a GET of
-//! an absent key is refused when the credential holds no covering
-//! `s3:ListBucket`, so a fresh bucket can surface as a refused read in any
-//! mode; that context names both readings. Every other refusal names the
-//! missing grant.
+//! fails with [`bootstrap_failure_context`]'s start-order fix. The gateway,
+//! query and maintain templates each list `sys/gc`, so on S3 an absent `sys/gc`
+//! answers as missing and the bootstrap proceeds, and a refused read means the
+//! credential lacks the read grant. Only under bucket policies that predate
+//! those list grants is a GET of an absent key refused, so a fresh bucket can
+//! surface as a refused read; that context names both readings, the missing
+//! read grant first. Every other refusal names the missing grant.
 
 use std::time::Duration;
 
@@ -54,19 +56,20 @@ pub fn bootstrap_failure_context(err: &GcConfigError, mode: Mode) -> String {
         GcConfigError::AccessDenied {
             op: GcAccessOp::Read,
             ..
-        } => "this process's object-store credential was refused GetObject on sys/gc. On S3, a \
-             GET of a key that does not exist is refused rather than reported missing when the \
-             credential holds no s3:ListBucket covering that key, and the gateway, query and \
-             maintain templates grant none covering sys/gc, so on a fresh bucket this can \
-             mean sys/gc has not been created yet: run `ravel-cli gc-config set` under the \
-             Admin credential, with a protection horizon and grace equal to the maintain \
-             process's --gc-protection-horizon and --gc-grace (its defaults when unset) and \
-             a max query duration and max flush lifetime matching the \
+        } => "this process's object-store credential was refused GetObject on sys/gc. The \
+             gateway, query and maintain templates each grant an s3:ListBucket naming sys/gc, \
+             so under them an absent sys/gc reads as missing rather than refused, and \
+             a refused read means this credential lacks GetObject on sys/gc, or kms:Decrypt \
+             on the bucket's default key if the bucket uses SSE-KMS, and restarting will not \
+             help until that grant is fixed. If the bucket's policies predate those list \
+             grants, S3 refuses a GET of a key that does not exist rather than reporting it \
+             missing, so on a fresh bucket this can instead mean sys/gc has not been created \
+             yet: apply the current deploy/iam templates, or run `ravel-cli gc-config set` \
+             under the Admin credential, with a protection horizon and grace equal to the \
+             maintain process's --gc-protection-horizon and --gc-grace (its defaults when \
+             unset) and a max query duration and max flush lifetime matching the \
              --gc-max-query-duration and --gc-max-flush-lifetime the processes run with, \
-             then restart this process. If sys/gc exists, this credential lacks read on it, \
-             plus \
-             kms:Decrypt on the bucket's default key if the bucket uses SSE-KMS, and \
-             restarting will not help until that grant is fixed"
+             then restart this process"
             .to_string(),
         GcConfigError::AccessDenied {
             op: GcAccessOp::Create,
@@ -220,14 +223,22 @@ mod tests {
     }
 
     #[test]
-    fn refused_read_names_the_absent_key_case_and_the_read_grant_in_every_mode() {
+    fn refused_read_names_the_read_grant_first_and_the_predating_policy_case_in_every_mode() {
         for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
             let msg = bootstrap_failure_context(&denied(GcAccessOp::Read), mode);
             assert!(msg.contains("refused GetObject on sys/gc"), "{msg}");
+            let read_grant = msg
+                .find("a refused read means this credential lacks GetObject on sys/gc")
+                .unwrap_or_else(|| panic!("{msg}"));
+            let predating = msg
+                .find("If the bucket's policies predate those list grants")
+                .unwrap_or_else(|| panic!("{msg}"));
+            assert!(read_grant < predating, "{msg}");
             assert!(
-                msg.contains("a GET of a key that does not exist is refused"),
+                msg.contains("refuses a GET of a key that does not exist"),
                 "{msg}"
             );
+            assert!(!msg.contains("grant none covering sys/gc"), "{msg}");
             assert!(
                 msg.contains("run `ravel-cli gc-config set` under the Admin credential"),
                 "{msg}"
