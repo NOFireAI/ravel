@@ -447,9 +447,9 @@ impl Distributed {
                 }
                 pb::status::Code::Timeout => {
                     // The worker stopped the slice at the query's deadline, or
-                    // refused it because the deadline had already passed. The
-                    // slice's fetcher re-dispatches a `TIMEOUT` that arrived
-                    // before `deadline.instant` (clock skew, see
+                    // refused it because the deadline had already passed. A
+                    // re-dispatching fetcher has already re-dispatched one
+                    // that arrived before `deadline.instant` (clock skew, see
                     // `SliceFetcher::fetch_within`), so this one is terminal,
                     // and the spend the worker made before it stopped is
                     // folded first (issue #1723).
