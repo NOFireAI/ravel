@@ -9,8 +9,10 @@
 //! - the startup static-tenant check ([`validate_static_provisioning`]), which
 //!   refuses to start only when a statically-known tenant's record is
 //!   unreadable, has a structurally invalid generation history
-//!   ([`ProvisioningError::CorruptGenerations`]), or when adopting the
-//!   configured value would hide pre-ADR data. A decodable record with a valid
+//!   ([`ProvisioningError::CorruptGenerations`]), or when the configured value
+//!   would hide data. In `query` mode the check lists committed data only
+//!   (the commit prefix) and never adopts; it still refuses when the configured
+//!   `shard_count` would hide committed data. A decodable record with a valid
 //!   history whose recorded `shard_count` differs from the live `--shards`
 //!   default is tolerated: routing uses the record's own generation history
 //!   (ADR-0082).
@@ -22,10 +24,12 @@
 //!
 //! Fresh-deployment safety: a brand-new tenant with no
 //! prior writes and no provisioning record must never fail startup. The startup
-//! check uses [`AbsentPolicy::AdoptIfData`], which returns
+//! check uses [`AbsentPolicy::AdoptIfData`] in every mode but `query`, and
+//! [`AbsentPolicy::RefuseIfCommittedDataHidden`] in `query`
+//! ([`static_absent_policy`]); both return
 //! [`ProvisioningCheck::FreshNoData`] for a (tenant, signal) with no record and
 //! no data, so an operator-managed cluster that starts with zero data and
-//! configured tenant tokens passes through cleanly; only pre-ADR data a lower
+//! configured tenant tokens passes through cleanly; only data a lower
 //! `shard_count` would hide, an unreadable record, or a record with a
 //! structurally invalid generation history, refuses. A decodable record with
 //! a valid history whose recorded `shard_count` differs from the live default
@@ -39,6 +43,8 @@ use parking_lot::Mutex;
 use ravel_catalog::{AbsentPolicy, ProvisioningCheck, ProvisioningError, validate_or_adopt};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::{Signal, TenantHash, TenantId};
+
+use crate::config::Mode;
 
 /// The signals the server ingests and maintains, and therefore provisions a
 /// `shard_count` record for. Mirrors `crate::maintain::MAINTAINED_SIGNALS` and
@@ -196,25 +202,47 @@ pub async fn ensure_provisioning_record(
     }
 }
 
+/// What the startup static-tenant check may do about an absent record in
+/// `mode`. A `query` process serves committed data only: it validates a
+/// present record and never adopts, and for an absent record it lists the
+/// commit prefix and refuses when its configured count would hide committed
+/// data, so the Query credential needs no provisioning write and no `l0/`
+/// listing for this check (ADR-0055, prov write conditions amendment). Every
+/// mode that runs ingest or maintenance adopts pre-ADR data, as those paths do
+/// at runtime.
+pub fn static_absent_policy(mode: Mode) -> AbsentPolicy {
+    match mode {
+        Mode::Query => AbsentPolicy::RefuseIfCommittedDataHidden,
+        Mode::All | Mode::Gateway | Mode::Maintain => AbsentPolicy::AdoptIfData,
+    }
+}
+
 /// Validate the configured `shard_count` for every statically-known tenant at
-/// startup (ADR-0050 section 5), refusing to start on the first disagreement.
+/// startup (ADR-0050 section 5), refusing to start on the first unreadable
+/// record or adoption that would hide data.
 /// The static tenant set is the union of `--tenant-token` (or
 /// `--tenant-token-file`) and `--maintain-tenant` (already hashed), so an
 /// OIDC/mTLS deployment with no static tenants (an empty set) has nothing to
 /// validate here and every dynamic tenant is validated at first touch instead.
 ///
-/// Uses [`AbsentPolicy::AdoptIfData`]: a (tenant, signal) with no record and no
-/// data passes through without refusing (the fresh-deployment case), a
-/// (tenant, signal) with pre-ADR data is adopted once, and only a present
-/// record that disagrees or pre-ADR data a lower value would hide refuses. This
-/// is the fresh-deployment property: a brand-new tenant with no
-/// prior writes and no provisioning record does not fail startup.
+/// Runs under [`static_absent_policy`]`(mode)`. Under
+/// [`AbsentPolicy::AdoptIfData`] a (tenant, signal) with no record and no data
+/// passes through without refusing (the fresh-deployment case), a (tenant,
+/// signal) with pre-ADR data is adopted once, and only an unreadable record or
+/// pre-ADR data a lower value would hide refuses. Under
+/// [`AbsentPolicy::RefuseIfCommittedDataHidden`] (Query mode) an absent record
+/// lists only the commit prefix, refuses when committed data sits on a shard
+/// index at or above `shard_count`, and otherwise passes without a write; a
+/// present record is validated the same way. Either way a brand-new tenant
+/// with no prior writes and no provisioning record does not fail startup.
 pub async fn validate_static_provisioning(
     store: &dyn ObjectStoreBackend,
     static_tenants: &[TenantHash],
     shard_count: u32,
+    mode: Mode,
     now_ns: i64,
 ) -> Result<(), ProvisioningError> {
+    let absent_policy = static_absent_policy(mode);
     for tenant_hash in static_tenants {
         for signal in PROVISIONED_SIGNALS {
             let check = validate_or_adopt(
@@ -223,7 +251,7 @@ pub async fn validate_static_provisioning(
                 signal,
                 shard_count,
                 now_ns,
-                AbsentPolicy::AdoptIfData,
+                absent_policy,
             )
             .await?;
             if matches!(check, ProvisioningCheck::Written) {
@@ -245,8 +273,11 @@ mod tests {
     use super::*;
     use prost::Message;
     use ravel_catalog::provisioning_key;
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions, StoreError};
+    use ravel_object_store::{
+        GetRange, InstrumentedStore, ObjectStoreBackend, PutOptions, StoreError,
+    };
     use ravel_proto::sys::v1 as sysproto;
 
     fn store() -> Arc<dyn ObjectStoreBackend> {
@@ -289,22 +320,26 @@ mod tests {
     /// zero data).
     #[tokio::test]
     async fn fresh_tenant_with_no_prior_data_starts_cleanly() {
-        let store = store();
-        let statics = [TenantId::new("acme").hash(), TenantId::new("globex").hash()];
-        validate_static_provisioning(store.as_ref(), &statics, 4, 1_000)
-            .await
-            .expect("a fresh tenant with no record and no data must not fail startup");
-        // And nothing was written for a signal with no data.
-        let got = store
-            .get(
-                &provisioning_key(&statics[0], Signal::Metrics),
-                GetRange::Full,
-            )
-            .await;
-        assert!(
-            matches!(got, Err(StoreError::NotFound)),
-            "no record written"
-        );
+        for mode in ALL_MODES {
+            let store = store();
+            let statics = [TenantId::new("acme").hash(), TenantId::new("globex").hash()];
+            validate_static_provisioning(store.as_ref(), &statics, 4, mode, 1_000)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{mode:?}: a fresh tenant with no record and no data must not fail startup: {e}")
+                });
+            // And nothing was written for a signal with no data.
+            let got = store
+                .get(
+                    &provisioning_key(&statics[0], Signal::Metrics),
+                    GetRange::Full,
+                )
+                .await;
+            assert!(
+                matches!(got, Err(StoreError::NotFound)),
+                "{mode:?}: no record written"
+            );
+        }
     }
 
     /// ADR-0082: a statically-known tenant whose recorded `shard_count` (4)
@@ -314,12 +349,244 @@ mod tests {
     /// panicked; now the drift is tolerated and startup proceeds.
     #[tokio::test]
     async fn static_tenant_drift_does_not_refuse_startup() {
-        let store = store();
+        for mode in ALL_MODES {
+            let store = store();
+            let th = TenantId::new("acme").hash();
+            seed_record(store.as_ref(), &th, Signal::Metrics, 4).await;
+            validate_static_provisioning(store.as_ref(), &[th], 2, mode, 1_000)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{mode:?}: a recorded shard_count above the live default is tolerated (ADR-0082): {e}")
+                });
+        }
+    }
+
+    const ALL_MODES: [Mode; 4] = [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain];
+
+    /// A store holding pre-ADR metrics data for `th` on shard 0 (an L0 shard
+    /// directory and a commit shard directory) and no provisioning record,
+    /// wrapped in a counter so a test can assert which operations ran.
+    async fn store_with_unprovisioned_data(th: &TenantHash) -> InstrumentedStore<MemoryStore> {
+        let inner = MemoryStore::new();
+        let hex = th.to_hex();
+        for key in [
+            format!("t/{hex}/m/l0/0000/100/seg"),
+            format!("t/{hex}/m/c/0000/100/rec.cmt"),
+        ] {
+            inner
+                .put(&key, vec![1].into(), PutOptions::default())
+                .await
+                .expect("seed shard data");
+        }
+        InstrumentedStore::new(inner)
+    }
+
+    /// The startup policy per mode: only a `query` process checks without
+    /// adopting. Every other mode runs ingest or maintenance and adopts.
+    #[test]
+    fn only_query_mode_checks_without_adopting() {
+        for mode in ALL_MODES {
+            let expected = if mode == Mode::Query {
+                AbsentPolicy::RefuseIfCommittedDataHidden
+            } else {
+                AbsentPolicy::AdoptIfData
+            };
+            assert_eq!(static_absent_policy(mode), expected, "{mode:?}");
+        }
+    }
+
+    /// A store holding unprovisioned metrics data for `th` at `keys` (relative
+    /// to `t/<hex>/m/`) with no provisioning record, shaped like the Query
+    /// credential: any listing of an `l0/` prefix fails, as the Query template
+    /// grants no `l0/` listing. Wrapped in a counter so a test can assert which
+    /// operations ran.
+    async fn query_store_with_unprovisioned_data(
+        th: &TenantHash,
+        keys: &[&str],
+    ) -> InstrumentedStore<FaultStore<MemoryStore>> {
+        let inner = MemoryStore::new();
+        let hex = th.to_hex();
+        for key in keys {
+            inner
+                .put(
+                    &format!("t/{hex}/m/{key}"),
+                    vec![1].into(),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed shard data");
+        }
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Permanent("query credential: no l0 listing".into()),
+            )
+            .with_key_contains("/l0/"),
+        );
+        InstrumentedStore::new(FaultStore::new(inner, plan))
+    }
+
+    /// A `query` process never adopts at startup: over a tenant with committed
+    /// data in range and no record it lists only the commit prefix (one
+    /// delimited listing per provisioned signal), never `l0/`, writes no record,
+    /// and starts. `l0/` holds data on shard 9, above the configured count of
+    /// 4, which the adopt path would refuse over; Query does not serve it.
+    /// Fails with `Mode::Query => AbsentPolicy::AdoptIfData` in
+    /// [`static_absent_policy`]: the adopt path lists `l0/`.
+    #[tokio::test]
+    async fn query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing() {
         let th = TenantId::new("acme").hash();
-        seed_record(store.as_ref(), &th, Signal::Metrics, 4).await;
-        validate_static_provisioning(store.as_ref(), &[th], 2, 1_000)
+        let store = query_store_with_unprovisioned_data(
+            &th,
+            &[
+                "c/0000/100/rec.cmt",
+                "c/0003/100/rec.cmt",
+                "l0/0009/100/seg",
+            ],
+        )
+        .await;
+        let before = store.metrics().snapshot();
+        validate_static_provisioning(&store, &[th], 4, Mode::Query, 1_000)
             .await
-            .expect("a recorded shard_count above the live default is tolerated (ADR-0082)");
+            .expect("query-mode startup over in-range committed data must pass");
+        let after = store.metrics().snapshot();
+        assert_eq!(
+            store.inner().fault_count(Op::List, FaultKind::Permanent),
+            0,
+            "query-mode startup must not list l0/"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            PROVISIONED_SIGNALS.len() as u64,
+            "one commit-prefix listing per provisioned signal"
+        );
+        assert_eq!(
+            after.put.calls - before.put.calls,
+            0,
+            "query-mode startup must not write"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            PROVISIONED_SIGNALS.len() as u64,
+            "one record read per provisioned signal"
+        );
+        let got = store
+            .get(&provisioning_key(&th, Signal::Metrics), GetRange::Full)
+            .await;
+        assert!(
+            matches!(got, Err(StoreError::NotFound)),
+            "no record written"
+        );
+    }
+
+    /// ADR-0050 section 5 in Query mode: committed data on shard 4 with
+    /// `--shards 4` and no record would be read through the implicit generation
+    /// 0 of 4 shards, leaving shard 4 out of every query, so startup refuses.
+    /// Fails with `Mode::Query => AbsentPolicy::CheckOnly` in
+    /// [`static_absent_policy`]: that policy returns before any listing.
+    #[tokio::test]
+    async fn query_mode_startup_refuses_when_shards_would_hide_committed_data() {
+        let th = TenantId::new("acme").hash();
+        let store =
+            query_store_with_unprovisioned_data(&th, &["c/0000/100/rec.cmt", "c/0004/100/rec.cmt"])
+                .await;
+        let before = store.metrics().snapshot();
+        let err = validate_static_provisioning(&store, &[th], 4, Mode::Query, 1_000)
+            .await
+            .expect_err("committed data on shard 4 is hidden by --shards 4");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::AdoptionWouldHideData {
+                    configured: 4,
+                    observed_shard: 4,
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(after.put.calls - before.put.calls, 0, "no write");
+        assert_eq!(
+            store.inner().fault_count(Op::List, FaultKind::Permanent),
+            0,
+            "no l0/ listing"
+        );
+    }
+
+    /// Query mode still validates a present record: one that does not belong to
+    /// this (tenant, signal) refuses startup exactly as in every other mode.
+    /// (A record whose `shard_count` merely differs from `--shards` is drift,
+    /// tolerated in every mode under ADR-0082:
+    /// `static_tenant_drift_does_not_refuse_startup`.)
+    #[tokio::test]
+    async fn query_mode_startup_still_refuses_an_unreadable_record() {
+        for mode in ALL_MODES {
+            let store = store();
+            let th = TenantId::new("acme").hash();
+            let other = TenantId::new("globex").hash();
+            let record = sysproto::ProvisioningRecord {
+                format_version: 1,
+                tenant_hash: other.0.to_vec(),
+                signal: sysproto::Signal::Metrics as i32,
+                shard_count: 4,
+                created_unix_ns: 1,
+                generations: Vec::new(),
+                format_floors: Vec::new(),
+            };
+            store
+                .put(
+                    &provisioning_key(&th, Signal::Metrics),
+                    record.encode_to_vec().into(),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed record");
+            let err = validate_static_provisioning(store.as_ref(), &[th], 4, mode, 1_000)
+                .await
+                .expect_err("a record naming another tenant must refuse startup");
+            assert!(
+                matches!(
+                    err,
+                    ProvisioningError::CorruptRecord {
+                        field: "tenant_hash",
+                        ..
+                    }
+                ),
+                "{mode:?}: got {err}"
+            );
+        }
+    }
+
+    /// Every mode that runs ingest or maintenance still adopts pre-ADR data at
+    /// startup: it lists the shard directories and creates the record.
+    #[tokio::test]
+    async fn adopting_modes_create_the_record_over_unprovisioned_data() {
+        for mode in [Mode::All, Mode::Gateway, Mode::Maintain] {
+            let th = TenantId::new("acme").hash();
+            let store = store_with_unprovisioned_data(&th).await;
+            let before = store.metrics().snapshot();
+            validate_static_provisioning(&store, &[th], 4, mode, 1_000)
+                .await
+                .unwrap_or_else(|e| panic!("{mode:?}: adopt must succeed: {e}"));
+            let after = store.metrics().snapshot();
+            assert!(
+                after.list_calls() > before.list_calls(),
+                "{mode:?}: the adopt path lists the shard directories"
+            );
+            assert_eq!(
+                after.put.calls - before.put.calls,
+                1,
+                "{mode:?}: exactly the metrics record is created"
+            );
+            let got = store
+                .get(&provisioning_key(&th, Signal::Metrics), GetRange::Full)
+                .await
+                .unwrap_or_else(|e| panic!("{mode:?}: record adopted: {e}"));
+            let record = sysproto::ProvisioningRecord::decode(got.data.as_ref())
+                .expect("adopted record decodes");
+            assert_eq!(record.shard_count, 4, "{mode:?}");
+        }
     }
 
     /// ADR-0082 on the dynamic path: a first-touch drift (recorded 4, live
