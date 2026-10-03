@@ -581,9 +581,12 @@ mod http {
 pub use http::HttpEngine;
 
 /// In-process DataFusion over the ClickBench fixture on the local
-/// filesystem: the oracle the suite's engines are compared against. Shares
-/// no Ravel code with [`in_process::InProcessEngine`], so a defect common to
-/// both the subject engine and its oracle cannot hide a wrong answer.
+/// filesystem: the reference the suite's engines are compared against in CI.
+/// It shares no Ravel code with [`in_process::InProcessEngine`], so it
+/// catches defects in Ravel's own SQL, scan and aggregate layers. It links
+/// the same DataFusion build as Ravel, so a defect in that build gives both
+/// sides the same answer and passes; ADR-2040 D7's reference is datafusion-cli
+/// output generated on the reference machine, which this does not replace.
 #[cfg(feature = "sql-latency")]
 mod reference {
     use std::path::Path;
