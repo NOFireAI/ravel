@@ -747,6 +747,7 @@ would admit nothing. The existing list statements are unchanged.
 | `t/<tenant_hash>/catalog/<signal>/HEAD` | | | `m`, `l`, `s` | the scheduled fold's `get_head`; absent means the first fold |
 | `t/<tenant_hash>/a/state/latest` | | yes | yes | the alert evaluator (folds the full history) and alert retention (checks the commit prefix) |
 | `t/<tenant_hash>/pq/grants` | | yes | | `grants::list`; absent is an empty grant list |
+| `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` | `l`, `s` | | | `read_marker` on every keyed log or span write, once per hour of the dedup window; absent means no marker at that hour. The keyhash and the hour are spelled one `?` per character, as the tenant hash is |
 
 The catalog `HEAD` that Gateway and Query read was already covered by their
 `t/*/catalog/*/*` list prefix, and Maintain's scrub cursor and other keys
@@ -766,40 +767,44 @@ nor a deeper key, a listing prefix, a 31- or 33-character tenant segment, or
 
 Some keys are deliberately left out. `sys/t/<tenant_hash>`, the alert lease
 and the compaction claims are written with a create-if-absent PUT first and
-read only once that PUT reports the object exists. The idempotency markers are
-found by listing a prefix, not by a single-key read, so they need no bootstrap
-grant: `GatewayList` grants that listing, as the next section describes. A
-data object that a concurrent compaction deleted is a race, not a bootstrap
-state, and naming those keys would need a `*`.
+read only once that PUT reports the object exists. A data object that a
+concurrent compaction deleted is a race, not a bootstrap state, and naming
+those keys would need a `*`.
 
 ## Idempotency markers: the keyed-ingest lookup
 
 A log or span request carrying `x-ravel-idempotency-key` looks up its marker
-before writing anything, and writes the marker after its data commits. The
-lookup lists one prefix, because the marker key ends in the ingest hour the
-original request pinned and a retry cannot know that hour. The calls are in
+before its own data is written, and writes the marker after its data commits.
+The marker key ends in the ingest hour the original request pinned, which a
+retry cannot know, so the lookup is a GET per hour of the dedup window: it GETs
+the exact marker key for each hour from one hour ahead of the current hour
+back 24 hours, newest first, and stops at the first marker it finds. A miss is
+26 GETs. It lists nothing. The calls are in
 `crates/ravel-ingest/src/idempotency.rs`:
 
 | Call | Mode | S3 operation | Grant |
 |---|---|---|---|
-| `read_marker` `list_all(store, &marker_prefix(tenant, signal, key))` | `gateway`, `all` | `s3:ListBucket` with `prefix=t/<tenant_hash>/<signal>/idem/<keyhash32>.`, signal `l` or `s` | `GatewayList` `s3:prefix` `t/????????????????????????????????/l/idem/????????????????????????????????.` and the same with `s` |
-| `read_marker_at` GETs the newest in-window marker the listing returned, and `write_marker` GETs the winner's marker after losing a create race | `gateway`, `all` | `s3:GetObject` | `GatewayRead` `t/*/*/idem/*` |
+| `read_marker` GETs `marker_key(tenant, signal, key, hour)` for each hour of the window, and `write_marker` GETs the winner's marker after losing a create race | `gateway`, `all` | `s3:GetObject` | `GatewayRead` `t/*/*/idem/*` |
+| the same probe of an absent marker, which AWS S3 answers 404 only under a list grant on that key | `gateway`, `all` | `s3:ListBucket` with `prefix=t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm`, signal `l` or `s` | `GatewayListTenantBootstrapKeys` `s3:prefix` `t/????????????????????????????????/l/idem/????????????????????????????????.????????T??.idm` and the same with `s` |
 | `write_marker` PUTs `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm` (`CreateIfAbsent`) | `gateway`, `all` | `s3:PutObject` | `GatewayWrite` `t/*/*/idem/*` |
 
-The list grant spells the tenant hash and the 32-character keyhash as one `?`
-per character, then the literal `.` the prefix ends in, so it admits exactly
-the lookup's prefix: not a listing of a tenant's whole `idem/` directory, not
-another signal's markers, and not a tenant segment wider or narrower than a
-tenant hash. Metrics requests take no key and do no lookup.
+The list grant names a marker key exactly, as the bootstrap keys above do, so
+a list request it admits returns at most that one key: it admits no listing of
+a tenant's `idem/` directory, of one key's markers across hours, or of another
+signal's markers. Metrics requests take no key and do no lookup.
 
-If the store refuses the lookup anyway, on a bucket whose policy predates this
-grant or under a hand-edited one, a keyed request fails with HTTP 503 or gRPC
-`UNAVAILABLE`, naming the refused LIST, and writes nothing, so the client's
-retry is safe. It never writes without the lookup, since that would store a
-duplicate of a request that already landed. A request without a key is
-unaffected.
-`crates/ravel-commit/tests/iam_templates.rs` pins the list grant and checks
-that it admits none of those sibling prefixes.
+If a probe fails with a store error other than not-found, on a bucket whose
+policy predates the list grant (where an absent marker answers 403) or for any
+other reason, the keyed request fails with HTTP 503 or gRPC `UNAVAILABLE`
+before its own data is written, so the client's retry is safe. The response
+says only that the idempotency marker lookup failed; the gateway logs the
+failed GET, its key and the store error at WARN and counts the refusal on
+`ravel_ingest_idempotency_lookup_failures_total`. It never writes without the
+lookup, since that would store a duplicate of a request that already landed. A
+request without a key is unaffected.
+`crates/ravel-commit/tests/iam_templates.rs` pins both grants for the marker
+key and checks that no gateway list grant admits the `idem/` directory or any
+other prefix beside a marker key.
 
 ## Bucket-configuration reads: granted by no template
 

@@ -204,13 +204,7 @@ pub async fn handle_export_traces(
             // whenever the marker exists and the lookup could not see it.
             Err(err) => {
                 return Err(SpanIngestRequestError::Write(SpanWriteError::Abandoned(
-                    crate::logs_ingest::marker_lookup_failure(
-                        &tenant,
-                        Signal::Spans,
-                        key,
-                        bucket,
-                        &err,
-                    ),
+                    crate::logs_ingest::marker_lookup_failure(Signal::Spans, &err),
                 )));
             }
         }
@@ -383,6 +377,10 @@ mod tests {
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
+    use crate::logs_ingest::marker_lookup_test_support::{
+        LookupFailureWarning, LookupFailureWarnings, STORE_ERROR_TEXT, marker_get_refusals,
+        marker_probe_store, put_count,
+    };
     use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
     /// Fixed post-floor fixture base, 2026-01-01T00:00:00Z in nanoseconds
@@ -857,61 +855,30 @@ mod tests {
     /// `corrupt_marker_falls_through_to_a_normal_write_not_an_error`.
     const MARKER_TEST_INGEST_TS_NS: i64 = BASE_TS_NS + 2_000;
 
-    /// More passthrough steps than any one test's PUTs, so the `Op::Put`
-    /// sequence's progress is the exact PUT count.
-    const PUT_COUNTER_STEPS: usize = 256;
-
-    /// A store that counts every PUT (sequence 0) and, when
-    /// `refuse_marker_list` is set, refuses every LIST under an `idem/`
-    /// prefix the way S3 refuses a ListBucket the policy does not grant.
-    fn marker_list_store(
-        refuse_marker_list: bool,
-    ) -> Arc<ravel_object_store::fault::FaultStore<MemoryStore>> {
-        use ravel_object_store::fault::{
-            FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence, SequenceStep,
-        };
-        let mut plan = FaultPlan::empty().with_sequence(
-            Sequence::new(Op::Put).with_steps(vec![SequenceStep::Passthrough; PUT_COUNTER_STEPS]),
-        );
-        if refuse_marker_list {
-            plan = plan.with_rule(
-                Rule::new(
-                    Op::List,
-                    ScriptedFault::Permanent("AccessDenied: s3:ListBucket".into()),
-                )
-                .with_key_contains("/idem/"),
-            );
-        }
-        Arc::new(FaultStore::new(MemoryStore::new(), plan))
-    }
-
-    fn put_count(store: &ravel_object_store::fault::FaultStore<MemoryStore>) -> u64 {
-        let puts = store.sequence_progress(0);
-        assert!(
-            (puts as usize) < PUT_COUNTER_STEPS,
-            "the PUT counter saturated at {puts}"
-        );
-        puts
-    }
-
-    fn marker_list_refusals(store: &ravel_object_store::fault::FaultStore<MemoryStore>) -> u64 {
-        use ravel_object_store::fault::{FaultKind, Op};
-        store.fault_count(Op::List, FaultKind::Permanent)
-    }
-
-    /// Issue #2462: a keyed span write whose marker lookup the store refuses
-    /// fails with the retryable `Abandoned` error, names the refused LIST, and
-    /// writes nothing.
+    /// Issue #2462: a keyed span write whose marker probe the store refuses
+    /// fails with the retryable `Abandoned` error before any of its data is
+    /// written. The client-facing message names no key, tenant hash, LIST or
+    /// store error; the failed GET, its key and the store error go to one WARN
+    /// line and one count of `ravel_ingest_idempotency_lookup_failures_total`.
     ///
-    /// Non-vacuity: restoring the old `Err(err) => { tracing::warn!(..) }` arm
-    /// in `handle_export_traces` makes the write succeed, so the `let Err`
-    /// pattern panics.
+    /// Non-vacuity: restoring a log-and-write arm for `Err(err)` in
+    /// `handle_export_traces` makes the write succeed, so the `let Err`
+    /// pattern panics; appending the store error to the message fails the
+    /// message equality check; dropping the `tracing::warn!` or the
+    /// `fetch_add` in `crate::logs_ingest::marker_lookup_failure` fails the
+    /// capture or the counter check.
     #[tokio::test]
     async fn keyed_write_whose_marker_lookup_is_refused_fails_retryable_and_writes_nothing() {
-        let store = marker_list_store(true);
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let store = marker_probe_store(true);
         let state = state_with_store(store.clone());
         let tenant = TenantId::new("acme");
         let key = b"idem-2462".to_vec();
+        let warnings = LookupFailureWarnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        let failures_before = crate::logs_ingest::idempotency_lookup_failures(Signal::Spans);
 
         let Err(err) = handle_export_traces(
             &state,
@@ -930,24 +897,52 @@ mod tests {
             panic!("expected the retryable Abandoned write error, got {err:?}");
         };
         assert!(err.is_retryable(), "{err:?} must be retryable");
-        let prefix = format!(
-            "t/{}/s/idem/{}.",
-            tenant.hash().to_hex(),
-            ravel_ingest::keyhash32(&tenant, &key)
+        assert_eq!(message, crate::logs_ingest::MARKER_LOOKUP_FAILED_MESSAGE);
+        let bucket = request_ingest_hour_bucket(MARKER_TEST_INGEST_TS_NS).expect("valid ingest ts");
+        let first_probe = ravel_ingest::marker_key(
+            &tenant,
+            Signal::Spans,
+            &key,
+            bucket + ravel_ingest::IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS,
         );
-        assert!(
-            message.contains(&format!("LIST {prefix})")) && message.contains("AccessDenied"),
-            "the error must name the refused LIST of {prefix:?} and the store error: {message}"
-        );
-        assert_eq!(marker_list_refusals(&store), 1, "the LIST fault must fire");
+        let client_text = err.to_string();
+        for forbidden in [
+            first_probe.as_str(),
+            &tenant.hash().to_hex(),
+            &ravel_ingest::keyhash32(&tenant, &key),
+            "LIST",
+            STORE_ERROR_TEXT,
+        ] {
+            assert!(
+                !client_text.contains(forbidden),
+                "the client-facing message must not carry {forbidden:?}: {client_text}"
+            );
+        }
+
+        assert_eq!(marker_get_refusals(&store), 1, "the GET fault must fire");
         assert_eq!(put_count(&store), 0, "a refused lookup must write nothing");
+        assert_eq!(
+            warnings.0.lock().as_slice(),
+            &[LookupFailureWarning {
+                signal: "s".to_string(),
+                request: "GET".to_string(),
+                key: first_probe,
+                error: format!("permanent error: {STORE_ERROR_TEXT}"),
+            }],
+            "exactly one WARN line, naming the GET, its key and the store error"
+        );
+        assert_eq!(
+            crate::logs_ingest::idempotency_lookup_failures(Signal::Spans) - failures_before,
+            1,
+            "the lookup failure must be counted exactly once"
+        );
     }
 
     /// The same refusal does not touch a request without a key: it never
     /// looks a marker up, so it writes as before.
     #[tokio::test]
-    async fn unkeyed_write_is_unaffected_by_a_refused_marker_listing() {
-        let store = marker_list_store(true);
+    async fn unkeyed_write_is_unaffected_by_a_refused_marker_probe() {
+        let store = marker_probe_store(true);
         let state = state_with_store(store.clone());
 
         let outcome = handle_export_traces(
@@ -959,10 +954,10 @@ mod tests {
             None,
         )
         .await
-        .expect("an unkeyed write never lists a marker prefix");
+        .expect("an unkeyed write never probes a marker");
 
         assert_eq!(outcome.tokens.len(), 1);
-        assert_eq!(marker_list_refusals(&store), 0);
+        assert_eq!(marker_get_refusals(&store), 0);
         assert!(
             put_count(&store) > 0,
             "the unkeyed write must store its data"
@@ -973,7 +968,7 @@ mod tests {
     /// data and then its marker: absence is a miss, not a store error.
     #[tokio::test]
     async fn keyed_write_whose_marker_lookup_finds_nothing_still_writes() {
-        let store = marker_list_store(false);
+        let store = marker_probe_store(false);
         let state = state_with_store(store.clone());
         let tenant = TenantId::new("acme");
         let key = b"idem-2462".to_vec();
