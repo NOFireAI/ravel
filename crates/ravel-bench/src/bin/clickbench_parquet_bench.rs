@@ -233,16 +233,19 @@ async fn run(args: Args) -> Result<bool, String> {
             tasks,
             &suite.statements,
             Duration::from_secs(args.concurrency_seconds),
+            &prereg.failures,
         )
         .await
         .map_err(|e| e.to_string())?;
         eprintln!(
-            "concurrency: {} tasks, {} completed, {} errors, qps={}, error_ratio={}",
+            "concurrency: {} tasks, {} completed, {} errors, qps={}, error_ratio={}, \
+             unregistered_error_ratio={}",
             figures.tasks,
             figures.queries_completed,
             figures.errors,
             figures.qps,
-            figures.error_ratio
+            figures.error_ratio,
+            figures.unregistered_error_ratio
         );
         Some(figures)
     };
