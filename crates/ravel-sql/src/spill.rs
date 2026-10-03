@@ -291,7 +291,7 @@ impl SpillRootOwner {
             .create(true)
             .truncate(false)
             .open(&lock_path)?;
-        fs4::FileExt::try_lock(&lock_file)?;
+        lock_file.try_lock()?;
         Ok(SpillRootOwner {
             dir,
             _lock: lock_file,
@@ -372,7 +372,7 @@ impl SpillRootOwner {
                 return;
             }
         };
-        match fs4::FileExt::try_lock(&lock_file) {
+        match lock_file.try_lock() {
             Ok(()) => {
                 drop(lock_file);
                 match std::fs::remove_dir_all(candidate) {
@@ -391,13 +391,13 @@ impl SpillRootOwner {
                     }
                 }
             }
-            Err(fs4::TryLockError::WouldBlock) => {
+            Err(std::fs::TryLockError::WouldBlock) => {
                 // Owned by a live process. Expected steady state; nothing to log.
             }
-            Err(err @ fs4::TryLockError::Error(_)) => {
+            Err(std::fs::TryLockError::Error(err)) => {
                 tracing::warn!(
                     dir = %candidate.display(),
-                    error = %std::io::Error::from(err),
+                    error = %err,
                     "cannot prove ownership of this SQL spill root; leaving it in place"
                 );
             }

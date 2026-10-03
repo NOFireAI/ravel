@@ -158,12 +158,11 @@ base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 humantime = "2"
 # Cache-dir-derived spill (ADR-0954 amendment, issue #2416) needs the host
-# volume's free bytes and an advisory lock an orphan sweep can test for
-# liveness without reading a pid. The workspace forbids `unsafe_code`
-# (including in dependencies this crate itself would otherwise have to write),
-# so this has to come from a dependency rather than a direct syscall; fs4 is a
-# new external crate, not yet in the lockfile under any other dependency.
-fs4 = "1"
+# volume's free bytes: `rustix::fs::statvfs` is a safe wrapper over the
+# syscall, which `unsafe_code = "forbid"` keeps out of this workspace's own
+# code. rustix is already in the lockfile through tempfile. The spill root's
+# owner lock is std's `File::try_lock` and needs no dependency.
+rustix = { version = "1", features = ["fs"] }
 
 # observability
 tracing = "0.1"
