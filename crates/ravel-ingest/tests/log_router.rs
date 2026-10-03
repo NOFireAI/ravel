@@ -496,6 +496,69 @@ async fn columnar_partial_failure_recovers_the_surviving_shards_token() {
     router.shutdown().await;
 }
 
+/// Issue #2460: a `stream_refs` entry past `stream_ids`' end must be refused
+/// by `ColumnarLogBatch::validate()` at the PUBLIC `write_columnar` entry
+/// point, before the batch ever reaches a shard actor. Distinguishes a build
+/// that validates after `est_columnar_bytes` (which indexes `stream_attrs`
+/// by `stream_refs` with no bound check of its own and would panic on this
+/// input instead of returning a typed error) from one that validates first.
+/// Also proves the malformed input is not misclassified as a stream-id
+/// collision, and that the router is still usable for a well-formed write
+/// afterward (the rejection must not poison shared router state).
+#[tokio::test]
+async fn write_columnar_rejects_a_stream_ref_past_stream_ids_end() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let clock = TestClock::new(BASE_NS);
+    let router = LogIngestRouter::new(flush_on_first(1), Arc::clone(&store), clock.clone());
+
+    let tenant = tenant("acme");
+    let rec = norm_record(&[("service.name", "api")], 1_000, "hello");
+    let mut batch = ColumnarLogBatch::from_records(&[to_logrecord(&rec)]);
+    assert_eq!(batch.stream_refs.len(), 1);
+    let past_end = batch.stream_ids.len() as u32;
+    batch.stream_refs[0] = past_end;
+
+    let err = router
+        .write_columnar(
+            tenant.clone(),
+            batch,
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect_err("a stream_refs entry past stream_ids' end must be refused, not panic");
+    assert!(
+        matches!(err, LogWriteError::SegmentBuild(ref msg) if msg.contains("stream_refs")),
+        "expected SegmentBuild naming stream_refs, got {err:?}"
+    );
+
+    assert_eq!(
+        router.metrics().snapshot().stream_id_collisions,
+        0,
+        "a malformed batch must not be counted as a stream-id collision"
+    );
+
+    // The router must stay usable: a well-formed write after the rejection
+    // still commits.
+    let good = ColumnarLogBatch::from_records(&[to_logrecord(&norm_record(
+        &[("service.name", "api")],
+        2_000,
+        "still works",
+    ))]);
+    let receipt = router
+        .write_columnar(
+            tenant.clone(),
+            good,
+            WriteMode::Strict,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("router stays usable after refusing a malformed batch");
+    assert_eq!(receipt.tokens.len(), 1);
+
+    router.shutdown().await;
+}
+
 /// Lands a conflicting commit record at shard 0's commit key and reports
 /// `AlreadyExists`, driving the pinned-identity split-brain panic in *that
 /// specific* shard actor. Unlike `SplitBrainOnFirstCommit`, it targets shard 0

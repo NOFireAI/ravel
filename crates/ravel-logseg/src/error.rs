@@ -44,6 +44,29 @@ pub enum LogSegError {
     /// nothing has been decoded yet, so it is never `Corrupted`.
     #[error("inconsistent stream attrs: {0}")]
     InconsistentStreamAttrs(String),
+    /// A [`crate::columnar_batch::ColumnarLogBatch`] whose fields contradict
+    /// each other or its own `num_rows`, refused by
+    /// [`crate::columnar_batch::ColumnarLogBatch::validate`] before the
+    /// columnar build path indexes into it. Covers: `ts_ns`, `observed_ts_ns`,
+    /// `severity_num`, `flags`, `severity_text`, `body`, `trace_id_validity`,
+    /// `span_id_validity`, `stream_refs`, or `residual_attrs` whose length is
+    /// not `num_rows`; a packed `trace_id` or `span_id` buffer whose length
+    /// does not match its present rows; `stream_ids` and `stream_attrs` of
+    /// different lengths; a repeated id within `stream_ids`; a `stream_refs`
+    /// value at or past `stream_ids.len()`; a `dyn_columns` entry whose
+    /// `validity` does not describe `num_rows` rows, whose `cells` count does
+    /// not match `validity`'s present count, or one of whose cells has a type
+    /// other than the column's `field_type`; a `dyn_col_dicts` that is
+    /// non-empty but not one entry per dyn column; a present dictionary whose
+    /// `ids` is not parallel to its column's present cells, holds an id at or
+    /// past its own `distinct.len()`, or names a `distinct` entry that differs
+    /// from its cell's bytes (for a `Str` cell or a `Bytes` cell; `List` and
+    /// `Map` cells are not compared). Not covered, see `validate`: duplicate
+    /// `(name, field_type)` columns, more than 4 GiB in one `VarBytes`, and
+    /// dictionary contents for `List`/`Map` cells. A caller-side input error,
+    /// not a stream id collision and not object corruption.
+    #[error("malformed columnar batch: {0}")]
+    MalformedColumnarBatch(String),
     /// The sort descriptor handed to the writer cannot be recorded for this
     /// object because its shape would not decode (no key or more than four, an
     /// empty or repeated name, generation 0). Writer-side input validation,
