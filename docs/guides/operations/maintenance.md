@@ -538,16 +538,17 @@ deployment's merges: raise `--maintain-claim-lease`. A steal is the other
 side of that event, but it also follows every crash and restart, so a steal
 rate alone over-alerts.
 
-Three flags configure claiming:
+Two flags configure claiming, and a third no longer has any effect:
 
 - `--maintain-claim-lease <DURATION>` (default `300s`): how long a claim stays
   live without a renewal. A lease below twice the time to encode and PUT the
   largest L1 segment at a conservative rate logs a startup warning, not a
   refusal; zero is refused outright.
-- `--maintain-claim-min-input-bytes <BYTES>` (default 64 MiB): the cost gate.
-  A bucket below this many listed L0 input bytes runs unclaimed, because a
-  duplicated small merge costs less than the claim traffic that would prevent
-  it. Zero is refused: it would claim every bucket regardless of size.
+- `--maintain-claim-min-input-bytes <BYTES>` (default 64 MiB): has no effect
+  and will be removed. With claims on, every bucket is claimed whatever its
+  size, because the claim also keeps a compaction and an erasure rewrite of
+  the same bucket from publishing over each other. The flag is still accepted
+  so existing deployments start unchanged; zero is still refused.
 - `--maintain-claims on|off` (default `on`): the fleet-wide escape hatch.
   `off` disables claiming everywhere on that process, for a store whose
   qualification record predates the CAS probes, or for an emergency; claims
