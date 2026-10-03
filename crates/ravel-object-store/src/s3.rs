@@ -213,11 +213,11 @@ const MULTIPART_UPLOAD_CONCURRENCY: usize = 4;
 /// The most requests [`S3Store::put`] can have in flight at once for a
 /// `len`-byte payload under `mode`: up to [`MULTIPART_UPLOAD_CONCURRENCY`] part
 /// uploads for an `Overwrite` above [`MULTIPART_THRESHOLD`], otherwise one.
-/// Upload integrity is not consulted, so for a store with integrity on, which
-/// keeps every put on the single-PUT path, this overstates a large overwrite.
-/// A scheduled handle sizes its permits from this
-/// ([`crate::scheduling`], "Ops that fan out").
-pub fn put_fan_out(len: usize, mode: &PutMode) -> usize {
+/// This is the fan-out with upload integrity off; with it on every put is a
+/// single PUT. A scheduled handle sizes its permits from this only for a store
+/// that does not declare `upload_checksum` ([`crate::scheduling`], "Ops that
+/// fan out").
+pub(crate) fn put_fan_out(len: usize, mode: &PutMode) -> usize {
     if matches!(mode, PutMode::Overwrite) && len > MULTIPART_THRESHOLD {
         len.div_ceil(MULTIPART_PART_SIZE)
             .min(MULTIPART_UPLOAD_CONCURRENCY)
