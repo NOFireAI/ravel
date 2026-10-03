@@ -282,8 +282,9 @@ struct FakeState {
     /// Woken whenever `in_flight` changes.
     in_flight_changed: Notify,
     /// When set, a request of one of these ops waits before answering until
-    /// this many requests are in flight or the grace period passes, so every
-    /// request a client sends concurrently overlaps at the server.
+    /// this many requests have been in flight at once (now or earlier) or the
+    /// grace period passes, so every request a client sends concurrently
+    /// overlaps at the server.
     hold: Mutex<Option<(Vec<Op>, usize, Duration)>>,
 }
 
@@ -308,13 +309,14 @@ impl Drop for InFlight<'_> {
 }
 
 impl FakeState {
-    /// Wait until at least `target` requests are in flight.
-    async fn wait_in_flight(&self, target: usize) {
+    /// Wait until `count` (`in_flight` or `peak_in_flight`) reads at least
+    /// `target`.
+    async fn wait_for(&self, count: &AtomicUsize, target: usize) {
         loop {
             let changed = self.in_flight_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if self.in_flight.load(Ordering::SeqCst) >= target {
+            if count.load(Ordering::SeqCst) >= target {
                 return;
             }
             changed.await;
@@ -506,15 +508,17 @@ impl FakeS3 {
         self.requests(op).len()
     }
 
-    /// Hold every request of the `ops` until `target` requests are in flight
-    /// or `grace` passes, whichever comes first.
+    /// Hold every request of the `ops` until `target` requests have been in
+    /// flight at once or `grace` passes, whichever comes first.
     fn hold(&self, ops: &[Op], target: usize, grace: Duration) {
         *self.state.hold.lock() = Some((ops.to_vec(), target, grace));
     }
 
     /// Wait until at least `target` requests are in flight.
     async fn wait_in_flight(&self, target: usize) {
-        self.state.wait_in_flight(target).await;
+        self.state
+            .wait_for(&self.state.in_flight, target)
+            .await;
     }
 
     /// The most requests of any kind the endpoint has served at once.
@@ -818,7 +822,7 @@ async fn handle(
     if let Some((ops, target, grace)) = hold
         && ops.contains(&op)
     {
-        let _ = tokio::time::timeout(grace, state.wait_in_flight(target)).await;
+        let _ = tokio::time::timeout(grace, state.wait_for(&state.peak_in_flight, target)).await;
     }
     if has_unsigned_amz_header(&headers) {
         return error_response(
