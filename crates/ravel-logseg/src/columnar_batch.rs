@@ -351,15 +351,21 @@ impl ColumnarLogBatch {
         }
 
         // Stream directory: id-ascending (BTreeMap iteration order), dense ref.
-        let mut ref_of: std::collections::HashMap<LogStreamId, u32> =
-            std::collections::HashMap::with_capacity(stream_blob.len());
-        for (i, (id, blob)) in stream_blob.into_iter().enumerate() {
-            ref_of.insert(id, i as u32);
+        for (id, blob) in stream_blob {
             batch.stream_ids.push(id);
             batch.stream_attrs.push(blob);
         }
+        // `batch.stream_ids` is ascending by construction, so each record's ref
+        // is its stream id's position in it, found by binary search rather than
+        // a hash lookup. A miss cannot happen: `stream_blob` above is built from
+        // every record's own `r.stream_id` in this same `records` slice, so each
+        // id resolved here was already inserted into it.
         for (row, r) in records.iter().enumerate() {
-            batch.stream_refs[row] = ref_of[&r.stream_id];
+            batch.stream_refs[row] = batch
+                .stream_ids
+                .binary_search(&r.stream_id)
+                .map(|i| i as u32)
+                .unwrap_or(0);
         }
 
         // Materialize dynamic columns in (name, type) order.
@@ -438,5 +444,90 @@ impl ColumnarLogBatch {
 impl Default for ColumnarLogBatch {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::stream_attrs_bytes;
+
+    /// A distinct stream id per `n` (up to `u32::MAX` streams), with the
+    /// ordering of `n` matching `LogStreamId`'s own `Ord` (big-endian bytes in
+    /// the leading 4 of 16), so "sorted position" and "numeric order of `n`"
+    /// are the same thing in these tests.
+    fn wide_id(n: u32) -> LogStreamId {
+        let mut a = [0u8; 16];
+        a[0..4].copy_from_slice(&n.to_be_bytes());
+        LogStreamId(a)
+    }
+
+    fn wide_attrs_blob(n: u32) -> Vec<u8> {
+        stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str(format!("svc{n}")))],
+            "scope",
+            "1.0",
+            &[("lib".into(), AttrValue::I64(i64::from(n)))],
+        )
+    }
+
+    fn wide_record(n: u32, ts_ns: i64) -> LogRecord {
+        LogRecord {
+            stream_id: wide_id(n),
+            stream_attrs: wide_attrs_blob(n),
+            ts_ns,
+            observed_ts_ns: ts_ns,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// `stream_refs` resolves each row's stream id to its position in the
+    /// id-ascending stream directory, by binary search rather than the
+    /// deleted `ref_of` hash map. Pushing 300 distinct streams in reverse
+    /// (push order is the opposite of id order) and asserting each row's ref
+    /// equals its stream id's numeric value (which is also its sorted
+    /// position, by `wide_id`'s construction) would pass under a push-order
+    /// ref just as easily as a sorted one if push order happened to match id
+    /// order; reversing rules that out.
+    #[test]
+    fn stream_refs_equal_sorted_position_for_many_streams() {
+        const STREAM_COUNT: u32 = 300;
+        let records: Vec<LogRecord> = (0..STREAM_COUNT)
+            .rev()
+            .enumerate()
+            .map(|(i, n)| wide_record(n, i as i64))
+            .collect();
+
+        let batch = ColumnarLogBatch::from_records(&records);
+        assert_eq!(batch.stream_ids.len(), STREAM_COUNT as usize);
+        assert!(
+            batch.stream_ids.windows(2).all(|w| w[0] < w[1]),
+            "stream directory must be id-ascending"
+        );
+
+        for (row, r) in records.iter().enumerate() {
+            let local_ref = batch.stream_refs[row] as usize;
+            assert_eq!(
+                batch.stream_ids[local_ref], r.stream_id,
+                "row {row} resolves to the wrong stream id"
+            );
+            // `wide_id` makes a stream's sorted position equal its own `n`.
+            let n = u32::from_be_bytes([
+                r.stream_id.0[0],
+                r.stream_id.0[1],
+                r.stream_id.0[2],
+                r.stream_id.0[3],
+            ]);
+            assert_eq!(
+                local_ref, n as usize,
+                "row {row} (stream {n}) must resolve to its sorted position"
+            );
+        }
     }
 }

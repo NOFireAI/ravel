@@ -419,10 +419,6 @@ impl RlogWriter {
             }
         }
         let sorted_ids: Vec<LogStreamId> = streams.keys().copied().collect();
-        let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(sorted_ids.len());
-        for (i, id) in sorted_ids.iter().enumerate() {
-            ref_of.insert(*id, i as u32);
-        }
 
         // Each clustering key's value per record, in push order, read off the
         // per-record layer only (ADR-2135 decision 1).
@@ -595,7 +591,7 @@ impl RlogWriter {
         for r in &self.records {
             rows.push(resolve_row(
                 r,
-                &ref_of,
+                &sorted_ids,
                 &column_of,
                 &tracked_slot,
                 &stamp_index,
@@ -995,6 +991,30 @@ impl RlogWriter {
         // claiming the same id with different bytes fails the whole object.
         let mut streams: BTreeMap<LogStreamId, &[u8]> = BTreeMap::new();
         for b in batches {
+            // `stream_attrs` must run parallel to `stream_ids` (the struct's own
+            // doc comment); nothing upstream of here enforces it. Zipping the two
+            // unequal-length silently drops whichever ids or blobs fall past the
+            // shorter one's end -- a dropped id is one the directory below never
+            // learns about, so it would later miss the stream-ref remap built
+            // from `sorted_ids` instead of resolving to the wrong stream. Refuse
+            // here, before the directory (or anything derived from it) is built.
+            if b.stream_ids.len() != b.stream_attrs.len() {
+                let message = if b.stream_attrs.len() < b.stream_ids.len() {
+                    format!(
+                        "stream {} has no stream_attrs blob: batch declares {} stream ids but only {} stream_attrs entries",
+                        b.stream_ids[b.stream_attrs.len()].to_hex(),
+                        b.stream_ids.len(),
+                        b.stream_attrs.len(),
+                    )
+                } else {
+                    format!(
+                        "batch declares {} stream_attrs entries but only {} stream ids",
+                        b.stream_attrs.len(),
+                        b.stream_ids.len(),
+                    )
+                };
+                return Err(LogSegError::InconsistentStreamAttrs(message));
+            }
             for (id, blob) in b.stream_ids.iter().zip(b.stream_attrs.iter()) {
                 match streams.entry(*id) {
                     Entry::Vacant(slot) => {
@@ -1014,10 +1034,6 @@ impl RlogWriter {
             }
         }
         let sorted_ids: Vec<LogStreamId> = streams.keys().copied().collect();
-        let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(sorted_ids.len());
-        for (i, id) in sorted_ids.iter().enumerate() {
-            ref_of.insert(*id, i as u32);
-        }
 
         // Each clustering key's value per global row, read from the same
         // first per-record occurrence the row path reads.
@@ -1122,6 +1138,26 @@ impl RlogWriter {
         let mut g_batch: Vec<u32> = Vec::with_capacity(total_rows);
 
         for (bi, b) in batches.iter().enumerate() {
+            // This batch's stream ids resolved to the object's global ref once
+            // per batch-local id, not once per row: a binary search of
+            // `sorted_ids` per entry here instead of per record. The length
+            // check above already refuses any batch whose `stream_attrs` does
+            // not cover every `stream_ids` entry, so every id here is in
+            // `sorted_ids`; this still returns a typed error instead of
+            // silently resolving to stream ref 0 on a miss, rather than relying
+            // solely on that earlier check to keep this site safe.
+            let batch_remap: Vec<u32> = b
+                .stream_ids
+                .iter()
+                .map(|sid| {
+                    sorted_ids.binary_search(sid).map(|i| i as u32).map_err(|_| {
+                        LogSegError::InconsistentStreamAttrs(format!(
+                            "stream {} has no stream_attrs blob: not present in this object's stream directory",
+                            sid.to_hex(),
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<u32>, LogSegError>>()?;
             let mut trace_slot = 0usize;
             let mut span_slot = 0usize;
             for row in 0..b.num_rows {
@@ -1144,9 +1180,9 @@ impl RlogWriter {
                 } else {
                     g_span.push(None);
                 }
-                let sid = b.stream_ids[b.stream_refs[row] as usize];
-                g_stream_id.push(sid);
-                g_stream_ref.push(ref_of[&sid]);
+                let local_ref = b.stream_refs[row] as usize;
+                g_stream_id.push(b.stream_ids[local_ref]);
+                g_stream_ref.push(batch_remap[local_ref]);
             }
         }
 
@@ -1880,14 +1916,20 @@ fn stream_level_column_eligible(
 /// the two paths cannot drift.
 fn resolve_row(
     r: &LogRecord,
-    ref_of: &HashMap<LogStreamId, u32>,
+    sorted_ids: &[LogStreamId],
     column_of: &ColumnIndex,
     slot_of: &HashMap<&str, u32>,
     index: &StampIndex,
     stream_seeds: &HashMap<LogStreamId, StreamSeed>,
     stamp: &mut StampScratch,
 ) -> ResolvedRow {
-    let stream_ref = ref_of.get(&r.stream_id).copied().unwrap_or(0);
+    // A miss cannot happen: `build_object`'s only caller builds `sorted_ids`
+    // from the stream ids of this same `self.records` slice before resolving
+    // any of them, so `r.stream_id` is always already a member.
+    let stream_ref = sorted_ids
+        .binary_search(&r.stream_id)
+        .map(|i| i as u32)
+        .unwrap_or(0);
     let mut cols: BTreeMap<u32, ColumnValue> = BTreeMap::new();
     let mut overflow: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
     // Each *tracked* name this record carries -- indexed (POSTINGS) or
@@ -4174,6 +4216,126 @@ mod tests {
         }
     }
 
+    /// Builds a `ColumnarLogBatch` directly rather than through
+    /// `ColumnarLogBatch::from_records`, which always keeps `stream_ids` and
+    /// `stream_attrs` parallel: every field here is `pub` and `push_columnar`
+    /// validates nothing, so this is the shape a malformed producer can hand
+    /// the writer (issue #2440). `stream_ids` and `local_ref` are the batch's
+    /// full stream directory and the one row's local stream reference into it;
+    /// `stream_attrs` is however many blobs the (malformed) caller supplied.
+    fn columnar_batch_with_stream_dir(
+        stream_ids: Vec<LogStreamId>,
+        stream_attrs: Vec<Vec<u8>>,
+        local_ref: u32,
+    ) -> ColumnarLogBatch {
+        use crate::columnar_batch::{Bitmap, VarBytes};
+        let mut severity_text = VarBytes::new();
+        severity_text.push(b"INFO");
+        let mut body = VarBytes::new();
+        body.push(b"hello world");
+        let mut trace_id_validity = Bitmap::new();
+        trace_id_validity.push(false);
+        let mut span_id_validity = Bitmap::new();
+        span_id_validity.push(false);
+        ColumnarLogBatch {
+            num_rows: 1,
+            ts_ns: vec![0],
+            observed_ts_ns: vec![0],
+            severity_num: vec![9],
+            flags: vec![0],
+            severity_text,
+            body,
+            trace_id: Vec::new(),
+            trace_id_validity,
+            span_id: Vec::new(),
+            span_id_validity,
+            stream_refs: vec![local_ref],
+            stream_ids,
+            stream_attrs,
+            dyn_columns: Vec::new(),
+            dyn_col_dicts: Vec::new(),
+            residual_attrs: vec![Vec::new()],
+        }
+    }
+
+    /// The issue #2440 acceptance test. `stream_attrs` is documented to run
+    /// parallel to `stream_ids`, but nothing checks it: before this fix, the
+    /// batch-local-to-global remap in `build_object_columnar` resolved a
+    /// `stream_ids` entry with no matching `stream_attrs` to stream ref 0 via
+    /// `unwrap_or(0)`, writing the row under the wrong stream with no error.
+    ///
+    /// `stream_ids` holds three ids in *local* order `[low, high, uncovered]`,
+    /// with only the first two covered by `stream_attrs`; by numeric value
+    /// `uncovered` sorts *between* `low` and `high`, not after both. That
+    /// shape, not `[low, uncovered, high]`, is deliberate: a flawed fix that
+    /// drops the uncovered id from the directory instead of refusing the
+    /// batch, then only catches a stream ref miss when the missing id would
+    /// sort after every id that did make it into the directory (for example a
+    /// bounds check on a binary-search insertion point instead of a real
+    /// coverage check), resolves `uncovered` here to `low`'s ref without
+    /// error -- because `uncovered` sorts *between* the two ids the directory
+    /// does end up with, its insertion point is not at the end. A fixture
+    /// with the uncovered id last would not tell the two fixes apart.
+    #[test]
+    fn columnar_batch_with_uncovered_stream_id_is_refused() {
+        let low = id(10);
+        let high = id(30);
+        let uncovered = id(20);
+        let batch = columnar_batch_with_stream_dir(
+            vec![low, high, uncovered],
+            vec![attrs_blob(10), attrs_blob(30)],
+            2, // the row references `uncovered`, local index 2
+        );
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.push_columnar(batch).expect("columnar push");
+        let err = w
+            .finish()
+            .expect_err("a stream id with no stream_attrs blob must be refused");
+        match err {
+            LogSegError::InconsistentStreamAttrs(msg) => {
+                assert!(
+                    msg.contains(&uncovered.to_hex()),
+                    "message must name the uncovered stream in hex: {msg}"
+                );
+            }
+            other => panic!("expected InconsistentStreamAttrs, got {other:?}"),
+        }
+    }
+
+    /// Same malformed shape as
+    /// [`columnar_batch_with_uncovered_stream_id_is_refused`], except the
+    /// batch's one row references a *covered* id and the uncovered id goes
+    /// unreferenced. `stream_attrs` running parallel to `stream_ids` is a
+    /// structural property of the batch, not a property of which id happens
+    /// to be read: an uncovered id left dangling in the directory is still a
+    /// batch no producer should have been able to build, so this is refused
+    /// identically rather than only when the gap is actually read.
+    #[test]
+    fn columnar_batch_with_unreferenced_uncovered_stream_id_is_refused() {
+        let low = id(10);
+        let high = id(30);
+        let uncovered = id(20);
+        let batch = columnar_batch_with_stream_dir(
+            vec![low, high, uncovered],
+            vec![attrs_blob(10), attrs_blob(30)],
+            0, // the row references `low`, a covered id; `uncovered` is unreferenced
+        );
+        let mut w = RlogWriter::new(RlogConfig::default(), identity());
+        w.push_columnar(batch).expect("columnar push");
+        let err = w
+            .finish()
+            .expect_err("an uncovered stream id must be refused even if no row references it");
+        match err {
+            LogSegError::InconsistentStreamAttrs(msg) => {
+                assert!(
+                    msg.contains(&uncovered.to_hex()),
+                    "message must name the uncovered stream in hex: {msg}"
+                );
+            }
+            other => panic!("expected InconsistentStreamAttrs, got {other:?}"),
+        }
+    }
+
     #[test]
     fn empty_stream_attrs_is_a_valid_blob() {
         // An empty resource+scope still has a non-empty canonical blob (two
@@ -5339,6 +5501,93 @@ mod tests {
             let col_counts: Vec<u32> = col_l0.iter().map(|e| e.record_count).collect();
             assert!(row_counts.len() > 1, "expected multiple blocks");
             assert_eq!(row_counts, col_counts);
+        }
+
+        /// A distinct stream id per `n` (beyond the outer module's `id(u8)`,
+        /// which tops out at 256 streams), with the ordering of `n` matching
+        /// `LogStreamId`'s own `Ord`, so a stream's sorted position is `n`.
+        fn wide_id(n: u32) -> LogStreamId {
+            let mut a = [0u8; 16];
+            a[0..4].copy_from_slice(&n.to_be_bytes());
+            LogStreamId(a)
+        }
+
+        fn wide_record(n: u32, ts_ns: i64) -> LogRecord {
+            let blob = stream_attrs_bytes(
+                &[("service.name".into(), AttrValue::Str(format!("svc{n}")))],
+                "scope",
+                "1.0",
+                &[("lib".into(), AttrValue::I64(i64::from(n)))],
+            );
+            LogRecord {
+                stream_id: wide_id(n),
+                stream_attrs: blob,
+                ts_ns,
+                observed_ts_ns: ts_ns,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: "hello world".into(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: Vec::new(),
+            }
+        }
+
+        /// The issue #2440 acceptance test. Resolving a record's stream ref by
+        /// binary search over `sorted_ids` instead of the deleted `ref_of` hash
+        /// map must still resolve every record to its true stream, on both the
+        /// row and columnar paths.
+        ///
+        /// 300 distinct streams, pushed in the reverse of id order, so push
+        /// order and sorted order genuinely disagree (a fixture with one
+        /// stream, or streams pushed in id order, cannot tell a push-order
+        /// resolution from a sorted one). Split into two columnar batches along
+        /// the push-order midpoint, which (because push order is the reverse
+        /// of id order) gives the two batches disjoint, non-overlapping stream
+        /// sets: the first batch holds the higher ids (150..300), whose
+        /// within-batch local ref differs from their global sorted-`sorted_ids`
+        /// ref; the second batch holds the lower ids (0..150), which are also
+        /// the globally lowest-ranked ids, so their local ref happens to equal
+        /// their global ref. A remap that used a batch's local ref as its
+        /// global one would therefore misresolve the first batch's rows to the
+        /// wrong (lower) stream while the second batch's rows would still
+        /// resolve correctly by coincidence -- which is what this split is
+        /// built to catch.
+        #[test]
+        fn stream_refs_equal_sorted_position_across_many_streams() {
+            const STREAM_COUNT: u32 = 300;
+            let records: Vec<LogRecord> = (0..STREAM_COUNT)
+                .rev()
+                .enumerate()
+                .flat_map(|(i, n)| {
+                    let base = i as i64 * 2;
+                    (0..2i64).map(move |k| wide_record(n, base + k))
+                })
+                .collect();
+            let expected: std::collections::HashMap<i64, LogStreamId> =
+                records.iter().map(|r| (r.ts_ns, r.stream_id)).collect();
+
+            let cfg = RlogConfig::default();
+            let (rb, _) = row_object(cfg, &records);
+            let (cb, _) = columnar_object(cfg, &records, 2);
+            assert_eq!(rb, cb, "row and columnar builds must stay byte-identical");
+
+            for (label, obj) in [("row", &rb), ("columnar", &cb)] {
+                let reader = crate::reader::RlogReader::new(obj, &cfg).expect("open reader");
+                let (rows, _) = reader
+                    .scan(&crate::record::Predicate::And(Vec::new()))
+                    .expect("scan");
+                assert_eq!(rows.len(), records.len(), "{label}: row count");
+                for row in &rows {
+                    assert_eq!(
+                        expected.get(&row.ts_ns),
+                        Some(&row.stream_id),
+                        "{label}: row at ts_ns={} decoded to the wrong stream id",
+                        row.ts_ns
+                    );
+                }
+            }
         }
     }
 
