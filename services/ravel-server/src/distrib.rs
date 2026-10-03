@@ -8026,9 +8026,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     /// entry says `timeout` and carries what the worker spent.
     ///
     /// Mutation proof: treating the deadline as never passed in `try_remote`
-    /// re-dispatches the slice, so the attempt and fallback assertions fail;
-    /// recording `"ok"` for a `TIMEOUT` response in `record_fragment_stat`
-    /// fails the status assertion.
+    /// sends the slice to a local read that answers `Ok`, so the response
+    /// status assertion fails; recording `"ok"` for a `TIMEOUT` response in
+    /// `record_fragment_stat` fails the entry's status assertion.
     #[tokio::test]
     async fn a_worker_timeout_after_the_coordinators_deadline_ends_the_slice() {
         const PAID: Spend = Spend {
@@ -8070,7 +8070,9 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
     ///
     /// Mutation proof: deleting the expired-capability arm in `try_remote`
     /// classifies the refusal as a transport loss, which quarantines the
-    /// worker in both halves.
+    /// worker, and the first half's quarantine assertion fails. Treating the
+    /// coordinator's deadline as never passed reads the second half locally,
+    /// and its status assertion fails.
     #[tokio::test]
     async fn an_older_workers_expired_capability_refusal_does_not_quarantine_it() {
         const NOTHING: Spend = Spend {
