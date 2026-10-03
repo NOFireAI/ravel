@@ -135,6 +135,20 @@ pub enum ComparatorError {
     NegativeDecimalScale { index: usize, scale: i8 },
     #[error("could not parse JSON reference as an array of row arrays: {0}")]
     JsonReferenceParse(String),
+    #[error(
+        "column_match = \"by-name\": column {column:?} is in the {present} output schema but not \
+         in the {absent} output schema"
+    )]
+    ColumnMatchNameMissing {
+        column: String,
+        present: &'static str,
+        absent: &'static str,
+    },
+    #[error(
+        "column_match = \"by-name\": column {column:?} appears more than once in the {side} \
+         output schema"
+    )]
+    ColumnMatchDuplicateName { column: String, side: &'static str },
 }
 
 /// The tie-breaking key and truncation shape ADR-2040 D7 compares under: the
@@ -952,6 +966,107 @@ pub fn resolve_order_key_columns(
         .collect()
 }
 
+/// How a statement's subject columns are paired with the reference's
+/// (`suite.toml`'s `column_match`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColumnMatch {
+    /// Subject column `i` is compared with reference column `i`.
+    #[default]
+    Positional,
+    /// The subject's columns are reordered to the reference's column order
+    /// by output column name before comparing (`column_match = "by-name"`).
+    ByName,
+}
+
+/// For each reference column, in order, the index of the subject column
+/// with the same name. Both sides must hold exactly the same set of names,
+/// each once: a duplicate on either side, or a name on one side only, is a
+/// typed error naming it.
+fn by_name_permutation(
+    reference_columns: &[String],
+    subject_columns: &[String],
+) -> Result<Vec<usize>, ComparatorError> {
+    for (side, columns) in [
+        ("reference", reference_columns),
+        ("subject", subject_columns),
+    ] {
+        for (i, name) in columns.iter().enumerate() {
+            if columns[..i].contains(name) {
+                return Err(ComparatorError::ColumnMatchDuplicateName {
+                    column: name.clone(),
+                    side,
+                });
+            }
+        }
+    }
+    if let Some(name) = subject_columns
+        .iter()
+        .find(|name| !reference_columns.contains(name))
+    {
+        return Err(ComparatorError::ColumnMatchNameMissing {
+            column: name.clone(),
+            present: "subject",
+            absent: "reference",
+        });
+    }
+    reference_columns
+        .iter()
+        .map(|name| {
+            subject_columns
+                .iter()
+                .position(|c| c == name)
+                .ok_or_else(|| ComparatorError::ColumnMatchNameMissing {
+                    column: name.clone(),
+                    present: "reference",
+                    absent: "subject",
+                })
+        })
+        .collect()
+}
+
+/// [`compare`], after pairing the subject's columns with the reference's
+/// under `column_match`. `reference_columns` and `subject_columns` are each
+/// side's output column names, in result-column order.
+///
+/// Under [`ColumnMatch::ByName`] every subject row is reordered to
+/// `reference_columns`' order first, so `tie.key`, the verdict, and every
+/// listed row and float mismatch use the reference's column positions.
+/// Under [`ColumnMatch::Positional`] the names are not consulted and this is
+/// [`compare`] itself.
+pub fn compare_with_columns(
+    reference: &[Vec<Cell>],
+    reference_columns: &[String],
+    subject: &[Vec<Cell>],
+    subject_columns: &[String],
+    column_match: ColumnMatch,
+    tie: &TieSpec,
+    float_tolerance: Option<&FloatTolerance>,
+) -> Result<ComparisonReport, ComparatorError> {
+    match column_match {
+        ColumnMatch::Positional => compare(reference, subject, tie, float_tolerance),
+        ColumnMatch::ByName => {
+            let permutation = by_name_permutation(reference_columns, subject_columns)?;
+            let reordered = subject
+                .iter()
+                .map(|row| {
+                    permutation
+                        .iter()
+                        .map(|&i| {
+                            row.get(i)
+                                .cloned()
+                                .ok_or(ComparatorError::ColumnCountMismatch {
+                                    reference: reference_columns.len(),
+                                    subject: row.len(),
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            compare(reference, &reordered, tie, float_tolerance)
+        }
+    }
+}
+
 fn project(row: &[Cell], key: &[usize]) -> Vec<Cell> {
     key.iter().map(|&i| row[i].clone()).collect()
 }
@@ -1713,6 +1828,149 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The same two columns in opposite orders, holding equal values: Pass
+    /// under by-name matching, Fail positionally.
+    #[test]
+    fn by_name_passes_reordered_columns_that_fail_positionally() {
+        let reference_columns = names(&["a", "b"]);
+        let subject_columns = names(&["b", "a"]);
+        let reference = vec![
+            vec![Cell::Int(1), Cell::Str("x".into())],
+            vec![Cell::Int(2), Cell::Str("y".into())],
+        ];
+        let subject = vec![
+            vec![Cell::Str("x".into()), Cell::Int(1)],
+            vec![Cell::Str("y".into()), Cell::Int(2)],
+        ];
+        let tie = tie(vec![], None, 0);
+        let run = |column_match| {
+            compare_with_columns(
+                &reference,
+                &reference_columns,
+                &subject,
+                &subject_columns,
+                column_match,
+                &tie,
+                None,
+            )
+            .expect("comparison runs")
+            .verdict
+        };
+        assert_eq!(run(ColumnMatch::ByName), Verdict::Pass);
+        assert_eq!(run(ColumnMatch::Positional), Verdict::Fail);
+    }
+
+    /// A by-name comparison where either side lacks a column the other has is
+    /// a typed error naming that column and which side holds it.
+    #[test]
+    fn by_name_with_a_column_on_one_side_only_is_refused() {
+        let reference = vec![vec![Cell::Int(1), Cell::Int(2)]];
+        let subject = vec![vec![Cell::Int(1), Cell::Int(2)]];
+        let tie = tie(vec![], None, 0);
+        let err = compare_with_columns(
+            &reference,
+            &names(&["a", "b"]),
+            &subject,
+            &names(&["a", "c"]),
+            ColumnMatch::ByName,
+            &tie,
+            None,
+        )
+        .expect_err("c is not a reference column");
+        assert_eq!(
+            err,
+            ComparatorError::ColumnMatchNameMissing {
+                column: "c".to_string(),
+                present: "subject",
+                absent: "reference",
+            }
+        );
+
+        let reference = vec![vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]];
+        let err = compare_with_columns(
+            &reference,
+            &names(&["a", "b", "c"]),
+            &subject,
+            &names(&["a", "b"]),
+            ColumnMatch::ByName,
+            &tie,
+            None,
+        )
+        .expect_err("c is not a subject column");
+        assert_eq!(
+            err,
+            ComparatorError::ColumnMatchNameMissing {
+                column: "c".to_string(),
+                present: "reference",
+                absent: "subject",
+            }
+        );
+    }
+
+    /// A name appearing twice on either side is a typed error naming it, even
+    /// when both sides hold the same set of names.
+    #[test]
+    fn by_name_with_a_duplicate_column_is_refused() {
+        let rows = vec![vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]];
+        let tie = tie(vec![], None, 0);
+        let err = compare_with_columns(
+            &rows,
+            &names(&["a", "b", "c"]),
+            &rows,
+            &names(&["a", "b", "b"]),
+            ColumnMatch::ByName,
+            &tie,
+            None,
+        )
+        .expect_err("b appears twice in the subject");
+        assert_eq!(
+            err,
+            ComparatorError::ColumnMatchDuplicateName {
+                column: "b".to_string(),
+                side: "subject",
+            }
+        );
+    }
+
+    /// By-name matching still compares every value: a wrong value fails the
+    /// comparison and is listed, with its row in the reference's column order.
+    #[test]
+    fn by_name_still_lists_a_wrong_value() {
+        let reference_columns = names(&["a", "b"]);
+        let subject_columns = names(&["b", "a"]);
+        let reference = vec![
+            vec![Cell::Int(1), Cell::Str("x".into())],
+            vec![Cell::Int(2), Cell::Str("y".into())],
+        ];
+        let subject = vec![
+            vec![Cell::Str("x".into()), Cell::Int(1)],
+            vec![Cell::Str("z".into()), Cell::Int(2)],
+        ];
+        let report = compare_with_columns(
+            &reference,
+            &reference_columns,
+            &subject,
+            &subject_columns,
+            ColumnMatch::ByName,
+            &tie(vec![], None, 0),
+            None,
+        )
+        .expect("comparison runs");
+        assert_eq!(report.verdict, Verdict::Fail);
+        assert_eq!(
+            report.row_mismatch.missing,
+            vec![vec![Cell::Int(2), Cell::Str("y".into())]]
+        );
+        assert_eq!(
+            report.row_mismatch.extra,
+            vec![vec![Cell::Int(2), Cell::Str("z".into())]]
+        );
     }
 
     /// Required test, and distinguishing test for wrong implementation (c):

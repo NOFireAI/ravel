@@ -30,12 +30,23 @@
 #   * `ci_expected_error` with a required `reason`: Ravel fails the statement;
 #     the acceptance test asserts each Ravel arm's error starts with this
 #     prefix instead of comparing results (Q19).
+#
+# One statement's columns come back in a different order on each engine:
+#
+#   * `column_match = "by-name"` with a required `reason`: the comparator
+#     reorders Ravel's columns to the reference's column order by output
+#     column name before comparing, and reports positions in the reference's
+#     order. Both sides must hold exactly the same column names, each once.
+#     Every value is still compared exactly (Q24). Without it, columns are
+#     compared by position.
 
 [table]
 # `{location}` is substituted with the fixture's hits.parquet object URL.
-# `ravel.cast.EventDate` reproduces upstream's view cast
-# `CAST(CAST("EventDate" AS INTEGER) AS DATE)` at the table level, since the
+# `ravel.cast.EventDate` reproduces the cast in upstream's view,
+# `CAST(CAST("EventDate" AS INTEGER) AS DATE)`, at the table level, since the
 # admitted DDL (ravel-sql::validate::validate_ddl) has no CREATE VIEW form.
+# It casts the column in place, at its Parquet position; it does not
+# reproduce the view's column order, which moves EventDate last (see Q24).
 template = "CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{location}' OPTIONS ('binary_as_string' 'true', 'ravel.cast.EventDate' 'date-from-days')"
 
 # Q43: `ORDER BY DATE_TRUNC('minute', M)` matches neither the alias `M` alone
@@ -52,10 +63,14 @@ order_key = [0]
 # Q24: `SELECT * ... ORDER BY "EventTime" LIMIT 10`. The projection is a
 # wildcard, so none of the textual rules has a projection item to match
 # against; `EventTime` is resolved by name against the engines' actual
-# output schemas instead.
+# output schemas instead. `SELECT *` returns the reference's columns in its
+# view's order, with EventDate last, and Ravel's in the Parquet file's order,
+# so the columns are matched by name.
 [[statement]]
 number = 24
 order_key_columns = ["EventTime"]
+column_match = "by-name"
+reason = "upstream's view moves EventDate last; Ravel's ravel.cast.EventDate casts it in place at its Parquet position"
 
 # Q25 orders by `EventTime` alone; Q27 orders by `EventTime, SearchPhrase`,
 # but the comparator's key-resolution rules require every ORDER BY column to
@@ -86,4 +101,4 @@ float_max_ulps = 2
 [[statement]]
 number = 19
 ci_expected_error = "query failed: SQL planning failed: This feature is not implemented: Extract not supported by ExprPlanner"
-reason = "EXTRACT has no ExprPlanner: datafusion is built without its datetime expressions"
+reason = "EXTRACT has no ExprPlanner: datafusion is built without its datetime expressions (issue #2458)"

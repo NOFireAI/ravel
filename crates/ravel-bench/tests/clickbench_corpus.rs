@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use datafusion::arrow::record_batch::RecordBatch;
 use ravel_bench::clickbench_parquet::comparator::{
-    self, ComparisonReport, Verdict, resolve_order_key_columns, resolve_tie_spec,
+    self, ColumnMatch, ComparisonReport, Verdict, resolve_order_key_columns, resolve_tie_spec,
 };
 use ravel_bench::clickbench_parquet::engine::{
     EngineError, InProcessEngine, ReferenceEngine, SuiteEngine,
@@ -311,12 +311,26 @@ fn judge(
     };
     let number = statement.number;
     let sql = &statement.sql;
+    let column_match = over.map_or(ColumnMatch::Positional, StatementOverride::column_match);
+    let (reference_columns, subject_columns) = match column_match {
+        ColumnMatch::Positional => (Vec::new(), Vec::new()),
+        ColumnMatch::ByName => (
+            column_names(reference).ok_or("reference returned no batches")?,
+            column_names(subject).ok_or("ravel returned no batches")?,
+        ),
+    };
     let tie = if let Some(over) = over.filter(|o| o.is_cardinality_only()) {
         resolve_tie_spec(number, sql, None, over.reason.as_deref())
     } else if let Some(names) = over.and_then(|o| o.order_key_columns.as_deref()) {
-        let subject_columns = column_names(subject).ok_or("ravel returned no batches")?;
-        let reference_columns = column_names(reference).ok_or("reference returned no batches")?;
-        let key = resolve_order_key_columns(names, &subject_columns, &reference_columns)
+        let reference_order = column_names(reference).ok_or("reference returned no batches")?;
+        // Under by-name matching the subject's columns are compared in the
+        // reference's order, so the key resolves against that order on both
+        // sides.
+        let subject_order = match column_match {
+            ColumnMatch::Positional => column_names(subject).ok_or("ravel returned no batches")?,
+            ColumnMatch::ByName => reference_order.clone(),
+        };
+        let key = resolve_order_key_columns(names, &subject_order, &reference_order)
             .map_err(|e| format!("order_key_columns: {e}"))?;
         resolve_tie_spec(number, sql, Some(&key), None)
     } else {
@@ -328,8 +342,16 @@ fn judge(
     let subject_rows =
         comparator::rows_from_arrow(subject).map_err(|e| format!("ravel rows: {e}"))?;
     let tolerance = over.and_then(StatementOverride::float_tolerance);
-    comparator::compare(&reference_rows, &subject_rows, &tie, tolerance.as_ref())
-        .map_err(|e| format!("comparator: {e}"))
+    comparator::compare_with_columns(
+        &reference_rows,
+        &reference_columns,
+        &subject_rows,
+        &subject_columns,
+        column_match,
+        &tie,
+        tolerance.as_ref(),
+    )
+    .map_err(|e| format!("comparator: {e}"))
 }
 
 /// One line of the verdict table, and a failure message when the line is

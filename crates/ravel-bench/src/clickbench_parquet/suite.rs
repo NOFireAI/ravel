@@ -2,7 +2,7 @@
 //! queries.sql`), tamper-evidence over it, and the Ravel-side DDL template
 //! and per-statement comparator overrides from `suite.toml`.
 
-use crate::clickbench_parquet::comparator::FloatTolerance;
+use crate::clickbench_parquet::comparator::{ColumnMatch, FloatTolerance};
 use serde::Deserialize;
 
 /// The exact upstream `queries.sql` text, embedded at compile time so the
@@ -91,6 +91,21 @@ pub enum SuiteError {
          ci_expected_error without a reason"
     )]
     ExpectedErrorWithoutReason { number: u32 },
+    /// A `[[statement]]` override declared `column_match` as something other
+    /// than `"by-name"`, the only supported value.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares column_match = \
+         {value:?}; the only supported value is \"by-name\""
+    )]
+    UnknownColumnMatch { number: u32, value: String },
+    /// A `[[statement]]` override declared `column_match = "by-name"` with no
+    /// `reason`: comparing columns by name instead of by position needs to
+    /// say why the two engines' column orders legitimately differ.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares column_match = \
+         \"by-name\" without a reason"
+    )]
+    ColumnMatchWithoutReason { number: u32 },
 }
 
 /// `suite.toml`'s `[table]` section: the Ravel DDL template that mounts the
@@ -142,10 +157,20 @@ pub struct StatementOverride {
     /// typed load error ([`SuiteError::UnknownCompareMode`]).
     #[serde(default)]
     pub compare: Option<String>,
+    /// When set to `"by-name"`, the comparator reorders the subject's columns
+    /// to the reference's column order by output column name before
+    /// comparing ([`ColumnMatch::ByName`]); `reason` is then required and
+    /// explains why the two column orders differ. Absent means positional
+    /// comparison. `"by-name"` is the only supported value; anything else is
+    /// a typed load error ([`SuiteError::UnknownColumnMatch`]).
+    #[serde(default)]
+    pub column_match: Option<String>,
     /// Required alongside `compare = "cardinality"`
-    /// ([`SuiteError::CardinalityWithoutReason`] otherwise) and alongside
+    /// ([`SuiteError::CardinalityWithoutReason`] otherwise), alongside
     /// `ci_expected_error` ([`SuiteError::ExpectedErrorWithoutReason`]
-    /// otherwise); unused otherwise.
+    /// otherwise), and alongside `column_match`
+    /// ([`SuiteError::ColumnMatchWithoutReason`] otherwise); unused
+    /// otherwise.
     #[serde(default)]
     pub reason: Option<String>,
     /// A stable prefix of the error Ravel returns for this statement. When
@@ -187,6 +212,18 @@ impl StatementOverride {
     /// `Some`.
     pub fn is_cardinality_only(&self) -> bool {
         self.compare.as_deref() == Some("cardinality")
+    }
+
+    /// The [`ColumnMatch`] this override declares: [`ColumnMatch::ByName`]
+    /// for `column_match = "by-name"`, [`ColumnMatch::Positional`] when
+    /// `column_match` is absent. `load` already rejects any other value and
+    /// a by-name declaration without a `reason`.
+    pub fn column_match(&self) -> ColumnMatch {
+        if self.column_match.as_deref() == Some("by-name") {
+            ColumnMatch::ByName
+        } else {
+            ColumnMatch::Positional
+        }
     }
 }
 
@@ -277,6 +314,19 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
             return Err(SuiteError::ExpectedErrorWithoutReason {
                 number: over.number,
             });
+        }
+        if let Some(mode) = &over.column_match {
+            if mode != "by-name" {
+                return Err(SuiteError::UnknownColumnMatch {
+                    number: over.number,
+                    value: mode.clone(),
+                });
+            }
+            if over.reason.is_none() {
+                return Err(SuiteError::ColumnMatchWithoutReason {
+                    number: over.number,
+                });
+            }
         }
     }
     Ok(Suite {
@@ -387,7 +437,84 @@ mod tests {
                  Extract not supported by ExprPlanner"
             )
         );
-        assert!(over.reason.is_some());
+        assert_eq!(
+            over.reason.as_deref(),
+            Some(
+                "EXTRACT has no ExprPlanner: datafusion is built without its datetime \
+                 expressions (issue #2458)"
+            )
+        );
+    }
+
+    /// The checked-in statement 24 override compares columns by name, with
+    /// its stated reason, and keeps its by-name ORDER BY key. No other
+    /// statement compares by name.
+    #[test]
+    fn statement_24_column_match_loads() {
+        let suite = load_default().expect("pinned corpus loads");
+        let over = suite.override_for(24).expect("Q24 override present");
+        assert_eq!(over.column_match(), ColumnMatch::ByName);
+        assert_eq!(
+            over.reason.as_deref(),
+            Some(
+                "upstream's view moves EventDate last; Ravel's ravel.cast.EventDate casts it \
+                 in place at its Parquet position"
+            )
+        );
+        assert_eq!(over.order_key_columns, Some(vec!["EventTime".to_string()]));
+        let by_name: Vec<u32> = suite
+            .overrides
+            .iter()
+            .filter(|o| o.column_match() == ColumnMatch::ByName)
+            .map(|o| o.number)
+            .collect();
+        assert_eq!(by_name, vec![24]);
+    }
+
+    /// `column_match = "by-name"` with no `reason` is a typed load error.
+    #[test]
+    fn column_match_without_reason_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 24
+            column_match = "by-name"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("reason-less column_match is refused");
+        assert!(matches!(
+            err,
+            SuiteError::ColumnMatchWithoutReason { number: 24 }
+        ));
+    }
+
+    /// A `column_match` value other than `"by-name"` is a typed load error.
+    #[test]
+    fn unknown_column_match_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 24
+            column_match = "by_name"
+            reason = "typo for by-name"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("unknown column_match is refused");
+        assert!(matches!(
+            err,
+            SuiteError::UnknownColumnMatch { number: 24, .. }
+        ));
+    }
+
+    /// An override without `column_match` compares positionally.
+    #[test]
+    fn absent_column_match_is_positional() {
+        let suite = load_default().expect("pinned corpus loads");
+        let over = suite.override_for(43).expect("Q43 override present");
+        assert_eq!(over.column_match, None);
+        assert_eq!(over.column_match(), ColumnMatch::Positional);
     }
 
     /// `ci_expected_error` with no `reason` is a typed load error.
