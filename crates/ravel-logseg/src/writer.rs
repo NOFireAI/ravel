@@ -631,6 +631,7 @@ impl RlogWriter {
             }
             rows.push(row);
         }
+        let row_order_before = row_sample.then(stage0::sample);
         match &cluster {
             None => rows.sort_by(|a, b| {
                 a.stream_ref
@@ -643,6 +644,9 @@ impl RlogWriter {
                 let perm = clustered_permutation(order, &stream_refs, &ts, &key_values);
                 rows = permute(rows, &perm)?;
             }
+        }
+        if let Some(before) = row_order_before {
+            stage0::record_row_order(before, stage0::sample());
         }
         stage0::fire(stage0_mode, "after_resolve_rows");
 
@@ -6136,6 +6140,15 @@ pub mod stage0 {
     pub static EVERYTHING_ELSE_BYTES: AtomicI64 = AtomicI64::new(0);
     pub static EVERYTHING_ELSE_ALLOCS: AtomicU64 = AtomicU64::new(0);
 
+    /// Cost of `build_object`'s row-ordering step (the `sort_by`/permute
+    /// block run once after the per-row loop), not any `ResolvedRow` field:
+    /// stable sort's auxiliary buffer is sized off the whole vector, not a
+    /// single row, so it cannot be attributed to a bucket above. Measured
+    /// directly so the step-delta comparison has a real second term instead
+    /// of an inferred one.
+    pub static ROW_ORDER_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static ROW_ORDER_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
     pub fn row_sample_enabled() -> bool {
         ROW_SAMPLE.load(Relaxed)
     }
@@ -6181,6 +6194,11 @@ pub mod stage0 {
         EVERYTHING_ELSE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
     }
 
+    pub fn record_row_order(before: (i64, u64), after: (i64, u64)) {
+        ROW_ORDER_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        ROW_ORDER_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
     /// Zeroes every row-sample accumulator; called before each sampled
     /// encode so results never carry over from a prior one.
     pub fn reset_row_samples() {
@@ -6197,5 +6215,7 @@ pub mod stage0 {
         STAMP_SCRATCH_ALLOCS.store(0, Relaxed);
         EVERYTHING_ELSE_BYTES.store(0, Relaxed);
         EVERYTHING_ELSE_ALLOCS.store(0, Relaxed);
+        ROW_ORDER_BYTES.store(0, Relaxed);
+        ROW_ORDER_ALLOCS.store(0, Relaxed);
     }
 }

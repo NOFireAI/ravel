@@ -114,6 +114,7 @@ struct ShapeResult {
     overflow: Bucket,
     stamp_scratch: Bucket,
     everything_else: Bucket,
+    row_order: Bucket,
 }
 
 /// One unsampled encode (`ROW_SAMPLE` off): returns the step delta read off
@@ -150,9 +151,11 @@ fn run_step_delta(corpus: Vec<LogRecord>) -> i64 {
 }
 
 /// One sampled encode (`ROW_SAMPLE` on): returns rows sampled, the sum of
-/// per-row whole-call deltas, and the five per-bucket sums, straight off the
-/// `stage0` accumulators `build_object`/`resolve_row` fed during the encode.
-fn run_sampled(corpus: Vec<LogRecord>) -> (u64, i64, u64, [Bucket; 5]) {
+/// per-row whole-call deltas, the five per-bucket sums, and the row-ordering
+/// step's own bucket (the `sort_by`/permute block run once after the loop,
+/// not part of any `ResolvedRow` field), straight off the `stage0`
+/// accumulators `build_object`/`resolve_row` fed during the encode.
+fn run_sampled(corpus: Vec<LogRecord>) -> (u64, i64, u64, [Bucket; 5], Bucket) {
     use std::sync::atomic::Ordering::Relaxed;
     stage0::MODE.store(0, Relaxed);
     stage0::reset_row_samples();
@@ -190,7 +193,11 @@ fn run_sampled(corpus: Vec<LogRecord>) -> (u64, i64, u64, [Bucket; 5]) {
             allocs: stage0::EVERYTHING_ELSE_ALLOCS.load(Relaxed),
         },
     ];
-    (rows_sampled, whole_bytes, whole_allocs, buckets)
+    let row_order = Bucket {
+        bytes: stage0::ROW_ORDER_BYTES.load(Relaxed),
+        allocs: stage0::ROW_ORDER_ALLOCS.load(Relaxed),
+    };
+    (rows_sampled, whole_bytes, whole_allocs, buckets, row_order)
 }
 
 fn measure_shape(name: &'static str, streams: usize, records_per_stream: usize) -> ShapeResult {
@@ -207,7 +214,7 @@ fn measure_shape(name: &'static str, streams: usize, records_per_stream: usize) 
     // One sampled encode. Not averaged with the unsampled runs above: the
     // whole point is to compare its per-row sum against the step delta those
     // measured, which the 5% assertion below does.
-    let (rows_sampled, whole_bytes, whole_allocs, buckets) = run_sampled(corpus);
+    let (rows_sampled, whole_bytes, whole_allocs, buckets, row_order) = run_sampled(corpus);
 
     if rows_sampled != RECORDS_PER_OBJECT as u64 {
         fail(format!(
@@ -215,10 +222,20 @@ fn measure_shape(name: &'static str, streams: usize, records_per_stream: usize) 
         ));
     }
 
+    // The step delta's window (`after_columns` to `after_resolve_rows`) covers
+    // the per-row loop AND the row-ordering step that runs once after it
+    // (`sort_by`/permute): stable sort's O(n) auxiliary buffer is sized off
+    // the whole vector, so it cannot be attributed to any single row or
+    // `ResolvedRow` field. `whole_bytes` sums only the per-row loop (measured
+    // directly: `rows` is pre-reserved to its final length, so `rows.push`
+    // between iterations never reallocates and introduces no gap), so the
+    // comparison basis is the loop sum plus the directly-measured
+    // row-ordering cost, not the loop sum alone.
     let step_tol = (step_delta.unsigned_abs() as f64 * 0.05).max(1.0);
-    if (whole_bytes - step_delta).unsigned_abs() as f64 > step_tol {
+    let accounted = whole_bytes + row_order.bytes;
+    if (accounted - step_delta).unsigned_abs() as f64 > step_tol {
         fail(format!(
-            "{name}: sum of per-row whole-call deltas {whole_bytes} vs step delta {step_delta} \
+            "{name}: whole-call deltas + row-order step {accounted} vs step delta {step_delta} \
              differ by more than 5% ({step_tol:.0} byte tolerance)"
         ));
     }
@@ -244,6 +261,7 @@ fn measure_shape(name: &'static str, streams: usize, records_per_stream: usize) 
         overflow: buckets[2],
         stamp_scratch: buckets[3],
         everything_else: buckets[4],
+        row_order,
     }
 }
 
@@ -269,6 +287,9 @@ fn main() {
     stage0::HOOK
         .set(stage0_hook)
         .unwrap_or_else(|_| fail("stage0 hook already set".to_string()));
+
+    let resolved_row_size = std::mem::size_of::<ravel_logseg::record::ResolvedRow>();
+    eprintln!("size_of::<ResolvedRow>() = {resolved_row_size}");
 
     let (cal_bytes, cal_allocs) = calibrate();
 
@@ -363,6 +384,35 @@ fn main() {
          it was not subtracted from anything below because it measured zero).\n\n"
     ));
 
+    md.push_str("## Deviation from the specified method\n\n");
+    md.push_str(&format!(
+        "The step delta's window (`after_columns` to `after_resolve_rows` in \
+         `build_object`) covers the per-row loop (which `resolve_row`'s per-component \
+         sampling and the per-row whole-call sampling both measure) AND the row-ordering \
+         step that runs once after the loop: `rows.sort_by(...)` in the unclustered path, \
+         or `clustered_permutation` plus `permute` in the clustered path. The first run \
+         against `1_stream` found the sum of per-row whole-call deltas undershooting the \
+         step delta by far more than 5% (7,367,670 vs 11,368,286 bytes, a 4,000,616 byte \
+         gap). `size_of::<ResolvedRow>()` is {resolved_row_size} bytes; \
+         {resolved_row_size} * {RECORDS_PER_OBJECT} = {} bytes, matching the gap to within \
+         616 bytes. Rust's stable sort allocates an auxiliary buffer sized off the whole \
+         slice, not any single row, so this cost cannot be attributed to a `ResolvedRow` \
+         field or folded into the per-row buckets without misrepresenting what each byte \
+         pays for.\n\n\
+         Rather than restructure `resolve_row` or add a second hook mechanism, \
+         `build_object` now also samples directly around the `match &cluster {{ ... }}` \
+         block (gated by the same `ROW_SAMPLE` flag, accumulated into a new `stage0` pair, \
+         `ROW_ORDER_BYTES`/`ROW_ORDER_ALLOCS`, distinct from the five `ResolvedRow`-field \
+         buckets). The per-shape sections below report this as its own line, and the \
+         \"sum of per-row whole-call deltas equals the step delta within 5%\" assertion \
+         now compares the step delta against the per-row sum plus this directly-measured \
+         row-ordering cost, not the per-row sum alone. This is a deviation from the dispatch's \
+         literal assertion wording (which did not anticipate a step-delta component outside \
+         `resolve_row`), made because the alternative was either a false failure on correct \
+         instrumentation or silently misattributing sort cost to a `ResolvedRow` field.\n\n",
+        resolved_row_size * RECORDS_PER_OBJECT
+    ));
+
     md.push_str("## ResolvedRow field to bucket assignment\n\n");
     md.push_str("| field | bucket |\n|---|---|\n");
     md.push_str("| `stream_ref` | everything else (scalar, no allocation) |\n");
@@ -408,6 +458,11 @@ fn main() {
             "Sum of per-row whole-call deltas (sampling on): {} bytes, {} allocations\n\n",
             r.whole_row_bytes, r.whole_row_allocs
         ));
+        md.push_str(&format!(
+            "Row-ordering step (sort/permute, after the loop, not a `ResolvedRow` field): {} \
+             bytes, {} allocations\n\n",
+            r.row_order.bytes, r.row_order.allocs
+        ));
 
         let bytes_per_row = r.step_delta as f64 / RECORDS_PER_OBJECT as f64;
         md.push_str(&format!(
@@ -422,7 +477,7 @@ fn main() {
             ("everything else", r.everything_else),
         ];
         let bucket_sum: i64 = bucket_rows.iter().map(|(_, b)| b.bytes).sum();
-        let remainder = r.step_delta - bucket_sum;
+        let remainder = r.step_delta - bucket_sum - r.row_order.bytes;
         let remainder_pct = remainder as f64 / r.step_delta as f64 * 100.0;
 
         md.push_str("| bucket | bytes | share of step delta | allocations/row | band | verdict |\n");
@@ -451,6 +506,14 @@ fn main() {
                 ));
             }
         }
+        let row_order_share = r.row_order.share_pct(r.step_delta);
+        let row_order_per_row = r.row_order.per_row_allocs(r.rows_sampled);
+        md.push_str(&format!(
+            "| row-ordering step (not a `ResolvedRow` field, see deviation note above) | {} | \
+             {row_order_share:.2}% | {row_order_per_row:.3} | no pre-registered band (outside \
+             the epic's `ResolvedRow`-bucket expectations) | n/a |\n",
+            r.row_order.bytes
+        ));
         md.push_str(&format!(
             "| unattributed remainder | {remainder} | {remainder_pct:.2}% | n/a | < {REMAINDER_MAX_PCT:.0}% | {} |\n",
             band_status(remainder_pct, f64::MIN, REMAINDER_MAX_PCT)
