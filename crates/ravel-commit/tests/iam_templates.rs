@@ -1,0 +1,11073 @@
+//! Structural validation of the shipped IAM policy templates
+//! (`deploy/iam/*.json`) against real object-key shapes.
+//!
+//! Every `s3:prefix` (ListBucket condition) and resource-ARN key pattern in
+//! the templates is checked with the same `StringLike` wildcard semantics
+//! IAM uses, against representative keys built with `ravel-commit`'s own
+//! key constructors -- never against string literals typed by hand. A
+//! pattern that stops matching any real key shape (a key-layout change) or
+//! a discovery-listing regression (ADR-0072 decision 5) fails this test
+//! instead of reaching production.
+//!
+//! A handful of policy prefixes name keyspaces `ravel-commit` has no
+//! constructor for (`idem/`, `prov`, `catalog/`, `admission/`, `sys/*`):
+//! those objects are built by other crates. This test explicitly skips
+//! them (see `OUT_OF_SCOPE_PATTERNS`) rather than fabricate a literal key
+//! that would defeat the point of testing against real constructors.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use ravel_commit::keys::{
+    commit_key, commit_shard_hour_prefix, commit_shard_prefix, compaction_record_key, data_key,
+    del_prefix, erasure_completion_key, erasure_request_key, l1_part_key, maint_cursor_key,
+    retention_tombstone_key, rewrite_record_key,
+};
+use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
+use ravel_fleet::query_workers::{QUERY_WORKERS_PREFIX, query_worker_key};
+use ravel_fleet::worker_set::heartbeat_key;
+use ravel_object_store::external::probe::PROBE_PREFIX;
+use ravel_types::{Signal, TenantHash};
+use uuid::Uuid;
+
+/// Legal-hold shard for `Signal::Audit` (ADR-0055 section 3).
+/// Hardcoded rather than imported from `ravel-maintain`:
+/// that crate is out of this test's scope, and the shard number is a
+/// frozen part of the object-key contract, not an implementation detail.
+const AUDIT_HOLD_SHARD: u32 = 0;
+/// Query-audit shard for `Signal::Audit` (same amendment).
+const QUERY_AUDIT_SHARD: u32 = 1;
+
+const ALL_SIGNALS: [Signal; 6] = [
+    Signal::Metrics,
+    Signal::Logs,
+    Signal::Spans,
+    Signal::Profiles,
+    Signal::Alerts,
+    Signal::Audit,
+];
+
+fn test_tenant() -> TenantHash {
+    TenantHash([0xab; 16])
+}
+
+fn hash16() -> &'static str {
+    "0123456789abcdef"
+}
+
+/// Every real object key `ravel-commit`'s key constructors can produce,
+/// across every signal (including `Signal::Audit` at both its shards).
+/// This is the ground truth the policy patterns are checked against.
+fn representative_keys() -> Vec<String> {
+    let tenant = test_tenant();
+    let writer_id = Uuid::from_u128(1);
+    let request_id = Uuid::from_u128(2);
+    let content_hash = [0u8; 32];
+    let ingest_hour_bucket = 0;
+
+    let mut keys = Vec::new();
+    for &signal in &ALL_SIGNALS {
+        let shards: &[u32] = if signal == Signal::Audit {
+            &[AUDIT_HOLD_SHARD, QUERY_AUDIT_SHARD]
+        } else {
+            &[0]
+        };
+        for &shard in shards {
+            keys.push(
+                data_key(&tenant, signal, shard, writer_id, 1, 1, &content_hash).expect("data_key"),
+            );
+            keys.push(
+                commit_key(&tenant, signal, shard, ingest_hour_bucket, writer_id, 1, 1)
+                    .expect("commit_key"),
+            );
+            keys.push(
+                l1_part_key(
+                    &tenant,
+                    signal,
+                    shard,
+                    ingest_hour_bucket,
+                    hash16(),
+                    0,
+                    hash16(),
+                )
+                .expect("l1_part_key"),
+            );
+            keys.push(
+                compaction_record_key(&tenant, signal, shard, ingest_hour_bucket, hash16())
+                    .expect("compaction_record_key"),
+            );
+            keys.push(
+                retention_tombstone_key(&tenant, signal, shard, ingest_hour_bucket)
+                    .expect("retention_tombstone_key"),
+            );
+            keys.push(
+                rewrite_record_key(&tenant, signal, shard, ingest_hour_bucket, hash16())
+                    .expect("rewrite_record_key"),
+            );
+            keys.push(maint_cursor_key(&tenant, signal, shard).expect("maint_cursor_key"));
+        }
+        // del/ erasure-request and erasure-completion keys (ADR-0064). The
+        // maintain template's delete grant reaches the request objects and
+        // must not reach the completion records; both witnesses are what
+        // maintain_template_grants_delete_on_erasure_requests reads.
+        keys.push(del_prefix(&tenant, signal));
+        keys.push(erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key"));
+        keys.push(
+            erasure_completion_key(&tenant, signal, request_id).expect("erasure_completion_key"),
+        );
+    }
+    keys
+}
+
+/// The top-level key space every quarantined orphan lives under, mirrored from
+/// `QUARANTINE_PREFIX` in `crates/ravel-maintain/src/sweep.rs` (ADR-0058
+/// decision 6). It is mirrored rather than imported for the reason
+/// `maintain_deletes_catalog_snap_and_idx_but_not_head` records: `ravel-commit`
+/// cannot depend on `ravel-maintain` without circularity, and the key builders
+/// there are private.
+///
+/// `quarantine/` sits ALONGSIDE `t/` and `sys/`, not under `t/`, which is why a
+/// `t/`-rooted grant reaches none of these keys and the reaper needs grants of
+/// its own (`maintain_template_covers_every_quarantine_call`).
+const QUARANTINE_PREFIX: &str = "quarantine/";
+
+/// The zero-padded `q<quarantined_at_ns>` stamp `quarantine_key` appends. Any
+/// value works as a witness; the WIDTH is what the key shape fixes, so it is
+/// written the way `sweep.rs` writes it rather than as a bare integer.
+const QUARANTINED_AT_NS: i64 = 1;
+
+/// Every L0 data key in `representative_keys`, which is every key shape the
+/// ADR-0058 orphan sweep can quarantine. Selected from that function's output
+/// rather than rebuilt, so a `data_key` signature or shard-width change moves
+/// the quarantine witnesses with it instead of leaving them behind.
+fn l0_data_keys() -> Vec<String> {
+    let keys: Vec<String> = representative_keys()
+        .into_iter()
+        .filter(|k| k.contains("/l0/"))
+        .collect();
+    assert!(
+        !keys.is_empty(),
+        "representative_keys() produces no l0/ data key, so every quarantine \
+         witness derived from one would be empty and the reachability \
+         assertions would examine nothing"
+    );
+    keys
+}
+
+/// `quarantine/<original key>/q<quarantined_at_ns>`, the key the sweep copies a
+/// quarantined orphan to (`quarantine_key`, `crates/ravel-maintain/src/sweep.rs`).
+/// The original key is preserved verbatim, so this composes a real `data_key`
+/// with the prefix and the stamp instead of spelling out a tenant key by hand.
+fn quarantine_key(live_key: &str) -> String {
+    format!("{QUARANTINE_PREFIX}{live_key}/q{QUARANTINED_AT_NS:020}")
+}
+
+/// `quarantine/t/<tenant_hash>/<signal>/l0/<shard>/`, the prefix the reaper
+/// passes to `list_all` (`quarantine_l0_data_prefix`, same file). Derived by
+/// dropping a real data key's object segment, so the shard segment's
+/// zero-padded width is never retyped here.
+fn quarantine_l0_data_prefix(live_key: &str) -> String {
+    let (shard_prefix, _object) = live_key
+        .rsplit_once('/')
+        .expect("an l0 data key ends in an object segment");
+    format!("{QUARANTINE_PREFIX}{shard_prefix}/")
+}
+
+/// The quarantine keyspace witnesses: one quarantine copy and one per-shard
+/// quarantine prefix per L0 data key shape. The prefix is included for the same
+/// reason `representative_keys` carries `del_prefix`: the `s3:prefix` the reaper
+/// lists with is a value a policy pattern is matched against, and a pattern
+/// witnessed by no key is invisible to every domain-wide measurement in this
+/// file (`assert_pattern_is_witnessed`).
+fn quarantine_witness_keys() -> Vec<String> {
+    let mut keys = Vec::new();
+    for live in l0_data_keys() {
+        keys.push(quarantine_key(&live));
+        keys.push(quarantine_l0_data_prefix(&live));
+    }
+    keys
+}
+
+/// One literal key per non-tenant keyspace the shipped templates name, for the
+/// keyspaces `ravel-commit` has no constructor for (`sys/`, `admission/`). They
+/// exist only as EXCLUSION WITNESSES for `glob_admits_everything`: a pattern
+/// that matches every key in `key_domain()` excludes nothing, and without a
+/// non-`t/` key in that domain the bounded prefix `t/*` -- which every
+/// `ravel-commit` key matches -- would be misread as excluding nothing and the
+/// shipped `admin` template would be rejected.
+///
+/// These are hand-written literals, which `representative_keys` deliberately is
+/// not, so they are kept out of that function: they are not evidence that any
+/// key constructor produces this shape, and no coverage or delete-scope guard
+/// reads them (`assert_admin_delete_grant_is_scratch_only` asks specifically
+/// about `t/**` tenant data and must keep reading `representative_keys` alone).
+/// Every one carries a `/`, so a pattern such as `*/*` still matches all of
+/// them and is still vacuous.
+const NON_TENANT_WITNESS_KEYS: [&str; 5] = [
+    "sys/tenancy",
+    "sys/qualification",
+    "sys/gc",
+    "sys/qualify/run-0/probe",
+    "admission/query/query-0",
+];
+
+/// The process id every fleet witness key below is built for. Any UUID works;
+/// what matters is that the key is the constructor's output and not a literal.
+const WITNESS_PROCESS_ID: u128 = 7;
+
+/// The two fleet heartbeat keys, built by the constructors the heartbeat
+/// writers and reapers themselves call: `heartbeat_key` for
+/// `sys/maintain/workers/<process_id>` (`crates/ravel-fleet/src/worker_set.rs`,
+/// ADR-0065 decision 1) and `query_worker_key` for
+/// `sys/query/workers/<process_id>` (`crates/ravel-fleet/src/query_workers.rs`,
+/// ADR-0071).
+///
+/// These were literals in `NON_TENANT_WITNESS_KEYS` until issue #1975. A
+/// literal is not evidence about the key a reaper deletes: it agrees with a
+/// pattern written against the same literal whether or not the code still
+/// builds that shape. `ravel-fleet` does not depend on `ravel-commit`, so
+/// taking it as a dev-dependency here is acyclic and costs nothing at runtime.
+fn fleet_witness_keys() -> Vec<String> {
+    let process_id = Uuid::from_u128(WITNESS_PROCESS_ID);
+    vec![
+        heartbeat_key(&process_id),
+        query_worker_key(&process_id.to_string()),
+    ]
+}
+
+/// The memo-snapshot prefix the maintain warm start lists:
+/// `MEMO_PREFIX` in `crates/ravel-maintain/src/memo_snapshot.rs`.
+const MEMO_PREFIX: &str = "sys/maintain/memo/";
+
+/// The control-plane keys whose constructors live in crates this test cannot
+/// depend on without a cycle through `ravel-commit`, written in the shape each
+/// constructor produces:
+///
+/// - `sys/auth`, the durable bearer-token map (`AUTH_KEY` in
+///   `crates/ravel-catalog/src/auth_token_map.rs`);
+/// - `sys/maintain/memo/<process_id>`, one maintain process's memo snapshot
+///   (`memo_key` in `crates/ravel-maintain/src/memo_snapshot.rs`);
+/// - `sys/t/<tenant_hash>`, one tenant's recovery manifest
+///   (`recovery_manifest_key` in `services/ravel-server/src/tenancy.rs`);
+/// - `t/<tenant_hash>/enc`, one tenant's KMS key-epoch record (`enc_key` in
+///   `crates/ravel-catalog/src/key_epoch.rs`);
+/// - `t/<tenant_hash>/a/alert-lease` and `t/<tenant_hash>/a/state/latest`, the
+///   alert evaluator's lease and state memo (`alert_lease_key` in
+///   `services/ravel-server/src/alerting.rs`, `alert_state_memo_key` in
+///   `services/ravel-server/src/alert_state_memo.rs`);
+/// - `t/<tenant_hash>/m/meta`, the tenant's metric metadata record
+///   (`metrics_meta_key` in `crates/ravel-catalog/src/metrics_meta.rs`);
+/// - the `t/<tenant_hash>/a/` and `quarantine/t/<tenant_hash>/a/` prefixes the
+///   maintain alert retention gate lists (`alert_keyspace_is_empty` in
+///   `services/ravel-server/src/maintain.rs`).
+///
+/// The tenant-scoped ones are built from `test_tenant()` and the signal's
+/// `key_prefix()`, the same inputs the real builders format.
+fn control_plane_witness_keys() -> Vec<String> {
+    let hex = test_tenant().to_hex();
+    vec![
+        "sys/auth".to_string(),
+        format!("{MEMO_PREFIX}{}", Uuid::from_u128(WITNESS_PROCESS_ID)),
+        format!("sys/t/{hex}"),
+        key_epoch_key(),
+        metrics_meta_key(),
+        alert_lease_key(),
+        alert_state_memo_key(),
+        alert_keyspace_prefix(),
+        format!("{QUARANTINE_PREFIX}{}", alert_keyspace_prefix()),
+    ]
+}
+
+/// `enc_key(&test_tenant())`: `t/<hex>/enc`.
+fn key_epoch_key() -> String {
+    format!("t/{}/enc", test_tenant().to_hex())
+}
+
+/// `metrics_meta_key(&test_tenant())`: `t/<hex>/m/meta`.
+fn metrics_meta_key() -> String {
+    format!(
+        "t/{}/{}/meta",
+        test_tenant().to_hex(),
+        Signal::Metrics.key_prefix()
+    )
+}
+
+/// `t/<hex>/<alerts prefix>/`, the alert keyspace of `test_tenant()`.
+fn alert_keyspace_prefix() -> String {
+    format!(
+        "t/{}/{}/",
+        test_tenant().to_hex(),
+        Signal::Alerts.key_prefix()
+    )
+}
+
+/// `alert_lease_key(&test_tenant())`: `t/<hex>/a/alert-lease`.
+fn alert_lease_key() -> String {
+    format!("{}alert-lease", alert_keyspace_prefix())
+}
+
+/// `alert_state_memo_key(&test_tenant())`: `t/<hex>/a/state/latest`.
+fn alert_state_memo_key() -> String {
+    format!("{}state/latest", alert_keyspace_prefix())
+}
+
+/// One literal key per TENANT-ROUTED keyspace the templates name that
+/// `ravel-commit` has no key constructor for, so `representative_keys` produces
+/// no witness for it: `catalog/`, `prov`, tenant `idem/`, tenant `admission/`,
+/// and the tenant-scoped `config` record. Every one is a real `t/<hash>/...`
+/// object key the templates grant an action on, written here as a literal
+/// because no crate constructor in `ravel-commit` builds it (fold writes catalog
+/// objects, the log-segment writer writes prov, ingest writes idem and admission
+/// markers, and `config` is built by `config_key` in `ravel-catalog`, which this
+/// crate cannot depend on without a cycle).
+///
+/// Without these, the two overlap mechanisms
+/// (`delete_deny_and_allow_overlap_exactly_where_expected` and
+/// `every_allow_deny_key_overlap_is_named_by_the_deny`) enumerate a domain that
+/// models NO key for `t/*/*/prov` or `t/*/catalog/*/*`: both protected patterns,
+/// and the live `t/*/*/idem/*` MaintainDelete grant, then matched zero keys and
+/// the measurement reported an empty overlap having examined nothing there. The
+/// anti-vacuity guard was an ANY over the whole protected set that `sys/tenancy`
+/// alone satisfied, so the two zero-witness keyspaces went unnoticed.
+///
+/// These are kept out of `representative_keys` because no constructor produces
+/// them, for the same reason the non-tenant witnesses are: they are not evidence
+/// that a constructor builds the shape, and the delete-scope/coverage guards that
+/// read `representative_keys` alone must keep seeing only constructor output.
+///
+/// The SIGNAL segment is derived from `ALL_SIGNALS` rather than typed, so every
+/// signal gets a witness in each of these keyspaces. Typing two of the six is
+/// what a delete pattern with a literal signal segment escapes: `t/*/*/c/*`
+/// matches `t/<hash>/catalog/c/HEAD`, so today's green rests on no
+/// `Signal::key_prefix()` being `c`, which nothing states. Adding a signal, or
+/// changing a prefix to a letter some delete grant names, now moves this set
+/// instead of leaving the scan silently narrow.
+fn constructor_free_tenant_witness_keys() -> Vec<String> {
+    let hash = hash16();
+    let mut keys = Vec::new();
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        keys.push(format!("t/{hash}/catalog/{prefix}/HEAD"));
+        keys.push(format!(
+            "t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap"
+        ));
+        keys.push(format!("t/{hash}/catalog/{prefix}/idx/name-postings"));
+        // A full-width tenant hash: the provisioning-record write grants spell
+        // the tenant segment as exactly 32 single-character wildcards.
+        keys.push(format!("t/{}/{prefix}/prov", test_tenant().to_hex()));
+        keys.push(format!("t/{hash}/{prefix}/idem/{hash}"));
+        keys.push(format!("t/{hash}/{prefix}/admission/writer-0"));
+    }
+    // The tenant config record (`config_key`, `crates/ravel-catalog`) is
+    // tenant-scoped, not per-signal (ADR-0066 decision 6), so it is added once
+    // rather than inside the signal loop. The three server roles read it and
+    // `t/*/config` is the grant that reaches it.
+    keys.push(format!("t/{hash}/config"));
+    keys
+}
+
+/// The Parquet table name every manifest witness below is built for.
+const PARQUET_WITNESS_TABLE: &str = "hits";
+
+/// `grants_key(&test_tenant())`: `t/<hex>/pq/grants`, the location grants
+/// record (`crates/ravel-pqtable/src/keys.rs`).
+fn parquet_grants_key() -> String {
+    format!("t/{}/pq/grants", test_tenant().to_hex())
+}
+
+/// `tenant_manifest_prefix(&test_tenant())`: `t/<hex>/pq/t/`, the prefix
+/// the Parquet sweep and `ravel-cli parquet ls` (`resolve::tables`) list.
+fn parquet_tenant_manifest_prefix() -> String {
+    format!("t/{}/pq/t/", test_tenant().to_hex())
+}
+
+/// `manifest_prefix(&test_tenant(), table)`: `t/<hex>/pq/t/<table>/v/`, the
+/// prefix `resolve::versions` and `resolve::newest` list.
+fn parquet_manifest_prefix() -> String {
+    format!(
+        "{}{PARQUET_WITNESS_TABLE}/v/",
+        parquet_tenant_manifest_prefix()
+    )
+}
+
+/// `manifest_key(&test_tenant(), table, 1)`:
+/// `t/<hex>/pq/t/<table>/v/<version:020>.pqm`.
+fn parquet_manifest_key() -> String {
+    format!("{}{:020}.pqm", parquet_manifest_prefix(), 1)
+}
+
+/// `probe_key()` in `crates/ravel-object-store/src/external/probe.rs`:
+/// `PROBE_PREFIX` followed by 32 random hex characters.
+fn parquet_probe_key() -> String {
+    format!("{PROBE_PREFIX}{:032x}", WITNESS_PROCESS_ID)
+}
+
+/// `snapshot_key(tenant, signal, process_id)` in
+/// `crates/ravel-ingest/src/reconcile.rs`:
+/// `t/<hex>/<signal>/admission/<process_id>.snapshot`.
+fn admission_snapshot_key(signal: Signal) -> String {
+    format!(
+        "t/{}/{}/admission/{}.snapshot",
+        test_tenant().to_hex(),
+        signal.key_prefix(),
+        Uuid::from_u128(WITNESS_PROCESS_ID)
+    )
+}
+
+/// The Parquet table keys and the admission snapshots, written in the shape
+/// each constructor produces. The Parquet key builders live in `ravel-pqtable`
+/// and the snapshot builder in `ravel-ingest`, which this crate does not depend
+/// on; the probe prefix is imported from `ravel-object-store` itself.
+fn parquet_and_admission_witness_keys() -> Vec<String> {
+    let mut keys = vec![
+        parquet_grants_key(),
+        parquet_tenant_manifest_prefix(),
+        parquet_manifest_prefix(),
+        parquet_manifest_key(),
+        parquet_probe_key(),
+    ];
+    keys.extend(ALL_SIGNALS.iter().map(|s| admission_snapshot_key(*s)));
+    keys
+}
+
+/// The key domain the value-level checks in this file evaluate a pattern
+/// against: every key `ravel-commit`'s constructors can produce, plus one
+/// witness per non-tenant keyspace the templates name, plus one per
+/// tenant-routed keyspace no constructor builds, plus the `quarantine/` copies
+/// and prefixes the ADR-0058 reaper works over. Built once.
+fn key_domain() -> &'static [String] {
+    static DOMAIN: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    DOMAIN.get_or_init(|| {
+        let mut keys = representative_keys();
+        keys.extend(NON_TENANT_WITNESS_KEYS.iter().map(|k| (*k).to_string()));
+        keys.extend(fleet_witness_keys());
+        keys.extend(control_plane_witness_keys());
+        keys.extend(constructor_free_tenant_witness_keys());
+        keys.extend(quarantine_witness_keys());
+        keys.extend(parquet_and_admission_witness_keys());
+        keys
+    })
+}
+
+/// Assert `pattern` (a shipped Allow or Deny object-key pattern) matches at least
+/// one key in `key_domain()`. If it matches none, the overlap mechanisms that
+/// enumerate the domain are BLIND to its keyspace: they report an empty overlap
+/// for it having examined nothing, which reads as "no overlap" when the truth is
+/// "not measured". Refuse by name rather than measure vacuously, mirroring how
+/// the list and KMS axes are refused as unmodelled in
+/// `assert_allow_deny_overlaps_are_named`.
+fn assert_pattern_is_witnessed(role: &str, class: &str, pattern: &str) {
+    assert!(
+        key_domain().iter().any(|k| glob_matches(pattern, k)),
+        "{role}: {class} pattern {pattern:?} matches no key in key_domain(), so \
+         the overlap enumeration models no key for its keyspace and would report \
+         an empty overlap having examined nothing. Add a witness key for this \
+         keyspace to constructor_free_tenant_witness_keys() or \
+         NON_TENANT_WITNESS_KEYS (#1346)"
+    );
+}
+
+/// Policy prefixes naming keyspaces `ravel-commit` has no key constructor
+/// for. Matched as plain substrings against the raw pattern text. `/config` is
+/// here for the same reason `/prov` and `catalog/` are: `config_key` lives in
+/// `ravel-catalog`, which this crate cannot depend on without a cycle, so the
+/// tenant config record has no `ravel-commit` constructor to produce a witness.
+/// `/enc`, `/m/meta`, `/alert-lease` and `/state/latest` are the same case:
+/// their builders live in `ravel-catalog` and `ravel-server`, and `/pq/` too,
+/// whose builders live in `ravel-pqtable`.
+const OUT_OF_SCOPE_PATTERNS: &[&str] = &[
+    "idem/",
+    "/prov",
+    "catalog/",
+    "admission/",
+    "sys/",
+    "/config",
+    "/enc",
+    "/m/meta",
+    "/alert-lease",
+    "/state/latest",
+    "/pq/",
+];
+
+/// The maintain alert retention gate's list prefixes, matched exactly rather
+/// than as substrings: `t/*/a/` is a substring of the in-scope `t/*/a/l0/*`.
+/// Checked by `maintain_template_covers_the_alert_retention_reads`.
+const ALERT_KEYSPACE_LIST_PREFIXES: &[&str] = &["t/*/a/", "quarantine/t/*/a/"];
+
+fn is_out_of_scope(pattern: &str) -> bool {
+    ALERT_KEYSPACE_LIST_PREFIXES.contains(&pattern)
+        || OUT_OF_SCOPE_PATTERNS
+            .iter()
+            .any(|marker| pattern.contains(marker))
+}
+
+/// The object-ARN prefix (and bare bucket ARN) the shipped templates use. A
+/// delete-capable statement whose `Resource` does not start with
+/// `BUCKET_KEY_PREFIX` reaches outside the configured bucket (or is the bare
+/// `"*"`, or names a different bucket); it is surfaced as a test failure, never
+/// stripped to nothing.
+const BUCKET_ARN: &str = "arn:aws:s3:::my-ravel-bucket";
+const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
+
+/// Translate an IAM policy glob into an anchored regex. IAM resolves two
+/// wildcard characters inside `Action`, `Resource`, and `s3:prefix` Condition
+/// strings: `*` matches any sequence and `?` matches exactly one character;
+/// every other character is literal. This handles both, so a `?` smuggled into
+/// any of those fields is resolved as the wildcard IAM treats it as instead of
+/// being escaped to a literal `\?` that quietly matches nothing. The shipped
+/// templates carry a `?` only in the Resources of gateway's
+/// `GatewayAdmissionDelete`, query's `QueryManifestCreate` and the five
+/// provisioning-record write statements, in the `s3:prefix` values of the three
+/// `*ListTenantBootstrapKeys` statements, and in no Action;
+/// `every_shipped_template_passes_the_choke_point` asserts that (not assumes
+/// it) over Action, Resource, and the `s3:prefix` values it reads through
+/// `list_prefix_patterns`.
+fn glob_to_regex(pattern: &str) -> regex::Regex {
+    let mut regex_src = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '*' => regex_src.push_str(".*"),
+            '?' => regex_src.push('.'),
+            other => regex_src.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    regex_src.push('$');
+    regex::Regex::new(&regex_src).expect("valid glob-derived regex")
+}
+
+fn glob_matches(pattern: &str, candidate: &str) -> bool {
+    glob_to_regex(pattern).is_match(candidate)
+}
+
+/// True when an IAM glob EXCLUDES NO KEY THIS SYSTEM CAN PRODUCE, so it
+/// constrains exactly as little as naming no pattern would.
+///
+/// # What the claim is relative to
+///
+/// The check is relative to `key_domain()`: every key `ravel-commit`'s own
+/// constructors emit, plus one literal witness per non-tenant keyspace the
+/// shipped templates name. It claims no more than that. A pattern this
+/// predicate accepts is not proved to exclude some arbitrary string; it is
+/// proved to exclude at least one key shape the templates are written to scope.
+/// That is the property the callers need, because a `Resource` key pattern or
+/// an `s3:prefix` only ever confronts keys the system actually stores.
+///
+/// # Why not the empty string
+///
+/// The first version of this predicate asked one question: does the pattern
+/// match the empty string? That domain is wrong in a way that let real
+/// spellings through, because `classify_resource` rejects the empty key outright
+/// -- so the predicate decided vacuity by asking about the one value the code
+/// downstream can never see. `*` and `**` match the empty string, but `?*`,
+/// `*?*` and `*/*` do not, while each of those matches all 67 representative
+/// keys; `*/*` is the plausible operator spelling of "any tenant, any signal"
+/// and, put in a shipped template's delete `Resource`, left the whole suite
+/// green.
+///
+/// The empty-string test is kept as a disjunct, so the new definition is a
+/// SUPERSET of the old one rather than a trade of one blind spot for another:
+/// the empty pattern `""` matches no key in the domain yet still constrains
+/// nothing (a bucket-relative `arn:aws:s3:::my-ravel-bucket/` strips to it), and
+/// the bare star, an all-star run, and every other pattern the old test caught
+/// are still caught.
+///
+/// A pattern that is merely OVER-broad remains accepted, which is deliberate and
+/// asserted: `t/*` matches every tenant key but excludes every `sys/` and
+/// `admission/` key, so it is not vacuous, and the shipped `admin` template
+/// names it. Rejecting a bounded-but-too-wide grant is a separate guard, out of
+/// scope here.
+fn glob_admits_everything(pattern: &str) -> bool {
+    let regex = glob_to_regex(pattern);
+    regex.is_match("") || key_domain().iter().all(|key| regex.is_match(key))
+}
+
+// ---------------------------------------------------------------------------
+// The action vocabulary. One predicate (`action_grants`) and one operation list
+// per axis; every axis in this file routes through them.
+// ---------------------------------------------------------------------------
+
+/// The S3 operations these guards reason about that act on an OBJECT, so a
+/// statement granting one must name bucket-relative object ARNs.
+const S3_OBJECT_OPERATIONS: [&str; 4] = [
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:DeleteObjectVersion",
+];
+
+/// The S3 operations these guards reason about that act on the BUCKET, so a
+/// statement granting one must name the bare bucket ARN. `s3:ListBucket` is the
+/// only one: it is what `list_prefix_patterns` reads an `s3:prefix` Condition
+/// for, and what the Condition-presence rule keys on.
+const S3_BUCKET_OPERATIONS: [&str; 1] = ["s3:ListBucket"];
+
+/// The S3 operations that destroy a stored object. A subset of
+/// `S3_OBJECT_OPERATIONS` (pinned by `operation_vocabulary_is_consistent`), kept
+/// separate because the delete axis selects on exactly these.
+const S3_DELETE_OPERATIONS: [&str; 2] = ["s3:DeleteObject", "s3:DeleteObjectVersion"];
+
+/// The KMS operations that mint a data key, i.e. that let the holder produce new
+/// ciphertext under a tenant key. `write_roles_have_kms_generate_data_key` and
+/// `roles_writing_routed_objects_have_kms_grant` require one; ADR-0055 forbids
+/// admin any of them (`admin_has_no_kms_generate_data_key`). All four spellings
+/// are listed so the negative assertion cannot be evaded by granting a variant.
+const KMS_DATA_KEY_OPERATIONS: [&str; 4] = [
+    "kms:GenerateDataKey",
+    "kms:GenerateDataKeyWithoutPlaintext",
+    "kms:GenerateDataKeyPair",
+    "kms:GenerateDataKeyPairWithoutPlaintext",
+];
+
+/// The remaining KMS operations these guards reason about.
+const KMS_OTHER_OPERATIONS: [&str; 2] = ["kms:Decrypt", "kms:Encrypt"];
+
+/// The single action predicate every axis in this file goes through: does the
+/// policy string `action` (possibly an IAM wildcard pattern, in whatever case
+/// the template spells it) grant `operation` (a literal IAM operation name)?
+///
+/// IAM action names are case-insensitive and resolve two wildcards, `*` (any
+/// sequence) and `?` (exactly one character), so `"*"`, `"s3:*"`, `"s3:Delete*"`
+/// and `"S3:DELETEOBJECT"` all grant `s3:DeleteObject`. Before this predicate
+/// existed each axis carried its own matcher and only the delete axis resolved
+/// wildcards, so `"Action": "s3:*"` granted PutObject and ListBucket while being
+/// selected by neither -- and the Condition-presence rule, which keys on the
+/// list grant, never fired either. There is now one place that
+/// decides, so no axis can be wildcard-aware while another is not.
+///
+/// The asymmetry is deliberate and asserted: the wildcard lives on the policy
+/// side. An `operation` carrying `*` or `?` is a caller bug, not a pattern to
+/// resolve, because a wildcarded operation would make the predicate answer a
+/// question no axis asked.
+fn action_grants(action: &str, operation: &str) -> bool {
+    assert!(
+        !operation.contains(IAM_WILDCARDS),
+        "action_grants takes a literal IAM operation name, not a pattern: {operation:?}"
+    );
+    let action = action.to_ascii_lowercase();
+    let operation = operation.to_ascii_lowercase();
+    if action == operation {
+        return true;
+    }
+    // Only a wildcard pattern grants beyond its own name: an unrelated literal
+    // action (`s3:DeleteObjectTagging`, `s3:DeleteBucket`) grants nothing else.
+    action.contains(IAM_WILDCARDS) && glob_matches(&action, &operation)
+}
+
+/// True when `action` grants at least one of `operations`.
+fn action_grants_any(action: &str, operations: &[&str]) -> bool {
+    operations.iter().any(|op| action_grants(action, op))
+}
+
+/// True when at least one of a statement's `actions` grants at least one of
+/// `operations`. Every axis's statement selection is this call.
+fn any_action_grants_any(actions: &[String], operations: &[&str]) -> bool {
+    actions.iter().any(|a| action_grants_any(a, operations))
+}
+
+/// True when `action` grants any KMS operation these guards reason about, so the
+/// statement carrying it is a KMS statement whose `Resource` the KMS resource
+/// guards own. This replaces the old case-folded `kms:` prefix test, which a
+/// wildcard action (`"*"`, `"kms:*"`) slipped past.
+fn action_selects_kms(action: &str) -> bool {
+    action_grants_any(action, &KMS_OTHER_OPERATIONS)
+        || action_grants_any(action, &KMS_DATA_KEY_OPERATIONS)
+}
+
+// ---------------------------------------------------------------------------
+// The resource vocabulary. `classify_resource` is the only place a `Resource`
+// string is interpreted; the choke point and every helper share it, so a shape
+// cannot be understood in one and dropped in the other.
+// ---------------------------------------------------------------------------
+
+/// The ARN service prefix of a KMS key resource.
+const KMS_ARN_PREFIX: &str = "arn:aws:kms:";
+
+/// What a `Resource` string names, as far as the guards in this file are
+/// concerned. `Unclassified` is not a fourth kind of resource: it is the shape
+/// `validate_statement` rejects, so no helper downstream ever has to decide what
+/// to do with one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceShape<'a> {
+    /// An object ARN under the configured bucket; carries the bucket-relative
+    /// key pattern (always non-empty).
+    ObjectKey(&'a str),
+    /// Exactly the bare bucket ARN: what an `s3:ListBucket` grant names.
+    Bucket,
+    /// A KMS key ARN.
+    KmsKey,
+    /// Anything else, including every shape outside the three above: an S3
+    /// access-point ARN (`arn:aws:s3:<region>:<account>:accesspoint/...`), an
+    /// Object Lambda ARN (`arn:aws:s3-object-lambda:...`), a multi-region access
+    /// point (`arn:aws:s3::<account>:accesspoint/...`), the everything-grant
+    /// `arn:*`, the bare `"*"`, another bucket's ARN, and a malformed non-ARN
+    /// such as `my-ravel-bucket/*`.
+    Unclassified,
+}
+
+/// Classify one `Resource` string. Total: every string lands in exactly one
+/// shape, and everything the guards cannot reason about lands in `Unclassified`
+/// rather than being returned as "nothing to check".
+///
+/// The bucket-relative arm requires a NON-EMPTY key pattern:
+/// `arn:aws:s3:::my-ravel-bucket/` names the object with the empty key, which no
+/// key constructor produces and no guard has a pattern for, so it is
+/// unclassified rather than an `ObjectKey("")` that matches nothing.
+fn classify_resource(resource: &str) -> ResourceShape<'_> {
+    match resource.strip_prefix(BUCKET_KEY_PREFIX) {
+        Some(key) if !key.is_empty() => return ResourceShape::ObjectKey(key),
+        _ => {}
+    }
+    if resource == BUCKET_ARN {
+        return ResourceShape::Bucket;
+    }
+    if resource.starts_with(KMS_ARN_PREFIX) {
+        return ResourceShape::KmsKey;
+    }
+    ResourceShape::Unclassified
+}
+
+#[derive(Debug)]
+struct Policy {
+    role: &'static str,
+    statements: serde_json::Value,
+}
+
+/// The complete set of statement keys any guard in this file reads. Sid,
+/// Effect, Action, and Resource are read directly (see `statement_actions`,
+/// `statement_resources`, `key_patterns_for`, `kms_statement_resources`, ...);
+/// Condition is read for the `s3:prefix` ListBucket block
+/// (`list_prefix_patterns`) and for the create-only and CAS-only PutObject
+/// blocks (`conditioned_put_patterns`). Nothing else is examined by any guard.
+///
+/// This list is the guard's contract: a statement carrying any key outside it
+/// is one no guard reasons about, so it must fail closed at `load_policy`
+/// rather than be silently skipped.
+const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource", "Condition"];
+
+/// The complete set of `Condition` operators any guard in this file reads on a
+/// list statement: `list_prefix_patterns` reads its one `StringLike` or
+/// `StringEquals` block. (The conditioned PutObject Conditions have their own
+/// exact-shape check, `validate_put_condition`.) A list statement whose
+/// Condition names any other operator -- a different comparison such as
+/// `StringNotLike`, or a set-qualified form such as `ForAnyValue:StringLike` --
+/// carries a constraint no guard reasons about, so it must fail closed at
+/// `validate_statement` rather than pass with its Condition unexamined.
+///
+/// IAM ANDs the operators of one Condition block, while `list_prefix_patterns`
+/// returns the union of their values, so `validate_condition` admits exactly
+/// one operator per list statement. A `StringEquals` value compares literally,
+/// so it may carry no `*` or `?`; that makes it read correctly as a glob.
+const HANDLED_CONDITION_OPERATORS: &[&str] = &["StringLike", "StringEquals"];
+
+/// The complete set of `Condition` keys any guard in this file reads, under a
+/// handled operator. Only `s3:prefix` is inspected (by `list_prefix_patterns`);
+/// any other condition key (`s3:delimiter`, `aws:SourceIp`, ...) is a constraint
+/// no guard reads and must fail closed rather than sit unexamined.
+const HANDLED_CONDITION_KEYS: &[&str] = &["s3:prefix"];
+
+/// The one Condition shape a non-list statement may carry: an `Allow` whose
+/// every Action is exactly `s3:PutObject`, conditioned on the request's
+/// `If-None-Match: *` header. S3 evaluates `s3:if-none-match` on PutObject, and
+/// a PUT without the header has no value for the key, so `StringEquals` fails
+/// and the PUT is refused: the statement grants create and never overwrite.
+/// `conditioned_put_patterns` reads it; any other operator, key, value, Effect
+/// or Action set fails closed in `validate_put_condition`.
+const CREATE_ONLY_CONDITION_OPERATOR: &str = "StringEquals";
+const CREATE_ONLY_CONDITION_KEY: &str = "s3:if-none-match";
+const CREATE_ONLY_CONDITION_VALUE: &str = "*";
+
+/// The second Condition shape a PutObject-only `Allow` may carry: the request
+/// must send an `If-Match` header. `PutMode::CasVersion` is sent as `If-Match:
+/// <etag>`, so the statement grants a compare-and-swap and never a create or an
+/// unconditional overwrite (checked against AWS on 2026-10-03). `"true"` would
+/// invert it into "only PUTs without If-Match", so the value is pinned too.
+const CAS_ONLY_CONDITION_OPERATOR: &str = "Null";
+const CAS_ONLY_CONDITION_KEY: &str = "s3:if-match";
+const CAS_ONLY_CONDITION_VALUE: &str = "false";
+
+/// The conditional write a PutObject-only `Allow` statement's Condition admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PutCondition {
+    /// `{"StringEquals": {"s3:if-none-match": "*"}}`: `PutMode::CreateIfAbsent`.
+    CreateOnly,
+    /// `{"Null": {"s3:if-match": "false"}}`: `PutMode::CasVersion`.
+    CasOnly,
+}
+
+/// Keys that describe a statement shape these guards deliberately cannot
+/// reason about: `NotAction`/`NotResource` invert the set the Action/Resource
+/// guards inspect (so a statement carrying them is permissive in exactly the
+/// direction the guard reads, while the guard sees an empty positive set and
+/// passes it), and `Principal`/`NotPrincipal` scope a statement to identities
+/// this file models nothing about. Each is rejected with a message saying so,
+/// rather than lumped in with an unrecognized-typo key.
+const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
+    &["NotAction", "NotResource", "NotPrincipal", "Principal"];
+
+/// Fail closed on any statement shape the guards in this file do not fully
+/// understand. This is the single choke point every shipped-template guard
+/// passes through (`load_policy` calls it for each statement), so a new
+/// unhandled shape is rejected once here instead of slipping past a guard that
+/// only reads the fields it happens to know.
+///
+/// # The contract
+///
+/// ALL shape decisions happen here, so the helpers are total functions over the
+/// shapes that get through. A statement reaching any guard has:
+///
+/// - a present string `Sid`, so every message can name it;
+/// - only keys in `HANDLED_STATEMENT_KEYS`, so no permission lives in a field no
+///   guard reads (`NotAction`/`NotResource`/`Principal` are rejected by name);
+/// - an `Effect` of `Allow` or `Deny`, so the effect-filtered axes partition it;
+/// - an `Action` that is a string or non-empty array of strings, EVERY element of
+///   which grants at least one operation in the vocabulary
+///   (`S3_OBJECT_OPERATIONS`, `S3_BUCKET_OPERATIONS`, `KMS_OTHER_OPERATIONS`,
+///   `KMS_DATA_KEY_OPERATIONS`), decided by the one predicate `action_grants`;
+/// - a `Resource` that is a string or non-empty array of strings, EVERY element
+///   of which `classify_resource` places in `ObjectKey`, `Bucket`, or `KmsKey`
+///   -- never `Unclassified`;
+/// - for each granted operation class, at least one resource of the matching
+///   shape, and no resource of a shape whose class the statement does not grant.
+///   So an object grant carries only bucket-relative object ARNs, a list grant
+///   carries the bare bucket ARN, a KMS grant carries only `arn:aws:kms:` ARNs,
+///   and the normal mixed idiom (ListBucket + GetObject over the bucket ARN plus
+///   an object prefix) is accepted because both classes are granted;
+/// - a `Condition` on a list statement, whose sub-shape is the one
+///   `StringLike` or `StringEquals` `s3:prefix` block `list_prefix_patterns`
+///   reads; on any other
+///   statement, no `Condition` unless it is one of the two PutObject shapes
+///   `conditioned_put_patterns` reads (an `Allow` granting exactly
+///   `s3:PutObject`, conditioned on `StringEquals` `s3:if-none-match` `*` or
+///   on `Null` `s3:if-match` `false`).
+///
+/// A helper downstream therefore cannot meet a shape it does not understand.
+/// `object_key_patterns` matches all four `ResourceShape` variants:
+/// it strips `ObjectKey`, skips `Bucket` and `KmsKey` because this function
+/// proved the same statement grants the list or KMS operation whose own guard
+/// reads that exact string, and panics on `Unclassified` because this function
+/// rejects it. Each remaining `continue` in a helper is axis selection ("this
+/// statement grants no operation on my axis", or "this statement is the other
+/// Effect"), never a shape skip.
+///
+/// The coverage rule holds PER EFFECT-SELECTED AXIS: every ALLOW statement is
+/// selected by at least one axis (the axis of a granted operation class), and
+/// that axis sees every resource it carries. It does NOT say every statement is
+/// read by some axis. One shape is deliberately read by none: a `Deny` whose
+/// Action grants ONLY KMS operations. Both KMS helpers (`kms_actions`,
+/// `kms_statement_resources`) filter to `Allow`, and every S3 axis skips it on
+/// actions, so no helper reads it. That is safe: a `Deny` grants nothing, so
+/// there is no grant left unchecked, and the KMS grant it would withdraw is
+/// itself an `Allow` the KMS axes DO read. `deny_kms_statement_is_not_scope_checked`
+/// pins this shape reaching no scope-check guard on purpose. (A `Deny` that
+/// grants S3 object/list/delete operations is still read by its S3 axis under
+/// `None`, e.g. `delete_key_patterns(.., "Deny")`, so KMS-only is the sole
+/// no-axis shape.)
+///
+/// Effect is a third axis, orthogonal to Action and Resource, and this guard
+/// does NOT partition on it: a `Deny` statement is validated for shape exactly
+/// like an `Allow`, so a well-formed `Deny` reaches every helper its Action and
+/// Resource select. IAM resolves an explicit `Deny` as an overriding
+/// prohibition, so any helper whose result a caller reads as a held permission
+/// ("this role MAY do X", "X is scoped") or a prohibition ("this role MAY NOT
+/// do X") MUST filter by Effect itself; the guard cannot do it for them without
+/// rejecting legitimate `Deny` blocks. The contract is per helper, stated in
+/// its own doc: a helper that reads as a grant takes an effect argument and its
+/// permission-reading callers pass `Some("Allow")` (`key_patterns_for`,
+/// `list_prefix_patterns`, `put_resource_key_patterns`, `delete_key_patterns`),
+/// or the helper filters to `Allow` internally when every caller reads it as a
+/// grant (`kms_actions`, `kms_statement_resources`). A pure shape check that
+/// reads the result as neither a grant nor a prohibition (the pattern-vs-key
+/// coverage guard) passes `None` and sees both effects on purpose.
+///
+/// The `Allow` filter closes ONE direction: it stops a `Deny`-derived output
+/// being read as an `Allow`-derived permission, asserting the inverse of the
+/// fact. It does NOT stop a `Deny` WITHDRAWING a grant that a positive guard then
+/// asserts is held: a Deny added alongside a retained Allow, withdrawing (say)
+/// `kms:GenerateDataKey`/`kms:Encrypt` from the only key, leaves
+/// `write_roles_have_kms_generate_data_key` and
+/// `roles_writing_routed_objects_have_kms_grant` green, because those guards read
+/// the retained `Allow` and never subtract the `Deny`. That case is knowingly
+/// left unhandled: it is availability drift, not permissiveness, since the
+/// templates would fail CLOSED in production (the write is denied) while the
+/// guard stayed green, strictly safer than the direction the filter closes. Its
+/// precondition -- that no shipped template carries a `Deny` withdrawing a
+/// granted KMS/Put capability -- is a property of the four JSON files, so it is
+/// asserted rather than assumed by `every_shipped_deny_is_a_delete_only_prohibition`.
+/// A delete `Deny` can still overlap a delete `Allow`; that overlap is measured
+/// and pinned by `EXPECTED_DELETE_OVERLAPS`, the one home for the Deny-override
+/// fact.
+///
+/// Rejects, naming the `Sid` (and the statement index) and the offending key or
+/// field:
+/// - a statement that is not a JSON object;
+/// - a missing or non-string `Sid` (`"Sid": 123`), so every other rejection can
+///   name the statement;
+/// - `NotAction`/`NotResource`/`NotPrincipal`/`Principal` (negated or
+///   principal-scoped: the guard cannot reason about them);
+/// - any other key outside `HANDLED_STATEMENT_KEYS` (e.g. a `Resources` typo);
+/// - an `Effect` that is neither `Allow` nor `Deny`;
+/// - an `Action` or `Resource` that is neither a string nor a non-empty array
+///   of strings (an empty array is vacuously "all strings", so it would pass as
+///   a valid set the guards then derive nothing from);
+/// - a missing `Resource` key (the resource guards would read `Null` and treat
+///   the statement as having nothing to check);
+/// - an `Action` element that grants no operation in the vocabulary, so no axis
+///   would select the statement;
+/// - a `Resource` element `classify_resource` cannot place, quoting the value:
+///   an S3 access-point or Object Lambda or multi-region-access-point ARN, the
+///   everything-grant `arn:*`, the bare `"*"`, another bucket's ARN, or a
+///   malformed non-ARN such as `my-ravel-bucket/*`;
+/// - a `Resource` whose shape belongs to an operation class the statement does
+///   not grant (an `s3:ListBucket` on an object ARN, an `s3:GetObject` on the
+///   bare bucket ARN, a KMS ARN on a statement granting no KMS operation), and
+///   conversely a granted class with no resource of its shape (an `s3:ListBucket`
+///   that names no bucket ARN);
+/// - on an `Allow` only, a `Resource` object-key pattern that admits every key in
+///   `key_domain()` (a bucket-relative `arn:aws:s3:::my-ravel-bucket/*`, which
+///   strips to `"*"`, or any other spelling that excludes nothing, such as
+///   `"*/*"`): shape-valid but vacuous, scoping the grant no more than naming no
+///   key would. On a `Deny` such a pattern is maximally constraining, so it is
+///   accepted;
+/// - a Condition whose presence does not track the ListBucket action: a
+///   ListBucket statement with no Condition (an unconstrained bucket-wide list),
+///   or a Condition on any non-ListBucket statement (read by no guard) other
+///   than the exact create-only or CAS-only PutObject shape;
+/// - a `Condition` whose sub-shape is anything other than the one block a guard
+///   reads: it must be a JSON object of exactly one handled operator
+///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike` and `StringEquals`),
+///   mapping a non-empty set of handled condition keys (`HANDLED_CONDITION_KEYS`,
+///   today `s3:prefix`) to a string or non-empty array of strings, with no `*`
+///   or `?` in a `StringEquals` value. A different operator, a set-qualified
+///   operator, two operators, an unhandled key, or an empty
+///   `{}`/`{"StringLike":{}}` is a shape `list_prefix_patterns` cannot read, so
+///   it fails closed here rather than contributing nothing silently;
+/// - on an `Allow` only, an `s3:prefix` VALUE that admits every key in
+///   `key_domain()` (a bare `"*"`, any all-`"*"` run, `"?*"`, `"*/*"`):
+///   shape-valid but vacuous, letting a caller list the whole bucket exactly as
+///   an absent Condition would. On a `Deny` it is a maximal prohibition and is
+///   accepted.
+fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Result<(), String> {
+    let obj = stmt
+        .as_object()
+        .ok_or_else(|| format!("{role}: statement #{index} is not a JSON object: {stmt:?}"))?;
+
+    // Sid must be a present string. Every rejection below quotes it, and every
+    // guard's own failure message names it; a missing Sid, or a non-string
+    // `"Sid": 123`, was accepted pre-fix through the `<no Sid>` fallback (Sid is
+    // in the handled set but its type was never checked), leaving a statement
+    // whose rejections could name nothing.
+    let sid = match obj.get("Sid") {
+        Some(serde_json::Value::String(s)) => s.as_str(),
+        Some(other) => {
+            return Err(format!(
+                "{role}: statement #{index} has a non-string Sid: {other:?} -- Sid is a \
+                 handled key and must be a string so every rejection can name it"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "{role}: statement #{index} has no Sid -- Sid is required so every \
+                 rejection names the statement it rejects"
+            ));
+        }
+    };
+
+    for key in obj.keys() {
+        if NEGATED_OR_PRINCIPAL_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): statement uses {key:?}; the guards \
+                 in this file cannot reason about negated or principal-scoped \
+                 statements (they read only the positive Action/Resource sets), so a \
+                 policy carrying it must be rejected rather than silently passed"
+            ));
+        }
+        if !HANDLED_STATEMENT_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): statement uses key {key:?}, which no \
+                 guard in this file handles (handled keys: {HANDLED_STATEMENT_KEYS:?}); it \
+                 must fail closed rather than sit unexamined"
+            ));
+        }
+    }
+
+    let effect = match obj.get("Effect").and_then(|v| v.as_str()) {
+        Some(e) if e.eq_ignore_ascii_case("Allow") || e.eq_ignore_ascii_case("Deny") => e,
+        other => {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): Effect is neither \"Allow\" nor \
+                 \"Deny\": {other:?}"
+            ));
+        }
+    };
+
+    if !is_string_or_string_array(obj.get("Action")) {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Action is neither a string nor a \
+             non-empty array of strings: {:?}",
+            obj.get("Action")
+        ));
+    }
+
+    match obj.get("Resource") {
+        None => {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): statement has no Resource key -- a \
+                 statement with no Resource is the exact shape the resource guards skip \
+                 (they read stmt[\"Resource\"], find Null, and treat it as nothing to \
+                 check)"
+            ));
+        }
+        resource if !is_string_or_string_array(resource) => {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): Resource is neither a string nor a \
+                 non-empty array of strings: {resource:?}"
+            ));
+        }
+        _ => {}
+    }
+
+    // Both shape checks above have passed, so `statement_actions` and
+    // `statement_resources` now return exactly what the policy declares.
+    let actions = statement_actions(stmt);
+    let resources = statement_resources(stmt);
+    validate_actions_and_resources(role, sid, index, effect, &actions, &resources)?;
+
+    // Two guards read a Condition: `list_prefix_patterns`, on a statement
+    // whose Action grants s3:ListBucket, and `conditioned_put_patterns`, on an
+    // Allow whose every Action is exactly s3:PutObject. So:
+    //  - a list statement MUST carry a Condition (an unconstrained bucket-wide
+    //    list is rejected, exactly like a missing Resource);
+    //  - a PutObject-only statement may carry one, and only the create-only
+    //    or CAS-only shape `validate_put_condition` accepts; and
+    //  - any other statement must carry NONE (a Condition there is read by no
+    //    guard: a StringLike/s3:prefix on the protected-delete Deny would pass
+    //    validation while, in AWS, a DeleteObject request carries no s3:prefix
+    //    context key, so the Deny never fires and protects nothing).
+    //
+    // The list grant is decided by `action_grants`, the same predicate every
+    // other axis uses, so `"Action": "s3:*"` -- which grants ListBucket -- is
+    // required to carry a Condition here too.
+    let grants_list = any_action_grants_any(&actions, &S3_BUCKET_OPERATIONS);
+    match obj.get("Condition") {
+        Some(condition) => {
+            if grants_list {
+                validate_condition(role, sid, index, effect, condition)?;
+            } else if is_put_object_only(&actions) {
+                validate_put_condition(role, sid, index, effect, condition)?;
+            } else {
+                return Err(format!(
+                    "{role}/{sid} (statement #{index}): statement carries a Condition but \
+                     its Action does not include s3:ListBucket -- only the ListBucket \
+                     s3:prefix Condition and the create-only and CAS-only s3:PutObject \
+                     Conditions are \
+                     read by any guard, so a Condition on any other statement sits \
+                     unexamined and must fail closed"
+                ));
+            }
+        }
+        None => {
+            if grants_list {
+                return Err(format!(
+                    "{role}/{sid} (statement #{index}): s3:ListBucket statement carries no \
+                     Condition -- an unconstrained bucket-wide list must be rejected, the \
+                     same as a missing Resource; it must carry a non-empty \
+                     StringLike/s3:prefix Condition"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The Action/Resource half of the choke point: every action must grant an
+/// operation in the vocabulary, and every resource must have a shape that some
+/// granted operation class asks for, with no granted class left without one.
+///
+/// This is what makes the resource helpers total. Deciding it here, once, for
+/// every axis before any helper runs, is what keeps a helper from deciding on its
+/// own which resources it understands and answering "nothing to check" for the
+/// rest: an access-point ARN, an Object Lambda ARN, `arn:*`, or a malformed
+/// `my-ravel-bucket/*` is a real S3 object grant reaching outside the bucket and
+/// must fail here, not be silently dropped, and a list grant's bare bucket ARN
+/// must be examined rather than exempted.
+///
+/// The three classes are independent, so a statement granting several carries the
+/// resources of each. That is what makes the normal IAM idiom -- one statement
+/// granting `s3:ListBucket` and `s3:GetObject` over the bucket ARN plus an object
+/// prefix -- valid rather than a rejection with a misleading reason.
+fn validate_actions_and_resources(
+    role: &str,
+    sid: &str,
+    index: usize,
+    effect: &str,
+    actions: &[String],
+    resources: &[&str],
+) -> Result<(), String> {
+    for action in actions {
+        let known = action_grants_any(action, &S3_OBJECT_OPERATIONS)
+            || action_grants_any(action, &S3_BUCKET_OPERATIONS)
+            || action_selects_kms(action);
+        if !known {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): Action {action:?} grants no operation \
+                 any guard in this file reasons about (S3 object {S3_OBJECT_OPERATIONS:?}, \
+                 S3 bucket {S3_BUCKET_OPERATIONS:?}, KMS {KMS_OTHER_OPERATIONS:?} + \
+                 {KMS_DATA_KEY_OPERATIONS:?}) -- no axis would select this statement, so \
+                 its Resource would sit unexamined"
+            ));
+        }
+    }
+
+    let grants_object = any_action_grants_any(actions, &S3_OBJECT_OPERATIONS);
+    let grants_list = any_action_grants_any(actions, &S3_BUCKET_OPERATIONS);
+    let grants_kms = actions.iter().any(|a| action_selects_kms(a));
+
+    let mut saw_object = false;
+    let mut saw_bucket = false;
+    let mut saw_kms = false;
+    for resource in resources {
+        match classify_resource(resource) {
+            ResourceShape::ObjectKey(key) => {
+                if !grants_object {
+                    return Err(format!(
+                        "{role}/{sid} (statement #{index}): Resource {resource:?} names an \
+                         object under {BUCKET_ARN:?}, but the statement's Action \
+                         {actions:?} grants no S3 object operation \
+                         ({S3_OBJECT_OPERATIONS:?}) -- an object ARN on a statement that \
+                         cannot act on an object is a shape no axis reads"
+                    ));
+                }
+                // The object-key VALUE must constrain, not merely have the object
+                // shape -- but only on an `Allow`. On an `Allow`, a pattern that
+                // matches every key in `key_domain()` scopes the grant no more
+                // than naming no key prefix would, so it is refused. On a `Deny`
+                // the same pattern is MAXIMALLY constraining -- it prohibits every
+                // object in the bucket, the safest hardening an operator can make
+                // -- so it must not be refused with a grant-worded reason. The
+                // justification below is written in terms of a grant and does not
+                // transfer to a prohibition, so the check is gated on the Effect.
+                // Vacuity is decided against `key_domain()`, so `*/*` and `?*`,
+                // which match every key without matching the empty string, are
+                // refused alongside the bare `*`. A bounded prefix (`t/*`,
+                // `sys/*`) excludes some key and is accepted on either Effect.
+                if effect.eq_ignore_ascii_case("Allow") && glob_admits_everything(key) {
+                    return Err(format!(
+                        "{role}/{sid} (statement #{index}): Allow Resource {resource:?} strips to \
+                         the object-key pattern {key:?}, which matches every key shape this file \
+                         knows about under {BUCKET_ARN:?} -- a full-bucket object grant constrains \
+                         no more than naming no key scope at all; it must name a bounded key \
+                         prefix that excludes some key the system can produce"
+                    ));
+                }
+                saw_object = true;
+            }
+            ResourceShape::Bucket => {
+                if !grants_list {
+                    return Err(format!(
+                        "{role}/{sid} (statement #{index}): Resource {resource:?} is the \
+                         bare bucket ARN, but the statement's Action {actions:?} grants no \
+                         S3 bucket operation ({S3_BUCKET_OPERATIONS:?}) -- an S3 object \
+                         operation must name a bucket-relative object ARN, not the bucket"
+                    ));
+                }
+                saw_bucket = true;
+            }
+            ResourceShape::KmsKey => {
+                if !grants_kms {
+                    return Err(format!(
+                        "{role}/{sid} (statement #{index}): Resource {resource:?} is a KMS \
+                         key ARN, but the statement's Action {actions:?} grants no KMS \
+                         operation -- the KMS resource guards select on the action, so this \
+                         ARN would be checked by nothing"
+                    ));
+                }
+                saw_kms = true;
+            }
+            ResourceShape::Unclassified => {
+                return Err(format!(
+                    "{role}/{sid} (statement #{index}): Resource {resource:?} is neither \
+                     bucket-relative to {BUCKET_ARN:?}, nor exactly that bucket ARN, nor \
+                     an {KMS_ARN_PREFIX:?} key ARN -- an access-point or Object Lambda or \
+                     multi-region-access-point ARN, \"*\", \"arn:*\", another bucket, or a \
+                     malformed non-ARN grants access no guard in this file can check, so \
+                     it must fail closed rather than be dropped as nothing to check \
+                     (issue #1346, H1)"
+                ));
+            }
+        }
+    }
+
+    if grants_object && !saw_object {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Action {actions:?} grants an S3 object \
+             operation but Resource {resources:?} names no object under {BUCKET_ARN:?} -- \
+             the object axis would derive an empty pattern set and skip the statement"
+        ));
+    }
+    if grants_list && !saw_bucket {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Action {actions:?} grants an S3 bucket \
+             operation but Resource {resources:?} is not the bare bucket ARN \
+             {BUCKET_ARN:?} -- a list grant on any other resource enumerates a bucket this \
+             file models nothing about, and round three's list-only exemption left exactly \
+             this shape read by no guard (issue #1346, H2)"
+        ));
+    }
+    if grants_kms && !saw_kms {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Action {actions:?} grants a KMS operation \
+             but Resource {resources:?} names no {KMS_ARN_PREFIX:?} key ARN -- \
+             kms_statement_resources would return an empty resource list and both KMS \
+             resource guards would examine nothing"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a statement's `Condition` sub-shape against the exact operators and
+/// keys the guards read (`HANDLED_CONDITION_OPERATORS` / `HANDLED_CONDITION_KEYS`).
+/// The Condition must be a NON-EMPTY JSON object; every operator in it must be
+/// handled and map to a NON-EMPTY object; every key under a handled operator must
+/// be handled and map to a string or non-empty array of strings (the shape
+/// `list_prefix_patterns` reads). Anything else -- an unhandled operator such as
+/// `StringNotLike` or a set-qualified `ForAnyValue:StringLike`, an unhandled key
+/// such as `s3:delimiter`, a non-object Condition, or an empty `{}` /
+/// `{"StringLike": {}}` (a `for` over an empty map iterates zero times, so it used
+/// to return Ok and constrain nothing) -- is a shape no guard reasons about and is
+/// rejected by name. Without this, a ListBucket statement
+/// carrying such a Condition passes validation and `list_prefix_patterns` then
+/// finds no `["StringLike"]["s3:prefix"]` array and silently contributes nothing.
+///
+/// A non-empty `StringLike` map whose every key is handled forces `s3:prefix` to
+/// be present (it is the only handled key), so no separate presence check is
+/// needed.
+///
+/// Shape is necessary but not sufficient: each `s3:prefix` VALUE must also
+/// constrain. A value `glob_admits_everything` reports as vacuous -- a bare
+/// `"*"`, any all-`"*"` run, and every spelling that excludes no key in
+/// `key_domain()` such as `"?*"` or `"*/*"` -- passes every shape check yet lets
+/// a caller list the whole bucket, constraining no more than an absent
+/// Condition. It is rejected for the same reason the empty block is, one level
+/// down in the value.
+fn validate_condition(
+    role: &str,
+    sid: &str,
+    index: usize,
+    effect: &str,
+    condition: &serde_json::Value,
+) -> Result<(), String> {
+    let cond_obj = condition.as_object().ok_or_else(|| {
+        format!("{role}/{sid} (statement #{index}): Condition is not a JSON object: {condition:?}")
+    })?;
+    if cond_obj.is_empty() {
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Condition is an empty object -- an empty \
+             Condition constrains nothing, so a ListBucket statement carrying it is an \
+             unconstrained bucket-wide list; it must be a non-empty StringLike/s3:prefix \
+             block (issue #1346, F2)"
+        ));
+    }
+    if cond_obj.len() > 1 {
+        let operators: Vec<&String> = cond_obj.keys().collect();
+        return Err(format!(
+            "{role}/{sid} (statement #{index}): Condition names more than one operator \
+             {operators:?}. IAM ANDs them, while list_prefix_patterns reads the union of \
+             their values, so a list statement carries exactly one operator"
+        ));
+    }
+    for (operator, keys) in cond_obj {
+        if !HANDLED_CONDITION_OPERATORS.contains(&operator.as_str()) {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): Condition uses operator {operator:?}, \
+                 which no guard in this file reads (handled operators: \
+                 {HANDLED_CONDITION_OPERATORS:?}); a different or set-qualified operator \
+                 such as StringNotLike or ForAnyValue:StringLike must fail closed rather \
+                 than sit unexamined"
+            ));
+        }
+        let key_obj = keys.as_object().ok_or_else(|| {
+            format!(
+                "{role}/{sid} (statement #{index}): Condition operator {operator:?} is not a \
+                 JSON object: {keys:?}"
+            )
+        })?;
+        if key_obj.is_empty() {
+            return Err(format!(
+                "{role}/{sid} (statement #{index}): Condition operator {operator:?} is an \
+                 empty object -- it must map s3:prefix to a non-empty value; an empty \
+                 operator map constrains nothing (issue #1346, F2)"
+            ));
+        }
+        for (cond_key, value) in key_obj {
+            if !HANDLED_CONDITION_KEYS.contains(&cond_key.as_str()) {
+                return Err(format!(
+                    "{role}/{sid} (statement #{index}): Condition operator {operator:?} names \
+                     key {cond_key:?}, which no guard in this file reads (handled keys: \
+                     {HANDLED_CONDITION_KEYS:?}); it must fail closed rather than sit \
+                     unexamined"
+                ));
+            }
+            if !is_string_or_string_array(Some(value)) {
+                return Err(format!(
+                    "{role}/{sid} (statement #{index}): Condition {operator:?}.{cond_key:?} is \
+                     neither a string nor a non-empty array of strings: {value:?}"
+                ));
+            }
+            if operator == "StringEquals" {
+                for prefix in condition_value_strings(value) {
+                    if prefix.contains(['*', '?']) {
+                        return Err(format!(
+                            "{role}/{sid} (statement #{index}): StringEquals {cond_key:?} value \
+                             {prefix:?} carries a wildcard character. StringEquals compares it \
+                             literally, while every guard here reads it as a glob, so a \
+                             wildcard prefix belongs under StringLike"
+                        ));
+                    }
+                }
+            }
+            // Shape is not enough: the VALUE must constrain -- but only on an
+            // `Allow`, for the same reason the object-key vacuity check is gated
+            // (see `validate_actions_and_resources`). On an `Allow`, a shape-valid
+            // s3:prefix that admits everything lets a caller list the whole bucket
+            // exactly as an absent Condition would. On a `Deny`, an s3:prefix that
+            // matches every request prohibits every list, which is maximally
+            // constraining; refusing it with a grant-worded reason inverts the
+            // fact. Gated on s3:prefix because "admits everything" is a glob-prefix
+            // reading; a future handled key with different value semantics would
+            // need its own.
+            if effect.eq_ignore_ascii_case("Allow") && cond_key == "s3:prefix" {
+                for prefix in condition_value_strings(value) {
+                    if glob_admits_everything(prefix) {
+                        return Err(format!(
+                            "{role}/{sid} (statement #{index}): Allow Condition \
+                             {operator:?}.{cond_key:?} value {prefix:?} admits every key shape this \
+                             file knows about, so it constrains no more than an absent Condition -- \
+                             an s3:prefix must exclude some key the system can produce"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True when every action names exactly `s3:PutObject`. A wildcard that also
+/// grants it (`s3:Put*`, `s3:*`) is not this shape: a conditioned-write
+/// Condition would then also gate operations no guard here reads it for.
+fn is_put_object_only(actions: &[String]) -> bool {
+    actions
+        .iter()
+        .all(|a| a.eq_ignore_ascii_case("s3:PutObject"))
+}
+
+/// Validate a PutObject-only statement's Condition: an `Allow` whose Condition
+/// is exactly `{"StringEquals": {"s3:if-none-match": "*"}}` (create-only) or
+/// exactly `{"Null": {"s3:if-match": "false"}}` (CAS-only), the value as a bare
+/// string or a one-element array. A Condition whose one operator is `Null` is
+/// held to the CAS-only shape; every other Condition is held to the create-only
+/// shape, so a refusal names what differs from it. On a `Deny` either Condition
+/// would withdraw one kind of write and leave the others standing, which no
+/// guard reads, so it is refused; so is every other operator, key, or value.
+fn validate_put_condition(
+    role: &str,
+    sid: &str,
+    index: usize,
+    effect: &str,
+    condition: &serde_json::Value,
+) -> Result<(), String> {
+    let cas = condition
+        .as_object()
+        .is_some_and(|c| c.len() == 1 && c.contains_key(CAS_ONLY_CONDITION_OPERATOR));
+    let (shape, operator, cond_key, expected) = if cas {
+        (
+            "CAS-only",
+            CAS_ONLY_CONDITION_OPERATOR,
+            CAS_ONLY_CONDITION_KEY,
+            CAS_ONLY_CONDITION_VALUE,
+        )
+    } else {
+        (
+            "create-only",
+            CREATE_ONLY_CONDITION_OPERATOR,
+            CREATE_ONLY_CONDITION_KEY,
+            CREATE_ONLY_CONDITION_VALUE,
+        )
+    };
+    let refuse = |why: &str| {
+        Err(format!(
+            "{role}/{sid} (statement #{index}): s3:PutObject Condition {condition} is not \
+             the {shape} shape {{\"{operator}\": {{\"{cond_key}\": \"{expected}\"}}}} on an \
+             Allow: {why}"
+        ))
+    };
+    if !effect.eq_ignore_ascii_case("Allow") {
+        return refuse("it is on a Deny");
+    }
+    let Some(cond_obj) = condition.as_object() else {
+        return refuse("it is not a JSON object");
+    };
+    if cond_obj.len() != 1 {
+        return refuse("it must name exactly one operator");
+    }
+    let Some(keys) = cond_obj.get(operator).and_then(|k| k.as_object()) else {
+        return refuse(&format!(
+            "its operator is not {operator} over a JSON object"
+        ));
+    };
+    if keys.len() != 1 {
+        return refuse("it must name exactly one condition key");
+    }
+    let Some(value) = keys.get(cond_key) else {
+        return refuse(&format!("its condition key is not {cond_key}"));
+    };
+    if !is_string_or_string_array(Some(value)) || condition_value_strings(value) != [expected] {
+        return refuse(&format!("its value is not exactly \"{expected}\""));
+    }
+    Ok(())
+}
+
+/// The conditioned write an `Allow` PutObject-only statement grants, or `None`
+/// for any other statement. The choke point admits a Condition on such a
+/// statement in the two `validate_put_condition` shapes alone, so the `Null`
+/// operator is what tells them apart.
+fn put_condition_of(stmt: &serde_json::Value) -> Option<PutCondition> {
+    let allow = stmt["Effect"]
+        .as_str()
+        .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+    if !allow || !is_put_object_only(&statement_actions(stmt)) {
+        return None;
+    }
+    let condition = stmt.get("Condition")?;
+    if condition.get(CAS_ONLY_CONDITION_OPERATOR).is_some() {
+        Some(PutCondition::CasOnly)
+    } else {
+        Some(PutCondition::CreateOnly)
+    }
+}
+
+/// Bucket-relative key patterns from every `Allow` PutObject statement carrying
+/// the `kind` Condition.
+fn conditioned_put_patterns(policy: &Policy, kind: PutCondition) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        if put_condition_of(stmt) != Some(kind) {
+            continue;
+        }
+        out.extend(object_key_patterns(
+            policy.role,
+            statement_sid(stmt),
+            &statement_resources(stmt),
+        ));
+    }
+    out
+}
+
+/// Bucket-relative key patterns from every `Allow` PutObject statement carrying
+/// the create-only Condition.
+fn create_only_put_patterns(policy: &Policy) -> Vec<String> {
+    conditioned_put_patterns(policy, PutCondition::CreateOnly)
+}
+
+/// Bucket-relative key patterns from every `Allow` statement that grants
+/// `s3:PutObject` with neither conditioned-write Condition, so the PUTs it
+/// allows include an unconditional overwrite.
+fn unconditioned_put_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let allow = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+        if !allow
+            || !any_action_grants_any(&statement_actions(stmt), &["s3:PutObject"])
+            || put_condition_of(stmt).is_some()
+        {
+            continue;
+        }
+        out.extend(object_key_patterns(
+            policy.role,
+            statement_sid(stmt),
+            &statement_resources(stmt),
+        ));
+    }
+    out
+}
+
+/// The string values in a Condition-key value that is a string or an array of
+/// strings (`validate_condition` has already proved it is one of those shapes).
+fn condition_value_strings(value: &serde_json::Value) -> Vec<&str> {
+    match value {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// True only for a JSON string or a non-empty array whose every element is a
+/// string. An empty array is rejected: `iter().all(..)` is vacuously true on it,
+/// so `"Action": []` / `"Resource": []` used to pass and every downstream guard
+/// then derived an empty set and skipped the statement.
+fn is_string_or_string_array(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::String(_)) => true,
+        Some(serde_json::Value::Array(a)) => {
+            !a.is_empty() && a.iter().all(serde_json::Value::is_string)
+        }
+        _ => false,
+    }
+}
+
+/// Run `validate_statement` over every statement in a policy's `Statement`
+/// array, returning the first rejection. This is the real per-statement
+/// validation loop `load_policy` runs on every shipped template; extracting it
+/// lets the regression tests call THIS function (and drive it through
+/// `build_policy`, load_policy's own body) rather than a re-typed copy of the
+/// loop that would keep passing if the call in `load_policy` were deleted.
+fn validate_policy_statements(role: &str, statements: &serde_json::Value) -> Result<(), String> {
+    let array = statements
+        .as_array()
+        .ok_or_else(|| format!("{role}: Statement is not an array"))?;
+    for (index, stmt) in array.iter().enumerate() {
+        validate_statement(role, index, stmt)?;
+    }
+    Ok(())
+}
+
+/// The parse-and-validate body shared by `load_policy` and the regression tests
+/// that need to drive the real validation call site with a synthetic policy
+/// (`load_policy` itself only reads the fixed `deploy/iam/*.json` paths). Panics,
+/// naming `source`, if `Statement` is not an array or any statement is rejected.
+fn build_policy(role: &'static str, source: &str, json: &serde_json::Value) -> Policy {
+    let statements = json["Statement"].clone();
+    assert!(statements.is_array(), "{source}: Statement is not an array");
+    if let Err(msg) = validate_policy_statements(role, &statements) {
+        panic!("{source}: {msg}");
+    }
+    Policy { role, statements }
+}
+
+/// The on-disk path of a shipped template.
+fn policy_json_path(role: &str) -> String {
+    format!(
+        "{}/../../deploy/iam/{role}.json",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn load_policy(role: &'static str) -> Policy {
+    load_policy_from(role, &policy_json_path(role))
+}
+
+/// The real file-reading entry point: read the policy at `path`, parse it, and
+/// run the full per-statement validation through `build_policy`. `load_policy`
+/// is exactly this against the fixed `deploy/iam/{role}.json` paths; a
+/// regression test drives it with a synthetic invalid file so the validation is
+/// exercised through the entry point production uses, not only through
+/// `build_policy`.
+fn load_policy_from(role: &'static str, path: &str) -> Policy {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    build_policy(role, path, &json)
+}
+
+/// Every action name in a statement's `Action` (a bare string or an array),
+/// with the policy's own capitalization preserved so a failure message quotes
+/// what the template actually says.
+///
+/// The `_ => Vec::new()` arm and the `filter_map` are unreachable for any
+/// statement that passed the choke point: `validate_statement` runs
+/// `is_string_or_string_array` on `Action` BEFORE calling this, so a non-string,
+/// a non-array, an empty array, and an array holding a non-string are all
+/// already rejected. The empty return survives only for the pre-fix fixtures,
+/// which call this on a raw `NotAction` statement precisely to pin that the
+/// action used to be invisible.
+fn statement_actions(stmt: &serde_json::Value) -> Vec<String> {
+    match &stmt["Action"] {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(a) => a
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every resource string in a statement's `Resource` (a bare string or an
+/// array). Unreachable-arm justification is the same as `statement_actions`:
+/// `validate_statement` checks `Resource` with `is_string_or_string_array`
+/// before anything reads it.
+fn statement_resources(stmt: &serde_json::Value) -> Vec<&str> {
+    match &stmt["Resource"] {
+        serde_json::Value::String(s) => vec![s.as_str()],
+        serde_json::Value::Array(a) => a.iter().filter_map(|v| v.as_str()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A statement's `Sid`. Total for anything that passed the choke point, which
+/// requires a present string Sid so every message can name the statement it is
+/// about; the old `unwrap_or("<no Sid>")` fallback named nothing.
+fn statement_sid(stmt: &serde_json::Value) -> &str {
+    stmt["Sid"].as_str().expect(
+        "the choke point (validate_statement) requires a present string Sid, so any \
+         statement reaching a guard has one",
+    )
+}
+
+/// `s3:prefix` patterns from the `Condition.StringLike` or
+/// `Condition.StringEquals` block of every statement whose `Effect` matches
+/// `effect` (`None` matches any) and whose `Action` grants a list operation. A
+/// `StringEquals` value carries no wildcard (`validate_condition`), so it reads
+/// as a glob matching only itself.
+///
+/// The `effect` argument is the same one `key_patterns_for` takes, and it exists
+/// for the same reason: a prefix is read as a permission or a prohibition
+/// depending on which caller reads it, and an explicit IAM `Deny` wins over an
+/// `Allow`. `discovery_prefix_admitted_for_every_discovering_role` reads the
+/// result as the prefixes a role is ALLOWED to list, so it must pass
+/// `Some("Allow")`: pooling a `Deny` block's `s3:prefix` into that vector would
+/// assert the inverse of the fact, admitting a discovery prefix that an explicit
+/// Deny withdraws. A caller that only checks each prefix names a
+/// real key shape (`every_in_scope_policy_pattern_matches_a_real_key_shape`) is
+/// effect-agnostic and passes `None`.
+///
+/// Selection goes through `action_grants`, so `"Action": "s3:*"` is read here
+/// too. Under round three's exact-name detection it was not, which is half of
+/// H3: an `s3:*` statement granted an unconstrained ListBucket while this
+/// function read nothing from it.
+fn list_prefix_patterns(policy: &Policy, effect: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        if let Some(effect) = effect {
+            let has_effect = stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case(effect));
+            if !has_effect {
+                continue;
+            }
+        }
+        if !any_action_grants_any(&statement_actions(stmt), &S3_BUCKET_OPERATIONS) {
+            continue;
+        }
+        // IAM allows a single `s3:prefix` value as a bare string or an array;
+        // read both so a bare-string prefix is not silently skipped. Any other
+        // shape is unreachable: the choke point requires a list statement to
+        // carry exactly one StringLike or StringEquals s3:prefix block whose
+        // value is a string or non-empty array of strings, with no wildcard in
+        // a StringEquals value, so the panic arm fires only for a statement
+        // that never passed validation.
+        let condition = &stmt["Condition"];
+        let block = if condition.get("StringEquals").is_some() {
+            &condition["StringEquals"]
+        } else {
+            &condition["StringLike"]
+        };
+        match &block["s3:prefix"] {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(patterns) => {
+                for p in patterns {
+                    out.push(p.as_str().expect("s3:prefix entry is a string").to_string());
+                }
+            }
+            other => panic!(
+                "{}/{}: list statement's Condition s3:prefix is {other:?} -- the \
+                 choke point requires a string or non-empty array of strings here, so \
+                 reaching this means a guard ran on an unvalidated statement",
+                policy.role,
+                statement_sid(stmt)
+            ),
+        }
+    }
+    out
+}
+
+/// A policy's statement array. `Statement`-is-an-array is asserted by
+/// `build_policy` and `validate_policy_statements` before a `Policy` exists.
+fn policy_statements(policy: &Policy) -> &Vec<serde_json::Value> {
+    policy
+        .statements
+        .as_array()
+        .expect("a Policy's Statement is an array (checked by build_policy)")
+}
+
+/// The bucket-relative key patterns among one statement's `resources`.
+///
+/// Total over `ResourceShape`, which is the point of the redesign: every arm is
+/// named and justified by a choke-point rule, so there is no catch-all that can
+/// quietly absorb a shape nobody thought about.
+///
+/// - `ObjectKey` is the pattern to check, returned.
+/// - `Bucket` contributes nothing to strip. Skipping it is safe because
+///   `validate_actions_and_resources` proved the same statement grants a list
+///   operation, whose Resource must be exactly this ARN and whose Condition must
+///   be the `s3:prefix` block `list_prefix_patterns` reads. This arm makes the
+///   normal mixed ListBucket+GetObject idiom work without a misleading rejection;
+///   exempting whole list statements at the caller instead would leave their
+///   Resources read by nothing.
+/// - `KmsKey` likewise: the choke point proved the statement grants a KMS
+///   operation, so `kms_statement_resources` selects it and both KMS resource
+///   guards run over this exact string.
+/// - `Unclassified` panics. The choke point rejects it, so reaching here means a
+///   guard ran on a statement that never passed validation (a synthetic fixture
+///   built straight from `Policy`), and the loud failure is the belt-and-braces
+///   half of the unclassified-resource fix.
+///
+/// An `Allow` full-bucket object grant `arn:aws:s3:::my-ravel-bucket/*` (which
+/// strips to `"*"` and matches every key) is rejected earlier, at the choke point
+/// by `validate_actions_and_resources`, so a shape-valid object ARN that
+/// constrains nothing never reaches `every_in_scope_policy_pattern_matches_a_real_key_shape`
+/// -- a coverage check, which asserts a pattern matches AT LEAST ONE real key and
+/// so cannot reject an over-broad pattern. Rejecting an in-bucket grant that is
+/// merely too wide but still bounded (`t/*`) remains a separate guard, out of
+/// scope here.
+fn object_key_patterns(role: &str, sid: &str, resources: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    for resource in resources {
+        match classify_resource(resource) {
+            ResourceShape::ObjectKey(key_pattern) => out.push(key_pattern.to_string()),
+            ResourceShape::Bucket | ResourceShape::KmsKey => {}
+            ResourceShape::Unclassified => panic!(
+                "{role}/{sid}: statement names resource {resource:?}, which is neither \
+                 bucket-relative to {BUCKET_ARN:?}, nor exactly that bucket ARN, nor an \
+                 {KMS_ARN_PREFIX:?} key ARN -- validate_statement rejects this shape, so \
+                 reaching here means a guard ran on an unvalidated statement (issue \
+                 #1346, H1)"
+            ),
+        }
+    }
+    out
+}
+
+/// Bucket-relative key patterns from every statement whose `Effect` matches
+/// `effect` (`None` matches any) and whose `Action` grants at least one of
+/// `operations`.
+///
+/// The single resource-collection loop every S3 axis uses: one loop, one action
+/// predicate, one resource classifier. Per-axis near-copies would let two of them
+/// disagree about a shape such as the bare bucket ARN, which is what an
+/// exemption added to one copy but not another once did.
+///
+/// The `continue`s are axis selection, not shape skips: "this statement grants
+/// no operation on my axis" and "this statement is the other Effect". The choke
+/// point's coverage rule guarantees every statement is selected by at least one
+/// axis, and whichever axis selects it sees every resource it carries.
+fn key_patterns_for(policy: &Policy, operations: &[&str], effect: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        if let Some(effect) = effect {
+            let has_effect = stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case(effect));
+            if !has_effect {
+                continue;
+            }
+        }
+        if !any_action_grants_any(&statement_actions(stmt), operations) {
+            continue;
+        }
+        out.extend(object_key_patterns(
+            policy.role,
+            statement_sid(stmt),
+            &statement_resources(stmt),
+        ));
+    }
+    out
+}
+
+/// The action strings, in template order, that select `policy` on the axis
+/// `operations` under `effect`. The action-side mirror of `key_patterns_for`,
+/// and the S3 counterpart of `kms_actions`.
+///
+/// Only the actions that grant an axis operation are returned, for the reason
+/// `kms_actions` filters the same way: a mixed ListBucket+GetObject statement
+/// must contribute `s3:ListBucket` to the list axis and `s3:GetObject` to the
+/// get axis rather than both to each, or an axis would report an action it does
+/// not select on. A wildcard action that grants an axis operation without naming
+/// it (`"s3:*"`) is returned, because `action_grants` decides membership.
+///
+/// The strings keep the template's own capitalization and spelling, so an
+/// expectation over them pins WHAT THE POLICY SAYS, not what it resolves to.
+/// That is the point: an action edit that leaves the resolved capability
+/// unchanged for the operations this file has a vocabulary for (`s3:Delete*` for
+/// the two delete operations) still widens the real grant, and must be read by a
+/// human rather than absorbed.
+fn actions_for(policy: &Policy, operations: &[&str], effect: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        if let Some(effect) = effect {
+            let has_effect = stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case(effect));
+            if !has_effect {
+                continue;
+            }
+        }
+        out.extend(
+            statement_actions(stmt)
+                .into_iter()
+                .filter(|a| action_grants_any(a, operations)),
+        );
+    }
+    out
+}
+
+/// Bucket-relative key patterns from every statement granting an S3 object
+/// operation (`GetObject`, `PutObject`, `DeleteObject`, ...), either Effect.
+///
+/// Selection is by grant, not by "not ListBucket": a list-only statement grants
+/// no object operation and is not selected, and a mixed ListBucket+GetObject
+/// statement IS selected and contributes its object patterns.
+fn resource_key_patterns(policy: &Policy) -> Vec<String> {
+    key_patterns_for(policy, &S3_OBJECT_OPERATIONS, None)
+}
+
+/// Bucket-relative key patterns from every statement whose `Action` grants
+/// `s3:PutObject` --- the writes that go through `KmsRoutingStore` and can
+/// select a per-tenant key. Delete/Get/Deny statements are excluded: they never
+/// route (reads and deletes delegate to the default store unconditionally, see
+/// `kms_routing.rs`).
+///
+/// Delete and Get are excluded by action selection; `Deny` is excluded by the
+/// `Some("Allow")` effect argument. Its consumer,
+/// `roles_writing_routed_objects_have_kms_grant`, reads the result as the routed
+/// writes a role performs and then demands a KMS grant for them, so a `Deny`
+/// PutObject read as a routed write would demand a KMS grant for a write the role
+/// cannot perform --- the inverse of the fact, since an explicit Deny withdraws
+/// the write. Passing `None` here left `Deny` matching, so
+/// the sentence above was true of Delete/Get and false of Deny; `Some("Allow")`
+/// makes it true.
+///
+/// `"Action": "s3:*"` grants PutObject and so is selected here, which round
+/// three's exact-name match missed (H3).
+fn put_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    key_patterns_for(policy, &["s3:PutObject"], Some("Allow"))
+}
+
+/// Bucket-relative key patterns from every statement whose `Effect` is `effect`
+/// and whose `Action` grants an S3 delete operation.
+///
+/// `"Allow"` returns the delete capability a role actually holds. The
+/// `DenyDeleteProtected` block names delete actions too, but it withdraws
+/// capability rather than granting it (and an explicit IAM `Deny` always wins),
+/// so it is selected separately by `"Deny"`, which returns the keys that block
+/// protects (ADR-0055 §3).
+fn delete_key_patterns(policy: &Policy, effect: &str) -> Vec<String> {
+    key_patterns_for(policy, &S3_DELETE_OPERATIONS, Some(effect))
+}
+
+const ROLES_WITH_DISCOVERY: [&str; 3] = ["gateway", "query", "maintain"];
+const ALL_ROLES: [&str; 4] = ["gateway", "query", "maintain", "admin"];
+
+/// Roles that PUT routed `t/<hash>/...` objects yet are deliberately kept
+/// Decrypt-only, exempt from the routed-write KMS grant rule below. Today only
+/// `admin`: ADR-0055 keeps it `GetObject`-only for routine data and forbids it
+/// `kms:GenerateDataKey*` (see `admin_has_no_kms_generate_data_key`) so a
+/// leaked Admin credential cannot mint ciphertext under tenant keys it has no
+/// write role for. Admin's narrow routed PUTs (`t/*/*/c/*` via
+/// `ravel-cli commit reconstruct`, the `t/*/u/*` audit prefix) therefore fail
+/// closed under `--tenant-kms-config` -- a known operational gap documented in
+/// docs/guides/operations.md, not a bug this test should paper over by
+/// demanding the grant. Listing the role here (rather than skipping the whole
+/// admin policy) keeps the exemption explicit and load-bearing: the test still
+/// asserts an exempt role actually writes routed objects, so the exemption
+/// cannot rot into masking a future regression.
+const ROUTED_WRITE_EXEMPT_ROLES: [&str; 1] = ["admin"];
+
+/// Roles whose IAM policy writes tenant data through `KmsRoutingStore`:
+/// Gateway's ingest PUTs, Maintain's compaction/rewrite
+/// PUTs, and Query's catalog-fold (`t/<hash>/catalog/.../snap|HEAD|idx`) and
+/// query-audit (`t/<hash>/u/...`) PUTs all land under `t/<hash>/...` and, once
+/// `--tenant-kms-config` routes that tenant to its own key, require
+/// `kms:GenerateDataKey*`/`kms:Encrypt` on that key or the PUT fails closed.
+/// This is a hand-maintained list; `roles_writing_routed_objects_have_kms_grant`
+/// is the anti-drift guard that derives the same requirement from each policy's
+/// own PUT patterns and `KmsRoutingStore`'s real routing predicate.
+const WRITE_ROLES: [&str; 3] = ["gateway", "maintain", "query"];
+
+/// `kms:*` action strings granted by an `Allow` statement anywhere in `policy`
+/// (`Action` as a bare string or an array), regardless of statement Sid.
+///
+/// Allow-only, for the F1 reason applied to actions rather than resources: every
+/// caller reads the result as a grant the role HOLDS
+/// (`write_roles_have_kms_generate_data_key`,
+/// `roles_writing_routed_objects_have_kms_grant`, `every_role_has_kms_decrypt`) or
+/// as the absence of one (`admin_has_no_kms_generate_data_key`), and an explicit
+/// IAM `Deny` grants nothing. Pooling a `Deny kms:GenerateDataKey` into this
+/// vector would report a role able to mint ciphertext when the Deny withdraws
+/// exactly that, and would make the negative admin assertion fail on a policy that
+/// safely denies the operation --- the inverse of the fact in both directions
+///. A `Deny` KMS statement passes the choke point, so this
+/// case is reachable, not hypothetical.
+///
+/// Selection goes through `action_selects_kms`, so `KMS:GenerateDataKey*` is
+/// returned and so is a wildcard action (`"*"`, `"kms:*"`) that grants a KMS
+/// operation without naming the service literally --- which the old case-folded
+/// `kms:` prefix test missed. The strings themselves keep the template's
+/// capitalization, so a caller's failure message shows what the policy said
+/// rather than a normalized form the operator would then grep for in vain.
+/// Callers ask `action_grants` what a returned string grants; none compares it
+/// literally.
+fn kms_actions(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let is_allow = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+        if !is_allow {
+            continue;
+        }
+        out.extend(
+            statement_actions(stmt)
+                .into_iter()
+                .filter(|a| action_selects_kms(a)),
+        );
+    }
+    out
+}
+
+/// Sid and KMS key ARNs for every `Allow` statement granting a KMS operation.
+/// Both KMS resource guards below go through this one selection rule, so a change
+/// to it cannot reach one guard and miss the other.
+///
+/// Allow-only, for the F1 reason: both guards read the result as a GRANT that must
+/// be narrowly scoped (`no_allow_kms_statement_grants_every_key_in_the_region`,
+/// `every_allow_kms_statement_names_a_key_id`). An explicit `Deny` grants nothing, so a
+/// `Deny` naming `key/*` is a broad prohibition (safe), yet these guards would
+/// flag it as an account-wide grant --- the inverse of the fact. A `Deny` KMS
+/// statement passes the choke point, so this is reachable; scoping is asked only
+/// of the grants.
+///
+/// The returned resources are filtered to `ResourceShape::KmsKey`, so a mixed
+/// statement's S3 object ARNs are not handed to the KMS ARN-shape assertions
+/// (which would reject them for the wrong reason). Nothing is lost: the choke
+/// point proved a KMS-granting statement carries at least one KMS ARN, and any
+/// object ARN it also carries is read by the object axis.
+fn kms_statement_resources(policy: &Policy) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let is_allow = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+        if !is_allow {
+            continue;
+        }
+        if !statement_actions(stmt)
+            .iter()
+            .any(|a| action_selects_kms(a))
+        {
+            continue;
+        }
+        let resources: Vec<String> = statement_resources(stmt)
+            .into_iter()
+            .filter(|r| matches!(classify_resource(r), ResourceShape::KmsKey))
+            .map(str::to_string)
+            .collect();
+        out.push((statement_sid(stmt).to_string(), resources));
+    }
+    out
+}
+
+/// Gateway/Maintain/Query write tenant data objects through `KmsRoutingStore`
+/// (ADR-0062 decision 1a): a configured tenant's PUT is delegated to a
+/// per-tenant `S3Store` built with that tenant's SSE-KMS key, which needs
+/// `kms:GenerateDataKey*` (and `kms:Encrypt`) on the caller's IAM policy or
+/// the PUT fails closed with `AccessDenied`. Flip any
+/// role's `*TenantKms` statement (or narrow its Action list to drop
+/// `kms:GenerateDataKey*`) in `deploy/iam/{gateway,maintain,query}.json` and
+/// this test fails.
+#[test]
+fn write_roles_have_kms_generate_data_key() {
+    for role in WRITE_ROLES {
+        let policy = load_policy(role);
+        let actions = kms_actions(&policy);
+        assert!(
+            actions
+                .iter()
+                .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
+            "{role}: policy is missing kms:GenerateDataKey* -- its ingest/compaction/\
+             catalog-fold PUTs under t/<hash>/... will fail closed against a \
+             --tenant-kms-config tenant. Found kms actions: {actions:?}"
+        );
+    }
+}
+
+/// Anti-drift guard: for EVERY role, derive whether it PUTs any
+/// object that routes through `KmsRoutingStore`'s per-tenant key straight from
+/// the policy's own `s3:PutObject` resource patterns and the crate's real
+/// routing predicate (`ravel_object_store::routes_through_tenant_key`), then
+/// require that role to carry both `kms:Encrypt` and `kms:GenerateDataKey*`.
+///
+/// Unlike `write_roles_have_kms_generate_data_key`, this test hardcodes no role
+/// list and no key strings: it reads whatever the policy grants PutObject on
+/// and asks the routing code itself whether that shape routes. So it fails in
+/// two independent drift directions --- a policy gaining a new routed PUT class
+/// without the KMS grant, or `routes_through_tenant_key` widening to cover a
+/// keyspace some role already PUTs --- either of which would otherwise ship a
+/// write that fails closed under `--tenant-kms-config`.
+///
+/// Non-vacuous by construction: a role whose policy PUTs routed object classes
+/// such as `t/*/catalog/*/{snap/*,HEAD,idx/*}` or `t/*/u/*` while its
+/// tenant-KMS statement grants only `kms:Decrypt` makes this assertion fail,
+/// naming that role until `kms:Encrypt`/`kms:GenerateDataKey*` are added.
+#[test]
+fn roles_writing_routed_objects_have_kms_grant() {
+    for role in ALL_ROLES {
+        assert_role_routed_writes_have_kms_grant(&load_policy(role));
+    }
+}
+
+/// The routed-write guard's body, factored out so a fixture can drive the real
+/// assertions on a synthetic policy rather than a re-typed copy of them (the
+/// same pattern `assert_admin_delete_grant_is_scratch_only` uses).
+///
+/// An EMPTY routed set is a failure here, not a skip. A body that read
+/// `if routed.is_empty() { continue; }` let a non-exempt write role widen its
+/// PutObject `Resource` to a pattern the routing predicate does not recognize,
+/// empty the set, and silently retire the KMS requirement for that role while
+/// keeping its PUT grant. Every shipped role PUTs at least one `t/<hash>/...`
+/// object, so the only way to reach an empty set is a widening or a deletion, and
+/// both must be loud. The exemption-honesty check reads off the same assertion.
+fn assert_role_routed_writes_have_kms_grant(policy: &Policy) {
+    let role = policy.role;
+    let puts = put_resource_key_patterns(policy);
+    assert!(
+        !puts.is_empty(),
+        "{role}: policy grants s3:PutObject on nothing -- every shipped role \
+         writes objects, so an empty PUT set means the write grant was dropped \
+         or moved somewhere no axis reads"
+    );
+
+    let routed: Vec<String> = puts
+        .iter()
+        .filter(|p| ravel_object_store::routes_through_tenant_key(p.as_str()))
+        .cloned()
+        .collect();
+    assert!(
+        !routed.is_empty(),
+        "{role}: grants s3:PutObject on {puts:?}, none of which routes through a \
+         per-tenant key. An empty routed set is not a role with nothing to check: \
+         pre-fix it SKIPPED the kms:GenerateDataKey*/kms:Encrypt requirement below \
+         (and, for a role in ROUTED_WRITE_EXEMPT_ROLES, voided the exemption-honesty \
+         check that the exemption still covers a real routed write). Either the PUT \
+         resource was widened past the tenant keyspace, or the role should be dropped \
+         from ROUTED_WRITE_EXEMPT_ROLES (issue #1346, hole twelve)"
+    );
+
+    // `routes_through_tenant_key` answers about a KEY; every caller above asks it
+    // about a PATTERN, which is a value no key constructor produces. That is the
+    // hole-ten property on the routing axis: a pattern whose own text does not
+    // parse as a tenant key can still ADMIT tenant keys (`*/*` admits every key in
+    // `key_domain()`), and the difference decides whether the KMS requirement
+    // applies. Asked here against real keys, so it cannot be dodged by spelling.
+    for pattern in &puts {
+        if ravel_object_store::routes_through_tenant_key(pattern) {
+            continue;
+        }
+        let admitted: Vec<&String> = key_domain()
+            .iter()
+            .filter(|key| {
+                glob_matches(pattern, key.as_str())
+                    && ravel_object_store::routes_through_tenant_key(key.as_str())
+            })
+            .collect();
+        assert!(
+            admitted.is_empty(),
+            "{role}: PUT pattern {pattern:?} does not itself parse as a routed \
+             tenant key, yet it admits routed keys {admitted:?} -- the KMS \
+             requirement would be decided on the pattern's own text instead of on \
+             the keys it grants (issue #1346, hole ten sweep)"
+        );
+    }
+
+    if ROUTED_WRITE_EXEMPT_ROLES.contains(&role) {
+        // `admin_has_no_kms_generate_data_key` pins that this exempt role stays
+        // Decrypt-only; the assertion above pins that the exemption still covers
+        // a real routed write rather than masking a later regression.
+        return;
+    }
+
+    let actions = kms_actions(policy);
+    assert!(
+        actions
+            .iter()
+            .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
+        "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
+         kms:GenerateDataKey* -- those writes fail closed under \
+         --tenant-kms-config. Found kms actions: {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|a| action_grants(a, "kms:Encrypt")),
+        "{role}: PUTs routed object class(es) {routed:?} but policy lacks \
+         kms:Encrypt -- those writes fail closed under --tenant-kms-config. \
+         Found kms actions: {actions:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The effective pattern set every role grants, per axis, by exact equality.
+//
+// Before this table, nothing asserted that a Deny is a Deny. Flipping
+// `DenyDeleteProtected`'s Effect to `Allow` in gateway.json, query.json or
+// maintain.json left the suite green, and so did deleting the statement
+// outright: only admin.json went red, and only because
+// `assert_admin_delete_grant_is_scratch_only` happens to assert exact equality
+// on admin's delete grant. Every other guard asks a one-sided question ("does
+// SOME pattern do X?"), which a Deny turning into an Allow, or vanishing,
+// cannot make false. Generalising that exact-equality
+// shape to every role and every axis is what makes the Effect load-bearing.
+//
+// The form is deliberate: an Allow set and a Deny set per axis, each by exact
+// equality, plus the overlap properties asserted separately over real keys
+// (`delete_deny_and_allow_overlap_exactly_where_expected` measures where the two
+// sides cover the same key, and `every_allow_deny_key_overlap_is_named_by_the_deny`
+// asserts the Deny's actions cover the Allow's wherever they do). The alternative
+// -- one "effective" set per axis, with the Deny globs subtracted from the Allow
+// globs -- is not exactly computable: glob difference is not a glob, so any
+// single-set form would have to approximate, and an approximation asserted by
+// exact equality is a fake. Two exact sets and a checked disjointness property
+// state the same fact without pretending to compute the subtraction.
+// ---------------------------------------------------------------------------
+
+/// The placeholder tenant-key ARN every shipped template carries.
+const TENANT_KMS_KEY_ARN: &str =
+    "arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID";
+
+/// The `DenyDeleteProtected` resource set shared by gateway, query, and admin:
+/// the three singleton control objects, the per-tenant provenance record, the
+/// whole catalog keyspace, and the legal-hold audit shard (ADR-0055 section 3),
+/// plus the durable bearer-token map `sys/auth` and the write-once recovery
+/// manifests `sys/t/*` (the control-plane key amendment: a deleted `sys/auth`
+/// reads as absent and installs an empty token map, revoking every durable
+/// token, and `sys/t/*` recovery manifests are write-once, ADR-0050), and the
+/// append-only KMS key-epoch records `t/*/enc` (a deleted record reads as "no
+/// per-tenant key was ever configured", ADR-0062 decision 1b).
+/// Maintain's own `DenyDeleteProtected` differs (see
+/// `MAINTAIN_PROTECTED_DELETE_KEYS`): its catalog entry is narrowed to the
+/// HEAD pointer alone, because `MaintainDelete` grants it delete on the
+/// `snap/`/`idx/` objects the catalog sweep removes (issue #1847), and a Deny
+/// naming the whole family would make every sweep pass fail on its first
+/// delete. This constant is shared by gateway/query/admin's rows below, so
+/// one of those three drifting out of step with the others fails on this
+/// axis rather than passing with its own variant.
+const PROTECTED_DELETE_KEYS: &[&str] = &[
+    "sys/tenancy",
+    "sys/qualification",
+    "sys/gc",
+    "t/*/*/prov",
+    "t/*/catalog/*/*",
+    "t/*/u/*/0000/*",
+    "sys/auth",
+    "sys/t/*",
+    "t/*/enc",
+    "t/*/pq/grants",
+];
+
+/// Maintain's `DenyDeleteProtected` resource set: same as `PROTECTED_DELETE_KEYS`
+/// except the catalog entry is `t/*/catalog/*/HEAD` rather than the whole
+/// `t/*/catalog/*/*` family, since Maintain alone is granted delete on the
+/// `snap/`/`idx/` objects under that family (`MaintainDelete`, issue #1847).
+/// The catalog sweep (`crates/ravel-maintain/src/sweep.rs`,
+/// `sweep_unreferenced_catalog_objects`) never deletes HEAD itself, only
+/// snapshot and index objects once they are unreferenced, so HEAD stays
+/// denied while the rest of the family becomes deletable.
+const MAINTAIN_PROTECTED_DELETE_KEYS: &[&str] = &[
+    "sys/tenancy",
+    "sys/qualification",
+    "sys/gc",
+    "t/*/*/prov",
+    "t/*/catalog/*/HEAD",
+    "t/*/u/*/0000/*",
+    "sys/auth",
+    "sys/t/*",
+    "t/*/enc",
+    "t/*/pq/grants",
+];
+
+/// The `DenyDeleteProtected` action set, identical in all four templates: both
+/// delete operations S3 distinguishes.
+///
+/// This is the axis the protection actually turns on. A `Deny` overrides an
+/// `Allow` only for the operations it NAMES, and three of maintain's delete
+/// grants cover the legal-hold shard (`EXPECTED_DELETE_OVERLAPS`), so dropping
+/// `s3:DeleteObjectVersion` from here would leave Maintain able to destroy
+/// versions of legal-hold audit objects while every pattern-set expectation and
+/// the overlap measurement stayed green. `every_allow_deny_key_overlap_is_named_by_the_deny`
+/// asserts the property directly; this row makes the edit itself visible.
+const PROTECTED_DELETE_ACTIONS: &[&str] = &["s3:DeleteObject", "s3:DeleteObjectVersion"];
+
+/// One role's complete grant surface, as the guards in this file derive it.
+/// Written as intent: each field is the exact list, in template order, that the
+/// axis returns. The Deny side of every axis except delete is empty, which is
+/// the claim `every_shipped_deny_is_a_delete_only_prohibition` restates
+/// structurally.
+///
+/// Every S3 axis carries a pattern list AND an action list, because a statement
+/// is two independent halves and the pattern half alone leaves one of them
+/// unpinned. Resources decide WHICH keys a statement reaches; actions decide
+/// WHAT it may do to them and, on a `Deny`, exactly how much of an overlapping
+/// `Allow` it overrides. Before the action rows, a resource edit reddened this
+/// table and an action edit prompted nobody.
+struct ExpectedRolePatterns {
+    role: &'static str,
+    list_prefixes: &'static [&'static str],
+    list_actions: &'static [&'static str],
+    gets: &'static [&'static str],
+    get_actions: &'static [&'static str],
+    puts: &'static [&'static str],
+    put_actions: &'static [&'static str],
+    deletes: &'static [&'static str],
+    delete_actions: &'static [&'static str],
+    protected_deletes: &'static [&'static str],
+    protected_delete_actions: &'static [&'static str],
+    kms_actions: &'static [&'static str],
+    /// `(Sid, KMS key ARNs)` per `Allow` statement granting a KMS operation.
+    kms_resources: &'static [(&'static str, &'static [&'static str])],
+}
+
+const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
+    // Gateway: ingest. Writes L0 data, commit records, idempotency and
+    // admission records, provenance, and the catalog objects a commit
+    // publishes. Its one delete is the admission reconcile's reap of dead
+    // processes' mutable admission snapshots, and reaches no durable object
+    // (gateway_template_covers_the_admission_snapshot_reap): its tenant hash
+    // and signal segments are spelled as exactly 32 and 1 single-character
+    // wildcards between literal slashes, so a Parquet manifest key, which
+    // has `/pq/` where the pattern needs `/<one char>/admission/`, cannot
+    // match. sys/auth is the
+    // durable token map the auth
+    // refresh reads, and sys/t/* the per-tenant recovery manifest every keyed
+    // ingest path creates; asserted by tenant_resolving_roles_read_the_auth_map
+    // and gateway_template_covers_the_recovery_manifest_write. t/*/enc is the
+    // KMS key-epoch record every server mode bootstraps under
+    // --tenant-kms-config (server_roles_read_and_write_the_key_epoch_record),
+    // and t/*/m/meta the metric metadata record the ingest metadata sink
+    // writes (metric_metadata_record_is_written_by_gateway_and_read_by_query).
+    ExpectedRolePatterns {
+        role: "gateway",
+        list_prefixes: &[
+            "t/",
+            "t/*/*/l0/*",
+            "t/*/*/c/*",
+            "t/*/*/admission/*",
+            "t/*/catalog/*/*",
+            // GatewayListBootstrapKeys and GatewayListTenantBootstrapKeys
+            // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/auth",
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            BOOTSTRAP_META_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+        ],
+        list_actions: &["s3:ListBucket", "s3:ListBucket", "s3:ListBucket"],
+        gets: &[
+            "t/*/*/l0/*",
+            "t/*/*/c/*",
+            "t/*/*/prov",
+            "t/*/*/idem/*",
+            "t/*/*/admission/*",
+            "t/*/catalog/*/*",
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/auth",
+            "t/*/config",
+            "t/*/enc",
+            "t/*/m/meta",
+        ],
+        get_actions: &["s3:GetObject"],
+        puts: &[
+            "t/*/*/l0/*",
+            "t/*/*/c/*",
+            "t/*/*/idem/*",
+            "t/*/*/admission/*",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/HEAD",
+            "t/*/catalog/*/idx/*",
+            "sys/tenancy",
+            "sys/t/*",
+            "t/*/enc",
+            "t/*/m/meta",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+        ],
+        // One entry per statement: GatewayWrite, then the create-only
+        // GatewayProvCreate (prov_put_grants_carry_exactly_the_expected_conditions).
+        put_actions: &["s3:PutObject", "s3:PutObject"],
+        deletes: &["t/????????????????????????????????/?/admission/*"],
+        delete_actions: &["s3:DeleteObject"],
+        protected_deletes: PROTECTED_DELETE_KEYS,
+        protected_delete_actions: PROTECTED_DELETE_ACTIONS,
+        kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
+        kms_resources: &[("GatewayTenantKms", &[TENANT_KMS_KEY_ARN])],
+    },
+    // Query: reads every level, writes catalog-fold output, the query-audit
+    // prefix and its worker registration; deletes no durable object. A drained query
+    // worker overwrites its own registration rather than deleting it, and the
+    // maintain role reaps dead registrations (issue #1828). sys/auth is read
+    // by the durable auth refresh (tenant_resolving_roles_read_the_auth_map).
+    // The alert evaluator runs here too: it writes alert transitions under
+    // t/*/a/l0/* and t/*/a/c/*, and reads and writes its per-tenant lease and
+    // state memo (query_template_covers_every_alert_evaluator_call). The
+    // Parquet table reads list and get the table manifests under t/*/pq/t/*
+    // and get the location grants record t/*/pq/grants
+    // (query_template_covers_every_parquet_table_read). HTTP Parquet DDL
+    // creates manifests under a create-only grant and runs the bucket probe,
+    // which puts and deletes sys/pq-probe/<random>
+    // (query_template_covers_every_parquet_ddl_call).
+    ExpectedRolePatterns {
+        role: "query",
+        list_prefixes: &[
+            "t/",
+            "t/*/*/c/*",
+            "t/*/catalog/*/*",
+            "admission/query/*",
+            "sys/query/workers/*",
+            "t/*/pq/t/*",
+            // QueryListBootstrapKeys and QueryListTenantBootstrapKeys
+            // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/auth",
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            BOOTSTRAP_META_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_P_PATTERN,
+            PROV_A_PATTERN,
+            PROV_U_PATTERN,
+            BOOTSTRAP_ALERT_STATE_PATTERN,
+            BOOTSTRAP_PQ_GRANTS_PATTERN,
+        ],
+        list_actions: &["s3:ListBucket", "s3:ListBucket", "s3:ListBucket"],
+        gets: &[
+            "t/*/*/c/*",
+            "t/*/*/l0/*",
+            "t/*/*/l1/*",
+            "t/*/catalog/*/*",
+            "t/*/*/prov",
+            "admission/query/*",
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/auth",
+            "sys/query/workers/*",
+            "t/*/config",
+            "t/*/enc",
+            "t/*/a/alert-lease",
+            "t/*/a/state/latest",
+            "t/*/m/meta",
+            "t/*/pq/grants",
+            "t/*/pq/t/*",
+        ],
+        get_actions: &["s3:GetObject"],
+        puts: &[
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/HEAD",
+            "t/*/catalog/*/idx/*",
+            "t/*/u/*",
+            "admission/query/*",
+            "sys/tenancy",
+            "sys/query/workers/*",
+            "t/*/enc",
+            "t/*/a/l0/*",
+            "t/*/a/c/*",
+            "t/*/a/alert-lease",
+            "t/*/a/state/latest",
+            "sys/pq-probe/*",
+            "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
+        ],
+        // QueryWrite, then QueryManifestCreate. No provisioning write: a query
+        // process checks a present record at startup and never adopts
+        // (query_template_writes_no_provisioning_record).
+        put_actions: &["s3:PutObject", "s3:PutObject"],
+        deletes: &["sys/pq-probe/*"],
+        delete_actions: &["s3:DeleteObject"],
+        protected_deletes: PROTECTED_DELETE_KEYS,
+        protected_delete_actions: PROTECTED_DELETE_ACTIONS,
+        kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
+        kms_resources: &[("QueryTenantKms", &[TENANT_KMS_KEY_ARN])],
+    },
+    // Maintain: the only role that deletes. Compaction and rewrite outputs,
+    // maintenance cursors, and the GC/tenancy control objects; its deletes
+    // cover the inputs compaction supersedes, the non-hold audit shard, the
+    // erasure request objects the .dreq sweep retires (ADR-0064 section 6),
+    // and the unreferenced catalog snapshot/index objects
+    // sweep_unreferenced_catalog_objects removes (issue #1847) -- the Deny
+    // below protects only the catalog HEAD pointer, not the whole family, so
+    // that sweep is not the one that deletes it.
+    // The del/ list prefix and the del/* read are that sweep's other two
+    // object-store calls, asserted against their call sites by
+    // maintain_template_covers_every_erasure_request_sweep_call. The read is
+    // del/* rather than del/*.done because the erasure rewrite pass GETs the
+    // .dreq body itself; the put reaches del/*.done because that pass writes
+    // the completion. Both are asserted by
+    // erasure_lifecycle_calls_outside_the_sweep_are_reachable.
+    // The catalog sweep needs the same two-call shape the erasure sweep does:
+    // sweep_unreferenced_catalog_objects lists t/*/catalog/*/snap/* and
+    // t/*/catalog/*/idx/* (list_all, twice), GETs t/*/catalog/*/HEAD
+    // (read_head_reference, twice: the first read and the pre-delete
+    // re-verify), and GETs each snapshot part that HEAD names
+    // (SnapshotReachability::ensure_part) before it ever reaches the delete
+    // grant above. Without the list the pass is refused with AccessDenied at
+    // the ListBucket; without the HEAD get it cannot resolve what is
+    // referenced; and without t/*/catalog/*/snap/* the part GET returns
+    // AccessDenied, which ensure_part turns into MaintainError::Store and so
+    // aborts the whole pass for that signal rather than one object.
+    //
+    // Maintain-mode processes also GET t/*/catalog/*/idx/*, from the scrub
+    // tick's load_covering_postings. Since #1964 it returns Err on anything
+    // that is not NotFound, so a missing grant there now surfaces instead of
+    // reading as "no postings ref yet". Before that it returned Ok(None) on
+    // ANY error, which is why this grant had to be DERIVED rather than
+    // observed: at the time nothing in a running system would have reported
+    // it. fold_inner also GETs idx/ objects for its .cstat and .npost reuse
+    // baseline, and since ADR-1693 the scheduled fold runs under
+    // Mode::Maintain (Mode::runs_scheduled_fold), so those reads land on this
+    // role too.
+    //
+    // The scheduled fold is also why the put axis carries the three catalog
+    // patterns: fold_inner PUTs snap/*.csnap, idx/*.cstat and idx/*.npost
+    // with CreateIfAbsent and the HEAD with CasVersion or CreateIfAbsent.
+    // The Deny below names only deletes, so it does not cancel the HEAD put.
+    // Asserted by maintain_template_covers_the_scheduled_fold_catalog_writes.
+    //
+    // Each is exactly the defect this role's del/* grants were added to fix,
+    // and the shape that shipped again here three times (issue #1847, rounds
+    // two through four). Asserted by
+    // maintain_template_covers_every_catalog_sweep_call.
+    //
+    // quarantine/t/*/*/l0/* appears on three axes (list, put, delete) because
+    // the ADR-0058 orphan sweep and its reaper touch a key space that is NOT
+    // under t/: sweep_orphans PUTs each candidate's bytes to
+    // quarantine/<original key>/q<ns>, and sweep_quarantine LISTs
+    // quarantine/t/<hash>/<signal>/l0/<shard>/ and DELETEs what is past the
+    // second horizon. IAM is default-deny and `t/` is a literal in every other
+    // pattern here, so before this grant the reaper was refused at its
+    // ListBucket and the sweep could not quarantine an orphan at all
+    // (issue #1957). There is no matching GET: nothing reads a quarantine
+    // object, since the copy reads the LIVE key (already covered by
+    // t/*/*/l0/*) and no restore path exists in the code. Asserted call by
+    // call by maintain_template_covers_every_quarantine_call.
+    //
+    // sys/maintain/workers/* appears on the list and delete axes, and is
+    // reached on get and put by the wider sys/maintain/* the memo snapshots
+    // and the ADR-1029 compaction claims share. The ADR-0065 heartbeat
+    // lifecycle touches it on all four: write_heartbeat PUTs this process's
+    // own key, live_set_read LISTs the prefix and GETs each in-window
+    // sibling, and reap_keys DELETEs each key past the reap horizon (all in
+    // crates/ravel-fleet/src/worker_set.rs, driven from
+    // services/ravel-server/src/maintain.rs). The delete pattern is narrower
+    // than sys/maintain/* on purpose: the reaper is the only deleter under
+    // that prefix, and a memo snapshot or a compaction claim is not its to
+    // remove. Until issue #1975 the delete axis named no sys/ resource at
+    // all, so every reap was refused and the prefix the per-tick LIST walks
+    // grew without bound. Asserted call by call by
+    // maintain_template_covers_every_worker_heartbeat_call.
+    //
+    // sys/query/workers/* appears on the list and delete axes only. The query
+    // role deletes nothing, so the maintain tick reaps dead query-worker
+    // records (issue #1828): reap_dead_query_workers in
+    // crates/ravel-fleet/src/query_workers.rs LISTs the prefix and DELETEs each
+    // key past the reap horizon, judged from LIST metadata, so it reads no
+    // record and writes none. Asserted call by call by
+    // maintain_template_covers_every_query_worker_reap_call.
+    //
+    // sys/maintain/memo/* appears on the list axis for the warm start, which
+    // LISTs the prefix before it GETs each snapshot (both under the wider
+    // sys/maintain/* read). Asserted by
+    // maintain_template_covers_every_memo_snapshot_read_call.
+    //
+    // t/*/a/state/latest and the t/*/a/ and quarantine/t/*/a/ list prefixes
+    // are the alert retention gate's reads: the alert state memo it takes the
+    // keep set from, and the two listings alert_keyspace_is_empty issues.
+    // Asserted by maintain_template_covers_the_alert_retention_reads.
+    //
+    // t/*/pq/t/* appears on the list and delete axes for `ravel-cli parquet
+    // sweep`, which runs under this credential: it lists a tenant's Parquet
+    // table manifests and deletes the superseded ones, and reads none of them.
+    // Asserted by maintain_template_covers_every_parquet_sweep_call.
+    ExpectedRolePatterns {
+        role: "maintain",
+        list_prefixes: &[
+            "t/",
+            "t/*/*/l0/*",
+            "t/*/*/c/*",
+            "t/*/*/l1/*",
+            "t/*/*/idem/*",
+            "t/*/*/del/*",
+            "t/*/*/maint/*",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/idx/*",
+            "sys/maintain/workers/*",
+            "sys/maintain/memo/*",
+            "sys/query/workers/*",
+            "quarantine/t/*/*/l0/*",
+            "t/*/a/",
+            "quarantine/t/*/a/",
+            "t/*/pq/t/*",
+            // MaintainListBootstrapKeys and MaintainListTenantBootstrapKeys
+            // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            BOOTSTRAP_HEAD_M_PATTERN,
+            BOOTSTRAP_HEAD_L_PATTERN,
+            BOOTSTRAP_HEAD_S_PATTERN,
+            BOOTSTRAP_ALERT_STATE_PATTERN,
+        ],
+        list_actions: &["s3:ListBucket", "s3:ListBucket", "s3:ListBucket"],
+        gets: &[
+            "t/*/*/l0/*",
+            "t/*/*/c/*",
+            "t/*/*/l1/*",
+            "t/*/*/maint/*",
+            "t/*/u/*",
+            "t/*/*/prov",
+            "t/*/*/del/*",
+            "t/*/catalog/*/HEAD",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/idx/*",
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/maintain/*",
+            "t/*/config",
+            "t/*/enc",
+            "t/*/a/state/latest",
+        ],
+        get_actions: &["s3:GetObject"],
+        puts: &[
+            "t/*/*/l1/*",
+            "t/*/*/c/*",
+            "t/*/*/maint/*",
+            "t/*/*/del/*.done",
+            "sys/gc",
+            "sys/tenancy",
+            "sys/maintain/*",
+            "quarantine/t/*/*/l0/*",
+            "t/*/enc",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/idx/*",
+            "t/*/catalog/*/HEAD",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+        ],
+        // MaintainWrite, then MaintainProvCreate (create-only, the maintain
+        // tick's adopt) and MaintainProvCas (CAS-only, the maintain migrate
+        // floor raise): every_prov_write_call_site_has_a_grant_of_its_kind.
+        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
+        deletes: &[
+            "t/*/*/l0/*",
+            "t/*/*/c/*",
+            "t/*/*/l1/*",
+            "t/*/*/idem/*",
+            "t/*/*/maint/*",
+            "t/*/u/*/0001/*",
+            "t/*/*/del/*.dreq",
+            "t/*/catalog/*/snap/*",
+            "t/*/catalog/*/idx/*",
+            "sys/maintain/workers/*",
+            "sys/query/workers/*",
+            "quarantine/t/*/*/l0/*",
+            "t/*/pq/t/*",
+        ],
+        // Both delete operations, and the same two the Deny names. Maintain is
+        // the only role where that identity is load-bearing rather than
+        // incidental: its level-based grants cover the legal-hold shard, so the
+        // shard is protected only as far as this list is covered by
+        // PROTECTED_DELETE_ACTIONS.
+        delete_actions: &["s3:DeleteObject", "s3:DeleteObjectVersion"],
+        protected_deletes: MAINTAIN_PROTECTED_DELETE_KEYS,
+        protected_delete_actions: PROTECTED_DELETE_ACTIONS,
+        kms_actions: &["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
+        kms_resources: &[("MaintainTenantKms", &[TENANT_KMS_KEY_ARN])],
+    },
+    // Admin: broad read, narrow create-only writes, and the delete grants on
+    // the two scratch prefixes ADMIN_SCRATCH_DELETES names. Decrypt-only on
+    // KMS. The sys/auth write is ravel-cli's tenant token upsert and revoke
+    // (admin_template_covers_every_auth_map_write_call), the t/*/config
+    // write is ravel-cli's tenant config record writes
+    // (admin_template_covers_every_tenant_config_write_call), and the
+    // t/*/pq/grants and sys/pq-probe/* writes are ravel-cli tenant
+    // parquet-grant's record write and bucket probe
+    // (admin_template_covers_every_parquet_grant_call).
+    ExpectedRolePatterns {
+        role: "admin",
+        list_prefixes: &["t/*", "sys/*"],
+        list_actions: &["s3:ListBucket"],
+        gets: &["t/*", "sys/*"],
+        get_actions: &["s3:GetObject"],
+        puts: &[
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/qualify/*",
+            "sys/gc",
+            "sys/auth",
+            "t/*/*/c/*",
+            "t/*/u/*",
+            "t/*/*/del/*.dreq",
+            "t/*/config",
+            "t/*/pq/grants",
+            "sys/pq-probe/*",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+        ],
+        // AdminWrite, then AdminProvCreate (create-only, provision adopt) and
+        // AdminProvCas (CAS-only, provision reshard).
+        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
+        deletes: ADMIN_SCRATCH_DELETES,
+        // Narrower than the Deny, which names both operations. Legitimate, and
+        // the reason the overlap property is asserted as containment rather than
+        // equality: admin's delete grant and its Deny cover no key in common, and
+        // where they did, a Deny naming MORE than the Allow grants is safe.
+        // One entry per statement: AdminQualifyDelete, then AdminProbeDelete.
+        delete_actions: &["s3:DeleteObject", "s3:DeleteObject"],
+        protected_deletes: PROTECTED_DELETE_KEYS,
+        protected_delete_actions: PROTECTED_DELETE_ACTIONS,
+        kms_actions: &["kms:Decrypt"],
+        kms_resources: &[("AdminTenantKms", &[TENANT_KMS_KEY_ARN])],
+    },
+];
+
+/// Compare one axis's derived set (key patterns, `s3:prefix` values or action
+/// strings) against the expected set, by exact equality and in order.
+fn assert_axis_eq(role: &str, axis: &str, actual: &[String], expected: &[&str]) {
+    let expected: Vec<String> = expected.iter().map(|p| (*p).to_string()).collect();
+    assert_eq!(
+        actual,
+        expected.as_slice(),
+        "{role}: the effective {axis} set is not the set this test \
+         expects. Every axis is pinned by exact equality, so a widened, dropped, \
+         reordered or Effect-flipped statement fails here rather than passing a \
+         one-sided \"does some pattern do X?\" check. If the template change is \
+         intended, update EXPECTED_PATTERNS in the same commit (issue #1346, \
+         hole eleven)"
+    );
+}
+
+/// Every role's grant surface, per axis, by exact equality against
+/// `EXPECTED_PATTERNS`: the key patterns and the action strings, both sides of
+/// every statement. The Allow and Deny sides are asserted separately: glob
+/// difference is not a glob, so a single "effective" set would have to
+/// approximate the subtraction, and the overlap that makes the two sides unsafe
+/// to read as independent is measured and covered by its own properties below.
+#[test]
+fn every_role_grants_exactly_the_expected_pattern_set() {
+    let mut covered: Vec<&str> = EXPECTED_PATTERNS.iter().map(|e| e.role).collect();
+    covered.sort_unstable();
+    let mut all_roles: Vec<&str> = ALL_ROLES.to_vec();
+    all_roles.sort_unstable();
+    assert_eq!(
+        covered, all_roles,
+        "EXPECTED_PATTERNS must carry exactly one row per guarded role, or a \
+         template would ship with no exact-equality assertion over it"
+    );
+
+    for expected in &EXPECTED_PATTERNS {
+        let role = expected.role;
+        let policy = load_policy(role);
+
+        assert_axis_eq(
+            role,
+            "s3:prefix Allow",
+            &list_prefix_patterns(&policy, Some("Allow")),
+            expected.list_prefixes,
+        );
+        assert_axis_eq(
+            role,
+            "s3:prefix Deny",
+            &list_prefix_patterns(&policy, Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
+            "list action Allow",
+            &actions_for(&policy, &S3_BUCKET_OPERATIONS, Some("Allow")),
+            expected.list_actions,
+        );
+        assert_axis_eq(
+            role,
+            "list action Deny",
+            &actions_for(&policy, &S3_BUCKET_OPERATIONS, Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
+            "s3:GetObject Allow",
+            &key_patterns_for(&policy, &["s3:GetObject"], Some("Allow")),
+            expected.gets,
+        );
+        assert_axis_eq(
+            role,
+            "s3:GetObject Deny",
+            &key_patterns_for(&policy, &["s3:GetObject"], Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
+            "get action Allow",
+            &actions_for(&policy, &["s3:GetObject"], Some("Allow")),
+            expected.get_actions,
+        );
+        assert_axis_eq(
+            role,
+            "get action Deny",
+            &actions_for(&policy, &["s3:GetObject"], Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
+            "s3:PutObject Allow",
+            &put_resource_key_patterns(&policy),
+            expected.puts,
+        );
+        assert_axis_eq(
+            role,
+            "s3:PutObject Deny",
+            &key_patterns_for(&policy, &["s3:PutObject"], Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
+            "put action Allow",
+            &actions_for(&policy, &["s3:PutObject"], Some("Allow")),
+            expected.put_actions,
+        );
+        assert_axis_eq(
+            role,
+            "put action Deny",
+            &actions_for(&policy, &["s3:PutObject"], Some("Deny")),
+            &[],
+        );
+        assert_axis_eq(
+            role,
+            "delete Allow",
+            &delete_key_patterns(&policy, "Allow"),
+            expected.deletes,
+        );
+        assert_axis_eq(
+            role,
+            "delete Deny",
+            &delete_key_patterns(&policy, "Deny"),
+            expected.protected_deletes,
+        );
+        assert_axis_eq(
+            role,
+            "delete action Allow",
+            &actions_for(&policy, &S3_DELETE_OPERATIONS, Some("Allow")),
+            expected.delete_actions,
+        );
+        assert_axis_eq(
+            role,
+            "delete action Deny",
+            &actions_for(&policy, &S3_DELETE_OPERATIONS, Some("Deny")),
+            expected.protected_delete_actions,
+        );
+        assert_axis_eq(
+            role,
+            "KMS action",
+            &kms_actions(&policy),
+            expected.kms_actions,
+        );
+
+        let expected_kms: Vec<(String, Vec<String>)> = expected
+            .kms_resources
+            .iter()
+            .map(|(sid, resources)| {
+                (
+                    (*sid).to_string(),
+                    resources.iter().map(|r| (*r).to_string()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kms_statement_resources(&policy),
+            expected_kms,
+            "{role}: the Allow KMS statements (Sid and key ARNs) are not the set \
+             this test expects (issue #1346, hole eleven)"
+        );
+    }
+}
+
+/// A Deny must be a Deny. Every `Deny` statement in every shipped template is
+/// the single `DenyDeleteProtected` block, and every action it names grants a
+/// delete operation and NOTHING else: no read, no write, no list, no KMS.
+///
+/// This is what makes the round-six availability-drift argument checkable
+/// instead of a claim about templates nobody asserted on. That argument says a
+/// `Deny` withdrawing a granted capability while a positive guard stays green is
+/// acceptable BECAUSE no shipped `Deny` withdraws a KMS or Put capability. The
+/// premise is a property of the four JSON files, so it belongs in an assertion:
+/// a `Deny kms:GenerateDataKey` or a `Deny s3:PutObject` added to any template
+/// fails here, and the argument's precondition is re-checked on every run rather
+/// than remembered from a commit message.
+#[test]
+fn every_shipped_deny_is_a_delete_only_prohibition() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let denies: Vec<&serde_json::Value> = policy_statements(&policy)
+            .iter()
+            .filter(|stmt| {
+                stmt["Effect"]
+                    .as_str()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("Deny"))
+            })
+            .collect();
+        assert_eq!(
+            denies.len(),
+            1,
+            "{role}: expected exactly one Deny statement (DenyDeleteProtected). \
+             Zero means the protected-delete block was deleted or its Effect \
+             flipped to Allow; more than one means a prohibition this file's \
+             guards have not been reasoned about was added (issue #1346, hole \
+             eleven)"
+        );
+        for stmt in denies {
+            let sid = statement_sid(stmt);
+            assert_eq!(
+                sid, "DenyDeleteProtected",
+                "{role}: the only Deny statement must be DenyDeleteProtected"
+            );
+            for action in statement_actions(stmt) {
+                assert!(
+                    action_grants_any(&action, &S3_DELETE_OPERATIONS),
+                    "{role}/{sid}: Deny action {action:?} grants no delete \
+                     operation, so this block prohibits something other than \
+                     deletion"
+                );
+                for operation in ["s3:GetObject", "s3:PutObject"] {
+                    assert!(
+                        !action_grants(&action, operation),
+                        "{role}/{sid}: Deny action {action:?} also withdraws \
+                         {operation} -- a Deny that withdraws a capability a \
+                         positive guard asserts is HELD is the availability-drift \
+                         case those guards do not subtract, so it must not ship"
+                    );
+                }
+                assert!(
+                    !action_grants_any(&action, &S3_BUCKET_OPERATIONS),
+                    "{role}/{sid}: Deny action {action:?} also withdraws \
+                     s3:ListBucket, which the discovery guard reads as held"
+                );
+                assert!(
+                    !action_selects_kms(&action),
+                    "{role}/{sid}: Deny action {action:?} also withdraws a KMS \
+                     operation, which write_roles_have_kms_generate_data_key and \
+                     roles_writing_routed_objects_have_kms_grant read as held"
+                );
+            }
+        }
+    }
+}
+
+/// Where a delete `Deny` and a delete `Allow` in the same policy cover the same
+/// key, exactly. `(Deny pattern, Allow pattern)` pairs, per role, sorted and
+/// deduplicated, witnessed by at least one key in `key_domain()`.
+///
+/// This is the ONE normative home in this file for the Deny-override fact; other
+/// helpers point here rather than restate it. An explicit IAM `Deny` overrides an
+/// `Allow` only for the operations it NAMES, so a delete `Deny` and a delete
+/// `Allow` can cover the same key and the effective capability is still correct.
+/// The shipped overlap is maintain's: its level-based delete grants reach the
+/// legal-hold audit shard, because an `Signal::Audit` shard-0 key is spelled
+/// `t/<hash>/u/{l0,c,l1}/0000/...`, so `t/*/*/l0/*` and `t/*/u/*/0000/*` both
+/// match it. That is ADR-0055 section 3 protection working, not a template bug.
+/// What is wrong is reading the `Allow` set alone as the delete capability the
+/// role HOLDS -- for these four pattern pairs it overstates. The fourth is the
+/// `maint/*` grant for the unnamed-since markers (ADR-1133): `*` spans `/`, so
+/// `t/<hash>/u/maint/unn/0000/...`, an audit shard-0 marker, matches the Deny
+/// too, and its delete is refused like every other key of that shard.
+///
+/// Pinning the overlap rather than asserting it away fails in both directions: a
+/// new overlap (a widened delete grant reaching a protected keyspace) and a
+/// vanished one (the audit-hold protection dropped, or a level grant narrowed)
+/// each change this table.
+const EXPECTED_DELETE_OVERLAPS: &[(&str, &[(&str, &str)])] = &[
+    ("gateway", &[]),
+    ("query", &[]),
+    // The ADR-0055 section 3 legal-hold shard, protected out of the three
+    // level-based grants compaction otherwise deletes, and out of the
+    // unnamed-since marker grant.
+    (
+        "maintain",
+        &[
+            ("t/*/u/*/0000/*", "t/*/*/c/*"),
+            ("t/*/u/*/0000/*", "t/*/*/l0/*"),
+            ("t/*/u/*/0000/*", "t/*/*/l1/*"),
+            ("t/*/u/*/0000/*", "t/*/*/maint/*"),
+        ],
+    ),
+    ("admin", &[]),
+];
+
+/// The other half of the round-six premise, corrected: measure where the shipped
+/// delete `Deny` and delete `Allow` sets cover the same key and pin the result
+/// against `EXPECTED_DELETE_OVERLAPS`, instead of claiming a disjointness that
+/// does not hold.
+///
+/// The measurement is OVER `key_domain()`, not over all strings, and the
+/// narrowing is necessary rather than convenient: as globs, maintain's delete
+/// grant `t/*/*/c/*` and its protected pattern `t/*/catalog/*/*` intersect,
+/// because IAM's `*` spans `/` (witness `t/a/catalog/b/c/d`, asserted below), yet
+/// no key any constructor emits lies in that intersection. An all-strings
+/// comparison would report an overlap that cannot occur while saying nothing
+/// about the one that does.
+#[test]
+fn delete_deny_and_allow_overlap_exactly_where_expected() {
+    // Observation 0: the narrowing to real keys is load-bearing, not cosmetic.
+    let glob_witness = "t/a/catalog/b/c/d";
+    assert!(
+        glob_matches("t/*/*/c/*", glob_witness) && glob_matches("t/*/catalog/*/*", glob_witness),
+        "fixture invalid: these two shipped maintain patterns were expected to \
+         intersect as globs, which is why disjointness is asserted over real keys"
+    );
+    assert!(
+        !key_domain().iter().any(|k| k.as_str() == glob_witness),
+        "fixture invalid: the glob-intersection witness must not be a key any \
+         constructor produces, or the templates really would be wrong"
+    );
+
+    let mut covered: Vec<&str> = EXPECTED_DELETE_OVERLAPS.iter().map(|(r, _)| *r).collect();
+    covered.sort_unstable();
+    let mut all_roles: Vec<&str> = ALL_ROLES.to_vec();
+    all_roles.sort_unstable();
+    assert_eq!(
+        covered, all_roles,
+        "EXPECTED_DELETE_OVERLAPS must carry exactly one row per guarded role"
+    );
+
+    for (role, expected) in EXPECTED_DELETE_OVERLAPS.iter().copied() {
+        let policy = load_policy(role);
+        let granted = delete_key_patterns(&policy, "Allow");
+        let protected = delete_key_patterns(&policy, "Deny");
+        assert!(
+            !protected.is_empty(),
+            "{role}: no delete-protected patterns -- this measurement would report \
+             an empty overlap having examined nothing"
+        );
+
+        // Anti-vacuity, per pattern rather than ANY. The guard this replaces was
+        // `protected_keys > 0` -- an ANY over the whole protected set that
+        // `sys/tenancy` alone satisfied, while its message claimed the stronger
+        // per-keyspace thing. Under it two of maintain's six protected patterns
+        // (`t/*/*/prov`, `t/*/catalog/*/*`) matched ZERO keys in the domain, so
+        // the overlap below examined nothing for those keyspaces and still
+        // reported the pinned overlap set as complete. Refusing each pattern by
+        // name fails closed on any protected or granted keyspace the domain does
+        // not model.
+        for pattern in &protected {
+            assert_pattern_is_witnessed(role, "delete Deny (protected)", pattern);
+        }
+        for pattern in &granted {
+            assert_pattern_is_witnessed(role, "delete Allow", pattern);
+        }
+
+        let mut overlaps: Vec<(&str, &str)> = Vec::new();
+        for key in key_domain() {
+            let denied: Vec<&String> = protected
+                .iter()
+                .filter(|p| glob_matches(p.as_str(), key))
+                .collect();
+            if denied.is_empty() {
+                continue;
+            }
+            for deny in denied {
+                for allow in granted.iter().filter(|p| glob_matches(p.as_str(), key)) {
+                    overlaps.push((deny.as_str(), allow.as_str()));
+                }
+            }
+        }
+        overlaps.sort_unstable();
+        overlaps.dedup();
+        assert_eq!(
+            overlaps.as_slice(),
+            expected,
+            "{role}: the delete Deny/Allow overlap is not the one \
+             EXPECTED_DELETE_OVERLAPS records. A new pair means a delete grant \
+             now reaches a protected keyspace (safe in AWS, since the explicit \
+             Deny wins, but the Allow set overstates the capability by that much \
+             and every guard reading it must account for the difference); a \
+             missing pair means a protection or a grant was narrowed"
+        );
+    }
+}
+
+/// Every object-key pattern the two overlap mechanisms read -- the delete
+/// protected `Deny` set, and every get/put/delete `Allow` set (the
+/// `OBJECT_OVERLAP_AXES` the containment/pin test enumerates) -- must be
+/// witnessed by at least one key in `key_domain()`. A pattern with no witness is
+/// invisible to both enumerations: they report no overlap for its keyspace having
+/// examined nothing.
+///
+/// This is the standalone form of the per-pattern refusal the delete-overlap and
+/// containment tests apply inline, and it fails closed on a keyspace the domain
+/// stops modelling: delete the `t/.../m/prov` witness, or add a template grant
+/// over a keyspace no constructor and no witness produces, and this test names
+/// the pattern rather than letting the measurement pass vacuously.
+#[test]
+fn every_overlap_pattern_has_a_domain_witness() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        for pattern in &delete_key_patterns(&policy, "Deny") {
+            assert_pattern_is_witnessed(role, "delete Deny (protected)", pattern);
+        }
+        for (axis, operations) in OBJECT_OVERLAP_AXES {
+            for stmt in axis_statements(&policy, operations, "Allow") {
+                for pattern in &stmt.patterns {
+                    assert_pattern_is_witnessed(role, &format!("{axis} Allow"), pattern);
+                }
+            }
+        }
+    }
+}
+
+/// `ALL_SIGNALS` is every `Signal`, and each one's `key_prefix()` is the letter
+/// this file's key shapes are written against. The `match` is the mechanism: a
+/// new variant makes this fail to compile, so `ALL_SIGNALS` -- and with it
+/// `representative_keys` and the derived constructor-free witness set -- cannot
+/// go silently short one signal.
+///
+/// The letters matter, not only the count. A delete grant can name the signal
+/// segment literally: maintain's `t/*/*/c/*` does. So whether a catalog witness
+/// `t/<hash>/catalog/<prefix>/HEAD` is reached by a delete `Allow` depends on
+/// which letters exist, and `no_delete_allow_reaches_the_disjoint_protected_keyspaces`
+/// is green partly because no prefix is `c`. Pinning the six letters here makes
+/// that a checked fact instead of an unstated one; if a prefix ever becomes `c`,
+/// that test starts reporting a delete grant reaching a protected keyspace,
+/// which is a template and ADR finding, not an assertion to weaken.
+#[test]
+fn all_signals_is_exhaustive_and_witnessed() {
+    for signal in ALL_SIGNALS {
+        let expected_prefix = match signal {
+            Signal::Metrics => "m",
+            Signal::Logs => "l",
+            Signal::Spans => "s",
+            Signal::Profiles => "p",
+            Signal::Alerts => "a",
+            Signal::Audit => "u",
+        };
+        assert_eq!(
+            signal.key_prefix(),
+            expected_prefix,
+            "{signal:?}: key_prefix() changed. The physical key prefixes are part \
+             of the frozen object-layout contract (docs/catalog-and-mvcc.md), and \
+             both the witness keys and the signal-segment delete patterns in this \
+             file are written against these letters"
+        );
+    }
+
+    let witnesses = constructor_free_tenant_witness_keys();
+    let hash = hash16();
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        for shape in [
+            format!("t/{hash}/catalog/{prefix}/HEAD"),
+            format!("t/{}/{prefix}/prov", test_tenant().to_hex()),
+            format!("t/{hash}/{prefix}/idem/{hash}"),
+            format!("t/{hash}/{prefix}/admission/writer-0"),
+        ] {
+            assert!(
+                witnesses.contains(&shape),
+                "{signal:?}: the constructor-free witness set carries no {shape:?}, \
+                 so a delete grant naming the {prefix:?} signal segment literally \
+                 would be measured against no key in that keyspace"
+            );
+        }
+    }
+}
+
+/// ADR-0055 section 2 says the protected keyspaces `sys/`, `prov` and `catalog/`
+/// "hold for a different reason than" the legal-hold shard: they are disjoint
+/// from every delete grant, so their `Deny` is belt-and-suspenders, while the
+/// legal-hold shard `t/*/u/*/0000/*` IS reached by maintain's level-based delete
+/// grants and holds only because the explicit `Deny` overrides them. As of
+/// issue #1847 that is no longer true of the whole `catalog/` family: Maintain's
+/// `MaintainDelete` now reaches the `snap/` and `idx/` objects under it too (the
+/// catalog sweep, `sweep_unreferenced_catalog_objects`, removes them once
+/// unreferenced), so only the HEAD pointer within `catalog/` still holds by
+/// disjointness -- the rest of the family joins the legal-hold shard's category.
+/// This test now backs the narrower claim: no delete `Allow` pattern in any
+/// template matches a witness key of `sys/`, `prov`, or `catalog/<sig>/HEAD`.
+///
+/// Scoped to DELETE on purpose. The ADR sentence is about delete capability;
+/// get and put legitimately reach catalog and prov (fold reads and writes catalog
+/// objects, the log-segment writer writes prov), so an all-axes version would be
+/// false and would say nothing about the delete protection the sentence
+/// describes. `sys/qualify/*` (admin's delete scratch) is a DIFFERENT sys key
+/// than the three protected ones, so the disjoint set is defined from the
+/// protected patterns, not from the `sys/` prefix.
+///
+/// If this fails, a delete grant reaches one of the disjoint keyspaces: that is
+/// a template finding to report, not an assertion to weaken.
+#[test]
+fn no_delete_allow_reaches_the_disjoint_protected_keyspaces() {
+    // The protected keyspaces that hold by pattern disjointness: every
+    // PROTECTED_DELETE_KEYS entry EXCEPT the legal-hold shard (held by the
+    // Deny overriding level-based grants that reach it) and EXCEPT the
+    // catalog family, narrowed here to the HEAD pointer alone. Maintain's own
+    // delete Allow now reaches the snap/ and idx/ objects under that family
+    // (`MaintainDelete`, issue #1847), so the family joins the legal-hold
+    // shard's category -- held only where the Deny overrides an Allow, not by
+    // disjointness -- except HEAD itself, which no Allow in any template
+    // reaches, so it stays in the disjoint set under its narrower pattern.
+    const DISJOINT_PROTECTED: &[&str] = &[
+        "sys/tenancy",
+        "sys/qualification",
+        "sys/gc",
+        "t/*/*/prov",
+        "t/*/catalog/*/HEAD",
+        "sys/auth",
+        "sys/t/*",
+        "t/*/enc",
+        "t/*/pq/grants",
+    ];
+    // Pin DISJOINT_PROTECTED to its own definition so it cannot drift from the
+    // protected list it is carved out of. It must be exactly
+    // PROTECTED_DELETE_KEYS minus the legal-hold shard, with the catalog
+    // family pattern narrowed to HEAD alone (the same narrowing
+    // MAINTAIN_PROTECTED_DELETE_KEYS carries on the Deny side; this derives
+    // it from the shared PROTECTED_DELETE_KEYS instead so either constant
+    // drifting, or a new protected keyspace being added, is caught here too).
+    // Nothing else asserts this relationship, so a new protected keyspace
+    // could otherwise be added with every other assertion green and its
+    // disjointness from delete grants never checked.
+    const LEGAL_HOLD_SHARD: &str = "t/*/u/*/0000/*";
+    const CATALOG_FAMILY: &str = "t/*/catalog/*/*";
+    const CATALOG_HEAD_ONLY: &str = "t/*/catalog/*/HEAD";
+    assert!(
+        PROTECTED_DELETE_KEYS.contains(&LEGAL_HOLD_SHARD),
+        "legal-hold shard {LEGAL_HOLD_SHARD:?} is not in PROTECTED_DELETE_KEYS; \
+         the disjoint set is defined as PROTECTED_DELETE_KEYS minus that shard \
+         and must track a rename (#1346)"
+    );
+    assert!(
+        PROTECTED_DELETE_KEYS.contains(&CATALOG_FAMILY),
+        "catalog family {CATALOG_FAMILY:?} is not in PROTECTED_DELETE_KEYS; the \
+         disjoint set narrows it to {CATALOG_HEAD_ONLY:?} and must track a \
+         rename (#1847)"
+    );
+    let expected_disjoint: Vec<&str> = PROTECTED_DELETE_KEYS
+        .iter()
+        .copied()
+        .filter(|p| *p != LEGAL_HOLD_SHARD)
+        .map(|p| {
+            if p == CATALOG_FAMILY {
+                CATALOG_HEAD_ONLY
+            } else {
+                p
+            }
+        })
+        .collect();
+    assert_eq!(
+        DISJOINT_PROTECTED,
+        expected_disjoint.as_slice(),
+        "DISJOINT_PROTECTED must equal PROTECTED_DELETE_KEYS minus the legal-hold \
+         shard {LEGAL_HOLD_SHARD:?}, with the catalog family narrowed to \
+         {CATALOG_HEAD_ONLY:?}. If a protected keyspace was added to \
+         PROTECTED_DELETE_KEYS, add it here so its disjointness from delete \
+         grants is checked; if one must be excluded or narrowed for a reason \
+         other than the two above, do so explicitly and justify it (#1346, #1847)"
+    );
+    let disjoint_witnesses: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| {
+            DISJOINT_PROTECTED
+                .iter()
+                .any(|p| glob_matches(p, k.as_str()))
+        })
+        .collect();
+    // Each disjoint keyspace must be witnessed, or its disjointness is asserted
+    // over a keyspace the domain models no key for -- the gap this round fixes:
+    // prov and catalog had zero witnesses.
+    for pattern in DISJOINT_PROTECTED {
+        assert!(
+            disjoint_witnesses
+                .iter()
+                .any(|k| glob_matches(pattern, k.as_str())),
+            "domain models no key for protected keyspace {pattern:?}, so its \
+             disjointness from delete grants cannot be checked"
+        );
+    }
+
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        for allow in &delete_key_patterns(&policy, "Allow") {
+            for witness in &disjoint_witnesses {
+                assert!(
+                    !glob_matches(allow, witness.as_str()),
+                    "{role}: delete Allow {allow:?} reaches {witness:?}, a key of \
+                     the sys/, prov or catalog/ keyspaces ADR-0055 section 2 calls \
+                     disjoint from every delete grant (they hold WITHOUT relying on \
+                     the Deny, unlike the legal-hold shard). Either that ADR \
+                     sentence is wrong or a template grants a delete it must not -- \
+                     report it, do not weaken this assertion (#1346)"
+                );
+            }
+        }
+    }
+}
+
+/// Issue #1847 pinning test. `DenyDeleteProtected` in `maintain.json`
+/// protects only the catalog HEAD pointer, and `MaintainDelete` grants
+/// delete on the `snap/` and `idx/` objects
+/// `sweep_unreferenced_catalog_objects` (`crates/ravel-maintain/src/sweep.rs`)
+/// actually removes. Before this issue `DenyDeleteProtected` named the whole
+/// `t/*/catalog/*/*` family, so the sweep's own delete was refused on its
+/// first attempt every pass and catalog garbage was never reclaimed.
+///
+/// Both directions are asserted for both object families, so a regression to
+/// either prior defect shape fails here: dropping the catalog entry from
+/// `DenyDeleteProtected` entirely fails the `head_key` DENY assertion below,
+/// not the Allow one. HEAD does not actually become deletable in that state,
+/// because no `MaintainDelete` pattern reaches a `.../HEAD` key and IAM is
+/// default-deny; what is lost is the explicit protection, which is what the
+/// Deny assertion exists to hold. Re-widening the Deny back to the
+/// whole family, or to any pattern that still reaches HEAD, makes the
+/// `head_key` Deny assertion pass but the `snap_key`/`idx_key` Deny
+/// assertions fail (a Deny reaching a key the sweep must delete is exactly
+/// the original bug). A narrowing that widens `MaintainDelete` no further
+/// than `snap/`/`idx/` is checked by the closing tightness assertion, against
+/// a key directly under `catalog/<signal>/` that is neither HEAD nor under
+/// `snap/` or `idx/`.
+///
+/// The key shapes are mirrored from the crate's own constructors rather than
+/// imported, following the precedent `constructor_free_tenant_witness_keys`
+/// above establishes: `ravel-commit` cannot depend on `ravel-catalog` or
+/// `ravel-maintain` without circularity, and the builders are not exported
+/// (`pub(crate)`/private). The shapes come from
+/// `crates/ravel-catalog/src/fold.rs`'s `head_object_key` (duplicated as
+/// `catalog_head_key` in `crates/ravel-maintain/src/reachability.rs`) and
+/// `crates/ravel-maintain/src/sweep.rs`'s `catalog_snap_prefix` /
+/// `catalog_idx_prefix`, all of which build
+/// `t/<tenant_hash_hex>/catalog/<signal>/...`.
+///
+/// The PREFIX is mirrored; the two witness filenames are not. Real keys are
+/// `snap/<hour>.<hash16>.csnap` and `idx/<hour>.<hash16>.{npost,cstat}`
+/// (`crates/ravel-catalog/src/fold.rs`), while the witnesses are
+/// `snap/0000000000000000.csnap` and `idx/name-postings`. That is
+/// immaterial to every pattern here, which all end in `snap/*` or `idx/*`,
+/// but a future tightening to something like `idx/*.cstat` would read as
+/// unreachable against a witness no constructor can produce. Tighten the
+/// witnesses first if that day comes.
+#[test]
+fn maintain_deletes_catalog_snap_and_idx_but_not_head() {
+    let hash = hash16();
+    let policy = load_policy("maintain");
+    let allow = delete_key_patterns(&policy, "Allow");
+    let deny = delete_key_patterns(&policy, "Deny");
+
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        let head_key = format!("t/{hash}/catalog/{prefix}/HEAD");
+        let snap_key = format!("t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap");
+        let idx_key = format!("t/{hash}/catalog/{prefix}/idx/name-postings");
+
+        assert!(
+            deny.iter().any(|p| glob_matches(p, &head_key)),
+            "{signal:?}: maintain's DenyDeleteProtected must still deny \
+             {head_key:?} -- the catalog HEAD pointer, the object the sweep \
+             never deletes"
+        );
+        assert!(
+            !allow.iter().any(|p| glob_matches(p, &head_key)),
+            "{signal:?}: maintain's MaintainDelete must not grant delete on \
+             {head_key:?} -- the sweep never deletes HEAD, so no Allow \
+             pattern should reach it"
+        );
+
+        assert!(
+            allow.iter().any(|p| glob_matches(p, &snap_key)),
+            "{signal:?}: maintain's MaintainDelete must grant delete on \
+             {snap_key:?} -- sweep_unreferenced_catalog_objects deletes \
+             unreferenced snap/ objects and needs this to succeed"
+        );
+        assert!(
+            !deny.iter().any(|p| glob_matches(p, &snap_key)),
+            "{signal:?}: maintain's DenyDeleteProtected must not deny \
+             {snap_key:?} -- a Deny reaching it would refuse the sweep's own \
+             delete, issue #1847's exact defect"
+        );
+
+        assert!(
+            allow.iter().any(|p| glob_matches(p, &idx_key)),
+            "{signal:?}: maintain's MaintainDelete must grant delete on \
+             {idx_key:?} -- sweep_unreferenced_catalog_objects deletes \
+             unreferenced idx/ objects (including .cstat) and needs this to \
+             succeed"
+        );
+        assert!(
+            !deny.iter().any(|p| glob_matches(p, &idx_key)),
+            "{signal:?}: maintain's DenyDeleteProtected must not deny \
+             {idx_key:?} -- a Deny reaching it would refuse the sweep's own \
+             delete, issue #1847's exact defect"
+        );
+    }
+
+    // Tightness: MaintainDelete's new grant must not reach anything directly
+    // under catalog/<signal>/ other than HEAD (already checked above), snap/,
+    // and idx/. A witness that is none of those three would only be reached
+    // by an over-broad narrowing, e.g. one that (re)used t/*/catalog/*/* for
+    // the Allow side instead of the two scoped patterns.
+    let prefix = Signal::Metrics.key_prefix();
+    let other_catalog_object = format!("t/{hash}/catalog/{prefix}/other-object");
+    assert!(
+        !allow.iter().any(|p| glob_matches(p, &other_catalog_object)),
+        "maintain's delete Allow set reaches {other_catalog_object:?}, a key \
+         directly under catalog/<signal>/ that is neither HEAD, snap/, nor \
+         idx/ -- MaintainDelete's catalog grant is wider than the sweep needs"
+    );
+}
+
+/// Every object-store call `sweep_unreferenced_catalog_objects`
+/// (`crates/ravel-maintain/src/sweep.rs`) makes must be reachable under the
+/// shipped Maintain template, and nothing wider than those calls need may
+/// reach it.
+///
+/// This is the same failure shape `maintain_template_covers_every_erasure_request_sweep_call`
+/// exists for, and it shipped here regardless: `MaintainDelete` grants delete
+/// on `snap/` and `idx/` keys (`maintain_deletes_catalog_snap_and_idx_but_not_head`
+/// pins that), but neither `MaintainList` nor `MaintainRead` named anything
+/// under `catalog/` before this test existed, so the pass was refused with
+/// `AccessDenied` on its first `ListBucket` before it ever reached a delete
+/// (issue #1847, round two).
+///
+/// The sweep makes four object-store calls:
+///
+/// - `list_all(store, &catalog_snap_prefix(tenant, signal))` (one
+///   `s3:ListBucket` whose `prefix` parameter is
+///   `t/<tenant_hash>/catalog/<signal>/snap/`),
+/// - `list_all(store, &catalog_idx_prefix(tenant, signal))` (the same, for
+///   `t/<tenant_hash>/catalog/<signal>/idx/`),
+/// - `store.get(&catalog_head_key(tenant, signal), GetRange::Full)`, inside
+///   `read_head_reference`, called twice per pass (the reference read before
+///   the candidate scan, and the pre-delete re-verify) -- one `s3:GetObject`
+///   pattern covers both call sites,
+/// - `store.delete(&meta.key)` on each surviving candidate under `snap/` or
+///   `idx/`, already asserted in full by
+///   `maintain_deletes_catalog_snap_and_idx_but_not_head` and restated here so
+///   this test fails as a whole if the delete grant regresses alongside the
+///   list or read grants.
+#[test]
+fn maintain_template_covers_every_catalog_sweep_call() {
+    let hash = hash16();
+    let maintain = load_policy("maintain");
+
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let allow_deletes = delete_key_patterns(&maintain, "Allow");
+    let deny_deletes = delete_key_patterns(&maintain, "Deny");
+
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        let head_key = format!("t/{hash}/catalog/{prefix}/HEAD");
+
+        // Call 1: list_all(store, &catalog_snap_prefix(tenant, signal)).
+        let snap_prefix = format!("t/{hash}/catalog/{prefix}/snap/");
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &snap_prefix)),
+            "maintain: no ListBucket s3:prefix admits {snap_prefix:?}, the \
+             prefix sweep_unreferenced_catalog_objects passes to list_all for \
+             the snap/ family. The pass is refused with AccessDenied before it \
+             ever lists a snapshot part, so the snap/ delete grant is \
+             unreachable. s3:prefix values: {list_prefixes:?}"
+        );
+
+        // Call 2: list_all(store, &catalog_idx_prefix(tenant, signal)).
+        let idx_prefix = format!("t/{hash}/catalog/{prefix}/idx/");
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &idx_prefix)),
+            "maintain: no ListBucket s3:prefix admits {idx_prefix:?}, the \
+             prefix sweep_unreferenced_catalog_objects passes to list_all for \
+             the idx/ family. The pass is refused with AccessDenied before it \
+             ever lists a name-postings or column-stats object, so the idx/ \
+             delete grant is unreachable. s3:prefix values: {list_prefixes:?}"
+        );
+
+        // Call 3: store.get(&catalog_head_key(...)) in read_head_reference,
+        // called twice per pass.
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &head_key)),
+            "maintain: no GetObject Allow reaches {head_key:?}, which \
+             read_head_reference GETs to build the reference set every listed \
+             snap/idx object is checked against. Without it the sweep fails \
+             closed (or, before that fix, panics on a decode of nothing) on \
+             every (tenant, signal) before it can tell a live part from an \
+             orphan. Grants: {gets:?}"
+        );
+
+        // Call 4: store.delete on each surviving snap/ or idx/ candidate.
+        let snap_key = format!("t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap");
+        let idx_key = format!("t/{hash}/catalog/{prefix}/idx/name-postings");
+        assert!(
+            allow_deletes.iter().any(|p| glob_matches(p, &snap_key)),
+            "maintain: no delete Allow reaches {snap_key:?} -- \
+             sweep_unreferenced_catalog_objects deletes unreferenced snap/ \
+             objects and needs this to succeed"
+        );
+        assert!(
+            allow_deletes.iter().any(|p| glob_matches(p, &idx_key)),
+            "maintain: no delete Allow reaches {idx_key:?} -- \
+             sweep_unreferenced_catalog_objects deletes unreferenced idx/ \
+             objects and needs this to succeed"
+        );
+
+        // The HEAD pointer itself must stay undeletable: the sweep never
+        // deletes it, and the list/read grants above must not have disturbed
+        // that safety property.
+        assert!(
+            deny_deletes.iter().any(|p| glob_matches(p, &head_key)),
+            "maintain: DenyDeleteProtected no longer denies {head_key:?}, the \
+             catalog HEAD pointer"
+        );
+        assert!(
+            !allow_deletes.iter().any(|p| glob_matches(p, &head_key)),
+            "maintain: a delete Allow reaches {head_key:?}, the catalog HEAD \
+             pointer the sweep never deletes"
+        );
+    }
+
+    // Tightness (list and delete): every pattern that reaches the catalog
+    // snap/idx keyspace must reach no key outside
+    // t/*/catalog/<signal>/{snap,idx}/. A pattern such as t/*/catalog/*/*
+    // would pass every functional assertion above while granting far more
+    // than the four calls need.
+    let snap_idx_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .flat_map(|signal| {
+            let prefix = signal.key_prefix();
+            [
+                format!("t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap"),
+                format!("t/{hash}/catalog/{prefix}/idx/name-postings"),
+            ]
+        })
+        .collect();
+    let outside_snap_idx: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| !snap_idx_witnesses.contains(k))
+        .collect();
+    assert!(
+        !outside_snap_idx.is_empty(),
+        "the key domain models no key outside the catalog snap/idx keyspace, \
+         so the tightness assertion below examines nothing"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("delete Allow", &allow_deletes),
+    ] {
+        for pattern in patterns {
+            let reaches_catalog = snap_idx_witnesses.iter().any(|w| glob_matches(pattern, w));
+            if !reaches_catalog {
+                continue;
+            }
+            for key in &outside_snap_idx {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the catalog \
+                     snap/idx keyspace AND {key:?}, which lies outside it. The \
+                     sweep's list and delete calls need snap/ and idx/ and \
+                     nothing else -- a pattern spanning both is over-granted \
+                     (#1847)"
+                );
+            }
+        }
+    }
+
+    // Reachability (read): Maintain-mode processes read THREE catalog shapes.
+    //
+    // - HEAD, by `read_head_reference`.
+    // - `snap/` parts, by `SnapshotReachability::ensure_part`
+    //   (crates/ravel-maintain/src/reachability.rs). Its error arm returns
+    //   `MaintainError::Store` on anything that is not `NotFound`, so an
+    //   AccessDenied there aborts the whole pass for that signal rather than
+    //   failing one object -- which is what a HEAD-only read grant produced.
+    // - `idx/` objects, by the scrub tick's `load_covering_postings`
+    //   (crates/ravel-catalog/src/covering_postings.rs). Since #1964 a
+    //   non-`NotFound` failure there returns `Err` and disables the postings
+    //   tier for the tick loudly; `NotFound` still degrades to `Ok(None)`.
+    //   `fold_inner`'s `.cstat`/`.npost` reuse GETs read the same keyspace,
+    //   and since ADR-1693 they run under this credential too: the scheduled
+    //   fold runs in `Mode::Maintain`
+    //   (`maintain_template_covers_the_scheduled_fold_catalog_writes`).
+    //
+    // The third shape is why this assertion had to exist BEFORE that fix, and
+    // why the grant was derived rather than observed: until #1964 a missing
+    // grant on `idx/` looked exactly like an empty catalog plus a permanent
+    // cost regression, and nothing in the running system said otherwise. The
+    // assertion stays because deriving the grant is still the only thing that
+    // keeps it correct -- a surfaced error tells an operator the grant is
+    // missing, it does not put it back.
+    let head_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{hash}/catalog/{}/HEAD", signal.key_prefix()))
+        .collect();
+    let part_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|signal| {
+            format!(
+                "t/{hash}/catalog/{}/snap/0000000000000000.csnap",
+                signal.key_prefix()
+            )
+        })
+        .collect();
+    let idx_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{hash}/catalog/{}/idx/name-postings", signal.key_prefix()))
+        .collect();
+    for witness in head_witnesses
+        .iter()
+        .chain(part_witnesses.iter())
+        .chain(idx_witnesses.iter())
+    {
+        assert!(
+            gets.iter().any(|p| glob_matches(p, witness)),
+            "maintain: no GetObject Allow reaches {witness:?}. Maintain-mode \
+             processes GET the HEAD, every snapshot part it names, and the \
+             idx/ objects the scrub tick's load_covering_postings reads. \
+             A grant covering only some of the three either aborts the pass \
+             or, for idx/, degrades silently (#1847)"
+        );
+    }
+
+    // Tightness (read): a catalog read pattern may reach HEAD, snapshot parts
+    // and idx/ objects, and nothing else.
+    let readable: Vec<&String> = head_witnesses
+        .iter()
+        .chain(part_witnesses.iter())
+        .chain(idx_witnesses.iter())
+        .collect();
+    let outside_head: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| !readable.contains(k))
+        .collect();
+    assert!(
+        !outside_head.is_empty(),
+        "the key domain models no key outside the catalog read keyspace, so \
+         the tightness assertion below examines nothing"
+    );
+    // One pre-existing grant reaches a HEAD witness incidentally rather than
+    // by naming the catalog keyspace: `Signal::Audit::key_prefix()` is "u", so
+    // `t/<hash>/catalog/u/HEAD` matches the audit read grant `t/*/u/*`,
+    // because IAM's `*` spans `/`. That grant exists to read the audit
+    // keyspace and must keep reaching it, so demanding it reach nothing else
+    // is unsatisfiable. The tightness rule below is about the grant this
+    // change adds, so it applies to patterns that name the catalog keyspace
+    // literally -- and the incidental set is pinned immediately after, so a
+    // NEW over-broad pattern cannot hide in the same exemption.
+    let catalog_gets: Vec<String> = gets
+        .iter()
+        .filter(|p| p.contains("catalog/"))
+        .cloned()
+        .collect();
+    let incidental: Vec<String> = gets
+        .iter()
+        .filter(|p| !p.contains("catalog/"))
+        .filter(|p| head_witnesses.iter().any(|w| glob_matches(p.as_str(), w)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        incidental,
+        vec!["t/*/u/*".to_string()],
+        "exactly one non-catalog Maintain read pattern may reach a catalog \
+         HEAD witness, the audit keyspace grant t/*/u/* that collides with \
+         Signal::Audit's \"u\" prefix. Another one appearing here means a \
+         pattern reaches catalog HEAD keys without naming the catalog \
+         keyspace, which the tightness loop below would then not examine \
+         (#1847)"
+    );
+    for pattern in &catalog_gets {
+        let reaches_readable = readable.iter().any(|w| glob_matches(pattern, w.as_str()));
+        if !reaches_readable {
+            continue;
+        }
+        for key in &outside_head {
+            assert!(
+                !glob_matches(pattern, key),
+                "maintain: GetObject Allow pattern {pattern:?} reaches a \
+                 catalog key the sweep reads AND {key:?}, which it never \
+                 reads. The pass GETs HEAD and the snapshot parts HEAD names, \
+                 and nothing else -- not idx/, not anything outside the \
+                 catalog keyspace (#1847)"
+            );
+        }
+    }
+}
+
+/// Every object-store call the scheduled catalog fold makes must be reachable
+/// under the shipped Maintain template. Since ADR-1693 the scheduled fold runs
+/// on the maintain tier (`Mode::runs_scheduled_fold` in
+/// `services/ravel-server/src/config.rs` is true for `Maintain` and `All`
+/// only), so a per-role deployment runs `fold_inner`
+/// (`crates/ravel-catalog/src/fold.rs`) under this credential. Before issue
+/// #2382 `MaintainWrite` granted no catalog key, so every fold that advanced
+/// was refused at its first snapshot write and the catalog stopped moving.
+///
+/// The fold's calls, by `fold.rs` call site:
+///
+/// - `discover_bucket_listings`: `list_all` on `commit_shard_hour_prefix` for
+///   each (shard, hour) bucket, then GETs of the commit records it lists;
+/// - the HEAD read at the top of `fold_inner` (`head_object_key`) and the
+///   reuse-baseline GETs of the parts, `.cstat` and `.npost` objects the
+///   current HEAD names;
+/// - `part_object_key`: PUT `snap/<hour>.<hash16>.csnap`, `CreateIfAbsent`,
+///   any refusal other than `AlreadyExists` aborts the fold;
+/// - `column_stats_object_key`: PUT `idx/<hour>.<hash16>.cstat`,
+///   `CreateIfAbsent`, issued when typed columns are declared, a refusal
+///   aborts the fold;
+/// - `postings_object_key`: PUT `idx/<hour>.<hash16>.npost`,
+///   `CreateIfAbsent`, a refusal is tolerated (the HEAD omits the postings);
+/// - `head_object_key`: PUT `HEAD` with `CasVersion` or `CreateIfAbsent`.
+///
+/// The catalog keys are taken from `key_domain()`'s catalog witnesses
+/// (`constructor_free_tenant_witness_keys`), so a witness change moves this
+/// test with it. The witness filenames are not the fold's
+/// `<hour>.<hash16>.<ext>` shape; see
+/// `maintain_deletes_catalog_snap_and_idx_but_not_head` for why that is
+/// immaterial to patterns ending in `snap/*` and `idx/*`.
+#[test]
+fn maintain_template_covers_the_scheduled_fold_catalog_writes() {
+    let tenant = test_tenant();
+    let maintain = load_policy("maintain");
+
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deny_puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Deny"));
+    let deny_deletes = delete_key_patterns(&maintain, "Deny");
+
+    let catalog_witnesses: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| k.contains("/catalog/"))
+        .collect();
+
+    for signal in ALL_SIGNALS {
+        let prefix = signal.key_prefix();
+        let scope = format!("/catalog/{prefix}/");
+        let of_signal: Vec<&String> = catalog_witnesses
+            .iter()
+            .copied()
+            .filter(|k| k.contains(&scope))
+            .collect();
+        let head: Vec<&String> = of_signal
+            .iter()
+            .copied()
+            .filter(|k| k.ends_with("/HEAD"))
+            .collect();
+        let snap: Vec<&String> = of_signal
+            .iter()
+            .copied()
+            .filter(|k| k.contains("/snap/"))
+            .collect();
+        let idx: Vec<&String> = of_signal
+            .iter()
+            .copied()
+            .filter(|k| k.contains("/idx/"))
+            .collect();
+        for (shape, found) in [("HEAD", &head), ("snap/", &snap), ("idx/", &idx)] {
+            assert!(
+                !found.is_empty(),
+                "{signal:?}: key_domain() carries no catalog {shape} witness, \
+                 so the fold coverage below would examine nothing for it"
+            );
+        }
+
+        // discover_bucket_listings: list_all on each commit bucket prefix,
+        // then a GET per commit record.
+        let bucket_prefix = ravel_commit::keys::commit_shard_hour_prefix(&tenant, signal, 0, 0)
+            .expect("commit_shard_hour_prefix");
+        assert!(
+            list_prefixes
+                .iter()
+                .any(|p| glob_matches(p, &bucket_prefix)),
+            "maintain: no ListBucket s3:prefix admits {bucket_prefix:?}, the \
+             commit bucket prefix the scheduled fold lists. s3:prefix values: \
+             {list_prefixes:?}"
+        );
+        let record =
+            commit_key(&tenant, signal, 0, 0, Uuid::from_u128(1), 1, 1).expect("commit_key");
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &record)),
+            "maintain: no GetObject Allow reaches the commit record {record:?} \
+             the scheduled fold reads. Grants: {gets:?}"
+        );
+
+        // HEAD read, reuse-baseline reads, and the four PUTs.
+        for witness in head.iter().chain(snap.iter()).chain(idx.iter()) {
+            assert!(
+                gets.iter().any(|p| glob_matches(p, witness)),
+                "maintain: no GetObject Allow reaches {witness:?}, which the \
+                 scheduled fold reads (HEAD, or a part, .cstat or .npost the \
+                 HEAD names). Grants: {gets:?}"
+            );
+            assert!(
+                puts.iter().any(|p| glob_matches(p, witness)),
+                "maintain: no PutObject Allow reaches {witness:?}, which the \
+                 scheduled fold PUTs on the maintain tier (ADR-1693). Without \
+                 it the fold is refused at its first snapshot write and the \
+                 catalog stops advancing (issue #2382). Grants: {puts:?}"
+            );
+            assert!(
+                !deny_puts.iter().any(|p| glob_matches(p, witness)),
+                "maintain: a PutObject Deny reaches {witness:?} and cancels the \
+                 fold's write grant. Deny patterns: {deny_puts:?}"
+            );
+        }
+
+        // The HEAD stays protected against deletion: the new put grant must
+        // not have been paid for by narrowing DenyDeleteProtected.
+        for witness in &head {
+            assert!(
+                deny_deletes.iter().any(|p| glob_matches(p, witness)),
+                "maintain: DenyDeleteProtected no longer denies {witness:?}, \
+                 the catalog HEAD pointer the fold CAS-writes"
+            );
+        }
+    }
+
+    // A put pattern naming the catalog keyspace reaches no key outside it.
+    // This does not catch a pattern widened within catalog/ (say
+    // t/*/catalog/*/*); EXPECTED_PATTERNS pins the exact spellings for that.
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|k| !catalog_witnesses.contains(k))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside the catalog keyspace, so the \
+         tightness assertion below examines nothing"
+    );
+    let catalog_puts: Vec<&String> = puts.iter().filter(|p| p.contains("catalog/")).collect();
+    assert!(
+        !catalog_puts.is_empty(),
+        "maintain: no PutObject Allow names the catalog keyspace. Grants: {puts:?}"
+    );
+    for pattern in catalog_puts {
+        for key in &outside {
+            assert!(
+                !glob_matches(pattern, key),
+                "maintain: catalog PutObject pattern {pattern:?} also reaches \
+                 {key:?}, which the fold never writes"
+            );
+        }
+    }
+}
+
+/// ADR-0064 section 6: "Maintain gains delete on `del/*.dreq` **only**", and
+/// "`del/*.done` joins the deny-delete set for every role including Maintain".
+///
+/// The `.dreq` sweep in `crates/ravel-maintain/src/sweep.rs` retires a request
+/// object once its `.done` exists, its protection horizon has elapsed, and no
+/// legal hold or still-resolvable superseded input holds it; without this grant
+/// every such delete is refused and the query-time exclusion filter keeps the
+/// request forever. `every_role_grants_exactly_the_expected_pattern_set` pins
+/// the pattern STRING; this asserts what the pattern does to the two real key
+/// shapes `ravel-commit` builds under `del/`, which is the half that separates
+/// the ADR's narrow grant from a `del/*` one that would also reach the
+/// permanent completion records.
+#[test]
+fn maintain_template_grants_delete_on_erasure_requests() {
+    let tenant = test_tenant();
+    let request_id = Uuid::from_u128(2);
+    let maintain = load_policy("maintain");
+    let allows = delete_key_patterns(&maintain, "Allow");
+
+    for signal in ALL_SIGNALS {
+        let dreq = erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
+        assert!(
+            allows.iter().any(|p| glob_matches(p, &dreq)),
+            "maintain: no delete Allow reaches the erasure request {dreq:?}, so \
+             the .dreq sweep is refused on every request object (ADR-0064 §6). \
+             Grants: {allows:?}"
+        );
+
+        let done =
+            erasure_completion_key(&tenant, signal, request_id).expect("erasure_completion_key");
+        for allow in &allows {
+            assert!(
+                !glob_matches(allow, &done),
+                "maintain: delete Allow {allow:?} reaches the completion record \
+                 {done:?}. ADR-0064 §6 makes .done permanent erasure evidence and \
+                 grants delete on .dreq ONLY; widen neither the template nor this \
+                 assertion (#1849)"
+            );
+        }
+
+        let prefix = del_prefix(&tenant, signal);
+        for allow in &allows {
+            assert!(
+                !glob_matches(allow, &prefix),
+                "maintain: delete Allow {allow:?} reaches the del/ prefix object \
+                 {prefix:?}; the ADR grant covers request objects only (#1849)"
+            );
+        }
+    }
+
+    // "only" is a claim about the other three roles as well.
+    for role in ALL_ROLES {
+        if role == "maintain" {
+            continue;
+        }
+        let policy = load_policy(role);
+        for signal in ALL_SIGNALS {
+            let dreq =
+                erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
+            let done = erasure_completion_key(&tenant, signal, request_id)
+                .expect("erasure_completion_key");
+            for allow in &delete_key_patterns(&policy, "Allow") {
+                assert!(
+                    !glob_matches(allow, &dreq),
+                    "{role}: delete Allow {allow:?} reaches the erasure request \
+                     {dreq:?}; ADR-0064 §6 gives that grant to Maintain only (#1849)"
+                );
+                assert!(
+                    !glob_matches(allow, &done),
+                    "{role}: delete Allow {allow:?} reaches the completion record \
+                     {done:?}, which ADR-0064 §6 makes permanent for every role \
+                     (#1849)"
+                );
+            }
+        }
+    }
+}
+
+/// Every object-store call the erasure-request sweep makes on the `del/`
+/// prefix must be reachable under the shipped Maintain template, and nothing
+/// wider than those calls need may reach it.
+///
+/// The sweep is `sweep_erasure_requests` in
+/// `crates/ravel-maintain/src/sweep.rs`, and it touches `del/` three times:
+///
+/// - `let prefix = keys::del_prefix(tenant, signal); let objects =
+///   list_all(store, &prefix).await?` (one `s3:ListBucket` whose `prefix`
+///   parameter is `t/<tenant_hash>/<signal>/del/`),
+/// - `let got = store.get(&meta.key, GetRange::Full).await?` on each listed
+///   key that parses as an erasure completion (one `s3:GetObject` per
+///   `del/<request_id>.done`; this pass never reads a `.dreq` body, but
+///   another one does -- see
+///   `erasure_lifecycle_calls_outside_the_sweep_are_reachable`),
+/// - `store.delete(dreq_key).await?` (one `s3:DeleteObject` per
+///   `del/<request_id>.dreq`).
+///
+/// `maintain_template_grants_delete_on_erasure_requests` covers the third call
+/// alone. The delete is useless without the other two: IAM is default-deny and
+/// the pass is refused at the LIST before it ever reaches a delete, so a
+/// template carrying the delete and neither of the others grants an authority
+/// the operation cannot exercise. Each assertion below names the call whose
+/// argument it is built from, and each axis is also checked for TIGHTNESS: a
+/// pattern that reaches `del/` must reach no key outside it, so widening the
+/// `s3:prefix` to `t/*` or the Get resource to `t/*` fails here as well as
+/// against `every_role_grants_exactly_the_expected_pattern_set`.
+#[test]
+fn maintain_template_covers_every_erasure_request_sweep_call() {
+    let tenant = test_tenant();
+    let request_id = Uuid::from_u128(3);
+    let maintain = load_policy("maintain");
+
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+
+    for signal in ALL_SIGNALS {
+        // Call 1: list_all(store, &keys::del_prefix(tenant, signal)).
+        let prefix = del_prefix(&tenant, signal);
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "maintain: no ListBucket s3:prefix admits {prefix:?}, the prefix \
+             sweep_erasure_requests passes to list_all. The pass is \
+             refused with AccessDenied before it reaches any .dreq, so the \
+             delete grant is unreachable. s3:prefix values: {list_prefixes:?}"
+        );
+
+        // Call 2: store.get on each listed .done key.
+        let done =
+            erasure_completion_key(&tenant, signal, request_id).expect("erasure_completion_key");
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &done)),
+            "maintain: no GetObject Allow reaches the completion record \
+             {done:?}, which sweep_erasure_requests GETs to decode the \
+             completion timestamp that anchors the protection horizon. Without \
+             it the pass fails on the first completed request. Grants: {gets:?}"
+        );
+
+        // Call 3: store.delete(dreq_key), already covered by
+        // maintain_template_grants_delete_on_erasure_requests and restated
+        // here so this test fails as a whole if the delete regresses.
+        let dreq = erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &dreq)),
+            "maintain: no delete Allow reaches the erasure request {dreq:?} \
+             (ADR-0064 §6). Grants: {deletes:?}"
+        );
+    }
+
+    // Tightness. Every pattern that reaches the erasure keyspace is measured
+    // against the whole key domain: a grant admitting a key outside `del/` is
+    // wider than the three calls above, and `t/*` -- which passes every
+    // functional assertion here -- is exactly that shape.
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.contains("/del/"))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside del/, so the tightness \
+         assertions below examine nothing"
+    );
+
+    // The witnesses that SELECT a pattern as an erasure-prefix grant exclude
+    // the audit signal, whose key prefix is `u`: `t/<hash>/u/del/...` is
+    // matched by Maintain's pre-existing `t/*/u/*` audit-keyspace read, which
+    // is written for `t/*/u/**` and spans one signal's `del/` by construction.
+    // That overlap predates this change and is unrelated to it, so selecting on
+    // it would make this assertion report the audit grant instead of a widened
+    // erasure grant. Every pattern written FOR `del/` reaches it under every
+    // signal, so nothing this test exists to catch escapes the narrowing: `t/*`
+    // is still selected, and still fails below.
+    assert_eq!(
+        Signal::Audit.key_prefix(),
+        "u",
+        "the audit signal's key prefix is what makes `t/*/u/*` span an erasure \
+         prefix; if it moved, this narrowing no longer describes the overlap it \
+         was written for and must be re-derived"
+    );
+    let erasure_signals: Vec<Signal> = ALL_SIGNALS
+        .iter()
+        .copied()
+        .filter(|s| *s != Signal::Audit)
+        .collect();
+    assert!(
+        !erasure_signals.is_empty(),
+        "no signal is left to witness the erasure keyspace with"
+    );
+    let erasure_witnesses: Vec<String> = erasure_signals
+        .iter()
+        .flat_map(|signal| {
+            [
+                del_prefix(&tenant, *signal),
+                erasure_request_key(&tenant, *signal, request_id).expect("erasure_request_key"),
+                erasure_completion_key(&tenant, *signal, request_id)
+                    .expect("erasure_completion_key"),
+            ]
+        })
+        .collect();
+
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:GetObject Allow", &gets),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns {
+            let reaches_erasure = erasure_witnesses.iter().any(|w| glob_matches(pattern, w));
+            if !reaches_erasure {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the erasure \
+                     keyspace AND {key:?}, which lies outside del/. The three \
+                     sweep calls need del/ and nothing else; a pattern that \
+                     spans both is over-granted (#1849)"
+                );
+            }
+        }
+    }
+
+    // No assertion here forbids a Get from reaching a `.dreq`. This pass parses
+    // request bodies from their KEYS and never fetches one, but
+    // `collect_pending_erasure_requests`
+    // (crates/ravel-maintain/src/erasure_rewrite.rs:147) GETs each `.dreq` to
+    // decode it, under the same Maintain identity, so the shape is justified
+    // outside this function and is asserted by
+    // `erasure_lifecycle_calls_outside_the_sweep_are_reachable`.
+}
+
+/// The `del/` calls the erasure lifecycle makes OUTSIDE
+/// `sweep_erasure_requests`, which
+/// `maintain_template_covers_every_erasure_request_sweep_call` does not see.
+///
+/// That test is scoped to one function, and scoping a reachability check by
+/// FILE rather than by behaviour is how #1849 shipped a delete grant whose own
+/// listing was refused. Three more calls touch `del/` under two identities:
+///
+/// - Maintain GETs each pending `.dreq` to decode it:
+///   `let got = store.get(&key, GetRange::Full).await?` in
+///   `collect_pending_erasure_requests`
+///   (`crates/ravel-maintain/src/erasure_rewrite.rs:147`).
+/// - Maintain PUTs the completion record: `write_erasure_completion`
+///   (`services/ravel-server/src/maintain.rs:2358`) builds
+///   `del/<request_id>.done` and puts it. Without this the sweep's
+///   `completions.get(request_id)` always misses, every request counts as
+///   kept, and no `.dreq` is ever deleted -- the delete grant is reachable and
+///   still never fires.
+/// - Admin PUTs the request itself: `ravel-cli erase submit`
+///   (`services/ravel-cli/src/erase.rs:136`).
+///
+/// Admin's LIST and GET already span `del/` through its blanket `t/*`, so
+/// only its PUT is asserted here.
+#[test]
+fn erasure_lifecycle_calls_outside_the_sweep_are_reachable() {
+    let tenant = test_tenant();
+    let request_id = Uuid::from_u128(4);
+    let maintain = load_policy("maintain");
+    let admin = load_policy("admin");
+
+    let maintain_gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let maintain_puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let admin_puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+
+    for signal in ALL_SIGNALS {
+        let dreq = erasure_request_key(&tenant, signal, request_id).expect("erasure_request_key");
+        let done =
+            erasure_completion_key(&tenant, signal, request_id).expect("erasure_completion_key");
+
+        assert!(
+            maintain_gets.iter().any(|p| glob_matches(p, &dreq)),
+            "maintain: no GetObject Allow reaches the request object {dreq:?}, \
+             which collect_pending_erasure_requests GETs to decode the subject \
+             predicate (erasure_rewrite.rs:147). The rewrite pass is refused \
+             before it can erase anything. Grants: {maintain_gets:?}"
+        );
+        assert!(
+            maintain_puts.iter().any(|p| glob_matches(p, &done)),
+            "maintain: no PutObject Allow reaches the completion record \
+             {done:?}, which write_erasure_completion writes (maintain.rs:2358). \
+             With no .done the sweep counts every request as kept and deletes \
+             no .dreq, so the delete grant never fires. Grants: {maintain_puts:?}"
+        );
+        assert!(
+            admin_puts.iter().any(|p| glob_matches(p, &dreq)),
+            "admin: no PutObject Allow reaches the request object {dreq:?}, \
+             which `ravel-cli erase submit` writes (erase.rs:136). No erasure \
+             request can be submitted at all. Grants: {admin_puts:?}"
+        );
+    }
+
+    // Tightness: neither new grant may reach a key outside `del/`.
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.contains("/del/"))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside del/, so the tightness \
+         assertion below examines nothing"
+    );
+    let done_witness =
+        erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done witness");
+    let dreq_witness =
+        erasure_request_key(&tenant, Signal::Metrics, request_id).expect("dreq witness");
+    for (role, patterns, witness) in [
+        ("maintain put", &maintain_puts, &done_witness),
+        ("admin put", &admin_puts, &dreq_witness),
+    ] {
+        for pattern in patterns {
+            if !glob_matches(pattern, witness) {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "{role}: pattern {pattern:?} reaches the erasure keyspace \
+                     AND {key:?}, which lies outside del/ (#1849)"
+                );
+            }
+        }
+    }
+}
+
+/// Every object-store call the ADR-0058 quarantine lifecycle makes, asserted
+/// against the shipped Maintain template, whichever prefix the call lands on.
+///
+/// The lifecycle is orphan GC's two halves in
+/// `crates/ravel-maintain/src/sweep.rs`, and the grant set is derived from every
+/// call site that touches `QUARANTINE_PREFIX`, not from one function: scoping a
+/// reachability check to the function a ticket names is how #1849, #1934 and
+/// #1847 each shipped a grant whose own listing was refused.
+///
+/// - `sweep_orphans` (rule 1) builds `dest = quarantine_key(&meta.key, ...)`
+///   (sweep.rs:687) and calls `quarantine_object`, which GETs the LIVE object
+///   (`store.get(src, GetRange::Full)`, sweep.rs:762) and PUTs the copy
+///   (`store.put(dest, ...)`, sweep.rs:767).
+/// - `sweep_orphans` then deletes the live key (`store.delete(&meta.key)`,
+///   sweep.rs:690), copy-first and delete-second.
+/// - `sweep_quarantine` (rule 1b, the reaper) LISTs the shard's quarantine
+///   prefix (`list_all(store, &quarantine_l0_data_prefix(...))`, sweep.rs:901)
+///   and DELETEs each copy past the second horizon
+///   (`store.delete(&meta.key)`, sweep.rs:921).
+///
+/// Two of the five need a grant no `t/`-rooted pattern can give.
+/// `QUARANTINE_PREFIX` is a TOP-LEVEL key space alongside `t/` and `sys/`
+/// (sweep.rs:812), and under `StringLike` the literal `t/` in every other
+/// pattern anchors at the start of the key, so `quarantine/t/...` matches none
+/// of them -- asserted below rather than argued. IAM being default-deny, the
+/// reaper was refused at its `ListBucket` and the sweep's copy at its `PutObject`
+/// before this grant existed, so a deployment on the shipped template could not
+/// quarantine an orphan at all (issue #1957).
+///
+/// No GET is asserted on the quarantine keyspace, and none is granted: the copy
+/// reads the live key, the reaper reads its horizon out of the key itself
+/// (`parse_quarantine_timestamp`), and no restore path exists in the code. If
+/// one is added, it needs its own grant on whichever role runs it, and the
+/// closing per-role assertion below is what will fail until it gets one.
+#[test]
+fn maintain_template_covers_every_quarantine_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+
+    let live_keys = l0_data_keys();
+    for live in &live_keys {
+        let copy = quarantine_key(live);
+        let prefix = quarantine_l0_data_prefix(live);
+
+        // Call 1: quarantine_object GETs the live object (sweep.rs:762).
+        assert!(
+            gets.iter().any(|p| glob_matches(p, live)),
+            "maintain: no GetObject Allow reaches the live object {live:?}, which \
+             quarantine_object reads before it can copy it (sweep.rs:762). \
+             Nothing is quarantined and, fail-closed, nothing is deleted. \
+             Grants: {gets:?}"
+        );
+
+        // Call 2: quarantine_object PUTs the copy (sweep.rs:767).
+        assert!(
+            puts.iter().any(|p| glob_matches(p, &copy)),
+            "maintain: no PutObject Allow reaches the quarantine copy {copy:?}, \
+             which quarantine_object writes (sweep.rs:767). Every candidate's \
+             copy fails, so the sweep counts it refused and leaves it live \
+             forever: orphan GC never collects anything (#1957). Grants: {puts:?}"
+        );
+
+        // Call 3: sweep_orphans deletes the live key, copy-first (sweep.rs:690).
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, live)),
+            "maintain: no delete Allow reaches the live object {live:?}, which \
+             sweep_orphans deletes once its copy landed (sweep.rs:690). The \
+             object stays live with a quarantine copy beside it. \
+             Grants: {deletes:?}"
+        );
+
+        // Call 4: the reaper LISTs the shard's quarantine prefix (sweep.rs:901).
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "maintain: no ListBucket s3:prefix admits {prefix:?}, the prefix \
+             sweep_quarantine passes to list_all (sweep.rs:901). The reaper is \
+             refused with AccessDenied before it sees a single copy, so the \
+             quarantine prefix grows without bound and its delete grant is \
+             unreachable (#1957). s3:prefix values: {list_prefixes:?}"
+        );
+
+        // Call 5: the reaper deletes a copy past the second horizon
+        // (sweep.rs:921).
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &copy)),
+            "maintain: no delete Allow reaches the quarantine copy {copy:?}, \
+             which sweep_quarantine deletes past quarantine_horizon_ns \
+             (sweep.rs:921). This is the only place orphan-GC'd data is \
+             physically removed, so without it the prefix leaks forever \
+             (ADR-0058 decision 6). Grants: {deletes:?}"
+        );
+    }
+
+    // The premise the three new patterns rest on: `quarantine/` is not under
+    // `t/`, so no pattern written for the live keyspace reaches a copy. Without
+    // this, a reader could believe `t/*/*/l0/*` already covered the reaper and
+    // read the grants above as redundant.
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:GetObject Allow", &gets),
+        ("s3:PutObject Allow", &puts),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns
+            .iter()
+            .filter(|p| !p.starts_with(QUARANTINE_PREFIX))
+        {
+            for live in &live_keys {
+                let copy = quarantine_key(live);
+                assert!(
+                    !glob_matches(pattern, &copy),
+                    "maintain: {axis} pattern {pattern:?} is not written for the \
+                     quarantine keyspace yet reaches {copy:?}. Either the pattern \
+                     is wider than the live keyspace it names, or \
+                     QUARANTINE_PREFIX stopped being a top-level key space and \
+                     every grant in this test must be re-derived (#1957)"
+                );
+            }
+        }
+    }
+
+    // Tightness, the same shape the erasure tests use: a pattern that reaches a
+    // quarantine copy must reach nothing outside `quarantine/`. The five calls
+    // need that keyspace and the live l0 keyspace the template already named;
+    // a pattern spanning both (`*`, or a `quarantine/*` widened to `*/t/*`) is
+    // over-granted. The GET axis is absent because nothing GETs a quarantine
+    // object: its witness above is the LIVE key, which `t/*/*/l0/*` reaches by
+    // design.
+    let quarantine_copies: Vec<String> = live_keys.iter().map(|k| quarantine_key(k)).collect();
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.starts_with(QUARANTINE_PREFIX))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside quarantine/, so the tightness \
+         assertions below examine nothing"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:PutObject Allow", &puts),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns {
+            if !quarantine_copies.iter().any(|w| glob_matches(pattern, w)) {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the quarantine \
+                     keyspace AND {key:?}, which lies outside it. The five calls \
+                     need quarantine/ and nothing else (#1957)"
+                );
+            }
+        }
+    }
+
+    // No other role touches the quarantine keyspace on any axis. Maintain is
+    // the only role that runs the sweep, and `quarantine/` sits outside the
+    // blanket `t/*` and `sys/*` reads admin holds, so nothing else reaches it
+    // today. A restore path (ADR-0058 decision 6 describes recovery as a copy
+    // of the bytes back to the original key, but no command implements one)
+    // would be the first caller to need a grant here, and this assertion is
+    // where the template and the code get compared when it lands.
+    for role in ALL_ROLES {
+        if role == "maintain" {
+            continue;
+        }
+        let policy = load_policy(role);
+        for (axis, patterns) in [
+            (
+                "s3:prefix Allow",
+                list_prefix_patterns(&policy, Some("Allow")),
+            ),
+            (
+                "s3:GetObject Allow",
+                key_patterns_for(&policy, &["s3:GetObject"], Some("Allow")),
+            ),
+            (
+                "s3:PutObject Allow",
+                key_patterns_for(&policy, &["s3:PutObject"], Some("Allow")),
+            ),
+            ("delete Allow", delete_key_patterns(&policy, "Allow")),
+        ] {
+            for pattern in &patterns {
+                for copy in &quarantine_copies {
+                    assert!(
+                        !glob_matches(pattern, copy),
+                        "{role}: {axis} pattern {pattern:?} reaches the quarantine \
+                         copy {copy:?}. Only Maintain runs the ADR-0058 sweep and \
+                         its reaper; if another role gained a quarantine caller, \
+                         grant it deliberately and move this assertion (#1957)"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Every object-store call the ADR-0065 maintain worker-heartbeat lifecycle
+/// makes, asserted against the shipped Maintain template, derived from every
+/// call site that touches `sys/maintain/workers/` rather than from the one
+/// function issue #1975 names.
+///
+/// The lifecycle is `crates/ravel-fleet/src/worker_set.rs`, driven from the
+/// maintain tick in `services/ravel-server/src/maintain.rs`:
+///
+/// - `WorkerSet::write_heartbeat` PUTs this process's own key
+///   (`store.put(&heartbeat_key(...), ..., PutMode::Overwrite)`,
+///   worker_set.rs:358).
+/// - `WorkerSet::live_set_read` LISTs the whole prefix
+///   (`list_all(store, WORKERS_PREFIX)`, worker_set.rs:403) and GETs each
+///   sibling whose LIST metadata is inside the liveness window
+///   (`store.get(&meta.key, GetRange::Full)`, worker_set.rs:424).
+/// - `WorkerSet::reap_keys` DELETEs each key past the reap horizon
+///   (`store.delete(key)`, worker_set.rs:463), from the candidates that same
+///   listing already produced. `services/ravel-server/src/maintain.rs:1111` is
+///   the production caller; `WorkerSet::reap_dead_workers` is the standalone
+///   form and makes the same two calls.
+///
+/// IAM is default-deny and the delete axis named no resource under
+/// `sys/maintain/` before issue #1975, so on a shipped deployment every reap
+/// was refused: dead heartbeat keys were never removed and the per-tick LIST
+/// over the prefix grew with every maintain process that had ever run, which
+/// is the unbounded-LIST cost issue #1679 removed on the assumption that this
+/// delete succeeded.
+///
+/// Like every other reachability test in this file, this reads ALLOW patterns
+/// only, by the convention `erasure_lifecycle_calls_outside_the_sweep_are_reachable`
+/// set. It says an Allow reaches each call, NOT that the call succeeds under
+/// the effective policy: the Allow/Deny relationship is
+/// `delete_deny_and_allow_overlap_exactly_where_expected` and
+/// `every_allow_deny_key_overlap_is_named_by_the_deny`.
+/// `every_role_grants_exactly_the_expected_pattern_set` pins the pattern
+/// strings by exact equality.
+#[test]
+fn maintain_template_covers_every_worker_heartbeat_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+
+    // The witness is the constructor's own output, never a literal: this is
+    // the exact key `write_heartbeat` PUTs, `live_set_read` GETs back and
+    // `reap_keys` DELETEs.
+    let heartbeat = heartbeat_key(&Uuid::from_u128(WITNESS_PROCESS_ID));
+    // The prefix `live_set_read` passes to `list_all`. `WORKERS_PREFIX` is
+    // private to `worker_set`, so it is recovered from the constructor's
+    // output rather than retyped, the same way `quarantine_l0_data_prefix`
+    // recovers the reaper's listing prefix from a real data key.
+    let (workers_prefix_body, _process_id) = heartbeat
+        .rsplit_once('/')
+        .expect("a heartbeat key ends in a process-id segment");
+    let workers_prefix = format!("{workers_prefix_body}/");
+
+    // Call 1: write_heartbeat PUTs this process's own key (worker_set.rs:358).
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &heartbeat)),
+        "maintain: no PutObject Allow reaches the heartbeat key {heartbeat:?}, \
+         which WorkerSet::write_heartbeat writes every interval \
+         (worker_set.rs:358). The process never joins its own fleet's live set \
+         as seen by a sibling. Grants: {puts:?}"
+    );
+
+    // Call 2: live_set_read LISTs the whole prefix (worker_set.rs:403).
+    assert!(
+        list_prefixes
+            .iter()
+            .any(|p| glob_matches(p, &workers_prefix)),
+        "maintain: no ListBucket s3:prefix admits {workers_prefix:?}, the prefix \
+         WorkerSet::live_set_read passes to list_all (worker_set.rs:403). The \
+         live-set read is refused with AccessDenied before it sees a sibling, \
+         so unit ownership falls back to solo and the reap grant below is \
+         unreachable. s3:prefix values: {list_prefixes:?}"
+    );
+
+    // Call 3: live_set_read GETs each in-window sibling (worker_set.rs:424).
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &heartbeat)),
+        "maintain: no GetObject Allow reaches the sibling heartbeat \
+         {heartbeat:?}, which WorkerSet::live_set_read decodes to read its \
+         stamped heartbeat_unix_ns (worker_set.rs:424). Grants: {gets:?}"
+    );
+
+    // Call 4: reap_keys DELETEs each key past the reap horizon
+    // (worker_set.rs:463), driven from maintain.rs:1111.
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &heartbeat)),
+        "maintain: no delete Allow reaches the dead-worker heartbeat \
+         {heartbeat:?}, which WorkerSet::reap_keys deletes past the reap \
+         horizon (worker_set.rs:463, driven from maintain.rs:1111). IAM is \
+         default-deny, so every reap is refused, no dead worker's key is ever \
+         removed, and the per-tick LIST over {workers_prefix:?} grows with \
+         every maintain process that has ever run (#1975). Grants: {deletes:?}"
+    );
+
+    // Tightness: a pattern reaching the heartbeat key must reach nothing
+    // outside `sys/maintain/`. The read and write axes are deliberately the
+    // whole `sys/maintain/*` control-plane prefix (the memo snapshots and the
+    // ADR-1029 compaction claims live beside the heartbeats), so the bound is
+    // that prefix and not the workers prefix alone.
+    let maintain_control_prefix = {
+        let (parent, _workers) = workers_prefix
+            .trim_end_matches('/')
+            .rsplit_once('/')
+            .expect("the workers prefix sits under a parent control-plane prefix");
+        format!("{parent}/")
+    };
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.starts_with(&maintain_control_prefix))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside {maintain_control_prefix:?}, so \
+         the tightness assertions below examine nothing"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("s3:GetObject Allow", &gets),
+        ("s3:PutObject Allow", &puts),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns {
+            if !glob_matches(pattern, &heartbeat) {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the worker \
+                     heartbeat {heartbeat:?} AND {key:?}, which lies outside \
+                     {maintain_control_prefix:?}. The four calls need that \
+                     control-plane prefix and nothing else (#1975)"
+                );
+            }
+        }
+    }
+
+    // No role that does not run a maintain worker reaches a maintain
+    // heartbeat. Admin is excluded on purpose and not by oversight: its
+    // blanket `sys/*` read and list are the operator role's deliberate posture
+    // over the whole control plane, asserted by
+    // every_role_grants_exactly_the_expected_pattern_set. Gateway and query
+    // run no maintain worker and must reach these keys on no axis.
+    for role in ["gateway", "query"] {
+        let policy = load_policy(role);
+        for (axis, patterns) in [
+            (
+                "s3:prefix Allow",
+                list_prefix_patterns(&policy, Some("Allow")),
+            ),
+            (
+                "s3:GetObject Allow",
+                key_patterns_for(&policy, &["s3:GetObject"], Some("Allow")),
+            ),
+            (
+                "s3:PutObject Allow",
+                key_patterns_for(&policy, &["s3:PutObject"], Some("Allow")),
+            ),
+            ("delete Allow", delete_key_patterns(&policy, "Allow")),
+        ] {
+            for pattern in &patterns {
+                assert!(
+                    !glob_matches(pattern, &heartbeat),
+                    "{role}: {axis} pattern {pattern:?} reaches the maintain \
+                     heartbeat {heartbeat:?}. Only a maintain-mode process \
+                     writes, reads or reaps one (ADR-0065 decision 1); if \
+                     another role gained a caller, grant it deliberately and \
+                     move this assertion (#1975)"
+                );
+            }
+        }
+    }
+}
+
+/// Every object-store call the maintain tick's query-worker reap makes,
+/// asserted against the shipped Maintain template (issue #1828).
+///
+/// The query role deletes nothing (ADR-0055 section 1), so the reap of dead
+/// `sys/query/workers/<process_id>` records runs on the maintain tick, owned by
+/// one maintain process per deployment
+/// (`reap_query_worker_heartbeats` in `services/ravel-server/src/maintain.rs`).
+/// It goes through `reap_dead_query_workers` in
+/// `crates/ravel-fleet/src/query_workers.rs`, which makes two calls:
+///
+/// - `list_all(store, QUERY_WORKERS_PREFIX)`, judging each key by the
+///   modification time the LIST result carries;
+/// - `store.delete(key)` in `reap_keys`, for each key past the reap horizon.
+///
+/// It reads and writes no record, so the maintain role gets no GET or PUT on
+/// the prefix. Before issue #1828 the query coordinator made these deletes
+/// under a role with no delete grant, every one was refused, and the prefix
+/// grew with every query worker that ever ran.
+#[test]
+fn maintain_template_covers_every_query_worker_reap_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+
+    let record = query_worker_key(&Uuid::from_u128(WITNESS_PROCESS_ID).to_string());
+
+    // Call 1: the reap LISTs the whole prefix.
+    assert!(
+        list_prefixes
+            .iter()
+            .any(|p| glob_matches(p, QUERY_WORKERS_PREFIX)),
+        "maintain: no ListBucket s3:prefix admits {QUERY_WORKERS_PREFIX:?}, the \
+         prefix reap_dead_query_workers passes to list_all. The reap is refused \
+         before it sees a key. s3:prefix values: {list_prefixes:?}"
+    );
+
+    // Call 2: reap_keys DELETEs each key past the reap horizon.
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &record)),
+        "maintain: no delete Allow reaches the dead query-worker record \
+         {record:?}, which reap_keys deletes past the reap horizon. Every reap \
+         is refused and {QUERY_WORKERS_PREFIX:?} grows with every query worker \
+         that has ever run (#1828). Grants: {deletes:?}"
+    );
+
+    // The reap reads and writes no record.
+    for (axis, patterns) in [("s3:GetObject Allow", &gets), ("s3:PutObject Allow", &puts)] {
+        assert!(
+            !patterns.iter().any(|p| glob_matches(p, &record)),
+            "maintain: {axis} reaches the query-worker record {record:?}, which \
+             the reap never reads or writes. Patterns: {patterns:?}"
+        );
+    }
+
+    // Tightness: a list or delete pattern reaching the record reaches nothing
+    // outside the query-worker prefix.
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.starts_with(QUERY_WORKERS_PREFIX))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside {QUERY_WORKERS_PREFIX:?}"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("delete Allow", &deletes),
+    ] {
+        for pattern in patterns {
+            if !glob_matches(pattern, &record) {
+                continue;
+            }
+            for key in &outside {
+                assert!(
+                    !glob_matches(pattern, key),
+                    "maintain: {axis} pattern {pattern:?} reaches the query-worker \
+                     record {record:?} AND {key:?}, which lies outside \
+                     {QUERY_WORKERS_PREFIX:?} (#1828)"
+                );
+            }
+        }
+    }
+
+    // The query role deletes only the Parquet bucket probe's scratch object,
+    // never this record.
+    let query_deletes = delete_key_patterns(&load_policy("query"), "Allow");
+    assert!(
+        query_deletes.iter().all(|p| p.starts_with(PROBE_PREFIX))
+            && !query_deletes.iter().any(|p| glob_matches(p, &record)),
+        "query: the role must grant no delete outside {PROBE_PREFIX:?} (ADR-0055 \
+         section 1, HTTP DDL amendment); the maintain role reaps its dead \
+         registrations. Grants: {query_deletes:?}"
+    );
+}
+
+/// Assert every `role` pattern on `axis` that reaches `witness` reaches no key in
+/// `key_domain()` outside `scope`, so a grant added for one control-plane key
+/// cannot quietly cover a neighbour.
+fn assert_reaches_nothing_outside(
+    role: &str,
+    axis: &str,
+    patterns: &[String],
+    witness: &str,
+    scope: &str,
+) {
+    let outside: Vec<&String> = key_domain()
+        .iter()
+        .filter(|key| !key.starts_with(scope))
+        .collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside {scope:?}"
+    );
+    for pattern in patterns {
+        if !glob_matches(pattern, witness) {
+            continue;
+        }
+        for key in &outside {
+            assert!(
+                !glob_matches(pattern, key),
+                "{role}: {axis} pattern {pattern:?} reaches {witness:?} AND \
+                 {key:?}, which lies outside {scope:?}"
+            );
+        }
+    }
+}
+
+/// The durable bearer-token map's writer is `ravel-cli tenant token upsert`
+/// and `revoke` (`services/ravel-cli/src/tenant_token.rs`), which go through
+/// `write_map` in `crates/ravel-catalog/src/auth_token_map.rs`: one GET of
+/// `sys/auth`, then a PUT of the same key, `CreateIfAbsent` on a fresh bucket
+/// and `CasVersion` after. Both modes are `s3:PutObject`. Nothing deletes the
+/// map. No server role writes it: the server only reads it.
+#[test]
+fn admin_template_covers_every_auth_map_write_call() {
+    const AUTH_KEY: &str = "sys/auth";
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&admin, "Allow");
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, AUTH_KEY)),
+        "admin: no GetObject Allow reaches {AUTH_KEY:?}, which read_auth_map \
+         reads before every write. Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, AUTH_KEY)),
+        "admin: no PutObject Allow reaches {AUTH_KEY:?}, which write_map PUTs on \
+         every tenant token upsert and revoke. Every one is refused. Grants: \
+         {puts:?}"
+    );
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, AUTH_KEY)),
+        "admin: a delete Allow reaches {AUTH_KEY:?}; nothing deletes the token \
+         map. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, AUTH_KEY, AUTH_KEY);
+
+    for role in ["gateway", "query", "maintain"] {
+        let puts = key_patterns_for(&load_policy(role), &["s3:PutObject"], Some("Allow"));
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, AUTH_KEY)),
+            "{role}: a PutObject Allow reaches {AUTH_KEY:?}. The only production \
+             writers are ravel-cli under Admin and the operator; a server role \
+             only reads the map. Grants: {puts:?}"
+        );
+    }
+}
+
+/// `DurableAuthState::refresh` (`services/ravel-server/src/lifecycle_refresh.rs`)
+/// GETs `sys/auth` through `read_auth_map` at startup, on every refresh horizon
+/// and on a rate-limited token miss. `start` in `services/ravel-server/src/lib.rs`
+/// builds that state in `Mode::All`, `Mode::Gateway` and `Mode::Query` on a
+/// keyed bucket, and never in `Mode::Maintain`. A refused GET counts as a failed
+/// refresh, and past the hard-stale bound durable tokens fail closed.
+#[test]
+fn tenant_resolving_roles_read_the_auth_map() {
+    const AUTH_KEY: &str = "sys/auth";
+    for role in ["gateway", "query"] {
+        let gets = key_patterns_for(&load_policy(role), &["s3:GetObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, AUTH_KEY)),
+            "{role}: no GetObject Allow reaches {AUTH_KEY:?}, which the durable \
+             auth refresh reads in this role's mode. Every refresh fails and \
+             durable bearer tokens are refused. Grants: {gets:?}"
+        );
+        assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, AUTH_KEY, AUTH_KEY);
+    }
+}
+
+/// The maintain warm start (`read_all_memo_snapshots` in
+/// `crates/ravel-maintain/src/memo_snapshot.rs`, called from the maintain loop
+/// in `services/ravel-server/src/maintain.rs` on every membership change) LISTs
+/// `sys/maintain/memo/` and GETs each snapshot it finds. A refused LIST is
+/// treated fail-open, as a cold start for every unit, so without the list grant
+/// every maintain cycle logs a warning and runs cold until the list succeeds.
+#[test]
+fn maintain_template_covers_every_memo_snapshot_read_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let snapshot = format!("{MEMO_PREFIX}{}", Uuid::from_u128(WITNESS_PROCESS_ID));
+
+    assert!(
+        list_prefixes.iter().any(|p| glob_matches(p, MEMO_PREFIX)),
+        "maintain: no ListBucket s3:prefix admits {MEMO_PREFIX:?}, the prefix \
+         read_all_memo_snapshots lists. The warm start is refused and every \
+         seeding runs cold. s3:prefix values: {list_prefixes:?}"
+    );
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &snapshot)),
+        "maintain: no GetObject Allow reaches the memo snapshot {snapshot:?}. \
+         Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &snapshot)),
+        "maintain: no PutObject Allow reaches the memo snapshot {snapshot:?}, \
+         which write_memo_snapshot writes. Grants: {puts:?}"
+    );
+    assert_reaches_nothing_outside(
+        "maintain",
+        "s3:prefix Allow",
+        &list_prefixes,
+        MEMO_PREFIX,
+        MEMO_PREFIX,
+    );
+}
+
+/// `RecoveryManifestWriter::ensure` (`services/ravel-server/src/tenancy.rs`)
+/// writes `sys/t/<tenant_hash>` with `CreateIfAbsent` on a keyed tenant's first
+/// ingest request in a process. Every ingest handler calls it, so it runs in
+/// `Mode::Gateway` and the gateway half of `Mode::All`. A refused write is
+/// logged and ingest continues, but the tenant never gets a manifest and the
+/// writer retries, and warns, on every later request.
+#[test]
+fn gateway_template_covers_the_recovery_manifest_write() {
+    const MANIFEST_SCOPE: &str = "sys/t/";
+    let gateway = load_policy("gateway");
+    let puts = key_patterns_for(&gateway, &["s3:PutObject"], Some("Allow"));
+    let manifest = format!("{MANIFEST_SCOPE}{}", test_tenant().to_hex());
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &manifest)),
+        "gateway: no PutObject Allow reaches the recovery manifest {manifest:?}, \
+         which every keyed ingest path writes for a tenant's first request. \
+         Grants: {puts:?}"
+    );
+    assert_reaches_nothing_outside(
+        "gateway",
+        "s3:PutObject Allow",
+        &puts,
+        &manifest,
+        MANIFEST_SCOPE,
+    );
+}
+
+/// `read_config` / `read_config_values` (`crates/ravel-catalog/src/tenant_config.rs`)
+/// GETs `t/<tenant_hash>/config`, the tenant config record (ADR-0066 decision 6,
+/// `config_key`). It propagates every store error except `NotFound`, so a
+/// refused GET is not read as "no overrides" but fails each reading role in its
+/// own mode:
+///
+/// - Maintain: `resolve_retention_window_ns`
+///   (`crates/ravel-maintain/src/retention.rs`) maps the error to
+///   `MaintainError::Invariant`, failing every retention pass.
+/// - Query: `DeclaredColumnSource::declared_columns`
+///   (`services/ravel-server/src/declared_columns.rs`, reached from
+///   `SqlExecutor::resolve_declared_columns`) never resolves the durable
+///   `typed_attr_columns` override, so queries run on the base schema.
+/// - Gateway: `refresh_tenant_limits_once`
+///   (`services/ravel-server/src/lifecycle_refresh.rs`) fails every cycle, so
+///   per-tenant admission overrides never apply.
+///
+/// The config key is tenant-scoped, not per-signal, so the witness is built from
+/// `hash16()` to match the one `constructor_free_tenant_witness_keys` adds to the
+/// domain. The only production writer is `ravel-cli` under Admin
+/// (`set_tenant_config`); no server role writes it, so no server template gains a
+/// write grant here.
+#[test]
+fn config_reading_roles_read_the_tenant_config_record() {
+    let config = format!("t/{}/config", hash16());
+    for role in ["gateway", "query", "maintain"] {
+        let gets = key_patterns_for(&load_policy(role), &["s3:GetObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &config)),
+            "{role}: no GetObject Allow reaches the tenant config record \
+             {config:?}, which this role's mode reads and propagates on any \
+             store error but NotFound. Grants: {gets:?}"
+        );
+        assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, &config, &config);
+    }
+}
+
+/// `sys/auth` (the durable bearer-token map) and `sys/t/*` (the write-once
+/// recovery manifests, ADR-0050) are create-once control-plane keys no role
+/// deletes on its normal path, so every template's `DenyDeleteProtected` must
+/// cover them. A deleted `sys/auth` reads as absent and installs an empty token
+/// map, silently revoking every durable token
+/// (`services/ravel-server/src/lifecycle_refresh.rs`); a `sys/t/*` manifest is
+/// write-once. This fails if either key leaves any role's Deny set, and if any
+/// role grants a delete Allow on either (nothing does, so the Deny is
+/// belt-and-suspenders; `no_delete_allow_reaches_the_disjoint_protected_keyspaces`
+/// asserts the disjointness, this pins the Deny itself).
+#[test]
+fn sys_auth_and_recovery_manifests_are_delete_protected_in_every_role() {
+    const AUTH_KEY: &str = "sys/auth";
+    let manifest = format!("sys/t/{}", test_tenant().to_hex());
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let denies = delete_key_patterns(&policy, "Deny");
+        assert!(
+            denies.iter().any(|p| glob_matches(p, AUTH_KEY)),
+            "{role}: no delete Deny reaches {AUTH_KEY:?}; a deleted token map \
+             reads as absent and revokes every durable token. Deny: {denies:?}"
+        );
+        assert!(
+            denies.iter().any(|p| glob_matches(p, &manifest)),
+            "{role}: no delete Deny reaches the recovery manifest {manifest:?}, \
+             which is write-once (ADR-0050). Deny: {denies:?}"
+        );
+        let allows = delete_key_patterns(&policy, "Allow");
+        assert!(
+            !allows.iter().any(|p| glob_matches(p, AUTH_KEY)),
+            "{role}: a delete Allow reaches {AUTH_KEY:?}; nothing deletes the \
+             token map. Allow: {allows:?}"
+        );
+        assert!(
+            !allows.iter().any(|p| glob_matches(p, &manifest)),
+            "{role}: a delete Allow reaches {manifest:?}; recovery manifests are \
+             write-once. Allow: {allows:?}"
+        );
+    }
+}
+
+/// Assert every `role` pattern on `axis` that reaches `witness` reaches no key in
+/// `key_domain()` for which `in_scope` is false. The predicate form of
+/// `assert_reaches_nothing_outside`, for a scope that spans tenants.
+fn assert_reaches_only(
+    role: &str,
+    axis: &str,
+    patterns: &[String],
+    witness: &str,
+    scope: &str,
+    in_scope: impl Fn(&str) -> bool,
+) {
+    let outside: Vec<&String> = key_domain().iter().filter(|key| !in_scope(key)).collect();
+    assert!(
+        !outside.is_empty(),
+        "the key domain models no key outside {scope}"
+    );
+    for pattern in patterns {
+        if !glob_matches(pattern, witness) {
+            continue;
+        }
+        for key in &outside {
+            assert!(
+                !glob_matches(pattern, key),
+                "{role}: {axis} pattern {pattern:?} reaches {witness:?} AND \
+                 {key:?}, which lies outside {scope}"
+            );
+        }
+    }
+}
+
+/// Whether `key` is `t/<any tenant>/<alerts prefix>/<sub>/...`.
+fn is_alert_subkey(key: &str, sub: &str) -> bool {
+    let mut parts = key.splitn(5, '/');
+    parts.next() == Some("t")
+        && parts.next().is_some()
+        && parts.next() == Some(Signal::Alerts.key_prefix())
+        && parts.next() == Some(sub)
+}
+
+/// `configure_tenant_kms` (`services/ravel-server/src/tenant_kms.rs`) runs from
+/// `services/ravel-server/src/main.rs` in every `--mode` whenever
+/// `--tenant-kms-config` is set. For each configured tenant
+/// `bootstrap_tenant_epoch` GETs `t/<hash>/enc` through `read_epochs_from_store`
+/// and, when the tenant has no record or its key changed, PUTs it through
+/// `record_key_epoch` (`crates/ravel-catalog/src/key_epoch.rs`):
+/// `CreateIfAbsent` for the bootstrap epoch, `CasVersion` for every appended
+/// one. Only `NotFound` reads as absence, so a refused GET or PUT makes the
+/// process refuse to start. Admin reads the record for `ravel-cli
+/// verify-custody` and writes it nowhere in production code. Nothing lists it.
+#[test]
+fn server_roles_read_and_write_the_key_epoch_record() {
+    let enc = key_epoch_key();
+    for role in ["gateway", "query", "maintain"] {
+        let policy = load_policy(role);
+        let gets = key_patterns_for(&policy, &["s3:GetObject"], Some("Allow"));
+        let puts = key_patterns_for(&policy, &["s3:PutObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: no GetObject Allow reaches the key-epoch record {enc:?}, \
+             which bootstrap_tenant_epoch reads at startup under \
+             --tenant-kms-config. The process refuses to start. Grants: {gets:?}"
+        );
+        assert!(
+            puts.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: no PutObject Allow reaches the key-epoch record {enc:?}, \
+             which record_key_epoch writes for a new tenant or a rotated key. \
+             The process refuses to start. Grants: {puts:?}"
+        );
+        assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, &enc, &enc);
+        assert_reaches_nothing_outside(role, "s3:PutObject Allow", &puts, &enc, &enc);
+    }
+
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &enc)),
+        "admin: no GetObject Allow reaches {enc:?}, which verify-custody reads. \
+         Grants: {gets:?}"
+    );
+    assert!(
+        !puts.iter().any(|p| glob_matches(p, &enc)),
+        "admin: a PutObject Allow reaches {enc:?}; no ravel-cli command writes \
+         the key-epoch record. Grants: {puts:?}"
+    );
+}
+
+/// `t/<hash>/enc` is an append-only history: `record_key_epoch` only ever
+/// appends an epoch, and a deleted record reads as "no per-tenant key was ever
+/// configured", so `verify-custody` stops checking the tenant and the next
+/// bootstrap rewrites epoch 0 over history it never saw. No role deletes it, so
+/// every template's `DenyDeleteProtected` covers it and no delete Allow does.
+#[test]
+fn key_epoch_records_are_delete_protected_in_every_role() {
+    let enc = key_epoch_key();
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let denies = delete_key_patterns(&policy, "Deny");
+        assert!(
+            denies.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: no delete Deny reaches the key-epoch record {enc:?}, an \
+             append-only history whose loss reads as absence. Deny: {denies:?}"
+        );
+        let allows = delete_key_patterns(&policy, "Allow");
+        assert!(
+            !allows.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: a delete Allow reaches {enc:?}; nothing deletes the \
+             key-epoch record. Allow: {allows:?}"
+        );
+    }
+}
+
+/// The ingest metadata sink (`crates/ravel-ingest/src/metrics_meta_sink.rs`),
+/// built with the ingest router in `Mode::Gateway` and `Mode::All`, merges each
+/// window's metric metadata into `t/<hash>/m/meta`: `read_metrics_meta` GETs it
+/// and `write_metrics_meta` (`crates/ravel-catalog/src/metrics_meta.rs`) PUTs it
+/// with `CreateIfAbsent` or `CasVersion`. The query metadata cache
+/// (`crates/ravel-query/src/http/metadata_cache.rs`), built in `Mode::Query` and
+/// `Mode::All`, GETs it to serve `/api/v1/metadata`. Both log and swallow a
+/// refusal, so without these grants metric metadata is never persisted and the
+/// endpoint serves nothing. Nothing deletes or lists the record.
+#[test]
+fn metric_metadata_record_is_written_by_gateway_and_read_by_query() {
+    let meta = metrics_meta_key();
+    let gateway = load_policy("gateway");
+    for (role, policy, operations) in [
+        ("gateway", &gateway, &["s3:GetObject", "s3:PutObject"][..]),
+        ("query", &load_policy("query"), &["s3:GetObject"][..]),
+    ] {
+        for operation in operations {
+            let patterns = key_patterns_for(policy, &[*operation], Some("Allow"));
+            assert!(
+                patterns.iter().any(|p| glob_matches(p, &meta)),
+                "{role}: no {operation} Allow reaches the metric metadata record \
+                 {meta:?}. Grants: {patterns:?}"
+            );
+            assert_reaches_nothing_outside(role, operation, &patterns, &meta, &meta);
+        }
+    }
+    let query_puts = key_patterns_for(&load_policy("query"), &["s3:PutObject"], Some("Allow"));
+    assert!(
+        !query_puts.iter().any(|p| glob_matches(p, &meta)),
+        "query: a PutObject Allow reaches {meta:?}; only the ingest metadata \
+         sink writes it. Grants: {query_puts:?}"
+    );
+}
+
+/// The alert evaluator (`services/ravel-server/src/alerting.rs`) is spawned by
+/// `alerting::spawn` inside the query-serving block of `start`
+/// (`services/ravel-server/src/lib.rs`), so it runs under the Query role in
+/// `Mode::Query` and `Mode::All`. Each tick, per tenant:
+///
+/// - `read_alert_state_memo` GETs `t/<hash>/a/state/latest`
+///   (`services/ravel-server/src/alert_state_memo.rs`), and the lease holder
+///   overwrites it with `write_alert_state_memo` (`PutMode::Overwrite`);
+/// - `acquire_lease` PUTs `t/<hash>/a/alert-lease` with `CreateIfAbsent`, and
+///   on `AlreadyExists` GETs it and PUTs it back with `CasVersion` to renew or
+///   take over. Nothing releases or deletes the lease;
+/// - `publish` writes each transition as an L0 data object
+///   (`put_data_object`) and a commit record (`publish`), both
+///   `CreateIfAbsent`, under the alerts signal. The history fold reads them
+///   back through the existing `t/*/*/c/*` and `t/*/*/l0/*` grants.
+///
+/// A refused lease PUT is `lease_unavailable` and skips rule evaluation, so
+/// without these grants no rule is ever evaluated.
+#[test]
+fn query_template_covers_every_alert_evaluator_call() {
+    let query = load_policy("query");
+    let gets = key_patterns_for(&query, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&query, &["s3:PutObject"], Some("Allow"));
+
+    for key in [alert_lease_key(), alert_state_memo_key()] {
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &key)),
+            "query: no GetObject Allow reaches {key:?}, which the alert \
+             evaluator reads every tick. Grants: {gets:?}"
+        );
+        assert!(
+            puts.iter().any(|p| glob_matches(p, &key)),
+            "query: no PutObject Allow reaches {key:?}, which the alert \
+             evaluator writes every tick. Grants: {puts:?}"
+        );
+        assert_reaches_nothing_outside("query", "s3:GetObject Allow", &gets, &key, &key);
+        assert_reaches_nothing_outside("query", "s3:PutObject Allow", &puts, &key, &key);
+    }
+
+    let tenant = test_tenant();
+    let writer_id = Uuid::from_u128(1);
+    let data = data_key(&tenant, Signal::Alerts, 0, writer_id, 1, 1, &[0u8; 32]).expect("data_key");
+    let commit = commit_key(&tenant, Signal::Alerts, 0, 0, writer_id, 1, 1).expect("commit_key");
+    for (key, sub) in [(&data, "l0"), (&commit, "c")] {
+        assert!(
+            puts.iter().any(|p| glob_matches(p, key)),
+            "query: no PutObject Allow reaches the alert transition {key:?}, \
+             which the alert evaluator publishes on every state change. Every \
+             transition fails. Grants: {puts:?}"
+        );
+        assert_reaches_only(
+            "query",
+            "s3:PutObject Allow",
+            &puts,
+            key,
+            &format!("the alerts signal's {sub}/ keyspace"),
+            |k| is_alert_subkey(k, sub),
+        );
+    }
+
+    // Query's only delete is the Parquet bucket probe's scratch object.
+    let deletes = delete_key_patterns(&query, "Allow");
+    assert!(
+        deletes.iter().all(|p| p.starts_with(PROBE_PREFIX)),
+        "query: the role must grant no delete outside {PROBE_PREFIX:?}; the \
+         alert evaluator deletes nothing. Grants: {deletes:?}"
+    );
+}
+
+/// The maintain alert retention pass (`run_alert_retention` in
+/// `services/ravel-server/src/maintain.rs`) reads the evaluator's state memo
+/// through `alert_keep_set`, which propagates every error but `NotFound`, so a
+/// refused GET skips the retention sweep for the tenant every tick. When no
+/// memo or alert record was seen, `alert_keyspace_is_empty` LISTs
+/// `t/<hash>/a/` and `quarantine/t/<hash>/a/`; a refused LIST logs a warning
+/// and runs the orphan sweep anyway, for every such tenant on every tick.
+/// Maintain neither writes the memo nor touches the lease.
+#[test]
+fn maintain_template_covers_the_alert_retention_reads() {
+    let maintain = load_policy("maintain");
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let memo = alert_state_memo_key();
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &memo)),
+        "maintain: no GetObject Allow reaches the alert state memo {memo:?}, \
+         which alert_keep_set reads. Every alert retention sweep is skipped. \
+         Grants: {gets:?}"
+    );
+    assert_reaches_nothing_outside("maintain", "s3:GetObject Allow", &gets, &memo, &memo);
+    for key in [memo, alert_lease_key()] {
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, &key)),
+            "maintain: a PutObject Allow reaches {key:?}; only the alert \
+             evaluator writes it. Grants: {puts:?}"
+        );
+    }
+
+    let keyspace = alert_keyspace_prefix();
+    for prefix in [keyspace.clone(), format!("{QUARANTINE_PREFIX}{keyspace}")] {
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "maintain: no ListBucket s3:prefix admits {prefix:?}, which \
+             alert_keyspace_is_empty lists. s3:prefix values: {list_prefixes:?}"
+        );
+        assert_reaches_nothing_outside(
+            "maintain",
+            "s3:prefix Allow",
+            &list_prefixes,
+            &prefix,
+            &prefix,
+        );
+    }
+}
+
+/// `ravel-cli typed-attr-column set` (`services/ravel-cli/src/typed_attr_column.rs`,
+/// `set_tenant_config`) and `ravel-cli clustering-key set|clear` and
+/// `bloom-scope set` (`services/ravel-cli/src/storage_layout.rs`,
+/// `TenantConfig::write_if_unchanged`) write `t/<hash>/config` through
+/// `write_config` in `crates/ravel-catalog/src/tenant_config.rs`: one GET, then a
+/// PUT with `CreateIfAbsent` when the record is absent and `CasVersion` when it
+/// exists. Both are `s3:PutObject`. Nothing deletes the record, and no server
+/// role writes it.
+#[test]
+fn admin_template_covers_every_tenant_config_write_call() {
+    let config = format!("t/{}/config", hash16());
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&admin, "Allow");
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &config)),
+        "admin: no GetObject Allow reaches {config:?}, which write_config reads \
+         before every write. Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &config)),
+        "admin: no PutObject Allow reaches the tenant config record {config:?}, \
+         which every ravel-cli tenant config write PUTs. Every one is refused. \
+         Grants: {puts:?}"
+    );
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, &config)),
+        "admin: a delete Allow reaches {config:?}; nothing deletes the tenant \
+         config record. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, &config, &config);
+
+    for role in ["gateway", "query", "maintain"] {
+        let puts = key_patterns_for(&load_policy(role), &["s3:PutObject"], Some("Allow"));
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, &config)),
+            "{role}: a PutObject Allow reaches {config:?}; no server role writes \
+             the tenant config record. Grants: {puts:?}"
+        );
+    }
+}
+
+/// Whether `key` is `t/<any tenant>/pq/<sub>` or lies under it.
+fn is_parquet_subkey(key: &str, sub: &str) -> bool {
+    let mut parts = key.splitn(4, '/');
+    parts.next() == Some("t")
+        && parts.next().is_some()
+        && parts.next() == Some("pq")
+        && parts
+            .next()
+            .is_some_and(|rest| rest == sub || rest.starts_with(&format!("{sub}/")))
+}
+
+/// `ravel-cli tenant parquet-grant add` and `remove`
+/// (`services/ravel-cli/src/parquet_grant.rs`) write the location grants record
+/// `t/<hash>/pq/grants` through `replace_whole` in
+/// `crates/ravel-pqtable/src/grants.rs`: one GET, then a PUT with
+/// `CreateIfAbsent` when the record is absent and `CasVersion` when it exists.
+/// Before the write, `add` qualifies the target bucket with
+/// `probe_not_ravel_bucket` (`crates/ravel-object-store/src/external/probe.rs`),
+/// which PUTs `sys/pq-probe/<random>` to the Ravel bucket and DELETEs it on every
+/// path it returns through. Nothing deletes the grants record: a deleted record
+/// reads as a tenant with no grants.
+#[test]
+fn admin_template_covers_every_parquet_grant_call() {
+    let grants = parquet_grants_key();
+    let probe = parquet_probe_key();
+    let admin = load_policy("admin");
+    let gets = key_patterns_for(&admin, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&admin, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&admin, "Allow");
+
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &grants)),
+        "admin: no GetObject Allow reaches {grants:?}, which replace_whole reads \
+         before every write. Grants: {gets:?}"
+    );
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &grants)),
+        "admin: no PutObject Allow reaches the location grants record \
+         {grants:?}, which every parquet-grant add and remove PUTs. Every one \
+         is refused. Grants: {puts:?}"
+    );
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, &grants)),
+        "admin: a delete Allow reaches {grants:?}; nothing deletes the grants \
+         record. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, &grants, &grants);
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &probe)),
+        "admin: no PutObject Allow reaches the bucket probe object {probe:?}, \
+         which probe_not_ravel_bucket writes before every parquet-grant add. \
+         Every add is refused. Grants: {puts:?}"
+    );
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &probe)),
+        "admin: no delete Allow reaches the bucket probe object {probe:?}, \
+         which probe_not_ravel_bucket deletes before it returns. Every probe \
+         leaves its object behind. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("admin", "s3:PutObject Allow", &puts, &probe, PROBE_PREFIX);
+    assert_reaches_nothing_outside("admin", "delete Allow", &deletes, &probe, PROBE_PREFIX);
+
+    // Query runs the same bucket probe for HTTP Parquet DDL
+    // (query_template_covers_every_parquet_ddl_call), so it is checked for the
+    // grants record only.
+    for role in ["gateway", "query", "maintain"] {
+        let policy = load_policy(role);
+        let puts = key_patterns_for(&policy, &["s3:PutObject"], Some("Allow"));
+        let deletes = delete_key_patterns(&policy, "Allow");
+        let keys: &[&String] = if role == "query" {
+            &[&grants]
+        } else {
+            &[&grants, &probe]
+        };
+        for key in keys {
+            assert!(
+                !puts.iter().any(|p| glob_matches(p, key))
+                    && !deletes.iter().any(|p| glob_matches(p, key)),
+                "{role}: a PutObject or delete Allow reaches {key:?}; only \
+                 ravel-cli under Admin writes the grants record, and only Admin \
+                 and Query run the bucket probe. Put: {puts:?}; delete: {deletes:?}"
+            );
+        }
+    }
+}
+
+/// The SQL engine's Parquet table provider (`crates/ravel-sql/src/parquet.rs`,
+/// built in the query-serving block from `services/ravel-server/src/query.rs`)
+/// resolves a table through `crates/ravel-pqtable/src/resolve.rs`:
+/// `resolve::newest` LISTs `t/<hash>/pq/t/<table>/v/` and `read_version` GETs
+/// the manifest it picks, and `grants::list` GETs `t/<hash>/pq/grants` to
+/// check every file the manifest names against the tenant's grants. The query
+/// path writes and deletes nothing under `pq/`.
+#[test]
+fn query_template_covers_every_parquet_table_read() {
+    let query = load_policy("query");
+    let list_prefixes = list_prefix_patterns(&query, Some("Allow"));
+    let gets = key_patterns_for(&query, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&query, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&query, "Allow");
+    let manifest = parquet_manifest_key();
+    let grants = parquet_grants_key();
+
+    for prefix in [parquet_tenant_manifest_prefix(), parquet_manifest_prefix()] {
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "query: no ListBucket s3:prefix admits {prefix:?}, which the Parquet \
+             table resolver lists. Every Parquet table query is refused. \
+             s3:prefix values: {list_prefixes:?}"
+        );
+        assert_reaches_only(
+            "query",
+            "s3:prefix Allow",
+            &list_prefixes,
+            &prefix,
+            "the Parquet manifest keyspace",
+            |k| is_parquet_subkey(k, "t"),
+        );
+    }
+    for key in [&manifest, &grants] {
+        assert!(
+            gets.iter().any(|p| glob_matches(p, key)),
+            "query: no GetObject Allow reaches {key:?}, which a Parquet table \
+             query reads. Grants: {gets:?}"
+        );
+    }
+    assert_reaches_only(
+        "query",
+        "s3:GetObject Allow",
+        &gets,
+        &manifest,
+        "the Parquet manifest keyspace",
+        |k| is_parquet_subkey(k, "t"),
+    );
+    assert_reaches_nothing_outside("query", "s3:GetObject Allow", &gets, &grants, &grants);
+
+    assert!(
+        !puts.iter().any(|p| glob_matches(p, &grants)),
+        "query: a PutObject Allow reaches {grants:?}; only ravel-cli under Admin \
+         writes the grants record. Grants: {puts:?}"
+    );
+    for key in [&manifest, &grants] {
+        assert!(
+            !deletes.iter().any(|p| glob_matches(p, key)),
+            "query: a delete Allow reaches {key:?}; the query path deletes \
+             nothing under pq/. Grants: {deletes:?}"
+        );
+    }
+}
+
+/// `POST /api/v1/sql` runs `CREATE [OR REPLACE] EXTERNAL TABLE` and `DROP
+/// TABLE` through `SqlExecutor::execute_ddl` (`crates/ravel-sql/src/ddl.rs`) in
+/// `Mode::Query` and `Mode::All`, against Ravel's own store under the Query
+/// credential. Its calls on that store:
+///
+/// - `resolve::newest` LISTs `t/<hash>/pq/t/<table>/v/` and GETs the newest
+///   manifest, before a plain `CREATE` and on every `writer::apply` attempt;
+///   `writer::apply`'s own-write check GETs a manifest it put.
+/// - `grants::list` GETs `t/<hash>/pq/grants` (`CREATE` only).
+/// - `probe_not_ravel_bucket` PUTs `sys/pq-probe/<32 hex>` with
+///   `PutMode::Overwrite` and DELETEs it on every path it returns through
+///   (`CREATE` only).
+/// - `writer::apply` PUTs `t/<hash>/pq/t/<table>/v/<version:020>.pqm` with
+///   `PutMode::CreateIfAbsent`, its only put (`crates/ravel-pqtable/src/writer.rs`).
+///   A `DROP` writes a dropped manifest version through the same put and
+///   deletes nothing. On an `AlreadyExists` the S3 backend HEADs the key, which
+///   IAM authorizes as `s3:GetObject`.
+///
+/// The `LOCATION` listing, HEAD and footer reads and both qualification reads
+/// go to the external store under its own profile, not this credential.
+#[test]
+fn query_template_covers_every_parquet_ddl_call() {
+    let query = load_policy("query");
+    let list_prefixes = list_prefix_patterns(&query, Some("Allow"));
+    let gets = key_patterns_for(&query, &["s3:GetObject"], Some("Allow"));
+    let puts = put_resource_key_patterns(&query);
+    let deletes = delete_key_patterns(&query, "Allow");
+    let manifest = parquet_manifest_key();
+    let grants = parquet_grants_key();
+    let probe = parquet_probe_key();
+
+    assert!(
+        list_prefixes
+            .iter()
+            .any(|p| glob_matches(p, &parquet_manifest_prefix())),
+        "query: no ListBucket s3:prefix admits the manifest prefix every DDL \
+         statement resolves. s3:prefix values: {list_prefixes:?}"
+    );
+    for key in [&manifest, &grants] {
+        assert!(
+            gets.iter().any(|p| glob_matches(p, key)),
+            "query: no GetObject Allow reaches {key:?}, which execute_ddl reads. \
+             Grants: {gets:?}"
+        );
+    }
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &manifest)),
+        "query: no PutObject Allow reaches the manifest {manifest:?}, which every \
+         committed CREATE and DROP writes. Every DDL statement is refused. \
+         Grants: {puts:?}"
+    );
+    assert_reaches_only(
+        "query",
+        "s3:PutObject Allow",
+        &puts,
+        &manifest,
+        "the Parquet manifest keyspace",
+        |k| is_parquet_subkey(k, "t"),
+    );
+
+    assert!(
+        puts.iter().any(|p| glob_matches(p, &probe)),
+        "query: no PutObject Allow reaches the bucket probe object {probe:?}, \
+         which probe_not_ravel_bucket writes before every CREATE. Every CREATE \
+         is refused. Grants: {puts:?}"
+    );
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &probe)),
+        "query: no delete Allow reaches the bucket probe object {probe:?}, \
+         which probe_not_ravel_bucket deletes before it returns. Every CREATE \
+         leaves its probe object behind. Grants: {deletes:?}"
+    );
+    assert_reaches_nothing_outside("query", "s3:PutObject Allow", &puts, &probe, PROBE_PREFIX);
+    assert_reaches_nothing_outside("query", "delete Allow", &deletes, &probe, PROBE_PREFIX);
+    for pattern in &deletes {
+        assert!(
+            pattern.starts_with(PROBE_PREFIX),
+            "query: delete Allow {pattern:?} lies outside the probe prefix \
+             {PROBE_PREFIX:?}; the bucket probe is the only thing the Query role \
+             deletes"
+        );
+    }
+}
+
+/// `writer::apply` puts every manifest with `PutMode::CreateIfAbsent`, which the
+/// S3 backend sends as `If-None-Match: *`, so the Query role needs to create
+/// manifests and never to overwrite one. Every Query PutObject pattern that
+/// reaches a manifest must come from the create-only statement: an
+/// unconditioned grant would let a compromised Query credential rewrite any
+/// table version in place.
+#[test]
+fn query_manifest_write_is_create_only() {
+    let query = load_policy("query");
+    let manifest = parquet_manifest_key();
+    let create_only = create_only_put_patterns(&query);
+    let reaching: Vec<String> = put_resource_key_patterns(&query)
+        .into_iter()
+        .filter(|p| glob_matches(p, &manifest))
+        .collect();
+    assert!(
+        !reaching.is_empty(),
+        "query: no PutObject Allow reaches {manifest:?}"
+    );
+    for pattern in &reaching {
+        assert!(
+            create_only.contains(pattern),
+            "query: PutObject Allow {pattern:?} reaches the manifest {manifest:?} \
+             without the create-only Condition {{\"StringEquals\": \
+             {{\"s3:if-none-match\": \"*\"}}}}, so it can overwrite an existing \
+             manifest. Create-only patterns: {create_only:?}"
+        );
+    }
+}
+
+/// The create-only manifest grant reaches manifest keys and nothing else under
+/// `t/<hash>/pq/t/`: `t/<32 x ?>/pq/t/*/v/<20 x ?>.pqm`. The table segment is
+/// `*` because names run 1 to 63 bytes; the version is exactly 20 characters
+/// (`VERSION_WIDTH` in `crates/ravel-pqtable/src/keys.rs`) with the `.pqm`
+/// suffix. A key that is not a manifest version, or one under another tenant
+/// prefix shape, must not match.
+#[test]
+fn query_manifest_create_grant_reaches_only_manifest_keys() {
+    let query = load_policy("query");
+    let create_only: Vec<String> = create_only_put_patterns(&query);
+    assert_eq!(
+        create_only,
+        ["t/????????????????????????????????/pq/t/*/v/????????????????????.pqm"],
+        "query: the create-only grant must be exactly the manifest key pattern"
+    );
+    let tenant = parquet_tenant_manifest_prefix();
+    let reached = [
+        parquet_manifest_key(),
+        format!("{tenant}hits/v/18446744073709551615.pqm"),
+        format!("{tenant}{}/v/{:020}.pqm", "a".repeat(63), 1),
+    ];
+    let not_reached = [
+        format!("{tenant}hits"),
+        format!("{tenant}hits/v/"),
+        format!("{tenant}hits/data.parquet"),
+        format!("{tenant}hits/v/{:019}.pqm", 1),
+        format!("{tenant}hits/v/{:021}.pqm", 1),
+        format!("{tenant}hits/v/{:020}.parquet", 1),
+        format!("{tenant}hits/v/{:020}.pqm.tmp", 1),
+        format!("{tenant}hits/x/{:020}.pqm", 1),
+        parquet_grants_key(),
+        format!("t/{}/pq/t/hits/v/{:020}.pqm", "ab".repeat(17), 1),
+    ];
+    for pattern in &create_only {
+        for key in &reached {
+            assert!(
+                glob_matches(pattern, key),
+                "{pattern:?} must reach the manifest key {key:?}"
+            );
+        }
+        for key in &not_reached {
+            assert!(
+                !glob_matches(pattern, key),
+                "{pattern:?} reaches {key:?}, which is not a manifest version key"
+            );
+        }
+    }
+}
+
+/// The create-only Condition passes the choke point in its one exact shape and
+/// every variant fails closed: a different value, operator, or key; a second
+/// operator; a Deny; or an Action set that is not exactly `s3:PutObject`.
+#[test]
+fn create_only_put_condition_shape_fails_closed_on_every_variant() {
+    let stmt = |effect: &str, action: serde_json::Value, condition: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "CreateOnly",
+            "Effect": effect,
+            "Action": action,
+            "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/pq/t/*",
+            "Condition": condition,
+        })
+    };
+    let good = serde_json::json!({"StringEquals": {"s3:if-none-match": "*"}});
+    let put = serde_json::json!("s3:PutObject");
+    for ok in [
+        stmt("Allow", put.clone(), good.clone()),
+        stmt(
+            "Allow",
+            serde_json::json!(["s3:PutObject"]),
+            serde_json::json!({"StringEquals": {"s3:if-none-match": ["*"]}}),
+        ),
+    ] {
+        assert!(
+            validate_statement("fixture", 0, &ok).is_ok(),
+            "the create-only shape must pass: {ok}"
+        );
+    }
+
+    let cases = [
+        (
+            "wrong value",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEquals": {"s3:if-none-match": "abc"}}),
+            ),
+        ),
+        (
+            "two values",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEquals": {"s3:if-none-match": ["*", "abc"]}}),
+            ),
+        ),
+        (
+            "StringLike operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringLike": {"s3:if-none-match": "*"}}),
+            ),
+        ),
+        (
+            "StringEqualsIfExists operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEqualsIfExists": {"s3:if-none-match": "*"}}),
+            ),
+        ),
+        (
+            "ForAnyValue:StringEquals operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"ForAnyValue:StringEquals": {"s3:if-none-match": "*"}}),
+            ),
+        ),
+        (
+            "if-match key",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEquals": {"s3:if-match": "*"}}),
+            ),
+        ),
+        (
+            "extra key",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({"StringEquals": {"s3:if-none-match": "*", "aws:SourceIp": "10.0.0.1"}}),
+            ),
+        ),
+        (
+            "extra operator",
+            stmt(
+                "Allow",
+                put.clone(),
+                serde_json::json!({
+                    "StringEquals": {"s3:if-none-match": "*"},
+                    "Null": {"s3:if-none-match": "false"}
+                }),
+            ),
+        ),
+        ("on a Deny", stmt("Deny", put.clone(), good.clone())),
+        (
+            "wildcard action",
+            stmt("Allow", serde_json::json!("s3:Put*"), good.clone()),
+        ),
+        (
+            "mixed actions",
+            stmt(
+                "Allow",
+                serde_json::json!(["s3:PutObject", "s3:GetObject"]),
+                good.clone(),
+            ),
+        ),
+    ];
+    for (name, case) in &cases {
+        let err = validate_statement("fixture", 0, case)
+            .expect_err(&format!("validate_statement must reject the {name} case"));
+        assert!(
+            err.contains("CreateOnly"),
+            "{name}: rejection must name the Sid; got {err:?}"
+        );
+    }
+
+    // `StringEqualsIfExists` is the dangerous one: a PUT that sends no
+    // If-None-Match header has no value for the key, so the operator passes it
+    // and the statement grants an unconditional overwrite. Both spellings embed
+    // the exact operator name, so they must be refused by an exact operator
+    // lookup and not by some later check a looser lookup would also reach.
+    for (operator, name) in [
+        ("StringEqualsIfExists", "StringEqualsIfExists operator"),
+        (
+            "ForAnyValue:StringEquals",
+            "ForAnyValue:StringEquals operator",
+        ),
+    ] {
+        assert!(operator.contains(CREATE_ONLY_CONDITION_OPERATOR));
+        let (_, case) = cases
+            .iter()
+            .find(|(n, _)| *n == name)
+            .expect("operator case present");
+        let err = validate_statement("fixture", 0, case).expect_err(name);
+        assert!(
+            err.contains("its operator is not StringEquals"),
+            "{name}: must be refused by the operator check; got {err:?}"
+        );
+    }
+}
+
+/// The CAS-only Condition passes the choke point in its one exact shape and
+/// every variant fails closed. `"true"` is the dangerous one: it admits only a
+/// PUT that sends no `If-Match`, which is every unconditional overwrite.
+#[test]
+fn cas_only_put_condition_shape_fails_closed_on_every_variant() {
+    let stmt = |effect: &str, action: serde_json::Value, condition: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "CasOnly",
+            "Effect": effect,
+            "Action": action,
+            "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+            "Condition": condition,
+        })
+    };
+    let good = serde_json::json!({"Null": {"s3:if-match": "false"}});
+    let put = serde_json::json!("s3:PutObject");
+    for ok in [
+        stmt("Allow", put.clone(), good.clone()),
+        stmt(
+            "Allow",
+            serde_json::json!(["s3:PutObject"]),
+            serde_json::json!({"Null": {"s3:if-match": ["false"]}}),
+        ),
+    ] {
+        assert!(
+            validate_statement("fixture", 0, &ok).is_ok(),
+            "the CAS-only shape must pass: {ok}"
+        );
+        assert_eq!(put_condition_of(&ok), Some(PutCondition::CasOnly));
+    }
+
+    let cases = [
+        (
+            "true value",
+            serde_json::json!({"Null": {"s3:if-match": "true"}}),
+            "its value is not exactly \"false\"",
+        ),
+        (
+            "two values",
+            serde_json::json!({"Null": {"s3:if-match": ["false", "true"]}}),
+            "its value is not exactly \"false\"",
+        ),
+        (
+            "if-none-match key",
+            serde_json::json!({"Null": {"s3:if-none-match": "false"}}),
+            "its condition key is not s3:if-match",
+        ),
+        (
+            "extra key",
+            serde_json::json!({"Null": {"s3:if-match": "false", "aws:SourceIp": "false"}}),
+            "it must name exactly one condition key",
+        ),
+        (
+            "StringLike operator",
+            serde_json::json!({"StringLike": {"s3:if-match": "*"}}),
+            "its operator is not StringEquals",
+        ),
+        (
+            "extra operator",
+            serde_json::json!({
+                "Null": {"s3:if-match": "false"},
+                "StringEquals": {"s3:if-none-match": "*"}
+            }),
+            "it must name exactly one operator",
+        ),
+    ];
+    for (name, condition, why) in &cases {
+        let case = stmt("Allow", put.clone(), condition.clone());
+        let err = validate_statement("fixture", 0, &case)
+            .expect_err(&format!("validate_statement must reject the {name} case"));
+        assert!(
+            err.contains("CasOnly") && err.contains(why),
+            "{name}: rejection must name the Sid and say {why:?}; got {err:?}"
+        );
+    }
+    for (name, case) in [
+        ("on a Deny", stmt("Deny", put.clone(), good.clone())),
+        (
+            "wildcard action",
+            stmt("Allow", serde_json::json!("s3:Put*"), good.clone()),
+        ),
+        (
+            "mixed actions",
+            stmt(
+                "Allow",
+                serde_json::json!(["s3:PutObject", "s3:GetObject"]),
+                good.clone(),
+            ),
+        ),
+    ] {
+        validate_statement("fixture", 0, &case)
+            .expect_err(&format!("validate_statement must reject the {name} case"));
+    }
+}
+
+/// The signals with a provisioning record: `PROVISIONED_SIGNALS` in
+/// `services/ravel-server/src/provisioning.rs`, which the `ravel-cli` provision
+/// and migrate signal arguments match.
+const PROVISIONED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+
+/// The provisioning record's key, `t/<hash>/<signal>/prov`
+/// (`provisioning_key` in `crates/ravel-catalog/src/provisioning.rs`, which
+/// this crate cannot depend on), for each provisioned signal.
+fn prov_witness_keys() -> Vec<String> {
+    let hash = test_tenant().to_hex();
+    PROVISIONED_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{hash}/{}/prov", signal.key_prefix()))
+        .collect()
+}
+
+/// The resources every provisioning-record write statement names, one per
+/// provisioned signal. The tenant hash is 32 single-character wildcards because
+/// IAM's `*` crosses `/`: `t/*/*/prov` would also reach a nested key ending in
+/// `/prov` and the `prov` key of a signal that has no record.
+const PROV_M_PATTERN: &str = "t/????????????????????????????????/m/prov";
+const PROV_L_PATTERN: &str = "t/????????????????????????????????/l/prov";
+const PROV_S_PATTERN: &str = "t/????????????????????????????????/s/prov";
+const PROV_PATTERNS: [&str; 3] = [PROV_M_PATTERN, PROV_L_PATTERN, PROV_S_PATTERN];
+
+/// Keys ending in `/prov` that are not a provisioning record: nested keys under
+/// `c/`, `del/` and `l0/` of a provisioned signal, a provisioned signal's
+/// `prov` key under a tenant segment one character narrower (31) or wider (33)
+/// than a tenant hash, and the `prov` key of every signal that has no record.
+/// No provisioning-record grant may reach one.
+fn prov_lookalike_keys() -> Vec<String> {
+    let hash = test_tenant().to_hex();
+    let narrow = &hash[..hash.len() - 1];
+    let wide = format!("{hash}0");
+    assert_eq!((narrow.len(), wide.len()), (31, 33));
+    let mut keys = Vec::new();
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        keys.push(format!("t/{hash}/{sig}/c/0000/20260101T00/prov"));
+        keys.push(format!("t/{hash}/{sig}/del/prov"));
+        keys.push(format!("t/{hash}/{sig}/l0/0000/prov"));
+        keys.push(format!("t/{narrow}/{sig}/prov"));
+        keys.push(format!("t/{wide}/{sig}/prov"));
+    }
+    for signal in ALL_SIGNALS {
+        if !PROVISIONED_SIGNALS.contains(&signal) {
+            keys.push(format!("t/{hash}/{}/prov", signal.key_prefix()));
+        }
+    }
+    keys
+}
+
+/// The three record patterns are the provisioned signals' key prefixes under a
+/// tenant segment exactly as wide as a tenant hash, and the lookalikes name
+/// every signal without a record.
+#[test]
+fn prov_patterns_follow_the_provisioned_signals() {
+    let width = test_tenant().to_hex().len();
+    let expected: Vec<String> = PROVISIONED_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{}/{}/prov", "?".repeat(width), signal.key_prefix()))
+        .collect();
+    assert_eq!(PROV_PATTERNS.to_vec(), expected);
+    // The 31- and 33-character lookalikes are live: a pattern one `?` narrower
+    // or wider reaches them, so only the width of `PROV_PATTERNS` keeps them out.
+    let hash = test_tenant().to_hex();
+    for (width, key) in [
+        (width - 1, format!("t/{}/m/prov", &hash[..width - 1])),
+        (width + 1, format!("t/{hash}0/m/prov")),
+    ] {
+        let pattern = format!("t/{}/m/prov", "?".repeat(width));
+        assert!(glob_matches(&pattern, &key), "{pattern} reaches {key}");
+        assert!(
+            !glob_matches(PROV_M_PATTERN, &key),
+            "{PROV_M_PATTERN} reaches {key}"
+        );
+        assert!(prov_lookalike_keys().contains(&key), "{key} is a lookalike");
+    }
+    let unprovisioned: Vec<&str> = ALL_SIGNALS
+        .iter()
+        .filter(|s| !PROVISIONED_SIGNALS.contains(s))
+        .map(|s| s.key_prefix())
+        .collect();
+    assert_eq!(unprovisioned, ["p", "a", "u"]);
+}
+
+/// Every production write of the provisioning record, the role whose
+/// credential issues it, and the conditional write it sends. Writes go through
+/// three functions in `crates/ravel-catalog/src/provisioning.rs`:
+/// `write_record_race_safe` (`PutMode::CreateIfAbsent`, reached from
+/// `validate_or_adopt` under `CreateFromConfig` or `AdoptIfData`),
+/// `append_generation` and `raise_format_floor` (both `PutMode::CasVersion`).
+/// No production path writes the record unconditionally. A `query` process
+/// runs the startup check under `RefuseIfCommittedDataHidden`
+/// (`static_absent_policy`), which never writes, and is not a caller.
+const PROV_WRITE_CALL_SITES: &[(&str, &str, PutCondition)] = &[
+    (
+        "ProvisioningRecordWriter::ensure (services/ravel-server/src/provisioning.rs), \
+         validate_or_adopt CreateFromConfig on a tenant's first ingest write",
+        "gateway",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "validate_static_provisioning (services/ravel-server/src/provisioning.rs, \
+         called from main.rs at startup), validate_or_adopt AdoptIfData in gateway \
+         and all mode",
+        "gateway",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "validate_static_provisioning at startup, AdoptIfData in maintain mode",
+        "maintain",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "the maintain tick (services/ravel-server/src/maintain.rs), validate_or_adopt \
+         AdoptIfData per tenant and signal",
+        "maintain",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "ravel-cli maintain migrate, raise_format_floor after a clean re-audit \
+         (crates/ravel-maintain/src/migrate.rs)",
+        "maintain",
+        PutCondition::CasOnly,
+    ),
+    (
+        "ravel-cli provision adopt, validate_or_adopt AdoptIfData",
+        "admin",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "ravel-cli provision reshard, append_generation",
+        "admin",
+        PutCondition::CasOnly,
+    ),
+];
+
+/// Per role, the conditions of the statements that write the provisioning
+/// record, as a multiset: template order is not asserted.
+const EXPECTED_PROV_PUT_CONDITIONS: &[(&str, &[PutCondition])] = &[
+    ("gateway", &[PutCondition::CreateOnly]),
+    ("query", &[]),
+    (
+        "maintain",
+        &[PutCondition::CreateOnly, PutCondition::CasOnly],
+    ),
+    ("admin", &[PutCondition::CreateOnly, PutCondition::CasOnly]),
+];
+
+/// Every conditioned PutObject statement in `policy` that reaches a
+/// provisioning record: its Sid, its condition and its key patterns.
+fn prov_put_statements(policy: &Policy) -> Vec<(String, PutCondition, Vec<String>)> {
+    let keys = prov_witness_keys();
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let Some(kind) = put_condition_of(stmt) else {
+            continue;
+        };
+        let patterns =
+            object_key_patterns(policy.role, statement_sid(stmt), &statement_resources(stmt));
+        if keys
+            .iter()
+            .any(|k| patterns.iter().any(|p| glob_matches(p, k)))
+        {
+            out.push((statement_sid(stmt).to_string(), kind, patterns));
+        }
+    }
+    out
+}
+
+/// Each `(Sid, key)` where a provisioning-record write statement in `policy`
+/// reaches a key in `prov_lookalike_keys()`.
+fn prov_grant_overreach(policy: &Policy) -> Vec<(String, String)> {
+    let lookalikes = prov_lookalike_keys();
+    let mut out = Vec::new();
+    for (sid, _, patterns) in prov_put_statements(policy) {
+        for key in &lookalikes {
+            if patterns.iter().any(|p| glob_matches(p, key)) {
+                out.push((sid.clone(), key.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Every role writes the provisioning record only through conditioned
+/// statements naming exactly `PROV_PATTERNS`, carrying exactly the conditions
+/// `EXPECTED_PROV_PUT_CONDITIONS` lists in any statement order, and keeps its
+/// deny-delete on it. An unconditioned PutObject reaching the record would let
+/// a compromised credential overwrite or replace any tenant's shard generations
+/// and format floors outright, where CAS-only still has to name the current
+/// version.
+#[test]
+fn prov_put_grants_carry_exactly_the_expected_conditions() {
+    let mut roles: Vec<&str> = EXPECTED_PROV_PUT_CONDITIONS
+        .iter()
+        .map(|(r, _)| *r)
+        .collect();
+    roles.sort_unstable();
+    let mut all_roles: Vec<&str> = ALL_ROLES.to_vec();
+    all_roles.sort_unstable();
+    assert_eq!(
+        roles, all_roles,
+        "one EXPECTED_PROV_PUT_CONDITIONS row per role"
+    );
+
+    let keys = prov_witness_keys();
+    let mut expected_patterns: Vec<&str> = PROV_PATTERNS.to_vec();
+    expected_patterns.sort_unstable();
+    for (role, expected) in EXPECTED_PROV_PUT_CONDITIONS {
+        let policy = load_policy(role);
+        let unconditioned = unconditioned_put_patterns(&policy);
+        for key in &keys {
+            assert!(
+                !unconditioned.iter().any(|p| glob_matches(p, key)),
+                "{role}: an unconditioned PutObject Allow reaches the provisioning \
+                 record {key:?}; every prov write must be create-only or CAS-only. \
+                 Unconditioned patterns: {unconditioned:?}"
+            );
+        }
+
+        let mut conditions = Vec::new();
+        for (sid, kind, mut patterns) in prov_put_statements(&policy) {
+            patterns.sort_unstable();
+            assert_eq!(
+                patterns, expected_patterns,
+                "{role}/{sid}: a conditioned prov statement must name the three \
+                 provisioning record patterns and nothing else"
+            );
+            conditions.push(kind);
+        }
+        conditions.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            conditions, expected,
+            "{role}: the conditioned PutObject statements reaching the provisioning \
+             record are not the expected set"
+        );
+
+        let protected = delete_key_patterns(&policy, "Deny");
+        for key in &keys {
+            assert!(
+                protected.iter().any(|p| glob_matches(p, key)),
+                "{role}: DenyDeleteProtected no longer covers {key:?}"
+            );
+        }
+    }
+}
+
+/// The provisioning-record grants reach the metrics, logs and spans records
+/// and no other key ending in `/prov`: not a nested key under `c/`, `del/` or
+/// `l0/`, and not the `prov` key of alerts, audit or profiles. Fails when any
+/// prov statement is widened back to `t/*/*/prov`
+/// (`a_prov_grant_widened_to_any_signal_reaches_the_lookalikes`).
+#[test]
+fn prov_grants_reach_only_the_provisioned_signals_records() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let statements = prov_put_statements(&policy);
+        for (sid, _, patterns) in &statements {
+            for key in prov_witness_keys() {
+                assert!(
+                    patterns.iter().any(|p| glob_matches(p, &key)),
+                    "{role}/{sid}: does not reach the provisioning record {key:?}"
+                );
+            }
+        }
+        let overreach = prov_grant_overreach(&policy);
+        assert!(
+            overreach.is_empty(),
+            "{role}: a provisioning-record grant reaches keys that are not a \
+             provisioning record: {overreach:?}"
+        );
+    }
+}
+
+/// The negative witnesses are live: widening one shipped prov statement to
+/// `t/*/*/prov` makes every lookalike reachable. In-memory; the file on disk
+/// is untouched.
+#[test]
+fn a_prov_grant_widened_to_any_signal_reaches_the_lookalikes() {
+    let path = policy_json_path("maintain");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let target = json["Statement"]
+        .as_array_mut()
+        .expect("maintain.json Statement is an array")
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainProvCas"))
+        .expect("maintain.json carries a MaintainProvCas statement");
+    target["Resource"] = serde_json::json!("arn:aws:s3:::my-ravel-bucket/t/*/*/prov");
+    let widened = build_policy("maintain", &path, &json);
+    let reached: Vec<String> = prov_grant_overreach(&widened)
+        .into_iter()
+        .map(|(sid, key)| {
+            assert_eq!(sid, "MaintainProvCas");
+            key
+        })
+        .collect();
+    assert_eq!(reached, prov_lookalike_keys());
+}
+
+/// The startup check of a `query` process over a tenant with no provisioning
+/// record (`AbsentPolicy::RefuseIfCommittedDataHidden` in `validate_or_adopt`,
+/// `crates/ravel-catalog/src/provisioning.rs`) issues one delimited listing of
+/// `t/<hash>/<sig>/c/` per provisioned signal (`commit_prefix` there) and never
+/// lists `t/<hash>/<sig>/l0/`. `query.json`'s ListBucket grant admits the
+/// first and does not admit the second. The ravel-server test
+/// `query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing`
+/// fails any `l0/` listing the way this template would, so a change to the
+/// check that lists `l0/` fails there unless this grant, and this test, change
+/// with it.
+#[test]
+fn query_template_admits_the_startup_commit_listing_and_not_l0() {
+    let query = load_policy("query");
+    let allowed = list_prefix_patterns(&query, Some("Allow"));
+    let denied = list_prefix_patterns(&query, Some("Deny"));
+    let tenant = test_tenant();
+    let hash = tenant.to_hex();
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        let shard_prefix = commit_shard_prefix(&tenant, signal, 0).expect("shard prefix");
+        let commit = shard_prefix
+            .strip_suffix("0000/")
+            .expect("commit shard prefix ends in the shard directory")
+            .to_string();
+        assert_eq!(commit, format!("t/{hash}/{sig}/c/"));
+        let l0_data =
+            data_key(&tenant, signal, 0, Uuid::from_u128(1), 1, 1, &[0u8; 32]).expect("data_key");
+        let l0_end = l0_data.find("/l0/").expect("data key has an l0 segment") + "/l0/".len();
+        let l0 = l0_data[..l0_end].to_string();
+        assert_eq!(l0, format!("t/{hash}/{sig}/l0/"));
+
+        assert!(
+            allowed.iter().any(|p| glob_matches(p, &commit)),
+            "query: no ListBucket s3:prefix admits {commit:?}, which the Query \
+             startup provisioning check lists. s3:prefix values: {allowed:?}"
+        );
+        assert!(
+            !denied.iter().any(|p| glob_matches(p, &commit)),
+            "query: a ListBucket Deny withdraws {commit:?}"
+        );
+        assert!(
+            !allowed.iter().any(|p| glob_matches(p, &l0)),
+            "query: a ListBucket s3:prefix admits {l0:?}; the Query startup check \
+             is documented and tested as never listing l0/. s3:prefix values: \
+             {allowed:?}"
+        );
+    }
+}
+
+/// A `query` process checks a present provisioning record at startup and never
+/// adopts (`static_absent_policy` in `services/ravel-server/src/provisioning.rs`),
+/// so `query.json` holds no PutObject statement of any kind that reaches a
+/// provisioned signal's record.
+#[test]
+fn query_template_writes_no_provisioning_record() {
+    let query = load_policy("query");
+    let puts = put_resource_key_patterns(&query);
+    for key in prov_witness_keys() {
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, &key)),
+            "query: a PutObject Allow reaches the provisioning record {key:?}. \
+             PutObject patterns: {puts:?}"
+        );
+    }
+    assert!(
+        !PROV_WRITE_CALL_SITES
+            .iter()
+            .any(|(_, role, _)| *role == "query"),
+        "query is not a provisioning-record writer"
+    );
+}
+
+/// Each production write of the provisioning record in `PROV_WRITE_CALL_SITES`
+/// is matched by a grant of its own kind on the role that issues it, for every
+/// provisioned signal. A create-only grant does not cover a `CasVersion` write,
+/// and a CAS-only grant does not cover a `CreateIfAbsent` one.
+#[test]
+fn every_prov_write_call_site_has_a_grant_of_its_kind() {
+    for (call, role, kind) in PROV_WRITE_CALL_SITES {
+        let policy = load_policy(role);
+        let granted = conditioned_put_patterns(&policy, *kind);
+        for key in prov_witness_keys() {
+            assert!(
+                granted.iter().any(|p| glob_matches(p, &key)),
+                "{role}: no {kind:?} PutObject Allow reaches {key:?}, which {call} \
+                 writes. {kind:?} patterns: {granted:?}"
+            );
+        }
+    }
+}
+
+/// `ravel-cli maintain migrate` runs under the Maintain credential (ADR-0066
+/// decision 5). Every object-store call it issues, traced from
+/// `migrate_family` (`crates/ravel-maintain/src/migrate.rs`) through the
+/// rewrite, claim and publish helpers, is reached by a `maintain.json` grant of
+/// the right kind, and no Deny cancels one. The two calls that end a walk are
+/// the cursor delete and the `CasVersion` floor raise on the provisioning
+/// record.
+#[test]
+fn maintain_template_covers_every_maintain_migrate_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let unconditioned_puts = unconditioned_put_patterns(&maintain);
+    let deletes = delete_key_patterns(&maintain, "Allow");
+    let denied_deletes = delete_key_patterns(&maintain, "Deny");
+    let put_allowed = |key: &str, kind: PutCondition| {
+        unconditioned_puts.iter().any(|p| glob_matches(p, key))
+            || conditioned_put_patterns(&maintain, kind)
+                .iter()
+                .any(|p| glob_matches(p, key))
+    };
+
+    let tenant = test_tenant();
+    let hash = tenant.to_hex();
+    let writer_id = Uuid::from_u128(1);
+    let hour = 0;
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        let prov = format!("t/{hash}/{sig}/prov");
+        // migrate_cursor_key in crates/ravel-maintain/src/migrate.rs.
+        let cursor = format!("t/{hash}/{sig}/maint/migrate/rseg/cursor");
+        let shard_prefix = commit_shard_prefix(&tenant, signal, 0).expect("shard prefix");
+        let hour_prefix = commit_shard_hour_prefix(&tenant, signal, 0, hour).expect("hour prefix");
+        let l0_commit = commit_key(&tenant, signal, 0, hour, writer_id, 1, 1).expect("commit_key");
+        let compaction = compaction_record_key(&tenant, signal, 0, hour, hash16())
+            .expect("compaction_record_key");
+        let rewrite =
+            rewrite_record_key(&tenant, signal, 0, hour, hash16()).expect("rewrite_record_key");
+        let l0_data = data_key(&tenant, signal, 0, writer_id, 1, 1, &[0u8; 32]).expect("data_key");
+        let l1_part =
+            l1_part_key(&tenant, signal, 0, hour, hash16(), 0, hash16()).expect("l1_part_key");
+
+        // Reads: the record (scan range, floor, raise), the cursor, every
+        // commit, compaction and rewrite record, the L0 inputs, and the L1
+        // parts a converged publish HEADs.
+        for key in [
+            &prov,
+            &cursor,
+            &l0_commit,
+            &compaction,
+            &rewrite,
+            &l0_data,
+            &l1_part,
+        ] {
+            assert!(
+                gets.iter().any(|p| glob_matches(p, key)),
+                "maintain: no GetObject Allow reaches {key:?}, which maintain \
+                 migrate reads. Grants: {gets:?}"
+            );
+        }
+        // Listings: the shard's hours and each hour bucket.
+        for prefix in [&shard_prefix, &hour_prefix] {
+            assert!(
+                list_prefixes.iter().any(|p| glob_matches(p, prefix)),
+                "maintain: no ListBucket s3:prefix admits {prefix:?}, which \
+                 maintain migrate lists. s3:prefix values: {list_prefixes:?}"
+            );
+        }
+        // Writes: the cursor (create, then CAS), the L1 parts and the
+        // compaction record (create), and the floor raise (CAS on the record).
+        for (key, kind) in [
+            (&cursor, PutCondition::CreateOnly),
+            (&cursor, PutCondition::CasOnly),
+            (&l1_part, PutCondition::CreateOnly),
+            (&compaction, PutCondition::CreateOnly),
+            (&prov, PutCondition::CasOnly),
+        ] {
+            assert!(
+                put_allowed(key, kind),
+                "maintain: no PutObject Allow admits a {kind:?} write of {key:?}, \
+                 which maintain migrate issues"
+            );
+        }
+        assert!(
+            !unconditioned_puts.iter().any(|p| glob_matches(p, &prov)),
+            "maintain: the floor raise must be the only kind of record write"
+        );
+        // The cursor delete after every completed walk, which stops the run on
+        // a refusal.
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &cursor)),
+            "maintain: no delete Allow reaches the migrate cursor {cursor:?}. \
+             Grants: {deletes:?}"
+        );
+        assert!(
+            !denied_deletes.iter().any(|p| glob_matches(p, &cursor)),
+            "maintain: a delete Deny reaches the migrate cursor {cursor:?}"
+        );
+    }
+
+    // Startup and the bucket claim, signal-independent.
+    assert!(gets.iter().any(|p| glob_matches(p, "sys/tenancy")));
+    let claim = format!("{COMPACTION_CLAIMS_PREFIX}{}", "0".repeat(64));
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &claim)),
+        "maintain: no GetObject Allow reaches the compaction claim {claim:?}"
+    );
+    for kind in [PutCondition::CreateOnly, PutCondition::CasOnly] {
+        assert!(
+            put_allowed(&claim, kind),
+            "maintain: no PutObject Allow admits a {kind:?} write of the \
+             compaction claim {claim:?}"
+        );
+    }
+}
+
+/// `ravel-cli parquet sweep` (`services/ravel-cli/src/parquet.rs`) runs under
+/// the Maintain credential. `sweep::plan` (`crates/ravel-pqtable/src/sweep.rs`)
+/// LISTs `t/<hash>/pq/t/` once, reads `sys/gc` for the deployment's grace floor,
+/// and `sweep::execute` DELETEs each superseded manifest past the grace. The
+/// sweep reads no manifest and never touches the grants record.
+#[test]
+fn maintain_template_covers_every_parquet_sweep_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+    let prefix = parquet_tenant_manifest_prefix();
+    let manifest = parquet_manifest_key();
+    let grants = parquet_grants_key();
+
+    assert!(
+        list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+        "maintain: no ListBucket s3:prefix admits {prefix:?}, the one prefix \
+         the Parquet sweep lists. The sweep is refused before it sees a \
+         manifest. s3:prefix values: {list_prefixes:?}"
+    );
+    assert!(
+        deletes.iter().any(|p| glob_matches(p, &manifest)),
+        "maintain: no delete Allow reaches the manifest {manifest:?}, which \
+         sweep::execute deletes once superseded. Grants: {deletes:?}"
+    );
+    assert!(
+        !gets.iter().any(|p| glob_matches(p, &manifest)),
+        "maintain: a GetObject Allow reaches the manifest {manifest:?}, but the \
+         sweep lists and deletes manifests and never reads one. Grants: {gets:?}"
+    );
+    assert!(
+        gets.iter().any(|p| glob_matches(p, "sys/gc")),
+        "maintain: no GetObject Allow reaches sys/gc, which the Parquet sweep \
+         reads for its grace floor. Grants: {gets:?}"
+    );
+    for (axis, patterns) in [
+        ("s3:prefix Allow", &list_prefixes),
+        ("delete Allow", &deletes),
+    ] {
+        let witness = if axis == "s3:prefix Allow" {
+            &prefix
+        } else {
+            &manifest
+        };
+        assert_reaches_only(
+            "maintain",
+            axis,
+            patterns,
+            witness,
+            "the Parquet manifest keyspace",
+            |k| is_parquet_subkey(k, "t"),
+        );
+    }
+    assert!(
+        !deletes.iter().any(|p| glob_matches(p, &grants)),
+        "maintain: a delete Allow reaches the grants record {grants:?}; the \
+         sweep deletes manifests only. Grants: {deletes:?}"
+    );
+}
+
+/// The table names `crates/ravel-pqtable/src/names.rs` refuses because a
+/// shipped template grants that key segment after a wildcard (ADR-2040's
+/// 2026-10-03 IAM segment amendment).
+const RESERVED_IAM_TABLE_NAMES: [&str; 10] = [
+    "l0",
+    "c",
+    "l1",
+    "idem",
+    "maint",
+    "admission",
+    "u",
+    "catalog",
+    "del",
+    "a",
+];
+
+/// The string literals of `IAM_GRANT_SEGMENTS` as written in
+/// `crates/ravel-pqtable/src/names.rs`. This crate does not depend on
+/// `ravel-pqtable`, so the list is read from the source; that crate's own
+/// `every_refused_table_form_has_its_typed_defect` asserts `validate_table`
+/// refuses each one.
+fn iam_grant_segments_in_names_rs() -> Vec<String> {
+    let path = format!(
+        "{}/../ravel-pqtable/src/names.rs",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let start = source
+        .find("pub const IAM_GRANT_SEGMENTS")
+        .unwrap_or_else(|| panic!("{path} declares no IAM_GRANT_SEGMENTS"));
+    let body = &source[start..];
+    let body = &body[body
+        .find('=')
+        .expect("IAM_GRANT_SEGMENTS has an initializer")..];
+    let body = &body[..body.find("];").expect("IAM_GRANT_SEGMENTS array closes")];
+    body.split('"')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// `manifest_key(&test_tenant(), table, 1)` for an arbitrary table name.
+fn parquet_manifest_key_for(table: &str) -> String {
+    format!(
+        "{}{table}/v/{:020}.pqm",
+        parquet_tenant_manifest_prefix(),
+        1
+    )
+}
+
+/// True if `pattern` matches `table`'s manifest key, or (for an `s3:prefix`) a
+/// listing prefix of that key no shorter than `t/<hash>/pq/t/<table>/`, which
+/// selects only that table's manifests.
+fn pattern_reaches_table(pattern: &str, table: &str, is_list_prefix: bool) -> bool {
+    let key = parquet_manifest_key_for(table);
+    if !is_list_prefix {
+        return glob_matches(pattern, &key);
+    }
+    let table_prefix_len = parquet_tenant_manifest_prefix().len() + table.len() + 1;
+    (table_prefix_len..=key.len()).any(|end| glob_matches(pattern, &key[..end]))
+}
+
+/// Per-name manifest witness for every reserved table name: the manifest key
+/// `t/<hash>/pq/t/<word>/v/<version>.pqm` is reached by at least one shipped
+/// template grant that does not reach an ordinary table's manifests (a grant
+/// over the whole table space, such as Admin's `t/*`, reaches every name and
+/// is not why any one is reserved). That grant is the reason the word is
+/// refused as a table name. The list is pinned to `IAM_GRANT_SEGMENTS` in
+/// `names.rs`, whose own test pins `validate_table` refusing each word.
+#[test]
+fn every_reserved_table_name_has_a_manifest_witness_a_template_grant_reaches() {
+    let mut in_names_rs = iam_grant_segments_in_names_rs();
+    in_names_rs.sort();
+    let mut here: Vec<String> = RESERVED_IAM_TABLE_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    here.sort();
+    assert_eq!(
+        here, in_names_rs,
+        "RESERVED_IAM_TABLE_NAMES must equal IAM_GRANT_SEGMENTS in \
+         crates/ravel-pqtable/src/names.rs"
+    );
+
+    let mut grants: Vec<(&str, &str, String, bool)> = Vec::new();
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        for pattern in key_patterns_for(&policy, &S3_OBJECT_OPERATIONS, Some("Allow")) {
+            grants.push((role, "object", pattern, false));
+        }
+        for pattern in list_prefix_patterns(&policy, Some("Allow")) {
+            grants.push((role, "s3:prefix", pattern, true));
+        }
+    }
+    let named: Vec<&(&str, &str, String, bool)> = grants
+        .iter()
+        .filter(|(_, _, pattern, list)| {
+            !pattern_reaches_table(pattern, PARQUET_WITNESS_TABLE, *list)
+        })
+        .collect();
+    assert!(
+        named.len() < grants.len(),
+        "fixture invalid: no grant reaches the ordinary table \
+         {PARQUET_WITNESS_TABLE:?}, so the whole-table-space filter excluded nothing"
+    );
+
+    for word in RESERVED_IAM_TABLE_NAMES {
+        let manifest = parquet_manifest_key_for(word);
+        let reaching: Vec<String> = named
+            .iter()
+            .filter(|(_, _, pattern, list)| pattern_reaches_table(pattern, word, *list))
+            .map(|(role, axis, pattern, _)| format!("{role} {axis} {pattern}"))
+            .collect();
+        assert!(
+            !reaching.is_empty(),
+            "no shipped template grant names a segment that reaches {manifest:?}, \
+             so {word:?} has no reason to be a reserved table name: un-reserve it \
+             in names.rs deliberately, or restore the grant"
+        );
+    }
+}
+
+/// `t/<hash>/pq/grants` is deleted by nothing, and a deleted record reads as a
+/// tenant with no grants (`grants::read` maps `NotFound` to an empty list), so
+/// every query over that tenant's Parquet tables is refused until an operator
+/// re-grants every location. Every template's `DenyDeleteProtected` covers it,
+/// and no delete Allow does.
+#[test]
+fn parquet_grants_record_is_delete_protected_in_every_role() {
+    let grants = parquet_grants_key();
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let denies = delete_key_patterns(&policy, "Deny");
+        assert!(
+            denies.iter().any(|p| glob_matches(p, &grants)),
+            "{role}: no delete Deny reaches the location grants record \
+             {grants:?}, whose loss reads as a tenant with no grants. Deny: \
+             {denies:?}"
+        );
+        let allows = delete_key_patterns(&policy, "Allow");
+        assert!(
+            !allows.iter().any(|p| glob_matches(p, &grants)),
+            "{role}: a delete Allow reaches {grants:?}; nothing deletes the \
+             grants record. Allow: {allows:?}"
+        );
+    }
+}
+
+/// The gateway's admission reconcile (`crates/ravel-ingest/src/reconcile.rs`)
+/// writes this process's per-signal snapshot at
+/// `t/<hash>/<signal>/admission/<process_id>.snapshot` with
+/// `PutMode::Overwrite`, lists the prefix, and `reap_keys` DELETEs every sibling
+/// snapshot past the reap horizon. The snapshot is mutable per-process state,
+/// not durable data, so the delete grant covers it and nothing else: no
+/// gateway delete Allow reaches a key outside the admission snapshots, and no
+/// gateway Deny refuses the reap.
+#[test]
+fn gateway_template_covers_the_admission_snapshot_reap() {
+    let gateway = load_policy("gateway");
+    let deletes = delete_key_patterns(&gateway, "Allow");
+    let denies = delete_key_patterns(&gateway, "Deny");
+    let is_admission_key = |k: &str| {
+        let mut parts = k.splitn(5, '/');
+        parts.next() == Some("t")
+            && parts.next().is_some()
+            && parts.next().is_some()
+            && parts.next() == Some("admission")
+    };
+
+    for signal in ALL_SIGNALS {
+        let snapshot = admission_snapshot_key(signal);
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &snapshot)),
+            "gateway: no delete Allow reaches the dead admission snapshot \
+             {snapshot:?}, which reap_keys deletes. Every reap is refused and \
+             the snapshots accumulate. Grants: {deletes:?}"
+        );
+        assert!(
+            !denies.iter().any(|p| glob_matches(p, &snapshot)),
+            "gateway: a delete Deny reaches {snapshot:?}, which refuses the \
+             reap the Allow grants. Deny: {denies:?}"
+        );
+        assert_reaches_only(
+            "gateway",
+            "delete Allow",
+            &deletes,
+            &snapshot,
+            "the admission snapshot keyspace",
+            is_admission_key,
+        );
+    }
+
+    // IAM's `*` crosses `/`, so `t/*/*/admission/*` also matches the
+    // manifests of a Parquet table named `admission`. This witness stays out
+    // of key_domain(): the gateway's read and write grants still reach it.
+    let admission_table_manifest = format!(
+        "{}admission/v/{:020}.pqm",
+        parquet_tenant_manifest_prefix(),
+        1
+    );
+    assert!(
+        !deletes
+            .iter()
+            .any(|p| glob_matches(p, &admission_table_manifest)),
+        "gateway: a delete Allow reaches {admission_table_manifest:?}, a manifest \
+         of a Parquet table named admission. The gateway deletes no durable \
+         object. Grants: {deletes:?}"
+    );
+
+    // Every gateway delete pattern is the admission reap's: the role deletes
+    // nothing else, immutable data included.
+    for pattern in &deletes {
+        assert!(
+            ALL_SIGNALS
+                .iter()
+                .any(|s| glob_matches(pattern, &admission_snapshot_key(*s))),
+            "gateway: delete Allow {pattern:?} reaches no admission snapshot; \
+             the gateway's only delete is the admission reap. Grants: \
+             {deletes:?}"
+        );
+    }
+}
+
+/// One statement reduced to what an Allow/Deny overlap check needs: which
+/// operations ON ONE AXIS it names, and which object keys it names them over.
+///
+/// The operations are the resolved literal names, not the policy's action
+/// strings, so `"s3:Delete*"` on one side and
+/// `["s3:DeleteObject", "s3:DeleteObjectVersion"]` on the other compare as the
+/// same coverage. Pinning the spellings is the separate job of
+/// `EXPECTED_PATTERNS`.
+struct AxisStatement {
+    sid: String,
+    operations: Vec<&'static str>,
+    patterns: Vec<String>,
+}
+
+/// Every statement of `effect` that names at least one operation in
+/// `operations`, reduced to an `AxisStatement`.
+fn axis_statements(
+    policy: &Policy,
+    operations: &[&'static str],
+    effect: &str,
+) -> Vec<AxisStatement> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let has_effect = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case(effect));
+        if !has_effect {
+            continue;
+        }
+        let actions = statement_actions(stmt);
+        let named: Vec<&'static str> = operations
+            .iter()
+            .copied()
+            .filter(|operation| actions.iter().any(|a| action_grants(a, operation)))
+            .collect();
+        if named.is_empty() {
+            continue;
+        }
+        let sid = statement_sid(stmt).to_string();
+        let patterns = object_key_patterns(policy.role, &sid, &statement_resources(stmt));
+        out.push(AxisStatement {
+            sid,
+            operations: named,
+            patterns,
+        });
+    }
+    out
+}
+
+/// The operation classes on which an `Allow` and a `Deny` in the same policy can
+/// select the same OBJECT KEY. Swept as a set rather than written for delete
+/// alone, but what the sweep buys differs by axis, and the earlier claim that
+/// get and put "carry a live overlap check" was only half right:
+///
+/// - `delete` is a TWO-operation axis (`s3:DeleteObject`,
+///   `s3:DeleteObjectVersion`), so its containment assertion can actually fire:
+///   an `Allow` may name a delete operation the overlapping `Deny` does not,
+///   leaving a non-empty uncovered set. That is the maintain legal-hold finding.
+/// - `get` and `put` are SINGLE-operation axes. A `Deny` that selects one of
+///   them necessarily names its only operation, so the uncovered set is always
+///   empty and the containment assertion structurally CANNOT fire on them. What
+///   the get/put sweep buys is not the containment property but the PIN: a `Deny`
+///   added to get or put makes a new `(role, axis)` pair that fails the
+///   `EXPECTED_OVERLAP_AXES` equality in
+///   `every_allow_deny_key_overlap_is_named_by_the_deny`. The sweep stays because
+///   that pin is worth having; it just does not establish containment on get/put.
+///
+/// The two axes NOT here have a domain that is not an object key, and the test
+/// fails closed on them instead: the list axis compares `s3:prefix` values
+/// (request parameters, not stored keys) and the KMS axis compares key ARNs.
+/// Neither can overlap today because no shipped `Deny` selects either -- the
+/// test asserts that emptiness directly, so a `Deny` added to one of them fails
+/// here rather than passing an axis this file does not model.
+const OBJECT_OVERLAP_AXES: [(&str, &[&str]); 3] = [
+    ("get", &["s3:GetObject"]),
+    ("put", &["s3:PutObject"]),
+    ("delete", &S3_DELETE_OPERATIONS),
+];
+
+/// The `(role, axis)` pairs where an `Allow` and a `Deny` statement cover a
+/// common key today. Exactly one: maintain's delete axis, over the legal-hold
+/// shard (`EXPECTED_DELETE_OVERLAPS` records the pattern pairs).
+///
+/// This is the anti-vacuity half of the containment test. Containment over an
+/// empty overlap set is vacuously true, so a test that only asserted the
+/// property would go green if the measurement stopped finding the overlap it
+/// exists for.
+const EXPECTED_OVERLAP_AXES: &[(&str, &str)] = &[("maintain", "delete")];
+
+/// Sid pairs of every `Deny` statement that selects a KMS operation.
+fn deny_kms_statement_sids(policy: &Policy) -> Vec<String> {
+    policy_statements(policy)
+        .iter()
+        .filter(|stmt| {
+            stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case("Deny"))
+        })
+        .filter(|stmt| {
+            statement_actions(stmt)
+                .iter()
+                .any(|a| action_selects_kms(a))
+        })
+        .map(|stmt| statement_sid(stmt).to_string())
+        .collect()
+}
+
+/// The containment property, for one policy. Returns the `(role, axis)` pairs
+/// where an overlap was found and checked, so a caller can pin that the
+/// measurement examined what it claims to.
+fn assert_allow_deny_overlaps_are_named(policy: &Policy) -> Vec<(&'static str, &'static str)> {
+    let role = policy.role;
+
+    // The two axes whose domain is not an object key. Neither is modelled here,
+    // so neither may carry a Deny: with an empty Deny side no Allow/Deny pair
+    // can select the same value, which is what makes the omission safe.
+    assert!(
+        list_prefix_patterns(policy, Some("Deny")).is_empty(),
+        "{role}: a Deny statement grants s3:ListBucket. The list axis compares \
+         s3:prefix request parameters rather than stored keys, so this file does \
+         not model an Allow/Deny overlap on it: whether the Deny covers every \
+         list the Allow permits is unchecked"
+    );
+    let deny_kms = deny_kms_statement_sids(policy);
+    assert!(
+        deny_kms.is_empty(),
+        "{role}: Deny statement(s) {deny_kms:?} select a KMS operation. The KMS \
+         axis compares key ARNs rather than stored keys, so this file does not \
+         model an Allow/Deny overlap on it: whether the Deny covers every KMS \
+         operation the Allow grants on the same key is unchecked"
+    );
+
+    let mut observed = Vec::new();
+    for (axis, operations) in OBJECT_OVERLAP_AXES {
+        let allows = axis_statements(policy, operations, "Allow");
+        let denies = axis_statements(policy, operations, "Deny");
+        for deny in &denies {
+            for allow in &allows {
+                let witnesses: Vec<&String> = key_domain()
+                    .iter()
+                    .filter(|key| {
+                        deny.patterns
+                            .iter()
+                            .any(|p| glob_matches(p.as_str(), key.as_str()))
+                            && allow
+                                .patterns
+                                .iter()
+                                .any(|p| glob_matches(p.as_str(), key.as_str()))
+                    })
+                    .collect();
+                if witnesses.is_empty() {
+                    continue;
+                }
+                observed.push((role, axis));
+                let uncovered: Vec<&str> = allow
+                    .operations
+                    .iter()
+                    .copied()
+                    .filter(|operation| !deny.operations.contains(operation))
+                    .collect();
+                assert!(
+                    uncovered.is_empty(),
+                    "{role}: on the {axis} axis, Allow statement {} and Deny \
+                     statement {} both cover key(s) {witnesses:?}, and the Allow \
+                     grants {uncovered:?} there, which the Deny does not name. An \
+                     IAM Deny overrides an Allow only for the operations it \
+                     names, so the effective capability on those keys includes \
+                     {uncovered:?}: the overlap is NOT neutralized. Either name \
+                     those operations in the Deny, or narrow the Allow off these \
+                     keys",
+                    allow.sid,
+                    deny.sid
+                );
+            }
+        }
+    }
+    observed.sort_unstable();
+    observed.dedup();
+    observed
+}
+
+/// A Deny overrides only the operations it NAMES.
+///
+/// `delete_deny_and_allow_overlap_exactly_where_expected` measures WHERE the
+/// shipped delete Allow and Deny sets cover the same key, and its
+/// justification for the three recorded maintain pairs is that an explicit IAM
+/// Deny wins, so the effective capability is still correct. That justification
+/// holds only for the actions the Deny names, and nothing asserted it: drop
+/// `s3:DeleteObjectVersion` from `DenyDeleteProtected` and Maintain can
+/// permanently destroy versions of legal-hold audit objects
+/// (`t/<hash>/u/{l0,c,l1}/0000/...`, reached through `t/*/*/l0/*` and its two
+/// siblings) while the overlap measurement reports the same three pairs and
+/// every pattern expectation stays green. ADR-0055 section 2 and its section 3
+/// amendment call that shard deny-delete-forever, so this is a documented
+/// invariant with no check under it.
+///
+/// The assertion is CONTAINMENT, not equality: the Allow's operations on the
+/// overlapping keys must be a subset of the Deny's. A Deny broader than the
+/// Allow is legitimate (admin's Deny names both delete operations while its
+/// `sys/qualify/*` grant names one), and equality would reject it.
+///
+/// Swept over every axis where an Allow and a Deny can select the same key, not
+/// written for delete: see `OBJECT_OVERLAP_AXES` for the two axes whose domain
+/// is not a key and how the sweep fails closed on them instead.
+#[test]
+fn every_allow_deny_key_overlap_is_named_by_the_deny() {
+    let mut observed = Vec::new();
+    for role in ALL_ROLES {
+        observed.extend(assert_allow_deny_overlaps_are_named(&load_policy(role)));
+    }
+    observed.sort_unstable();
+    observed.dedup();
+    assert_eq!(
+        observed.as_slice(),
+        EXPECTED_OVERLAP_AXES,
+        "the set of (role, axis) pairs carrying an Allow/Deny key overlap is not \
+         the one EXPECTED_OVERLAP_AXES records. A missing pair means the \
+         containment above now checks nothing where it used to check the \
+         legal-hold shard; a new pair means an Allow and a Deny began covering a \
+         common key on an axis where they did not"
+    );
+}
+
+/// The containment assertion in both directions, on synthetic policies, so
+/// neither direction rests on the shipped templates happening to be correct.
+///
+/// Case 1 is the shape that must stay accepted: a Deny naming MORE operations
+/// than the overlapping Allow grants. Asserting the two action sets are EQUAL
+/// would reject it, and equality is a stronger condition than the property
+/// needs.
+///
+/// Case 2 is the finding itself, reproduced in miniature: an Allow granting a
+/// delete operation the overlapping Deny does not name.
+#[test]
+fn deny_broader_than_the_allow_is_accepted_and_narrower_is_not() {
+    let hold_shard = format!("{BUCKET_KEY_PREFIX}t/*/u/*/0000/*");
+    let level_zero = format!("{BUCKET_KEY_PREFIX}t/*/*/l0/*");
+
+    let policy = |allow_actions: serde_json::Value, deny_actions: serde_json::Value| {
+        build_policy(
+            "fixture",
+            "<synthetic>",
+            &serde_json::json!({
+                "Statement": [
+                    {
+                        "Sid": "LevelDelete",
+                        "Effect": "Allow",
+                        "Action": allow_actions,
+                        "Resource": [level_zero],
+                    },
+                    {
+                        "Sid": "DenyDeleteProtected",
+                        "Effect": "Deny",
+                        "Action": deny_actions,
+                        "Resource": [hold_shard],
+                    },
+                ]
+            }),
+        )
+    };
+
+    // Case 1: Deny names both operations, the Allow grants one. Accepted, and
+    // the overlap is real -- the returned axis proves the check ran rather than
+    // finding nothing to check.
+    let broader = policy(
+        serde_json::json!("s3:DeleteObject"),
+        serde_json::json!(["s3:DeleteObject", "s3:DeleteObjectVersion"]),
+    );
+    assert_eq!(
+        assert_allow_deny_overlaps_are_named(&broader),
+        vec![("fixture", "delete")],
+        "fixture invalid: the Allow and the Deny were expected to cover a common \
+         legal-hold key, or case 1 proves nothing about a Deny broader than the \
+         Allow"
+    );
+
+    // Case 2: the same overlap with the operations swapped. Rejected, naming the
+    // operation the Deny leaves granted.
+    let narrower = policy(
+        serde_json::json!(["s3:DeleteObject", "s3:DeleteObjectVersion"]),
+        serde_json::json!("s3:DeleteObject"),
+    );
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_allow_deny_overlaps_are_named(&narrower)
+    }));
+    let message = panic_message(
+        failure.expect_err("a Deny that names less than the overlapping Allow must fail"),
+    );
+    assert!(
+        message.contains("s3:DeleteObjectVersion"),
+        "the failure must name the operation the Deny does not cover; got \
+         {message:?}"
+    );
+}
+
+/// Admin is GetObject-only per ADR-0055 (its only tenant-scoped writes are
+/// narrow, create-only control paths, not routine data-object PUTs), so it
+/// must never carry `kms:GenerateDataKey*`: granting it would widen the
+/// compromise blast radius the ADR-0072 key-policy posture exists to limit.
+/// Flip `deploy/iam/admin.json`'s `AdminTenantKms` statement to include
+/// `kms:GenerateDataKey*` and this test fails.
+#[test]
+fn admin_has_no_kms_generate_data_key() {
+    let policy = load_policy("admin");
+    let actions = kms_actions(&policy);
+    assert!(
+        !actions
+            .iter()
+            .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
+        "admin: policy must not carry kms:GenerateDataKey* (Decrypt-only per ADR-0055). \
+         Found kms actions: {actions:?}"
+    );
+}
+
+/// The delete-grant guard's body, factored out so the regression fixtures run
+/// the real assertion on synthetic policies rather than a re-typed copy of it
+/// (the same pattern the KMS `assert_kms_resource_*` helpers use). The delete
+/// set is derived first, so a delete-capable Allow that is out-of-bucket or
+/// wildcard-actioned fails inside `delete_key_patterns` before any
+/// protected-block check.
+///
+/// A synthetic fixture still has to carry the whole shape --- the scratch Allows
+/// and a Deny block as well as the statement under test --- or it fails the
+/// first `assert_eq` for an unrelated reason and cannot tell a guard that
+/// rejects from one that does not.
+///
+/// Scratch means a prefix whose objects are transient, hold no tenant data and
+/// anchor nothing: the qualification run's `sys/qualify/<run-id>/` and the
+/// Parquet bucket probe's `sys/pq-probe/<random>`, which the probe deletes
+/// before it returns. Both are in `ADMIN_SCRATCH_DELETES`.
+fn assert_admin_delete_grant_is_scratch_only(policy: &Policy) {
+    let deletes = delete_key_patterns(policy, "Allow");
+    assert_eq!(
+        deletes, ADMIN_SCRATCH_DELETES,
+        "{}: the delete-capable Allows must be exactly the scratch prefixes \
+         {ADMIN_SCRATCH_DELETES:?} (so `store qualify` can exercise the delete \
+         probe and the Parquet bucket probe can remove its object); found \
+         {deletes:?}",
+        policy.role
+    );
+
+    // Whatever the grant list is, it must reach no real tenant object under
+    // t/**. representative_keys() are all t/<hash>/... shapes, so a delete
+    // pattern matching any of them would grant delete on tenant data.
+    let tenant_keys = representative_keys();
+    for pattern in &deletes {
+        for key in &tenant_keys {
+            assert!(
+                !glob_matches(pattern, key),
+                "{}: delete grant {pattern:?} reaches tenant key {key:?}",
+                policy.role
+            );
+        }
+    }
+
+    // ...and it must not cover any key the same policy denies delete on. Each
+    // DenyDeleteProtected pattern is instantiated into a concrete key (every
+    // `*` becomes a literal segment) and the grant glob must not match it.
+    let protected = delete_key_patterns(policy, "Deny");
+    assert!(
+        !protected.is_empty(),
+        "{}: DenyDeleteProtected names no delete-protected keys -- the \
+         disjointness check below would pass having examined nothing",
+        policy.role
+    );
+    for grant in &deletes {
+        for prot in &protected {
+            let sample = prot.replace('*', "x");
+            assert!(
+                !glob_matches(grant, &sample),
+                "{}: delete grant {grant:?} covers protected key {sample:?} \
+                 (from DenyDeleteProtected pattern {prot:?})",
+                policy.role
+            );
+        }
+    }
+}
+
+/// Admin's delete grants, in template order: the scratch prefixes
+/// `assert_admin_delete_grant_is_scratch_only` accepts and nothing else.
+const ADMIN_SCRATCH_DELETES: &[&str] = &["sys/qualify/*", "sys/pq-probe/*"];
+
+/// Admin's only `s3:DeleteObject` grants are two transient scratch prefixes:
+/// `sys/qualify/*`, so `ravel-cli store qualify` can run ADR-0050's
+/// delete-visibility probe (which deletes a key under `sys/qualify/<run-id>/`)
+/// on a fresh bucket without failing closed, and `sys/pq-probe/*`, so the
+/// Parquet bucket probe `ravel-cli tenant parquet-grant add` runs can delete
+/// the object it wrote. Admin holds no delete on tenant data (`t/**`) or on any
+/// key the same policy's `DenyDeleteProtected` block covers, so ADR-0055's
+/// property "Admin never deletes tenant data or a protected key" still holds.
+/// Widen the grant beyond those two prefixes, or drop either, and this test
+/// fails.
+#[test]
+fn admin_delete_grant_is_scratch_only() {
+    let policy = load_policy("admin");
+    assert_admin_delete_grant_is_scratch_only(&policy);
+}
+
+/// The historical Allow side of `delete_key_patterns`, kept verbatim so the
+/// fixture below pins two holes independent of the fixed code: delete capability
+/// recognized only by an exact `s3:DeleteObject` match, and any resource not
+/// under the bucket prefix silently dropped (`if let Some(..)` with no `else`).
+/// It spells out exactly the two comparisons whose holes it pins
+/// (`eq_ignore_ascii_case` on the action, `strip_prefix` against a literal ARN);
+/// reusing today's live predicate would make the fixture a tautology the moment
+/// that predicate changed.
+///
+/// Everything that is NOT the hole still goes through live code, so an assertion
+/// whose whole content is "this body came back empty" could be satisfied by a
+/// regression in that live code instead of by the hole. The fixture pins WHY the
+/// result was empty from the raw JSON alongside: it asserts the delete set
+/// exactly, then asserts separately which of the two holes swallowed the
+/// statement.
+fn pre_fix_allow_delete_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let is_allow = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+        if !is_allow {
+            continue;
+        }
+        let grants_delete = statement_actions(stmt)
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("s3:DeleteObject"));
+        if !grants_delete {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+                out.push(key_pattern.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Regression fixture for the two delete-capability holes: a delete grant
+/// recognized only by an exact `s3:DeleteObject` match, and a resource not under
+/// the bucket prefix silently dropped. So a statement granting
+/// `s3:*`/`s3:Delete*`/`*` on any resource, or `s3:DeleteObject` on `"*"` or a
+/// different bucket, was invisible: the delete-pattern helper returned an empty
+/// set and "Admin's only delete Allow is sys/qualify/*" passed while a
+/// delete-everywhere grant sat unexamined. Both closed: the Action is matched as
+/// an IAM wildcard pattern (ASCII-folded, `*`/`?` resolved), and a delete-capable
+/// statement whose Resource is not bucket-relative is a test failure naming the
+/// Sid, never a dropped entry.
+///
+/// Synthetic statements, not `deploy/iam/*.json`: a fixture over the shipped
+/// (correct) admin policy passes whichever way the matcher behaves.
+///
+/// Each fixture carries the WHOLE bypass shape, not just the permissive
+/// statement: admin's shipped `s3:DeleteObject` Allows on `sys/qualify/*` and
+/// `sys/pq-probe/*` (which the exact match sees), the permissive statement
+/// (which it does not), and a
+/// `DenyDeleteProtected` block. That combination makes the fixture reach the same
+/// PASSING state under the historical derivation that admin's real policy
+/// reaches, so only the post-fix derivation rejects. A fixture holding the
+/// permissive statement alone panics on the scratch-only `assert_eq` either way,
+/// which makes a bare `is_err()` unfalsifiable. So each case asserts in both
+/// directions and names WHICH: the historical derivation returns exactly the
+/// scratch prefix (hiding the grant), and the post-fix guard rejects with that
+/// case's expected message.
+#[test]
+fn wildcard_or_out_of_bucket_delete_grant_is_not_a_bypass() {
+    // The two post-fix rejection paths, as a substring of the panic each
+    // produces. Asserting the message rather than `is_err()` is what keeps them
+    // distinguishable: a fixture rejected by some third guard, or by a missing
+    // Deny block, would otherwise read as a pass for the wrong reason.
+    const UNCLASSIFIED_RESOURCE: &str =
+        "reaching here means a guard ran on an unvalidated statement";
+    const NOT_SCRATCH_ONLY: &str = "the delete-capable Allows must be exactly the scratch prefixes";
+
+    // (Sid, Action, Resource, does the pre-fix EXACT action match recognize it,
+    //  which post-fix rejection the case must produce)
+    let cases = [
+        // Wildcard action the exact match misses, on the bare "*" resource: the
+        // action hole and the resource hole at once. Post-fix the action is
+        // selected and the resource classifies as nothing, so the rejection
+        // comes from inside delete_key_patterns.
+        (
+            "StarActionStarResource",
+            serde_json::json!("s3:*"),
+            "*",
+            false,
+            UNCLASSIFIED_RESOURCE,
+        ),
+        // Wildcard action, bucket-relative resource OUTSIDE sys/qualify: the
+        // action hole ALONE. The resource is classifiable either way, so this
+        // case reddens only if the action predicate resolves wildcards, and it
+        // surfaces as a second, non-scratch pattern in the delete set.
+        (
+            "DeleteStarOutsidePrefix",
+            serde_json::json!("s3:Delete*"),
+            "arn:aws:s3:::my-ravel-bucket/t/tenant/data",
+            false,
+            NOT_SCRATCH_ONLY,
+        ),
+        // The all-actions wildcard on a DIFFERENT bucket's ARN: the action hole
+        // plus a resource that names another bucket entirely.
+        (
+            "StarActionOtherBucket",
+            serde_json::json!("*"),
+            "arn:aws:s3:::other-bucket/t/*",
+            false,
+            UNCLASSIFIED_RESOURCE,
+        ),
+        // Mis-cased literal delete on "*": here the pre-fix EXACT match already
+        // recognized the action (it folds case), so this isolates the resource
+        // hole ALONE --- the statement was seen as a delete yet its "*" resource
+        // was silently dropped, leaving the scratch prefix as the whole set.
+        (
+            "WrongCaseDeleteObjectStarResource",
+            serde_json::json!("S3:DELETEOBJECT"),
+            "*",
+            true,
+            UNCLASSIFIED_RESOURCE,
+        ),
+    ];
+
+    let protected_resources: Vec<String> = PROTECTED_DELETE_KEYS
+        .iter()
+        .map(|key| format!("{BUCKET_KEY_PREFIX}{key}"))
+        .collect();
+
+    for (sid, action, resource, pre_fix_exact_recognizes, expected_rejection) in cases {
+        let policy = Policy {
+            role: "fixture",
+            statements: serde_json::json!([
+                // The shipped scratch deletes. The pre-fix exact action match
+                // sees these two, so the pre-fix delete set is non-empty and
+                // equal to what the guard demands.
+                {
+                    "Sid": "AdminQualifyScratchDelete",
+                    "Effect": "Allow",
+                    "Action": "s3:DeleteObject",
+                    "Resource": format!("{BUCKET_KEY_PREFIX}sys/qualify/*"),
+                },
+                // The permissive statement the pre-fix match misses.
+                {
+                    "Sid": sid,
+                    "Effect": "Allow",
+                    "Action": action,
+                    "Resource": resource,
+                },
+                {
+                    "Sid": "AdminProbeDelete",
+                    "Effect": "Allow",
+                    "Action": "s3:DeleteObject",
+                    "Resource": format!("{BUCKET_KEY_PREFIX}sys/pq-probe/*"),
+                },
+                // ...and the protected block, so the guard's "DenyDeleteProtected
+                // names no keys" check cannot be what rejects and mask which
+                // assertion actually fired.
+                {
+                    "Sid": "DenyDeleteProtected",
+                    "Effect": "Deny",
+                    "Action": PROTECTED_DELETE_ACTIONS,
+                    "Resource": protected_resources,
+                },
+            ]),
+        };
+        let permissive = &policy_statements(&policy)[1];
+        let actions = statement_actions(permissive);
+
+        // Observation 1 (load-bearing): under the pre-fix derivation the delete
+        // set is EXACTLY the shipped scratch prefix --- the permissive statement
+        // contributes nothing --- so the scratch-only assert_eq passes on a
+        // policy that grants delete outside sys/qualify. That is the hole. If
+        // this stops holding, the fixture no longer reaches the state admin's
+        // real policy reaches and must be rewritten, not deleted.
+        let pre_fix = pre_fix_allow_delete_key_patterns(&policy);
+        assert_eq!(
+            pre_fix, ADMIN_SCRATCH_DELETES,
+            "fixture {sid} invalid: the pre-fix derivation must return exactly \
+             the shipped scratch prefixes, hiding the permissive grant so the \
+             scratch-only assertion passes over it; returned {pre_fix:?}"
+        );
+
+        // ...pin WHY the permissive statement was invisible so the two holes
+        // stay distinguishable: either the pre-fix exact match did not see a
+        // wildcard action, or it saw the action but the silent drop discarded a
+        // non-bucket-relative resource.
+        let pre_fix_action_hit = actions
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("s3:DeleteObject"));
+        assert_eq!(
+            pre_fix_action_hit, pre_fix_exact_recognizes,
+            "fixture {sid} invalid: expected pre-fix exact action recognition = \
+             {pre_fix_exact_recognizes} for {actions:?}"
+        );
+        assert!(
+            any_action_grants_any(&actions, &S3_DELETE_OPERATIONS),
+            "fixture {sid} invalid: the post-fix action predicate must recognize \
+             {actions:?} as a delete grant"
+        );
+
+        // Observation 2: the real guard fires on the synthetic policy, and the
+        // message says which path did it --- panicking inside
+        // delete_key_patterns on a resource that classifies as nothing, or
+        // failing the scratch-only assert_eq on a second, non-scratch key.
+        // catch_unwind so the panic is reported as a result here.
+        let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_admin_delete_grant_is_scratch_only(&policy)
+        }));
+        let message = panic_message(guard.expect_err(&format!(
+            "the delete guard must reject fixture {sid}: a delete-capable \
+             statement on {resource:?} must surface as a permissive grant, not \
+             sit unexamined beside the scratch prefix"
+        )));
+        assert!(
+            message.contains(expected_rejection),
+            "fixture {sid}: the delete guard rejected, but not for the reason \
+             this case is written for. Expected a message containing \
+             {expected_rejection:?}; got {message:?}"
+        );
+    }
+}
+
+/// Every role reads SSE-KMS objects at some point (fold, query resolve,
+/// compaction inputs, `ravel-cli` inspection) and decryption on GET is
+/// server-side but still requires `kms:Decrypt` on the caller's IAM policy
+/// (ADR-0062 section 1a's "reads never select a key" is about client-side
+/// key *selection*, not about needing no grant at all). Remove any role's
+/// `kms:Decrypt` action in `deploy/iam/*.json` and this test fails, naming
+/// that role.
+#[test]
+fn every_role_has_kms_decrypt() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let actions = kms_actions(&policy);
+        assert!(
+            actions.iter().any(|a| action_grants(a, "kms:Decrypt")),
+            "{role}: policy is missing kms:Decrypt -- its reads of SSE-KMS objects \
+             under a --tenant-kms-config tenant will fail closed. \
+             Found kms actions: {actions:?}"
+        );
+    }
+}
+
+/// The two wildcard characters IAM resolves inside a `Resource` ARN: `*`
+/// matches any sequence, `?` matches exactly one character. Either one, in
+/// any segment of a KMS ARN, grants more keys than the ARN appears to name:
+/// `key/????????-????-????-????-????????????` covers every key whose id has
+/// the shape of a UUID, and a `?` or `*` in the region or account position
+/// widens the grant the same way.
+const IAM_WILDCARDS: [char; 2] = ['*', '?'];
+
+/// True when `resource` names more than the single key it appears to name.
+fn kms_resource_is_wildcarded(resource: &str) -> bool {
+    resource.contains(IAM_WILDCARDS)
+}
+
+/// The ARN shape a KMS `Resource` must have to pin one key: no IAM wildcard
+/// in any segment, and a key-id segment that cannot span a `/` (so an
+/// `alias/...` or a nested path cannot pose as a key id).
+fn kms_key_arn_pattern() -> regex::Regex {
+    regex::Regex::new(r"^arn:aws:kms:[^:*?/]+:[^:*?/]+:key/[^:*?/]+$").expect("valid regex")
+}
+
+/// The account-wide-grant half of the KMS resource guard, as one function so
+/// the regression fixtures below run the real assertion rather than a copy of
+/// its text.
+fn assert_kms_resource_is_not_account_wide(role: &str, sid: &str, resource: &str) {
+    assert!(
+        !kms_resource_is_wildcarded(resource),
+        "{role}: statement {sid:?} grants a kms: action on {resource:?}, which \
+         contains an IAM wildcard (`*` or `?`) and so covers keys beyond the one \
+         it appears to name"
+    );
+}
+
+/// The names-a-specific-key half of the KMS resource guard, likewise shared
+/// with the fixtures.
+fn assert_kms_resource_names_a_key_id(role: &str, sid: &str, resource: &str) {
+    assert!(
+        kms_key_arn_pattern().is_match(resource),
+        "{role}: statement {sid:?} resource {resource:?} does not name a \
+         specific key id (expected arn:aws:kms:<region>:<account>:key/<id>, \
+         with no `*` or `?` in any segment)"
+    );
+}
+
+/// Every ALLOW statement whose `Action` grants any `kms:` action must not name a
+/// `Resource` that covers every key in the account/region: not the bare
+/// wildcard `"*"`, not an ARN ending `:key/*`, and not an ARN carrying an IAM
+/// wildcard character anywhere else either. Only `Allow` statements are checked
+/// (`kms_statement_resources` filters to them): a `Deny` naming `key/*` is a
+/// broad prohibition, not an over-broad grant. Pinned as a negation (not an
+/// exact tenant-key ARN) so it survives an operator's post-substitution
+/// value. Widen any of the four templates' KMS `Resource` back to
+/// `arn:aws:kms:us-east-1:111122223333:key/*` and this test fails, naming
+/// the role and the statement `Sid`.
+#[test]
+fn no_allow_kms_statement_grants_every_key_in_the_region() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let statements = kms_statement_resources(&policy);
+        assert!(
+            !statements.is_empty(),
+            "{role}: no statement carrying a kms: action was found -- this guard \
+             would pass having examined nothing"
+        );
+        for (sid, resources) in statements {
+            assert!(
+                !resources.is_empty(),
+                "{role}/{sid}: statement grants a KMS operation but names no \
+                 {KMS_ARN_PREFIX:?} key ARN -- this guard would examine nothing \
+                 (validate_statement rejects the shape, so a shipped template reaching \
+                 here means the choke point was bypassed)"
+            );
+            for resource in &resources {
+                assert_kms_resource_is_not_account_wide(role, &sid, resource);
+            }
+        }
+    }
+}
+
+/// Every ALLOW statement whose `Action` grants any `kms:` action must name a
+/// `Resource` that pins a specific key id, so an operator cannot re-widen
+/// the grant to every key by substituting `arn:aws:kms:<region>:<account>:key/*`
+/// (or any other wildcard variant, in the key id or in the region or account
+/// segment) in place of the placeholder. Only `Allow` statements are checked
+/// (`kms_statement_resources` filters to them): a `Deny` names a prohibition,
+/// which need not pin a single key.
+#[test]
+fn every_allow_kms_statement_names_a_key_id() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let statements = kms_statement_resources(&policy);
+        assert!(
+            !statements.is_empty(),
+            "{role}: no statement carrying a kms: action was found -- this guard \
+             would pass having examined nothing"
+        );
+        for (sid, resources) in statements {
+            assert!(
+                !resources.is_empty(),
+                "{role}/{sid}: statement grants a KMS operation but names no \
+                 {KMS_ARN_PREFIX:?} key ARN -- this guard would examine nothing \
+                 (validate_statement rejects the shape, so a shipped template reaching \
+                 here means the choke point was bypassed)"
+            );
+            for resource in &resources {
+                assert_kms_resource_names_a_key_id(role, &sid, resource);
+            }
+        }
+    }
+}
+
+/// Regression fixture for the case-sensitivity fix above: `KMS:Decrypt` (or any
+/// other capitalization) on `"Resource": "*"` is exactly as fully-permissive as
+/// `kms:Decrypt`, and the case-sensitive `starts_with("kms:")` selection both
+/// guards above used to run would silently skip it -- reporting the templates
+/// safe while a fully-permissive statement sat unexamined. This is not a real
+/// shipped template; it is a synthetic statement built to prove the matcher
+/// itself, independent of what `deploy/iam/*.json` currently contains.
+#[test]
+fn mixed_case_kms_action_is_not_a_bypass() {
+    let stmt = serde_json::json!({
+        "Sid": "MixedCaseFullyPermissive",
+        "Effect": "Allow",
+        "Action": "KMS:Decrypt",
+        "Resource": "*"
+    });
+    let actions = statement_actions(&stmt);
+
+    // Observation 1 (load-bearing): the pre-fix selection (case-sensitive)
+    // misses the mixed-case action entirely, exactly the hole this test guards
+    // against. Kept as the literal pre-fix expression, not a call into the
+    // fixed code, so it pins that the hole existed.
+    let selected_before_fix = actions.iter().any(|a| a.starts_with("kms:"));
+    assert!(
+        !selected_before_fix,
+        "fixture invalid: the pre-fix case-sensitive matcher was expected to \
+         miss \"KMS:Decrypt\" -- if it didn't, this fixture no longer proves \
+         the hole existed"
+    );
+
+    // Observation 2: the post-fix selection catches it, through the same
+    // helper the guards use.
+    let selected_after_fix = actions.iter().any(|a| action_selects_kms(a));
+    assert!(
+        selected_after_fix,
+        "fixture invalid: the post-fix matcher should select \"KMS:Decrypt\""
+    );
+
+    // Observation 3: the guard's own function -- not a re-typed copy of its
+    // expression -- must fire on this fixture's "Resource": "*" now that the
+    // statement is selected. Run it through catch_unwind so this test reports
+    // the panic as an assertion result instead of aborting the binary.
+    let resource = stmt["Resource"].as_str().expect("Resource is a string");
+    let sid = stmt["Sid"].as_str().expect("Sid is a string");
+    let guard_result = std::panic::catch_unwind(|| {
+        assert_kms_resource_is_not_account_wide("fixture", sid, resource)
+    });
+    assert!(
+        guard_result.is_err(),
+        "the guard must reject \"KMS:Decrypt\" on Resource \"*\" once the \
+         statement is selected -- a mixed-case action must not bypass the \
+         no-account-wide-key assertion"
+    );
+}
+
+/// Regression fixture for the case-sensitivity hole in a NEGATIVE assertion,
+/// which fails silent where the positive ones fail loud. IAM action names are
+/// case-insensitive, so a policy granting `KMS:GenerateDataKey*` holds exactly
+/// the privilege `admin_has_no_kms_generate_data_key` asserts the role does
+/// not hold. Both halves of that assertion used to compare case-sensitively:
+/// `kms_actions` selected on `starts_with("kms:")`, and the caller compared
+/// with `starts_with("kms:GenerateDataKey")`. Either one alone was enough to
+/// report a role Decrypt-only while it could mint ciphertext under every
+/// tenant key the statement names.
+///
+/// Synthetic, not read from `deploy/iam/`: the shipped admin template is
+/// lowercase and correct, so a fixture over it passes whichever way the
+/// matcher behaves and proves nothing about the matcher.
+#[test]
+fn mixed_case_generate_data_key_is_not_missed_by_the_negative_assertion() {
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "MixedCaseGenerateDataKey",
+            "Effect": "Allow",
+            "Action": ["KMS:GenerateDataKey*", "KMS:Decrypt"],
+            "Resource":
+                "arn:aws:kms:us-east-1:111122223333:key/abcd1234-5678-90ab-cdef-1234567890ab"
+        }]),
+    };
+    let declared: Vec<String> = policy
+        .statements
+        .as_array()
+        .expect("fixture statements are an array")
+        .iter()
+        .flat_map(statement_actions)
+        .collect();
+
+    // Observation 1 (load-bearing): the pre-fix selection saw no kms action at
+    // all, so the negative assertion held over an empty action list while the
+    // grant sat in the policy. Written as the literal pre-fix expressions, so
+    // this pins the hole rather than restating the fix.
+    let selected_before_fix: Vec<&String> =
+        declared.iter().filter(|a| a.starts_with("kms:")).collect();
+    assert!(
+        selected_before_fix.is_empty(),
+        "fixture invalid: the pre-fix selection was expected to miss \
+         \"KMS:GenerateDataKey*\" -- if it saw it, this fixture no longer \
+         proves the hole existed"
+    );
+    // The second half of the hole, independent of the first: even handed the
+    // action directly, the pre-fix comparison did not recognize it.
+    assert!(
+        !declared
+            .iter()
+            .any(|a| a.starts_with("kms:GenerateDataKey")),
+        "fixture invalid: the pre-fix comparison was expected to miss \
+         \"KMS:GenerateDataKey*\" even when given the action"
+    );
+
+    // Observation 2: the post-fix selection and comparison both see it, so the
+    // negative assertion in admin_has_no_kms_generate_data_key now fires.
+    let actions = kms_actions(&policy);
+    assert!(
+        actions
+            .iter()
+            .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
+        "the post-fix matcher must see KMS:GenerateDataKey* as the \
+         kms:GenerateDataKey* grant it is. Found kms actions: {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|a| action_grants(a, "kms:Decrypt")),
+        "the post-fix matcher must see KMS:Decrypt as kms:Decrypt. \
+         Found kms actions: {actions:?}"
+    );
+
+    // Observation 3: the selected strings keep the template's own
+    // capitalization, so a failure message quotes what the policy says rather
+    // than a normalized form the operator cannot find in the file.
+    assert!(
+        actions.iter().any(|a| a == "KMS:GenerateDataKey*"),
+        "kms_actions must preserve the policy's own spelling for failure \
+         messages. Found kms actions: {actions:?}"
+    );
+}
+
+/// The same case-sensitivity shape on the `s3:PutObject` selection that feeds
+/// `roles_writing_routed_objects_have_kms_grant`. That guard derives the set
+/// of routed PUT patterns from the policy and skips the role outright when the
+/// set is empty, so a case-sensitive match on the action name silently skips
+/// the KMS-grant check for a role that does route writes -- the same
+/// fails-silent shape as the negative assertion above, reached through an
+/// empty derived set instead of an empty action list.
+///
+/// Synthetic for the same reason: the shipped templates spell the action
+/// lowercase.
+#[test]
+fn mixed_case_put_object_still_selects_routed_write_patterns() {
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "MixedCaseRoutedPut",
+            "Effect": "Allow",
+            "Action": ["S3:PutObject"],
+            "Resource": ["arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*"]
+        }]),
+    };
+
+    // Observation 1 (load-bearing): the pre-fix case-sensitive equality
+    // selected nothing, so the derived routed-PUT set was empty and the guard
+    // continued past this role without checking any KMS grant.
+    let selected_before_fix = policy
+        .statements
+        .as_array()
+        .expect("fixture statements are an array")
+        .iter()
+        .any(|stmt| statement_actions(stmt).iter().any(|a| a == "s3:PutObject"));
+    assert!(
+        !selected_before_fix,
+        "fixture invalid: the pre-fix case-sensitive match was expected to \
+         miss \"S3:PutObject\" -- if it saw it, this fixture no longer proves \
+         the hole existed"
+    );
+
+    // Observation 2: the post-fix selection returns the pattern, and the real
+    // routing predicate confirms it is a routed write, so the guard now
+    // reaches its KMS-grant assertions for this role instead of skipping it.
+    let patterns = put_resource_key_patterns(&policy);
+    assert_eq!(
+        patterns,
+        vec!["t/*/*/l0/*".to_string()],
+        "the post-fix selection must return the statement's PUT pattern"
+    );
+    assert!(
+        patterns
+            .iter()
+            .any(|p| ravel_object_store::routes_through_tenant_key(p)),
+        "fixture invalid: {patterns:?} must route through the tenant key, or \
+         the guard would skip this role for a reason unrelated to the matcher"
+    );
+}
+
+/// Regression fixture for the single-character-wildcard hole: IAM resolves `?`
+/// inside a `Resource` ARN as exactly one character, so
+/// `key/????????-????-????-????-????????????` grants every key whose id has the
+/// shape of a UUID, and a `?` in the region or account segment widens the grant
+/// the same way. Both pre-fix predicates accepted those ARNs: the direct check
+/// tested only for the two literals `"*"` and a `:key/*` suffix, and the ARN
+/// regex excluded `*` from the key-id segment alone. The guards therefore ran
+/// and reported the templates scoped while an effectively account-wide grant sat
+/// unexamined.
+///
+/// Synthetic statements, not `deploy/iam/*.json`: a fixture read from the config
+/// directory passes for reasons unrelated to the matcher, and goes green the day
+/// someone edits the config. Each case asserts in both directions -- that the
+/// pre-fix predicates did NOT reject the resource (so the test cannot quietly
+/// become a tautology if the predicates are rewritten) and that the post-fix
+/// ones do.
+#[test]
+fn single_character_wildcard_in_kms_resource_is_not_a_bypass() {
+    // The pre-fix ARN shape check, kept verbatim so observation 1 below pins
+    // the hole rather than restating the fix.
+    let pre_fix_key_arn_pattern =
+        regex::Regex::new(r"^arn:aws:kms:[^:]+:[^:]+:key/[^*]+$").expect("valid regex");
+
+    let cases = [
+        (
+            "QuestionMarkKeyId",
+            "arn:aws:kms:us-east-1:111122223333:key/????????-????-????-????-????????????",
+        ),
+        (
+            "QuestionMarkRegionAndAccount",
+            "arn:aws:kms:us-east-?:11112222333?:key/abcd1234-5678-90ab-cdef-1234567890ab",
+        ),
+    ];
+
+    for (sid, resource) in cases {
+        let stmt = serde_json::json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": ["kms:Decrypt", "kms:Encrypt"],
+            "Resource": [resource],
+        });
+        let resources: Vec<String> = stmt["Resource"]
+            .as_array()
+            .expect("Resource is an array")
+            .iter()
+            .map(|v| v.as_str().expect("Resource entry is a string").to_string())
+            .collect();
+        assert_eq!(
+            resources.len(),
+            1,
+            "fixture invalid: expected exactly one resource for {sid}"
+        );
+        let resource = resources[0].as_str();
+
+        // Observation 1 (load-bearing): neither pre-fix predicate rejected this
+        // resource. If either one does, the fixture no longer proves the hole
+        // existed and must be rewritten rather than deleted.
+        let pre_fix_direct_rejects = resource == "*" || resource.ends_with(":key/*");
+        assert!(
+            !pre_fix_direct_rejects,
+            "fixture invalid: the pre-fix direct check was expected to accept \
+             {resource:?} -- if it rejects it, this fixture no longer proves the \
+             `?` hole existed"
+        );
+        assert!(
+            pre_fix_key_arn_pattern.is_match(resource),
+            "fixture invalid: the pre-fix ARN regex was expected to accept \
+             {resource:?} -- if it rejects it, this fixture no longer proves the \
+             `?` hole existed"
+        );
+
+        // Observation 2: both post-fix predicates reject it.
+        assert!(
+            kms_resource_is_wildcarded(resource),
+            "the post-fix direct check must treat {resource:?} as wildcarded"
+        );
+        assert!(
+            !kms_key_arn_pattern().is_match(resource),
+            "the post-fix ARN regex must reject {resource:?}"
+        );
+
+        // Observation 3: the real guards' own assertions fire on this statement.
+        // Run through catch_unwind so the panic is reported as a result here
+        // instead of aborting the binary.
+        let account_wide_guard = std::panic::catch_unwind(|| {
+            assert_kms_resource_is_not_account_wide("fixture", sid, resource)
+        });
+        assert!(
+            account_wide_guard.is_err(),
+            "no_allow_kms_statement_grants_every_key_in_the_region's assertion must \
+             fire on {resource:?}"
+        );
+        let key_id_guard = std::panic::catch_unwind(|| {
+            assert_kms_resource_names_a_key_id("fixture", sid, resource)
+        });
+        assert!(
+            key_id_guard.is_err(),
+            "every_allow_kms_statement_names_a_key_id's assertion must fire on \
+             {resource:?}"
+        );
+    }
+}
+
+/// Regression fixtures for the fail-closed choke point, closing the
+/// skip-what-you-do-not-understand class this guard exists for: a statement that
+/// could not read `Resource`, a case-sensitive action-prefix match, a `?`
+/// accepted in ARN segments, and `NotResource`/`NotAction` ignored. Before this,
+/// `load_policy` performed no per-statement validation, so a statement whose
+/// permission lived in a field
+/// no guard reads -- `NotResource`, `NotAction`, an unrecognized key such as a
+/// `Resources` typo, or a statement with no `Resource` at all -- was loaded and
+/// then silently skipped by whichever guard went looking for a field it did not
+/// find. The guard ran, reported the templates safe, and the statement sat
+/// unexamined.
+///
+/// Synthetic statements, not `deploy/iam/*.json`: the shipped templates carry
+/// only handled, well-formed statements, so a fixture over them proves nothing
+/// about the choke point and goes green the day someone edits the config. Each
+/// negative case asserts in both directions -- that the pre-fix guards found
+/// nothing to object to (Observation 1, the hole) and that `validate_statement`
+/// now rejects it naming both the `Sid` and the offending key (Observation 2).
+#[test]
+fn statement_using_an_unhandled_key_fails_closed() {
+    // (Sid, statement, substring the rejection must name, phrase identifying
+    // WHICH rule rejected, which field hid the permission pre-fix:
+    // "resource" => resource_key_patterns skipped it, "action" =>
+    // statement_actions saw no action).
+    //
+    // The name and the rule are separate columns because a Sid can contain the
+    // name (`TypoResources` contains `Resources`), and then "the rejection
+    // names the offending key" is implied by "the rejection names the Sid" and
+    // asserts nothing. The rule phrase is the independent claim: it fires when
+    // the choke point rejects for some other reason than the one this case is
+    // written for.
+    let negative_cases = [
+        (
+            "NegatedResource",
+            serde_json::json!({
+                "Sid": "NegatedResource",
+                "Effect": "Allow",
+                "Action": "s3:DeleteObject",
+                "NotResource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov"
+            }),
+            "NotResource",
+            "cannot reason about negated or principal-scoped",
+            "resource",
+        ),
+        (
+            "NegatedAction",
+            serde_json::json!({
+                "Sid": "NegatedAction",
+                "Effect": "Allow",
+                "NotAction": "s3:GetObject",
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "NotAction",
+            "cannot reason about negated or principal-scoped",
+            "action",
+        ),
+        (
+            "TypoResources",
+            serde_json::json!({
+                "Sid": "TypoResources",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resources": "arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*"
+            }),
+            "Resources",
+            "which no guard in this file handles",
+            "resource",
+        ),
+        (
+            "MissingResource",
+            serde_json::json!({
+                "Sid": "MissingResource",
+                "Effect": "Allow",
+                "Action": "s3:GetObject"
+            }),
+            "no Resource",
+            "the exact shape the resource guards skip",
+            "resource",
+        ),
+    ];
+
+    for (sid, stmt, must_name, must_explain, hidden_side) in &negative_cases {
+        let policy = Policy {
+            role: "fixture",
+            statements: serde_json::json!([stmt.clone()]),
+        };
+
+        // Observation 1 (load-bearing): the pre-fix guard that would have read
+        // the permission found nothing. A resource-hidden statement produces no
+        // resource pattern to check; an action-hidden statement produces no
+        // action. If the relevant set stops being empty, the fixture no longer
+        // proves the statement was skipped and must be rewritten, not deleted.
+        match *hidden_side {
+            "resource" => assert!(
+                resource_key_patterns(&policy).is_empty(),
+                "fixture {sid} invalid: resource_key_patterns was expected to \
+                 skip the statement (returning nothing); it did not"
+            ),
+            "action" => assert!(
+                statement_actions(stmt).is_empty(),
+                "fixture {sid} invalid: statement_actions was expected to see no \
+                 action (returning nothing); it did not"
+            ),
+            other => panic!("fixture {sid}: unknown hidden_side {other:?}"),
+        }
+
+        // Observation 2: the choke point rejects it, naming the Sid and the key,
+        // and the rejection is the one this case is written for.
+        let err = validate_statement("fixture", 0, stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        assert!(
+            err.contains(must_name),
+            "fixture {sid}: rejection must name {must_name:?}; got {err:?}"
+        );
+        assert!(
+            err.contains(sid),
+            "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+        assert!(
+            err.contains(must_explain),
+            "fixture {sid}: rejection must come from the rule this case is \
+             written for, whose message contains {must_explain:?}; got {err:?}"
+        );
+
+        // ...and so does the extracted loop `load_policy` actually runs
+        // (`validate_policy_statements`), called directly here rather than
+        // re-typed into a closure. `load_policy_rejects_an_unhandled_statement`
+        // separately pins that `load_policy`/`build_policy` still call it.
+        assert!(
+            validate_policy_statements(policy.role, &policy.statements).is_err(),
+            "fixture {sid}: validate_policy_statements (load_policy's real loop) \
+             must reject it"
+        );
+    }
+
+    // Positive control: a well-formed Allow whose keys are all handled passes.
+    let ok = serde_json::json!({
+        "Sid": "WellFormedAllow",
+        "Effect": "Allow",
+        "Action": ["s3:GetObject", "s3:PutObject"],
+        "Resource": ["arn:aws:s3:::my-ravel-bucket/t/*"]
+    });
+    assert!(
+        validate_statement("fixture", 0, &ok).is_ok(),
+        "a well-formed Allow with only handled keys must pass"
+    );
+}
+
+/// Companion to the choke point's key check: a statement whose keys are all
+/// handled but whose values are malformed must also fail closed rather than be
+/// skipped. Pre-fix, an `Effect` that is neither Allow nor Deny was skipped by
+/// every effect-filtered guard (they compare case-insensitively against exactly
+/// those two), and an `Action` or `Resource` that is neither a string nor an
+/// array of strings was read as an empty set and dropped. Synthetic for the
+/// same reason as above.
+#[test]
+fn malformed_effect_action_or_resource_fails_closed() {
+    let cases = [
+        (
+            "BadEffect",
+            serde_json::json!({
+                "Sid": "BadEffect",
+                "Effect": "Permit",
+                "Action": "s3:GetObject",
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "Effect",
+            "Effect is neither \"Allow\" nor \"Deny\"",
+        ),
+        (
+            "ActionIsNumber",
+            serde_json::json!({
+                "Sid": "ActionIsNumber",
+                "Effect": "Allow",
+                "Action": 7,
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "Action",
+            "Action is neither a string nor a non-empty array of strings",
+        ),
+        (
+            "ActionArrayHasNonString",
+            serde_json::json!({
+                "Sid": "ActionArrayHasNonString",
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", 7],
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "Action",
+            "Action is neither a string nor a non-empty array of strings",
+        ),
+        (
+            "ResourceIsNumber",
+            serde_json::json!({
+                "Sid": "ResourceIsNumber",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": 7
+            }),
+            "Resource",
+            "Resource is neither a string nor a non-empty array of strings",
+        ),
+    ];
+
+    for (sid, stmt, must_name, must_explain) in &cases {
+        let err = validate_statement("fixture", 0, stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        assert!(
+            err.contains(must_name),
+            "fixture {sid}: rejection must name {must_name:?}; got {err:?}"
+        );
+        assert!(
+            err.contains(sid),
+            "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+        // Independent of both above: every Sid here contains its own
+        // `must_name`, so "the rejection names the key" follows from "the
+        // rejection names the Sid" and asserts nothing on its own. This is the
+        // claim that fires when some other rule rejected the statement first.
+        assert!(
+            err.contains(must_explain),
+            "fixture {sid}: rejection must come from the rule this case is \
+             written for, whose message contains {must_explain:?}; got {err:?}"
+        );
+    }
+}
+
+/// An empty `Action`/`Resource` array must fail closed. Before the fix,
+/// `is_string_or_string_array` returned true for `[]` (`iter().all(..)` is
+/// vacuously true on an empty array), so `"Action": []` / `"Resource": []`
+/// passed validation and every downstream guard derived an empty set and skipped
+/// the statement -- the same skip class, one level inside a handled key.
+/// Synthetic, not `deploy/iam/*.json`: the shipped templates carry no empty
+/// arrays.
+#[test]
+fn empty_action_or_resource_array_fails_closed() {
+    let cases = [
+        (
+            "EmptyAction",
+            serde_json::json!({
+                "Sid": "EmptyAction",
+                "Effect": "Allow",
+                "Action": [],
+                "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"
+            }),
+            "Action",
+            "Action is neither a string nor a non-empty array of strings",
+        ),
+        (
+            "EmptyResource",
+            serde_json::json!({
+                "Sid": "EmptyResource",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": []
+            }),
+            "Resource",
+            "Resource is neither a string nor a non-empty array of strings",
+        ),
+    ];
+
+    for (sid, stmt, must_name, must_explain) in &cases {
+        // The fixed predicate rejects the empty array. (An `iter().all` over the
+        // empty array is vacuously true, which is exactly the pre-fix bug.)
+        assert!(
+            !is_string_or_string_array(stmt.get(must_name)),
+            "fixture {sid}: an empty {must_name} array must not count as a string array"
+        );
+        let err = validate_statement("fixture", 0, stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        assert!(
+            err.contains(must_name),
+            "fixture {sid}: rejection must name {must_name:?}; got {err:?}"
+        );
+        assert!(
+            err.contains(sid),
+            "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+        // Both Sids here contain their own `must_name`, so the key-naming
+        // assertion above follows from the Sid-naming one. This is the
+        // independent claim: the empty array is what rejected the statement.
+        assert!(
+            err.contains(must_explain),
+            "fixture {sid}: rejection must come from the string-array shape \
+             rule, whose message contains {must_explain:?}; got {err:?}"
+        );
+    }
+}
+
+/// F1 regression: a `Condition` whose sub-shape is anything other than the one
+/// `StringLike`/`s3:prefix` block a guard reads must fail closed. Pre-fix,
+/// `validate_statement` accepted any `Condition` value, so a statement carrying
+/// `StringNotLike`, a set-qualified `ForAnyValue:StringLike`, an unhandled key
+/// such as `s3:delimiter`, or a non-object Condition passed validation and
+/// `list_prefix_patterns` then found no `["StringLike"]["s3:prefix"]` array and
+/// silently contributed nothing -- the skip class moved one level down into a
+/// handled key. Synthetic, not `deploy/iam/*.json`: every shipped list Condition
+/// is exactly one `StringLike` or `StringEquals` `s3:prefix` block.
+#[test]
+fn unhandled_condition_shape_fails_closed() {
+    let cases = [
+        (
+            "StringNotLikeOperator",
+            serde_json::json!({
+                "Sid": "StringNotLikeOperator",
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::my-ravel-bucket",
+                "Condition": {"StringNotLike": {"s3:prefix": ["t/*"]}}
+            }),
+            "StringNotLike",
+            "which no guard in this file reads (handled operators:",
+        ),
+        (
+            "SetQualifiedOperator",
+            serde_json::json!({
+                "Sid": "SetQualifiedOperator",
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::my-ravel-bucket",
+                "Condition": {"ForAnyValue:StringLike": {"s3:prefix": ["t/*"]}}
+            }),
+            "ForAnyValue:StringLike",
+            "which no guard in this file reads (handled operators:",
+        ),
+        (
+            "UnhandledConditionKey",
+            serde_json::json!({
+                "Sid": "UnhandledConditionKey",
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::my-ravel-bucket",
+                "Condition": {"StringLike": {"s3:delimiter": ["/"]}}
+            }),
+            "s3:delimiter",
+            "which no guard in this file reads (handled keys:",
+        ),
+        (
+            "ConditionNotObject",
+            serde_json::json!({
+                "Sid": "ConditionNotObject",
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::my-ravel-bucket",
+                "Condition": "StringLike"
+            }),
+            "Condition",
+            "Condition is not a JSON object",
+        ),
+    ];
+
+    for (sid, stmt, must_name, must_explain) in &cases {
+        // Load-bearing: the guard that would read this Condition finds nothing,
+        // so the constraint sits unexamined. Prove the pre-fix skip on the two
+        // operator cases (both are s3:ListBucket, so list_prefix_patterns is the
+        // guard that skips them).
+        if *sid == "StringNotLikeOperator" || *sid == "SetQualifiedOperator" {
+            let policy = Policy {
+                role: "fixture",
+                statements: serde_json::json!([stmt.clone()]),
+            };
+            // The pre-fix body decides list membership through the live
+            // `statement_actions`, so an empty result on its own is also what a
+            // regression there would produce. Pin the raw Action first: the
+            // emptiness has to come from the unread Condition sub-shape.
+            assert_eq!(
+                stmt["Action"],
+                serde_json::json!("s3:ListBucket"),
+                "fixture {sid} invalid: this case is a list statement, and the \
+                 emptiness below must come from the unread Condition rather \
+                 than from action selection returning nothing"
+            );
+            assert!(
+                pre_fix_list_prefix_patterns(&policy).is_empty(),
+                "fixture {sid}: the pre-fix list_prefix_patterns was expected to \
+                 skip the statement (finding no StringLike/s3:prefix); it did not"
+            );
+        }
+
+        let err = validate_statement("fixture", 0, stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        assert!(
+            err.contains(must_name),
+            "fixture {sid}: rejection must name {must_name:?}; got {err:?}"
+        );
+        assert!(
+            err.contains(sid),
+            "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+        // Two of these Sids contain their own `must_name`, so for them the
+        // key-naming assertion follows from the Sid-naming one. This names the
+        // Condition rule that had to be the one to reject.
+        assert!(
+            err.contains(must_explain),
+            "fixture {sid}: rejection must come from the Condition rule this \
+             case is written for, whose message contains {must_explain:?}; got \
+             {err:?}"
+        );
+    }
+
+    // Positive control: the shipped StringLike/s3:prefix shape passes.
+    let ok = serde_json::json!({
+        "Sid": "GoodCondition",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": "arn:aws:s3:::my-ravel-bucket",
+        "Condition": {"StringLike": {"s3:prefix": ["t/*", "sys/*"]}}
+    });
+    assert!(
+        validate_statement("fixture", 0, &ok).is_ok(),
+        "the shipped StringLike/s3:prefix Condition shape must pass"
+    );
+}
+
+/// F3 wiring guard: `load_policy` (through its shared body `build_policy`) must
+/// actually call `validate_policy_statements`. Driving a synthetic invalid
+/// policy through `build_policy` -- the real validation call site -- is what
+/// makes this test fail if that call is deleted; a test that only calls
+/// `validate_policy_statements` directly would keep passing. Proven by removing
+/// the call from `build_policy`: this test then reports no panic and fails.
+#[test]
+fn load_policy_rejects_an_unhandled_statement() {
+    let json = serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "NegatedResource",
+            "Effect": "Allow",
+            "Action": "s3:DeleteObject",
+            "NotResource": "arn:aws:s3:::my-ravel-bucket/t/*"
+        }]
+    });
+    let built = std::panic::catch_unwind(|| build_policy("fixture", "synthetic", &json));
+    assert!(
+        built.is_err(),
+        "build_policy (load_policy's real body) must reject a statement whose \
+         permission lives in NotResource, a field no guard reads"
+    );
+}
+
+/// Sweep proof: `list_prefix_patterns` reads a bare-string `s3:prefix`, not only
+/// an array. IAM allows either shape; before this fix the `.as_array()` read
+/// skipped a bare string, so a ListBucket discovery prefix expressed as a string
+/// contributed nothing.
+#[test]
+fn list_prefix_patterns_reads_a_bare_string_prefix() {
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "BareStringPrefix",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::my-ravel-bucket",
+            "Condition": {"StringLike": {"s3:prefix": "t/"}}
+        }]),
+    };
+    assert_eq!(
+        list_prefix_patterns(&policy, None),
+        vec!["t/".to_string()],
+        "a bare-string s3:prefix must be read, not skipped"
+    );
+    // ...and the shipped array shape still validates and is read.
+    assert!(
+        validate_statement("fixture", 0, &policy_statements(&policy)[0]).is_ok(),
+        "a bare-string s3:prefix is a valid IAM shape and must pass validation"
+    );
+}
+
+#[test]
+fn discovery_prefix_admitted_for_every_discovering_role() {
+    for role in ROLES_WITH_DISCOVERY {
+        let policy = load_policy(role);
+        // Allow-only: an explicit Deny ListBucket withdraws listing, so its
+        // s3:prefix is not a prefix the role is ALLOWED to discover. Reading it
+        // here would assert the inverse of the fact.
+        let patterns = list_prefix_patterns(&policy, Some("Allow"));
+        assert!(
+            patterns.iter().any(|p| glob_matches(p, "t/")),
+            "{role}: ListBucket s3:prefix condition {patterns:?} does not admit \
+             the bare delimited discovery prefix \"t/\" (ravel-maintain's \
+             discover_tenants calls list_delimited(\"t/\"))"
+        );
+    }
+}
+
+#[test]
+fn every_in_scope_policy_pattern_matches_a_real_key_shape() {
+    // The quarantine witnesses join the constructor output here rather than
+    // being skipped as out of scope: each one is a real `data_key` composed
+    // with the `quarantine/` prefix and stamp the reaper builds, so a
+    // `quarantine/...` pattern is held to the same real-key shape as every
+    // other pattern instead of passing unexamined.
+    let mut keys = representative_keys();
+    keys.extend(quarantine_witness_keys());
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        // None: this is a shape check (does every pattern name a real key?), not
+        // a permission read, so a Deny list prefix must still name a real key.
+        let mut patterns = list_prefix_patterns(&policy, None);
+        patterns.extend(resource_key_patterns(&policy));
+        for pattern in patterns {
+            if is_out_of_scope(&pattern) {
+                continue;
+            }
+            if pattern == "t/" {
+                // The discovery-only literal: not a per-key pattern, checked
+                // by discovery_prefix_admitted_for_every_discovering_role.
+                continue;
+            }
+            let matched = keys.iter().any(|k| glob_matches(&pattern, k));
+            assert!(
+                matched,
+                "{}: pattern {pattern:?} matches no key shape produced by \
+                 ravel-commit's key constructors",
+                policy.role
+            );
+        }
+    }
+}
+
+/// The pre-fix `list_prefix_patterns` body, verbatim: an exact-name list
+/// detection and a `_ => {}` arm that contributed nothing for any Condition
+/// sub-shape it did not recognize. Kept so the Condition fixtures can pin that
+/// the constraint used to sit unread; the live helper now panics on that arm,
+/// because the choke point rejects every shape that could reach it.
+fn pre_fix_list_prefix_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let is_list = statement_actions(stmt)
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("s3:ListBucket"));
+        if !is_list {
+            continue;
+        }
+        match &stmt["Condition"]["StringLike"]["s3:prefix"] {
+            serde_json::Value::String(s) => out.push(s.clone()),
+            serde_json::Value::Array(patterns) => {
+                for p in patterns {
+                    out.push(p.as_str().expect("s3:prefix entry is a string").to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The pre-fix `resource_key_patterns` body, verbatim: `is_list_only` read from
+/// `stmt["Action"].as_str()` only, and a resource that did not strip the bucket
+/// prefix silently dropped (`if let Some(..)` with no `else`). Kept so the F1
+/// fixture pins the two holes existed rather than restating the fix.
+fn pre_fix_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let is_list_only = stmt["Action"]
+            .as_str()
+            .is_some_and(|a| a.eq_ignore_ascii_case("s3:ListBucket"));
+        if is_list_only {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+                out.push(key_pattern.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The pre-fix `put_resource_key_patterns` body, verbatim (same silent drop).
+fn pre_fix_put_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let grants_put = statement_actions(stmt)
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("s3:PutObject"));
+        if !grants_put {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = r.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+                out.push(key_pattern.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// F1 regression: a Resource that grants S3 object access but is not
+/// bucket-relative (`"*"`, `s3:*` on `"*"`, another bucket's ARN) must surface as
+/// a test failure naming the role and Sid, in BOTH the read and write resource
+/// helpers, not be silently dropped. Synthetic statements, not `deploy/iam/*.json`:
+/// a fixture over the (correct) shipped templates passes whichever way the strip
+/// behaves and proves nothing. Each case asserts in both directions -- that the
+/// pre-fix helper dropped it (returning an empty set, hiding the grant) and that
+/// the post-fix helper panics on it.
+#[test]
+fn out_of_bucket_resource_grant_is_not_a_bypass() {
+    // Read side (resource_key_patterns): (Sid, Action, Resource).
+    let read_cases = [
+        ("GetOnStar", serde_json::json!("s3:GetObject"), "*"),
+        (
+            "GetOnOtherBucket",
+            serde_json::json!("s3:GetObject"),
+            "arn:aws:s3:::other-bucket/t/*",
+        ),
+        ("StarActionStarResource", serde_json::json!("s3:*"), "*"),
+    ];
+    for (sid, action, resource) in &read_cases {
+        let policy = Policy {
+            role: "fixture",
+            statements: serde_json::json!([{
+                "Sid": sid,
+                "Effect": "Allow",
+                "Action": action,
+                "Resource": resource,
+            }]),
+        };
+        // Observation 1 (load-bearing): the pre-fix helper dropped the
+        // out-of-bucket resource, so the derived set was empty and every resource
+        // guard skipped the statement. If it stops being empty the fixture no
+        // longer proves the hole and must be rewritten, not deleted.
+        let pre = pre_fix_resource_key_patterns(&policy);
+        assert!(
+            pre.is_empty(),
+            "fixture {sid} invalid: pre-fix resource_key_patterns was expected to \
+             drop the out-of-bucket resource (returning nothing); returned {pre:?}"
+        );
+        // Observation 2: the post-fix helper panics naming the role and Sid.
+        let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resource_key_patterns(&policy)
+        }));
+        assert!(
+            guard.is_err(),
+            "resource_key_patterns must reject fixture {sid}: an S3 grant on \
+             {resource:?} must surface, not be silently dropped"
+        );
+    }
+
+    // Write side (put_resource_key_patterns): PutObject on "*". Dropping it left
+    // roles_writing_routed_objects_have_kms_grant an empty routed set, so it
+    // skipped the role's KMS-grant check entirely.
+    let put_policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "PutOnStar",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": "*",
+        }]),
+    };
+    let pre_put = pre_fix_put_resource_key_patterns(&put_policy);
+    assert!(
+        pre_put.is_empty(),
+        "fixture PutOnStar invalid: pre-fix put_resource_key_patterns was expected \
+         to drop the \"*\" resource; returned {pre_put:?}"
+    );
+    let put_guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        put_resource_key_patterns(&put_policy)
+    }));
+    assert!(
+        put_guard.is_err(),
+        "put_resource_key_patterns must reject PutObject on \"*\": dropping it \
+         makes roles_writing_routed_objects_have_kms_grant skip the role on an \
+         empty routed set"
+    );
+
+    // Trap (must not trip the new guard): an array-form ListBucket statement's
+    // bare bucket ARN must be SKIPPED, not panicked. The pre-fix `.as_str()`
+    // is_list_only returned None for the array form, so the bare bucket ARN would
+    // reach the now-fatal strip; the post-fix statement_actions-based detection
+    // recognizes it as list-only and skips it.
+    let list_policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "ArrayFormList",
+            "Effect": "Allow",
+            "Action": ["s3:ListBucket"],
+            "Resource": "arn:aws:s3:::my-ravel-bucket",
+        }]),
+    };
+    let pre_fix_is_list_only = policy_statements(&list_policy)[0]["Action"]
+        .as_str()
+        .is_some_and(|a| a.eq_ignore_ascii_case("s3:ListBucket"));
+    assert!(
+        !pre_fix_is_list_only,
+        "fixture ArrayFormList invalid: the pre-fix as_str() detection was \
+         expected to miss the array-form ListBucket (proving the trap is real)"
+    );
+    let list_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        resource_key_patterns(&list_policy)
+    }));
+    assert_eq!(
+        list_result.ok(),
+        Some(Vec::<String>::new()),
+        "resource_key_patterns must skip an array-form ListBucket statement, not \
+         panic on its bare bucket ARN"
+    );
+
+    // A kms: ARN on a non-list statement is skipped (None), not panicked: the KMS
+    // resource guards own it. This is why the read-path strip cannot blindly
+    // panic on every non-bucket-relative resource -- every role carries a
+    // *TenantKms statement whose Resource is a kms: ARN.
+    let kms_policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "KmsResource",
+            "Effect": "Allow",
+            "Action": "kms:Decrypt",
+            "Resource": "arn:aws:kms:us-east-1:111122223333:key/abcd1234-5678-90ab-cdef-1234567890ab",
+        }]),
+    };
+    let kms_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        resource_key_patterns(&kms_policy)
+    }));
+    assert_eq!(
+        kms_result.ok(),
+        Some(Vec::<String>::new()),
+        "resource_key_patterns must skip a kms: ARN (checked by the KMS guards), \
+         not panic"
+    );
+}
+
+/// The pre-fix `validate_condition` body, verbatim (round two's version, no
+/// empty-object checks): a `for` over an empty map iterates zero times, so `{}`
+/// and `{"StringLike": {}}` both returned Ok. Kept so the F2 fixture pins the
+/// hole existed rather than restating the fix.
+fn pre_fix_validate_condition(condition: &serde_json::Value) -> Result<(), String> {
+    let cond_obj = condition
+        .as_object()
+        .ok_or_else(|| "Condition is not an object".to_string())?;
+    for (operator, keys) in cond_obj {
+        if !HANDLED_CONDITION_OPERATORS.contains(&operator.as_str()) {
+            return Err(format!("operator {operator:?}"));
+        }
+        let key_obj = keys
+            .as_object()
+            .ok_or_else(|| "operator is not an object".to_string())?;
+        for (cond_key, value) in key_obj {
+            if !HANDLED_CONDITION_KEYS.contains(&cond_key.as_str()) {
+                return Err(format!("key {cond_key:?}"));
+            }
+            if !is_string_or_string_array(Some(value)) {
+                return Err(format!("value {value:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// F2 regression (empty maps): `"Condition": {}` and `"Condition": {"StringLike":
+/// {}}` must fail closed. Pre-fix, a `for` over an empty map iterated zero times,
+/// so both returned Ok -- the vacuous-set bug round two fixed for arrays,
+/// re-created in the code that fixed it. Synthetic, not `deploy/iam/*.json`: the
+/// shipped list Conditions are all non-empty `s3:prefix` blocks.
+#[test]
+fn empty_condition_or_stringlike_map_fails_closed() {
+    let cases = [
+        ("EmptyCondition", serde_json::json!({})),
+        ("EmptyStringLike", serde_json::json!({"StringLike": {}})),
+    ];
+    for (sid, condition) in &cases {
+        // Observation 1 (load-bearing): the pre-fix validator accepted the empty
+        // map (zero loop iterations), so the constraint sat unexamined.
+        assert!(
+            pre_fix_validate_condition(condition).is_ok(),
+            "fixture {sid} invalid: pre-fix validate_condition was expected to \
+             accept {condition:?} (vacuous empty-map loop); it did not"
+        );
+        // Observation 2: the full statement validator rejects a ListBucket
+        // statement carrying it, naming the empty shape and the Sid.
+        let stmt = serde_json::json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::my-ravel-bucket",
+            "Condition": condition,
+        });
+        let err = validate_statement("fixture", 0, &stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        assert!(
+            err.contains("empty"),
+            "fixture {sid}: rejection must name the empty shape; got {err:?}"
+        );
+        assert!(
+            err.contains(sid),
+            "fixture {sid}: rejection must name the Sid; got {err:?}"
+        );
+    }
+}
+
+/// F1 regression (the blocking finding): an `s3:prefix` value that admits every
+/// key must fail closed. Pre-fix, `validate_condition` checked the value's SHAPE
+/// (a non-empty string or non-empty array of strings) but never whether the value
+/// constrained anything, so `{"StringLike": {"s3:prefix": ["*"]}}` -- non-empty,
+/// and constraining exactly as little as no Condition at all -- passed. The
+/// discovery guard's glob on "*" succeeds and every representative key matches the
+/// "*" shape, so narrowing a shipped template's list Condition to it left the
+/// whole suite green. This is the vacuous-value sibling of the empty-map holes
+/// `empty_condition_or_stringlike_map_fails_closed` covers, one level down in the
+/// value. Synthetic: every shipped s3:prefix is a bounded prefix.
+#[test]
+fn vacuous_s3_prefix_value_fails_closed() {
+    // Observation 1 (load-bearing): the pre-fix value check accepted the star.
+    // Written as the exact pre-fix expression -- SHAPE only -- so this pins the
+    // hole rather than restating the fix.
+    let star_value = serde_json::json!(["*"]);
+    assert!(
+        is_string_or_string_array(Some(&star_value)),
+        "fixture invalid: the pre-fix s3:prefix value check (shape only) was \
+         expected to accept [\"*\"]"
+    );
+    // ...and the pre-fix Condition validator (round two's body, kept verbatim)
+    // blessed the whole StringLike/s3:prefix block, so the constraint sat
+    // unexamined.
+    let star_condition = serde_json::json!({"StringLike": {"s3:prefix": ["*"]}});
+    assert!(
+        pre_fix_validate_condition(&star_condition).is_ok(),
+        "fixture invalid: pre-fix validate_condition was expected to accept the \
+         \"*\" s3:prefix value (shape only); it did not"
+    );
+
+    // The star value fails: the ListBucket statement carrying it is rejected,
+    // naming the Sid, the value, and why.
+    let star_stmt = serde_json::json!({
+        "Sid": "ListEverything",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": ["*"]}},
+    });
+    let err = validate_statement("fixture", 0, &star_stmt)
+        .expect_err("validate_statement must reject a \"*\" s3:prefix");
+    for expected in ["\"*\"", "ListEverything", "admits every key"] {
+        assert!(
+            err.contains(expected),
+            "rejection must name {expected:?}; got {err:?}"
+        );
+    }
+    // A bare-string "*" (not only the array form) fails the same way.
+    let star_string_stmt = serde_json::json!({
+        "Sid": "ListEverythingBareString",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": "*"}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &star_string_stmt).is_err(),
+        "a bare-string \"*\" s3:prefix must also fail closed"
+    );
+
+    // A real tenant-scoped list of prefixes passes: each one excludes some key
+    // outside it, so none is vacuous.
+    let tenant_scoped = serde_json::json!({
+        "Sid": "ListTenantScoped",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": ["t/", "t/*/*/c/*", "sys/query/workers/*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &tenant_scoped).is_ok(),
+        "a tenant-scoped s3:prefix list must pass: {:?}",
+        validate_statement("fixture", 0, &tenant_scoped)
+    );
+
+    // On a shipped template: narrowing QueryList's s3:prefix to ["*"] makes the
+    // whole list vacuous and must fail the choke point, while the unmutated
+    // template still loads. In-memory; the file on disk is untouched.
+    let path = policy_json_path("query");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_policy(
+            "query", &path, &json
+        )))
+        .is_ok(),
+        "the shipped query template must load unchanged"
+    );
+    let statements = json["Statement"]
+        .as_array_mut()
+        .expect("query.json Statement is an array");
+    let target = statements
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("QueryList"))
+        .expect("query.json carries a QueryList statement");
+    target["Condition"]["StringLike"]["s3:prefix"] = serde_json::json!(["*"]);
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_policy("query", &path, &json)
+    }));
+    let message = panic_message(built.expect_err(
+        "build_policy must reject QueryList once its s3:prefix is narrowed to [\"*\"]",
+    ));
+    assert!(
+        message.contains("QueryList") && message.contains("admits every key"),
+        "the rejection must name the mutated statement and the vacuity; got {message:?}"
+    );
+}
+
+/// F1 sweep regression (resource axis): a bucket-relative object grant that admits
+/// every key -- `arn:aws:s3:::my-ravel-bucket/*`, which strips to "*" -- must fail
+/// closed. It is shape-valid (bucket-relative, non-empty key) yet scopes the object
+/// grant no more than naming no key prefix would: the resource-axis sibling of F1's
+/// "*" s3:prefix. Round four's `object_key_patterns` doc recorded this as
+/// deliberately NOT closed ("a coverage check cannot reject an over-broad
+/// pattern"); the sweep for this round closes it at the choke point. Synthetic: no
+/// shipped template names a bucket-relative "*" object resource.
+#[test]
+fn full_bucket_object_resource_fails_closed() {
+    // Observation 1 (load-bearing): the coverage guard cannot catch this -- "*"
+    // matches every representative key, so it matches AT LEAST ONE, which is all
+    // `every_in_scope_policy_pattern_matches_a_real_key_shape` asks. Written as
+    // that guard's own predicate over the real keys.
+    let keys = representative_keys();
+    assert!(
+        keys.iter().any(|k| glob_matches("*", k)),
+        "fixture invalid: the coverage check (matches at least one real key) must \
+         accept \"*\", which is why it cannot reject this vacuous grant"
+    );
+
+    for action in ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"] {
+        let stmt = serde_json::json!({
+            "Sid": "FullBucketObject",
+            "Effect": "Allow",
+            "Action": action,
+            "Resource": "arn:aws:s3:::my-ravel-bucket/*",
+        });
+        let err = validate_statement("fixture", 0, &stmt).expect_err(&format!(
+            "validate_statement must reject a full-bucket {action} grant"
+        ));
+        for expected in ["\"*\"", "FullBucketObject", "matches every key"] {
+            assert!(
+                err.contains(expected),
+                "{action}: rejection must name {expected:?}; got {err:?}"
+            );
+        }
+    }
+
+    // A bounded object prefix (the shipped shape) still passes: it excludes keys
+    // outside `t/`.
+    let bounded = serde_json::json!({
+        "Sid": "BoundedObject",
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::my-ravel-bucket/t/*",
+    });
+    assert!(
+        validate_statement("fixture", 0, &bounded).is_ok(),
+        "a bounded object prefix must pass: {:?}",
+        validate_statement("fixture", 0, &bounded)
+    );
+}
+
+/// The other direction of the resource-vacuity rule: on a `Deny`, an object-key
+/// pattern that matches every key is MAXIMALLY constraining -- it prohibits
+/// every object in the bucket -- so it must LOAD, not be refused with the
+/// grant-worded reason. Widening `DenyDeleteProtected`'s Resource to the whole
+/// bucket is the safest hardening an operator can make (it denies both delete
+/// operations on every object), and before the Effect gate it took the suite red.
+/// Synthetic: no shipped template names a whole-bucket Deny resource.
+#[test]
+fn whole_bucket_deny_resource_is_maximally_constraining_and_loads() {
+    let deny_whole_bucket = serde_json::json!({
+        "Sid": "DenyDeleteProtected",
+        "Effect": "Deny",
+        "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+        "Resource": "arn:aws:s3:::my-ravel-bucket/*",
+    });
+    // The specific thing: the guard that used to panic on the vacuous key now
+    // returns Ok, so the statement passes the choke point.
+    assert!(
+        validate_statement("fixture", 0, &deny_whole_bucket).is_ok(),
+        "a Deny whose Resource matches every key must pass the choke point: {:?}",
+        validate_statement("fixture", 0, &deny_whole_bucket)
+    );
+    // And a whole policy carrying it loads through build_policy (load_policy's body).
+    let policy = build_policy(
+        "fixture",
+        "<synthetic>",
+        &serde_json::json!({ "Statement": [deny_whole_bucket] }),
+    );
+    assert_eq!(
+        policy_statements(&policy).len(),
+        1,
+        "the synthetic Deny policy must load with its one statement"
+    );
+
+    // The `Allow` side is unchanged. A synthetic `Allow` with the same
+    // whole-bucket object pattern is still refused, with the grant-worded
+    // message. `full_bucket_object_resource_fails_closed` pins this for the
+    // object axis; restated here so both directions sit together.
+    let allow_whole_bucket = serde_json::json!({
+        "Sid": "FullBucketObject",
+        "Effect": "Allow",
+        "Action": "s3:DeleteObject",
+        "Resource": "arn:aws:s3:::my-ravel-bucket/*",
+    });
+    let err = validate_statement("fixture", 0, &allow_whole_bucket)
+        .expect_err("an Allow whose Resource matches every key must still be refused");
+    assert!(
+        err.contains("matches every key"),
+        "the Allow rejection must keep the grant-worded message; got {err:?}"
+    );
+}
+
+/// The list-prefix half of the same rule. On a `Deny` ListBucket, an s3:prefix
+/// that admits every request prohibits every list, which is maximally
+/// constraining, so it must LOAD. On an `Allow` an admits-everything s3:prefix is
+/// still refused (`vacuous_s3_prefix_value_fails_closed` pins that). Synthetic:
+/// no shipped template carries a Deny ListBucket.
+#[test]
+fn whole_bucket_deny_list_prefix_is_maximally_constraining_and_loads() {
+    let deny_star = serde_json::json!({
+        "Sid": "DenyListEverything",
+        "Effect": "Deny",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": ["*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &deny_star).is_ok(),
+        "a Deny s3:prefix `*` denies every list request and must load: {:?}",
+        validate_statement("fixture", 0, &deny_star)
+    );
+
+    // The `Allow` side is unchanged: an admits-everything s3:prefix on an Allow
+    // still fails closed.
+    let allow_star = serde_json::json!({
+        "Sid": "ListEverything",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": ["*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &allow_star).is_err(),
+        "an Allow s3:prefix `*` must still fail closed"
+    );
+}
+
+/// Hole ten regression: the vacuity predicate used to ask whether a pattern
+/// matched the EMPTY STRING, a value `classify_resource` rejects outright, so it
+/// decided vacuity against a key the code downstream can never see. Three
+/// spellings match every real key while matching no empty string -- `?*`, `*?*`
+/// and `*/*` -- and `*/*` is the plausible operator spelling of "any tenant, any
+/// signal". Put in a shipped template's delete `Resource`, it left the suite
+/// green at 39/0.
+///
+/// Both directions per spelling: the pre-fix predicate (written verbatim, so
+/// this fixture cannot become a tautology when the live one changes) accepted
+/// it while it matched every representative key, and the corpus-relative
+/// predicate rejects it. The superset property is asserted too: everything the
+/// old test caught is still caught, and a bounded-but-broad `t/*` is still
+/// accepted, since rejecting over-broad-but-bounded grants is a separate guard.
+#[test]
+fn vacuous_pattern_spellings_that_dodge_the_empty_string_fail_closed() {
+    let keys = representative_keys();
+    assert_eq!(
+        keys.len(),
+        67,
+        "fixture invalid: the measured table below is stated over 67 \
+         representative keys"
+    );
+
+    // Observation 1 (load-bearing): each spelling dodged the pre-fix predicate
+    // (`glob_matches(pattern, "")`, spelled out here) while matching every
+    // single representative key.
+    for spelling in ["?*", "*?*", "*/*"] {
+        assert!(
+            !glob_matches(spelling, ""),
+            "fixture invalid: the pre-fix predicate was expected to call \
+             {spelling:?} non-vacuous; it did not"
+        );
+        assert!(
+            keys.iter().all(|k| glob_matches(spelling, k)),
+            "fixture invalid: {spelling:?} was expected to match all 67 \
+             representative keys"
+        );
+    }
+
+    // Observation 2: the corpus-relative predicate rejects every vacuous
+    // spelling, including the two the old one already caught (superset).
+    for spelling in ["", "*", "**", "***", "?*", "*?*", "*/*"] {
+        assert!(
+            glob_admits_everything(spelling),
+            "{spelling:?} excludes no key the system can produce and must be \
+             rejected as vacuous"
+        );
+    }
+
+    // ...and still accepts every pattern that excludes something, including the
+    // over-broad-but-bounded `t/*` the shipped admin template names.
+    for bounded in [
+        "t/*",
+        "sys/*",
+        "t/",
+        "t/*/*/l0/*",
+        "t/*/catalog/*/*",
+        "admission/query/*",
+        "sys/tenancy",
+        "?",
+        "*x",
+        "*/*/*",
+    ] {
+        assert!(
+            !glob_admits_everything(bounded),
+            "{bounded:?} excludes some key in the domain, so it is over-broad at \
+             worst, not vacuous; rejecting it is a different guard"
+        );
+    }
+
+    // On a shipped template: MaintainDelete's five scoped resources replaced by
+    // the single `*/*` must fail the choke point, naming the statement. Every
+    // sample key DenyDeleteProtected covers is inside `*/*`, so the delete-scope
+    // guards saw nothing wrong. In-memory; the file on disk is untouched.
+    for spelling in ["*/*", "?*", "*?*"] {
+        let message = panic_message(
+            mutate_maintain_delete_resource(spelling)
+                .expect_err("build_policy must reject a vacuous MaintainDelete resource"),
+        );
+        assert!(
+            message.contains("MaintainDelete") && message.contains("matches every key"),
+            "the rejection must name the mutated statement and the vacuity; got \
+             {message:?}"
+        );
+    }
+    // A bounded replacement in the same position still builds: this fixture pins
+    // vacuity, not breadth.
+    assert!(
+        mutate_maintain_delete_resource("t/*").is_ok(),
+        "a bounded delete resource must still be accepted in that position"
+    );
+}
+
+/// Rebuild the shipped `maintain` template with `MaintainDelete`'s `Resource`
+/// replaced by the single bucket-relative pattern `key_pattern`, in memory.
+fn mutate_maintain_delete_resource(
+    key_pattern: &str,
+) -> Result<Policy, Box<dyn std::any::Any + Send>> {
+    let path = policy_json_path("maintain");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let statements = json["Statement"]
+        .as_array_mut()
+        .expect("maintain.json Statement is an array");
+    let target = statements
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainDelete"))
+        .expect("maintain.json carries a MaintainDelete statement");
+    target["Resource"] = serde_json::json!([format!("{BUCKET_KEY_PREFIX}{key_pattern}")]);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_policy("maintain", &path, &json)
+    }))
+}
+
+/// The pre-fix routed-write guard body, verbatim in the derivation and in the
+/// skip: an empty routed set fell through to `continue`, so neither KMS
+/// assertion ran. Returns true when the pre-fix guard SKIPPED the role.
+fn pre_fix_routed_write_guard_skipped(policy: &Policy) -> bool {
+    let mut routed = Vec::new();
+    for stmt in policy_statements(policy) {
+        let is_allow = stmt["Effect"]
+            .as_str()
+            .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+        if !is_allow {
+            continue;
+        }
+        let grants_put = statement_actions(stmt)
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("s3:PutObject"));
+        if !grants_put {
+            continue;
+        }
+        for resource in statement_resources(stmt) {
+            if let Some(key) = resource.strip_prefix("arn:aws:s3:::my-ravel-bucket/")
+                && ravel_object_store::routes_through_tenant_key(key)
+            {
+                routed.push(key.to_string());
+            }
+        }
+    }
+    routed.is_empty()
+}
+
+/// Hole twelve regression: an empty routed-write set is a failure, not a skip.
+/// The guard derived the routed PUT patterns and then read
+/// `if routed.is_empty() { continue; }`, so widening a write role's PutObject
+/// `Resource` off the tenant keyspace emptied the set and silently retired the
+/// `kms:GenerateDataKey*`/`kms:Encrypt` requirement for that role: the policy
+/// kept its write grant, and the guard reported nothing.
+///
+/// Both directions: the pre-fix body skipped the synthetic role, and the live
+/// guard fails on it. Driven through `assert_role_routed_writes_have_kms_grant`,
+/// the function the real test calls, not a re-typed copy.
+#[test]
+fn empty_routed_write_set_is_not_a_skip() {
+    // A role that PUTs only outside the tenant keyspace and holds no KMS grant
+    // at all: exactly the shape the KMS requirement exists for, if it applied.
+    let widened = fixture_policy(serde_json::json!({
+        "Sid": "WidenedWrite",
+        "Effect": "Allow",
+        "Action": "s3:PutObject",
+        "Resource": ["arn:aws:s3:::my-ravel-bucket/sys/maintain/*"],
+    }));
+
+    // Observation 1 (load-bearing): the pre-fix body skipped it.
+    assert!(
+        pre_fix_routed_write_guard_skipped(&widened),
+        "fixture invalid: the pre-fix guard was expected to skip a role whose PUT \
+         patterns route nowhere"
+    );
+
+    // Observation 2: the live guard fails on it, naming the role and the reason.
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_role_routed_writes_have_kms_grant(&widened)
+    }));
+    let message = panic_message(
+        failure.expect_err("an empty routed set must fail, not skip the KMS requirement"),
+    );
+    assert!(
+        message.contains("none of which routes through a per-tenant key"),
+        "the failure must say the routed set was empty; got {message:?}"
+    );
+
+    // A role that PUTs a routed object and carries the KMS grants still passes,
+    // so this fixture pins the skip, not the requirement.
+    let routed_with_kms = Policy {
+        role: "fixture",
+        statements: serde_json::json!([
+            {
+                "Sid": "RoutedWrite",
+                "Effect": "Allow",
+                "Action": "s3:PutObject",
+                "Resource": ["arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*"],
+            },
+            {
+                "Sid": "FixtureTenantKms",
+                "Effect": "Allow",
+                "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
+                "Resource": [TENANT_KMS_KEY_ARN],
+            },
+        ]),
+    };
+    assert_role_routed_writes_have_kms_grant(&routed_with_kms);
+
+    // On a shipped template: MaintainWrite narrowed to its one non-routing
+    // resource empties the routed set. Pre-fix that skipped maintain entirely;
+    // now it fails. In-memory; the file on disk is untouched.
+    let path = policy_json_path("maintain");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let statements = json["Statement"]
+        .as_array_mut()
+        .expect("maintain.json Statement is an array");
+    // The two conditioned prov statements route through the tenant key too, so
+    // they go with the narrowing.
+    statements.retain(|stmt| {
+        stmt["Sid"] != serde_json::json!("MaintainProvCreate")
+            && stmt["Sid"] != serde_json::json!("MaintainProvCas")
+    });
+    let target = statements
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainWrite"))
+        .expect("maintain.json carries a MaintainWrite statement");
+    target["Resource"] = serde_json::json!(["arn:aws:s3:::my-ravel-bucket/sys/maintain/*"]);
+    let mutated = build_policy("maintain", &path, &json);
+    assert!(
+        pre_fix_routed_write_guard_skipped(&mutated),
+        "fixture invalid: the pre-fix guard was expected to skip the narrowed \
+         maintain template"
+    );
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_role_routed_writes_have_kms_grant(&mutated)
+    }));
+    assert!(
+        failure.is_err(),
+        "narrowing MaintainWrite to a non-routing resource must fail the routed \
+         write guard, not silently skip maintain"
+    );
+}
+
+/// The routed-write guard's first failure branch: no PUT grant at all.
+///
+/// `assert_role_routed_writes_have_kms_grant` has three failure branches, and
+/// each is a distinct claim about a distinct policy shape. Only the empty-routed-set
+/// branch had a fixture; this one and the pattern-admits-routed-keys branch below
+/// existed only at their definition sites, so a rewrite that turned either back
+/// into a skip would have gone unnoticed.
+///
+/// The shape is a role whose PutObject grant was dropped or moved to a field no
+/// axis reads. Pre-empty-set-fix that emptied `routed` too and skipped the role;
+/// the dedicated assertion distinguishes it, so the message says the write grant
+/// is gone rather than that it routes nowhere.
+#[test]
+fn empty_put_set_fails_the_routed_write_guard() {
+    let read_only = build_policy(
+        "fixture",
+        "<synthetic>",
+        &serde_json::json!({
+            "Statement": [{
+                "Sid": "ReadOnly",
+                "Effect": "Allow",
+                "Action": "s3:GetObject",
+                "Resource": [format!("{BUCKET_KEY_PREFIX}t/*/*/l0/*")],
+            }]
+        }),
+    );
+    assert!(
+        put_resource_key_patterns(&read_only).is_empty(),
+        "fixture invalid: this policy was expected to grant s3:PutObject on \
+         nothing"
+    );
+
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_role_routed_writes_have_kms_grant(&read_only)
+    }));
+    let message =
+        panic_message(failure.expect_err("a policy with no PUT grant must fail, not pass"));
+    assert!(
+        message.contains("grants s3:PutObject on nothing"),
+        "the failure must say the PUT set was empty, not that it routes nowhere; \
+         got {message:?}"
+    );
+}
+
+/// The routed-write guard's third failure branch: a PUT pattern that does not
+/// itself parse as a routed tenant key yet admits routed keys.
+///
+/// This is the hole-ten property on the routing axis. `t/*` is not a routed key
+/// (`routes_through_tenant_key` needs a non-empty hash segment FOLLOWED BY a
+/// slash, and `t/*` has no second slash), but as a glob it matches every tenant
+/// key, so a role holding it can PUT routed objects while the KMS requirement is
+/// decided on the pattern's own text and comes out false.
+///
+/// Reaching the branch takes a two-element resource list: the guard asserts a
+/// non-empty routed set first, so a policy whose only PUT pattern is `t/*` fails
+/// at the branch above instead. The routing element makes the routed set
+/// non-empty, and `t/*` then trips this branch.
+#[test]
+fn non_routing_put_pattern_admitting_routed_keys_fails_the_routed_write_guard() {
+    let kms_statement = serde_json::json!({
+        "Sid": "FixtureTenantKms",
+        "Effect": "Allow",
+        "Action": ["kms:Encrypt", "kms:GenerateDataKey*", "kms:Decrypt"],
+        "Resource": [TENANT_KMS_KEY_ARN],
+    });
+    let write_statement = |resources: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "FixtureWrite",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": resources,
+        })
+    };
+
+    // The same policy without the `t/*` element passes, so the branch below is
+    // fired by that element and not by anything else in the fixture.
+    let routing_only = build_policy(
+        "fixture",
+        "<synthetic>",
+        &serde_json::json!({
+            "Statement": [
+                write_statement(serde_json::json!([format!("{BUCKET_KEY_PREFIX}t/*/*/l1/*")])),
+                kms_statement.clone(),
+            ]
+        }),
+    );
+    assert_role_routed_writes_have_kms_grant(&routing_only);
+
+    let admits_routed = build_policy(
+        "fixture",
+        "<synthetic>",
+        &serde_json::json!({
+            "Statement": [
+                write_statement(serde_json::json!([
+                    format!("{BUCKET_KEY_PREFIX}t/*/*/l1/*"),
+                    format!("{BUCKET_KEY_PREFIX}t/*"),
+                ])),
+                kms_statement,
+            ]
+        }),
+    );
+    assert!(
+        !ravel_object_store::routes_through_tenant_key("t/*")
+            && key_domain()
+                .iter()
+                .any(|key| glob_matches("t/*", key.as_str())
+                    && ravel_object_store::routes_through_tenant_key(key.as_str())),
+        "fixture invalid: `t/*` must not parse as a routed key while still \
+         admitting one, or this case does not reach the branch it is written for"
+    );
+
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_role_routed_writes_have_kms_grant(&admits_routed)
+    }));
+    let message = panic_message(
+        failure.expect_err("a PUT pattern admitting routed keys it does not parse as must fail"),
+    );
+    assert!(
+        message.contains("yet it admits routed keys"),
+        "the failure must name the pattern-versus-key gap; got {message:?}"
+    );
+}
+
+/// F2 regression (Condition presence): a ListBucket statement must carry a
+/// Condition, and a non-ListBucket statement must not. Pre-fix, `validate_statement`
+/// only validated a Condition when present and never checked the Action, so a
+/// ListBucket with no Condition (an unconstrained bucket-wide list) and a
+/// StringLike/s3:prefix on the protected-delete Deny (read by no guard, and never
+/// fired in AWS since a DeleteObject request carries no s3:prefix) both passed.
+/// Synthetic for the same reason as above.
+#[test]
+fn condition_presence_must_track_list_bucket_action() {
+    // Hole: a ListBucket statement with NO Condition. list_prefix_patterns
+    // contributes nothing for it, and pre-fix validation accepted it.
+    let no_condition = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "ListNoCondition",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::my-ravel-bucket",
+        }]),
+    };
+    // The pre-fix body decides list membership through the live
+    // `statement_actions`, so an empty result on its own is also what a
+    // regression there would produce. Pin the raw JSON first: this statement IS
+    // a list statement and it carries no Condition, so the emptiness below can
+    // only be the absent Condition.
+    let no_condition_stmt = &policy_statements(&no_condition)[0];
+    assert_eq!(
+        no_condition_stmt["Action"],
+        serde_json::json!("s3:ListBucket"),
+        "fixture invalid: this statement must be a list statement"
+    );
+    assert_eq!(
+        no_condition_stmt["Condition"],
+        serde_json::Value::Null,
+        "fixture invalid: this statement must carry no Condition at all"
+    );
+    assert!(
+        pre_fix_list_prefix_patterns(&no_condition).is_empty(),
+        "fixture invalid: a ListBucket statement with no Condition must contribute \
+         no s3:prefix pattern (the unconstrained-list shape)"
+    );
+    let err = validate_statement("fixture", 0, &policy_statements(&no_condition)[0])
+        .expect_err("validate_statement must reject a ListBucket statement with no Condition");
+    assert!(
+        err.contains("no Condition"),
+        "rejection must name the missing Condition; got {err:?}"
+    );
+    assert!(
+        err.contains("ListNoCondition"),
+        "rejection must name the Sid; got {err:?}"
+    );
+
+    // Hole: a StringLike/s3:prefix Condition on a NON-ListBucket statement (a
+    // protected-delete Deny). list_prefix_patterns never reads it (not
+    // ListBucket), so the Condition sits unexamined while pre-fix validation
+    // blessed it.
+    let deny_with_prefix = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "DenyWithPrefix",
+            "Effect": "Deny",
+            "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+            "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+            "Condition": {"StringLike": {"s3:prefix": ["t/*"]}},
+        }]),
+    };
+    assert!(
+        list_prefix_patterns(&deny_with_prefix, None).is_empty(),
+        "fixture invalid: list_prefix_patterns must skip a non-ListBucket \
+         statement, so its Condition sits unread"
+    );
+    let err = validate_statement("fixture", 0, &policy_statements(&deny_with_prefix)[0])
+        .expect_err("validate_statement must reject a Condition on a non-ListBucket statement");
+    assert!(
+        err.contains("does not include s3:ListBucket"),
+        "rejection must explain the non-ListBucket Condition; got {err:?}"
+    );
+    assert!(
+        err.contains("DenyWithPrefix"),
+        "rejection must name the Sid; got {err:?}"
+    );
+}
+
+/// F1 regression (Effect axis, list discovery): a `Deny` ListBucket carrying an
+/// s3:prefix must not be read as a prefix the role is ALLOWED to discover. This
+/// round's Condition-presence rule forces a deny-listing block to carry an
+/// s3:prefix, and `list_prefix_patterns`' only permission-reading caller,
+/// `discovery_prefix_admitted_for_every_discovering_role`, pools every
+/// statement's prefixes into one vector it reads as allowed listing. Reading a
+/// Deny's prefix there asserts the inverse of the fact, since an explicit IAM
+/// Deny withdraws listing. The fix gives `list_prefix_patterns` the same effect
+/// argument `key_patterns_for` takes and calls it with `Some("Allow")` from the
+/// discovery guard. Synthetic, not `deploy/iam/*.json`: no shipped template
+/// carries a Deny ListBucket, so a fixture over them proves nothing.
+#[test]
+fn deny_list_prefix_does_not_admit_a_discovery_prefix() {
+    // Arm A: Allow lists only "sys/*"; no statement mentions "t/".
+    let arm_a = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "AllowListSys",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": "arn:aws:s3:::my-ravel-bucket",
+            "Condition": {"StringLike": {"s3:prefix": ["sys/*"]}},
+        }]),
+    };
+    // Arm B: same Allow, plus a Deny ListBucket carrying the discovery prefix.
+    let arm_b = Policy {
+        role: "fixture",
+        statements: serde_json::json!([
+            {
+                "Sid": "AllowListSys",
+                "Effect": "Allow",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::my-ravel-bucket",
+                "Condition": {"StringLike": {"s3:prefix": ["sys/*"]}},
+            },
+            {
+                "Sid": "DenyListOutsideTenant",
+                "Effect": "Deny",
+                "Action": "s3:ListBucket",
+                "Resource": "arn:aws:s3:::my-ravel-bucket",
+                "Condition": {"StringLike": {"s3:prefix": ["t/"]}},
+            },
+        ]),
+    };
+
+    // Observation 1 (load-bearing): the effect-blind read (`None`, the mode the
+    // discovery guard used before the fix) pools the Deny's "t/" into the set in
+    // arm B. If this stops admitting "t/" the effect-blindness is gone and the
+    // fixture no longer pins the hole.
+    assert!(
+        list_prefix_patterns(&arm_b, None)
+            .iter()
+            .any(|p| glob_matches(p, "t/")),
+        "fixture invalid: an effect-blind read must pool the Deny ListBucket's \
+         s3:prefix \"t/\" into the discovery set (the hole this fixes)"
+    );
+
+    // Observation 2: the Allow-only read the discovery guard now performs admits
+    // "t/" in NEITHER arm -- arm A never allows it, and arm B only DENIES it.
+    for (label, policy) in [("arm A", &arm_a), ("arm B", &arm_b)] {
+        let admitted = list_prefix_patterns(policy, Some("Allow"));
+        assert!(
+            !admitted.iter().any(|p| glob_matches(p, "t/")),
+            "{label}: Allow-only list_prefix_patterns must not admit \"t/\" as a \
+             discovery prefix (arm A never allows it; arm B only denies it); got \
+             {admitted:?}"
+        );
+    }
+
+    // Both statements are well-formed IAM the choke point accepts, so the Deny
+    // really does reach the helper: the fix is the effect filter, not a rejection.
+    for (idx, stmt) in policy_statements(&arm_b).iter().enumerate() {
+        assert!(
+            validate_statement("fixture", idx, stmt).is_ok(),
+            "fixture invalid: statement #{idx} must pass the choke point so the \
+             Deny reaches list_prefix_patterns"
+        );
+    }
+}
+
+/// F1/F2 regression (Effect axis, routed write): a `Deny` PutObject must not be
+/// read as a routed write. `put_resource_key_patterns`' caller
+/// `roles_writing_routed_objects_have_kms_grant` reads its result as object
+/// classes the role WRITES and then demands a KMS grant for them; a Deny put is
+/// a prohibition, so reading it there would demand a KMS grant to satisfy a write
+/// the policy forbids. The fix passes `Some("Allow")` to the effect-aware base
+/// helper (F2), the consistent choice given F1. Synthetic: no shipped template
+/// carries a Deny PutObject.
+#[test]
+fn deny_put_object_is_not_a_routed_write() {
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "DenyPutRouted",
+            "Effect": "Deny",
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD",
+        }]),
+    };
+    // Observation 1 (load-bearing): the effect-blind base helper reads the Deny
+    // put as a routed write. If it stops returning the pattern the fixture no
+    // longer pins the hole.
+    let blind = key_patterns_for(&policy, &["s3:PutObject"], None);
+    assert!(
+        blind.iter().any(|p| p == "t/*/catalog/*/HEAD"),
+        "fixture invalid: an effect-blind read must return the Deny PutObject \
+         resource as a routed write (the hole this fixes); got {blind:?}"
+    );
+    // Observation 2: the Allow-only put helper the caller uses returns nothing.
+    let routed = put_resource_key_patterns(&policy);
+    assert!(
+        routed.is_empty(),
+        "put_resource_key_patterns must not read a Deny PutObject as a routed \
+         write; got {routed:?}"
+    );
+    // The Deny reaches the helper: it passes the choke point.
+    assert!(
+        validate_statement("fixture", 0, &policy_statements(&policy)[0]).is_ok(),
+        "fixture invalid: the Deny PutObject must pass the choke point so it \
+         reaches put_resource_key_patterns"
+    );
+}
+
+/// F1 regression (Effect axis, KMS actions): a `Deny kms:GenerateDataKey` must
+/// not be read as a held grant. Every `kms_actions` caller reads its result as a
+/// KMS operation the role HOLDS (or, for admin, the absence of one); an explicit
+/// Deny grants nothing, so pooling it would report a role able to mint ciphertext
+/// the Deny withdraws, and would flip the negative admin assertion. The fix
+/// filters `kms_actions` to `Allow` internally, since every caller reads a grant.
+/// Synthetic: no shipped template carries a Deny KMS statement.
+#[test]
+fn deny_kms_action_is_not_read_as_a_grant() {
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "DenyGenerateDataKey",
+            "Effect": "Deny",
+            "Action": "kms:GenerateDataKey",
+            "Resource": "arn:aws:kms:us-east-1:111122223333:key/abcd1234-5678-90ab-cdef-1234567890ab",
+        }]),
+    };
+    // Observation 1 (load-bearing): the pre-fix effect-blind scan (the live body
+    // minus its `Allow` filter) pooled the Deny action into the grant set.
+    let mut blind: Vec<String> = Vec::new();
+    for stmt in policy_statements(&policy) {
+        blind.extend(
+            statement_actions(stmt)
+                .into_iter()
+                .filter(|a| action_selects_kms(a)),
+        );
+    }
+    assert!(
+        blind
+            .iter()
+            .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
+        "fixture invalid: an effect-blind scan must pool the Deny \
+         kms:GenerateDataKey into the grant set (the hole this fixes); got {blind:?}"
+    );
+    // Observation 2: the Allow-only kms_actions returns nothing.
+    let actions = kms_actions(&policy);
+    assert!(
+        actions.is_empty(),
+        "kms_actions must not read a Deny KMS statement as a held grant; got \
+         {actions:?}"
+    );
+    // The Deny reaches the helper: it passes the choke point.
+    assert!(
+        validate_statement("fixture", 0, &policy_statements(&policy)[0]).is_ok(),
+        "fixture invalid: the Deny KMS statement must pass the choke point so it \
+         reaches kms_actions"
+    );
+}
+
+/// F1 regression (Effect axis, KMS resources): a `Deny` naming `key/*` is a broad
+/// prohibition (safe), but both KMS resource guards read `kms_statement_resources`
+/// as a grant that must be narrowly scoped, so reading a Deny there would flag a
+/// safe account-wide prohibition as an over-broad grant -- the inverse of the
+/// fact. The fix filters `kms_statement_resources` to `Allow`; scoping is asked
+/// only of the grants. Synthetic: no shipped template carries a Deny KMS
+/// statement.
+#[test]
+fn deny_kms_statement_is_not_scope_checked() {
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([{
+            "Sid": "DenyBroadKms",
+            "Effect": "Deny",
+            "Action": "kms:Decrypt",
+            "Resource": "arn:aws:kms:us-east-1:111122223333:key/*",
+        }]),
+    };
+    // Observation 1 (load-bearing): the pre-fix effect-blind scan (the live body
+    // minus its `Allow` filter) returned the Deny's broad key/* ARN.
+    let mut blind: Vec<(String, Vec<String>)> = Vec::new();
+    for stmt in policy_statements(&policy) {
+        if !statement_actions(stmt)
+            .iter()
+            .any(|a| action_selects_kms(a))
+        {
+            continue;
+        }
+        let resources: Vec<String> = statement_resources(stmt)
+            .into_iter()
+            .filter(|r| matches!(classify_resource(r), ResourceShape::KmsKey))
+            .map(str::to_string)
+            .collect();
+        blind.push((statement_sid(stmt).to_string(), resources));
+    }
+    assert!(
+        blind
+            .iter()
+            .any(|(_, rs)| rs.iter().any(|r| r.ends_with("key/*"))),
+        "fixture invalid: an effect-blind scan must return the Deny's broad key/* \
+         ARN (the hole this fixes); got {blind:?}"
+    );
+    // Observation 2: the Allow-only helper returns nothing.
+    let statements = kms_statement_resources(&policy);
+    assert!(
+        statements.is_empty(),
+        "kms_statement_resources must not hand a Deny KMS statement to the \
+         scope-check guards; got {statements:?}"
+    );
+    // The Deny reaches the helper: it passes the choke point.
+    assert!(
+        validate_statement("fixture", 0, &policy_statements(&policy)[0]).is_ok(),
+        "fixture invalid: the Deny KMS statement must pass the choke point so it \
+         reaches kms_statement_resources"
+    );
+}
+
+/// F3 regression (Sid): a missing or non-string Sid must fail closed. Pre-fix,
+/// `obj.get("Sid").and_then(as_str).unwrap_or("<no Sid>")` swallowed a
+/// `"Sid": 123` and an absent Sid, and the otherwise-valid statement passed while
+/// every rejection could name only `<no Sid>`. Synthetic, not `deploy/iam/*.json`:
+/// every shipped statement carries a string Sid.
+#[test]
+fn sid_must_be_a_present_string() {
+    // Non-string Sid.
+    let non_string = serde_json::json!({
+        "Sid": 123,
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::my-ravel-bucket/t/*",
+    });
+    // Observation 1 (load-bearing): the pre-fix extraction saw no string Sid, so
+    // it fell back to "<no Sid>" and validated the rest as if well-formed.
+    assert!(
+        non_string["Sid"].as_str().is_none(),
+        "fixture invalid: the pre-fix as_str() extraction was expected to see no \
+         string Sid for 123"
+    );
+    let err = validate_statement("fixture", 0, &non_string)
+        .expect_err("validate_statement must reject a non-string Sid");
+    assert!(
+        err.contains("non-string Sid"),
+        "rejection must name the non-string Sid; got {err:?}"
+    );
+
+    // Missing Sid entirely.
+    let missing = serde_json::json!({
+        "Effect": "Allow",
+        "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::my-ravel-bucket/t/*",
+    });
+    let err = validate_statement("fixture", 0, &missing)
+        .expect_err("validate_statement must reject a missing Sid");
+    assert!(
+        err.contains("no Sid"),
+        "rejection must name the missing Sid; got {err:?}"
+    );
+}
+
+/// F3 regression (index): every rejection names the statement index, so an
+/// operator can locate the offending statement in a Sid-less or duplicate-Sid
+/// array. Pre-fix, messages carried only `role/Sid`.
+#[test]
+fn rejection_message_names_the_statement_index() {
+    let statements = serde_json::json!([
+        {"Sid": "Good", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"},
+        {"Sid": "Bad", "Effect": "Permit", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::my-ravel-bucket/t/*"},
+    ]);
+    let err = validate_policy_statements("fixture", &statements)
+        .expect_err("the invalid second statement must be rejected");
+    assert!(
+        err.contains("#1"),
+        "rejection must name the statement index #1; got {err:?}"
+    );
+    assert!(
+        err.contains("Bad"),
+        "rejection must name the Sid; got {err:?}"
+    );
+}
+
+/// F4 wiring guard: `load_policy_from` -- `load_policy`'s real file-reading body --
+/// must reject an invalid policy. Driving a synthetic invalid file through it is
+/// what fails if the validation call is deleted from `build_policy`, or if
+/// `load_policy_from` stops calling `build_policy`; a test that only calls
+/// `validate_policy_statements` directly would keep passing. This closes the F4
+/// gap: the shipped entry point, not only the extracted body, is exercised.
+#[test]
+fn load_policy_from_rejects_a_synthetic_invalid_file() {
+    let path = std::env::temp_dir().join(format!(
+        "ravel-iam-fixture-{}-invalid.json",
+        std::process::id()
+    ));
+    let json = r#"{"Version":"2012-10-17","Statement":[{"Sid":"NegatedResource","Effect":"Allow","Action":"s3:DeleteObject","NotResource":"arn:aws:s3:::my-ravel-bucket/t/*"}]}"#;
+    std::fs::write(&path, json).expect("write synthetic policy fixture");
+    let path_str = path.to_str().expect("temp path is valid UTF-8").to_string();
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        load_policy_from("fixture", &path_str)
+    }));
+    std::fs::remove_file(&path).ok();
+    assert!(
+        built.is_err(),
+        "load_policy_from (load_policy's real file-reading body) must reject a \
+         statement whose permission lives in NotResource, a field no guard reads"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Fixtures for the total-shape redesign. The earlier
+// `bucket_relative_s3_pattern` and the list-only exemption its callers carried
+// are kept verbatim as `round_three_*` below, so each fixture pins the hole it
+// closes instead of restating today's rule.
+// ---------------------------------------------------------------------------
+
+/// Round three's resource classifier, verbatim: it panicked for exactly two
+/// shapes (`"*"` and an `arn:aws:s3:::` prefix) and returned `None` for
+/// everything else. Its doc claimed `None` meant "names a different service such
+/// as a KMS ARN", but nothing checked that, so every S3 grant shape outside those
+/// two -- access point, Object Lambda, multi-region access point, `arn:*`, a
+/// malformed non-ARN -- came back as "nothing to check" (H1).
+fn round_three_bucket_relative_s3_pattern(resource: &str) -> Option<String> {
+    if let Some(key_pattern) = resource.strip_prefix("arn:aws:s3:::my-ravel-bucket/") {
+        return Some(key_pattern.to_string());
+    }
+    if resource == "*" || resource.starts_with("arn:aws:s3:::") {
+        panic!("round three panicked for {resource:?}");
+    }
+    None
+}
+
+/// Round three's `resource_key_patterns`, verbatim: the list-only exemption that
+/// skipped a list statement before its Resource was looked at by anything (H2),
+/// plus the silent-drop classifier above.
+fn round_three_resource_key_patterns(policy: &Policy) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let actions = statement_actions(stmt);
+        let is_list_only = !actions.is_empty()
+            && actions
+                .iter()
+                .all(|a| a.eq_ignore_ascii_case("s3:ListBucket"));
+        if is_list_only {
+            continue;
+        }
+        let resources = match &stmt["Resource"] {
+            serde_json::Value::Array(a) => a.clone(),
+            v @ serde_json::Value::String(_) => vec![v.clone()],
+            _ => continue,
+        };
+        for r in resources {
+            let r = r.as_str().expect("Resource entry is a string");
+            if let Some(key_pattern) = round_three_bucket_relative_s3_pattern(r) {
+                out.push(key_pattern);
+            }
+        }
+    }
+    out
+}
+
+/// The message a `catch_unwind` payload carries, so a fixture can assert the
+/// rejection names the offending statement rather than only that something
+/// panicked.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        return (*s).to_string();
+    }
+    "<non-string panic payload>".to_string()
+}
+
+/// A single-statement synthetic policy.
+fn fixture_policy(stmt: serde_json::Value) -> Policy {
+    Policy {
+        role: "fixture",
+        statements: serde_json::json!([stmt]),
+    }
+}
+
+/// H1 regression: every S3 object grant whose `Resource` is not bucket-relative
+/// must be rejected by name. Round three's classifier panicked only for `"*"` and
+/// for an `arn:aws:s3:::` prefix and returned `None` for everything else, so each
+/// of these five shapes -- all real S3 object grants reaching outside the
+/// configured bucket -- was silently dropped and every resource guard derived an
+/// empty set.
+///
+/// All five shapes are covered, not one: the access-point and multi-region
+/// access-point forms carry a region and/or account and so miss the `:::` form,
+/// Object Lambda is a different service name entirely, `arn:*` is the
+/// everything-grant, and `my-ravel-bucket/*` is not an ARN at all.
+///
+/// Synthetic statements, not `deploy/iam/*.json`: the shipped templates name only
+/// bucket-relative object ARNs, so a fixture over them passes whichever way the
+/// classifier behaves. Each case asserts in both directions.
+#[test]
+fn non_bucket_relative_s3_object_resource_fails_closed() {
+    let cases = [
+        (
+            "AccessPointArn",
+            "arn:aws:s3:us-east-1:111122223333:accesspoint/ap/object/*",
+        ),
+        (
+            "ObjectLambdaArn",
+            "arn:aws:s3-object-lambda:us-east-1:111122223333:accesspoint/olap/object/*",
+        ),
+        (
+            "MultiRegionAccessPointArn",
+            "arn:aws:s3::111122223333:accesspoint/mrap/object/*",
+        ),
+        ("EverythingArn", "arn:*"),
+        ("MalformedNonArn", "my-ravel-bucket/*"),
+    ];
+
+    for (sid, resource) in cases {
+        let stmt = serde_json::json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": "s3:GetObject",
+            "Resource": resource,
+        });
+        let policy = fixture_policy(stmt.clone());
+
+        // Observation 1 (load-bearing): the resource is not bucket-relative, yet
+        // round three's classifier fell through to None instead of panicking, so
+        // its callers dropped it. Written as round three's own two literal
+        // conditions, so this pins the hole rather than restating the fix.
+        assert!(
+            resource.strip_prefix(BUCKET_KEY_PREFIX).is_none(),
+            "fixture {sid} invalid: {resource:?} must NOT be bucket-relative, or it \
+             is not an out-of-bucket grant at all"
+        );
+        let round_three_panicked = resource == "*" || resource.starts_with("arn:aws:s3:::");
+        assert!(
+            !round_three_panicked,
+            "fixture {sid} invalid: round three's two panic conditions were expected \
+             to miss {resource:?} -- if one catches it, this fixture no longer proves \
+             the catch-all None hole existed"
+        );
+        assert_eq!(
+            round_three_bucket_relative_s3_pattern(resource),
+            None,
+            "fixture {sid} invalid: round three's classifier was expected to return \
+             None (silently dropping the grant) for {resource:?}"
+        );
+        assert!(
+            round_three_resource_key_patterns(&policy).is_empty(),
+            "fixture {sid} invalid: round three's resource helper was expected to \
+             derive an empty pattern set for {resource:?}, hiding the grant"
+        );
+
+        // Observation 2: the choke point rejects it, naming the role, the
+        // statement index, the Sid and the offending value.
+        let err = validate_statement("gateway", 3, &stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        for expected in [resource, sid, "#3", "gateway"] {
+            assert!(
+                err.contains(expected),
+                "fixture {sid}: rejection must name {expected:?}; got {err:?}"
+            );
+        }
+
+        // Observation 3 (belt and braces): the helper itself panics if a guard is
+        // ever run on a statement that never passed the choke point.
+        let guard = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            resource_key_patterns(&policy)
+        }));
+        let message = panic_message(guard.expect_err(&format!(
+            "resource_key_patterns must panic on fixture {sid}, not drop the resource"
+        )));
+        assert!(
+            message.contains(resource) && message.contains(sid),
+            "fixture {sid}: the helper's panic must name the Sid and the resource; \
+             got {message:?}"
+        );
+    }
+}
+
+/// H2 regression: a list statement's `Resource` must be examined. Round three
+/// made a non-bucket-relative Resource fatal and then, to stop that tripping the
+/// bare bucket ARN that `s3:ListBucket` legitimately names, exempted whole
+/// list-only statements from the resource helpers. The result was a list
+/// statement whose Resource was read by NO guard in the file: `s3:ListBucket` on
+/// `"*"` -- which enumerates every bucket in the account -- passed validation,
+/// was skipped by the resource helpers, and `list_prefix_patterns` read only its
+/// Condition. This hole did not exist before round three.
+///
+/// The fix is the choke point's resource-class rule: a list grant must name the
+/// bare bucket ARN and nothing else, so the exemption is no longer needed and the
+/// helper never has to guess.
+#[test]
+fn list_statement_resource_is_examined() {
+    let cases = [
+        // The account-wide list: no class at all, rejected as unclassified.
+        ("ListOnStar", "*", "nor exactly that bucket ARN"),
+        // A list grant naming an object ARN: legal JSON, and in AWS a ListBucket
+        // on an object ARN matches nothing, so it is a template bug either way.
+        // The resource classifies, and the mismatch with the granted class is
+        // what rejects it.
+        (
+            "ListOnObjectArn",
+            "arn:aws:s3:::my-ravel-bucket/t/*",
+            "grants no S3 object operation",
+        ),
+    ];
+
+    for (sid, resource, must_explain) in cases {
+        let stmt = serde_json::json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": resource,
+            "Condition": {"StringLike": {"s3:prefix": ["t/*"]}},
+        });
+        let policy = fixture_policy(stmt.clone());
+
+        // Observation 1 (load-bearing): round three's list-only exemption skipped
+        // the statement before its Resource was classified at all, so the
+        // resource helper derived nothing.
+        assert!(
+            round_three_resource_key_patterns(&policy).is_empty(),
+            "fixture {sid} invalid: round three's list-only exemption was expected \
+             to skip the statement entirely; it did not"
+        );
+
+        // ...and the only guard that DID look at this statement looked solely at
+        // its Condition, which is the shape of the hole: the prefix was read, the
+        // Resource was not.
+        assert_eq!(
+            pre_fix_list_prefix_patterns(&policy),
+            vec!["t/*".to_string()],
+            "fixture {sid} invalid: list_prefix_patterns was expected to read the \
+             Condition (and nothing else) for this statement"
+        );
+
+        // Observation 2: the choke point now rejects the Resource by name.
+        let err = validate_statement("admin", 0, &stmt)
+            .expect_err(&format!("validate_statement must reject fixture {sid}"));
+        for expected in [resource, sid, must_explain] {
+            assert!(
+                err.contains(expected),
+                "fixture {sid}: rejection must name {expected:?}; got {err:?}"
+            );
+        }
+    }
+
+    // The same hole with the list grant hidden beside an object grant, which is
+    // what makes the class-mismatch arms above insufficient on their own: the
+    // object ARN is legitimate for the GetObject half, so only the coverage rule
+    // ("grants a bucket operation, names no bucket ARN") catches the ListBucket
+    // half reaching every key in the bucket with no Resource a guard reads.
+    let hidden = serde_json::json!({
+        "Sid": "ListHiddenBesideRead",
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket", "s3:GetObject"],
+        "Resource": "arn:aws:s3:::my-ravel-bucket/t/*",
+        "Condition": {"StringLike": {"s3:prefix": ["t/*"]}},
+    });
+    let hidden_policy = fixture_policy(hidden.clone());
+
+    // Observation 1 (load-bearing): round three read this statement twice and
+    // never once asked what its list half was scoped to. The resource helper saw
+    // it (is_list_only was false, so the exemption did not apply) and derived only
+    // the object pattern; the list guard saw it and read only the Condition.
+    assert_eq!(
+        round_three_resource_key_patterns(&hidden_policy),
+        vec!["t/*".to_string()],
+        "fixture invalid: round three's resource helper was expected to derive only \
+         the object pattern here, saying nothing about the list grant"
+    );
+    assert_eq!(
+        pre_fix_list_prefix_patterns(&hidden_policy),
+        vec!["t/*".to_string()],
+        "fixture invalid: round three's list guard was expected to read only the \
+         Condition here"
+    );
+
+    // Observation 2: the coverage rule rejects it, tagged H2.
+    let err = validate_statement("query", 2, &hidden)
+        .expect_err("validate_statement must reject a list grant that names no bucket ARN");
+    for expected in ["ListHiddenBesideRead", "#2", "issue #1346, H2"] {
+        assert!(
+            err.contains(expected),
+            "the rejection must name {expected:?}; got {err:?}"
+        );
+    }
+
+    // Trap (must not trip): the shipped list shape -- exactly the bare bucket ARN
+    // with an s3:prefix Condition -- still passes, and still contributes its
+    // prefixes.
+    let shipped = serde_json::json!({
+        "Sid": "ShippedListShape",
+        "Effect": "Allow",
+        "Action": "s3:ListBucket",
+        "Resource": BUCKET_ARN,
+        "Condition": {"StringLike": {"s3:prefix": ["t/", "sys/*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &shipped).is_ok(),
+        "the shipped list statement shape (bare bucket ARN + s3:prefix Condition) \
+         must still pass"
+    );
+    assert_eq!(
+        list_prefix_patterns(&fixture_policy(shipped), None),
+        vec!["t/".to_string(), "sys/*".to_string()],
+        "the shipped list shape must still contribute its s3:prefix patterns"
+    );
+}
+
+/// H3 regression, the predicate: `"s3:*"` and `"*"` grant PutObject, ListBucket
+/// and the delete actions, and `"*"` grants the KMS operations too. Round three
+/// resolved IAM wildcards on the delete axis only; put, list and KMS selection
+/// all compared exact names, so an `s3:*` statement was selected by none of them
+/// and the Condition-presence rule (which keys on the list grant) never fired.
+///
+/// This test is over the predicate rather than a policy because the predicate is
+/// now the only place any axis decides: if it answers all of these, no axis can
+/// be wildcard-blind.
+#[test]
+fn wildcard_action_is_selected_by_every_axis() {
+    // (action, does it grant an S3 object op / a bucket op / a KMS op,
+    //  and what did round three's put / list / KMS matcher answer for it)
+    let cases = [
+        ("s3:*", (true, true, false), (false, false, false)),
+        ("S3:*", (true, true, false), (false, false, false)),
+        ("*", (true, true, true), (false, false, false)),
+        ("s3:?utObject", (true, false, false), (false, false, false)),
+        // The one wildcard round three's KMS prefix matcher did catch: `kms:*`
+        // starts with `kms:`. It is `"*"` that slipped past that axis.
+        ("kms:*", (false, false, true), (false, false, true)),
+        // Control: a literal action grants only itself.
+        ("s3:GetObject", (true, false, false), (false, false, false)),
+        // Control: an unrelated literal grants nothing in the vocabulary.
+        (
+            "s3:DeleteObjectTagging",
+            (false, false, false),
+            (false, false, false),
+        ),
+    ];
+
+    for (action, post_fix, pre_fix) in cases {
+        let (grants_object, grants_list, grants_kms) = post_fix;
+        assert_eq!(
+            action_grants_any(action, &S3_OBJECT_OPERATIONS),
+            grants_object,
+            "action_grants: {action:?} vs {S3_OBJECT_OPERATIONS:?}"
+        );
+        assert_eq!(
+            action_grants_any(action, &S3_BUCKET_OPERATIONS),
+            grants_list,
+            "action_grants: {action:?} vs {S3_BUCKET_OPERATIONS:?}"
+        );
+        assert_eq!(
+            action_selects_kms(action),
+            grants_kms,
+            "action_selects_kms: {action:?}"
+        );
+
+        // Observation 1 (load-bearing): round three's per-axis matchers --
+        // exact case-folded equality for put and list, a case-folded `kms:`
+        // prefix for KMS -- asked about THIS case's action, so a row added to
+        // the table has to state what they answered for it. Spelled against
+        // two literals instead, the comparison is a compile-time constant that
+        // no edit to this file, to a template, or to the predicate could make
+        // fire, which is decoration rather than an assertion.
+        assert_eq!(
+            (
+                action.eq_ignore_ascii_case("s3:PutObject"),
+                action.eq_ignore_ascii_case("s3:ListBucket"),
+                action.starts_with("kms:"),
+            ),
+            pre_fix,
+            "round three's (put, list, KMS) selection for {action:?}"
+        );
+    }
+
+    // ...while the delete axis, the one round three made wildcard-aware, saw it.
+    // That asymmetry is what the single predicate removes.
+    assert!(
+        action_grants_any("s3:*", &S3_DELETE_OPERATIONS),
+        "the delete axis was already wildcard-aware and must stay so"
+    );
+}
+
+/// H3 regression, the shipped-template mutation the reviewer used: changing
+/// `GatewayWrite`'s Action from `s3:PutObject` to `s3:*` passed all 26 tests
+/// under round three. `s3:*` grants PutObject (so the routed-write KMS check
+/// should select the statement) and ListBucket (so the Condition-presence rule
+/// should demand an `s3:prefix` Condition and the resource rule should demand the
+/// bucket ARN), and round three's exact-name matchers saw neither.
+///
+/// The mutation is applied to an in-memory copy of `deploy/iam/gateway.json`; the
+/// file on disk is not touched, and the unmutated policy is asserted to still
+/// load.
+#[test]
+fn shipped_gateway_write_mutated_to_wildcard_action_fails_closed() {
+    let path = policy_json_path("gateway");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+
+    // The unmutated template still loads: this test's failure is about the
+    // mutation, not about the shipped file.
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_policy(
+            "gateway", &path, &json
+        )))
+        .is_ok(),
+        "the shipped gateway template must load unchanged"
+    );
+
+    let statements = json["Statement"]
+        .as_array_mut()
+        .expect("gateway.json Statement is an array");
+    // GatewayProvCreate is a second PutObject grant round three would have
+    // read; dropping it leaves GatewayWrite as the only put statement, which is
+    // the shape the reviewer mutated.
+    statements.retain(|stmt| stmt["Sid"] != serde_json::json!("GatewayProvCreate"));
+    let target = statements
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayWrite"))
+        .expect("gateway.json carries a GatewayWrite statement");
+    let original = target["Action"].clone();
+    assert_eq!(
+        original,
+        serde_json::json!("s3:PutObject"),
+        "fixture invalid: GatewayWrite's Action is no longer the s3:PutObject this \
+         mutation replaces"
+    );
+    target["Action"] = serde_json::json!("s3:*");
+
+    let mutated = Policy {
+        role: "gateway",
+        statements: json["Statement"].clone(),
+    };
+
+    // Observation 1 (load-bearing): under round three's exact-name matchers the
+    // mutated policy hid the grant in two independent places.
+    //
+    // The pre-fix put body decides membership through the live
+    // `statement_actions`, so an empty result on its own is also what a
+    // regression there would produce. Pin the raw mutated Action and round
+    // three's own comparison over it, so the emptiness is the exact-name
+    // matcher missing a wildcard and nothing else.
+    let mutated_action = json["Statement"]
+        .as_array()
+        .and_then(|s| {
+            s.iter()
+                .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayWrite"))
+        })
+        .and_then(|stmt| stmt["Action"].as_str())
+        .expect("the mutated GatewayWrite statement carries a string Action")
+        .to_string();
+    assert_eq!(
+        mutated_action, "s3:*",
+        "fixture invalid: the mutation must have taken effect on GatewayWrite"
+    );
+    assert!(
+        !mutated_action.eq_ignore_ascii_case("s3:PutObject"),
+        "fixture invalid: round three selected put statements by exact name, so \
+         the mutated action {mutated_action:?} must not match it"
+    );
+    assert!(
+        pre_fix_put_resource_key_patterns(&mutated).is_empty(),
+        "fixture invalid: round three's PutObject selection was expected to derive \
+         an EMPTY routed-write set from the mutated policy (so \
+         roles_writing_routed_objects_have_kms_grant skipped the role)"
+    );
+    let round_three_list_prefixes = pre_fix_list_prefix_patterns(&mutated);
+    assert!(
+        !round_three_list_prefixes.contains(&"*".to_string()),
+        "fixture invalid: round three's list detection was expected to read nothing \
+         from the s3:* statement; got {round_three_list_prefixes:?}"
+    );
+    assert!(
+        round_three_bucket_relative_s3_pattern("arn:aws:s3:::my-ravel-bucket/t/*/*/l0/*").is_some(),
+        "fixture invalid: the mutated statement's resources still strip cleanly, so \
+         nothing but the Action matcher could have caught this"
+    );
+
+    // Observation 2: the choke point rejects the mutated template, naming the
+    // statement, and `load_policy`'s real body is what does it.
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        build_policy("gateway", &path, &json)
+    }));
+    let message = panic_message(built.expect_err(
+        "build_policy must reject GatewayWrite mutated to \"s3:*\": the action grants \
+         ListBucket and PutObject, and its resources are object ARNs with no Condition",
+    ));
+    assert!(
+        message.contains("GatewayWrite") && message.contains("s3:*"),
+        "the rejection must name the mutated statement and its Action; got {message:?}"
+    );
+
+    // Observation 3: the post-fix put axis DOES select the mutated statement, so
+    // the routed-write KMS check would run on it rather than skip the role.
+    let routed: Vec<String> = put_resource_key_patterns(&mutated)
+        .into_iter()
+        .filter(|p| ravel_object_store::routes_through_tenant_key(p))
+        .collect();
+    assert!(
+        !routed.is_empty(),
+        "the post-fix put axis must select the s3:* statement's routed PUT patterns"
+    );
+}
+
+/// H3 companion: the normal IAM idiom round three's list-only exemption would
+/// have mishandled -- one statement granting both `s3:ListBucket` and
+/// `s3:GetObject`, naming both the bare bucket ARN and an object prefix -- must be
+/// ACCEPTED, and both axes must read it. Rejecting it (or rejecting it with a
+/// misleading "not bucket-relative" reason) would be a new failure of the same
+/// class, in the opposite direction.
+#[test]
+fn mixed_list_and_object_statement_is_accepted() {
+    let stmt = serde_json::json!({
+        "Sid": "MixedListAndRead",
+        "Effect": "Allow",
+        "Action": ["s3:ListBucket", "s3:GetObject"],
+        "Resource": [BUCKET_ARN, "arn:aws:s3:::my-ravel-bucket/t/*"],
+        "Condition": {"StringLike": {"s3:prefix": ["t/*"]}},
+    });
+    assert!(
+        validate_statement("fixture", 0, &stmt).is_ok(),
+        "a statement granting both ListBucket and GetObject over the bucket ARN plus \
+         an object prefix is a normal IAM idiom and must be accepted: {:?}",
+        validate_statement("fixture", 0, &stmt)
+    );
+
+    let policy = fixture_policy(stmt);
+
+    // The object axis reads the object prefix and skips the bucket ARN rather
+    // than panicking on it (round three's classifier panicked for the bare bucket
+    // ARN, which is why the exemption was added at the caller).
+    assert!(
+        std::panic::catch_unwind(|| round_three_bucket_relative_s3_pattern(BUCKET_ARN)).is_err(),
+        "fixture invalid: round three's classifier was expected to panic on the bare \
+         bucket ARN (the reason the list-only exemption existed)"
+    );
+    assert_eq!(
+        resource_key_patterns(&policy),
+        vec!["t/*".to_string()],
+        "the object axis must read the object prefix and skip the bucket ARN"
+    );
+
+    // ...and the list axis reads the Condition, so neither half sits unexamined.
+    assert_eq!(
+        list_prefix_patterns(&policy, None),
+        vec!["t/*".to_string()],
+        "the list axis must read the mixed statement's s3:prefix Condition"
+    );
+}
+
+/// The vocabulary's own invariants, so a later edit cannot silently narrow it:
+/// every operation is a literal name (`action_grants` asserts this, and an
+/// operation carrying a wildcard would make it answer a different question), the
+/// delete axis selects a subset of the object axis (a delete that is not an
+/// object operation would be selected by the delete guard while the choke point
+/// demanded a resource shape for a class it does not grant), and the three
+/// classes are disjoint (a shape rule keyed on class would otherwise be
+/// ambiguous).
+#[test]
+fn operation_vocabulary_is_consistent() {
+    let all: Vec<&str> = S3_OBJECT_OPERATIONS
+        .iter()
+        .chain(S3_BUCKET_OPERATIONS.iter())
+        .chain(KMS_OTHER_OPERATIONS.iter())
+        .chain(KMS_DATA_KEY_OPERATIONS.iter())
+        .copied()
+        .collect();
+    for op in &all {
+        assert!(
+            !op.contains(IAM_WILDCARDS),
+            "operation {op:?} carries an IAM wildcard; operations must be literal names"
+        );
+    }
+    for op in S3_DELETE_OPERATIONS {
+        assert!(
+            S3_OBJECT_OPERATIONS.contains(&op),
+            "delete operation {op:?} is not in S3_OBJECT_OPERATIONS, so a statement \
+             granting it would be selected by the delete axis while the choke point \
+             required no object resource for it"
+        );
+    }
+    for op in &all {
+        let object = S3_OBJECT_OPERATIONS.contains(op);
+        let bucket = S3_BUCKET_OPERATIONS.contains(op);
+        let kms = action_selects_kms(op);
+        assert_eq!(
+            u8::from(object) + u8::from(bucket) + u8::from(kms),
+            1,
+            "operation {op:?} belongs to more than one resource class (object \
+             {object}, bucket {bucket}, kms {kms}), so the choke point's shape rules \
+             would be ambiguous"
+        );
+    }
+}
+
+/// The `role/Sid` of every statement whose Resource carries IAM's
+/// single-character `?` wildcard.
+const QUESTION_MARK_RESOURCE_STATEMENTS: [&str; 7] = [
+    "gateway/GatewayAdmissionDelete",
+    "gateway/GatewayProvCreate",
+    "query/QueryManifestCreate",
+    "maintain/MaintainProvCreate",
+    "maintain/MaintainProvCas",
+    "admin/AdminProvCreate",
+    "admin/AdminProvCas",
+];
+
+/// The `role/Sid` of every list statement whose `s3:prefix` carries IAM's
+/// single-character `?` wildcard.
+const QUESTION_MARK_PREFIX_STATEMENTS: [&str; 3] = [
+    "gateway/GatewayListTenantBootstrapKeys",
+    "query/QueryListTenantBootstrapKeys",
+    "maintain/MaintainListTenantBootstrapKeys",
+];
+
+/// Every shipped template under `deploy/iam` passes the choke point, and the set
+/// this file guards is exactly the set on disk. `ALL_ROLES` is hand-written, so
+/// without this a new template would ship unguarded.
+#[test]
+fn every_shipped_template_passes_the_choke_point() {
+    let dir = format!("{}/../../deploy/iam", env!("CARGO_MANIFEST_DIR"));
+    let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read dir {dir}: {e}"))
+        .map(|entry| entry.expect("dir entry").file_name())
+        .filter_map(|name| {
+            name.to_str()
+                .and_then(|n| n.strip_suffix(".json"))
+                .map(str::to_string)
+        })
+        .collect();
+    on_disk.sort();
+    let mut guarded: Vec<String> = ALL_ROLES.iter().map(|r| (*r).to_string()).collect();
+    guarded.sort();
+    assert_eq!(
+        on_disk, guarded,
+        "the templates under deploy/iam and the roles ALL_ROLES guards must be the \
+         same set"
+    );
+    assert_eq!(
+        on_disk.len(),
+        4,
+        "expected 4 shipped templates: {on_disk:?}"
+    );
+
+    let mut question_mark_resources: Vec<String> = Vec::new();
+    let mut question_mark_prefixes: Vec<String> = Vec::new();
+    for role in ALL_ROLES {
+        // load_policy panics on any rejection, naming role, index, Sid and field.
+        let policy = load_policy(role);
+        assert!(
+            !policy_statements(&policy).is_empty(),
+            "{role}: policy has no statements"
+        );
+
+        // `glob_to_regex` resolves `?` as IAM's single-character wildcard and
+        // documents the two shipped fields that carry one. That is a property
+        // of the four JSON files, so it is asserted here rather than assumed: a
+        // `?` added to a template silently changes what every pattern axis
+        // reads.
+        for stmt in policy_statements(&policy) {
+            let sid = statement_sid(stmt);
+            for action in statement_actions(stmt) {
+                assert!(
+                    !action.contains('?'),
+                    "{role}/{sid}: Action {action:?} carries a `?`. glob_to_regex \
+                     resolves it as IAM's single-character wildcard; the doc claim \
+                     that no shipped Action uses one is now false and every \
+                     pattern-set expectation in this file must be re-read"
+                );
+            }
+            let mut carries_question_mark = false;
+            for resource in statement_resources(stmt) {
+                if !resource.contains('?') {
+                    continue;
+                }
+                // The admission reap spells the tenant hash and signal segments
+                // as a fixed count of single-character wildcards between
+                // literal slashes, so the delete cannot reach a Parquet
+                // manifest, whose key has `/pq/t/` at those positions.
+                // The Query manifest create spells the tenant hash the same
+                // way, so the write reaches `t/<32 characters>/pq/t/` and no
+                // deeper `pq/t/` segment of another keyspace. The
+                // provisioning-record writes do too, so they reach only
+                // `t/<32 characters>/<signal>/prov`.
+                if QUESTION_MARK_RESOURCE_STATEMENTS.contains(&format!("{role}/{sid}").as_str()) {
+                    carries_question_mark = true;
+                    continue;
+                }
+                panic!(
+                    "{role}/{sid}: Resource {resource:?} carries a `?`, and only \
+                     {QUESTION_MARK_RESOURCE_STATEMENTS:?} are allowed one. Same \
+                     consequence as for Action above"
+                );
+            }
+            if carries_question_mark {
+                question_mark_resources.push(format!("{role}/{sid}"));
+            }
+        }
+
+        // `s3:prefix` Condition values are the third field fed through
+        // `glob_to_regex` (via `glob_admits_everything` in `validate_condition`
+        // and `glob_matches` in `discovery_prefix_admitted_for_every_discovering_role`),
+        // so the `?` allowlist must be asserted over them too or the
+        // glob_to_regex doc's citation of this test would overstate its scope.
+        // The bootstrap-key statements spell the tenant hash as 32 `?`, so the
+        // listing they admit reaches one key shape and no deeper segment.
+        for stmt in policy_statements(&policy) {
+            let sid = statement_sid(stmt);
+            let single = Policy {
+                role,
+                statements: serde_json::json!([stmt.clone()]),
+            };
+            let prefixes = list_prefix_patterns(&single, None);
+            if !prefixes.iter().any(|p| p.contains('?')) {
+                continue;
+            }
+            assert!(
+                QUESTION_MARK_PREFIX_STATEMENTS.contains(&format!("{role}/{sid}").as_str()),
+                "{role}/{sid}: s3:prefix {prefixes:?} carries a `?`, and only \
+                 {QUESTION_MARK_PREFIX_STATEMENTS:?} are allowed one. glob_to_regex \
+                 resolves it as IAM's single-character wildcard, so every prefix \
+                 axis in this file must be re-read"
+            );
+            question_mark_prefixes.push(format!("{role}/{sid}"));
+        }
+    }
+    question_mark_resources.sort();
+    let mut allowlisted: Vec<&str> = QUESTION_MARK_RESOURCE_STATEMENTS.to_vec();
+    allowlisted.sort_unstable();
+    assert_eq!(
+        question_mark_resources, allowlisted,
+        "the allowlisted `?` Resources must still be the only ones, and must \
+         still carry their `?`"
+    );
+    question_mark_prefixes.sort();
+    let mut allowlisted: Vec<&str> = QUESTION_MARK_PREFIX_STATEMENTS.to_vec();
+    allowlisted.sort_unstable();
+    assert_eq!(
+        question_mark_prefixes, allowlisted,
+        "the allowlisted `?` s3:prefix statements must still be the only ones, \
+         and must still carry their `?`"
+    );
+}
+
+/// The object-store contract's compliance-mode paragraph must state the true
+/// consequence of a locked commit record instead of the retired claim that
+/// Object Lock on the protected prefixes never conflicts with a legitimate
+/// erasure request: the sweep's delete on a locked record lands as a delete
+/// marker, and the locked version stays in storage until its retain-until
+/// `R` has passed and noncurrent-version expiry has removed it. The
+/// paragraph must not carry the withdrawn claims that the lock refuses the
+/// delete or that an operator keeps `R` inside `protection_horizon`; the
+/// scan stops at the paragraph's end, so the catalog-family text, which
+/// names `protection_horizon` for rule 5's age gate, cannot satisfy or
+/// fail it. `t/*/*/c/*` must stay deletable: present in Maintain's own
+/// delete grant and absent from `PROTECTED_DELETE_KEYS`
+/// (`DenyDeleteProtected`), or the superseded sweep this doc claim rests on
+/// could not run at all.
+#[test]
+fn commit_prefix_is_deletable_and_a_locked_record_delete_lands_as_a_marker() {
+    let doc_path = format!(
+        "{}/../../docs/object-store-contract.md",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let doc = std::fs::read_to_string(&doc_path).unwrap_or_else(|e| panic!("read {doc_path}: {e}"));
+
+    assert!(
+        !doc.contains("never conflicts with a legitimate erasure request"),
+        "{doc_path} still carries the retired claim that Object Lock on the \
+         protected prefixes never conflicts with a legitimate erasure \
+         request; a locked commit record keeps an erased subject's bytes in \
+         storage as a noncurrent version until its retain-until has passed"
+    );
+
+    let commit_paragraph: String = doc
+        .lines()
+        .skip_while(|l| !l.contains("commit records `t/*/*/c/*`"))
+        .take_while(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        !commit_paragraph.is_empty(),
+        "{doc_path}: could not find the paragraph naming commit records \
+         `t/*/*/c/*` under the compliance-mode Object Lock point; the \
+         anchor text this test scans for may have moved"
+    );
+    for phrase in [
+        "on a still-locked commit record, retained until `R`, does not refuse that delete",
+        "it succeeds and inserts a delete marker",
+        "The locked version stays in storage as a noncurrent version",
+        "once both its retain-until has passed and `E_v` has elapsed since the delete",
+        "`max(bound + E_v, R)`",
+    ] {
+        assert!(
+            commit_paragraph.contains(phrase),
+            "the paragraph naming t/*/*/c/* must say a delete on a locked \
+             commit record lands as a delete marker and the locked version \
+             stays until its retain-until; missing {phrase:?}; paragraph \
+             was:\n{commit_paragraph}"
+        );
+    }
+    for retired in [
+        "refuses that delete until",
+        "`max(bound, R)`",
+        "protection_horizon",
+    ] {
+        assert!(
+            !commit_paragraph.contains(retired),
+            "the paragraph naming t/*/*/c/* still carries {retired:?}: Object \
+             Lock does not refuse the sweep's delete, so it neither delays \
+             the sweep nor asks an operator to keep the retention period \
+             inside protection_horizon; paragraph was:\n{commit_paragraph}"
+        );
+    }
+
+    let policy = load_policy("maintain");
+    let maintain_delete = policy_statements(&policy)
+        .iter()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainDelete"))
+        .expect("maintain.json carries a MaintainDelete statement");
+    let resources = statement_resources(maintain_delete);
+    assert!(
+        resources.iter().any(|r| r.ends_with("t/*/*/c/*")),
+        "MaintainDelete must grant delete on t/*/*/c/*, or the superseded \
+         sweep this doc claim rests on could not delete a commit record at \
+         all: {resources:?}"
+    );
+    assert!(
+        !PROTECTED_DELETE_KEYS.contains(&"t/*/*/c/*"),
+        "t/*/*/c/* must stay out of PROTECTED_DELETE_KEYS (DenyDeleteProtected); \
+         an IAM Deny there would refuse every superseded-sweep delete of a \
+         commit record outright, where the compliance-mode lock this doc \
+         claim describes refuses none (each delete lands as a delete marker)"
+    );
+}
+
+/// Every doc that restates the compliance-mode claim must restate the
+/// *qualified* form, on two axes.
+///
+/// First, "never a target" is scoped to three named mechanisms (supersession
+/// GC, retention deletion, subject erasure). Each guide once widened that into
+/// a universal ("never sweep targets", "never deleted by a maintenance sweep",
+/// "nothing ever deletes them"), which is false:
+/// `sweep_unreferenced_catalog_objects` deletes every catalog snapshot and
+/// index object the current HEAD no longer names, and those keys are inside
+/// the locked `t/*/catalog/*/*` family.
+///
+/// Second, the correction to that first error carried its own false claim:
+/// that a locked catalog object costs storage rather than erasure latency,
+/// because no catalog object can hold a subject value. Per-part `.cstat`
+/// column-statistics objects do hold one. `ColumnStat` carries a `ColumnValue`
+/// min and max and a repeated `DictEntry` dictionary
+/// (proto/ravel/catalog.proto), `ColumnValue` admits `str_utf8` and
+/// `bytes_val`, the fold tallies a declared `Str` or `Bytes` column's exact
+/// min, max and distinct-value dictionary
+/// (crates/ravel-catalog/src/column_stats_build.rs), a tenant may declare any
+/// attribute key as a `STR` typed attribute column (proto/ravel/sys.proto),
+/// and the object lands under the swept `idx/` prefix
+/// (crates/ravel-catalog/src/fold.rs).
+///
+/// Third, the correction to the second error was itself incomplete: the
+/// `.done`-scope prose in docs/deletion-and-gc.md and the erasure stage table
+/// in docs/consistency-model.md still stated the universal in other words
+/// ("index objects carry no subject values", "the only place a subject
+/// physically lives"). Those spellings are retired here too, and the
+/// consistency doc is now one of the rows, so no file that carried the claim
+/// is outside this pin.
+///
+/// `commit_prefix_is_deletable_and_a_locked_record_delete_lands_as_a_marker` reads
+/// only the contract page, so reverting any other file left it green. This is
+/// the per-file pin: each row names the phrases only the corrected text
+/// carries and every phrase the three corrections retired, so reverting one
+/// file fails one named assertion.
+const CATALOG_SWEEP_DOC_CLAIMS: &[(&str, &[&str], &[&str])] = &[
+    (
+        "docs/object-store-contract.md",
+        &["unreferenced-catalog sweep", "distinct-value dictionary"],
+        CATALOG_SUBJECT_VALUE_RETIRED,
+    ),
+    (
+        "docs/deletion-and-gc.md",
+        CATALOG_CONSEQUENCE_AND_POINTER,
+        CATALOG_SUBJECT_VALUE_RETIRED,
+    ),
+    (
+        "docs/guides/disaster-recovery.md",
+        CATALOG_CONSEQUENCE_AND_POINTER,
+        CATALOG_SUBJECT_VALUE_RETIRED,
+    ),
+    (
+        "docs/guides/operations/deployment.md",
+        CATALOG_CONSEQUENCE_AND_POINTER,
+        CATALOG_SUBJECT_VALUE_RETIRED,
+    ),
+    (
+        "docs/consistency-model.md",
+        CATALOG_CONSEQUENCE_AND_POINTER,
+        CATALOG_SUBJECT_VALUE_RETIRED,
+    ),
+];
+
+/// The four non-normative restatements now carry only the operator-facing
+/// consequence of a lock on the catalog family and a pointer, by heading, to
+/// the object store contract that owns the full mechanism. Requiring both
+/// anchors keeps each file from silently dropping the erasure-cost consequence
+/// or the pointer: removing the pointer from any one file fails the presence
+/// assertion for that row.
+const CATALOG_CONSEQUENCE_AND_POINTER: &[&str] = &[
+    "costs an erasure obligation",
+    "A lock on the catalog family",
+];
+
+/// Phrases no doc may carry again. The first group is the "a maintenance sweep
+/// never touches the catalog family" universal in each spelling a doc used;
+/// the second is the "and so a lock there cannot delay an erasure" claim that
+/// replaced it, in each spelling; the third is the same universal in the
+/// spellings the `.done`-scope prose used, which sat seventy lines below the
+/// correction in its own file and in the consistency doc's stage table.
+/// `never a sweep target` is listed because its absence from an earlier list
+/// is exactly why one summary-table row kept the universal after the prose
+/// above it had been corrected.
+const CATALOG_SUBJECT_VALUE_RETIRED: &[&str] = &[
+    "are never sweep targets",
+    "never a sweep target",
+    "never targets of the sweeps",
+    "nothing ever deletes",
+    "locking those three is free",
+    "never deleted by a maintenance sweep",
+    "costs nothing beyond the mechanism itself",
+    "cannot hold a subject value",
+    "no catalog object can hold a subject value",
+    "No subject value can live in a catalog object",
+    "carry no subject values",
+    "hold no subject values",
+    "disjoint from subject erasure by construction",
+    "the only place a subject physically lives",
+    // The IAM half of the same claim. The catalog delete-deny was
+    // narrowed to `catalog/<signal>/HEAD` (#1847), so a doc asserting the
+    // shipped policy refuses the delete outright now states an
+    // open-ended erasure bound where the contract states `+R`. Two
+    // passages survived the first sweep for exactly this reason: the
+    // retired list covered the sweep half only.
+    "the shipped Maintain IAM policy the delete is denied outright",
+    "open-ended under the shipped Maintain IAM policy",
+    "which denies the maintenance role every delete under the catalog",
+];
+
+#[test]
+fn every_doc_qualifies_the_catalog_family_sweep_and_erasure_claim() {
+    for (rel, required, retired) in CATALOG_SWEEP_DOC_CLAIMS {
+        let path = format!("{}/../../{rel}", env!("CARGO_MANIFEST_DIR"));
+        let doc = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        for anchor in *required {
+            assert!(
+                doc.contains(anchor),
+                "{rel} must contain {anchor:?}. The unreferenced-catalog sweep \
+                 deletes objects under t/*/catalog/*/*, and a per-part \
+                 column-statistics object among them stores a declared Str or \
+                 Bytes column's exact min, max and distinct-value dictionary, \
+                 so a lock on that family both delays collection and extends \
+                 the erasure bound"
+            );
+        }
+        for phrase in *retired {
+            assert!(
+                !doc.contains(phrase),
+                "{rel} still carries the retired claim {phrase:?}; \
+                 sweep_unreferenced_catalog_objects deletes catalog snapshot \
+                 and index objects, and a .cstat among them can hold an erased \
+                 subject's own column value verbatim"
+            );
+        }
+    }
+}
+
+/// The unnamed-since markers (ADR-1133) live under the per-signal `maint/`
+/// prefix. The retention and superseded-input sweeps write one with
+/// `CreateIfAbsent`, delete it after the objects it gated (or on a re-name or
+/// an anchor mismatch), and the orphan reaper lists `maint/unn/` signal-wide.
+/// A refused marker delete keeps a retention bucket's tombstone, and blocks a
+/// candidate whose marker must be replaced, on every pass (decision 6), so all
+/// three grants are load-bearing.
+#[test]
+fn maintain_template_covers_every_unnamed_marker_call() {
+    use ravel_commit::keys::{
+        record_unnamed_marker_key, retention_unnamed_marker_key, unnamed_marker_prefix,
+    };
+    let tenant = test_tenant();
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let puts = key_patterns_for(&maintain, &["s3:PutObject"], Some("Allow"));
+    let deletes = delete_key_patterns(&maintain, "Allow");
+    let denied = delete_key_patterns(&maintain, "Deny");
+
+    for signal in ALL_SIGNALS {
+        let prefix = unnamed_marker_prefix(&tenant, signal);
+        let record = compaction_record_key(&tenant, signal, 3, 480_000, hash16())
+            .expect("compaction_record_key");
+        let markers = [
+            retention_unnamed_marker_key(&tenant, signal, 3, 480_000)
+                .expect("retention_unnamed_marker_key"),
+            record_unnamed_marker_key(&record).expect("record_unnamed_marker_key"),
+        ];
+        assert!(
+            list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
+            "maintain: no ListBucket s3:prefix admits {prefix:?}, the orphan \
+             marker reaper's LIST. s3:prefix values: {list_prefixes:?}"
+        );
+        for marker in &markers {
+            assert!(marker.starts_with(&prefix), "{marker:?} under {prefix:?}");
+            assert!(
+                puts.iter().any(|p| glob_matches(p, marker)),
+                "maintain: no PutObject Allow reaches the marker {marker:?}. \
+                 Grants: {puts:?}"
+            );
+            assert!(
+                gets.iter().any(|p| glob_matches(p, marker)),
+                "maintain: no GetObject Allow reaches the marker {marker:?}. \
+                 Grants: {gets:?}"
+            );
+            assert!(
+                deletes.iter().any(|p| glob_matches(p, marker)),
+                "maintain: no delete Allow reaches the marker {marker:?}, so \
+                 every marker delete is refused and its candidate blocks for \
+                 good. Grants: {deletes:?}"
+            );
+            assert!(
+                !denied.iter().any(|p| glob_matches(p, marker)),
+                "maintain: a delete Deny reaches the marker {marker:?}. \
+                 Denies: {denied:?}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bootstrap-key ListBucket grants (issue #2332). On AWS S3 a GET or HEAD of an
+// absent key answers 403 unless the caller holds an `s3:ListBucket` whose
+// `s3:prefix` condition covers that key, and 404 when it does. Each server role
+// lists exactly the single keys it reads where the code treats absence as a
+// normal state, so the read sees `NotFound` instead of `AccessDenied`.
+// ---------------------------------------------------------------------------
+
+/// The per-tenant bootstrap keys. The tenant hash is 32 single-character
+/// wildcards and no pattern carries a `*`, so each admits one key shape and no
+/// listing of anything below or beside it.
+const BOOTSTRAP_CONFIG_PATTERN: &str = "t/????????????????????????????????/config";
+const BOOTSTRAP_ENC_PATTERN: &str = "t/????????????????????????????????/enc";
+const BOOTSTRAP_META_PATTERN: &str = "t/????????????????????????????????/m/meta";
+const PROV_P_PATTERN: &str = "t/????????????????????????????????/p/prov";
+const PROV_A_PATTERN: &str = "t/????????????????????????????????/a/prov";
+const PROV_U_PATTERN: &str = "t/????????????????????????????????/u/prov";
+const BOOTSTRAP_ALERT_STATE_PATTERN: &str = "t/????????????????????????????????/a/state/latest";
+const BOOTSTRAP_PQ_GRANTS_PATTERN: &str = "t/????????????????????????????????/pq/grants";
+const BOOTSTRAP_HEAD_M_PATTERN: &str = "t/????????????????????????????????/catalog/m/HEAD";
+const BOOTSTRAP_HEAD_L_PATTERN: &str = "t/????????????????????????????????/catalog/l/HEAD";
+const BOOTSTRAP_HEAD_S_PATTERN: &str = "t/????????????????????????????????/catalog/s/HEAD";
+
+/// One server role's two bootstrap-key list statements. IAM ANDs the operators
+/// of one Condition block, so the fixed keys (`StringEquals`) and the
+/// per-tenant keys (`StringLike`) need a statement each.
+struct ExpectedBootstrapGrants {
+    role: &'static str,
+    fixed_sid: &'static str,
+    fixed_keys: &'static [&'static str],
+    tenant_sid: &'static str,
+    tenant_patterns: &'static [&'static str],
+}
+
+const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
+    ExpectedBootstrapGrants {
+        role: "gateway",
+        fixed_sid: "GatewayListBootstrapKeys",
+        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc", "sys/auth"],
+        tenant_sid: "GatewayListTenantBootstrapKeys",
+        tenant_patterns: &[
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            BOOTSTRAP_META_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+        ],
+    },
+    ExpectedBootstrapGrants {
+        role: "query",
+        fixed_sid: "QueryListBootstrapKeys",
+        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc", "sys/auth"],
+        tenant_sid: "QueryListTenantBootstrapKeys",
+        tenant_patterns: &[
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            BOOTSTRAP_META_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_P_PATTERN,
+            PROV_A_PATTERN,
+            PROV_U_PATTERN,
+            BOOTSTRAP_ALERT_STATE_PATTERN,
+            BOOTSTRAP_PQ_GRANTS_PATTERN,
+        ],
+    },
+    ExpectedBootstrapGrants {
+        role: "maintain",
+        fixed_sid: "MaintainListBootstrapKeys",
+        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc"],
+        tenant_sid: "MaintainListTenantBootstrapKeys",
+        tenant_patterns: &[
+            BOOTSTRAP_CONFIG_PATTERN,
+            BOOTSTRAP_ENC_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            BOOTSTRAP_HEAD_M_PATTERN,
+            BOOTSTRAP_HEAD_L_PATTERN,
+            BOOTSTRAP_HEAD_S_PATTERN,
+            BOOTSTRAP_ALERT_STATE_PATTERN,
+        ],
+    },
+];
+
+/// One single-key read whose `NotFound` the code handles as a normal state.
+struct BootstrapRead {
+    role: &'static str,
+    key: String,
+    call_site: &'static str,
+    /// The list statement whose `s3:prefix` admits `key`: one of the role's
+    /// two bootstrap statements, or an existing statement that already did.
+    admitted_by: &'static str,
+}
+
+/// Every single-key read, per server role, on a startup or first-request path,
+/// whose absence the code treats as a normal state, written in the shape each
+/// key builder produces for `test_tenant()`. `all` mode is the union.
+fn bootstrap_reads() -> Vec<BootstrapRead> {
+    let hex = test_tenant().to_hex();
+    let mut reads = Vec::new();
+    let mut add = |role, key: String, call_site, admitted_by| {
+        reads.push(BootstrapRead {
+            role,
+            key,
+            call_site,
+            admitted_by,
+        });
+    };
+    for (role, fixed_sid, tenant_sid) in [
+        (
+            "gateway",
+            "GatewayListBootstrapKeys",
+            "GatewayListTenantBootstrapKeys",
+        ),
+        (
+            "query",
+            "QueryListBootstrapKeys",
+            "QueryListTenantBootstrapKeys",
+        ),
+        (
+            "maintain",
+            "MaintainListBootstrapKeys",
+            "MaintainListTenantBootstrapKeys",
+        ),
+    ] {
+        add(
+            role,
+            "sys/qualification".to_string(),
+            "qualification::enforce (services/ravel-server/src/qualification.rs), startup",
+            fixed_sid,
+        );
+        add(
+            role,
+            "sys/tenancy".to_string(),
+            "read_marker in tenancy::resolve_and_pin (services/ravel-server/src/tenancy.rs), \
+             startup; store_probe::run_probe_cycle",
+            fixed_sid,
+        );
+        add(
+            role,
+            "sys/gc".to_string(),
+            "read_gc_config in bootstrap_gc_config (crates/ravel-maintain/src/gc_config.rs), \
+             startup",
+            fixed_sid,
+        );
+        add(
+            role,
+            format!("t/{hex}/config"),
+            "read_config (crates/ravel-catalog/src/tenant_config.rs): the gateway limits and \
+             indexed-field refreshes, the query declared-column refresh, the maintain \
+             lifecycle discovery, retention window and fold",
+            tenant_sid,
+        );
+        add(
+            role,
+            format!("t/{hex}/enc"),
+            "read_epochs_from_store in bootstrap_tenant_epoch \
+             (services/ravel-server/src/tenant_kms.rs), startup under --tenant-kms-config",
+            tenant_sid,
+        );
+    }
+    for role in ["gateway", "query"] {
+        let fixed_sid = if role == "gateway" {
+            "GatewayListBootstrapKeys"
+        } else {
+            "QueryListBootstrapKeys"
+        };
+        let tenant_sid = if role == "gateway" {
+            "GatewayListTenantBootstrapKeys"
+        } else {
+            "QueryListTenantBootstrapKeys"
+        };
+        add(
+            role,
+            "sys/auth".to_string(),
+            "read_auth_map in DurableAuthState::refresh \
+             (services/ravel-server/src/lifecycle_refresh.rs), startup and refresh, keyed bucket",
+            fixed_sid,
+        );
+        add(
+            role,
+            metrics_meta_key(),
+            "read_metrics_meta: the gateway metadata sink flush, the query metadata cache",
+            tenant_sid,
+        );
+    }
+    for signal in PROVISIONED_SIGNALS {
+        let key = format!("t/{hex}/{}/prov", signal.key_prefix());
+        add(
+            "gateway",
+            key.clone(),
+            "validate_or_adopt via ProvisioningRecordWriter::ensure and \
+             validate_static_provisioning (services/ravel-server/src/provisioning.rs)",
+            "GatewayListTenantBootstrapKeys",
+        );
+        add(
+            "maintain",
+            key,
+            "validate_or_adopt and read_generations_from_store in the maintain tick \
+             (services/ravel-server/src/maintain.rs); validate_static_provisioning",
+            "MaintainListTenantBootstrapKeys",
+        );
+        add(
+            "maintain",
+            format!("t/{hex}/catalog/{}/HEAD", signal.key_prefix()),
+            "get_head in the scheduled fold (crates/ravel-catalog/src/fold.rs)",
+            "MaintainListTenantBootstrapKeys",
+        );
+    }
+    // The query catalog enforces provisioning, so every resolve reads the
+    // queried signal's record, including the signals that never get one.
+    for signal in ALL_SIGNALS {
+        add(
+            "query",
+            format!("t/{hex}/{}/prov", signal.key_prefix()),
+            "enforce_provisioning_once and read_scan_generations \
+             (crates/ravel-catalog/src/catalog.rs) on each resolve; \
+             validate_static_provisioning",
+            "QueryListTenantBootstrapKeys",
+        );
+        add(
+            "query",
+            format!("t/{hex}/catalog/{}/HEAD", signal.key_prefix()),
+            "read_head (crates/ravel-catalog/src/snapshot_resolve.rs) and the on-demand fold",
+            "QueryList",
+        );
+    }
+    add(
+        "query",
+        alert_state_memo_key(),
+        "read_alert_state_memo in the alert evaluator tick (services/ravel-server/src/alerting.rs)",
+        "QueryListTenantBootstrapKeys",
+    );
+    add(
+        "query",
+        parquet_grants_key(),
+        "grants::list (crates/ravel-pqtable/src/grants.rs), Parquet table resolve and DDL",
+        "QueryListTenantBootstrapKeys",
+    );
+    add(
+        "maintain",
+        alert_state_memo_key(),
+        "read_alert_state_memo in alert_keep_set (services/ravel-server/src/maintain.rs)",
+        "MaintainListTenantBootstrapKeys",
+    );
+    // `cursor_key` in services/ravel-server/src/scrub.rs.
+    add(
+        "maintain",
+        format!("t/{hex}/m/maint/scrub/0000.cursor"),
+        "load_cursor (services/ravel-server/src/scrub.rs)",
+        "MaintainList",
+    );
+    reads
+}
+
+/// Keys and listing prefixes no bootstrap statement may admit beyond the ones a
+/// role's own reads name: listing prefixes above a bootstrap key, a key one
+/// segment deeper, and every per-tenant read's key under a tenant segment one
+/// character narrower (31) or wider (33) than a tenant hash.
+fn bootstrap_negative_witnesses() -> Vec<String> {
+    let hex = test_tenant().to_hex();
+    let narrow = &hex[..hex.len() - 1];
+    let wide = format!("{hex}0");
+    assert_eq!((narrow.len(), wide.len()), (31, 33));
+    let mut keys: Vec<String> = [
+        "sys/",
+        "sys/t/",
+        "t/",
+        "sys/gc/x",
+        "sys/tenancy/x",
+        "sys/qualification/x",
+        "sys/auth/x",
+    ]
+    .iter()
+    .map(|k| (*k).to_string())
+    .collect();
+    for suffix in [
+        "",
+        "m/",
+        "a/",
+        "catalog/",
+        "catalog/m/",
+        "config/x",
+        "enc/x",
+        "m/meta/x",
+        "m/prov/x",
+        "x/prov",
+        "a/state/latest/x",
+        "pq/grants/x",
+        "catalog/m/HEAD/x",
+        "catalog/m/snap/0000000000000000.csnap",
+    ] {
+        keys.push(format!("t/{hex}/{suffix}"));
+    }
+    for read in bootstrap_reads() {
+        if let Some(rest) = read.key.strip_prefix(&format!("t/{hex}/")) {
+            keys.push(format!("t/{narrow}/{rest}"));
+            keys.push(format!("t/{wide}/{rest}"));
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// The candidates out of `key_domain()`, the bootstrap reads and the negative
+/// witnesses that `expected`'s two statements in `policy` admit.
+fn bootstrap_admitted(
+    policy: &Policy,
+    expected: &ExpectedBootstrapGrants,
+) -> std::collections::BTreeSet<String> {
+    let statements: Vec<serde_json::Value> = policy_statements(policy)
+        .iter()
+        .filter(|s| {
+            let sid = statement_sid(s);
+            sid == expected.fixed_sid || sid == expected.tenant_sid
+        })
+        .cloned()
+        .collect();
+    let bootstrap_only = Policy {
+        role: policy.role,
+        statements: serde_json::Value::Array(statements),
+    };
+    let prefixes = list_prefix_patterns(&bootstrap_only, Some("Allow"));
+    let mut candidates: Vec<String> = key_domain().to_vec();
+    candidates.extend(bootstrap_reads().into_iter().map(|r| r.key));
+    candidates.extend(bootstrap_negative_witnesses());
+    candidates
+        .into_iter()
+        .filter(|key| prefixes.iter().any(|p| glob_matches(p, key)))
+        .collect()
+}
+
+/// `Ok` when `expected`'s two statements in `policy` admit exactly the keys of
+/// the role's own bootstrap reads, out of every candidate `bootstrap_admitted`
+/// tries; otherwise the extra and missing keys.
+fn check_bootstrap_grants_admit_only(
+    policy: &Policy,
+    expected: &ExpectedBootstrapGrants,
+) -> Result<(), String> {
+    let wanted: std::collections::BTreeSet<String> = bootstrap_reads()
+        .into_iter()
+        .filter(|r| {
+            r.role == expected.role
+                && (r.admitted_by == expected.fixed_sid || r.admitted_by == expected.tenant_sid)
+        })
+        .map(|r| r.key)
+        .collect();
+    let admitted = bootstrap_admitted(policy, expected);
+    let extra: Vec<&String> = admitted.difference(&wanted).collect();
+    let missing: Vec<&String> = wanted.difference(&admitted).collect();
+    if extra.is_empty() && missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: the bootstrap list statements admit {extra:?}, which no bootstrap read \
+             of this role names, and miss {missing:?}",
+            expected.role
+        ))
+    }
+}
+
+/// Each server role's two bootstrap statements carry exactly the expected
+/// Condition: the fixed keys under `StringEquals`, the per-tenant keys under
+/// `StringLike` with a 32-wildcard tenant segment and no `*`. The template
+/// holds no other statement named for bootstrap keys.
+#[test]
+fn bootstrap_list_grants_carry_exactly_the_expected_conditions() {
+    for expected in &EXPECTED_BOOTSTRAP_GRANTS {
+        let role = expected.role;
+        let policy = load_policy(role);
+        let mut bootstrap_sids: Vec<&str> = policy_statements(&policy)
+            .iter()
+            .map(statement_sid)
+            .filter(|sid| sid.contains("Bootstrap"))
+            .collect();
+        bootstrap_sids.sort_unstable();
+        let mut want = vec![expected.fixed_sid, expected.tenant_sid];
+        want.sort_unstable();
+        assert_eq!(bootstrap_sids, want, "{role}: bootstrap list statements");
+
+        for (sid, operator, values) in [
+            (expected.fixed_sid, "StringEquals", expected.fixed_keys),
+            (expected.tenant_sid, "StringLike", expected.tenant_patterns),
+        ] {
+            let stmt = policy_statements(&policy)
+                .iter()
+                .find(|s| statement_sid(s) == sid)
+                .unwrap_or_else(|| panic!("{role}: no statement {sid}"));
+            assert_eq!(
+                stmt,
+                &serde_json::json!({
+                    "Sid": sid,
+                    "Effect": "Allow",
+                    "Action": "s3:ListBucket",
+                    "Resource": BUCKET_ARN,
+                    "Condition": {operator: {"s3:prefix": values}},
+                }),
+                "{role}/{sid}: the statement is not exactly the expected list grant"
+            );
+        }
+        for key in expected.fixed_keys {
+            assert!(
+                key.starts_with("sys/") && !key.contains(['*', '?']),
+                "{role}: fixed bootstrap key {key:?}"
+            );
+        }
+        for pattern in expected.tenant_patterns {
+            let segments: Vec<&str> = pattern.split('/').collect();
+            assert_eq!(
+                (segments[0], segments[1]),
+                ("t", "?".repeat(test_tenant().to_hex().len()).as_str()),
+                "{role}: {pattern:?} must spell the tenant hash as one `?` per character"
+            );
+            assert!(!pattern.contains('*'), "{role}: {pattern:?} carries a `*`");
+            for segment in &segments[2..] {
+                assert!(
+                    !segment.contains('?'),
+                    "{role}: {pattern:?} has a `?` outside the tenant segment"
+                );
+            }
+        }
+    }
+
+    // Query reads the provisioning record of whichever signal a query
+    // resolves, so its statement names one record per signal letter.
+    let query = EXPECTED_BOOTSTRAP_GRANTS
+        .iter()
+        .find(|e| e.role == "query")
+        .expect("query row");
+    let hash = "?".repeat(test_tenant().to_hex().len());
+    let want: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|s| format!("t/{hash}/{}/prov", s.key_prefix()))
+        .collect();
+    let got: Vec<String> = query
+        .tenant_patterns
+        .iter()
+        .filter(|p| p.ends_with("/prov"))
+        .map(|p| (*p).to_string())
+        .collect();
+    assert_eq!(
+        got, want,
+        "query: one provisioning-record pattern per signal"
+    );
+}
+
+/// Every bootstrap read in `bootstrap_reads` is admitted by the list statement
+/// it names, which belongs to that role, and its GET is granted. A read the
+/// discovery statement already covered names that statement.
+#[test]
+fn every_bootstrap_read_is_admitted_by_its_roles_list_grant() {
+    let reads = bootstrap_reads();
+    for role in ROLES_WITH_DISCOVERY {
+        assert!(
+            reads.iter().any(|r| r.role == role),
+            "{role}: no bootstrap read listed"
+        );
+    }
+    for read in &reads {
+        let policy = load_policy(read.role);
+        let stmt = policy_statements(&policy)
+            .iter()
+            .find(|s| statement_sid(s) == read.admitted_by)
+            .unwrap_or_else(|| panic!("{}: no statement {}", read.role, read.admitted_by));
+        let single = Policy {
+            role: read.role,
+            statements: serde_json::json!([stmt.clone()]),
+        };
+        let prefixes = list_prefix_patterns(&single, Some("Allow"));
+        assert!(
+            prefixes.iter().any(|p| glob_matches(p, &read.key)),
+            "{}/{}: s3:prefix {prefixes:?} does not admit {:?}, read by {}. Without it \
+             S3 answers the read of an absent key with 403, not 404",
+            read.role,
+            read.admitted_by,
+            read.key,
+            read.call_site
+        );
+        let gets = key_patterns_for(&policy, &["s3:GetObject"], Some("Allow"));
+        assert!(
+            gets.iter().any(|p| glob_matches(p, &read.key)),
+            "{}: no GetObject Allow reaches {:?}, read by {}",
+            read.role,
+            read.key,
+            read.call_site
+        );
+    }
+}
+
+/// The bootstrap statements admit no key beyond their role's own bootstrap
+/// reads: not a sibling key another role reads, not a key one segment deeper,
+/// not a listing prefix such as `sys/` or `t/<hash>/`, and not a tenant
+/// segment one character narrower or wider than a tenant hash.
+#[test]
+fn bootstrap_list_grants_admit_no_other_key() {
+    let hex = test_tenant().to_hex();
+    for expected in &EXPECTED_BOOTSTRAP_GRANTS {
+        let policy = load_policy(expected.role);
+        check_bootstrap_grants_admit_only(&policy, expected).unwrap_or_else(|e| panic!("{e}"));
+
+        // The witnesses are live: each is in the candidate set and refused.
+        let admitted = bootstrap_admitted(&policy, expected);
+        let mut refused = vec![
+            "sys/".to_string(),
+            "t/".to_string(),
+            format!("t/{hex}/"),
+            "sys/gc/x".to_string(),
+            format!("t/{hex}/enc/x"),
+            format!("t/{}/enc", &hex[..hex.len() - 1]),
+            format!("t/{hex}0/enc"),
+            alert_lease_key(),
+            format!("sys/t/{hex}"),
+            format!("t/{hex}/x/prov"),
+        ];
+        if expected.role == "maintain" {
+            refused.push("sys/auth".to_string());
+            refused.push(metrics_meta_key());
+            refused.push(format!("t/{hex}/a/prov"));
+        }
+        if expected.role == "gateway" {
+            refused.push(alert_state_memo_key());
+            refused.push(format!("t/{hex}/catalog/m/HEAD"));
+        }
+        for key in &refused {
+            assert!(
+                !admitted.contains(key),
+                "{}: the bootstrap list statements admit {key:?}",
+                expected.role
+            );
+        }
+    }
+}
+
+/// A list Condition carries exactly one operator, and a `StringEquals` value no
+/// wildcard; `list_prefix_patterns` reads a `StringEquals` block.
+#[test]
+fn list_condition_operator_rules_fail_closed() {
+    let stmt = |condition: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "Fixture",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": BUCKET_ARN,
+            "Condition": condition,
+        })
+    };
+    let exact = stmt(serde_json::json!({"StringEquals": {"s3:prefix": ["sys/gc", "sys/tenancy"]}}));
+    validate_statement("fixture", 0, &exact).expect("an exact-key StringEquals list Condition");
+    let policy = Policy {
+        role: "fixture",
+        statements: serde_json::json!([exact]),
+    };
+    assert_eq!(
+        list_prefix_patterns(&policy, Some("Allow")),
+        ["sys/gc", "sys/tenancy"]
+    );
+
+    let both = stmt(serde_json::json!({
+        "StringEquals": {"s3:prefix": "sys/gc"},
+        "StringLike": {"s3:prefix": BOOTSTRAP_ENC_PATTERN},
+    }));
+    let err = validate_statement("fixture", 0, &both).expect_err("two operators");
+    assert!(err.contains("more than one operator"), "{err}");
+
+    for value in ["sys/*", "sys/g?"] {
+        let wild = stmt(serde_json::json!({"StringEquals": {"s3:prefix": [value]}}));
+        let err = validate_statement("fixture", 0, &wild).expect_err(value);
+        assert!(err.contains("carries a wildcard character"), "{err}");
+    }
+}
+
+/// Widening one bootstrap condition fails the negative witnesses: Maintain's
+/// `sys/gc` widened to `sys/*` admits `sys/auth`, which Maintain never reads,
+/// and Gateway's key-epoch pattern widened to `t/*/enc` admits the 31- and
+/// 33-character tenant segments. `sys/*` under `StringEquals` is a literal,
+/// which the choke point refuses.
+#[test]
+fn a_widened_bootstrap_condition_fails_the_negative_witnesses() {
+    let hex = test_tenant().to_hex();
+    let cases: [(&str, bool, &str, &str, String); 2] = [
+        (
+            "maintain",
+            true,
+            "sys/gc",
+            "sys/*",
+            "\"sys/auth\"".to_string(),
+        ),
+        (
+            "gateway",
+            false,
+            BOOTSTRAP_ENC_PATTERN,
+            "t/*/enc",
+            format!("\"t/{hex}0/enc\""),
+        ),
+    ];
+    for (role, fixed, narrow, widened, witness) in cases {
+        let expected = EXPECTED_BOOTSTRAP_GRANTS
+            .iter()
+            .find(|e| e.role == role)
+            .expect("expected row");
+        let (sid, values) = if fixed {
+            (expected.fixed_sid, expected.fixed_keys)
+        } else {
+            (expected.tenant_sid, expected.tenant_patterns)
+        };
+        let path = policy_json_path(role);
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read template"))
+                .expect("parse template");
+        let stmt = json["Statement"]
+            .as_array_mut()
+            .expect("Statement array")
+            .iter_mut()
+            .find(|s| s["Sid"] == serde_json::json!(sid))
+            .expect("bootstrap statement");
+        let wider: Vec<&str> = values
+            .iter()
+            .map(|v| if *v == narrow { widened } else { *v })
+            .collect();
+        assert_ne!(wider, values, "{role}: the fixture widened nothing");
+
+        if fixed {
+            stmt["Condition"] = serde_json::json!({"StringEquals": {"s3:prefix": wider}});
+            let err = validate_statement(role, 0, stmt).expect_err("wildcard under StringEquals");
+            assert!(err.contains("carries a wildcard character"), "{err}");
+        }
+        stmt["Condition"] = serde_json::json!({"StringLike": {"s3:prefix": wider}});
+        let policy = build_policy(role, "widened fixture", &json);
+        let err = check_bootstrap_grants_admit_only(&policy, expected)
+            .expect_err("a widened condition must fail the negative witnesses");
+        assert!(err.contains(&witness), "{role}: {err}");
+
+        check_bootstrap_grants_admit_only(&load_policy(role), expected)
+            .expect("the shipped template passes the same check");
+    }
+}
+
+/// Query's per-signal provisioning-record patterns collapsed back into one
+/// `t/<hash>/?/prov` admit `t/<hash>/x/prov`, a letter no `Signal` uses, and
+/// fail the negative witnesses.
+#[test]
+fn a_single_wildcard_query_prov_pattern_fails_the_negative_witnesses() {
+    let hex = test_tenant().to_hex();
+    let hash = "?".repeat(hex.len());
+    let expected = EXPECTED_BOOTSTRAP_GRANTS
+        .iter()
+        .find(|e| e.role == "query")
+        .expect("query row");
+    let any_signal = format!("t/{hash}/?/prov");
+    let mut collapsed: Vec<String> = Vec::new();
+    for value in expected.tenant_patterns {
+        if value.ends_with("/prov") {
+            if !collapsed.contains(&any_signal) {
+                collapsed.push(any_signal.clone());
+            }
+        } else {
+            collapsed.push((*value).to_string());
+        }
+    }
+    assert_eq!(
+        collapsed.len(),
+        expected.tenant_patterns.len() + 1 - ALL_SIGNALS.len(),
+        "the fixture collapsed every provisioning-record pattern"
+    );
+
+    let path = policy_json_path("query");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read template"))
+            .expect("parse template");
+    let stmt = json["Statement"]
+        .as_array_mut()
+        .expect("Statement array")
+        .iter_mut()
+        .find(|s| s["Sid"] == serde_json::json!(expected.tenant_sid))
+        .expect("bootstrap statement");
+    stmt["Condition"] = serde_json::json!({"StringLike": {"s3:prefix": collapsed}});
+    let policy = build_policy("query", "single-wildcard fixture", &json);
+    let err = check_bootstrap_grants_admit_only(&policy, expected)
+        .expect_err("a single-wildcard signal segment must fail the negative witnesses");
+    assert!(err.contains(&format!("\"t/{hex}/x/prov\"")), "{err}");
+
+    check_bootstrap_grants_admit_only(&load_policy("query"), expected)
+        .expect("the shipped template passes the same check");
+}

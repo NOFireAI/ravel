@@ -1,0 +1,276 @@
+# Container-first quickstart stack (ADR-0081 decisions 1-3).
+#
+# `docker compose -f deploy/docker-compose/ravel.yml up -d` brings up a full,
+# self-contained Ravel: RustFS as the S3-compatible object store, a one-shot that
+# creates the bucket, a one-shot that qualifies the store, ravel-server pulled
+# from GHCR, an OpenTelemetry Collector generating real telemetry from the host,
+# and Grafana with a provisioned Ravel datasource. No Rust toolchain, no compile.
+#
+# SECURITY: every credential and token in this file is a fixed DEVELOPMENT value
+# (the RustFS `ravel`/`ravel-dev-secret` pair and the `demo-token` bearer token),
+# and every published host port binds loopback (`127.0.0.1`) only. None of this
+# is for any deployment reachable from a network. The loopback prefixes are what
+# keep the checked-in bearer token off the reader's LAN (ADR-0081 decision 1); do
+# not drop them.
+services:
+  # RustFS and the bucket-creation one-shot mirror deploy/docker-compose/rustfs.yml
+  # exactly: same credentials, same `ravel-dev` bucket, same `rustfs-data/` host
+  # dir (gitignored, shared with that stack, and safe to reuse across runs).
+  # ghcr.io rather than Docker Hub: rationale in deploy/README.md.
+  rustfs:
+    image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    # `server` is the default subcommand, so the data directory is the only
+    # required argument. The console port serves nothing until --console-enable
+    # is passed; with it, the UI is at /rustfs/console/.
+    command: ["--console-enable", "--console-address", ":9001", "/data"]
+    # The image runs as uid 10001, and on a Linux host the bind-mounted
+    # rustfs-data/ below is created root-owned, so RustFS cannot write its
+    # disk there. Root in this dev-only container keeps the bind mount
+    # working the way it did for MinIO, which ran as root.
+    user: "0:0"
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
+    volumes:
+      - ../../rustfs-data:/data
+
+  createbucket:
+    image: public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
+    depends_on: [rustfs]
+    environment:
+      AWS_ACCESS_KEY_ID: ravel
+      AWS_SECRET_ACCESS_KEY: ravel-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      # No IMDS on a developer laptop or a CI runner; without this the CLI
+      # spends its metadata timeout on every call before using the static
+      # credentials above.
+      AWS_EC2_METADATA_DISABLED: "true"
+    # A signed S3 call fails until RustFS is serving, so the until-loop is the
+    # readiness wait: this service completes successfully only once the bucket
+    # actually exists, which is what the qualify one-shot below depends on. The
+    # image's entrypoint is the `aws` binary itself, so running more than one
+    # command needs an explicit shell.
+    #
+    # The bucket is created the way a --require-bucket-protection deployment
+    # needs it (docs/object-store-contract.md "Required bucket configuration"):
+    # Object Lock enabled at creation, versioning on, and one whole-bucket
+    # lifecycle rule carrying the sanctioned actions, the same rule set
+    # deploy/k8s/rustfs.yaml sends. NoncurrentDays 1 keeps a dev bucket's
+    # noncurrent versions briefly. A `rustfs-data/` created before this bucket
+    # carried Object Lock fails the read-back below; remove it to start over.
+    # crates/ravel-object-store's
+    # `launcher_lifecycle_documents_pass_every_in_process_condition` test reads
+    # the lifecycle document from this file.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        LIFECYCLE='{"Rules":[{"ID":"ravel","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true},"NoncurrentVersionExpiration":{"NoncurrentDays":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+        s3() { aws --endpoint-url http://rustfs:9000 s3api "$$@"; }
+        i=0
+        until s3 list-buckets >/dev/null 2>&1; do
+          i=$$((i + 1))
+          if [ $$i -ge 120 ]; then echo 'rustfs did not answer a signed call in 120 s'; exit 1; fi
+          echo 'waiting for rustfs'; sleep 1
+        done
+        s3 head-bucket --bucket ravel-dev 2>/dev/null ||
+          s3 create-bucket --bucket ravel-dev --object-lock-enabled-for-bucket
+        s3 head-bucket --bucket ravel-dev
+        # Object Lock is read before anything is put. Versioning and the
+        # lifecycle rule are each read first and put only when the read does
+        # not already match, then read back: rustfs-data/ outlives
+        # `docker compose down`, and bringing the stack up again on the same
+        # directory then issues no put.
+        lock="$$(s3 get-object-lock-configuration --bucket ravel-dev --query ObjectLockConfiguration.ObjectLockEnabled --output text)" || lock=none
+        test "$$lock" = Enabled || { echo "bucket ravel-dev does not have Object Lock enabled ($$lock); remove rustfs-data/ to start over"; exit 1; }
+        if [ "$$(s3 get-bucket-versioning --bucket ravel-dev --query Status --output text)" = Enabled ]; then
+          echo 'bucket ravel-dev already has versioning Enabled; not putting it'
+        else
+          s3 put-bucket-versioning --bucket ravel-dev --versioning-configuration Status=Enabled
+          test "$$(s3 get-bucket-versioning --bucket ravel-dev --query Status --output text)" = Enabled
+        fi
+        # lifecycle_ok: one read of the whole lifecycle configuration, tab
+        # separated: rule count, Status, scope (Filter and legacy Prefix as one
+        # JSON object), then the three actions. Every field goes through
+        # to_string. Returns 1 with the mismatch in $$why, including when the
+        # read fails because the bucket has no configuration.
+        lifecycle_ok() {
+          lc="$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')" ||
+            { why='could not be read'; return 1; }
+          want() { test "$$2" = "$$3" || { why="want $$1 $$2, read $$3 ($$lc)"; return 1; }; }
+          tab="$$(printf '\t')"; set -f; IFS="$$tab"; set -- $$lc; unset IFS; set +f
+          want fields 6 "$$#" || return 1
+          want rules 1 "$$1" || return 1
+          want status Enabled "$$2" || return 1
+          # The whole-bucket spellings the server's rule parser reads as an
+          # empty prefix. This reads through botocore, which drops unknown
+          # elements and text inside Filter and keeps only the first of two
+          # Filters. Text beside a Filter's one Prefix is harmless: the server
+          # ignores it too and reads the whole bucket. An unknown element
+          # inside Filter, text in a Filter with no child, or a second Filter
+          # reads back as an accepted spelling here, while the server reads it
+          # as an unrecognized filter, reports the lifecycle conditions
+          # unknown, and starts with a warning rather than refusing.
+          case "$$3" in
+            '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
+            *) why="rule is not scoped to the whole bucket ($$3)"; return 1 ;;
+          esac
+          want ExpiredObjectDeleteMarker true "$$4" || return 1
+          want NoncurrentDays 1 "$$5" || return 1
+          want DaysAfterInitiation 7 "$$6"
+        }
+        if lifecycle_ok 2>/dev/null; then
+          echo 'bucket ravel-dev already carries the lifecycle rule; not putting it'
+        else
+          echo "putting the lifecycle rule: bucket ravel-dev lifecycle: $$why"
+          s3 put-bucket-lifecycle-configuration --bucket ravel-dev --lifecycle-configuration "$$LIFECYCLE"
+          lifecycle_ok || { echo "bucket ravel-dev lifecycle: $$why"; exit 1; }
+        fi
+        echo 'bucket ravel-dev ready: Object Lock, versioning and lifecycle rules set'
+
+  # Store qualification (ADR-0050 section 6): ravel-server refuses to start on a
+  # non-Memory store until `sys/qualification` is present, and there is
+  # deliberately no bootstrap-and-continue path for it. A freshly created
+  # bucket has no such record, so it must be written before the server starts.
+  # The published image carries ravel-cli for exactly this (Dockerfile.prebuilt);
+  # override the entrypoint to run it. `store qualify` is idempotent: on an
+  # already-qualified bucket it reports the existing record and exits 0, so this
+  # tolerates a populated `rustfs-data/` across runs.
+  qualify:
+    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.21.0}
+    depends_on:
+      createbucket:
+        condition: service_completed_successfully
+    entrypoint: ["/usr/local/bin/ravel-cli"]
+    command: ["--store", "s3", "store", "qualify"]
+    environment:
+      RAVEL_S3_ENDPOINT: http://rustfs:9000
+      # rustfs is a compose service name, not loopback, so ravel-cli refuses
+      # this plaintext endpoint without the opt-in, exactly as the server does.
+      RAVEL_S3_ALLOW_HTTP: "true"
+      RAVEL_S3_BUCKET: ravel-dev
+      RAVEL_S3_REGION: us-east-1
+      RAVEL_S3_ACCESS_KEY: ravel
+      RAVEL_S3_SECRET_KEY: ravel-dev-secret
+
+  # ravel-server, pulled from GHCR (override the pin with RAVEL_IMAGE). The image
+  # has no default CMD by design -- the operator supplies every argument -- so the
+  # full vector is passed here (ADR-0081 decision 2). It binds 0.0.0.0 INSIDE the
+  # container namespace; the loopback prefix on the port mapping is what keeps it
+  # off the host's other interfaces. --dev-insecure-tenant-header is deliberately
+  # not used: it refuses to enable unless --listen-http binds loopback, which the
+  # container boundary forbids, so the demo authenticates with a real bearer
+  # token against a real tenant map, exactly as a deployment does.
+  ravel-server:
+    image: ${RAVEL_IMAGE:-ghcr.io/nofireai/ravel-server:0.21.0}
+    depends_on:
+      qualify:
+        condition: service_completed_successfully
+    command:
+      - "--mode"
+      - "all"
+      - "--store"
+      - "s3"
+      - "--listen-http"
+      - "0.0.0.0:4318"
+      - "--listen-grpc"
+      - "0.0.0.0:4317"
+      - "--shards"
+      - "4"
+      - "--tenant-token"
+      - "demo-token=demo-tenant"
+      # A fresh bucket refuses to start unless a tenant-hash scheme is chosen
+      # (services/ravel-server/src/tenancy.rs: keyed is the default, an
+      # unspecified config is FreshBucketNeedsKey). The quickstart is an unkeyed
+      # dev bucket, so opt out explicitly. Safe on a reused rustfs-data/ too: an
+      # existing unkeyed marker validates against this, keyed would not.
+      - "--tenant-hash-unkeyed"
+    ports:
+      - "127.0.0.1:4318:4318"
+      - "127.0.0.1:4317:4317"
+    environment:
+      RAVEL_S3_ENDPOINT: http://rustfs:9000
+      # The endpoint above is plaintext http:// to the `rustfs` service, which
+      # is not loopback from inside this container, so startup refuses it
+      # without this. The traffic never leaves the compose network; a
+      # deployment reaching a real object store uses https:// instead.
+      #
+      # An environment variable rather than an argument, on purpose. The image
+      # pin above defaults to a published release that predates this flag, and
+      # an unknown ARGUMENT makes clap exit non-zero, so the stack would not
+      # start on the pinned default that the weekly quickstart leg runs. An
+      # unknown environment variable is ignored by the old binary and honoured
+      # by the new one, so both work.
+      RAVEL_S3_ALLOW_HTTP: "true"
+      RAVEL_S3_BUCKET: ravel-dev
+      RAVEL_S3_REGION: us-east-1
+      RAVEL_S3_ACCESS_KEY: ravel
+      RAVEL_S3_SECRET_KEY: ravel-dev-secret
+      # The query-audit pipeline tokenizes recorded query text under this key
+      # by default (ADR-0062 decision 2e). This checked-in value is a fixed
+      # DEVELOPMENT key for the quickstart only; override it with the same
+      # variable for anything beyond a laptop. A keyed deployment
+      # (--tenant-hash-key-file) derives the audit token key from the
+      # deployment key instead and needs no separate variable.
+      RAVEL_AUDIT_TOKEN_KEY: ${RAVEL_AUDIT_TOKEN_KEY:-998626405d16aeca71f4fac7673b55213a774ba40401709022e81a27f050ffd8}
+
+  # The demo's data generator (ADR-0081 decision 3): a real OpenTelemetry
+  # Collector scraping host metrics and exporting its own internal logs, both
+  # to Ravel over OTLP/HTTP with the demo bearer token. The metrics pipeline
+  # authenticates with the bearertokenauth extension; the internal-logs export
+  # (service.telemetry.logs) sets a plain Authorization header instead, because
+  # service.telemetry does not wire extensions. This exercises the same OTLP
+  # path a real user configures, and the first Grafana screen shows the
+  # reader's own machine. The internal logs give a plain `docker compose up` a
+  # log source for the README's PromQL-over-logs query (`ravel_log_lines`) when
+  # no telemetrygen is involved (#1334).
+  otel-collector:
+    # ghcr.io, not Docker Hub (otel/opentelemetry-collector-contrib): same
+    # anonymous-pull-allowance problem as the RustFS images above, and the
+    # upstream project publishes this image to ghcr.io under a different
+    # repo path (collector-releases, not collector-contrib).
+    image: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.160.0@sha256:799dc6cf12c96192af37b5bdba804da8c10b3bc563b43cb90c3f3c58d9572ad6
+    depends_on: [ravel-server]
+    command: ["--config=/etc/otel/collector-config.yaml"]
+    # The collector's own metrics, for answering "is it delivering?" without
+    # guessing from an empty dashboard (#209). Read the delivery counters with:
+    #   curl -s localhost:18888/metrics | grep otelcol_exporter
+    # A non-zero `send_failed` means Ravel is refusing the exports.
+    #
+    # Published on 18888 rather than the collector's own 8888: that port is the
+    # collector default and is contended on a developer machine, and a
+    # quickstart that fails on `docker compose up` with "port is already
+    # allocated" is a bad first command. The container side stays 8888.
+    ports:
+      - "127.0.0.1:18888:8888"
+    volumes:
+      - ../otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
+
+  # Grafana with a provisioned Prometheus-type datasource pointed at
+  # ravel-server's /api/v1 surface, carrying the demo bearer token (ADR-0081
+  # decision 1). The token lives in a checked-in provisioning file; it is a fixed
+  # development credential in the same class as the RustFS secret above.
+  #
+  # Left on Docker Hub deliberately: no anonymous mirror was found elsewhere.
+  # Checked (anonymous manifest HEAD for grafana/grafana:latest):
+  #   quay.io/grafana/grafana            -> 401 (no such repository)
+  #   ghcr.io/grafana/grafana             -> 403 (forbidden)
+  #   public.ecr.aws/grafana/grafana      -> 404 (no such repository)
+  grafana:
+    image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
+    depends_on: [ravel-server]
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # No sign-up, no telemetry phone-home: this is a throwaway local instance.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ../grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../grafana/dashboards:/var/lib/grafana/dashboards:ro

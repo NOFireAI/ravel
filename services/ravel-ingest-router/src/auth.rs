@@ -1,0 +1,193 @@
+//! Builds the canonical-tenant resolver chain from [`CanonicalAuthSettings`],
+//! reusing the shared [`ravel_tenant_resolve`] implementation so the router and
+//! `ravel-server` never drift on what the canonical tenant is (ADR-0080
+//! decision 3).
+//!
+//! The chain mirrors `ravel_server::tenant::build_auth_resolver`: a static
+//! bearer map, optionally a dev-header resolver, optionally OIDC. Unlike
+//! `ravel-server`, this router has no dedicated mTLS listener, so
+//! [`ravel_tenant_resolve::MtlsResolver`] is never installed here at all
+//! (ADR-0050 decision 1 shape): `--mtls-enabled` is refused at startup
+//! (`crate::config::Cli::into_config`) rather than folded into this one public
+//! chain, where a client-supplied client-certificate identity header would let
+//! any client pick its own tenant. A dedicated `--mtls-listener` that
+//! terminates mTLS separately from the public HTTP/gRPC listeners is a
+//! follow-up that needs its own ADR.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ravel_tenant_resolve::{
+    DevHeaderTenantResolver, FallbackResolver, OidcJwksCache, OidcResolver,
+    StaticBearerTokenResolver, TenantResolver,
+};
+use ravel_types::TenantId;
+use tokio::task::JoinHandle;
+
+use crate::config::CanonicalAuthSettings;
+
+/// The built resolver plus, when OIDC is configured, the shared JWKS cache and
+/// refresh parameters the caller drives on a background task.
+pub(crate) struct CanonicalResolver {
+    pub resolver: Arc<dyn TenantResolver>,
+    pub oidc_refresh: Option<OidcRefresh>,
+}
+
+/// Inputs for the JWKS refresh loop: the cache the request-path resolver reads,
+/// the URL to fetch, and the refetch interval.
+pub(crate) struct OidcRefresh {
+    pub cache: Arc<OidcJwksCache>,
+    pub jwks_url: String,
+    /// Refetch period. Zero is refused by [`OidcRefresh::check`] before
+    /// anything is spawned.
+    pub interval: Duration,
+}
+
+impl OidcRefresh {
+    /// Refuse parameters the refresh loop cannot run with.
+    /// [`tokio::time::interval`] panics on a zero period, which would kill the
+    /// spawned task after its initial refresh.
+    pub(crate) fn check(&self) -> Result<(), JwksRefreshSpawnError> {
+        if self.interval.is_zero() {
+            return Err(JwksRefreshSpawnError::ZeroRefreshInterval);
+        }
+        Ok(())
+    }
+}
+
+/// Why the JWKS refresh loop refused to start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum JwksRefreshSpawnError {
+    /// A zero OIDC JWKS refresh interval.
+    #[error(
+        "the OIDC JWKS refresh interval must be non-zero (--oidc-jwks-refresh-interval-secs, \
+         OidcSettings::refresh_interval): a zero interval cannot drive the JWKS refresh timer"
+    )]
+    ZeroRefreshInterval,
+}
+
+/// Build the canonical-tenant resolver chain.
+pub(crate) fn build(settings: &CanonicalAuthSettings) -> anyhow::Result<CanonicalResolver> {
+    let tokens: HashMap<String, TenantId> = settings
+        .tokens
+        .iter()
+        .map(|(token, tenant)| (token.clone(), TenantId::new(tenant.clone())))
+        .collect();
+
+    let mut resolvers: Vec<Arc<dyn TenantResolver>> =
+        vec![Arc::new(StaticBearerTokenResolver::new(tokens))];
+
+    if settings.dev_header {
+        resolvers.push(Arc::new(DevHeaderTenantResolver::default()));
+    }
+
+    let mut oidc_refresh = None;
+    if let Some(oidc) = &settings.oidc {
+        let cache = Arc::new(
+            OidcJwksCache::new().map_err(|e| anyhow::anyhow!("failed to build OIDC cache: {e}"))?,
+        );
+        resolvers.push(Arc::new(OidcResolver::new(
+            cache.clone(),
+            oidc.issuer.clone(),
+            oidc.audiences.clone(),
+            oidc.tenant_claim.clone(),
+        )));
+        oidc_refresh = Some(OidcRefresh {
+            cache,
+            jwks_url: oidc.jwks_url.clone(),
+            interval: oidc.refresh_interval,
+        });
+    }
+
+    let resolver: Arc<dyn TenantResolver> = Arc::new(FallbackResolver::new(resolvers));
+    Ok(CanonicalResolver {
+        resolver,
+        oidc_refresh,
+    })
+}
+
+/// Spawn the periodic JWKS refresh loop. Does one best-effort refresh up front
+/// so an OIDC router does not reject every request for a full interval at
+/// startup, then refetches on `interval`. A failed refresh keeps the previously
+/// cached keys (a transient JWKS outage does not start rejecting every token).
+///
+/// A zero `interval` returns [`JwksRefreshSpawnError::ZeroRefreshInterval`]
+/// and spawns nothing.
+pub(crate) fn spawn_jwks_refresh(
+    params: OidcRefresh,
+) -> Result<JoinHandle<()>, JwksRefreshSpawnError> {
+    params.check()?;
+    Ok(tokio::spawn(async move {
+        if let Err(err) = params.cache.refresh(&params.jwks_url).await {
+            tracing::warn!(error = %err, "initial JWKS refresh failed; will retry on interval");
+        }
+        let mut ticker = tokio::time::interval(params.interval);
+        // Skip the immediate first tick: the up-front refresh above already ran.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match params.cache.refresh(&params.jwks_url).await {
+                Ok(()) => tracing::debug!("JWKS refresh complete"),
+                Err(err) => {
+                    tracing::warn!(error = %err, "JWKS refresh failed; keeping cached keys")
+                }
+            }
+        }
+    }))
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn spawn_refuses_a_zero_refresh_interval() {
+        let params = OidcRefresh {
+            cache: Arc::new(OidcJwksCache::new().expect("cache builds")),
+            jwks_url: "https://issuer.example.com/jwks".to_string(),
+            interval: Duration::ZERO,
+        };
+        let err = spawn_jwks_refresh(params).expect_err("a zero interval must be refused");
+        assert_eq!(err, JwksRefreshSpawnError::ZeroRefreshInterval);
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            0,
+            "nothing may be spawned for a refused interval"
+        );
+    }
+
+    #[test]
+    fn built_chain_rejects_a_client_cert_header_only_request() {
+        // The mTLS resolver must never be part of this chain (ADR-0050
+        // decision 1 shape): a chain built from a static bearer token alone
+        // must not resolve a tenant from the client-certificate identity
+        // header. What this kills is an unconditional push of MtlsResolver
+        // onto `resolvers` in `build`: with one there, this resolves to
+        // Ok(TenantId("victim-tenant")) instead of an error. It cannot kill
+        // the original conditional folding, which read a `mtls_header` field
+        // CanonicalAuthSettings no longer has.
+        let settings = CanonicalAuthSettings {
+            tokens: vec![("tok".to_string(), "acme".to_string())],
+            dev_header: false,
+            oidc: None,
+        };
+        let built = build(&settings).expect("chain builds");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ravel-client-cert-cn",
+            "victim-tenant".parse().expect("valid header value"),
+        );
+
+        assert!(
+            built.resolver.resolve(&headers).is_err(),
+            "a client-cert header alone must not resolve a tenant: the mTLS \
+             resolver must never be installed in this chain"
+        );
+    }
+}

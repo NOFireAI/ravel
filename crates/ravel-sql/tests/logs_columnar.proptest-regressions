@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cfa01d3c894ba8b795db502860fd344432776c0c3e70260a93c791994d7fc5b1 # shrinks to scenario = Scenario { records: [RecordSpec { ts: 0, obs_extra: 0, severity_num: 0, severity_text: "INFO", body: "timeout", trace_id: None, span_id: None, flags: 0, resource: [("name", Str("api"))], attrs: [("name", I64(7))] }], projection: [10], word: None }

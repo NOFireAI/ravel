@@ -1,0 +1,1323 @@
+//! LogFooter, the 16-byte trailer, and the reader open protocol
+//! (docs/log-segment-format.md "Reader protocol", "LogFooter").
+//!
+//! The footer is the `ravel.logseg.v1.LogFooter` protobuf; the trailer mirrors
+//! RSEG's shape. `footer_crc32c` covers the footer bytes plus every trailer
+//! byte except the crc field itself (ADR-0010 §4). [`open`] performs the full
+//! reader protocol on a whole object and validates the section table before
+//! returning any descriptor.
+
+use prost::Message;
+use ravel_proto::logseg::v1 as pb;
+
+use crate::error::LogSegError;
+use crate::source::ByteSource;
+
+/// Trailer magic, last 4 bytes of every RLOG object.
+pub const MAGIC: [u8; 4] = *b"RLG1";
+/// RLOG trailer version. Bumped 1 -> 2 by ADR-0032 to carry compaction
+/// identity (`level`, `input_set_hash`, `part_index`) in the footer, and 2 -> 3
+/// by ADR-0095, which redefined what a SKIP_IDX numeric stat (`NumStat`) means:
+/// an I64/F64/Bool stat now bounds the value each row *resolves* for the
+/// column's attribute name -- its resource and scope layers overridden by its
+/// own attributes, cross-type duplicates resolved -- rather than the raw
+/// columnar occurrence. A row that carries no occurrence of the name at all is
+/// bounded too, by whatever its stream layer gives it. The bytes are unchanged
+/// in shape, so nothing but this version byte distinguishes the two meanings.
+///
+/// Bumped 3 -> 4 by ADR-0699, which moved BLOCKS to row groups whose pages are
+/// stored column-major and moved the page descriptors out of the block header
+/// into the new PAGE_DIR section. A version-4 block is not a contiguous byte
+/// range and has no header, so nothing but this version byte tells a reader
+/// which of the two layouts BLOCKS holds.
+///
+/// Bumped 4 -> 5 by ADR-2135, which added the footer sort descriptor and
+/// clustering generation, put the covered-column list at the head of BLOOM,
+/// sized each bloom filter to a multiple of 512 bits instead of a power of
+/// two, and reserved encoding tags 10-13.
+///
+/// Versions 3 and 4 are not readable: ADR-0892 and ADR-2135 deleted their
+/// readers, so the window below is a single version, matching RSPAN and RSEG.
+/// A stored object of any other version is rejected with
+/// [`LogSegError::UnsupportedVersion`].
+pub const VERSION: u16 = 5;
+
+/// The set of RLOG trailer versions this build's reader accepts. Writers always
+/// emit the current version [`VERSION`]; readers accept that version and
+/// nothing else. The window is at most two versions wide by construction and
+/// never accepts anything below its floor, so a retired version stays rejected.
+/// This is the single source the reader gate and the CLI
+/// `audit-versions`/`migrate` paths all read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SupportedVersions {
+    newest: u16,
+    oldest: u16,
+}
+
+impl SupportedVersions {
+    /// A window accepting exactly one version. This is the shape today: RLOG is
+    /// still pre-release, so each bump deletes the previous version's reader
+    /// (ADR-0032 for v1, ADR-0095 for v2, ADR-0892 for v3). There is no N-1 to
+    /// accept and the reader behaves identically to the old single-version gate.
+    pub const fn single(version: u16) -> Self {
+        Self {
+            newest: version,
+            oldest: version,
+        }
+    }
+
+    /// The N/N-1 window: accept `newest` and the immediately preceding version.
+    /// Reserved for first public release, which is the only point ADR-0027
+    /// decision 7 and ADR-0066 decision 1 open it; no RLOG version uses it
+    /// today (ADR-0892).
+    pub const fn n_and_prev(newest: u16) -> Self {
+        // `newest` is always a real format version (>= 1), so the predecessor
+        // never underflows.
+        Self {
+            newest,
+            oldest: newest - 1,
+        }
+    }
+
+    /// The current (newest, always-written) version.
+    pub const fn newest(&self) -> u16 {
+        self.newest
+    }
+
+    /// The oldest accepted version (the window floor).
+    pub const fn oldest(&self) -> u16 {
+        self.oldest
+    }
+
+    /// Whether `version` is inside the accepted window.
+    pub const fn contains(&self, version: u16) -> bool {
+        version >= self.oldest && version <= self.newest
+    }
+}
+
+/// RLOG's supported-version window: `{5}` since ADR-2135, which deleted the
+/// version-4 reader under the same pre-release posture ADR-0892 applied to
+/// version 3, keeping RLOG in line with RSPAN and RSEG. The
+/// writer emits `SUPPORTED_VERSIONS.newest()`; the reader accepts that and
+/// nothing else. This is the single source the writer, the reader gate,
+/// `audit-versions`, `migrate`, and the compactor's `OUTPUT_FORMAT_VERSION` all
+/// read.
+pub const SUPPORTED_VERSIONS: SupportedVersions = SupportedVersions::single(VERSION);
+
+/// Signal byte for log segments.
+pub const SIGNAL_LOGS: u8 = 2;
+/// Reserved trailer byte; must be zero.
+pub const RESERVED: u8 = 0;
+/// Trailer size: footer_len(4) + footer_crc32c(4) + version(2) + signal(1) +
+/// reserved(1) + magic(4).
+pub const TRAILER_LEN: usize = 16;
+
+/// Section `comp` tag: stored raw.
+pub const COMP_NONE: u8 = 0;
+/// Section `comp` tag: zstd frame.
+pub const COMP_ZSTD: u8 = 2;
+
+/// Default per-section decompressed-size cap used during open validation.
+pub const DEFAULT_MAX_SECTION_UNCOMP: u64 = 1 << 30;
+
+/// Section kinds (docs/log-segment-format.md). The five v1 kinds are mandatory;
+/// any other kind is skipped. POSTINGS (added by ADR-0049) is optional: absent
+/// is always legal, so it is validated separately from the mandatory-five loop
+/// below rather than added to `known`.
+pub mod kind {
+    pub const STREAM_DIR: u32 = 1;
+    pub const FIELD_DIR: u32 = 2;
+    pub const BLOCKS: u32 = 3;
+    pub const SKIP_IDX: u32 = 4;
+    pub const BLOOM: u32 = 5;
+    pub const POSTINGS: u32 = 6;
+    // Kind 7 is reserved for GRAM_IDX (ADR-0105), which has no implementation
+    // yet; PAGE_DIR takes the next free number rather than that one.
+    /// Per-row-group, per-column-chunk, per-page directory
+    /// (ADR-0699 decision 2). Mandatory since trailer version 4, and in
+    /// version 5, the only version this build reads.
+    pub const PAGE_DIR: u32 = 8;
+}
+
+/// One section table entry (mirrors `ravel.logseg.v1.Section`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SectionDesc {
+    pub kind: u32,
+    pub offset: u64,
+    pub len: u64,
+    pub crc32c: u32,
+    pub comp: u8,
+    pub uncomp_len: u64,
+}
+
+/// The decoded footer (mirrors `ravel.logseg.v1.LogFooter`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LogFooter {
+    pub tenant_hash: [u8; 16],
+    pub shard: u32,
+    pub writer_id: [u8; 16],
+    pub writer_epoch: u64,
+    pub writer_seq: u64,
+    pub min_ts_ns: i64,
+    pub max_ts_ns: i64,
+    pub min_observed_ts_ns: i64,
+    pub max_observed_ts_ns: i64,
+    pub record_count: u64,
+    pub block_count: u64,
+    pub stream_count: u64,
+    pub sections: Vec<SectionDesc>,
+    /// Compaction level: 0 = L0 flush object, 1 = L1 compacted part (ADR-0032).
+    pub level: u32,
+    /// Hash over the sorted input list of a compaction (empty on an L0 object),
+    /// same canonical convention as RSEG's `input_set_hash`.
+    pub input_set_hash: Vec<u8>,
+    /// Part ordinal within one compaction output (0 on an L0 object).
+    pub part_index: u32,
+    /// The object's row order (ADR-2135 decision 2). `None` is the default
+    /// `(stream_ref, ts)` order.
+    pub sort_descriptor: Option<SortDescriptor>,
+    /// The tenant clustering generation the object was written under: 0 when
+    /// the tenant never set a key. A cleared key leaves `sort_descriptor`
+    /// `None` with a nonzero generation; a descriptor with generation 0 is
+    /// refused as corrupt.
+    pub clustering_generation: u64,
+}
+
+/// Width of the time bucket leading a clustered sort key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortBucketWidth {
+    OneHour,
+    SixHours,
+    OneDay,
+}
+
+impl SortBucketWidth {
+    /// The bucket width in nanoseconds, the divisor of `ts.div_euclid`.
+    pub fn width_ns(self) -> i64 {
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        match self {
+            SortBucketWidth::OneHour => NS_PER_HOUR,
+            SortBucketWidth::SixHours => 6 * NS_PER_HOUR,
+            SortBucketWidth::OneDay => 24 * NS_PER_HOUR,
+        }
+    }
+}
+
+/// Value type of one sort key column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SortKeyType {
+    Str,
+    I64,
+    Bool,
+    Bytes,
+}
+
+/// One sort key column: a declared typed attribute name and its type.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SortKeyColumn {
+    pub name: String,
+    pub ty: SortKeyType,
+}
+
+/// Most key columns a sort descriptor may name (ADR-2135 decision 1).
+pub const MAX_SORT_KEY_COLUMNS: usize = 4;
+
+/// A clustered row order: `(stream_ref, ts.div_euclid(bucket), key_columns in
+/// order, ts)`. `key_columns` holds 1 to [`MAX_SORT_KEY_COLUMNS`] entries.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SortDescriptor {
+    pub bucket_width: SortBucketWidth,
+    pub key_columns: Vec<SortKeyColumn>,
+}
+
+impl SortDescriptor {
+    fn to_proto(&self) -> pb::SortDescriptor {
+        let bucket_width = match self.bucket_width {
+            SortBucketWidth::OneHour => pb::SortBucketWidth::OneHour,
+            SortBucketWidth::SixHours => pb::SortBucketWidth::SixHours,
+            SortBucketWidth::OneDay => pb::SortBucketWidth::OneDay,
+        };
+        pb::SortDescriptor {
+            bucket_width: bucket_width as i32,
+            key_columns: self
+                .key_columns
+                .iter()
+                .map(|c| {
+                    let ty = match c.ty {
+                        SortKeyType::Str => pb::SortKeyColumnType::Str,
+                        SortKeyType::I64 => pb::SortKeyColumnType::I64,
+                        SortKeyType::Bool => pb::SortKeyColumnType::Bool,
+                        SortKeyType::Bytes => pb::SortKeyColumnType::Bytes,
+                    };
+                    pb::SortKeyColumn {
+                        name: c.name.clone(),
+                        r#type: ty as i32,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn from_proto(p: pb::SortDescriptor, generation: u64) -> Result<Self, LogSegError> {
+        let bucket_width = match pb::SortBucketWidth::try_from(p.bucket_width) {
+            Ok(pb::SortBucketWidth::OneHour) => SortBucketWidth::OneHour,
+            Ok(pb::SortBucketWidth::SixHours) => SortBucketWidth::SixHours,
+            Ok(pb::SortBucketWidth::OneDay) => SortBucketWidth::OneDay,
+            Ok(pb::SortBucketWidth::Unspecified) | Err(_) => {
+                return Err(LogSegError::Corrupted(format!(
+                    "footer sort descriptor bucket width {} unknown",
+                    p.bucket_width
+                )));
+            }
+        };
+        let mut key_columns: Vec<SortKeyColumn> = Vec::with_capacity(p.key_columns.len());
+        for c in p.key_columns {
+            let ty = match pb::SortKeyColumnType::try_from(c.r#type) {
+                Ok(pb::SortKeyColumnType::Str) => SortKeyType::Str,
+                Ok(pb::SortKeyColumnType::I64) => SortKeyType::I64,
+                Ok(pb::SortKeyColumnType::Bool) => SortKeyType::Bool,
+                Ok(pb::SortKeyColumnType::Bytes) => SortKeyType::Bytes,
+                Ok(pb::SortKeyColumnType::Unspecified) | Err(_) => {
+                    return Err(LogSegError::Corrupted(format!(
+                        "footer sort key column {:?} type {} unknown",
+                        c.name, c.r#type
+                    )));
+                }
+            };
+            key_columns.push(SortKeyColumn { name: c.name, ty });
+        }
+        let d = SortDescriptor {
+            bucket_width,
+            key_columns,
+        };
+        d.validate(generation).map_err(|e| match e {
+            LogSegError::InvalidSortDescriptor(why) => {
+                LogSegError::Corrupted(format!("footer sort descriptor: {why}"))
+            }
+            other => other,
+        })?;
+        Ok(d)
+    }
+
+    /// Refuses a descriptor no writer, footer or catalog key may carry: one
+    /// paired with clustering generation 0, one with a key column count outside
+    /// 1..=[`MAX_SORT_KEY_COLUMNS`], an empty key column name, or a name given
+    /// twice. The bucket width and column types are closed enums, so an
+    /// unspecified width or type cannot reach this check; the footer decoder
+    /// refuses those while it builds the descriptor. Every refusal is
+    /// [`LogSegError::InvalidSortDescriptor`]; the footer decoder reports the
+    /// same message as `Corrupted`.
+    pub fn validate(&self, generation: u64) -> Result<(), LogSegError> {
+        if generation == 0 {
+            return Err(LogSegError::InvalidSortDescriptor(
+                "a descriptor needs a nonzero clustering generation".into(),
+            ));
+        }
+        let n = self.key_columns.len();
+        if n == 0 || n > MAX_SORT_KEY_COLUMNS {
+            return Err(LogSegError::InvalidSortDescriptor(format!(
+                "{n} key columns, not 1..={MAX_SORT_KEY_COLUMNS}"
+            )));
+        }
+        for (i, c) in self.key_columns.iter().enumerate() {
+            if c.name.is_empty() {
+                return Err(LogSegError::InvalidSortDescriptor(
+                    "key column name empty".into(),
+                ));
+            }
+            if self.key_columns[..i].iter().any(|k| k.name == c.name) {
+                return Err(LogSegError::InvalidSortDescriptor(format!(
+                    "key column {:?} named twice",
+                    c.name
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl LogFooter {
+    /// The descriptor for a known section kind, if present.
+    pub fn section(&self, kind: u32) -> Option<&SectionDesc> {
+        self.sections.iter().find(|s| s.kind == kind)
+    }
+
+    fn to_proto(&self) -> pb::LogFooter {
+        pb::LogFooter {
+            tenant_hash: self.tenant_hash.to_vec(),
+            shard: self.shard,
+            writer_id: self.writer_id.to_vec(),
+            writer_epoch: self.writer_epoch,
+            writer_seq: self.writer_seq,
+            min_ts_ns: self.min_ts_ns,
+            max_ts_ns: self.max_ts_ns,
+            min_observed_ts_ns: self.min_observed_ts_ns,
+            max_observed_ts_ns: self.max_observed_ts_ns,
+            record_count: self.record_count,
+            block_count: self.block_count,
+            stream_count: self.stream_count,
+            sections: self
+                .sections
+                .iter()
+                .map(|s| pb::Section {
+                    kind: s.kind,
+                    offset: s.offset,
+                    len: s.len,
+                    crc32c: s.crc32c,
+                    comp: i32::from(s.comp),
+                    uncompressed_len: s.uncomp_len,
+                })
+                .collect(),
+            level: self.level,
+            input_set_hash: self.input_set_hash.clone(),
+            part_index: self.part_index,
+            sort_descriptor: self.sort_descriptor.as_ref().map(SortDescriptor::to_proto),
+            clustering_generation: self.clustering_generation,
+        }
+    }
+
+    fn from_proto(p: pb::LogFooter) -> Result<Self, LogSegError> {
+        let tenant_hash = <[u8; 16]>::try_from(p.tenant_hash.as_slice())
+            .map_err(|_| LogSegError::Corrupted("footer tenant_hash not 16 bytes".into()))?;
+        let writer_id = <[u8; 16]>::try_from(p.writer_id.as_slice())
+            .map_err(|_| LogSegError::Corrupted("footer writer_id not 16 bytes".into()))?;
+        let mut sections = Vec::with_capacity(p.sections.len());
+        for s in p.sections {
+            let comp = u8::try_from(s.comp)
+                .map_err(|_| LogSegError::Corrupted("footer section comp range".into()))?;
+            sections.push(SectionDesc {
+                kind: s.kind,
+                offset: s.offset,
+                len: s.len,
+                crc32c: s.crc32c,
+                comp,
+                uncomp_len: s.uncompressed_len,
+            });
+        }
+        let sort_descriptor = p
+            .sort_descriptor
+            .map(|d| SortDescriptor::from_proto(d, p.clustering_generation))
+            .transpose()?;
+        Ok(LogFooter {
+            tenant_hash,
+            shard: p.shard,
+            writer_id,
+            writer_epoch: p.writer_epoch,
+            writer_seq: p.writer_seq,
+            min_ts_ns: p.min_ts_ns,
+            max_ts_ns: p.max_ts_ns,
+            min_observed_ts_ns: p.min_observed_ts_ns,
+            max_observed_ts_ns: p.max_observed_ts_ns,
+            record_count: p.record_count,
+            block_count: p.block_count,
+            stream_count: p.stream_count,
+            sections,
+            level: p.level,
+            input_set_hash: p.input_set_hash,
+            part_index: p.part_index,
+            sort_descriptor,
+            clustering_generation: p.clustering_generation,
+        })
+    }
+}
+
+/// `footer_crc32c`: covers the footer protobuf bytes (including the v2
+/// compaction-identity fields `level`/`input_set_hash`/`part_index`, which live
+/// inside the same encoded `LogFooter` message and so need no separate
+/// checksum), then `footer_len`
+/// (u32 LE), `version` (u16 LE), `signal`, `reserved`, `magic` — every trailer
+/// byte except the crc field itself (ADR-0010 §4).
+fn footer_crc(footer_bytes: &[u8], footer_len: u32, version: u16, signal: u8, reserved: u8) -> u32 {
+    let mut crc = crc32c::crc32c(footer_bytes);
+    crc = crc32c::crc32c_append(crc, &footer_len.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &version.to_le_bytes());
+    crc = crc32c::crc32c_append(crc, &[signal, reserved]);
+    crc32c::crc32c_append(crc, &MAGIC)
+}
+
+/// Appends the footer protobuf bytes and the 16-byte trailer to `out`.
+pub fn write_footer_and_trailer(out: &mut Vec<u8>, footer: &LogFooter) {
+    write_footer_and_trailer_versioned(out, footer, VERSION);
+}
+
+/// [`write_footer_and_trailer`] with the trailer version named explicitly.
+///
+/// The writer always emits [`VERSION`]. This exists so a test can stamp a
+/// version the reader does not accept, and assert the typed rejection, without
+/// a second copy of the trailer arithmetic: a hand-rolled trailer whose
+/// `footer_crc32c` did not cover the substituted version byte would be refused
+/// as corruption and prove nothing about the version gate.
+pub fn write_footer_and_trailer_versioned(out: &mut Vec<u8>, footer: &LogFooter, version: u16) {
+    let footer_bytes = footer.to_proto().encode_to_vec();
+    let footer_len = footer_bytes.len() as u32;
+    let crc = footer_crc(&footer_bytes, footer_len, version, SIGNAL_LOGS, RESERVED);
+    out.extend_from_slice(&footer_bytes);
+    out.extend_from_slice(&footer_len.to_le_bytes());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
+    out.push(SIGNAL_LOGS);
+    out.push(RESERVED);
+    out.extend_from_slice(&MAGIC);
+}
+
+/// Outcome of opening a `.rlog` object from a suffix probe (the ranged reader
+/// protocol): either the footer parsed, or the suffix did not reach the whole
+/// footer and the caller must fetch the named absolute byte range (itself a
+/// true suffix of the object) and call [`open_from_suffix`] again with it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SuffixOutcome {
+    /// The footer was fully covered and validated.
+    Ready(LogFooter),
+    /// The suffix covered the trailer but not the whole footer. Fetch
+    /// `[offset, offset + len)` (footer + trailer) and retry.
+    NeedRange { offset: u64, len: u64 },
+}
+
+/// Opens a whole RLOG object: verifies the trailer, the footer crc, decodes the
+/// footer, and validates the section table. Every violation is `Corrupted`.
+/// The whole object always covers the footer, so this never asks for a range.
+pub fn open(bytes: &[u8]) -> Result<LogFooter, LogSegError> {
+    match open_from_suffix(bytes, bytes.len() as u64)? {
+        SuffixOutcome::Ready(footer) => Ok(footer),
+        // Unreachable: a whole object covers its own footer.
+        SuffixOutcome::NeedRange { .. } => Err(LogSegError::Corrupted(
+            "footer not covered by whole object".into(),
+        )),
+    }
+}
+
+/// [`open`] over a [`ByteSource`]: reads the trailer, then the footer and
+/// trailer range it names, through [`open_from_suffix`]. On a whole buffer this
+/// runs the same checks in the same order as [`open`] and returns the same
+/// footer or error; on a [`crate::SparseObject`] it needs only those two
+/// ranges placed.
+pub fn open_source<S: ByteSource + ?Sized>(src: &S) -> Result<LogFooter, LogSegError> {
+    let total = src.object_len();
+    let trailer_len = TRAILER_LEN as u64;
+    if total < trailer_len {
+        return Err(LogSegError::Corrupted("object smaller than trailer".into()));
+    }
+    let trailer = src.read(total - trailer_len, trailer_len)?;
+    let (offset, len) = match open_from_suffix(&trailer, total)? {
+        SuffixOutcome::Ready(footer) => return Ok(footer),
+        SuffixOutcome::NeedRange { offset, len } => (offset, len),
+    };
+    match open_from_suffix(&src.read(offset, len)?, total)? {
+        SuffixOutcome::Ready(footer) => Ok(footer),
+        SuffixOutcome::NeedRange { .. } => Err(LogSegError::Corrupted(
+            "footer not covered by whole object".into(),
+        )),
+    }
+}
+
+/// The trailer's format version, without decoding the footer.
+///
+/// The version is what selects the BLOCKS layout (ADR-0699 decision 3), so a
+/// reader needs it alongside the section table, which does not carry it. This
+/// only reads the two trailer bytes; every other trailer and footer check is
+/// [`open`]'s, and a caller is expected to have called it.
+pub fn trailer_version(bytes: &[u8]) -> Result<u16, LogSegError> {
+    let trailer = bytes
+        .len()
+        .checked_sub(TRAILER_LEN)
+        .and_then(|at| bytes.get(at..))
+        .ok_or_else(|| LogSegError::Corrupted("object smaller than trailer".into()))?;
+    Ok(u16::from_le_bytes([trailer[8], trailer[9]]))
+}
+
+/// Opens a `.rlog` object from a suffix of its bytes (docs/log-segment-format.md
+/// "Reader protocol"). `suffix` is the last `suffix.len()` bytes of an object of
+/// `total_size` bytes. When the suffix covers the footer and trailer, this
+/// validates the trailer, the footer crc, and the section table, then returns
+/// the footer; when it covers the trailer but not the whole footer, it returns
+/// [`SuffixOutcome::NeedRange`] naming the absolute footer+trailer range to
+/// fetch and retry. This is the RLOG analogue of `ravel_segment::open_from_suffix`
+/// and lets a caller read the footer and section directory with one or two
+/// ranged GETs instead of the whole object. Every violation is `Corrupted`.
+pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome, LogSegError> {
+    let total = usize::try_from(total_size)
+        .map_err(|_| LogSegError::Corrupted("total_size range".into()))?;
+    if total < TRAILER_LEN {
+        return Err(LogSegError::Corrupted("object smaller than trailer".into()));
+    }
+    if suffix.len() < TRAILER_LEN || suffix.len() > total {
+        return Err(LogSegError::Corrupted(
+            "suffix does not cover the trailer".into(),
+        ));
+    }
+    let trailer = &suffix[suffix.len() - TRAILER_LEN..];
+    let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    let footer_crc32c = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
+    let version = u16::from_le_bytes([trailer[8], trailer[9]]);
+    let signal = trailer[10];
+    let reserved = trailer[11];
+    let magic = &trailer[12..16];
+
+    if magic != MAGIC {
+        return Err(LogSegError::Corrupted("bad magic".into()));
+    }
+    if !SUPPORTED_VERSIONS.contains(version) {
+        return Err(LogSegError::UnsupportedVersion(version));
+    }
+    if signal != SIGNAL_LOGS {
+        return Err(LogSegError::Corrupted(format!(
+            "unsupported signal {signal}"
+        )));
+    }
+    if reserved != RESERVED {
+        return Err(LogSegError::Corrupted("reserved byte nonzero".into()));
+    }
+    if footer_len == 0 {
+        return Err(LogSegError::Corrupted("footer_len is zero".into()));
+    }
+    // Absolute footer region [footer_start, total - TRAILER_LEN).
+    let footer_start = total
+        .checked_sub(TRAILER_LEN)
+        .and_then(|v| v.checked_sub(footer_len as usize))
+        .ok_or_else(|| LogSegError::Corrupted("footer_len past object".into()))?;
+
+    // The suffix covers [suffix_start, total). If the footer starts before it,
+    // ask the caller for the footer+trailer range and retry.
+    let suffix_start = total - suffix.len();
+    if footer_start < suffix_start {
+        return Ok(SuffixOutcome::NeedRange {
+            offset: footer_start as u64,
+            len: (total - footer_start) as u64,
+        });
+    }
+    let rel_start = footer_start - suffix_start;
+    let rel_end = suffix.len() - TRAILER_LEN;
+    let footer_bytes = &suffix[rel_start..rel_end];
+
+    let expected = footer_crc(footer_bytes, footer_len, version, signal, reserved);
+    if expected != footer_crc32c {
+        return Err(LogSegError::Corrupted("footer crc mismatch".into()));
+    }
+
+    let proto = pb::LogFooter::decode(footer_bytes)
+        .map_err(|e| LogSegError::Corrupted(format!("footer decode: {e}")))?;
+    let footer = LogFooter::from_proto(proto)?;
+
+    validate_sections(&footer, footer_start as u64, DEFAULT_MAX_SECTION_UNCOMP)?;
+    Ok(SuffixOutcome::Ready(footer))
+}
+
+/// Validates the section table: at most one of each known kind, all five v1
+/// kinds present, every range inside the section area with overflow-checked
+/// arithmetic, and every `uncomp_len` within the cap.
+pub fn validate_sections(
+    footer: &LogFooter,
+    section_area_end: u64,
+    max_uncomp: u64,
+) -> Result<(), LogSegError> {
+    let known = [
+        kind::STREAM_DIR,
+        kind::FIELD_DIR,
+        kind::BLOCKS,
+        kind::SKIP_IDX,
+        kind::BLOOM,
+    ];
+    for k in known {
+        let n = footer.sections.iter().filter(|s| s.kind == k).count();
+        if n == 0 {
+            return Err(LogSegError::Corrupted(format!("missing section kind {k}")));
+        }
+        if n > 1 {
+            return Err(LogSegError::Corrupted(format!(
+                "duplicate section kind {k}"
+            )));
+        }
+    }
+    for s in &footer.sections {
+        // Unknown kinds are skipped but their ranges are still bounds-checked so
+        // a hostile descriptor cannot point outside the object.
+        let end = s
+            .offset
+            .checked_add(s.len)
+            .ok_or_else(|| LogSegError::Corrupted("section range overflow".into()))?;
+        if end > section_area_end {
+            return Err(LogSegError::Corrupted("section range out of bounds".into()));
+        }
+        if s.uncomp_len > max_uncomp {
+            return Err(LogSegError::Corrupted("section uncomp_len over cap".into()));
+        }
+        if s.comp != COMP_NONE && s.comp != COMP_ZSTD {
+            return Err(LogSegError::Corrupted(format!(
+                "unknown comp tag {}",
+                s.comp
+            )));
+        }
+    }
+    // POSTINGS (ADR-0049) is optional: 0 or 1 occurrences, never mandatory.
+    // Absent is always legal (docs/adrs/0049-rlog-postings.md decision 5).
+    let postings_count = footer
+        .sections
+        .iter()
+        .filter(|s| s.kind == kind::POSTINGS)
+        .count();
+    if postings_count > 1 {
+        return Err(LogSegError::Corrupted(
+            "duplicate section kind POSTINGS".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    fn sample_footer(sections: Vec<SectionDesc>) -> LogFooter {
+        LogFooter {
+            tenant_hash: [1u8; 16],
+            shard: 7,
+            writer_id: [2u8; 16],
+            writer_epoch: 3,
+            writer_seq: 4,
+            min_ts_ns: -5,
+            max_ts_ns: 900,
+            min_observed_ts_ns: 0,
+            max_observed_ts_ns: 1000,
+            record_count: 42,
+            block_count: 2,
+            stream_count: 3,
+            sections,
+            level: 0,
+            input_set_hash: Vec::new(),
+            part_index: 0,
+            sort_descriptor: None,
+            clustering_generation: 0,
+        }
+    }
+
+    /// Builds a minimal valid object: a body area of `body_len` zero bytes
+    /// carrying the five mandatory sections, then footer+trailer.
+    fn build_object(body_len: usize) -> Vec<u8> {
+        let sections = vec![
+            SectionDesc {
+                kind: kind::STREAM_DIR,
+                offset: 0,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::FIELD_DIR,
+                offset: 1,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::BLOCKS,
+                offset: 2,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::SKIP_IDX,
+                offset: 3,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::BLOOM,
+                offset: 4,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+            },
+        ];
+        let mut obj = vec![0u8; body_len];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+        obj
+    }
+
+    #[test]
+    fn roundtrip_open() {
+        let obj = build_object(5);
+        let got = open(&obj).expect("open");
+        assert_eq!(got.shard, 7);
+        assert_eq!(got.record_count, 42);
+        assert_eq!(got.section(kind::BLOCKS).map(|s| s.offset), Some(2));
+    }
+
+    /// A footer carrying non-default compaction identity round-trips exactly
+    /// through encode then decode (the fields ADR-0032 added in v2, carried
+    /// unchanged by v3). The three fields live inside the same protobuf
+    /// `LogFooter` the `footer_crc32c` already covers.
+    #[test]
+    fn footer_round_trips_level_input_set_hash_part_index() {
+        let mut footer = sample_footer(sample_sections());
+        footer.level = 1;
+        footer.input_set_hash = vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0xff];
+        footer.part_index = 7;
+
+        let mut obj = vec![0u8; 5];
+        write_footer_and_trailer(&mut obj, &footer);
+        let got = open(&obj).expect("open");
+
+        assert_eq!(got.level, 1);
+        assert_eq!(got.input_set_hash, vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0xff]);
+        assert_eq!(got.part_index, 7);
+        assert_eq!(got, footer);
+    }
+
+    /// Hand-build a structurally valid trailer whose version is one higher than
+    /// the supported constant and assert the reader rejects it with the typed
+    /// `UnsupportedVersion(N)` variant, not `Corrupted` (ADR-0066 decision 2:
+    /// fail-closed-on-newer, typed). Only the trailer `version` field differs
+    /// from a valid object; the crc is recomputed for that version so the
+    /// rejection is the version check, not an incidental crc mismatch.
+    #[test]
+    fn rejects_newer_trailer_as_unsupported_version() {
+        let newer = VERSION + 1;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, newer, SIGNAL_LOGS, RESERVED);
+
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&newer.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        match open(&obj) {
+            Err(LogSegError::UnsupportedVersion(v)) => assert_eq!(v, newer),
+            other => panic!("expected UnsupportedVersion, got {other:?}"),
+        }
+    }
+
+    /// The immediately preceding version (v2) is rejected too, and with the
+    /// typed variant: ADR-0095 deletes v2 read support in the same change that
+    /// introduces v3, so there is no dual-reader window. A stored v2 object is
+    /// unreadable by this build by design, and it must say so as
+    /// `UnsupportedVersion(2)` rather than looking like corruption.
+    #[test]
+    fn rejects_v2_trailer_as_unsupported_version() {
+        const V2: u16 = 2;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, V2, SIGNAL_LOGS, RESERVED);
+
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&V2.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        assert!(matches!(
+            open(&obj),
+            Err(LogSegError::UnsupportedVersion(2))
+        ));
+    }
+
+    /// The version/corruption split is real: an older version (v1) is also the
+    /// typed `UnsupportedVersion` variant, never `Corrupted`.
+    #[test]
+    fn rejects_v1_trailer_as_unsupported_version() {
+        const V1: u16 = 1;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, V1, SIGNAL_LOGS, RESERVED);
+
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&V1.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        assert!(matches!(
+            open(&obj),
+            Err(LogSegError::UnsupportedVersion(1))
+        ));
+    }
+
+    /// Today's RLOG window is a single version: ADR-0892 deleted the version-3
+    /// reader and ADR-2135 the version-4 one, so nothing but [`VERSION`] is
+    /// accepted.
+    #[test]
+    fn todays_window_accepts_only_the_current_version() {
+        assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);
+        assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
+        assert!(SUPPORTED_VERSIONS.contains(VERSION));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION - 2));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION + 1));
+    }
+
+    /// The predecessor version is EXCLUDED, in the shape RSEG pins its own
+    /// exclusion of `VERSION_V6` (`ravel-segment/src/format.rs`). ADR-0892
+    /// decision 6: deleting a reader without pinning its absence lets the
+    /// window silently reopen, and `SupportedVersions::n_and_prev` is one token
+    /// away in the same file. Swapping `single(VERSION)` back to
+    /// `n_and_prev(VERSION)` fails here. The versions are spelled out so a bump
+    /// that forgets to revisit this window fails too: 5 is the only version,
+    /// and 4 (ADR-2135) and 3 (ADR-0892) are both outside it.
+    #[test]
+    fn the_previous_version_is_excluded_from_the_window() {
+        assert_eq!(VERSION, 5);
+        assert!(SUPPORTED_VERSIONS.contains(5));
+        assert!(!SUPPORTED_VERSIONS.contains(VERSION - 1));
+        assert!(!SUPPORTED_VERSIONS.contains(4));
+        assert!(!SUPPORTED_VERSIONS.contains(3));
+    }
+
+    /// The exclusion is the reader's behaviour, not just the constant's: a
+    /// structurally valid object whose trailer says 3, with the crc recomputed
+    /// over that version so nothing else can be what fails, is rejected with
+    /// the typed `UnsupportedVersion(3)`.
+    #[test]
+    fn rejects_v3_trailer_as_unsupported_version() {
+        const V3: u16 = 3;
+        let footer = sample_footer(sample_sections());
+        let footer_bytes = footer.to_proto().encode_to_vec();
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, V3, SIGNAL_LOGS, RESERVED);
+
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&V3.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        assert!(matches!(
+            open(&obj),
+            Err(LogSegError::UnsupportedVersion(3))
+        ));
+    }
+
+    /// The N/N-1 window shape, proven on a synthetic version number (no RLOG
+    /// version below v2 has a byte fixture). The window is exactly two versions
+    /// wide with a hard floor at N-1: it accepts N and N-1, rejects N-2 and
+    /// older, and must never silently widen past N-1.
+    #[test]
+    fn n_and_prev_window_is_exactly_two_wide_with_a_floor() {
+        const N: u16 = 100;
+        let window = SupportedVersions::n_and_prev(N);
+        assert_eq!(window.newest(), N);
+        assert_eq!(window.oldest(), N - 1);
+        assert!(window.contains(N));
+        assert!(window.contains(N - 1));
+        assert!(!window.contains(N - 2), "N-2 is below the floor, rejected");
+        assert!(!window.contains(N + 1));
+    }
+
+    /// An L0 object built through the normal writer path stamps the compaction
+    /// identity at its L0 defaults (ADR-0032): level=0, empty input_set_hash,
+    /// part_index=0.
+    #[test]
+    fn l0_object_stamps_level_zero_sentinels() {
+        use ravel_types::logstream::{AttrValue, LogStreamId};
+
+        use crate::record::{LogRecord, stream_attrs_bytes};
+        use crate::writer::{ObjectIdentity, RlogConfig, RlogWriter};
+
+        let stream_id = LogStreamId([3u8; 16]);
+        let stream_attrs = stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str("svc".into()))],
+            "scope",
+            "1.0",
+            &[],
+        );
+        let record = LogRecord {
+            stream_id,
+            stream_attrs,
+            ts_ns: 10,
+            observed_ts_ns: 11,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "hello world".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        };
+
+        let identity = ObjectIdentity {
+            tenant_hash: [1u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut w = RlogWriter::new(RlogConfig::default(), identity);
+        w.push(record).expect("push");
+        let object = w.finish().expect("finish");
+
+        let footer = open(&object).expect("open");
+        assert_eq!(footer.level, 0);
+        assert!(footer.input_set_hash.is_empty());
+        assert_eq!(footer.part_index, 0);
+    }
+
+    #[test]
+    fn rejects_each_corruption() {
+        let obj = build_object(5);
+        // Too small.
+        assert!(matches!(open(&obj[..8]), Err(LogSegError::Corrupted(_))));
+
+        // Bad magic.
+        let mut bad = obj.clone();
+        let n = bad.len();
+        bad[n - 1] ^= 0xff;
+        assert!(matches!(open(&bad), Err(LogSegError::Corrupted(_))));
+
+        // Wrong signal.
+        let mut bad = obj.clone();
+        bad[n - 6] = 1;
+        assert!(matches!(open(&bad), Err(LogSegError::Corrupted(_))));
+
+        // Reserved nonzero.
+        let mut bad = obj.clone();
+        bad[n - 5] = 9;
+        assert!(matches!(open(&bad), Err(LogSegError::Corrupted(_))));
+
+        // footer crc mismatch (flip a footer proto byte, which the crc covers;
+        // the 5-byte body area precedes the footer).
+        let mut bad = obj.clone();
+        bad[n - TRAILER_LEN - 1] ^= 0xff;
+        assert!(matches!(open(&bad), Err(LogSegError::Corrupted(_))));
+
+        // footer_len overflow (huge).
+        let mut bad = obj.clone();
+        bad[n - 16..n - 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(open(&bad), Err(LogSegError::Corrupted(_))));
+    }
+
+    #[test]
+    fn rejects_missing_and_out_of_range_sections() {
+        // Missing BLOOM.
+        let sections = vec![
+            SectionDesc {
+                kind: kind::STREAM_DIR,
+                offset: 0,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::FIELD_DIR,
+                offset: 1,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::BLOCKS,
+                offset: 2,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::SKIP_IDX,
+                offset: 3,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+        ];
+        let mut obj = vec![0u8; 5];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+        assert!(matches!(open(&obj), Err(LogSegError::Corrupted(_))));
+
+        // A section pointing past the section area.
+        let mut sections = sample_sections();
+        sections[2].len = 10_000;
+        let mut obj = vec![0u8; 5];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+        assert!(matches!(open(&obj), Err(LogSegError::Corrupted(_))));
+    }
+
+    fn sample_sections() -> Vec<SectionDesc> {
+        vec![
+            SectionDesc {
+                kind: kind::STREAM_DIR,
+                offset: 0,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::FIELD_DIR,
+                offset: 1,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::BLOCKS,
+                offset: 2,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::SKIP_IDX,
+                offset: 3,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_ZSTD,
+                uncomp_len: 1,
+            },
+            SectionDesc {
+                kind: kind::BLOOM,
+                offset: 4,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+            },
+        ]
+    }
+
+    /// A footer proto whose `input_set_hash` (field 15) length prefix claims
+    /// more bytes than follow is a typed `Corrupted` error at decode, never a
+    /// panic and never a silently truncated hash. The crc is computed over the
+    /// crafted bytes so the reader reaches the prost decode step rather than
+    /// failing the crc check first.
+    #[test]
+    fn truncated_input_set_hash_is_corrupted_not_truncated() {
+        let mut footer_bytes = sample_footer(sample_sections()).to_proto().encode_to_vec();
+        // field 15, wire type 2 (LEN): tag, a claimed length of 10, then only 2
+        // payload bytes so the field runs past the buffer end.
+        footer_bytes.push((15 << 3) | 2);
+        footer_bytes.push(10);
+        footer_bytes.extend_from_slice(&[0xaa, 0xbb]);
+
+        let footer_len = footer_bytes.len() as u32;
+        let crc = footer_crc(&footer_bytes, footer_len, VERSION, SIGNAL_LOGS, RESERVED);
+        let mut obj = vec![0u8; 5];
+        obj.extend_from_slice(&footer_bytes);
+        obj.extend_from_slice(&footer_len.to_le_bytes());
+        obj.extend_from_slice(&crc.to_le_bytes());
+        obj.extend_from_slice(&VERSION.to_le_bytes());
+        obj.push(SIGNAL_LOGS);
+        obj.push(RESERVED);
+        obj.extend_from_slice(&MAGIC);
+
+        assert!(matches!(open(&obj), Err(LogSegError::Corrupted(_))));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+
+        /// Arbitrary compaction-identity values survive a footer encode/decode
+        /// round-trip exactly (ADR-0032's fields, carried unchanged by v3).
+        #[test]
+        fn footer_compaction_identity_fields_round_trip(
+            level in any::<u32>(),
+            part_index in any::<u32>(),
+            hash in proptest::collection::vec(any::<u8>(), 0..40),
+        ) {
+            let mut footer = sample_footer(sample_sections());
+            footer.level = level;
+            footer.part_index = part_index;
+            footer.input_set_hash = hash.clone();
+
+            let mut obj = vec![0u8; 5];
+            write_footer_and_trailer(&mut obj, &footer);
+            let got = open(&obj).expect("open");
+
+            prop_assert_eq!(got.level, level);
+            prop_assert_eq!(got.part_index, part_index);
+            prop_assert_eq!(got.input_set_hash, hash);
+        }
+
+        /// Corrupting any byte inside the footer proto region (which carries
+        /// `input_set_hash`) is always caught as a typed `Corrupted` error via
+        /// the footer crc, never a panic and never a silently altered footer.
+        #[test]
+        fn footer_corruption_is_typed_error(
+            hash in proptest::collection::vec(any::<u8>(), 1..40),
+            flip in any::<usize>(),
+            xor in any::<u8>(),
+        ) {
+            let mut footer = sample_footer(sample_sections());
+            footer.input_set_hash = hash;
+            let mut obj = vec![0u8; 5];
+            write_footer_and_trailer(&mut obj, &footer);
+
+            // Footer proto bytes occupy [5, total - TRAILER_LEN).
+            let start = 5usize;
+            let end = obj.len() - TRAILER_LEN;
+            let i = start + (flip % (end - start));
+            obj[i] ^= xor | 1;
+
+            prop_assert!(matches!(open(&obj), Err(LogSegError::Corrupted(_))));
+        }
+    }
+
+    fn key(name: &str, ty: SortKeyType) -> SortKeyColumn {
+        SortKeyColumn {
+            name: name.into(),
+            ty,
+        }
+    }
+
+    fn descriptor(key_columns: Vec<SortKeyColumn>) -> pb::SortDescriptor {
+        SortDescriptor {
+            bucket_width: SortBucketWidth::OneHour,
+            key_columns,
+        }
+        .to_proto()
+    }
+
+    /// A sort key names each column once and names it with a nonempty string.
+    /// A repeat is refused whether or not its type differs, and an empty name
+    /// is refused in any position; distinct names of one type still decode.
+    #[test]
+    fn sort_descriptor_refuses_duplicate_and_empty_key_names() {
+        let ok = descriptor(vec![
+            key("region", SortKeyType::Str),
+            key("zone", SortKeyType::Str),
+        ]);
+        let decoded = SortDescriptor::from_proto(ok, 1).expect("distinct names decode");
+        assert_eq!(decoded.key_columns.len(), 2);
+
+        let refused = [
+            (
+                vec![
+                    key("region", SortKeyType::Str),
+                    key("region", SortKeyType::Str),
+                ],
+                "named twice",
+            ),
+            (
+                vec![
+                    key("region", SortKeyType::Str),
+                    key("status", SortKeyType::I64),
+                    key("region", SortKeyType::I64),
+                ],
+                "named twice",
+            ),
+            (vec![key("", SortKeyType::Str)], "name empty"),
+            (
+                vec![key("region", SortKeyType::Str), key("", SortKeyType::Bool)],
+                "name empty",
+            ),
+        ];
+        for (columns, needle) in refused {
+            match SortDescriptor::from_proto(descriptor(columns.clone()), 1) {
+                Err(LogSegError::Corrupted(m)) => assert!(m.contains(needle), "{m}"),
+                other => panic!("{columns:?}: expected Corrupted({needle}), got {other:?}"),
+            }
+        }
+    }
+
+    /// The shapes `SortDescriptor::validate` refuses, each with the generation
+    /// it is paired with and the exact message.
+    fn refused_shapes() -> Vec<(Vec<SortKeyColumn>, u64, &'static str)> {
+        let s = |n: &str| key(n, SortKeyType::Str);
+        vec![
+            (Vec::new(), 1, "0 key columns, not 1..=4"),
+            (
+                vec![s("a"), s("b"), s("c"), s("d"), s("e")],
+                1,
+                "5 key columns, not 1..=4",
+            ),
+            (
+                vec![s("code")],
+                0,
+                "a descriptor needs a nonzero clustering generation",
+            ),
+            (vec![s("a"), s("")], 1, "key column name empty"),
+            (
+                vec![s("code"), key("code", SortKeyType::I64)],
+                1,
+                "key column \"code\" named twice",
+            ),
+        ]
+    }
+
+    /// One case per rule: an empty column list under a nonzero generation, more
+    /// than the maximum, a descriptor under generation 0, an empty name and a
+    /// repeated name. The width and column types are closed enums here, so an
+    /// unspecified width has no domain value to pass; the footer decoder
+    /// refuses it from the proto (`rejects_an_unspecified_bucket_width`).
+    #[test]
+    fn validate_refuses_each_rule_with_its_message() {
+        for (columns, generation, want) in refused_shapes() {
+            let d = SortDescriptor {
+                bucket_width: SortBucketWidth::OneHour,
+                key_columns: columns.clone(),
+            };
+            match d.validate(generation) {
+                Err(LogSegError::InvalidSortDescriptor(m)) => assert_eq!(m, want, "{columns:?}"),
+                other => panic!("{columns:?}/{generation}: expected {want:?}, got {other:?}"),
+            }
+        }
+        let max = SortDescriptor {
+            bucket_width: SortBucketWidth::OneDay,
+            key_columns: ["a", "b", "c", "d"]
+                .iter()
+                .map(|n| key(n, SortKeyType::Bytes))
+                .collect(),
+        };
+        max.validate(1)
+            .expect("four distinct columns under generation 1");
+        max.validate(u64::MAX).expect("any nonzero generation");
+    }
+
+    /// The footer decoder refuses every shape `validate` refuses, as
+    /// `Corrupted` carrying validate's own message.
+    #[test]
+    fn footer_decode_refuses_the_shapes_validate_refuses() {
+        for (columns, generation, want) in refused_shapes() {
+            let mut f = sample_footer(Vec::new());
+            f.sort_descriptor = Some(SortDescriptor {
+                bucket_width: SortBucketWidth::SixHours,
+                key_columns: columns.clone(),
+            });
+            f.clustering_generation = generation;
+            match LogFooter::from_proto(f.to_proto()) {
+                Err(LogSegError::Corrupted(m)) => {
+                    assert_eq!(m, format!("footer sort descriptor: {want}"), "{columns:?}")
+                }
+                other => panic!("{columns:?}/{generation}: expected Corrupted, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_an_unspecified_bucket_width() {
+        let mut p = descriptor(vec![key("code", SortKeyType::Str)]);
+        p.bucket_width = pb::SortBucketWidth::Unspecified as i32;
+        assert!(matches!(
+            SortDescriptor::from_proto(p, 1),
+            Err(LogSegError::Corrupted(m)) if m == "footer sort descriptor bucket width 0 unknown"
+        ));
+    }
+}

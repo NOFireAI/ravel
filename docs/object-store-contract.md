@@ -1,0 +1,1824 @@
+# Object Store Contract
+
+Rust trait: `ravel_object_store::ObjectStoreBackend`. All Ravel durability
+arguments are made against THIS contract, never against a specific vendor.
+Amended by ADR-0010 §12.
+
+## Operations
+
+```rust
+#[async_trait]
+pub trait ObjectStoreBackend: Send + Sync + 'static {
+    /// Write a complete object.
+    async fn put(&self, key: &str, data: Bytes, opts: PutOptions) -> Result<PutOutcome, StoreError>;
+    /// Read whole object or a byte range. Suffix(n) = last n bytes, n > 0.
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError>;
+    /// As get, but reading the version the pin selects and only if that
+    /// object still has the pinned ETag. The default implementation refuses
+    /// with `Unsupported`, never falling back to an unconditional get.
+    /// `PinnedRead` is the outcome plus the pin for the bytes served. See
+    /// "Conditional reads" below.
+    async fn get_pinned(&self, key: &str, range: GetRange, pin: &Pin)
+        -> Result<PinnedRead, StoreError>;
+    /// An unconditional get that also reports the pin for the bytes it read,
+    /// for a first read taken before any pin exists. The default
+    /// implementation reads through `get` and reports an ETag-only pin.
+    async fn get_with_pin(&self, key: &str, range: GetRange)
+        -> Result<PinnedRead, StoreError>;
+    /// A HEAD returning the object's metadata and its pin. The default
+    /// implementation reports an ETag-only pin; a versioned backend
+    /// overrides it to fill in the version.
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError>;
+    /// Begin a multipart upload. Only backends reporting `multipart` provide
+    /// it; the default implementation refuses. See "Multipart upload" below.
+    async fn put_multipart<'a>(&'a self, key: &str)
+        -> Result<Box<dyn MultipartUpload + 'a>, StoreError>;
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError>;
+    /// Paginated recursive prefix listing, lexicographic order.
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError>;
+    /// As list, but begins strictly after start_after in key order.
+    async fn list_after(&self, prefix: &str, start_after: Option<&str>, page: Option<PageToken>)
+        -> Result<ListPage, StoreError>;
+    /// One-level listing: entries directly under prefix plus common sub-prefixes.
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError>;
+    async fn delete(&self, key: &str) -> Result<(), StoreError>; // idempotent: NotFound => Ok
+    fn capabilities(&self) -> Capabilities;
+}
+
+pub enum PutMode { Overwrite, CreateIfAbsent, CasVersion(Version) }
+pub struct PutOptions { pub mode: PutMode, pub checksum: Option<UploadChecksum> }
+pub enum UploadChecksum { Crc32c(u32) /* extend per backend */ }
+pub enum GetRange { Full, Range(u64, u64) /* [start, end) */, Suffix(u64) }
+pub struct Pin { pub etag: String, pub version: Option<String> }
+pub struct PutOutcome { pub etag: Etag, pub version: Version }
+pub struct GetOutcome { pub data: Bytes, pub etag: Etag, pub version: Version, pub total_size: u64 }
+pub struct ObjectMeta { pub key: String, pub size: u64, pub etag: Etag, pub version: Version, pub last_modified_unix_ms: i64 }
+pub struct ListPage { pub objects: Vec<ObjectMeta>, pub next: Option<PageToken> }
+pub struct DelimitedList { pub objects: Vec<ObjectMeta>, pub common_prefixes: Vec<String> }
+
+#[async_trait]
+pub trait MultipartUpload: Send {
+    /// Append one part. `checksum` is a local pre-flight (see below).
+    async fn put_part(&mut self, data: Bytes, checksum: Option<UploadChecksum>) -> Result<(), StoreError>;
+    /// Publish every part so far as one object, atomically.
+    async fn complete(&mut self) -> Result<PutOutcome, StoreError>;
+    /// Discard the upload; the object must not exist afterwards.
+    async fn abort(&mut self) -> Result<(), StoreError>;
+}
+```
+
+`Etag` is content identity (equality checks). `Version` is an opaque
+precondition token for CAS: S3 etag, GCS generation, Azure etag. The two
+coincide on S3 and differ elsewhere; commit-protocol code uses only
+`Version` for CAS and only `Etag` for content-identity assertions.
+
+`StoreError` variants (exhaustive for callers' retry logic):
+`NotFound`, `AlreadyExists`, `PreconditionFailed`, `AccessDenied`,
+`Throttled { retry_after_ms }`, `Timeout`, `Corrupted(msg)` (checksum or
+range mismatch), `InvalidRange(msg)`, `Transient(msg)`, `Permanent(msg)`,
+`Unsupported { operation }` (the backend does not implement the operation at
+all, so no argument and no retry can make it succeed, unlike `Permanent`,
+which reports a request the backend understood and rejected), `ReadOnly {
+operation, store }` (the store was opened read-only and the call would have
+mutated it), and the three a paged listing drain raises on a backend that
+breaks the listing contract: `ListRepeatedToken { prefix }`,
+`ListPageCeiling { prefix, ceiling }` and `ListOrderViolation { prefix,
+previous, offending }`.
+
+Retry classification: `Throttled`, `Timeout`, `Transient` are retryable with
+jittered exponential backoff. `AlreadyExists` on `CreateIfAbsent` is a
+*protocol signal*, not an error to retry. `AccessDenied` is permanent and
+alerts differently (misconfigured credentials or prefix policy).
+A 404 is not always `NotFound`. On the S3 adapter a 404 whose error body
+names `NoSuchBucket` is `Permanent` on get, list, put, delete and multipart,
+because a missing bucket is not a missing object and a delete must never
+report it as an idempotent success; any other 404 is
+`NotFound`, except a whole-request 404 on `delete`, which is described with
+the per-key `DeleteObjects` codes under "Required bucket configuration". On
+`ExternalStore`'s Azure arm a 404 whose body names `ContainerNotFound` is
+`Permanent` on get and list, and its GCS arm, which `object_store` reaches
+through the XML API, reads `NoSuchBucket` the same way; that store is
+read-only, so it has no delete to cover. A HEAD response has no body on any
+of these backends, so `head` and `pin_of` against a missing bucket or
+container still read `NotFound`: telling the two apart would cost a second
+request.
+`PreconditionFailed`, `Unsupported` and `ReadOnly` are never retryable: a
+retry of a pinned read reads the same changed object, and neither an
+unimplemented operation nor a read-only store changes between attempts.
+
+### HTTP client timeouts (S3 adapter)
+
+The `S3Store` adapter builds its `object_store` `AmazonS3` client on an
+explicit `ClientOptions` (`S3HttpConfig`), so the request, connect, and
+pool-idle timeouts are deliberate values this repo chose, not whatever the
+dependency happens to default to. The `S3HttpConfig` doc comment carries the
+per-value reasoning; the values (defaults, overridable via
+`S3Store::with_http_config`) are:
+
+| Value | Configured | Inherited default it replaces |
+|---|---|---|
+| Request timeout (connect → body complete) | 20 s | 30 s |
+| Connect timeout (TCP + TLS) | 3 s | 5 s |
+| Pool idle timeout | 30 s | ~90 s (reqwest, uncapped) |
+| HTTP/2 keep-alive interval / ack timeout | 10 s / 10 s, while-idle on | disabled |
+
+The request timeout must stay above the tail of the largest single request on
+the wire (an 8 MiB multipart part or a whole-object GET) even on a badly
+degraded connection, so it is set conservatively at 20 s pending a tail-latency
+measurement to tighten it; a timeout below the real tail turns a slow-but-
+succeeding request into a retry storm. The HTTP/2 keep-alive knobs are set for
+correctness but are inert under the client's HTTP/1.1 default (which we keep:
+HTTP/2 is slower for bulk S3 transfers), so under HTTP/1.1 connection liveness
+comes from the connect, request, and pool-idle timeouts.
+
+**A fixed timeout requires a bounded request, so the adapter bounds one.** Every
+request size is chosen by this crate except one: a whole-object read, whose size
+is whatever the object is. `max_l1_part_bytes` defaults to 256 MiB, 32x an 8 MiB
+multipart part, so no fixed timeout can cover both. `S3Store::get` therefore
+never reads more than `S3HttpConfig::max_request_body_bytes()` bytes from one
+request. `GetRange::Full` starts with one unranged GET (the only form an
+endpoint answers with the stored checksum; see "Read-side checksum
+verification"), reads its body up to the bound, and drops the rest of that
+response unread; whatever remains is fetched as ranged requests of at most the
+bound each. The bound is derived from the configured `request_timeout` as
+`(request_timeout - 6 s of connect/TLS/first-byte allowance) * 625 000 B/s`
+(a 5 Mbps floor rate), clamped to `[1 MiB, 8 MiB]`: the upper bound is the
+multipart part size, so read and write share one largest-request-on-the-wire,
+and the lower bound stops a tight `request_timeout` splitting a whole-object
+read so finely that the per-request round trips cost more than the bound buys
+back. At the default 20 s the derived value is 8 MiB, ~13.4 s at the floor rate,
+inside the 14 s transfer budget; a compile-time assertion in `s3.rs` pins the
+inequality. Below a `request_timeout` of about 7.7 s the 1 MiB floor binds and
+the formula above no longer predicts the chunk size. A caller-supplied `GetRange::Range` is passed
+through unsplit: the caller sized that request itself.
+
+Cost of the split, in requests and wire bytes as transferred, excluding
+`object_store`'s internal per-request retries:
+
+| Object size | Requests | Wire bytes |
+|---|---|---|
+| 0 .. bound | 1, unranged | the object |
+| above the bound | `ceil(size / bound)`: the unranged first, cut at the bound, then ranged ones up to 4 in flight | the object, plus one response header set per additional request, plus whatever the endpoint had already sent of the abandoned first body when its connection was dropped |
+
+The ranges start where the cut first body stopped and partition the rest of the
+object, so no byte is read twice. Dropping the unread remainder of the first
+response closes its connection instead of returning it to the pool, which only
+an object above the bound pays. No request is issued before the first GET to
+learn the size, so a commit record read is exactly one request. Every
+request after the first carries the first's ETag as an `If-Match`, so an object
+overwritten mid-read fails the read (retryable) rather than splicing two
+versions together; data objects are immutable, and the mutable pointer keys are
+all far below the bound, so this is a guard rather than a live path.
+
+**Worst-case wall time for one logical operation.** A request timeout is a
+retryable error, and `object_store` runs its own internal retry loop
+(`RetryConfig`, unchanged: `max_retries = 10`, `retry_timeout = 180 s`,
+jittered exponential backoff), stopping before it *starts* a retry once 180 s
+have elapsed since the first attempt. The final in-flight attempt still runs
+its full 20 s, so one logical operation can spend about `retry_timeout +
+request_timeout` = 180 s + 20 s ≈ 200 s inside the adapter before surfacing an
+error. Callers bound this from above: every caller passes a deadline and the
+trait honors cancellation by drop, so the query deadline (usually well under
+180 s) is what ends one operation in practice.
+
+### Semantics adapters MUST honor
+
+- Conditional-put failure maps by mode: under `CreateIfAbsent` a
+  precondition failure surfaces as `AlreadyExists`; under `CasVersion` as
+  `PreconditionFailed`. A conformance test asserts both against real S3
+  and RustFS (the memory oracle alone cannot catch a uniform mapping).
+- Concurrent conditional writes racing the same key may surface as a
+  transient conflict; after retry the loser must land on
+  `AlreadyExists`/`PreconditionFailed` per mode. A raced `CreateIfAbsent`
+  is the load-bearing case: AWS PutObject documents a 409
+  `ConditionalRequestConflict` that the client MUST retry, distinct from a
+  genuine already-exists. The S3 adapter cannot see the HTTP status
+  (`object_store` 0.14 maps every raw 409 to `AlreadyExists`, keeps the
+  status in a crate-private type, and enables its own conflict retry only
+  for the update / etag-match modes, never for create), so on
+  `AlreadyExists` under `CreateIfAbsent` it issues one `HEAD` to
+  disambiguate, and the HEAD's own outcome decides which of four ways the
+  conflict resolves: key **present** stays `AlreadyExists` (a real
+  collision, so the commit-path split-brain guard and the compaction
+  vanished-part guard still fire); key **absent** becomes a retryable
+  `Transient` naming a conditional-request conflict, which
+  `StoreError::is_retryable` routes back into the caller's existing retry
+  loop; the HEAD itself failing retryably (`Throttled`, `Timeout`,
+  `Transient`) surfaces that error verbatim, because an inconclusive probe
+  determined nothing about the key, and a caller that read it as
+  `AlreadyExists` would stop retrying while nothing had been written; and
+  the HEAD failing terminally (`AccessDenied`, `PreconditionFailed`,
+  `Corrupted`, `InvalidRange`, `Permanent`) still resolves to
+  `AlreadyExists`, since retrying the probe cannot change a terminal
+  outcome. This cannot lose a genuine already-exists, only delay one: on
+  the retry the idempotent create conflicts again, and once a HEAD finally
+  succeeds a present key still yields `AlreadyExists`. The cost of an
+  inconclusive probe is one extra round trip, never a wrong answer.
+- Listing is paginated (S3 pages at 1000 keys). Cross-page guarantee: any
+  key created before the first page request is returned; keys created
+  during the scan may or may not appear; a key MAY appear more than once
+  and callers MUST dedup by key. The RAW delivery sequence, across every
+  page of one drain and counting repeats, is non-decreasing, and a repeat
+  re-delivers the last key delivered, never an earlier one. That is what
+  `MemoryStore::list`, `S3Store::list`, and S3 itself do, and the
+  conformance suite's `LexicographicListingOrder` probe judges the raw
+  sequence on exactly this rule: equal adjacent keys pass, a decrease
+  fails qualification. So a caller draining every page dedups at constant
+  memory by holding only the last key: an equal key is dropped, and a key
+  strictly below it is an order violation, not a repeat, which the client
+  rejects rather than reordering. The client also bounds the drain: a
+  continuation token equal to the previous one is a spinning backend and
+  the client fails rather than looping forever, and a token that keeps
+  changing without ending is bounded by a page ceiling (100 000 pages,
+  100 million keys at the 1000-key page size).
+- `list_after(prefix, start_after, page)` returns exactly the keys `list`
+  would, minus every key `<= start_after`: each returned key compares
+  strictly greater than `start_after`, in the same lexicographic order and
+  under the same pagination and cross-page guarantee as `list`.
+  `start_after == None` is identical to `list`. `start_after` need not name
+  an existing key and is typically a prefix string that sorts before the
+  first key the caller wants, letting the caller skip a whole key sub-range
+  server-side rather than paging through and discarding it (S3
+  `ListObjectsV2` `start-after`, exclusive; the memory oracle resumes its
+  ordered map strictly after the marker). A `start_after` at or below the
+  listed prefix excludes no key under it. Overriding the default (which
+  lists from the prefix and drops `<= start_after` in the client) is a
+  performance property only; the visible result set is identical.
+- `list` and `head` report one object's `etag` identically, byte for byte,
+  and report the same `size`. Quoting, casing and any weak-validator prefix
+  are passed through verbatim from the backend rather than normalized, so an
+  ETag read off a listing is spendable as a read precondition without a
+  second `head`. A caller that records an identity from a listing and pins a
+  later read to it depends on this; a test in `ravel-object-store`'s
+  conformance module asserts the agreement on every subject it runs and then
+  spends the listed ETag as a pin through `get_pinned`.
+- `Suffix(0)` and zero-length `Range` are `InvalidRange`.
+- `Range(start, end)` is half-open; the HTTP Range header is inclusive, so
+  adapters emit `bytes=start-(end-1)`. Boundary conformance tests required
+  (exact object/section/page ends).
+- `last_modified` may have 1-second granularity. Never order commits by it;
+  it exists for advisory age decisions (GC age checks, claim expiry) only.
+  It is server-assigned, which is the whole point of the widening: it is the
+  one time base every contender shares, so an advisory expiry judged against
+  it needs no agreement between node clocks (ADR-1029 §1). "Advisory" is
+  load-bearing here -- an age decision read from this field may be wrong
+  under skew or granularity, so it may only cost duplicated work, never
+  correctness.
+
+### Conditional reads (ADR-2040 decision 1)
+
+Every object Ravel writes is immutable, so an unconditional `get` of one is
+already pinned by construction. A Parquet file Ravel did not write is not:
+the operator granted a bucket and a key, and whoever owns that bucket may
+overwrite the key at any time. `get_pinned(key, range, pin)` is the read for
+that case. `Pin` carries the identity the catalog recorded when the object
+was granted, and its two halves do different jobs:
+
+- `etag` is a **precondition**. The store compares it against the object it
+  is about to read and refuses the read when it does not match. On the wire
+  it is `If-Match`.
+- `version` is a **selector**. It names which version of the object to read,
+  and the store reads that one. On the wire it is S3's `versionId`, GCS's
+  `generation`, or Azure's `versionid`. It is `Some` only when the store
+  issues a version id distinct from the ETag; a store without versioning
+  reports none and the pin is then an ETag alone.
+
+A pin carrying both selects the named version and applies `If-Match` to it.
+Selecting is not a second precondition, and the difference shows in the
+outcome: an ETag that does not match is a failed condition on an object that
+is there, while a version the store does not have is an object that is not
+there.
+
+The precondition travels on the wire, not in the client, so a replaced
+object costs one refused request rather than a transferred body that the
+caller then has to reject.
+
+A pinned read is pinned on *every* request it issues. `GetRange::Full`
+against `S3Store` is one unranged request plus ranged ones for anything past
+`max_request_body_bytes` (see "Read-side checksum verification"), and the
+caller's pin rides on all of them, the unranged first included: a read whose
+first request dropped the pin would pay for a body from whatever version the
+key holds now and only then compare. The continuation requests of an
+*unpinned* whole-object read carry the first response's ETag as `If-Match`
+and nothing else, never a version id. Two reasons. Ravel's own bucket is
+versioned, and a GET carrying `versionId` needs `s3:GetObjectVersion`, which
+the shipped IAM templates do not grant. And a version id would select the
+first response's version, so an object overwritten mid-read would be
+finished silently from the old version instead of failing the `If-Match`
+and surfacing as the retryable `Transient` the unpinned read reports.
+
+Outcomes, in the order they are decided:
+
+| Object state | Result |
+|---|---|
+| No object at `key` | `NotFound`, never `PreconditionFailed` |
+| `pin.version` is `Some` and that version is unknown or deleted | `NotFound` |
+| The selected object's ETag differs from `pin.etag` | `PreconditionFailed` |
+| The selected object matches | `PinnedRead`: the `GetOutcome` `get` would return, whose `etag` is the pinned one, plus the `Pin` identifying the bytes served |
+
+Per backend, the same three rules:
+
+| Backend | Version selector | Unknown or deleted version | ETag mismatch |
+|---|---|---|---|
+| `S3Store` | `versionId` query parameter | `NotFound` | `PreconditionFailed` |
+| `ExternalStore` GCS | `generation` | `NotFound` | `PreconditionFailed` |
+| `ExternalStore` Azure | `versionid` | `NotFound` | `PreconditionFailed` |
+| `MemoryStore` | keeps only the current object, so any pinned version that is not the current one is gone | `NotFound` | `PreconditionFailed` |
+
+A full read (`GetRange::Full`) is bounded differently per backend. `S3Store`,
+and so the S3 kind of `ExternalStore`, splits it into requests of at most
+`max_get_chunk` bytes, so no single response outlives the request timeout.
+The GCS and Azure kinds of `ExternalStore` issue one unranged request and
+read its whole body. A caller reading a large GCS or Azure object in full
+must bound it with ranged reads itself. ADR-2040's Parquet reader is
+specified to read by range (the footer, then column chunks), so it is not
+meant to take the unsplit path.
+
+The rows above assume the three real backends answer a well-formed but
+absent version with a 404 and a failed `If-Match` with a 412; nothing in
+this crate verifies that against a live endpoint. A malformed or foreign
+version id can instead draw a 400, which `classify_generic` maps to a
+retryable `Transient`, not `NotFound`. A pin built from store metadata
+through `Pin::from_store` does not carry such an id. Both codes reach the rows above
+through `map_get_error` (on `ExternalStore`'s GCS and Azure arms, through a
+wrapper that first reads a `ContainerNotFound` body as `Permanent`), which
+defers to `map_error_common` for everything but a 416: that maps
+`object_store`'s `NotFound` to `StoreError::NotFound` (unless the 404 body
+names `NoSuchBucket`, which is `Permanent`) and its `Precondition` to
+`StoreError::PreconditionFailed`.
+
+`MemoryStore` is the oracle for this, and it models the rule rather than the
+storage: it does not retain superseded versions, so a pin naming one is
+answered `NotFound`, which is what a real backend answers once that version
+is deleted or expired. The conformance case
+`an_old_version_is_not_found_while_an_old_etag_is_a_precondition_failure`
+overwrites one object and spends two stale pins on it, the version pin and
+the ETag-only pin, and asserts the two different answers.
+
+The first row is a distinct answer, not a detail: a caller acts differently
+on a grant target that vanished and one that changed. `PreconditionFailed`
+here is not retryable, because a retry reads the same changed object; the
+caller's recourse is to re-resolve the object's identity, not to try again.
+
+A backend that cannot evaluate preconditions MUST refuse with `Unsupported`,
+which is what the default trait implementation does. It does not fall back
+to an unconditional `get`: silently dropping the precondition serves bytes
+from a replaced file, which is the exact failure the method exists to
+prevent. `MemoryStore`, `S3Store` and `ExternalStore` implement it.
+
+#### Learning the version of the bytes you read
+
+`get_pinned` returns `PinnedRead`, which is the read outcome plus the `Pin`
+identifying the bytes served, so a caller that has just read a Parquet
+footer can record the identity of what it read without a second request.
+`get_with_pin(key, range)` is the same thing for an unconditional first
+read, which is what `CREATE EXTERNAL TABLE` does before any pin exists.
+`pin_of(key)` is a HEAD that returns the object's metadata and its pin.
+
+`ObjectMeta.version` is NOT that pin's version. It is the compare-and-swap
+token a conditional write compares, which on S3 is the ETag. The two are
+different values with different jobs, which is why the version is reported
+through `Pin` and no field was added to `ObjectMeta`.
+
+Every pin is built from store metadata through one constructor,
+`Pin::from_store(etag, version)`, which drops a version equal to the ETag:
+that is an unversioned store reporting its ETag twice, not a selector.
+`S3Store::pin_of` fills the version from `object_store`'s `ObjectMeta`
+(`None` on an unversioned bucket), the external GCS and Azure path does the
+same, and the default implementations of `pin_of` and `get_with_pin` report
+an ETag-only pin, so a backend on an unversioned store needs no override.
+
+#### Which implementations forward these
+
+`get_pinned`, `get_with_pin` and `pin_of` are forwarded, with the pin
+intact, by every implementation in `ravel-object-store`:
+
+| Implementation | How it forwards |
+|---|---|
+| `impl ObjectStoreBackend for Arc<T>` | straight delegation |
+| `InstrumentedStore` | delegates, billing `get_pinned` and `get_with_pin` as one `StoreOp::Get` with their bytes and refused preconditions, and `pin_of` as one `StoreOp::Head` |
+| `ClassedStore`'s per-class handle | delegates, taking a scheduler permit of the same class and billing the same ops |
+| `FaultStore` | delegates, resolving `get_pinned` and `get_with_pin` against the same `Op::Get` rules and counters as `get`, and `pin_of` against `Op::Head` |
+| `KmsRoutingStore` | delegates all three to the default store, like every other read: reads never select a KMS key |
+| `ExternalStore` | delegates to `S3Store` on the S3 arm and to the `object_store` generic path on the GCS and Azure arms |
+
+`InstrumentedStore` and the scheduled handle bill a pinned read as a GET
+because it is one GET on the wire, and a caller's GET count must not depend
+on which read path it took.
+
+Wrappers OUTSIDE this crate do not forward them: `ravel-server`'s
+`SharedKmsStore`, `ravel-sim`'s store, and the `ravel-bench` wrappers
+implement the trait without overriding any of the three, so each falls
+through to the default implementation. `get_pinned` there is `Unsupported`,
+and `pin_of` and `get_with_pin` report an ETag-only pin from the wrapper's
+own `head`/`get`. That is a deliberate consequence of failing closed rather
+than an oversight: a pinned read through a wrapper that has not been
+qualified refuses instead of silently dropping the pin. An external table
+read must not be routed through one.
+
+`ScriptedFault::FailedPrecondition` is the one fault kind that applies to
+`get_pinned` and not to `get`, and it is scriptable only, never generated in
+random mode.
+
+`external::probe::probe_preconditions` is how a candidate store is qualified
+for this before any grant relies on it (see "Read-only external stores"
+below).
+
+## Mandatory capabilities (production)
+
+Every mode requires these; production startup fails if any is false.
+
+| Capability | Flag | Used by |
+|---|---|---|
+| Create + read-after-write consistency | consistent_read | commit visibility |
+| List-after-write consistency | consistent_list | commit discovery |
+| `CreateIfAbsent` conditional put | create_if_absent | commit records, data objects |
+| Version CAS put | cas_version | catalog HEAD pointers |
+| Byte-range + suffix reads | suffix_range | footer-first segment reads |
+| Paginated prefix listing | prefix_list | discovery, GC |
+
+Each row is a `Capabilities` flag, and the set is exactly
+`Capabilities::mandatory()`; `ravel_server::store::check_capabilities`
+enforces it before the backend is used. Optional: batch delete, lifecycle
+expiration, SSE/KMS headers.
+
+### Mode-conditional capabilities
+
+| Capability | Flag | Required by |
+|---|---|---|
+| Multipart upload | multipart | `--mode maintain` (forward-looking, see below) |
+
+`multipart` is not in `Capabilities::mandatory()`;
+`required_capabilities(Mode::Maintain)` adds it, and no other mode requires it.
+Today `ravel-maintain` writes its compaction outputs as single-PUT
+content-addressed objects (`crates/ravel-maintain/src/build.rs`, a module of
+the crate and not a cargo build script, is where that `put` is issued). The
+explicit `put_multipart` path itself is exercised end-to-end regardless of
+who calls it: `ClassedStore` schedules each part by its handle's class
+permit like any other op
+(`scheduling::tests::a_multipart_part_waits_for_a_permit_of_its_class`), and
+`s3::tests::multipart_parts_carry_checksums_under_integrity` proves every
+part carries a server-verified checksum, not only the first, under
+`upload_integrity`. The maintain-mode requirement stands so that compaction
+can stream large L1/L2 segments as multipart uploads once it is written to
+use them; `MemoryStore` and `S3Store` both report `multipart: true` and
+implement the sequence, so `--mode maintain` starts against the memory
+oracle and against any S3-compatible endpoint regardless of whether a
+caller exercises the path. (`S3Store::put` does take an internal multipart
+path above its threshold, but that is a size-driven implementation detail of
+`put`, not a caller reaching for `put_multipart`; see "When `put()` uses it"
+below.)
+
+### Multipart upload
+
+`ObjectStoreBackend::put_multipart(key)` returns a `MultipartUpload` handle: a
+sequence of `put_part` calls followed by exactly one `complete` or `abort`. The
+flag and the method must agree: a backend reporting `multipart: false` MUST
+refuse `put_multipart` with `Permanent`, which is what the default trait
+implementation does, and the contract suite asserts both directions.
+
+**Part bounds.** Enforced locally by every backend, at the call that violates
+them, rather than deferred to the server's `CompleteMultipartUpload`:
+
+| Rule | Value | Constant |
+|---|---|---|
+| Minimum size, any part but the last | 5 MiB | `MULTIPART_MIN_PART_SIZE` |
+| Minimum size, last part | 1 byte (no part may be empty) | n/a |
+| Maximum parts per upload | 10 000 | `MULTIPART_MAX_PARTS` |
+
+These are S3's own limits. A short part is legal while it is the last one, so
+it is the *next* `put_part` that fails, naming the part that became non-final.
+A `complete` with zero parts fails. Every one of these failures is
+`StoreError::Permanent` (caller misuse, never retryable) and leaves no object.
+
+**Ordering.** Parts are ordered by the sequence of `put_part` calls, not by the
+order they finish; an implementation may upload them concurrently.
+
+**Visibility and abort.** Nothing is readable at `key` until `complete`
+returns `Ok`; an incomplete, aborted, dropped, or crashed upload never becomes
+a visible object, not even a truncated one (S3's own multipart guarantee, and
+the reason compaction's crash story degrades to wasted work rather than corrupt
+state). `abort` releases the uploaded parts. It is best effort against the
+server but final for the handle: an upload S3 never heard the abort for leaves
+orphaned parts, which are billed until a bucket lifecycle rule reaps them, and
+never a readable object. **A bucket that Ravel writes multipart uploads to MUST
+configure `AbortIncompleteMultipartUpload`**, with a cleanup period of 7 days or
+less. This is not a recommendation: a failed abort or a future dropped
+mid-upload can leave billable parts indefinitely, and nothing in Ravel reaps
+them, so the lifecycle rule is the only mechanism that bounds the cost. Because `put()`'s
+above-threshold multipart path aborts best effort and discards the result
+(it never retries or blocks on the abort), that failure is otherwise silent:
+`S3Store::multipart_abort_failures` counts aborts whose request returned an
+error, and `S3Store::multipart_uploads_unreaped` counts multipart uploads that
+ended without a successful abort for any reason (a failed abort, or a future
+dropped mid-upload with its abort unresolved). Note the two do not partition
+cleanly: if the future is cancelled while `upload.abort().await` is still
+pending, the guard increments `multipart_uploads_unreaped` while
+`multipart_abort_failures` does not, even though an abort request WAS attempted
+and may well have been applied server-side. So the difference between them
+counts "no confirmed abort outcome", which includes both "no abort was issued"
+and "an abort was issued and its result is unknown".
+
+Both counters cover only uploads that reached the point where the guard is
+armed. `put_via_multipart` arms `UnreapedGuard` *after*
+`put_multipart(&path).await` returns, so if `CreateMultipartUpload` is accepted
+server-side and the future is cancelled before its response arrives, an open
+upload exists that neither counter ever sees. That window is bounded by the
+lifecycle rule and by nothing else, which is a further reason the rule is
+required rather than advisory.
+
+Read both as **outcomes that were not confirmed**, not as a count of billable
+orphans. An abort can return an error after S3 has already applied the
+operation, and in particular an abort issued after an ambiguous `complete()`
+error can fail precisely *because the upload already completed*, leaving a
+visible object and nothing to reap, while both counters rise. So a non-zero
+value means "reconcile against S3's own list of open uploads", not "this many
+orphans exist". Both read a
+process-local `AtomicU64` on the `S3Store`; a hard process crash increments
+neither, so that case stays inferable only from S3's own list of open uploads.
+
+**Retry and failure.** Nothing retries internally beyond what `object_store`'s
+client already does per request. A `put_part` that still fails *poisons the
+handle*: the first failure surfaces the classified `StoreError` a `put` would
+(so the original cause stays visible), but the handle is now dead, and every
+later `put_part` and `complete` fails with a non-retryable `Permanent` error.
+The documented recovery is to `abort` and restart the whole upload, never to
+retry the part. This is not a Ravel policy choice but what `object_store`'s S3
+upload permits: `S3MultiPartUpload::put_part` fixes the part's index
+synchronously at call time and `complete` errors unless it holds exactly that
+many parts, so a retried part lands at a *new* index and the hole the failed
+part left can never be filled (retrying it would live-lock). A
+part-sequence violation (an empty part, or a non-final part below the minimum)
+poisons the handle the same way: a later `complete` errors rather
+than publishing a truncated object. A checksum mismatch is the one *recoverable*
+rejection: it does not poison, so the caller may re-send the same bytes with the
+correct checksum. `complete` and `abort` consume the handle logically; a second
+call on the same handle fails with `Permanent` rather than re-issuing a request
+against a spent upload id. `abort` stays callable on a poisoned handle, so the
+caller can still release the uploaded parts.
+
+**Write mode.** `complete` publishes unconditionally, exactly like
+`PutMode::Overwrite`. There is no multipart `CreateIfAbsent` or `CasVersion`:
+`object_store` 0.14's `PutMultipartOptions` carries tags, attributes, and
+extensions, with no `PutMode`, so no precondition can ride on
+`CompleteMultipartUpload`. Callers needing create-once semantics must write
+keys that are unique by construction; Ravel's data objects and compaction
+parts are content-addressed, so they are.
+
+**When `put()` uses it.** `S3Store::put` switches from one PUT to a multipart
+upload above `s3::MULTIPART_THRESHOLD` (16 MiB), cutting the payload into
+`s3::MULTIPART_PART_SIZE` (8 MiB) parts with at most 4 in flight. The
+threshold is two whole parts, so the multipart path never produces a
+degenerate single-part upload, and every part but the last is exactly 8 MiB:
+uniform non-final part sizes, which the strictest S3-compatible backends (R2)
+require. 8 MiB parts keep the 10 000-part ceiling at 80 GiB, far above any
+object Ravel writes. The switch is invisible to callers: same `PutOutcome`,
+same bytes back. It applies to `Overwrite` only; a `CreateIfAbsent` or
+`CasVersion` put stays on the single-PUT path at every size (bounded by S3's
+5 GiB single-request limit) rather than silently dropping its precondition.
+`MemoryStore::put` has no threshold: there is no transport to chunk.
+
+**Checksum coverage.** `put_part`'s optional `UploadChecksum` is verified
+per part, before the part is sent, with exactly the reach `PutOptions::checksum`
+has on the same backend: a real check on `MemoryStore`, a local pre-flight
+against the caller's buffer on `S3Store` (see "Upload checksums": the
+caller's CRC32C value itself cannot be put on the wire through `object_store`
+0.14). That is separate from the server-verified checksum `upload_integrity`
+selects, which this path already sends whenever integrity is on, because the
+algorithm is set for the whole client: `object_store` 0.14.1's
+`create_multipart` sends `x-amz-checksum-algorithm`, and each `put_part` goes
+through `PutRequest::with_payload`, which attaches that part's
+`x-amz-checksum-crc64nvme` or `x-amz-checksum-sha256` --- proven on the wire,
+part by part (not only the first), by
+`s3::tests::multipart_parts_carry_checksums_under_integrity` against a fake
+endpoint. Whether `CompleteMultipartUpload`'s body then carries a per-part
+checksum is not this client's choice: `object_store` reads each part's
+checksum off `UploadPart`'s *response* headers, not off what it sent, so the
+Complete body carries one only when the endpoint's `UploadPart` response
+echoes the same header back; the same test confirms this against a fake
+endpoint that does. It sends no `x-amz-checksum-type`, so what the endpoint
+records for the completed object is its default type for the algorithm (on
+AWS, a full-object checksum for CRC64-NVME and a composite one for
+SHA-256). `put()` does not route large overwrites here under integrity yet
+(see "Upload checksums"): sending the part checksums is now proven, but
+server-side verification of them still waits on a real-endpoint check.
+A mismatch fails that
+`put_part` with `Corrupted`, does not count as a part, and leaves the upload
+open, so the caller may re-send the same bytes with a correct checksum. There
+is **no caller-supplied whole-object checksum** for a multipart upload: `complete` takes no
+checksum argument, and the object never exists as one buffer to digest. Ravel's
+integrity guarantee for these objects is therefore read-time only, from the
+footer/section/page crc32c hierarchy (docs/segment-format.md), same as for any
+other object.
+
+**Observability and faults.** `InstrumentedStore` passes `put_multipart`
+through uncounted: a multipart upload is a handle, not a call, and no `StoreOp`
+describes its parts. `put()`'s own above-threshold multipart path is counted,
+as one `put`, because that is what the caller invoked. `FaultStore` carries no
+scripted (`Rule`/`Sequence`) fault on a multipart part, but part completions
+are hold sites for its test-only completion-ordering gate (ADR-0059 decision
+5): `complete()` can hold each submitted part until a `GateHandle` releases it,
+so a test can drive parts completing out of submission order and confirm the
+assembled object stays byte-correct. The scripted-fault gap is an
+observability/testing gap, not a correctness one, and no production path
+depends on part completion order.
+
+### Upload checksums (on by default in the server, never startup-gating)
+
+`upload_checksum` is a `Capabilities` flag, but it is NOT mandatory and no
+mode may require it. When a backend reports `upload_checksum: true`, it
+guarantees a write is verified against corruption between the caller and the
+server: a body that does not match is rejected with `Corrupted` and no object
+becomes visible. When it reports `false`, only the local pre-flight below runs
+and transport corruption is caught at read time instead.
+
+**Two-part integrity, and what each part covers.** `put()` runs the caller's
+`PutOptions::checksum` (CRC32C) as a local pre-flight against its input buffer
+on every backend, rejecting a caller/payload mismatch with `Corrupted` before
+any network call. This is the caller -> our-buffer half. The contract suite
+asserts it (`assert_upload_checksum_verification`). The our-buffer -> server
+half is what `upload_checksum: true` adds.
+
+**`MemoryStore`** verifies `PutOptions::checksum` against the bytes it received
+and always reports `upload_checksum: true`; it is the semantics oracle for the
+capability. The contract suite pins the promise with
+`upload_checksum_store_rejects_corrupt_in_flight`: `FaultStore`'s `CorruptBody`
+fault flips the payload between caller and store, and a store claiming the
+capability must reject it (asserting the fault counter proves the corruption
+fired).
+
+**`S3Store`** selects it through `S3HttpConfig::upload_integrity`
+(`UploadIntegrity`):
+
+- `Off` (the library default) attaches no checksum and reports
+  `upload_checksum: false`. This is the historical behavior.
+- `Crc64Nvme` / `Sha256` configure `object_store`'s whole-client
+  `AmazonS3Builder::with_checksum_algorithm`, so it computes that digest over
+  the exact payload and sends it as `x-amz-checksum-crc64nvme` /
+  `x-amz-checksum-sha256`; S3 verifies-or-rejects on receipt. The capability
+  then reports `true`.
+
+`ravel-server` builds its store with `Crc64Nvme` by default, selectable with
+`--s3-upload-integrity {off,crc64nvme,sha256}` (`RAVEL_S3_UPLOAD_INTEGRITY`),
+and the Kubernetes operator does the same for its own S3 client and exposes the
+setting as `spec.storage.s3.uploadIntegrity`. So every PUT the server makes,
+commit records included, carries a checksum the endpoint verifies on receipt
+and stores for the read-side check below. An endpoint that does not accept the
+header fails every PUT; startup writes nothing to an existing bucket, so that
+shows at the first flush, possibly after the process reports ready.
+`--s3-upload-integrity off` is the remedy, and leaves every object it writes
+with no transport checksum. The per-tenant stores `--tenant-kms-config`
+routes to are built with the same HTTP config as the default store, so they
+apply both flags. The library default stays `Off` for any other caller that
+builds an `S3Store` directly. `ravel-cli` takes the same `--s3-upload-integrity` flag, default and
+environment variable, so `ravel-cli store qualify` PUTs with the checksum the
+servers will use and an endpoint that rejects the header fails qualification.
+The operator's store qualification Job always sets `RAVEL_S3_UPLOAD_INTEGRITY`
+from `spec.storage.s3.uploadIntegrity`, and a change to that field re-runs
+qualification.
+
+Two limits of `object_store` 0.14's `AmazonS3` client shape this. First, it
+exposes no per-request checksum hook and no way to attach a caller-supplied
+precomputed digest (`PutRequest::with_payload` computes the digest itself), and
+its algorithm knob offers only SHA-256 or CRC64-NVME. So the attached checksum
+is *not* the caller's CRC32C from `PutOptions::checksum`; it is a separate,
+stronger (64-bit) digest `object_store` computes over the same buffer the
+pre-flight just checked, so the caller's bytes are still covered end to end.
+Second, a backend that *silently ignores* the header cannot be detected in the
+adapter: `object_store`'s `PutResult` carries only `e_tag`/`version`, never the
+response headers in which S3 echoes a honored checksum. A backend that
+*rejects* the header fails the PUT loudly (a surfaced `StoreError`), so the
+detectable failure mode fails safe; the undetectable one is why a non-`Off`
+mode is a deployment-level assertion that the configured endpoint honors the
+chosen algorithm, made visible through the capability flag rather than probed.
+The startup warn/downgrade choice this implies lives in the server wiring that
+reads `capabilities()`, not in this crate.
+
+`upload_checksum` is not in `Capabilities::mandatory()` and gates no mode, so
+`S3Store` starts in every mode under either setting. Read-time integrity is the
+backstop regardless: the footer/section/page crc32c hierarchy
+(docs/segment-format.md) verifies data on every read of format-bearing bytes,
+independent of whether a wire-level upload checksum existed.
+
+### Read-side checksum verification
+
+A full-object `get` verifies the bytes it received against the checksum the
+store recorded when the object was written, before they reach the caller
+(ADR-1696 decisions 2 to 5). A mismatch is `Corrupted`, the variant this
+document already reserves for a checksum mismatch, so no reader gains an error
+arm. This is the read-time check the commit family otherwise has nowhere to put:
+a commit record is a bare protobuf with no checksum of its own (ADR-1696
+decision 6 keeps it that way), so a flipped bit inside a stored record decodes
+as a valid record and a flip in `max_event_ts_ns` moves the segment out of a
+query's range with no error anywhere.
+
+**`MemoryStore`** records a CRC-32C beside each object on write and recomputes
+it on a full-object get. It is the oracle for this rule, and
+`MemoryStore::corrupt_stored_byte` (compiled only with the crate's
+`test-support` feature, which test builds enable through their
+dev-dependencies) is the only thing that can make an object's
+stored bytes and stored checksum disagree: it flips one bit of the stored object
+and leaves the checksum alone, which is bit rot, not a rewrite. The contract
+suite pins the rule with `full_object_get_of_a_corrupted_stored_object_is_refused`
+(the `FaultStore` `CorruptRange` counter proves the wrapper was in the path, and
+the refusal still comes from the backend underneath it) and its ranged
+counterpart below.
+
+**`S3Store`** asks the endpoint for the stored checksum with
+`x-amz-checksum-mode: ENABLED` and recomputes `x-amz-checksum-crc64nvme` or
+`-crc32c` over the body that arrived. Four properties shape how:
+
+- The endpoint returns the stored checksum only on a response to an *unranged*
+  GET. MinIO's GET and HEAD handlers attach `x-amz-checksum-*` only when
+  checksum mode is enabled and no `Range` header is present, and RustFS, which
+  derives from MinIO, does the same; a ranged GET comes back with no checksum
+  whatever bytes it covers. So the first request of a `GetRange::Full` read is
+  unranged, and its body is read up to `max_request_body_bytes` (see "HTTP
+  client timeouts"). An object that fits arrives whole in that one response,
+  with its checksum, and is verified.
+- An object above `max_request_body_bytes` is cut at the bound and finished
+  with ranged requests, and no single response then carries the whole object the
+  checksum covers. Such a read is counted unverified rather than verified. Every
+  commit-family record is orders of magnitude below that bound, so a record read
+  is always one request, and it is verified wherever the endpoint stored a
+  checksum this adapter can recompute.
+- The response headers are invisible above the HTTP layer in `object_store`
+  0.14 (`GetResult` carries `payload`, `meta`, `range`, `attributes`, and
+  nothing else), so the checksum is read in the counting HTTP connector the
+  adapter already installs below the retry loop and handed back to the adapter
+  per request.
+- That connector runs *after* SigV4 signing, and S3 requires every `x-amz-*`
+  header to be signed, so the request header cannot be added there. It rides on
+  `ClientOptions`' default headers instead, which `object_store` signs onto
+  PUT, GET, HEAD, DELETE and the multipart requests, where it is meaningless
+  and ignored on all but GET and HEAD. `object_store` does not sign it onto a
+  LIST, and a reqwest client built from the same options would add it there
+  after signing, which an S3 endpoint refuses with 403 `AccessDenied`; the
+  connector therefore builds its reqwest client without default headers, and a
+  LIST carries none.
+
+**`S3HttpConfig::request_stored_checksum`** (default `true`) is the switch for
+the request header. Set to `false`, no request carries `x-amz-checksum-mode`, the
+endpoint returns no stored checksum, and every full-object read is served and
+counted unverified. It exists for an endpoint that rejects the header outright.
+`ravel-server` sets it with `--s3-request-stored-checksum` (default `true`;
+`--s3-request-stored-checksum=false` turns it off, environment variable
+`RAVEL_S3_REQUEST_STORED_CHECKSUM`), `ravel-cli` with the same flag, default
+and environment variable, and the operator with
+`spec.storage.s3.requestStoredChecksum`, which also reaches the store
+qualification Job.
+
+**A read with no verifiable checksum is served and counted, never refused**
+(decision 3). The count is `StoreMetricsSnapshot::get_unverified` (also
+`S3Store::get_unverified`); `ravel-server` exports it at `/metrics` as
+`ravel_store_get_unverified_total`, a counter labelled `mode` only. Three
+things land there: a response with no
+`x-amz-checksum-*` header (an endpoint that stores no checksum, one that ignored
+checksum mode, or a store with `request_stored_checksum` off), a response
+carrying a digest this adapter cannot recompute (SHA-256, which has no
+implementation in this workspace, or a composite multipart digest, which
+digests part digests rather than the body), and the cut whole-object read
+above. The count moves once per logical full-object `get`, not once per HTTP
+request. Failing closed instead would make an upgrade an outage: every object
+written before upload integrity was enabled carries no stored checksum, and
+read-time integrity for data objects is the format crc hierarchy regardless. A
+non-zero and growing count against an endpoint that is supposed to store
+checksums is the signal that it is dropping them, which is the one thing the PUT
+side cannot detect.
+
+**A pinned full read is verified too.** `get_pinned` and `get_with_pin` with
+`GetRange::Full` run the same path as `get`, so the unranged first request
+carries the caller's pin *and* asks for the stored checksum, and an object
+that fits in one response is both pinned and verified. The two features are
+independent conditions on one request, not two paths. `MemoryStore` matches:
+every read path there recomputes its stored CRC-32C on a full read, whatever
+pin selected the bytes.
+
+**Ranged reads are not verified** (decision 4). An endpoint returns no stored
+checksum on a ranged response, and a slice could not be compared against the
+whole-object checksum if it did, so a caller-issued `GetRange::Range` or
+`GetRange::Suffix` is outside the check by construction: it is neither verified
+nor counted. Suffix and range reads of data objects keep the format's own crc32c
+hierarchy as their check, which is what they have today. `MemoryStore` matches
+this, so the oracle and the adapter agree about which reads are covered.
+
+The RustFS contract lane (`rustfs_contract` in
+`crates/ravel-object-store/tests/contract.rs`, run by CI's
+`object-store-contract` job) checks the real-endpoint half: a `Crc64Nvme` PUT
+read back with `GetRange::Full` moves the unverified count by exactly 0, and a
+ranged read of the same object is served.
+
+With `upload_integrity` on, `put()` never takes its above-threshold multipart
+path: every object up to S3's 5 GiB single-request limit goes out as one
+checksummed PUT, and a larger payload is refused rather than sent as
+multipart. The reason is cost and shape, not a missing mechanism: one PUT is
+one billed request where multipart costs parts + 2, and the whole object gets
+one checksum over its bytes as sent, where multipart sends one with each part
+and leaves the completed object's checksum type to the endpoint's default for
+the algorithm. The explicit `put_multipart` path already sends those part
+checksums under integrity (see "Checksum coverage" under "Multipart upload"),
+so a later change can switch large overwrites to multipart under integrity
+once a real endpoint is shown to verify them. Only the explicit `put_multipart` API uploads parts, and no production writer
+calls it; for what a caller-supplied part checksum covers there, see "Checksum
+coverage" under "Multipart upload".
+
+Upload checksums are CRC32C-class integrity checks against transport
+corruption; they do not verify blake3. blake3 in commit records is an
+idempotency and identity discriminator, not a transport check.
+
+### Backend support notes
+
+AWS S3 since Dec 2020 provides strong read-after-write and list
+consistency; S3 conditional writes (If-None-Match/If-Match) provide
+CreateIfAbsent and CAS. GCS: generation preconditions. Azure: etags +
+leases. RustFS supports the full mandatory set. Server-side upload checksums
+are reachable through `object_store`'s whole-client
+`with_checksum_algorithm` (SHA-256 / CRC64-NVME), which
+`S3HttpConfig::upload_integrity` selects; SHA-256 is the broadly supported
+choice (AWS S3 and RustFS), CRC64-NVME needs a recent endpoint. RustFS accepts
+a CRC64-NVME PUT and returns the stored checksum on an unranged read (the
+contract lane above asserts both). The library default is `Off`, so an
+`S3Store` built directly reports `upload_checksum: false` unless a mode is
+configured; `ravel-server` and `ravel-cli` configure `Crc64Nvme` unless told
+otherwise (see "Upload checksums").
+
+### Credentials
+
+`S3Config` selects a credential source explicitly through `auth`
+(`S3AuthMode`), never by inferring one from the absence of keys. The default
+is `S3AuthMode::Static`, which is every deployment today and behaves exactly
+as before ADR-0106.
+
+**Static mode (ADR-0072 decision 1).** Takes long-lived `access_key_id` /
+`secret_access_key`, an optional temporary `session_token` for STS-issued or
+IRSA-style credentials, and an optional `credentials_file` for credentials
+an external process rotates on disk (a Kubernetes secret mount, an STS
+sidecar). Ravel never calls STS itself; `credentials_file` only makes an
+externally-minted rotating credential expressible. When both are set, the
+file wins. The file is read once at `S3Store::new`, eagerly: an unreadable
+or malformed file fails construction with a typed `StoreError` (fail fast at
+startup). After that it is re-read lazily, only on request-path credential
+access, and only when its mtime has changed since the last read; there is no
+background thread and no timer. A successful re-read swaps the cached
+credential atomically, so a request already in flight finishes on whatever
+credential it already obtained. A read or parse failure while rotating
+never fails the request: the last-good credential is kept and a
+rate-limited warning is logged, never a panic.
+
+**Instance-role mode (ADR-0106).** `auth = S3AuthMode::InstanceRole` fetches
+short-lived credentials from the EC2 instance metadata service (IMDSv2) on
+the link-local address, so an EC2 deployment stores no static key at all.
+`access_key_id`, `secret_access_key`, `session_token`, and `credentials_file`
+must all be absent; setting `auth = InstanceRole` together with any of them is
+a configuration error, and `S3Store::new` rejects it with a typed `StoreError`
+at construction (there is no precedence question, because the mix is refused
+outright). `instance_metadata_endpoint` overrides the IMDS base URL (default
+`http://169.254.169.254`); it is an operator-facing knob on the same trust
+boundary as every other `--s3-*` setting and exists so tests and unusual
+deployments can redirect IMDS.
+
+The provider is IMDSv2 only: it `PUT`s for a session token, then `GET`s the
+role document (`AccessKeyId`, `SecretAccessKey`, `Token`, `Expiration`). Any
+non-success from the metadata endpoint, including a `403` from a disabled or
+hop-limited IMDS, is a typed error, never a downgrade to the token-less
+IMDSv1 flow. The first fetch runs eagerly at `S3Store::new` under a bounded
+timeout, so an instance misconfigured for a role fails at startup rather than
+on its first S3 request, and construction never hangs indefinitely. The
+credential is cached and refreshed on the request path once the clock comes
+within 5 minutes of its `Expiration`. A transient refresh failure keeps
+serving the cached credential while it is still unexpired; once the cached
+credential has actually expired, the request fails with a typed error, a
+failure counter (`S3Store::credential_refresh_failures`, mirroring
+`credential_rotation_failures`) increments, and a warning is logged
+rate-limited to once per 60s. Credentials live only in memory: never written
+to disk, and redacted from the provider's `Debug`.
+
+**SSE-KMS under an instance role.** `kms_key_id` works unchanged in either
+mode, because S3 performs the KMS call server-side on every PUT. When
+`kms_key_id` is set with `auth = InstanceRole`, the instance role's IAM
+policy must grant `kms:GenerateDataKey` and `kms:Decrypt` on that key, since
+the role is the identity S3 evaluates for the encryption and decryption
+calls.
+
+## Runtime qualification (executable contract)
+
+`Capabilities` is self-reported: a backend declares `consistent_list: true`
+because its adapter believes the vendor provides it, not because anything
+checked. The problem is that nothing did: a backend
+that advertises S3 compatibility but actually delivers eventually consistent
+listing was trusted silently, and the resulting failures at the commit layer
+looked like data loss rather than a misconfigured store.
+
+`crates/ravel-object-store/src/conformance.rs` is this contract turned into
+a suite that empirically probes a live backend rather than reading its
+declared flags. `run_conformance_suite(store, scratch_prefix, page_size)`
+runs, under a throwaway key prefix (`page_size` is the declared list page
+size the two listing probes size their key counts against; see
+`CrossPageListing` below):
+
+- `ConditionalWriteCreateIfAbsent`: a `CreateIfAbsent` put on a key an
+  earlier `CreateIfAbsent` put already created must fail `AlreadyExists` and
+  must not apply its bytes (the losing-writer outcome the "Semantics adapters
+  MUST honor" section above requires). This is the sequential case: the
+  loser starts after the winner finished.
+- `ConcurrentCreateIfAbsentSingleWinner`: the same conditional create with
+  eight writers racing one absent key, every request in flight at once.
+  Exactly one must return `Ok`, exactly seven must observe `AlreadyExists`,
+  and the surviving object must hold the winner's bytes. The sequential
+  probe above cannot falsify a backend that checks and applies the
+  precondition non-atomically, because it never gives it a window to lose
+  in; this one does.
+- `ConditionalWriteCasVersion`: a `CasVersion` put against a stale version
+  must fail `PreconditionFailed`, not silently overwrite.
+- `ConsistentReadAfterWrite`: a `get` immediately following a `put` returns
+  the just-written bytes, repeated over several keys to catch a
+  read-your-writes gap that only shows up intermittently.
+- `ConsistentListAfterWrite`: a `list` immediately following a `put`
+  includes the new key, repeated the same way, to catch eventual-consistency
+  listing rather than trusting the `consistent_list` flag. This probe
+  drains `list` itself, which `S3Store` implements separately from
+  `list_after` and every catalog scan issues, so the suite covers both
+  methods rather than reaching one only through the other's default.
+- `LexicographicListingOrder`: `page_size + 2` keys (the suite's declared list
+  page size, floored at 5; see `CrossPageListing` below) written in
+  non-sorted order must come back in lexicographic key order on both `list`
+  and `list_after`, and `list_after` must additionally resume strictly after
+  its marker in that same order, delivering exactly the keys above it. At the
+  floor of 5 the keys are a fixed five-letter alphabet; above it they are
+  zero-padded numeric suffixes written in descending order, so an unpadded
+  ordering (where `"k10"` would otherwise sort before `"k9"`) cannot pass by
+  accident. A continuation token only names a position when the order is the
+  lexicographic one, which is what `S3Store::list` pagination and every
+  catalog scan built on it assume. `S3Store` implements `list` and
+  `list_after` separately (the default `list_after` is `list` plus a
+  client-side filter), so a backend can be ordered on one entry point and
+  reversed on the other; the probe drains a full pass through each and names
+  the offending entry point in its failure, including when the failure is the
+  drain itself (a `list`/`list_after` error, or pagination that never
+  terminates), not only an out-of-order delivery. Every pass judges the raw
+  delivery sequence, repeats included, on the rule the listing bullet above
+  states: a repeat of the last delivered key passes, a repeat of an earlier
+  one fails. Judging a deduplicated sequence instead, or only one entry
+  point, would qualify a backend whose every drain then fails with
+  `ListOrderViolation`. Each full drain must also have crossed a real page
+  boundary, on the same at-least-two-key-bearing-pages rule
+  `CrossPageListing` states below: order observed inside a single page is
+  order the backend already had in hand, and says nothing about whether a
+  continuation token names a position in the key space, which is the claim
+  this probe exists to check.
+- `CrossPageListing`: the suite is given a declared list page size (the real
+  page size the backend under test was built with -- `ravel-cli store
+  qualify --list-page-size`, defaulting to the production S3 page size of
+  1000); the probe writes `page_size + 2` keys, floored at 5, before the
+  first page request. `S3Store::with_page_size` cuts one wire response
+  client-side rather than asking for a smaller one: `S3Store::list` sets no
+  `MaxKeys`, so S3 answers with its default of up to 1000 keys, and the
+  method opens a fresh `object_store` listing stream per page, pulls at most
+  `page_size` entries off it, and drops it -- leaving that response's own
+  `NextContinuationToken` unfollowed unless `page_size` exceeds what one
+  response carries. Writing more keys than the backend's actual page size is
+  therefore the only way to force a real continuation-token boundary; a
+  shrunken declared page size against a large real one exercises only Ravel's
+  own client-side drain loop, not the backend. At the default the run does
+  prove the backend's side: 1002 keys means S3 serves a full 1000-key
+  response and then honours an exclusive `start-after` resume past it. All
+  `page_size + 2` keys written must come back as that many distinct keys,
+  none lost between pages, AND delivered across at least two
+  pages that actually carry objects: a backend may emit a trailing empty page
+  purely to signal the end of a listing once total keys exactly fill a
+  multiple of the page size, and counting that page toward "more than one
+  page" would let a single real page of results pass as if a boundary had
+  been crossed. Repeat deliveries across real pages are allowed (the
+  cross-page guarantee above permits them); losses are not.
+- `DeleteVisibility`: after a successful delete, a `get` of the key returns
+  `NotFound` and a listing of its prefix omits it while still holding the
+  sibling key that was not deleted; a second delete of the now-absent key
+  succeeds and changes nothing. The listing side is drained through both
+  `list` and `list_after`, so a delete visible through one entry point but not
+  the other is caught here rather than depending on which path a caller
+  happens to use. Retention sweep, GC, and ADR-0064 erasure all read a
+  delete's acknowledgement as the object being gone.
+
+Each probe returns a `ProbeResult` naming which `Property` it checked, so a
+failure reads "this backend cannot do conditional writes" or "this backend's
+listing is eventually consistent" instead of a bare pass/fail, so an operator
+does not have to guess which mandatory capability the backend actually
+lacks. The last four probes above are the empirical counterparts of the
+common TLA model's `CreateIfAbsentWinnerUnique`,
+`ListingConsumersConsistent`, `ListReturn`/`ListEventuallyComplete`, and
+`DeleteIdempotent` (`formal/tla/common/traceability.md`).
+
+Because the delete probe deletes, the credential running `ravel-cli store
+qualify` needs delete permission on the scratch prefix
+`sys/qualify/<run-id>/**`, and only there. The shipped Admin template
+(`deploy/iam/admin.json`, the `AdminQualifyDelete` statement) grants exactly
+this: `s3:DeleteObject` on `sys/qualify/*` and nowhere else, added by
+ADR-0055's amendment for this probe. A deployment using that template
+qualifies a fresh bucket with no manual policy edit, and Admin still holds no
+delete on tenant data or any protected key.
+
+ADR-0050 section 6 also names cross-page listing consistency and
+multipart-complete visibility as probes for this suite. Cross-page listing
+is the `CrossPageListing` probe above; multipart-complete visibility is
+still not implemented.
+
+`CONFORMANCE_SUITE_VERSION` is `2`. Version 1 checked four properties (the two
+conditional-write modes, read-after-write, and list-after-write); version 2 is
+the eight-probe suite above, adding concurrent single-winner create,
+lexicographic listing order, cross-page listing, and delete visibility. A
+record written under version 1 was never checked against those four, so
+ravel-server refuses startup on it (a stale record that reads as a current pass
+is worse than none: a missing record fails closed, a stale one passes). A
+bucket qualified under the old suite must be re-qualified. `ravel-cli store
+qualify` does that in place: a re-run overwrites a below-floor
+`sys/qualification` record with the current pass, and leaves an
+equal-or-newer record untouched. Re-recording is the only way to clear the
+refusal, because the record is written with `CreateIfAbsent` and cannot
+otherwise be replaced.
+
+Conditional reads are deliberately not a ninth gating property, and
+`CONFORMANCE_SUITE_VERSION` stays at `2` for them. The suite qualifies the
+bucket Ravel writes, and nothing on Ravel's own write or read path issues a
+pinned read: every object Ravel writes is immutable. The store that needs
+qualifying for `get_pinned` is a granted external bucket, which is a
+different store, qualified per grant by `external::probe::probe_preconditions`
+rather than once per bucket by this suite. Adding the property here would
+make every already-qualified bucket re-qualify against a property its own
+callers never exercise. The trait-level behavior is covered instead by tests
+in `conformance.rs` that run each subject through the pinned-read cases.
+
+This is a runtime, once-per-bucket check, not a replacement for the
+compile-time contract suite below: `crates/ravel-object-store/tests/contract.rs`
+is a development-time
+proof that each adapter *implementation* honors the trait, run in CI against
+all three backends including a real RustFS endpoint. `conformance.rs` is an
+operator-facing probe of one specific *deployment*, the actual configured
+endpoint and bucket, because the adapter can be correct while the vendor
+serving it is not (a misconfigured storage class, a proxy in front of the
+bucket, a non-S3 vendor's compatibility gap).
+
+`ravel-cli store qualify` runs this suite against the backend configured by
+the CLI's usual `--store`/`RAVEL_S3_*` flags and, on a full pass, writes a
+JSON record to `sys/qualification` via `CreateIfAbsent`:
+
+```json
+{
+  "suite_version": 2,
+  "backend_identity": "s3://<bucket>@<endpoint>",
+  "qualified_unix_ns": 1234567890000000000,
+  "passed_properties": ["conditional_write_create_if_absent", "..."]
+}
+```
+
+Against an S3 store it also runs the stored-checksum echo check before the
+record is written: under `--s3-upload-integrity crc64nvme` with the stored
+checksum requested, it PUTs a probe object under the run's scratch prefix,
+reads it back whole, and deletes it. A refused PUT or GET, or a returned
+checksum that does not match the body read, fails qualification and writes no
+record; an endpoint that returns no stored checksum is reported and does not
+fail it.
+
+`CreateIfAbsent` makes qualification once-per-bucket at a given suite version:
+a second `store qualify` run against a bucket already qualified under the
+current version leaves the existing record untouched and reports it instead of
+overwriting it, per ADR-1302 (superseding ADR-0050 section 6). The one exception
+is a record written under an older suite version, which a re-run overwrites with
+the current pass so the version above does not strand an already-qualified
+bucket. That overwrite is guarded by `CasVersion` on the version the run just
+read, not an unconditional write, so a concurrent `qualify` from a newer binary
+that installed a higher-version record between the read and the write is left in
+place rather than downgraded. A failing run writes nothing new to
+`sys/qualification`; its process exit names every failing property.
+
+At startup ravel-server compares the record's `backend_identity` against the
+identity it is configured for and logs a warning on a mismatch, without
+refusing. The identity is endpoint-derived (bucket plus optional endpoint, no
+credentials), so an endpoint rename or a path-style/virtual-host switch alters
+it with no change of backend, and refusing on that benign case would be an
+outage an operator disables. A mismatch is instead the signal that a
+replicated, restored, or migrated bucket carries a qualification a different
+backend earned: verify the backend and re-run `store qualify` if it is
+genuinely a different store. The command only ever writes under
+`sys/qualify/<run-id>/` and the single `sys/qualification` key; it never
+reads, lists, or writes any tenant-prefixed key, so it is safe to run
+against a bucket that already holds production data.
+
+The scratch objects the suite leaves behind are no longer a handful. The two
+listing probes dominate the count, and each writes `max(page_size + 2, 5)`
+small objects, so a run leaves `2 x max(page_size + 2, 5)` of them plus the
+14 the other probes leave (two conditional-write keys, five read-after-write,
+five list-after-write, one concurrent-create, and the delete probe's
+surviving key): 2018 objects at the default page size of 1000, against 24
+before the page size became a parameter. The delete probe's second key and
+the stored-checksum echo probe's object are the only scratch objects a run
+deletes; the echo object stays too when its delete is refused, and the run
+prints a note naming it. Nothing else is deleted afterward and each run's
+prefix is unique, so this is unbounded untracked
+storage a runbook should sweep periodically (delete `sys/qualify/` between
+runs), not a correctness issue. A bucket qualified with a small
+`--list-page-size` writes proportionally fewer, but proves proportionally
+less.
+
+A `sys/qualification` record written by this suite before the page size
+became a parameter recorded a pass that never crossed a real pagination
+boundary, so it is weaker evidence than its version number suggests.
+`CONFORMANCE_SUITE_VERSION` deliberately stays at `2`: bumping it would make
+`ravel-server` refuse startup on every deployed bucket's record until each
+was re-qualified, which is an outage traded for evidence of a property no
+deployment has been observed to lack. The consequence is that re-running
+`store qualify` against such a bucket does not replace the record: the
+stored version is the current one, so the run leaves it untouched and
+reports it (the once-per-bucket no-op above). The re-run's own printed probe
+results are the evidence that pagination holds; installing a fresh record
+instead requires removing the old one out of band.
+
+## Required bucket configuration (ADR-0064 §7, ADR-0072 decision 3)
+
+Everything above is a property of the `ObjectStoreBackend` *adapter*.
+ADR-0064 §7 additionally names bucket-level *configuration*
+Ravel's deletion and retention guarantees depend on, orthogonal to the
+adapter contract:
+
+1. **Versioning.** Object versioning must be either OFF, or ON and paired
+   with a noncurrent-version expiration rule (plus expired-delete-marker
+   cleanup) on every `t/` prefix. Versioning ON without that pairing is an
+   unsupported configuration: it silently turns every Ravel delete
+   (retention sweep, ADR-0064 selective erasure) into a soft delete,
+   inverting the system's deletion guarantees while everything above this
+   layer keeps reporting success.
+2. **No other lifecycle expiration or archival-transition rule** may target
+   any Ravel-owned prefix. A storage-class transition or an expiration rule
+   added for cost reasons can silently delete or relocate a commit record,
+   a manifest, or provenance data outside any path Ravel's own retention
+   logic controls.
+3. **Two sanctioned lifecycle rules**, and only these:
+   - `AbortIncompleteMultipartUpload` (REQUIRED, 7 days or less) cleans up
+     abandoned multipart uploads. **Its absence violates the bucket
+     configuration contract**, because nothing in Ravel reaps abandoned
+     uploads: a failed abort or a future dropped mid-upload leaves billable
+     parts indefinitely, and this rule is the only mechanism that bounds them.
+   - The noncurrent-version expiration rule required by point 1 when
+     versioning is ON.
+4. **Object Lock, compliance mode**, on the protected prefixes: `sys/*`,
+   `t/*/*/prov`, commit records `t/*/*/c/*`, and the catalog keyspace
+   `t/*/catalog/*/*` (the HEAD pointer and its versions, and the snapshot
+   and index objects the same pattern reaches). These are the objects whose
+   immutability the commit and catalog layers assume as a given (see "Data
+   objects, commit records, manifests, and index objects are immutable";
+   this section is that invariant's bucket-level enforcement point). Object
+   Lock protects object *versions*: compliance mode refuses any request that
+   would destroy or alter a locked version (a delete naming its version id,
+   a lifecycle expiration) for the configured retention period, with no
+   principal (including the bucket owner) able to shorten or remove it. It
+   does not protect the key's current-version pointer. Object Lock requires
+   a versioned bucket, and there a delete with no version id succeeds and
+   inserts a delete marker, and a PUT adds a new current version; neither
+   is refused. Against a compromised or misconfigured credential, then, the
+   guarantee is that every locked version stays recoverable, not that the
+   key keeps reading it. Every Ravel delete is such a delete:
+   `S3Store::delete` calls `object_store` 0.14.1's `ObjectStoreExt::delete`,
+   which for S3 goes through `delete_stream` and sends a `DeleteObjects`
+   request (`POST /?delete`) whose body names only the key, with no
+   `VersionId`. Ravel never sets `disable_bulk_delete`, the one switch that
+   would send a path `DELETE` instead. Subject identifiers that must remain erasable under ADR-0064 live in
+   *values*, never in *object keys or names*, so naming a prefix in the lock
+   never exposes a subject value through the pattern itself. What a locked
+   object *contains* is a separate question, and for one member of the
+   catalog family the answer is not "nothing erasable"; see "A lock on the
+   catalog family" below. `sys/*`, `t/*/*/prov`, and `t/*/catalog/*/*` are
+   never targets of supersession GC, ADR-0019 retention deletion, or
+   ADR-0064 erasure, so a lock on those three costs nothing *against those
+   three mechanisms*. That is the whole of the exemption, and it does not
+   generalise: the catalog family is a target of a fourth mechanism, the
+   unreferenced-catalog sweep, covered in "A lock on the catalog family"
+   below. Commit records (`t/*/*/c/*`) are not exempt even that far: once
+   superseded, supersession GC and ADR-0019 retention deletion physically
+   delete them, and ADR-0064 erasure reaches them transitively (the
+   erasure sweep itself deletes only the `.dreq` request objects; the
+   rewrite pass supersedes its inputs, and the superseded sweep then
+   removes those inputs' commit records like any other superseded chain).
+   A per-object compliance-mode retention on a still-locked commit record,
+   retained until `R`, does not refuse that delete. The sweep's `DeleteObjects` entry
+   carries no version id, so it succeeds and inserts a delete marker: the key reads as
+   absent to Ravel from then on, and the sweep moves on exactly as it would
+   on an unlocked record. The locked version stays in storage as a
+   noncurrent version. The noncurrent-version expiration rule point 1
+   requires (`NoncurrentDays = E_v`, counted from the delete) cannot remove
+   it while it is locked, so it is physically removed by a lifecycle run
+   once both its retain-until has passed and `E_v` has elapsed since the
+   delete: the physical-removal bound for the record is the later of
+   `bound + E_v` and its retain-until `R` (a time: the moment the mechanism
+   locked the version plus the retention period it chose), written
+   `max(bound + E_v, R)` below. That bound
+   comes from lifecycle expiry and `R`, not from the sweep waiting, and the
+   sweep's progress does not depend on `R` at all.
+
+   The superseded sweep does tolerate refused deletes, but what refuses
+   them is a deny policy or a credential without `s3:DeleteObject`, not
+   Object Lock. It is the only maintenance pass that tolerates one per
+   chain: every other pass that deletes, ADR-0019 retention deletion and
+   the unreferenced-catalog sweep among them, fails as a whole on the
+   first refused delete (see "A lock on the catalog family" below). S3 reports that refusal per key inside the `DeleteObjects`
+   200 response, as an `<Error>` whose code is `AccessDenied`, and
+   `S3Store::delete` returns it as `AccessDenied`, the class the sweep
+   tolerates per chain. Every per-key code maps by the HTTP status S3
+   documents for it, the way a single request's status maps: the 403 codes
+   (`AccessDenied`, `AllAccessDisabled`, `AccountProblem`,
+   `InvalidAccessKeyId`, `InvalidObjectState`, `SignatureDoesNotMatch`) to
+   `AccessDenied`, `NoSuchKey` to the idempotent missing-key success,
+   `NoSuchBucket` to `Permanent`, `PreconditionFailed` to
+   `PreconditionFailed`, and `ServiceUnavailable` to `Throttled`.
+   `object_store` retries the whole request on a per-key `SlowDown` or
+   `InternalError`, and any other code takes the generic classification
+   (`Transient` unless its text reads as a throttle or a timeout), which is
+   retryable and fails the pass. A whole-request 403 is `AccessDenied` too.
+   A whole-request 404 is not a missing key: `DeleteObjects` addresses the
+   bucket and S3 reports a missing key per key, so S3 answers a request-level
+   404 when the bucket itself is gone (`NoSuchBucket`). Only a `NoSuchKey`
+   code reads as the missing-key success there; any other code, or none, is
+   `Permanent` and fails the pass. It runs three delete loops in order over
+   every cleared chain in the pass: every chain's input commit records first, then every
+   chain's input data objects (its L0 data and pre-rewrite L1 segments),
+   then every chain's own compaction or rewrite records last, so a rewrite
+   record outlives every input it superseded. A refused delete stops only
+   the chain it belongs to: that chain's later keys are left for a later
+   pass, in every loop, and every other chain in the pass is still
+   collected. A pass in which every delete it attempted was refused still
+   fails with the first refusal, so a credential without delete permission
+   stalls the unit rather than passing quietly. A refusal on a chain's
+   input commit record therefore leaves that chain's L0 data in place until
+   the refusal is lifted; a refusal on a chain's own compaction or rewrite
+   record is met only after the pass has deleted that chain's input records
+   and their data, so it holds only that record, and any above it. The
+   crash ordering the sweep is built around, a record outliving the
+   objects it superseded, is preserved either way.
+
+   **A lock on the catalog family.** `t/*/catalog/*/*` reaches more than
+   the HEAD pointer and its versions: the same pattern covers the
+   snapshot parts under `catalog/<signal>/snap/` and the name-postings
+   and column-statistics objects under `catalog/<signal>/idx/`
+   (docs/catalog-and-mvcc.md, object layout). Those are swept. Every fold
+   writes new content-addressed objects and swaps HEAD, and
+   `sweep_unreferenced_catalog_objects`
+   (`crates/ravel-maintain/src/sweep.rs`, driven in production by
+   `services/ravel-server/src/maintain.rs`'s maintenance tick) deletes
+   every object under those two prefixes that the current HEAD no longer
+   names, once it is older than `protection_horizon`. A compliance-mode
+   retention on the family therefore has a cost, and for some tenants
+   part of that cost is a genuine erasure bound.
+
+   Not every catalog object is alike here. The HEAD pointer, the snapshot
+   entries inside a snapshot part, and the name postings carry identities,
+   hashes, counts, timestamps, and metric names only, never a label or
+   attribute value: that is what ADR-0064's Context establishes, and it
+   enumerates exactly `SnapshotEntry`, `SnapshotPartHeader`, and name
+   postings (ADR-0064 Context, plus its §7 requirement that subject
+   identifiers never appear inside metric names). The per-part
+   column-statistics objects post-date that ADR and were never analysed
+   there, and they do hold values. A `ColumnStat` carries a `ColumnValue`
+   min, a `ColumnValue` max, and a repeated `DictEntry` dictionary, and a
+   `ColumnValue` admits `str_utf8` and `bytes_val`
+   (proto/ravel/catalog.proto). The fold tallies a declared `Str` or
+   `Bytes` column exactly: its distinct-value dictionary and its exact min
+   and max (`crates/ravel-catalog/src/column_stats_build.rs`; the
+   dictionary is kept only up to a fixed entry cap and dropped past it,
+   the min and max are always kept, so a subject value can sit in the
+   extrema of a high-cardinality column with no dictionary). A tenant
+   may declare any attribute key, `user.id` among them, as a `STR` typed
+   attribute column whose key is the SQL column name verbatim
+   (proto/ravel/sys.proto, `TypedAttrColumn`). Those objects are written as
+   `t/<hash>/catalog/<signal>/idx/*.cstat`
+   (`crates/ravel-catalog/src/fold.rs`), inside the `idx/` prefix this
+   sweep lists.
+
+   So for any tenant with a `STR` or `BYTES` typed attribute column, an
+   erased subject's own value can sit verbatim in a `.cstat`. Erasure does
+   not rewrite that object in place, and it does not refresh the catalog
+   either: the rewrite pass publishes new data objects and a rewrite record
+   and drives no tenant-catalog fold of its own
+   (`crates/ravel-maintain/src/rewrite.rs`, whose catalog calls are the
+   segment-internal catalog a rewrite decodes). The catalog picks the
+   rewrite up only when the fold reconciles that hour, through the fixed
+   reconcile window or the retention-frontier band, or when a HEAD rebuild
+   re-derives every hour (`crates/ravel-catalog/src/fold.rs`,
+   docs/catalog-and-mvcc.md "Fold reconcile pass"). Until one of those
+   runs, the live HEAD still names the pre-rewrite part, the sweep keeps
+   that part's `.cstat` precisely because HEAD names it
+   (`crates/ravel-maintain/src/sweep.rs`), and the erased value persists
+   with no retention involved at all. Only after the reconcile or the
+   rebuild is the stale `.cstat` unreferenced, and only then does a
+   retention on `t/*/catalog/*/*` start to matter. Even then the sweep does
+   not delete it at once: rule 5 deletes an unreferenced catalog object
+   only once its `last_modified` age exceeds `protection_horizon` (25 h
+   5 min with defaults), so the delete lands at the first sweep after the
+   later of the reconcile and that age, which can be about a day after the
+   reconcile. That delete succeeds as a delete marker, as for a commit
+   record above, so Ravel stops reading it, but the locked version holding
+   the value stays in storage until its retain-until `R` has passed and
+   the noncurrent-version expiration, `E_v` after the delete, has removed
+   it. The erasure bound for such a tenant is therefore
+   `max(max(T_f, T_w + protection_horizon) + S + E_v, R)`, where `T_f` is
+   when the fold reconciles that hour (or HEAD is rebuilt), `T_w` is the
+   stale object's `last_modified`, `S` is one sweep interval (default
+   5 min), and `R` is the locked version's retain-until; it is not
+   `max(bound + E_v, R)`.
+
+   An older shipped template made this worse than that bound.
+   `deploy/iam/maintain.json`'s `DenyDeleteProtected` statement used to deny
+   the Maintain role every delete under `t/*/catalog/*/*`, so the
+   unreferenced `.cstat` was not deletable at all, whatever the retention
+   posture was: the bound was open-ended rather than the one above. The
+   current template's `DenyDeleteProtected` denies only `catalog/<signal>/HEAD`, and
+   `MaintainDelete` grants delete on `catalog/<signal>/snap/*` and
+   `catalog/<signal>/idx/*`, matching what
+   `sweep_unreferenced_catalog_objects` actually removes, so the bound
+   above is the one that applies under the current templates. An operator
+   running a copy of `maintain.json` shipped before this narrowing must
+   re-apply it: until then the sweep still refuses its first catalog delete
+   every pass, so catalog garbage, including any unreferenced `.cstat`
+   holding an erased subject's value, is never reclaimed. An operator who
+   wants the immutability guarantee without the retention half still scopes the
+   Object Lock mechanism to `catalog/<signal>/HEAD` alone, which is the
+   object the immutability argument above actually rests on; that scoping
+   was always independent of the IAM deny and remains sufficient now that
+   the deny is narrowed to match.
+
+   A lock on the whole catalog family rather than HEAD alone does not
+   stall this sweep: Object Lock refuses none of its deletes, for the
+   delete-marker reason above. What does stall it is a refusal from a deny
+   policy or a missing `s3:DeleteObject`, such as the older template's
+   deny. The sweep's delete loop propagates the first refusal, so one
+   refused object aborts that `(tenant, signal)` pass and the unreferenced
+   objects behind it in the same pass are left in place too. The
+   production driver logs the failed pass and retries on the next
+   maintenance tick, where the same object is refused again, so
+   collection of that `(tenant, signal)`'s catalog garbage resumes only
+   once the policy is fixed.
+
+   **How the prefix scoping is achieved.** Object Lock has no prefix
+   scope of its own. It is enabled once per bucket, at bucket creation,
+   together with versioning. Retention then applies per object version,
+   in one of two ways: a **bucket default retention**, which reaches
+   every object written to the bucket, data objects included, or a
+   **per-object retention** set on an individual object version at write
+   time or afterwards. So "compliance mode on the protected prefixes"
+   means per-object retention on the objects under those prefixes, and
+   **no Ravel process ever sets it**. Every Ravel write path writes
+   plain objects and stays that way. The scoped posture is an
+   operator-run mechanism outside Ravel. Objects under the protected
+   prefixes carry per-object retention applied by that mechanism; the
+   bucket itself does not lock a prefix. Two shapes satisfy the
+   requirement. Both need Object Lock enabled on the bucket with **no
+   default retention**, and versioning ON:
+
+   | Mechanism | What it does | Coverage window |
+   |---|---|---|
+   | Event-driven function | A function subscribed to object-created events, filtered to the protected prefixes, calls the per-object retention API in compliance mode with the chosen retention period. Notifications can be delayed or lost, and objects written before the subscription existed raise none, so the function needs durable retry with a dead-letter queue, a one-time backfill over every existing version under the prefixes, and a periodic reconciliation against an S3 Inventory of all versions that locks anything missed. | Each object is locked within seconds of its creation; a missed event is covered at the next reconciliation. |
+   | Scheduled batch job | An S3 Batch Operations job, run on a schedule and driven by an S3 Inventory manifest that lists all object versions (`IncludedObjectVersions=All`) filtered to the same prefixes, sets the same retention on every listed version, current and noncurrent. An entry with no version id is rejected before the job is submitted; a current-version-only manifest leaves noncurrent versions unlocked. | Up to the schedule interval plus the inventory delay plus the job's own execution and retry time. |
+
+   Between an object's creation and the moment the mechanism acts on it,
+   the object carries no retention, and any credential that can delete a
+   version (`s3:DeleteObjectVersion`) can remove it permanently. That window is the residual exposure of the scoped
+   posture. Pick the mechanism whose window your compliance regime
+   accepts. The AWS reference for both is
+   [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html).
+
+   The alternative posture is **whole-bucket**: set a bucket default
+   retention and run no mechanism at all. S3 then applies retention at
+   write time, so there is no window. The cost is that every data object
+   is locked for the retention period. Selective subject erasure and
+   retention deletion still succeed as delete markers, so Ravel stops
+   reading the object, but they cannot physically remove its locked
+   version before that period ends.
+
+Enforcement stays at the bucket/IAM layer (ADR-0042 decision 3): nothing
+in this crate can configure Object Lock or lifecycle policy, and
+`object_store` 0.14 exposes no API to read either. `S3Store` reads them
+itself, with read-only signed GETs of the bucket's `?versioning`,
+`?lifecycle` and `?object-lock` configuration (and `?replication` and
+per-object `?retention` when asked), using the store's own credentials and
+no second SDK. What this crate *can* do is report what a backend
+affirmatively discloses, via
+[`ObjectLockProbeSource`]/`probe_object_lock` and
+[`BucketConfigProbeSource`]/`probe_bucket_config` (see "Runtime
+qualification" above) plus `bucket_config_alarms`, which turns an observed
+[`BucketConfigProbe`] into `"ALARM:"`-prefixed strings for a genuine
+contract violation (point 1's versioning/expiration pairing) and
+`"NOTE:"`-prefixed strings where the probe cannot establish compliance. The
+multipart-abort rule is REQUIRED (point 3), so its absence is a contract
+violation and not an advisory gap; it is reported under `"NOTE:"` because a
+backend reached through `ObjectStoreBackend` alone cannot observe the rule, and
+the same prefix is kept when `S3Store` does observe it. The prefix reflects
+the limits of the probe, never a weaker requirement.
+
+Which answer a caller gets depends on the type it probes. The
+`dyn ObjectStoreBackend` impls of these traits report
+[`ObjectLockStatus::Unknown`] and every `BucketConfigProbe` field `Unknown`,
+since the trait exposes no such query. `S3Store` implements them from the
+bucket reads above, so a caller holding the concrete store gets the bucket's
+real answers: `ravel-cli store qualify`, `ravel-cli store
+verify-protection` and the `ravel-server` startup gate below do. In `store
+qualify` the lines stay informational and never change whether qualification
+passes, exactly as ADR-0055 §3 designed them. `ravel-server` keeps the base
+`S3Store` beside the wrapped handles it builds and reads the bucket's
+protection report through it; on every other backend it holds only
+`dyn ObjectStoreBackend`, which reports every condition `Unknown`.
+
+`ravel-server --require-bucket-protection` (ADR-0072 decision 3, ADR-1727
+decision 5, default OFF, env `RAVEL_REQUIRE_BUCKET_PROTECTION`) turns that
+report into a startup gate instead of a print statement, so a deployment
+cannot go into production silently unprotected. On S3 it sends three
+read-only GETs (`?versioning`, `?lifecycle`, `?object-lock`) and evaluates
+seven of the report's conditions: `versioning`, `noncurrent-expiration`,
+`expired-delete-marker`, `abort-multipart`, `rule-scope`, `no-foreign-rule`
+and `object-lock`. It never asks for `delete-marker-replication` or
+`object-retention`.
+
+- Fatal, refusing to start with a typed error that names each condition:
+  `object-lock` failed (Object Lock disabled, point 4), `abort-multipart`
+  failed (no enabled `AbortIncompleteMultipartUpload` rule of 7 days or less
+  covering `t/`, point 3), `no-foreign-rule` failed (point 2), and
+  `noncurrent-expiration` failed while `versioning` passed (point 1). The
+  server has no expected `E_v`, so it does not compare a covering rule's
+  `NoncurrentDays` with one, but the condition still fails on a covering rule
+  that also keeps `NewerNoncurrentVersions`, on covering rules that disagree
+  on `NoncurrentDays`, and on a rule over part of `t/` that expires
+  noncurrent versions sooner than they agree on.
+- Every other failed condition (`versioning`, `expired-delete-marker`,
+  `rule-scope`, or `noncurrent-expiration` on an unversioned bucket) logs one
+  warning and starts.
+- Every `Unknown` condition logs one warning and starts. The
+  bucket-configuration read is bounded to 10 seconds. With the read-cache
+  warm-up's own 10-second bound, which also runs before the main HTTP
+  listener binds, that leaves at least 5 seconds before the Kubernetes
+  operator's liveness probe can first restart the pod (about 25 seconds after
+  it starts); a read that has not finished by
+  then leaves every condition `Unknown`. The bound covers that read only: the
+  `sys/qualification` read that runs before it is bounded by the store's own
+  request timeout and retries, so an endpoint that stalls every request holds
+  startup there first.
+- Three gauges carry the result: `ravel_bucket_protection_conditions_failed`
+  and `ravel_bucket_protection_conditions_unknown` count the seven checked
+  conditions observed `Fail` and `Unknown`, and
+  `ravel_bucket_protection_unknown` is `1` whenever the unknown count is
+  nonzero. All three are set on a refusal too, and read `0` with the flag
+  off. A zero failed count is evidence that the bucket passes the seven
+  conditions only while the unknown count is also zero.
+
+The three GETs need `s3:GetBucketVersioning`,
+`s3:GetLifecycleConfiguration` and `s3:GetBucketObjectLockConfiguration` on
+the server's identity. No IAM template under `deploy/iam/` grants them to a
+server role, so on AWS a server running under a shipped
+template reads every condition `Unknown` and starts with a warning until the
+operator attaches those actions.
+
+The Kubernetes operator passes the flag to every `RavelCluster`, so the dev
+bucket launchers (the create-bucket Jobs in `deploy/k8s/` and the compose
+`createbucket` one-shots) create the bucket with Object Lock, versioning on,
+and one enabled whole-bucket rule carrying `ExpiredObjectDeleteMarker`,
+`NoncurrentVersionExpiration` and `AbortIncompleteMultipartUpload` of 7 days.
+
+With the flag off (the default), none of this runs, and startup behavior
+is unchanged from before this gate existed. The flag makes an
+unprotected production deployment *visible and refusable*; it does not
+and cannot make Object Lock or lifecycle policy real in-process: that
+capability is still reserved for its own trait-extending ADR per
+ADR-0042 decision 3.
+
+## Implementations
+
+1. `MemoryStore`: reference implementation and semantics oracle; strong
+   consistency, monotonic etags/versions, injectable clock. Note the fake
+   clock defaults to 0: GC-grace tests must set it explicitly. Its multipart
+   upload buffers parts in the handle (nothing to chunk in process) but
+   enforces the same part bounds and produces exactly the object a single
+   `put` of the concatenated parts would, from the same etag/version counter.
+2. `FaultStore<S>`: wraps any backend; deterministic seeded fault plan
+   injecting: timeouts, throttling, partial-write-then-error (object must
+   NOT become visible), failed conditional writes, duplicate delivery (op
+   applied, error returned, modeling ack loss), corrupt range responses,
+   etag change between reads (real bytes under a new etag, so a
+   snapshot-pinning caller must abort), `NotFound` blips, transient/permanent
+   errors. Every fault site counted; plans scriptable per-operation-index and
+   per-key-pattern, and as ordered per-key sequences (a distinct outcome on
+   each successive matching call). Completion ordering is controlled by a
+   separate, test-only hold-and-release primitive (ADR-0059 decision 5), not by
+   the scripted fault plan: `FaultStore::hold` registers a gate that matches a
+   call the same way a rule does (`op` + key substring + occurrence) and blocks
+   the matching call inside the store until a `GateHandle` releases that
+   specific held call. It controls *when* a concurrently in-flight call's result
+   becomes visible to its caller, composing with rather than replacing a
+   scripted fault. This is a test primitive on the wrapper, not a general store
+   capability, and its existence is not a claim that production code depends on
+   completion order (it does not, per ADR-0059).
+3. `S3Store`: `object_store` crate adapter (AWS S3, plus an S3-compatible
+   endpoint such as RustFS via the endpoint override), honoring every MUST
+   above.
+
+### Instrumentation decorator
+
+`InstrumentedStore<S>` wraps any backend and counts, per operation, calls, `ok`
+count, failures by `StoreError` variant, bytes (returned for `get`, offered for
+`put`), and a fixed-bucket latency histogram, read as a snapshot off a shared
+`StoreMetrics` handle. Observability only, never correctness-bearing, and a
+zero behavior change: every method delegates and forwards its result verbatim,
+and `capabilities()` passes straight through, so the startup gate still sees
+the wrapped backend's own declaration. `ravel-server`'s `build_store` wraps
+whichever backend it built, unconditionally in every mode, and the contract
+suite runs its full assertion set through the decorator to prove transparency.
+
+`calls` is completions, not attempts: it counts one per logical operation, so
+the `object_store` retry loop that runs *below* this decorator (`RetryConfig`,
+default `max_retries = 10`) is invisible to it: one `get()` that retried nine
+times is one `calls`/`get` while the provider bills ten HTTP requests. The
+billed count is carried in a separate per-operation `attempts`
+counter on the same `StoreMetrics` block, filled in by the S3 adapter's counting
+HTTP connector (`S3Store::with_metrics`, installed via
+`AmazonS3Builder::with_http_connector`), which records one attempt per HTTP
+request `object_store` issues, retries included. `attempts >= calls` holds
+exactly when every store the decorator counts a `calls` on records its attempts
+into the same `StoreMetrics` handle: a store built with `S3Store::new` (no
+handle) wrapped in `InstrumentedStore::with_metrics` would count `calls` while
+recording no `attempts`, so the relation is a property of the wiring, not of the
+decorator. `ravel-server` establishes it for the whole S3 chain by handing one
+handle to the base `S3Store` and, under `--tenant-kms-config`, to every
+per-tenant KMS-routed store (`KmsRoutingStore::new`); a store built without the
+handle would make `ravel_store_attempts_total` under-report for the traffic it
+serves.
+
+`attempts` is the billed HTTP request count, not a retry counter. Retries are
+one reason it exceeds `calls`, and not the only one: a whole-object read and a
+multipart write each issue several HTTP requests per logical call, so `attempts`
+exceeds `calls` for `get`/`put` even when nothing retried. Read `attempts` as
+what the provider bills, and do not read `attempts - calls` as retry overhead;
+isolating retries specifically would need a separate counter this does not add. The connector
+wraps the default reqwest client and delegates unchanged, so `RetryConfig` and
+every retry behavior above stay exactly as documented: this observes the loop,
+it does not alter it. A backend that issues no HTTP (`MemoryStore`) leaves
+`attempts` at zero. `ravel-server` exports it as `ravel_store_attempts_total`
+beside `ravel_store_calls_total`.
+
+The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
+against all three, multipart included (`assert_multipart_upload` is part of
+`run_contract_suite`, written against the trait so it holds for the oracle, the
+wrappers, and a real endpoint alike). Two multipart assertions are S3-shaped and
+run only against a live endpoint: the composite `"<digest>-<partcount>"` ETag,
+which proves the parts really went out as parts rather than being buffered into
+one PUT, and `put()`'s own threshold switch. The `S3Store` case is gated on
+`RAVEL_RUSTFS_URL`; the CI
+`object-store-contract` job (`.github/workflows/ci.yml`) stands up RustFS,
+creates the bucket, sets that variable, and asserts the gated test executed
+rather than skipping. This job is required: S3 is the only durable backend,
+so an adapter regression must fail CI.
+
+`crates/ravel-object-store/tests/s3_http_faults.rs` covers what neither the
+contract suite nor `s3.rs`'s classification unit tests can: the retry, backoff,
+and multipart behavior `S3Store` exhibits *on the wire*. It stands up a fake S3
+endpoint (axum, loopback, ephemeral port), points `S3Store` at it through the
+ordinary `S3Config::endpoint` override, and scripts per-request faults --- 503,
+429, a `SlowDown` error body as both a 503 and the 200-with-error body S3
+documents for `CompleteMultipartUpload`, 403 `AccessDenied`, a connection
+dropped mid-response, and a multipart sequence failing after some parts
+succeeded. Because the endpoint records every request with a timestamp, the
+assertions are on what the server saw: a throttled GET/PUT is really re-sent, a
+403 is really sent once, the pause between attempts really grows, and a failed
+multipart upload really leaves no object at the key. No live endpoint and no
+Docker, so it runs in the default `cargo test`, unlike the endpoint-gated
+assertions above.
+
+### Per-tenant KMS routing decorator
+
+`KmsRoutingStore` wraps a default backend and routes writes (`put`,
+`put_multipart`) for a tenant with a configured KMS key to a lazily-built,
+cached per-tenant `S3Store` built from the default `S3Config` with only
+`kms_key_id` overridden (ADR-0062 decision 1a). Routing is decided per call
+from the object key alone: every tenant-scoped key begins with
+`t/<tenant_hash_hex>/`, so no trait change and no per-tenant handle threaded
+through call sites. Every read (`get`, `head`, `list`, `list_delimited`),
+`delete`, and any non-`t/`-prefixed or malformed-tenant-segment key delegates
+unconditionally to the default store: SSE-KMS decryption on GET is
+server-side and transparent given `kms:Decrypt`, so a reader never selects a
+key. `capabilities()` passes straight through the default store's
+declaration, same as the instrumentation decorator.
+
+Per-tenant stores are cached for the process lifetime (`Box::leak`'d to
+`&'static`, bounded by the number of distinct configured tenants) so a
+`put_multipart` handle can satisfy the trait's lifetime without a
+self-referential owner. The cache is keyed by tenant hash together with the
+ARN it was built under: registering a new key for a tenant that already has
+a cached store (`set_tenant_key`) does not retroactively re-encrypt anything
+already written (objects are immutable), but the next write for that tenant
+rebuilds the cache entry under the new key rather than silently continuing
+to route through the store built under the superseded one.
+
+The contract suite runs `KmsRoutingStore` (wrapping `MemoryStore`, no tenant
+key configured) through the full assertion set the same way it does
+`InstrumentedStore`, proving the decorator is transparent when no tenant has
+opted into per-tenant routing. It does not exercise the routing branch
+itself (a live per-tenant `S3Store` has no endpoint under test); routing is
+covered by `kms_routing`'s own unit tests instead, including key rotation
+and `put_multipart` routing.
+
+### Observed store time
+
+`ObjectStoreBackend::observed_store_time_ns() -> Option<i64>` reports the
+store's own clock, in unix nanoseconds, as the backend last observed it
+(ADR-1685 decision 1). It is a defaulted method returning `None`, so a backend
+with no remote store behind it implements nothing; adding it is not a contract
+change for a third-party implementation.
+
+The S3 adapter returns the `Date` header of the **latest** response it
+received, parsed as RFC 7231 IMF-fixdate, and `None` before its first response.
+The header is read by the same HTTP connector that counts billed requests and
+observes stored checksums, because `object_store` 0.14 exposes no response
+headers above it. Three properties follow, and callers depend on each:
+
+- **Every response, not only a successful one.** A 503 or a 403 carries the
+  store's clock as honestly as a 200, so a process being throttled keeps a
+  fresh observation.
+- **The latest response wins; it is never a running maximum.** An endpoint or
+  proxy that answers one request with a wrong `Date` moves the value, including
+  backwards, until the next response corrects it. A maximum would latch that
+  one bad header for the life of the process.
+- **A missing or unparseable `Date` changes nothing.** The previous
+  observation stands rather than being cleared, so a momentary bad header does
+  not read as "no observation".
+
+For a store whose `Date` is correct the value is a **lower bound** on the
+store's current time, never an estimate of it: the store stamped it before the
+response left, nothing advances it by elapsed time, and a leap second (`:60`)
+is clamped to `:59` rather than read as the next minute. A wrong `Date` moves
+it in the direction of its error. A caller may use it to bound how far *behind* the store its
+own clock is (ADR-1685 decision 2 refuses a flush whose reading lags it by more
+than the clock-skew allowance), and must not use it to bound how far ahead. It
+is arbitrarily stale in a process that has issued no requests, and it costs no
+extra request and no new object.
+
+`MemoryStore` returns `None` unless a test sets a value through
+`set_observed_store_time_ns`, which is behind the `test-support` feature: the
+oracle serves no responses, so it observes no store clock, and deriving one
+from the host clock would hand a caller the very clock it is trying to check.
+
+Every decorator in `ravel-object-store` delegates to the store it wraps ---
+`InstrumentedStore`, `FaultStore`, `KmsRoutingStore` (to its default store,
+which serves every read), the `ClassedStore` class handles, and the `Arc<T>`
+forwarding impl --- and so does ravel-server's `SharedKmsStore`, which sits
+between `InstrumentedStore` and `KmsRoutingStore` under `--tenant-kms-config`.
+A decorator that answered `None` instead would silently
+disable the caller's check, since production wraps its backend in several of
+them; each delegation is pinned by a test in its own module.
+
+### Read-only external stores (ADR-2040 decision 3)
+
+A Parquet table queried in place lives in a bucket Ravel does not own,
+reached with credentials Ravel was granted. `external::ExternalStore` is the
+`ObjectStoreBackend` for that bucket, and three properties hold by
+construction.
+
+**Identity is `(profile, bucket, key)`, not a URL.** An
+`external::ExternalProfile` is a name plus one `ExternalKind` (`S3` with the
+`S3Config` connection settings minus the bucket, `Gcs`, or `Azure`), and
+`ExternalStore::open(profile, bucket)` binds a profile to one bucket. A URL
+is a rendering of the triple, never the identity: two profiles can reach the
+same URL with different rights, and the same bytes under a different
+endpoint are not the same object. `load_profiles` therefore rejects an empty
+name and a duplicate name rather than resolving a duplicate last-one-wins,
+because the pinned cache key (`ravel_cache::CacheKey::pinned`) hashes the
+profile name and two profiles sharing one would collide two credential sets
+into one key. An S3 profile whose endpoint carries a path, a query or a
+fragment (anything after the host and port other than trailing `/`s) is
+refused at `ExternalStore::open` with `ProfileError::EndpointPath`, because
+the adapter sends every request under the endpoint as written and a path
+would move the bucket the profile names under another one.
+
+**A profile holds where a secret is, never the secret.** Every credential
+value a profile carries is a `SecretSource`: `Env { name }` or `File { path }`
+(trailing whitespace trimmed, so a mounted secret with a newline works
+unedited). The one credential Ravel never handles itself is the GCS
+service-account key file, whose path goes to `object_store`'s builder; it is
+still a path and never a key. `SecretSource`'s `Debug` renders
+`SecretSource(env, redacted)` or `SecretSource(file, redacted)`, and every
+credential enum around it renders its own redacted form
+(`GcsCredentials(service_account, redacted)` and so on), so neither a value
+nor its location reaches a log line or a panic message. The location is
+withheld deliberately: an environment variable's name and a key file's path
+are deployment facts, and printing them beside "redacted" hands a reader with
+log access the place to look. The `ProfileError::SecretUnavailable` message
+names only the kind of source for the same reason. Every `SecretSource`
+resolves once, at `open`, so an unreadable one fails there rather than on the
+first read. A builder or credential failure inside `ExternalStore::open`
+becomes one fixed message per store kind,
+`ProfileError::CredentialsRejected` ("gcs credentials could not be loaded for
+profile <name>"), and the underlying `object_store` error is dropped rather
+than carried as a source: it quotes what the builder was handed, and for GCS
+that is the service-account file path.
+
+**Read-only is enforced locally, in the type.** `put`, `put_multipart` and
+`delete` refuse with `StoreError::ReadOnly` without touching the network, so
+a misconfigured grant cannot become a request against someone else's bucket.
+`capabilities()` reports `create_if_absent: false`, `cas_version: false`,
+`upload_checksum: false` and `multipart: false`: a caller that selects a
+path by capability must never select a write path here. Those flags describe
+this store, not the bucket behind it. An external store is consequently never
+a candidate for the mandatory-capability check above, which governs the
+bucket Ravel writes. On the read side it reports `consistent_read`,
+`consistent_list` and `prefix_list` true for every kind, and `suffix_range`
+true for S3 and GCS but false for Azure, whose `object_store` client refuses
+a suffix range before sending it. Once a file has a manifest entry, the
+`ravel-parquet` reader's footer read asks for an explicit range ending at
+the pinned size, so it issues no suffix range on any kind. Before that --
+`ravel-parquet::snapshot`, building the manifest entry -- no pinned size
+exists yet: the first footer read is a suffix read where `suffix_range` is
+true, and otherwise an explicit range over the last `min(FOOTER_PREFETCH,
+size)` bytes of the size the listing (or a single-object HEAD) reported,
+self-correcting with one retry at the size its own response reports if
+that listed size was stale, and refusing `FileChanged` if the two reads
+still disagree. A listed size of 0, or one that overshoots the object's
+real end past what a valid range can express, issues no explicit range at
+all on a store without `suffix_range`: one HEAD recovers the real size
+instead, refusing `FileChanged` if its ETag disagrees with the listing's
+pin and `EmptyFile` if it reports a real size of 0, otherwise re-reading
+once at the size it reports. A request count for such a store can
+therefore include one HEAD in addition to its footer GETs.
+
+Two probes qualify a grant before anything reads through it, both in
+`external::probe`, both fail-closed, and both run at grant creation rather
+than on the request path:
+
+- `probe_preconditions(store, key)` qualifies the store for `get_pinned`. It
+  takes the object's pin with `pin_of(key)` (the same HEAD-based constructor
+  a caller would record, so the probe asserts the identity a caller would
+  use), then issues two 1-byte ranged reads, one pinned to that identity and
+  one pinned to a wrong ETag. It qualifies only if the first is served and
+  the second is refused with `PreconditionFailed`. The failure it returns
+  says which half failed: a store that serves the wrong pin ignores
+  preconditions (`WrongPinAccepted`), a store that refuses the matching pin
+  implements them incorrectly (`MatchingPinRefused`), a store that refuses
+  the wrong pin with some other error cannot be read through either
+  (`WrongPinWrongError`), and a HEAD that failed means the question was
+  never asked (`Head`). Only the object's own identity is pinned, and only
+  1 byte is read, because what is being measured is the header. The wrong
+  ETag is 16 random bytes rendered as quoted hex, drawn afresh on every
+  call, rather than a fixed literal: a store could refuse one known-bad
+  string and serve every other pinned read unconditionally, and the probe
+  would record that as precondition support. It is quoted because S3 ETags
+  are quoted strings, so an unquoted value could be rejected as malformed
+  instead of evaluated as a precondition, which would pass the probe for the
+  wrong reason. The probe writes nothing to the store it is qualifying.
+- `probe_not_ravel_bucket(ravel_store, candidate_store)` refuses a candidate
+  that is a Ravel bucket, which would let an external table read Ravel's
+  objects across tenants. It reads two keys from the candidate and both must
+  come back a clean `NotFound`.
+  - The identity read catches Ravel's own live bucket reached under another
+    name. The probe writes a random key under `sys/pq-probe/` with random
+    contents to Ravel's own bucket and reads that key from the candidate:
+    the probe bytes are `SameBucket`. The key is random so no candidate
+    holds it by coincidence and the contents are random so a store
+    answering every key with one placeholder cannot be mistaken for
+    Ravel's own.
+  - The tenancy-marker read catches what the identity read cannot: a copy,
+    a restore, or a replication target of a Ravel bucket is a different
+    bucket that still holds Ravel's objects, and the probe object written
+    after the copy was taken is not in it. The probe reads `sys/tenancy`
+    (the marker key of ADR-0050) from the candidate, and a candidate that
+    serves it at all is refused with `TenancyMarkerPresent`, whatever the
+    bytes are: the marker is not parsed, because holding the key is
+    already the answer.
+
+  Anything other than a clean `NotFound` or, for the identity read, the
+  exact probe payload (an access denial, a timeout, different bytes) is
+  `Inconclusive`, which is a refusal. Passing an inconclusive candidate
+  would qualify a grant on the strength of an error message. One
+  consequence is worth stating plainly: credentials scoped so tightly that
+  they cannot read `sys/` answer the marker read with an access denial
+  rather than a `NotFound`, so a grant offered under least-privilege
+  credentials of that shape is refused. That is the intended trade, because
+  the probe cannot tell "you may not ask" from "there is nothing there".
+  The probe issues a delete for its own object before returning, on every
+  path it returns through; a failed delete is logged and does not change the
+  verdict. Two paths never reach that delete and can leave an object behind:
+  a probe put that timed out after the object had landed, and a cancelled
+  probe (the future dropped before the delete is issued). Nothing in Ravel
+  reaps `sys/pq-probe/`, so what bounds the leak is whatever lifecycle rule
+  the operator sets on that prefix in the bucket itself. Each leaked object
+  is 32 bytes.
+
+Nothing in a shipping binary constructs an `ExternalStore` or calls either
+probe yet. The callers are the Parquet reader and the grant and
+`CREATE EXTERNAL TABLE` paths of ADR-2040, which have not landed.
+
+## Rules for callers
+
+- Never infer visibility from a successful data PUT; only commit records
+  confirm publication (ADR-0002).
+- All GETs of format-bearing bytes verify embedded checksums; etag
+  inequality between ranged reads of the same immutable object aborts with
+  `Corrupted` (data objects are created with CreateIfAbsent, so rewrites
+  cannot produce differing content for one key).
+- Every caller passes a deadline; trait impls honor cancellation by drop.
+- Every read of an object Ravel did not write goes through `get_pinned`
+  carrying the identity the catalog recorded for it. A plain `get` of such an
+  object is a bug: the key is mutable from Ravel's point of view, so the
+  bytes may no longer match the recorded schema and statistics, and the
+  pinned cache key is only sound because the read that fills it asserted that
+  identity on the wire.

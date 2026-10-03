@@ -1,0 +1,1502 @@
+//! `GET /metrics` is served on the HTTP listener in every mode, including
+//! `Mode::Maintain`, the same regression shape as
+//! `health_endpoints.rs`'s maintain-mode guard.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ravel_object_store::StoreMetrics;
+use ravel_object_store::memory::MemoryStore;
+use ravel_server::health_listener::{HEARTBEAT_INTERVAL, HealthListener, Heartbeat};
+use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
+use ravel_types::TenantId;
+
+const TOKEN: &str = "testtoken";
+
+/// Mirrors `health_endpoints.rs`'s helper: an in-process server backed by
+/// `MemoryStore`, parameterized by mode and by whether it spawns a fold task.
+async fn start_test_server(
+    mode: Mode,
+    process_memory_budget_bytes: u64,
+    fold_enabled: bool,
+) -> ravel_server::Running {
+    start_test_server_with(mode, process_memory_budget_bytes, fold_enabled, None).await
+}
+
+/// [`start_test_server`], started through `start_with_heartbeat` with the
+/// caller's heartbeat when one is given, the way `main` starts a
+/// `--listen-health` process.
+async fn start_test_server_with(
+    mode: Mode,
+    process_memory_budget_bytes: u64,
+    fold_enabled: bool,
+    heartbeat: Option<Heartbeat>,
+) -> ravel_server::Running {
+    start_test_server_with_store_metrics(
+        mode,
+        process_memory_budget_bytes,
+        fold_enabled,
+        heartbeat,
+        Arc::new(StoreMetrics::default()),
+    )
+    .await
+}
+
+/// [`start_test_server_with`], serving the caller's `store_metrics` at
+/// `/metrics` so a test can move its counters and read them back scraped.
+async fn start_test_server_with_store_metrics(
+    mode: Mode,
+    process_memory_budget_bytes: u64,
+    fold_enabled: bool,
+    heartbeat: Option<Heartbeat>,
+    store_metrics: Arc<StoreMetrics>,
+) -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let store = Arc::new(MemoryStore::new());
+    let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
+        query_budgets: Default::default(),
+        max_inflight_flushes: 1,
+        max_queued_flushes: 8,
+        adaptive_flush_delay: false,
+        max_flush_delay: std::time::Duration::from_secs(2),
+        max_flush_delay_idle: std::time::Duration::from_secs(40),
+        min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
+        mode,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: fold_enabled,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        metrics_tenant_labels: false,
+        limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
+        scrub_period: std::time::Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
+        parquet_profiles: None,
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes,
+        process_memory_budget_is_fallback: false,
+        cache_dir: None,
+        catalog_resolve_concurrency: None,
+        cpu_gate_permits: ravel_server::config::CpuGatePermits { read: 3, write: 2 },
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
+        distrib: None,
+        remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
+    };
+    match heartbeat {
+        Some(heartbeat) => ravel_server::start_with_heartbeat(
+            config,
+            store.clone(),
+            store.clone(),
+            store_metrics,
+            None,
+            heartbeat,
+        )
+        .await
+        .expect("server starts"),
+        None => ravel_server::start(config, store.clone(), store.clone(), store_metrics, None)
+            .await
+            .expect("server starts"),
+    }
+}
+
+/// `/metrics` must be served in every mode, maintain included, alongside
+/// `/healthz` and `/readyz`.
+#[tokio::test]
+async fn metrics_served_in_every_mode() {
+    for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let client = reqwest::Client::new();
+
+        let response = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes");
+        assert_eq!(
+            response.status(),
+            200,
+            "metrics must be 200 in mode {mode:?}"
+        );
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .expect("content-type header present")
+            .to_str()
+            .expect("content-type is ASCII");
+        assert!(
+            content_type.starts_with("text/plain"),
+            "metrics content-type should be text/plain, got {content_type}"
+        );
+
+        let body = response.text().await.expect("metrics body is text");
+        assert!(
+            body.contains("ravel_store_calls_total"),
+            "metrics body missing store family in mode {mode:?}:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_catalog_interlock_violations_total"),
+            "metrics body missing catalog family in mode {mode:?}:\n{body}"
+        );
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// `Mode::All` and `Mode::Gateway` build ingest routers; `Mode::Query` and
+/// `Mode::Maintain` do not. The ingest metric families must appear exactly
+/// where the routers exist, not be zero-padded in modes that build none.
+#[tokio::test]
+async fn metrics_ingest_family_present_only_in_ingest_modes() {
+    for (mode, expect_ingest) in [
+        (Mode::All, true),
+        (Mode::Gateway, true),
+        (Mode::Query, false),
+        (Mode::Maintain, false),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let client = reqwest::Client::new();
+
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        assert_eq!(
+            body.contains("ravel_ingest_flushes_by_size_total"),
+            expect_ingest,
+            "mode {mode:?} ingest family presence should be {expect_ingest}:\n{body}"
+        );
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// The queued-flush cap (issue #1740) is only operable if the two figures it
+/// moves are readable on the surface an operator actually scrapes.
+/// `--max-queued-flushes`' help tells an operator to watch
+/// `ravel_ingest_flush_trigger_deferred_total` for refusals and
+/// `ravel_ingest_queued_flushes` for the queue depth those refusals bound, so
+/// both families must render on `/metrics`, with a sample per ingest signal,
+/// wherever an ingest router exists.
+///
+/// Counted, not merely tested for presence: a family emitted twice is a
+/// duplicate series a scrape rejects and reads the same as a single one to
+/// `contains`. Asserted zero in the modes that build no router, so a family
+/// hardcoded into the exposition regardless of the routers would fail here
+/// rather than read as coverage.
+#[tokio::test]
+async fn metrics_render_queued_flush_families_named_by_the_flag_help() {
+    for (mode, mode_label, expect_ingest) in [
+        (Mode::All, "all", true),
+        (Mode::Gateway, "gateway", true),
+        (Mode::Query, "query", false),
+        (Mode::Maintain, "maintain", false),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let client = reqwest::Client::new();
+
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        for (family, metric_type) in [
+            ("ravel_ingest_queued_flushes", "gauge"),
+            ("ravel_ingest_flush_trigger_deferred_total", "counter"),
+            ("ravel_ingest_deferral_cap_refused_total", "counter"),
+            ("ravel_ingest_rerouted_flushes_total", "counter"),
+            ("ravel_ingest_hand_back_failures_total", "counter"),
+            ("ravel_ingest_teardown_unscanned_writes_total", "counter"),
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {family} {metric_type}"))
+                    .count(),
+                usize::from(expect_ingest),
+                "mode {mode:?} must declare {family} exactly {} time(s):\n{body}",
+                usize::from(expect_ingest)
+            );
+            for signal in ["metrics", "logs", "spans"] {
+                assert_eq!(
+                    body.matches(&format!(
+                        "{family}{{mode=\"{mode_label}\",signal=\"{signal}\"}} "
+                    ))
+                    .count(),
+                    usize::from(expect_ingest),
+                    "mode {mode:?} must render {family} for signal {signal} exactly {} \
+                     time(s):\n{body}",
+                    usize::from(expect_ingest)
+                );
+            }
+        }
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// Issue #1728: the store-probe liveness gauge must reach a real HTTP scrape,
+/// not just the in-process atomic `store_probe::probe_last_run_unix_ns`
+/// reads directly, since an operator's monitoring only ever sees the rendered
+/// body. Exactly one series, with its `gauge` TYPE header, in every mode: the
+/// family is unconditional (ADR-0050 section 7 reachability is meaningful
+/// even in `Mode::Maintain`, which runs no ingest router).
+#[tokio::test]
+async fn metrics_store_probe_last_run_gauge_on_rendered_metrics() {
+    for (mode, mode_label) in [
+        (Mode::All, "all"),
+        (Mode::Gateway, "gateway"),
+        (Mode::Query, "query"),
+        (Mode::Maintain, "maintain"),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let client = reqwest::Client::new();
+
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        assert_eq!(
+            body.matches("# TYPE ravel_store_probe_last_run_timestamp_seconds gauge")
+                .count(),
+            1,
+            "mode {mode:?} must declare the store-probe last-run gauge exactly once:\n{body}"
+        );
+        assert_eq!(
+            body.matches(&format!(
+                "ravel_store_probe_last_run_timestamp_seconds{{mode=\"{mode_label}\"}} "
+            ))
+            .count(),
+            1,
+            "mode {mode:?} must render the store-probe last-run gauge exactly once:\n{body}"
+        );
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// Bodies a versioned, locked, compliant bucket answers the control plane's
+/// three server-side GETs with.
+fn fake_bucket_body(subresource: &str) -> &'static str {
+    match subresource {
+        "versioning" => {
+            "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+        }
+        "lifecycle" => {
+            "<LifecycleConfiguration><Rule><ID>ravel</ID><Status>Enabled</Status><Filter/>\
+             <NoncurrentVersionExpiration><NoncurrentDays>30</NoncurrentDays>\
+             </NoncurrentVersionExpiration>\
+             <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>\
+             <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation>\
+             </AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>"
+        }
+        "object-lock" => {
+            "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+             </ObjectLockConfiguration>"
+        }
+        other => panic!("unexpected subresource {other:?}"),
+    }
+}
+
+/// A fake S3 endpoint over [`fake_bucket_body`], returning its base URL and
+/// the count of requests and body bytes it served.
+async fn spawn_fake_bucket() -> (
+    String,
+    Arc<std::sync::atomic::AtomicU64>,
+    Arc<std::sync::atomic::AtomicU64>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let served = Arc::new(AtomicU64::new(0));
+    let served_bytes = Arc::new(AtomicU64::new(0));
+    let (requests, bytes) = (Arc::clone(&served), Arc::clone(&served_bytes));
+    let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+        let (requests, bytes) = (Arc::clone(&requests), Arc::clone(&bytes));
+        async move {
+            let query = uri.query().unwrap_or("");
+            let subresource = query.split(['=', '&']).next().unwrap_or("");
+            let body = fake_bucket_body(subresource);
+            requests.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(body.len() as u64, Ordering::Relaxed);
+            body
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), served, served_bytes)
+}
+
+/// An `S3Store` on `endpoint` recording into `metrics`.
+fn s3_store_on(endpoint: String, metrics: &Arc<StoreMetrics>) -> ravel_object_store::s3::S3Store {
+    ravel_object_store::s3::S3Store::with_metrics(
+        ravel_object_store::s3::S3Config {
+            bucket: "ravel-test".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(endpoint),
+            access_key_id: "test".to_string(),
+            secret_access_key: "test".to_string(),
+            allow_http: true,
+            force_path_style: true,
+            kms_key_id: None,
+            session_token: None,
+            credentials_file: None,
+            auth: Default::default(),
+            instance_metadata_endpoint: None,
+        },
+        Arc::clone(metrics),
+    )
+    .expect("store")
+}
+
+/// The one sample line of the unlabelled-but-`mode` family `name`. The same
+/// body as `family_samples` in `src/metrics.rs`'s test module; keep the two in
+/// step.
+fn mode_only_samples<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+    body.lines()
+        .filter(|line| {
+            line.strip_prefix(name)
+                .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+        })
+        .collect()
+}
+
+/// The unverified-read counter and the three bucket-protection control-plane
+/// counters on a live scrape, read from the `StoreMetrics` handle the server
+/// was started with. The control-plane counts are moved by real probes: one
+/// `S3Store` against a fake bucket (three GETs answered, 568 body bytes) and
+/// one against a closed port (three GETs sent, none answered), both recording
+/// into that handle, so `requests`, `calls` and `response_bytes` all differ and
+/// a family rendering the wrong field fails. None of it reaches the per-op
+/// `ravel_store_*` families.
+#[tokio::test]
+async fn metrics_render_get_unverified_and_control_plane_counters() {
+    use std::sync::atomic::Ordering;
+
+    use ravel_object_store::conformance::{BucketControlPlane, BucketProtectionParams};
+    use ravel_object_store::instrument::ControlPlaneMetricsSnapshot;
+
+    let metrics: Arc<StoreMetrics> = Arc::default();
+    for _ in 0..4 {
+        metrics.record_get_unverified();
+    }
+
+    let (endpoint, served, served_bytes) = spawn_fake_bucket().await;
+    s3_store_on(endpoint, &metrics)
+        .bucket_protection_report(&BucketProtectionParams::default())
+        .await;
+    assert_eq!(served.load(Ordering::Relaxed), 3);
+    assert_eq!(served_bytes.load(Ordering::Relaxed), 568);
+
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let closed_base = format!("http://{}", closed.local_addr().expect("addr"));
+    drop(closed);
+    s3_store_on(closed_base, &metrics)
+        .bucket_protection_report(&BucketProtectionParams::default())
+        .await;
+
+    assert_eq!(
+        metrics.control_plane(),
+        ControlPlaneMetricsSnapshot {
+            requests: 6,
+            calls: 3,
+            response_bytes: 568,
+        }
+    );
+
+    let running =
+        start_test_server_with_store_metrics(Mode::Query, u64::MAX, false, None, metrics).await;
+    let body = scrape(&running).await;
+    running.shutdown().await.expect("graceful shutdown");
+
+    for (name, value) in [
+        ("ravel_store_get_unverified_total", 4),
+        ("ravel_store_control_plane_requests_total", 6),
+        ("ravel_store_control_plane_calls_total", 3),
+        ("ravel_store_control_plane_response_bytes_total", 568),
+    ] {
+        assert_eq!(
+            body.matches(&format!("# TYPE {name} counter\n")).count(),
+            1,
+            "{name} TYPE line:\n{body}"
+        );
+        assert_eq!(
+            mode_only_samples(&body, name),
+            vec![format!("{name}{{mode=\"query\"}} {value}")],
+            "{name} sample:\n{body}"
+        );
+    }
+    assert!(
+        !body
+            .lines()
+            .any(|line| line.contains("control_plane") && line.contains("op=\"")),
+        "no control-plane series under an op label:\n{body}"
+    );
+}
+
+/// ADR-0873's three observability families on a live `/metrics` scrape.
+///
+/// The per-carrier drop tally renders in every mode: its four carriers are
+/// read by four different subsystems, and `compaction-part` is observed in
+/// exactly the mode that compacts, so gating it on folding would hide a
+/// defect signal where it is most likely to appear. The fold stamp-coverage
+/// pair renders where a fold can run AT ALL, by either route
+/// (`ServerConfig::folds_in_process`): the scheduled task, spawned in
+/// `Mode::Maintain` and `Mode::All` and only when `--disable-fold` is absent,
+/// or the on-demand `POST /api/v1/admin/fold` route, mounted in `all` and
+/// `query` whatever `--disable-fold` says. So `--mode all --disable-fold`
+/// renders the pair (an operator can still fold it, and that fold moves the
+/// totals), while every `gateway` process and `--mode maintain
+/// --disable-fold` omit it: they can fold by neither route.
+///
+/// Each family is counted, not merely tested for presence: a family emitted
+/// twice is a duplicate series a scrape rejects, and a duplicate reads the
+/// same as a single one to `contains`.
+#[tokio::test]
+async fn metrics_declared_stats_families_render_once_where_the_fold_runs() {
+    for (mode, mode_label, fold_enabled, expect_fold) in [
+        (Mode::All, "all", true, true),
+        // The on-demand route is mounted here, so this process can fold.
+        (Mode::All, "all", false, true),
+        // Gateway runs no scheduled fold and mounts no on-demand route, so
+        // `--disable-fold` changes nothing: it can fold by neither route
+        // either way.
+        (Mode::Gateway, "gateway", true, false),
+        (Mode::Gateway, "gateway", false, false),
+        (Mode::Query, "query", true, true),
+        (Mode::Query, "query", false, true),
+        // Maintain runs the scheduled fold over the units it owns, and has no
+        // on-demand route, so `--disable-fold` is what decides it here.
+        (Mode::Maintain, "maintain", true, true),
+        (Mode::Maintain, "maintain", false, false),
+    ] {
+        let running = start_test_server(mode, u64::MAX, fold_enabled).await;
+        let base = format!("http://{}", running.http_addr);
+        let client = reqwest::Client::new();
+
+        let body = client
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        assert_eq!(
+            body.matches("# TYPE ravel_declared_stats_drops_observed_total counter")
+                .count(),
+            1,
+            "mode {mode:?} must declare the drop tally exactly once:\n{body}"
+        );
+        for carrier in [
+            "commit-record",
+            "compaction-part",
+            "snapshot-entry",
+            "cstat",
+        ] {
+            assert_eq!(
+                body.matches(&format!(
+                    "ravel_declared_stats_drops_observed_total{{mode=\"{mode_label}\",carrier=\"{carrier}\"}} "
+                ))
+                .count(),
+                1,
+                "mode {mode:?} must render the {carrier} drop series exactly once:\n{body}"
+            );
+        }
+
+        for family in [
+            "ravel_catalog_fold_stamped_records_total",
+            "ravel_catalog_fold_stamped_entries_total",
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {family} counter")).count(),
+                usize::from(expect_fold),
+                "mode {mode:?} fold_enabled={fold_enabled} family {family} header \
+                 count should be {}:\n{body}",
+                usize::from(expect_fold)
+            );
+            assert_eq!(
+                body.matches(&format!("{family}{{mode=\"{mode_label}\"}} "))
+                    .count(),
+                usize::from(expect_fold),
+                "mode {mode:?} fold_enabled={fold_enabled} family {family} sample \
+                 count should be {}:\n{body}",
+                usize::from(expect_fold)
+            );
+        }
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// ADR-1170 decision 4: the three process memory budget gauges must render
+/// with real values read from the same `MemoryBudget` the server was started
+/// with, not zeroed placeholders. `component="fetch"` reads `0` because the
+/// server is idle: no fetch reservation is held when the body is scraped.
+#[tokio::test]
+async fn metrics_memory_budget_family_reflects_configured_budget() {
+    const BUDGET_BYTES: u64 = 123_456_789;
+    let running = start_test_server(Mode::All, BUDGET_BYTES, false).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let body = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+
+    assert!(
+        body.contains(&format!(
+            "ravel_memory_budget_bytes{{mode=\"all\"}} {BUDGET_BYTES}"
+        )),
+        "metrics body missing budget gauge at the configured value:\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"sql\"} 0"),
+        "metrics body missing sql reserved gauge:\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_reserved_bytes{mode=\"all\",component=\"fetch\"} 0"),
+        "metrics body missing fetch reserved gauge (must be 0 while no fetch is in flight):\n{body}"
+    );
+    assert!(
+        body.contains("ravel_memory_handoff_overlap_bytes{mode=\"all\"} 0"),
+        "metrics body missing handoff overlap gauge:\n{body}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// ADR-1702 decision 11: a scrape in every mode carries each CPU gate and
+/// tokio runtime family exactly once, with the permit counts the server was
+/// started with (`start_test_server` sets read 3, write 2). Counted rather
+/// than tested with `contains`, so a family rendered twice fails too.
+#[tokio::test]
+async fn metrics_render_cpu_gate_and_runtime_families_once() {
+    for (mode, mode_label) in [
+        (Mode::All, "all"),
+        (Mode::Gateway, "gateway"),
+        (Mode::Query, "query"),
+        (Mode::Maintain, "maintain"),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let body = reqwest::Client::new()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        for (family, kind) in [
+            ("ravel_cpu_gate_permits", "gauge"),
+            ("ravel_cpu_gate_running", "gauge"),
+            ("ravel_cpu_gate_queued", "gauge"),
+            ("ravel_cpu_gate_wait_seconds", "summary"),
+            ("ravel_cpu_gate_run_seconds", "summary"),
+            ("ravel_cpu_gate_abandoned_total", "counter"),
+            ("ravel_cpu_gate_jobs_total", "counter"),
+            ("ravel_cpu_gate_inline_total", "counter"),
+            ("ravel_runtime_workers", "gauge"),
+            ("ravel_runtime_alive_tasks", "gauge"),
+            ("ravel_runtime_global_queue_depth", "gauge"),
+            ("ravel_runtime_worker_busy_seconds_total", "counter"),
+        ] {
+            let header = format!("# TYPE {family} {kind}\n");
+            assert_eq!(
+                body.matches(&header).count(),
+                1,
+                "mode {mode:?}: {header:?} must appear exactly once:\n{body}"
+            );
+        }
+        for (gate, permits) in [("read", 3), ("write", 2)] {
+            let line = format!(
+                "ravel_cpu_gate_permits{{mode=\"{mode_label}\",gate=\"{gate}\"}} {permits}"
+            );
+            assert_eq!(
+                body.lines().filter(|rendered| *rendered == line).count(),
+                1,
+                "mode {mode:?}: {line:?} must render exactly once:\n{body}"
+            );
+        }
+        let workers_line = body
+            .lines()
+            .find(|line| line.starts_with("ravel_runtime_workers{"))
+            .expect("runtime workers sample");
+        let workers: usize = workers_line
+            .rsplit(' ')
+            .next()
+            .and_then(|value| value.parse().ok())
+            .expect("runtime workers value");
+        assert!(workers >= 1, "the scraping runtime has at least one worker");
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with("ravel_runtime_worker_busy_seconds_total{"))
+                .count(),
+            workers,
+            "one busy sample per runtime worker"
+        );
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// Scrapes `/metrics` once and returns the body.
+async fn scrape(running: &ravel_server::Running) -> String {
+    reqwest::Client::new()
+        .get(format!("http://{}/metrics", running.http_addr))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text")
+}
+
+/// Asserts `ravel_health_heartbeat_age_seconds` renders exactly once and that
+/// its value is under one heartbeat interval plus one more tick: an idle main
+/// runtime beats every [`HEARTBEAT_INTERVAL`], so a larger age means the
+/// heartbeat task is not running.
+fn assert_heartbeat_age_rendered(body: &str, context: &str) {
+    let header = "# TYPE ravel_health_heartbeat_age_seconds gauge\n";
+    assert_eq!(
+        body.matches(header).count(),
+        1,
+        "{context}: {header:?} must appear exactly once:\n{body}"
+    );
+    let samples: Vec<&str> = body
+        .lines()
+        .filter(|line| line.starts_with("ravel_health_heartbeat_age_seconds{"))
+        .collect();
+    assert_eq!(samples.len(), 1, "{context}: one sample:\n{body}");
+    let age: f64 = samples[0]
+        .rsplit(' ')
+        .next()
+        .and_then(|value| value.parse().ok())
+        .expect("heartbeat age value");
+    let bound = (HEARTBEAT_INTERVAL * 2).as_secs_f64();
+    assert!(
+        (0.0..bound).contains(&age),
+        "{context}: heartbeat age {age} s on an idle server, want under {bound} s"
+    );
+}
+
+/// ADR-1702 decision 11: the heartbeat age renders in every mode without
+/// `--listen-health`, from the heartbeat `start` builds and beats itself.
+#[tokio::test]
+async fn metrics_render_heartbeat_age_without_listen_health() {
+    for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let body = scrape(&running).await;
+        assert_heartbeat_age_rendered(&body, &format!("mode {mode:?}"));
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// `start` must run the heartbeat task, not only build the heartbeat: a
+/// heartbeat is stamped at construction, so a first scrape reads a small age
+/// whether or not anything beats it. The second scrape comes after a real
+/// wait past the bound, which only a running task keeps the age under. The
+/// wait is on the wall clock because `start` beats a `SystemClock` heartbeat
+/// the test cannot step.
+#[tokio::test]
+async fn metrics_heartbeat_age_stays_bounded_while_start_beats() {
+    let running = start_test_server(Mode::All, u64::MAX, false).await;
+    assert_heartbeat_age_rendered(&scrape(&running).await, "first scrape");
+    tokio::time::sleep(HEARTBEAT_INTERVAL * 5 / 2).await;
+    assert_heartbeat_age_rendered(
+        &scrape(&running).await,
+        "scrape 2.5 heartbeat intervals later",
+    );
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A clock that moves only when the test sets it.
+struct SteppedClock(std::sync::atomic::AtomicI64);
+
+impl ravel_ingest::Clock for SteppedClock {
+    fn now_ns(&self) -> i64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// `start_with_heartbeat` must render the caller's heartbeat, the same one
+/// the health listener reads, and leave the listener's verdict on it alone.
+/// The heartbeat is never spawned, so only the stepped clock moves its age:
+/// at 45 s `/metrics` reads exactly 45, `/readyz` (30 s bound) fails and
+/// `/healthz` (60 s bound) still passes.
+#[tokio::test]
+async fn metrics_and_health_listener_read_the_same_heartbeat() {
+    const BASE_NS: i64 = 1_800_000_000_000_000_000;
+    let clock = Arc::new(SteppedClock(std::sync::atomic::AtomicI64::new(BASE_NS)));
+    let heartbeat = Heartbeat::new(clock.clone());
+    let listener = HealthListener::bind(
+        "127.0.0.1:0".parse().expect("valid loopback addr"),
+        heartbeat.clone(),
+    )
+    .expect("health listener binds");
+    let running = start_test_server_with(Mode::All, u64::MAX, false, Some(heartbeat)).await;
+    listener.attach_readiness(running.readiness());
+    let health = |route: &str| format!("http://{}{route}", listener.local_addr());
+    let client = reqwest::Client::new();
+    let status = |url: String| {
+        let client = client.clone();
+        async move {
+            client
+                .get(url)
+                .send()
+                .await
+                .expect("health listener request completes")
+                .status()
+                .as_u16()
+        }
+    };
+
+    assert_eq!(
+        status(health("/readyz")).await,
+        200,
+        "/readyz at heartbeat age 0 s, so a later 503 is the heartbeat's"
+    );
+
+    clock.0.store(
+        BASE_NS + 45 * 1_000_000_000,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let body = scrape(&running).await;
+    let samples: Vec<&str> = body
+        .lines()
+        .filter(|line| line.starts_with("ravel_health_heartbeat_age_seconds{"))
+        .collect();
+    assert_eq!(
+        samples,
+        ["ravel_health_heartbeat_age_seconds{mode=\"all\"} 45"],
+        "/metrics must read the heartbeat passed to start_with_heartbeat:\n{body}"
+    );
+    assert_eq!(status(health("/readyz")).await, 503, "/readyz at 45 s");
+    assert_eq!(status(health("/healthz")).await, 200, "/healthz at 45 s");
+
+    running.shutdown().await.expect("graceful shutdown");
+    tokio::task::spawn_blocking(move || listener.shutdown())
+        .await
+        .expect("health listener shutdown task")
+        .expect("health listener stops");
+}
+
+/// With `--listen-health`, `main` builds the heartbeat, spawns its task and
+/// binds the listener before `start_with_heartbeat`; `/metrics` renders the
+/// age of that same heartbeat, once.
+#[tokio::test]
+async fn metrics_render_heartbeat_age_with_listen_health() {
+    for mode in [Mode::All, Mode::Gateway, Mode::Query, Mode::Maintain] {
+        let heartbeat = Heartbeat::new(Arc::new(ravel_ingest::SystemClock));
+        let heartbeat_task = heartbeat.spawn();
+        let listener = HealthListener::bind(
+            "127.0.0.1:0".parse().expect("valid loopback addr"),
+            heartbeat.clone(),
+        )
+        .expect("health listener binds");
+        let running = start_test_server_with(mode, u64::MAX, false, Some(heartbeat)).await;
+        listener.attach_readiness(running.readiness());
+
+        let body = scrape(&running).await;
+        assert_heartbeat_age_rendered(&body, &format!("mode {mode:?} with --listen-health"));
+
+        running.shutdown().await.expect("graceful shutdown");
+        heartbeat_task.abort();
+        tokio::task::spawn_blocking(move || listener.shutdown())
+            .await
+            .expect("health listener shutdown task")
+            .expect("health listener stops");
+    }
+}
+
+// --- ADR-0051 section 6: the /metrics admission family ---
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+use opentelemetry_proto::tonic::metrics::v1::{
+    Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use prost::Message;
+use ravel_ingest::{AdmissionLimits, CountLimit, RateLimit};
+use ravel_server::LimitsConfig;
+
+/// One admission scenario: a distinct tenant, its bearer token, the limit
+/// override that shapes what its request hits, and the rejection reason (if
+/// any) that override forces onto the `/metrics` admission family.
+struct Scenario {
+    tenant: &'static str,
+    token: &'static str,
+    limits: AdmissionLimits,
+    /// Distinct series in the one request this tenant sends. More than
+    /// `max_active_series` forces per-series cap rejections; a fresh-series
+    /// count over the creation-rate burst forces a whole-request rejection.
+    series: usize,
+    /// The `reason` label this scenario must produce, or `None` for the
+    /// clean-admit tenant.
+    expect_reason: Option<&'static str>,
+}
+
+/// Four tenants, one per admission outcome: a clean admit plus each of the
+/// three rejection reasons the admission counters distinguish (byte_rate,
+/// series_rate, series_cap). Every non-overridden limit stays at this
+/// service's generous shipped defaults so exactly the intended layer fires.
+fn admission_scenarios() -> Vec<Scenario> {
+    let tight = |per_sec, burst| RateLimit::Bounded { per_sec, burst };
+    vec![
+        Scenario {
+            tenant: "adm-admit",
+            token: "tok-admit",
+            limits: AdmissionLimits::default(),
+            series: 2,
+            expect_reason: None,
+        },
+        Scenario {
+            tenant: "adm-cap",
+            token: "tok-cap",
+            limits: AdmissionLimits {
+                max_active_series: CountLimit::Bounded(1),
+                ..AdmissionLimits::default()
+            },
+            series: 4,
+            expect_reason: Some("series_cap"),
+        },
+        Scenario {
+            tenant: "adm-byte",
+            token: "tok-byte",
+            limits: AdmissionLimits {
+                ingest_byte_rate: tight(1, 1),
+                ..AdmissionLimits::default()
+            },
+            series: 2,
+            expect_reason: Some("byte_rate"),
+        },
+        Scenario {
+            tenant: "adm-srate",
+            token: "tok-srate",
+            limits: AdmissionLimits {
+                series_creation_rate: tight(1, 1),
+                ..AdmissionLimits::default()
+            },
+            series: 4,
+            expect_reason: Some("series_rate"),
+        },
+    ]
+}
+
+fn admission_now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos() as i64
+}
+
+/// An `ExportMetricsServiceRequest` with `count` distinct series (distinct
+/// `__name__`), each one gauge point, mirroring `admission_e2e.rs`.
+fn export_request(count: usize, ts_ns: i64) -> ExportMetricsServiceRequest {
+    let metrics = (0..count)
+        .map(|i| Metric {
+            name: format!("adm_series_{i}"),
+            data: Some(MetricData::Gauge(Gauge {
+                data_points: vec![NumberDataPoint {
+                    time_unix_nano: ts_ns as u64,
+                    value: Some(NumberValue::AsDouble(1.0)),
+                    ..Default::default()
+                }],
+            })),
+            ..Default::default()
+        })
+        .collect();
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(AnyValue {
+                        value: Some(AnyValueVariant::StringValue("adm".to_string())),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// Starts a server in `Mode::All` with every scenario's tenant token and
+/// per-tenant limit override installed, and `--metrics-tenant-labels` set to
+/// `tenant_labels`.
+async fn start_admission_server(tenant_labels: bool) -> ravel_server::Running {
+    let scenarios = admission_scenarios();
+    let mut tokens = HashMap::new();
+    let mut tenants = HashMap::new();
+    for s in &scenarios {
+        tokens.insert(s.token.to_string(), TenantId::new(s.tenant));
+        tenants.insert(TenantId::new(s.tenant), s.limits);
+    }
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let store = Arc::new(MemoryStore::new());
+    let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
+        query_budgets: Default::default(),
+        max_inflight_flushes: 1,
+        max_queued_flushes: 8,
+        adaptive_flush_delay: false,
+        max_flush_delay: std::time::Duration::from_secs(2),
+        max_flush_delay_idle: std::time::Duration::from_secs(40),
+        min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
+        mode: Mode::All,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        metrics_tenant_labels: tenant_labels,
+        deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
+        scrub_period: std::time::Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
+        parquet_profiles: None,
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
+        cache_dir: None,
+        catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
+        distrib: None,
+        remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        limits: LimitsConfig {
+            defaults: ravel_server::config::limits::shipped_defaults(),
+            tenants,
+            ..LimitsConfig::default()
+        },
+    };
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
+}
+
+/// Drives every scenario's one export request against `base`, generating the
+/// admission activity the `/metrics` family then reports.
+async fn drive_admission_activity(base: &str) {
+    let client = reqwest::Client::new();
+    for s in admission_scenarios() {
+        let request = export_request(s.series, admission_now_ns());
+        client
+            .post(format!("{base}/v1/metrics"))
+            .header("authorization", format!("Bearer {}", s.token))
+            .header("content-type", "application/x-protobuf")
+            .body(request.encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes");
+    }
+}
+
+/// Distinct `tenant_hash` label values across every `ravel_admission_*`
+/// sample line in an exposition body.
+fn admission_tenant_hashes(body: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in body.lines() {
+        if !line.starts_with("ravel_admission_") {
+            continue;
+        }
+        let Some(brace) = line.find('{') else {
+            continue;
+        };
+        let close = line.find('}').expect("closed label block");
+        for pair in line[brace + 1..close].split(',') {
+            if let Some(value) = pair.strip_prefix("tenant_hash=\"") {
+                out.insert(value.trim_end_matches('"').to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The acceptance test for per-tenant admission labels (ADR-0051 section 6). N tenants each
+/// generate admission activity (one admitted, three rejected by distinct
+/// reasons). Scraped with `--metrics-tenant-labels` off, every
+/// `ravel_admission_*` series collapses to `tenant_hash="other"`, so the
+/// exposition's cardinality does not grow with tenant count. Scraped with it
+/// on, N distinct real `tenant_hash` values appear, and all three rejection
+/// reasons are present and distinguishable.
+#[tokio::test]
+async fn admission_family_tenant_labels_bounded() {
+    let scenarios = admission_scenarios();
+    let tenant_count = scenarios.len();
+    let expected_hashes: std::collections::HashSet<String> = scenarios
+        .iter()
+        .map(|s| TenantId::new(s.tenant).hash().to_hex())
+        .collect();
+    let expected_reasons: Vec<&str> = scenarios.iter().filter_map(|s| s.expect_reason).collect();
+    let client = reqwest::Client::new();
+
+    // --- Flag off: everything folds to tenant_hash="other". ---
+    let running = start_admission_server(false).await;
+    let base = format!("http://{}", running.http_addr);
+    drive_admission_activity(&base).await;
+    let body_off = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+    running.shutdown().await.expect("graceful shutdown");
+
+    let hashes_off = admission_tenant_hashes(&body_off);
+    assert_eq!(
+        hashes_off,
+        std::collections::HashSet::from(["other".to_string()]),
+        "with --metrics-tenant-labels off, {tenant_count} tenants must collapse to exactly \
+         tenant_hash=\"other\", so /metrics cardinality never grows with tenant count:\n{body_off}"
+    );
+    // Even folded, the admission family itself must be present and populated.
+    assert!(
+        body_off.contains("ravel_admission_admitted_total{"),
+        "the admission family must render even when folded:\n{body_off}"
+    );
+
+    // --- Flag on: each tenant keeps its own hash; all reasons distinguishable. ---
+    let running = start_admission_server(true).await;
+    let base = format!("http://{}", running.http_addr);
+    drive_admission_activity(&base).await;
+    let body_on = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+    running.shutdown().await.expect("graceful shutdown");
+
+    let hashes_on = admission_tenant_hashes(&body_on);
+    assert_eq!(
+        hashes_on.len(),
+        tenant_count,
+        "with --metrics-tenant-labels on, exactly {tenant_count} distinct tenant hashes must \
+         appear (one per active tenant), got {hashes_on:?}:\n{body_on}"
+    );
+    assert_eq!(
+        hashes_on, expected_hashes,
+        "the rendered hashes must be exactly the active tenants' real hashes, not \"other\":\n\
+         {body_on}"
+    );
+    assert!(
+        !hashes_on.contains("other"),
+        "no tenant may fold to \"other\" with labels on:\n{body_on}"
+    );
+
+    // Each rejection reason is exercised and distinguishable by its own series.
+    for reason in expected_reasons {
+        assert!(
+            body_on.contains(&format!("reason=\"{reason}\"}}"))
+                && body_on
+                    .lines()
+                    .any(|l| l.starts_with("ravel_admission_rejected_total")
+                        && l.contains(&format!("reason=\"{reason}\""))
+                        && l.rsplit(' ').next().is_some_and(|v| v != "0")),
+            "rejection reason {reason:?} must appear with a nonzero count:\n{body_on}"
+        );
+    }
+}
+
+// --- ADR-0076 decision 2 / #146: the /metrics PUT attribution family ---
+
+const ATTR_CONFIGURED_TENANT: &str = "attr-configured";
+const ATTR_CONFIGURED_TOKEN: &str = "attr-configured-token";
+const ATTR_OTHER_TENANT: &str = "attr-unconfigured";
+const ATTR_OTHER_TOKEN: &str = "attr-unconfigured-token";
+
+/// Starts a server in `Mode::All` with both attribution-test tenants' tokens
+/// installed and `--metrics-tenant-labels` on, but only
+/// `ATTR_CONFIGURED_TENANT` present in `limits.tenants` -- the allowlist the
+/// attribution family folds against, the same set and gate
+/// `query_accounting` uses.
+async fn start_attribution_server() -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(
+        ATTR_CONFIGURED_TOKEN.to_string(),
+        TenantId::new(ATTR_CONFIGURED_TENANT),
+    );
+    tokens.insert(
+        ATTR_OTHER_TOKEN.to_string(),
+        TenantId::new(ATTR_OTHER_TENANT),
+    );
+    let mut tenants = HashMap::new();
+    tenants.insert(
+        TenantId::new(ATTR_CONFIGURED_TENANT),
+        AdmissionLimits::default(),
+    );
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let store = Arc::new(MemoryStore::new());
+    let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
+        query_budgets: Default::default(),
+        max_inflight_flushes: 1,
+        max_queued_flushes: 8,
+        adaptive_flush_delay: false,
+        max_flush_delay: std::time::Duration::from_secs(2),
+        max_flush_delay_idle: std::time::Duration::from_secs(40),
+        min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
+        mode: Mode::All,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        metrics_tenant_labels: true,
+        deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
+        scrub_period: std::time::Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
+        parquet_profiles: None,
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
+        cache_dir: None,
+        catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
+        distrib: None,
+        remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        limits: LimitsConfig {
+            defaults: ravel_server::config::limits::shipped_defaults(),
+            tenants,
+            ..LimitsConfig::default()
+        },
+    };
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
+}
+
+/// Drives one clean-admit metrics export per attribution tenant. Strict mode
+/// (the default: no `x-ravel-ingest-mode` header) blocks the response until
+/// the flush's commit-token ack, so a completed POST already guarantees
+/// `record_flush` -- and therefore this tenant's `TenantPutAttribution` entry
+/// -- has fired; no sleep or poll is needed to observe it on the next scrape.
+async fn drive_attribution_activity(base: &str) {
+    let client = reqwest::Client::new();
+    for token in [ATTR_CONFIGURED_TOKEN, ATTR_OTHER_TOKEN] {
+        let request = export_request(2, admission_now_ns());
+        let response = client
+            .post(format!("{base}/v1/metrics"))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/x-protobuf")
+            .body(request.encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes");
+        assert_eq!(
+            response.status(),
+            200,
+            "clean-admit attribution scenario must be admitted, not rejected"
+        );
+    }
+}
+
+/// Distinct `tenant_hash` label values across every
+/// `ravel_ingest_attribution_puts_total` sample line for `signal="metrics"`.
+fn attribution_tenant_hashes(body: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for line in body.lines() {
+        if !line.starts_with("ravel_ingest_attribution_puts_total{") {
+            continue;
+        }
+        if !line.contains("signal=\"metrics\"") {
+            continue;
+        }
+        let brace = line.find('{').expect("attribution sample carries labels");
+        let close = line.find('}').expect("closed label block");
+        for pair in line[brace + 1..close].split(',') {
+            if let Some(value) = pair.strip_prefix("tenant_hash=\"") {
+                out.insert(value.trim_end_matches('"').to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The soundness test for ADR-0076 decision 2 / #146: a tenant outside the
+/// `--metrics-tenant-labels` allowlist must never get its own `tenant_hash`
+/// series on the per-tenant PUT attribution family, no matter how much ingest
+/// traffic it drives through the real router -- it must fold into
+/// `tenant_hash="other"`, the same bounded-cardinality contract
+/// `query_accounting` and the admission family already hold on this
+/// unauthenticated route. This is written to fail against a naive
+/// unbounded-label implementation: an `attribution_rows` that always keeps
+/// `Some(entry.tenant)` regardless of `allowlist` would render
+/// `ATTR_OTHER_TENANT`'s real hash here instead of folding it, and the
+/// "no unlisted hash" assertion below would catch it.
+#[tokio::test]
+async fn attribution_family_folds_unconfigured_tenant_to_other() {
+    let running = start_attribution_server().await;
+    let base = format!("http://{}", running.http_addr);
+    drive_attribution_activity(&base).await;
+
+    let client = reqwest::Client::new();
+    let body = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+    running.shutdown().await.expect("graceful shutdown");
+
+    assert!(
+        body.contains("ravel_ingest_attribution_puts_total{"),
+        "attribution family must be present once ingest has flushed:\n{body}"
+    );
+
+    let hashes = attribution_tenant_hashes(&body);
+    let configured_hash = TenantId::new(ATTR_CONFIGURED_TENANT).hash().to_hex();
+    assert!(
+        hashes.contains(&configured_hash),
+        "the configured tenant must render its real hash:\n{body}"
+    );
+    assert!(
+        hashes.iter().all(|h| h == &configured_hash || h == "other"),
+        "an unconfigured tenant must never get its own tenant_hash series, only fold into \
+         \"other\", got {hashes:?}:\n{body}"
+    );
+    assert!(
+        hashes.contains("other"),
+        "the unconfigured tenant's traffic must actually appear folded into \"other\" -- \
+         without this, the two asserts above pass vacuously if the unconfigured tenant's \
+         PUTs never rendered at all, got {hashes:?}:\n{body}"
+    );
+}
+
+/// The three bucket-protection gauges reach a live scrape, each declared once
+/// with one sample. No test in this binary turns on
+/// `--require-bucket-protection`, so each reads the flag-off value 0.
+#[tokio::test]
+async fn bucket_protection_gauges_render_zero_with_the_flag_off() {
+    let running = start_test_server(Mode::All, u64::MAX, false).await;
+    let body = scrape(&running).await;
+    running.shutdown().await.expect("graceful shutdown");
+
+    for name in [
+        "ravel_bucket_protection_unknown",
+        "ravel_bucket_protection_conditions_failed",
+        "ravel_bucket_protection_conditions_unknown",
+    ] {
+        assert_eq!(
+            body.matches(&format!("# TYPE {name} gauge\n")).count(),
+            1,
+            "{name} must be declared exactly once:\n{body}"
+        );
+        assert_eq!(
+            mode_only_samples(&body, name),
+            vec![format!("{name}{{mode=\"all\"}} 0")],
+            "{name} must render one sample at 0:\n{body}"
+        );
+    }
+}
+
+/// Issue #1742: both new families must actually reach a live `GET /metrics`
+/// scrape, not just the in-process `render()` unit tests in
+/// `services/ravel-server/src/metrics.rs`. `ravel_ingest_flush_all_residue_tenants_total`
+/// is checked once per ingest signal, `ravel_shutdown_drain_overrun_total`
+/// once with no `signal` label (it is process-wide, not per pipeline). Counted
+/// exactly, not merely `contains`, for the same reason as the queued-flush
+/// test above: a family or sample emitted twice is a duplicate series a
+/// scrape rejects, and `contains` cannot tell a duplicate from a single line.
+///
+/// This test does not drive a real residue or overrun value (that is pinned,
+/// with exact distinct-per-signal numbers, by
+/// `flush_all_residue_renders_distinctly_for_every_signal` in `metrics.rs`
+/// and by `drain_overrun_counter_increments_exactly_once_on_a_real_overrun`
+/// in `graceful_shutdown_e2e.rs`); it only proves the rendering path a real
+/// scrape actually uses exposes both families at all, over HTTP, in the mode
+/// where the ingest families exist.
+#[tokio::test]
+async fn drain_overrun_and_residue_families_render() {
+    let running = start_test_server(Mode::All, u64::MAX, false).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let body = client
+        .get(format!("{base}/metrics"))
+        .send()
+        .await
+        .expect("metrics request completes")
+        .text()
+        .await
+        .expect("metrics body is text");
+
+    assert_eq!(
+        body.matches("# TYPE ravel_ingest_flush_all_residue_tenants_total counter")
+            .count(),
+        1,
+        "residue family must be declared exactly once:\n{body}"
+    );
+    for signal in ["metrics", "logs", "spans"] {
+        assert_eq!(
+            body.matches(&format!(
+                "ravel_ingest_flush_all_residue_tenants_total{{mode=\"all\",signal=\"{signal}\"}} "
+            ))
+            .count(),
+            1,
+            "residue family must render exactly one sample for signal {signal}:\n{body}"
+        );
+    }
+
+    assert_eq!(
+        body.matches("# TYPE ravel_shutdown_drain_overrun_total counter")
+            .count(),
+        1,
+        "overrun family must be declared exactly once:\n{body}"
+    );
+    assert_eq!(
+        body.matches("ravel_shutdown_drain_overrun_total{mode=\"all\"} ")
+            .count(),
+        1,
+        "overrun family must render exactly one sample, with no signal label:\n{body}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}

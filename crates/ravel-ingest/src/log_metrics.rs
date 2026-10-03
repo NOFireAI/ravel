@@ -1,0 +1,1302 @@
+//! Self-observability counters for the log pipeline, the log-side
+//! counterpart of [`crate::IngestMetrics`].
+//!
+//! # Counting convention
+//!
+//! Identical to [`crate::metrics`]'s, and worth restating because mixing the
+//! two timing conventions up misreads the numbers. Every counter here is a
+//! monotonic process-global total with **no per-shard and no per-tenant
+//! dimension**: a single [`LogIngestMetrics`] is constructed once by the log
+//! router and shared by every log shard actor through an `Arc`, so a value is
+//! the sum across all shards and all tenants of this process.
+//!
+//! - **Attempt-time.** [`record_flush`](LogIngestMetrics::record_flush) fires
+//!   when a flush is *opened*, before the RLOG build, the data-object PUT, or
+//!   the commit-record PUT. A flush later abandoned is counted in both
+//!   `flushes_by_*` **and** one of the `abandoned_*` counters. Flushes that
+//!   reached a durable commit are the three trigger counters summed, minus
+//!   `abandoned_retry_exhausted` and `abandoned_input_rejected`; the bare
+//!   trigger sum overcounts.
+//! - **Success-time.** `acks_ok`/`acks_err` are recorded when a flush's
+//!   strict waiters are acked, i.e. at the flush's terminal outcome. They
+//!   count strict-mode waiters only: a buffered-mode flush, or an age/size
+//!   flush with no strict waiter attached, records zero on both.
+//!
+//! `flushes_manual` covers every [`FlushTrigger::Manual`] flush: an explicit
+//! flush request, the shutdown drain, and the channel-close drop-path drain.
+//! It is not exclusively operator-requested flushes.
+//!
+//! Two field names differ from [`crate::IngestMetricsSnapshot`]'s, because
+//! the unit differs: `buffered_records_total` (a log unit is a record, not a
+//! sample) and `stream_id_collisions` (log identity is a stream, not a
+//! series). Everything else matches name for name and semantics for
+//! semantics.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use ravel_types::TenantHash;
+
+use crate::attribution::{TenantCount, TenantPutAttribution, TenantTopK};
+use crate::metrics::{FlushTrigger, ShardSkew, ShardSkewStats};
+
+#[derive(Debug, Default)]
+pub struct LogIngestMetrics {
+    /// Flushes opened because the tenant buffer reached `target_bytes`.
+    /// Attempt-time: incremented at flush open, so it includes flushes later
+    /// abandoned.
+    flushes_by_size: AtomicU64,
+    /// Flushes opened because the tenant buffer aged past `max_flush_delay`.
+    /// Attempt-time, same as `flushes_by_size`.
+    flushes_by_age: AtomicU64,
+    /// Flushes opened because a tenant buffer below a non-zero
+    /// `idle_flush_byte_floor` aged past the sub-floor hold,
+    /// `max_flush_lifetime` less one `flush_tick` ([`FlushTrigger::AgeFloor`],
+    /// ADR-1737 decision 6). Attempt-time.
+    flushes_by_age_floor: AtomicU64,
+    /// Flushes opened by any [`FlushTrigger::Manual`] path. Attempt-time.
+    flushes_manual: AtomicU64,
+    /// Retried PUT attempts across both the data-object and commit-record
+    /// paths. Excludes each path's first attempt.
+    put_retries: AtomicU64,
+    /// Flushes abandoned because a PUT exhausted its retry budget or
+    /// `max_flush_lifetime` elapsed while the flush's own store calls were in
+    /// flight ([`crate::LogWriteError::Abandoned`]). A durability signal about
+    /// the object store: the flush held a permit and its PUTs did not land in
+    /// time. Nothing was acknowledged and the whole write stays retryable.
+    /// Split from `abandoned_queue_deadline`, which never reached a store call.
+    abandoned_retry_exhausted: AtomicU64,
+    /// Flushes abandoned because their flush-open deadline elapsed while still
+    /// queued for a `max_inflight_flushes` permit, before any store call
+    /// ([`crate::LogWriteError::Abandoned`], issue #1739). A contention signal,
+    /// distinct from `abandoned_retry_exhausted` so a deadline reached in the
+    /// queue is not read as the store failing to accept a PUT.
+    abandoned_queue_deadline: AtomicU64,
+    /// Flushes abandoned because the input could not be turned into a durable
+    /// object at all: the RLOG build, data-key derivation, or commit-record
+    /// build failed ([`crate::LogWriteError::SegmentBuild`]). A client
+    /// signal: identical input will fail again, so the write is not
+    /// retryable.
+    abandoned_input_rejected: AtomicU64,
+    /// Cumulative bytes admitted into shard buffers at enqueue time.
+    buffered_bytes_total: AtomicU64,
+    /// Cumulative log record count admitted into shard buffers at enqueue
+    /// time.
+    buffered_records_total: AtomicU64,
+    /// Strict-mode waiters acked with a commit token (success-time). Zero for
+    /// buffered-mode and for flushes with no strict waiter.
+    acks_ok: AtomicU64,
+    /// Strict-mode waiters acked with a [`crate::LogWriteError`]
+    /// (success-time). Zero for buffered-mode and for flushes with no strict
+    /// waiter.
+    acks_err: AtomicU64,
+    /// Batches rejected because two records shared a `stream_id` under
+    /// different `stream_attrs` (the fail-loud collision check
+    /// `RlogWriter::finish()` performs).
+    stream_id_collisions: AtomicU64,
+    /// Flush-open stamps raised to this writer's monotonic floor because the
+    /// injected clock read below the previous stamp (ADR-1307), the log-pipeline
+    /// counterpart of [`crate::IngestMetrics`]'s own counter. Intended for
+    /// Prometheus export under the name `ravel_ingest_clock_regressions_total`
+    /// (#1473).
+    clock_regressions: AtomicU64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307): counted separately from
+    /// `clock_regressions` (absorbed). Intended for Prometheus export under the
+    /// name `ravel_ingest_clock_regressions_refused_total` (#1473).
+    clock_regressions_refused: AtomicU64,
+    /// Flushes refused because the raw flush-open reading lagged the object
+    /// store's observed clock by more than the clock-skew allowance (ADR-1685):
+    /// the writer's clock is slow enough to publish into a sealed ingest hour.
+    /// Intended for Prometheus export under the name
+    /// `ravel_ingest_clock_lag_refused_total`.
+    clock_lag_refused: AtomicU64,
+    /// Flush-open attempts that found no store-clock observation yet, so the
+    /// ADR-1685 lag check could not run and the flush proceeded unchecked. The
+    /// counter is cumulative and never resets, so the wiring-defect signal is a
+    /// value still GROWING past a process's first minute, not a nonzero one:
+    /// the attempts made before the first response was observed are expected,
+    /// and they stay in the total for the life of the process. Growth is a
+    /// wiring defect only against a store that observes a clock at all: a
+    /// `MemoryStore` reports none unless a test sets one, so on a deployment
+    /// backed by it this counter grows by design. Intended for
+    /// Prometheus export under the name
+    /// `ravel_ingest_clock_lag_unchecked_total`.
+    clock_lag_unchecked: AtomicU64,
+    /// Flush-open attempts on a teardown drain that found a lagging reading and
+    /// went on with the ADR-1685 check bypassed.
+    /// A lag refusal re-anchors nothing (unlike a regression refusal), so every
+    /// enforced pass of a drain reads the same lag and refuses again, and on a
+    /// `Shutdown` or channel-close drain the bypass passes run the flush anyway
+    /// rather than strand acknowledged buffered-mode rows (the ADR-1685
+    /// teardown amendment carries the argument). It counts the
+    /// bypass, not the publication: the ADR-1307 floor still applies on a
+    /// bypass pass. Those rows land in an ingest hour
+    /// the fold may already have sealed, invisible to token-less reads until a
+    /// HEAD rebuild, which is recoverable where the drop is not. Nonzero means a
+    /// writer was shut down with a lagging clock: fix the host clock, and rebuild
+    /// the catalog HEAD if a token-less read is missing the rows. Logged at WARN
+    /// beside this bump, naming the lag. Intended for Prometheus export under the
+    /// name `ravel_ingest_clock_lag_bypassed_at_shutdown_total`.
+    clock_lag_bypassed_at_shutdown: AtomicU64,
+    /// Tenants still buffered after a TEARDOWN `flush_all` (`Shutdown`, channel
+    /// close) exhausted its bounded retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect, logged at ERROR beside this bump. Residue on a
+    /// `FlushNow` drain is not counted here: the actor keeps running with those
+    /// tenants buffered, so the next trigger retries them and nothing is lost
+    /// (logged at WARN instead).
+    ///
+    /// An ADR-1685 lag refusal on its own never reaches here: a teardown
+    /// drain's bypass passes disable that check and publish
+    /// (`clock_lag_bypassed_at_shutdown`), so teardown residue takes
+    /// [`crate::MAX_FLUSH_ALL_PASSES`] consecutive backwards steps past the
+    /// hold bound on the bypass passes' own readings, which that constant and
+    /// the ADR-1685 teardown amendment spell out.
+    flush_all_residue_tenants: AtomicU64,
+    /// Multi-shard Strict writes that returned
+    /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
+    /// committed durably and at least one sibling then failed in the same
+    /// `write()` call. A nonzero value means some clients saw an error,
+    /// retryable exactly when the wrapped `LogWriteError` is, for data already
+    /// durable on the committed shards; a client that does retry re-ingests
+    /// those shards' records, and unlike the metrics pipeline logs have no
+    /// read-time dedup, so that retry duplicates them. An idempotency key does
+    /// not help here: a partial commit writes no marker (see
+    /// docs/consistency-model.md). The metrics and span pipelines keep the
+    /// same counter.
+    partial_writes: AtomicU64,
+    /// Writes refused at the flush deferral cap
+    /// ([`crate::LogWriteError::DeferralCapReached`]), the log-side copy of
+    /// [`crate::IngestMetrics`]'s counter of the same name.
+    deferral_cap_refused: AtomicU64,
+    /// Distinct log shard actors observed dead by the router: its send half
+    /// or a strict-mode ack found the shard channel closed, meaning the actor
+    /// task ended (e.g. panicked) without the router shutting it down.
+    /// Counted once per shard of each live shard-actor set on the first
+    /// observation, so it is bounded by the sum of those sets' shard counts
+    /// (one set per distinct active `shard_count`) and makes a permanently
+    /// degraded process observable.
+    shard_deaths: AtomicU64,
+    /// Shards condemned and no longer serving (issue #1691): a log shard is
+    /// condemned on its first death, so this moves with `shard_deaths`. The
+    /// counter to alert on; docs/ingest.md, Log pipeline, has the full rule.
+    shards_condemned: AtomicU64,
+    /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
+    /// the log-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
+    stale_provisioning_flushes: AtomicU64,
+    /// Flushes routed on a last-known-good provisioning view past the refresh
+    /// interval `C`, inside the bounded grace window, because the
+    /// provisioning re-read could not complete but the cached view's validity
+    /// horizon had not been crossed (`GenerationSwitch::try_grace_extend`).
+    /// Degraded, not failed: distinct from `stale_provisioning_flushes`, which
+    /// counts a flush that failed closed outright. A sustained rise here means
+    /// the store is slow/throttled and this router is degraded-but-available
+    /// rather than fleet-wide-outed; the log-pipeline counterpart of
+    /// `IngestMetrics::grace_extended_stale_flushes`.
+    grace_extended_stale_flushes: AtomicU64,
+    /// Flushes handed back instead of written outside the scan set of the hour
+    /// they pinned (ADR-1642 scan-set amendment), the log-pipeline counterpart
+    /// of `IngestMetrics::rerouted_flushes`.
+    rerouted_flushes: AtomicU64,
+    /// The counterpart of `IngestMetrics::hand_back_failures`.
+    hand_back_failures: AtomicU64,
+    /// The counterpart of `IngestMetrics::teardown_unscanned_writes`.
+    teardown_unscanned_writes: AtomicU64,
+    /// Flushes whose per-tenant indexed-field list resolved from a stale cached
+    /// value or a failed-re-read/validation fallback rather than a fresh durable
+    /// `TenantConfig` read this tick (ADR-0079 deliverable 6). Degraded, not
+    /// failed: the flush still indexes on the last-known-good or CLI-only list.
+    /// A sustained rise means a tenant's durable override is unreadable or
+    /// malformed and its override is silently not applying -- the exact
+    /// silent-gap class ADR-0079 exists to close, so it must be visible. Mirrors
+    /// `grace_extended_stale_flushes` (a snapshot-only counter, read via
+    /// [`LogIngestMetrics::snapshot`]).
+    indexed_fields_stale_fallbacks: AtomicU64,
+    /// Objects flushed carrying a non-empty POSTINGS section (ADR-0049). The denominator for average section bytes per indexed object; an
+    /// object whose resolved indexed-field list produced no section is not
+    /// counted here.
+    postings_objects: AtomicU64,
+    /// Cumulative encoded POSTINGS section bytes across every flushed object.
+    postings_bytes_total: AtomicU64,
+    /// Cumulative count of indexed fields that emitted a posting list, summed
+    /// over objects. The denominator for a mean distinct-per-field
+    /// (`postings_distinct_values_total / postings_indexed_fields_total`); no
+    /// per-field label is kept, which the ADR-0044 allowlist forbids.
+    postings_indexed_fields_total: AtomicU64,
+    /// Cumulative distinct-value count across every non-capped indexed field,
+    /// summed over objects.
+    postings_distinct_values_total: AtomicU64,
+    /// Indexed fields dropped from POSTINGS for exceeding the per-field
+    /// distinct-value cap (ADR-0049 decision 4), summed over objects.
+    postings_capped_fields_total: AtomicU64,
+    /// Distinct `(name, type)` pairs that received a real dynamic column,
+    /// summed over flushed objects (ADR-0100 decision 1).
+    dynamic_columns_used_total: AtomicU64,
+    /// Distinct `(name, type)` pairs that overflowed the `max_dynamic_columns`
+    /// budget and folded into `attrs_raw`, summed over flushed objects
+    /// (ADR-0100 decision 1). A sustained rise means loads are silently losing
+    /// columnar access to attributes past the budget.
+    dynamic_columns_overflowed_total: AtomicU64,
+    /// Largest `dynamic_columns_used` of any single flushed object seen so far
+    /// (a running maximum, not a sum). A total cannot show budget pressure
+    /// before the cap is crossed; this maximum can, so an operator sees a load
+    /// approaching `max_dynamic_columns` before any object overflows it
+    /// (ADR-0100 decision 1).
+    dynamic_columns_used_max: AtomicU64,
+    /// Per-shard count of flushes whose flush task has been spawned but has
+    /// not yet acked its waiters (ADR-0067 decisions 1-2, the log-pipeline
+    /// counterpart of [`crate::IngestMetrics`]'s own gauge), counted from the
+    /// moment the buffer leaves the actor: a task still waiting for its
+    /// `max_inflight_flushes` permit is included, because it holds a flush
+    /// window of memory and its ADR-0069 byte charge exactly as an executing
+    /// one does (ADR-1642). So this can exceed `max_inflight_flushes` per
+    /// shard: the bound caps concurrent execution, not how many flushes are
+    /// spawned and waiting. Keyed by shard
+    /// index; a shard with no flush in flight has no entry, equivalent to 0.
+    /// Not part of [`LogIngestMetricsSnapshot`]'s flat counters because it is a
+    /// gauge with a per-shard dimension, unlike everything else here; read it
+    /// via [`LogIngestMetrics::in_flight_flushes_by_shard`].
+    in_flight_flushes: Mutex<HashMap<u32, i64>>,
+    /// Per-shard flush counts split by the trigger that opened each flush
+    /// (issue #983), so two loads of the same input can be compared honestly:
+    /// object count is not a function of the command line (input order
+    /// concentrates consecutive rows on one shard, and the wall-clock age
+    /// trigger makes host speed change the layout), but the trigger mix that
+    /// produced it is. Recorded at flush open on the actor, alongside the
+    /// process-wide `flushes_by_*` counters, from the `FlushTrigger` the
+    /// decision site passed; the cause is never inferred after the fact. Carries
+    /// a per-shard dimension like `in_flight_flushes`, so it is read via
+    /// [`LogIngestMetrics::flush_trigger_mix_by_shard`] rather than folded into
+    /// the flat snapshot. A shard that never flushed is simply absent,
+    /// equivalent to an all-zero [`FlushTriggerMix`].
+    flush_trigger_mix: Mutex<HashMap<u32, FlushTriggerMix>>,
+    /// Per-shard ingest-skew accounting (issue #865), the log-pipeline
+    /// counterpart of [`crate::IngestMetrics`]'s own: message throughput and the
+    /// on-actor / flush-permit-wait / off-actor time split. Same accumulator
+    /// type, so the three spans mean exactly what [`ShardSkewStats`] documents.
+    ///
+    /// This is the metric that tells a bulk load which tier is the bottleneck:
+    /// a rising `flush_permit_wait_ns` says the per-shard
+    /// `max_inflight_flushes` window is binding, a rising `on_actor_ns` says the
+    /// single-threaded actor is, and a large `off_actor_ns` against a small
+    /// wall-clock share says the shard is idle between batches because nothing
+    /// upstream handed it work (issue #800).
+    ///
+    /// Preallocated by [`LogIngestMetrics::new`]; `default()` allocates none and
+    /// therefore records nothing, exactly as [`crate::IngestMetrics`] does.
+    shard_skew: ShardSkew,
+    /// Bounded-cardinality per-tenant PUT attribution (ADR-0076 decision 2),
+    /// the log-pipeline counterpart of [`crate::IngestMetrics`]'s own. Carries
+    /// a per-tenant dimension, so it stays bounded by a top-K cap rather than
+    /// an unbounded label, and is read via
+    /// [`LogIngestMetrics::tenant_put_attribution`] rather than folded into the
+    /// `Copy` snapshot. See [`crate::attribution`] for the policy.
+    put_attribution: TenantPutAttribution,
+    /// Per-tenant count of flushed objects written with no sort descriptor and
+    /// full bloom coverage because the tenant's stored clustering key or bloom
+    /// scope did not resolve (ADR-2135), intended for export as
+    /// `ingest_clustering_key_unresolved_total` labelled by tenant. Bounded
+    /// like `put_attribution` (ADR-0076 decision 2): the same top-K table, so
+    /// at most [`crate::MAX_TRACKED_TENANTS`] tenants carry a label, and the
+    /// tracked counts still sum to every unresolved flush recorded. Read via
+    /// [`LogIngestMetrics::clustering_key_unresolved_by_tenant`].
+    clustering_key_unresolved: TenantTopK,
+}
+
+/// Point-in-time copy of [`LogIngestMetrics`] for scraping. See the
+/// [module docs](self) for each field's timing convention.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogIngestMetricsSnapshot {
+    pub flushes_by_size: u64,
+    pub flushes_by_age: u64,
+    pub flushes_by_age_floor: u64,
+    pub flushes_manual: u64,
+    pub put_retries: u64,
+    pub abandoned_retry_exhausted: u64,
+    /// Flushes abandoned by their flush-open deadline while queued for a permit,
+    /// before any store call (issue #1739). Distinct from
+    /// `abandoned_retry_exhausted` (a store failure).
+    pub abandoned_queue_deadline: u64,
+    pub abandoned_input_rejected: u64,
+    pub buffered_bytes_total: u64,
+    pub buffered_records_total: u64,
+    pub acks_ok: u64,
+    pub acks_err: u64,
+    pub stream_id_collisions: u64,
+    /// Flush-open stamps raised to this writer's monotonic floor after a
+    /// backwards clock step (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_total` (#1473).
+    pub clock_regressions: u64,
+    /// Flushes refused because the backwards step exceeded the monotonic hold
+    /// bound (ADR-1307). Intended for export as
+    /// `ravel_ingest_clock_regressions_refused_total` (#1473).
+    pub clock_regressions_refused: u64,
+    /// Flushes refused because the raw flush-open reading lagged the store's
+    /// observed clock beyond the clock-skew allowance (ADR-1685). Intended for
+    /// export as `ravel_ingest_clock_lag_refused_total`.
+    pub clock_lag_refused: u64,
+    /// Flush-open attempts made before any store-clock observation, so the
+    /// ADR-1685 lag check did not run. Intended for export as
+    /// `ravel_ingest_clock_lag_unchecked_total`.
+    pub clock_lag_unchecked: u64,
+    /// Flush-open attempts a teardown drain made with the ADR-1685 lag check
+    /// bypassed, rather than strand acknowledged buffered-mode rows the check
+    /// refuses on every enforced pass. Counts the bypass, not the publication:
+    /// the ADR-1307 floor still applies to such an attempt and can refuse it,
+    /// in which case a later bypass pass publishes. Intended for export as
+    /// `ravel_ingest_clock_lag_bypassed_at_shutdown_total`.
+    pub clock_lag_bypassed_at_shutdown: u64,
+    /// Tenants left buffered after a teardown `flush_all` (`Shutdown`, channel
+    /// close) exhausted its retry passes (ADR-1307 finding F1): a lost
+    /// acknowledged buffered-mode write on a graceful teardown. Nonzero is a
+    /// durability defect. A `FlushNow` drain does not bump it (the actor keeps
+    /// running and retries the residue).
+    pub flush_all_residue_tenants: u64,
+    /// Multi-shard Strict writes returned as
+    /// [`crate::LogWriteError::PartialWrite`] (issue #1130): a partial
+    /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
+    pub partial_writes: u64,
+    /// Writes refused at the flush deferral cap. Exported as
+    /// `ravel_ingest_deferral_cap_refused_total`.
+    pub deferral_cap_refused: u64,
+    pub shard_deaths: u64,
+    /// Shards condemned on their first death (issue #1691; docs/ingest.md, Log
+    /// pipeline). Exported as `ravel_ingest_shards_condemned_total`.
+    pub shards_condemned: u64,
+    pub stale_provisioning_flushes: u64,
+    pub grace_extended_stale_flushes: u64,
+    /// Flushes handed back instead of written outside the scan set (ADR-1642
+    /// scan-set amendment).
+    pub rerouted_flushes: u64,
+    /// Hand-back episodes that left rows in the source buffer because a
+    /// target shard was not live. Exported as
+    /// `ravel_ingest_hand_back_failures_total`.
+    pub hand_back_failures: u64,
+    /// Teardown flushes written in place outside the scan set. Exported as
+    /// `ravel_ingest_teardown_unscanned_writes_total`.
+    pub teardown_unscanned_writes: u64,
+    pub indexed_fields_stale_fallbacks: u64,
+    pub postings_objects: u64,
+    pub postings_bytes_total: u64,
+    pub postings_indexed_fields_total: u64,
+    pub postings_distinct_values_total: u64,
+    pub postings_capped_fields_total: u64,
+    pub dynamic_columns_used_total: u64,
+    pub dynamic_columns_overflowed_total: u64,
+    pub dynamic_columns_used_max: u64,
+    /// Sum across shards of [`LogIngestMetrics::in_flight_flushes_by_shard`] at
+    /// snapshot time. The per-shard breakdown does not fit this struct's flat
+    /// Copy shape; call `in_flight_flushes_by_shard` directly for that.
+    pub in_flight_flushes_total: u64,
+    /// Sum across shards of `flush_permit_wait_ns` from
+    /// [`LogIngestMetrics::shard_skew_by_shard`] at snapshot time: total
+    /// injected-`Clock` nanoseconds every flush task has spent waiting on its
+    /// shard's `max_inflight_flushes` semaphore. The per-shard breakdown does
+    /// not fit this struct's flat Copy shape; call `shard_skew_by_shard`
+    /// directly for that.
+    pub flush_permit_wait_ns_total: u64,
+    /// Sum across shards of `flushes_queued` from
+    /// [`LogIngestMetrics::shard_skew_by_shard`] at snapshot time: flush tasks
+    /// spawned and not yet reaped, the quantity
+    /// [`crate::IngestConfig::max_queued_flushes`] caps per shard (issue
+    /// #1740). A gauge, so this sum is point-in-time and can fall. It can read
+    /// above `shard_count * max_queued_flushes`: a buffer over its memory
+    /// backstop spawns past the cap. The per-shard breakdown does not fit this
+    /// struct's flat Copy shape; call `shard_skew_by_shard` directly for that.
+    pub flushes_queued_total: u64,
+    /// Sum across shards of `flush_trigger_deferred` from
+    /// [`LogIngestMetrics::shard_skew_by_shard`] at snapshot time: size and age
+    /// flush triggers refused because the shard was already at
+    /// `max_queued_flushes` (issue #1740). Cumulative. The per-shard breakdown
+    /// does not fit this struct's flat Copy shape; call `shard_skew_by_shard`
+    /// directly for that.
+    pub flush_trigger_deferred_total: u64,
+}
+
+/// One shard's flush count split by the trigger that opened each flush (issue
+/// #983). The three causes are disjoint and every flush lands in exactly one,
+/// so [`FlushTriggerMix::total`] equals the shard's flushes-opened count. Read
+/// via [`LogIngestMetrics::flush_trigger_mix_by_shard`].
+///
+/// Attempt-time, like the process-wide `flushes_by_*` counters: a flush is
+/// counted here when it is opened, so one later abandoned still counts. On a
+/// load that abandons nothing, the per-shard total equals the objects the shard
+/// wrote, and the sum across shards equals the load's object count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlushTriggerMix {
+    /// Flushes opened because the tenant buffer reached `target_bytes`
+    /// ([`FlushTrigger::Size`]).
+    pub size: u64,
+    /// Flushes opened because the tenant buffer aged past `max_flush_delay`
+    /// ([`FlushTrigger::Age`], and the metrics-only [`FlushTrigger::AgeAdaptive`]
+    /// the log actor never raises) or, below a non-zero `idle_flush_byte_floor`,
+    /// past the sub-floor hold ([`FlushTrigger::AgeFloor`]). The process-wide
+    /// counters keep the floor case apart as `flushes_by_age_floor`.
+    pub age: u64,
+    /// Flushes opened by the final drain at close: a [`FlushTrigger::Manual`]
+    /// shutdown drain, channel-close drain, or explicit flush request.
+    pub final_drain: u64,
+}
+
+impl FlushTriggerMix {
+    /// The shard's flushes-opened count, the sum of the three disjoint causes.
+    pub fn total(&self) -> u64 {
+        self.size + self.age + self.final_drain
+    }
+}
+
+impl LogIngestMetrics {
+    /// Metrics for a log router whose generation-0 set has `shard_count`
+    /// shards. Preallocates the lock-free per-shard skew accumulators (issue
+    /// #865) so the per-message path indexes straight into the slice with no
+    /// lock; see [`crate::metrics::SHARD_SKEW_CAPACITY`] for why the capacity is
+    /// not `shard_count`.
+    ///
+    /// `LogIngestMetrics::default()` allocates none, matching
+    /// [`crate::IngestMetrics::default`], which suits the tests and sinks that
+    /// never read the per-shard counters.
+    pub fn new(shard_count: u32) -> Self {
+        LogIngestMetrics {
+            shard_skew: ShardSkew::with_capacity(shard_count),
+            ..Default::default()
+        }
+    }
+
+    /// One `Write`/`WriteColumnar` message sent by the router into shard
+    /// `shard`'s channel (issue #865). Enqueue-time, so
+    /// `messages_enqueued - messages_processed` is the depth still in the
+    /// channel.
+    pub(crate) fn record_shard_enqueued(&self, shard: u32) {
+        self.shard_skew.record_enqueued(shard);
+    }
+
+    /// One write message pulled and handled by shard `shard`'s actor, plus the
+    /// injected-`Clock` nanoseconds the actor spent handling it, excluding both
+    /// the flush that runs off the actor and any flush-permit wait nested inside
+    /// the call.
+    pub(crate) fn record_shard_processed(&self, shard: u32, on_actor_ns: u64) {
+        self.shard_skew.record_processed(shard, on_actor_ns);
+    }
+
+    /// One flush trigger's injected-`Clock` wait on shard `shard`'s
+    /// `max_inflight_flushes` semaphore (ADR-0067 decision 2). This is the
+    /// figure that says whether the per-shard flush window is the binding
+    /// concurrency bound: at `max_inflight_flushes` it accrues, below it, it
+    /// stays at zero however slow the flushes are.
+    pub(crate) fn record_shard_flush_permit_wait_ns(&self, shard: u32, wait_ns: u64) {
+        self.shard_skew.record_flush_permit_wait_ns(shard, wait_ns);
+    }
+
+    /// One completed flush task's injected-`Clock` nanoseconds (encode plus both
+    /// PUTs), attributed to the shard it flushed. Bracketed inside the spawned
+    /// task with the permit already held, so it re-counts neither `on_actor_ns`
+    /// nor the permit wait that preceded the spawn.
+    pub(crate) fn record_shard_off_actor_ns(&self, shard: u32, off_actor_ns: u64) {
+        self.shard_skew.record_off_actor_ns(shard, off_actor_ns);
+    }
+
+    /// Shard `shard`'s current spawned-but-unreaped flush-task count, the
+    /// quantity `IngestConfig::max_queued_flushes` caps (issue #1740).
+    /// Published by the shard actor wherever its flush set changes length, so
+    /// the gauge reflects what the next trigger will be tested against.
+    pub(crate) fn record_shard_flushes_queued(&self, shard: u32, queued: u64) {
+        self.shard_skew.record_flushes_queued(shard, queued);
+    }
+
+    /// One size or age flush trigger refused because shard `shard` was already
+    /// at its queued-flush cap (issue #1740). The rows stay buffered for the
+    /// next tick.
+    pub(crate) fn record_shard_flush_trigger_deferred(&self, shard: u32) {
+        self.shard_skew.record_flush_trigger_deferred(shard);
+    }
+
+    /// Point-in-time per-shard skew figures, sorted by shard index (issue #865),
+    /// the log counterpart of [`crate::IngestMetrics::shard_skew_by_shard`]. A
+    /// shard with no recorded activity is simply absent.
+    pub fn shard_skew_by_shard(&self) -> Vec<(u32, ShardSkewStats)> {
+        self.shard_skew.by_shard()
+    }
+
+    pub(crate) fn record_flush(&self, shard: u32, trigger: FlushTrigger) {
+        let counter = match trigger {
+            FlushTrigger::Size => &self.flushes_by_size,
+            // The log shard actor has no adaptive-delay trigger of its own
+            // (ADR-0067 decisions 1-3 scope to the metrics pipeline only);
+            // this arm exists only so the shared `FlushTrigger` enum stays
+            // exhaustive here, and is never reached from this actor.
+            FlushTrigger::Age | FlushTrigger::AgeAdaptive => &self.flushes_by_age,
+            FlushTrigger::AgeFloor => &self.flushes_by_age_floor,
+            FlushTrigger::Manual => &self.flushes_manual,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+
+        // Per-shard split (issue #983), from the same `trigger` the process-wide
+        // counter above used, so the two can never disagree on the cause.
+        let mut map = self
+            .flush_trigger_mix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(shard).or_default();
+        match trigger {
+            FlushTrigger::Size => entry.size += 1,
+            FlushTrigger::Age | FlushTrigger::AgeAdaptive | FlushTrigger::AgeFloor => {
+                entry.age += 1
+            }
+            FlushTrigger::Manual => entry.final_drain += 1,
+        }
+    }
+
+    /// Point-in-time per-shard flush trigger mix, sorted by shard index (issue
+    /// #983). A shard that never flushed is absent, equivalent to an all-zero
+    /// [`FlushTriggerMix`]. This is the honest comparison basis between two
+    /// loads of the same input, which the raw object count is not.
+    pub fn flush_trigger_mix_by_shard(&self) -> Vec<(u32, FlushTriggerMix)> {
+        let map = self
+            .flush_trigger_mix
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut mix: Vec<(u32, FlushTriggerMix)> = map.iter().map(|(&s, &m)| (s, m)).collect();
+        mix.sort_unstable_by_key(|&(shard, _)| shard);
+        mix
+    }
+
+    /// Attribute one completed flush's PUTs to `tenant` (success-time,
+    /// ADR-0076 decision 2). Called from the terminal success path of
+    /// `log_shard.rs`'s `run_flush`, after both PUTs have landed.
+    pub(crate) fn record_flush_puts(&self, tenant: TenantHash) {
+        self.put_attribution.record_flush(tenant);
+    }
+
+    /// The bounded-cardinality per-tenant PUT attribution (ADR-0076 decision
+    /// 2). Reachable from `LogIngestRouter` through
+    /// [`crate::LogIngestRouter::metrics`].
+    pub fn tenant_put_attribution(&self) -> &TenantPutAttribution {
+        &self.put_attribution
+    }
+
+    pub(crate) fn record_put_retry(&self) {
+        self.put_retries.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned by retry-budget or lifetime exhaustion while its own
+    /// store calls were in flight ([`crate::LogWriteError::Abandoned`]): a
+    /// durability signal, retryable.
+    pub(crate) fn record_abandoned_retry_exhausted(&self) {
+        self.abandoned_retry_exhausted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned because its flush-open deadline elapsed while it was
+    /// queued for a permit, before any store call
+    /// ([`crate::LogWriteError::Abandoned`], issue #1739): a contention signal,
+    /// retryable.
+    pub(crate) fn record_abandoned_queue_deadline(&self) {
+        self.abandoned_queue_deadline
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A flush abandoned because the input could not be built into a durable
+    /// object ([`crate::LogWriteError::SegmentBuild`]): a client signal, not
+    /// retryable.
+    pub(crate) fn record_abandoned_input_rejected(&self) {
+        self.abandoned_input_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_buffered(&self, bytes: u64, records: u64) {
+        self.buffered_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+        self.buffered_records_total
+            .fetch_add(records, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_acks(&self, count: usize, ok: bool) {
+        let counter = if ok { &self.acks_ok } else { &self.acks_err };
+        counter.fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_stream_id_collision(&self) {
+        self.stream_id_collisions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush whose flush-open stamp was raised to this writer's monotonic
+    /// floor because the clock read below the previous stamp (ADR-1307).
+    pub(crate) fn record_clock_regression(&self) {
+        self.clock_regressions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush refused because the backwards step exceeded the monotonic hold
+    /// bound `MAX_FLUSH_CLOCK_HOLD_NS` (ADR-1307).
+    pub(crate) fn record_clock_regression_refused(&self) {
+        self.clock_regressions_refused
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush refused because its raw reading lagged the store's observed
+    /// clock beyond the clock-skew allowance (ADR-1685).
+    pub(crate) fn record_clock_lag_refused(&self) {
+        self.clock_lag_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush-open attempt that found no store-clock observation, so the
+    /// ADR-1685 lag check did not run.
+    pub(crate) fn record_clock_lag_unchecked(&self) {
+        self.clock_lag_unchecked.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush-open attempt a teardown drain made with the ADR-1685 lag
+    /// check bypassed, so acknowledged buffered-mode rows were not stranded.
+    /// The ADR-1307 floor still applies to that attempt, so this counts the
+    /// bypass rather than a publication; a floor refusal there re-anchors the
+    /// floor and the next bypass pass publishes.
+    pub(crate) fn record_clock_lag_bypassed_at_shutdown(&self) {
+        self.clock_lag_bypassed_at_shutdown
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `count` tenants still buffered after a teardown `flush_all` drained
+    /// (ADR-1307 finding F1). Called once per teardown drain that leaves a
+    /// residue; never from the `FlushNow` drain, which retries its residue on
+    /// the next trigger.
+    pub(crate) fn record_flush_all_residue(&self, count: u64) {
+        self.flush_all_residue_tenants
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// One multi-shard Strict write returned as
+    /// [`crate::LogWriteError::PartialWrite`] (issue #1130): at least one shard
+    /// committed durably before a sibling failed. Recorded once per such write,
+    /// at the router's error construction site.
+    pub(crate) fn record_partial_write(&self) {
+        self.partial_writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One write refused at the flush deferral cap.
+    pub(crate) fn record_deferral_cap_refused(&self) {
+        self.deferral_cap_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_shard_death(&self) {
+        self.shard_deaths.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One shard condemned (issue #1691; docs/ingest.md, Log pipeline). Called
+    /// once per shard beside [`Self::record_shard_death`], with the same dedup.
+    pub(crate) fn record_shard_condemned(&self) {
+        self.shards_condemned.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Shards condemned so far in this process (issue #1691). A direct atomic
+    /// load, the value [`crate::LogIngestRouter::ready`] tests against zero.
+    pub fn condemned_shards(&self) -> u64 {
+        self.shards_condemned.load(Ordering::Relaxed)
+    }
+
+    /// Adjusts shard `shard`'s in-flight-flush gauge by `delta`. Both deltas
+    /// belong to `log_shard`'s `InFlightFlushGuard`: +1 in its constructor, -1
+    /// in its `Drop`, including on panic. Nothing else may call this, or the
+    /// two can disagree. Poison recovery rather than a panic
+    /// on a poisoned lock: a gauge is best-effort self-observability, not a
+    /// durability path, so a prior panicked holder must not take this one down
+    /// with it.
+    pub(crate) fn record_inflight_flush_delta(&self, shard: u32, delta: i64) {
+        let mut map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = map.entry(shard).or_insert(0);
+        *entry += delta;
+    }
+
+    /// Point-in-time per-shard in-flight-flush counts, sorted by shard index.
+    /// A shard with none in flight is simply absent, equivalent to 0.
+    pub fn in_flight_flushes_by_shard(&self) -> Vec<(u32, u64)> {
+        let map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut counts: Vec<(u32, u64)> = map
+            .iter()
+            .map(|(&shard, &count)| (shard, count.max(0) as u64))
+            .collect();
+        counts.sort_unstable_by_key(|&(shard, _)| shard);
+        counts
+    }
+
+    /// Shard `shard`'s raw signed in-flight-flush count, before the clamp
+    /// [`LogIngestMetrics::in_flight_flushes_by_shard`] applies on read. Tests
+    /// only: the clamp is what hides an unbalanced increment/decrement pair
+    /// from the public reader, so a test that the pair cannot come apart has
+    /// to see the sign.
+    #[cfg(test)]
+    pub(crate) fn in_flight_flushes_signed(&self, shard: u32) -> i64 {
+        let map = self
+            .in_flight_flushes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.get(&shard).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn record_stale_provisioning_flush(&self) {
+        self.stale_provisioning_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_grace_extended_stale_flush(&self) {
+        self.grace_extended_stale_flushes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush handed back instead of written outside the scan set
+    /// (ADR-1642 scan-set amendment).
+    pub(crate) fn record_rerouted_flush(&self) {
+        self.rerouted_flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flushes handed back so far, read by the router's drain.
+    pub(crate) fn rerouted_flushes(&self) -> u64 {
+        self.rerouted_flushes.load(Ordering::Relaxed)
+    }
+
+    /// One hand-back episode that kept rows in the source buffer because a
+    /// target shard was not live.
+    pub(crate) fn record_hand_back_failure(&self) {
+        self.hand_back_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One teardown flush written in place outside the scan set.
+    pub(crate) fn record_teardown_unscanned_write(&self) {
+        self.teardown_unscanned_writes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush resolved its indexed-field list from a stale cached value or a
+    /// failed-re-read/validation fallback rather than a fresh durable read
+    /// (ADR-0079 deliverable 6). Called from `run_flush` on the overlay's
+    /// fallback arm, mirroring [`Self::record_grace_extended_stale_flush`].
+    pub(crate) fn record_indexed_fields_stale_fallback(&self) {
+        self.indexed_fields_stale_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flush for `tenant` resolved its storage layout to the unkeyed
+    /// default (no sort descriptor, full bloom coverage) because the stored
+    /// layout did not resolve (ADR-2135). Called from `run_flush` at
+    /// resolution, before the object is encoded, so a flush that later fails
+    /// to encode or PUT still counts.
+    pub(crate) fn record_clustering_key_unresolved(&self, tenant: TenantHash) {
+        self.clustering_key_unresolved.record(tenant, 1);
+    }
+
+    /// Point-in-time per-tenant unresolved-layout flush counts, sorted by
+    /// tenant hash. A tenant with no unresolved flush is absent, and at most
+    /// [`crate::MAX_TRACKED_TENANTS`] tenants are present; a tenant admitted by
+    /// evicting another carries the evicted count in its `error` bound.
+    pub fn clustering_key_unresolved_by_tenant(&self) -> Vec<TenantCount> {
+        let mut counts = self.clustering_key_unresolved.counts();
+        counts.sort_unstable_by_key(|c| c.tenant);
+        counts
+    }
+
+    /// Fold one flushed object's write-side POSTINGS counters
+    /// ([`ravel_logseg::writer::WriteStats`]) into the cumulative totals
+    /// (ADR-0049). An object with no POSTINGS section
+    /// (`postings_bytes == 0`) still records here: it moves no counter, so an
+    /// unindexed tenant leaves every total untouched. Unlike the single-counter
+    /// `record_*` methods this moves several counters at once, one per field of
+    /// the stats.
+    pub(crate) fn record_postings(&self, stats: ravel_logseg::writer::WriteStats) {
+        if stats.postings_bytes > 0 {
+            self.postings_objects.fetch_add(1, Ordering::Relaxed);
+        }
+        self.postings_bytes_total
+            .fetch_add(stats.postings_bytes, Ordering::Relaxed);
+        self.postings_indexed_fields_total
+            .fetch_add(u64::from(stats.postings_indexed_fields), Ordering::Relaxed);
+        self.postings_distinct_values_total
+            .fetch_add(stats.postings_distinct_total, Ordering::Relaxed);
+        self.postings_capped_fields_total
+            .fetch_add(u64::from(stats.postings_capped_fields), Ordering::Relaxed);
+        // Dynamic-column budget (ADR-0100 decision 1). Folded for every object,
+        // not only POSTINGS-carrying ones: an object with no indexed field
+        // still assigns dynamic columns and can overflow the budget. The used
+        // count also feeds a running maximum, which shows budget pressure
+        // before any object crosses the cap.
+        self.dynamic_columns_used_total
+            .fetch_add(u64::from(stats.dynamic_columns_used), Ordering::Relaxed);
+        self.dynamic_columns_overflowed_total.fetch_add(
+            u64::from(stats.dynamic_columns_overflowed),
+            Ordering::Relaxed,
+        );
+        self.dynamic_columns_used_max
+            .fetch_max(u64::from(stats.dynamic_columns_used), Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> LogIngestMetricsSnapshot {
+        let skew = self.shard_skew_by_shard();
+        LogIngestMetricsSnapshot {
+            flushes_by_size: self.flushes_by_size.load(Ordering::Relaxed),
+            flushes_by_age: self.flushes_by_age.load(Ordering::Relaxed),
+            flushes_by_age_floor: self.flushes_by_age_floor.load(Ordering::Relaxed),
+            flushes_manual: self.flushes_manual.load(Ordering::Relaxed),
+            put_retries: self.put_retries.load(Ordering::Relaxed),
+            abandoned_retry_exhausted: self.abandoned_retry_exhausted.load(Ordering::Relaxed),
+            abandoned_queue_deadline: self.abandoned_queue_deadline.load(Ordering::Relaxed),
+            abandoned_input_rejected: self.abandoned_input_rejected.load(Ordering::Relaxed),
+            buffered_bytes_total: self.buffered_bytes_total.load(Ordering::Relaxed),
+            buffered_records_total: self.buffered_records_total.load(Ordering::Relaxed),
+            acks_ok: self.acks_ok.load(Ordering::Relaxed),
+            acks_err: self.acks_err.load(Ordering::Relaxed),
+            stream_id_collisions: self.stream_id_collisions.load(Ordering::Relaxed),
+            clock_regressions: self.clock_regressions.load(Ordering::Relaxed),
+            clock_regressions_refused: self.clock_regressions_refused.load(Ordering::Relaxed),
+            clock_lag_refused: self.clock_lag_refused.load(Ordering::Relaxed),
+            clock_lag_unchecked: self.clock_lag_unchecked.load(Ordering::Relaxed),
+            clock_lag_bypassed_at_shutdown: self
+                .clock_lag_bypassed_at_shutdown
+                .load(Ordering::Relaxed),
+            flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
+            partial_writes: self.partial_writes.load(Ordering::Relaxed),
+            deferral_cap_refused: self.deferral_cap_refused.load(Ordering::Relaxed),
+            shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
+            shards_condemned: self.shards_condemned.load(Ordering::Relaxed),
+            stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
+            grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
+            hand_back_failures: self.hand_back_failures.load(Ordering::Relaxed),
+            teardown_unscanned_writes: self.teardown_unscanned_writes.load(Ordering::Relaxed),
+            indexed_fields_stale_fallbacks: self
+                .indexed_fields_stale_fallbacks
+                .load(Ordering::Relaxed),
+            postings_objects: self.postings_objects.load(Ordering::Relaxed),
+            postings_bytes_total: self.postings_bytes_total.load(Ordering::Relaxed),
+            postings_indexed_fields_total: self
+                .postings_indexed_fields_total
+                .load(Ordering::Relaxed),
+            postings_distinct_values_total: self
+                .postings_distinct_values_total
+                .load(Ordering::Relaxed),
+            postings_capped_fields_total: self.postings_capped_fields_total.load(Ordering::Relaxed),
+            dynamic_columns_used_total: self.dynamic_columns_used_total.load(Ordering::Relaxed),
+            dynamic_columns_overflowed_total: self
+                .dynamic_columns_overflowed_total
+                .load(Ordering::Relaxed),
+            dynamic_columns_used_max: self.dynamic_columns_used_max.load(Ordering::Relaxed),
+            in_flight_flushes_total: self
+                .in_flight_flushes_by_shard()
+                .into_iter()
+                .map(|(_, count)| count)
+                .sum(),
+            flush_permit_wait_ns_total: skew
+                .iter()
+                .map(|(_, stats)| stats.flush_permit_wait_ns)
+                .sum(),
+            flushes_queued_total: skew.iter().map(|(_, stats)| stats.flushes_queued).sum(),
+            flush_trigger_deferred_total: skew
+                .iter()
+                .map(|(_, stats)| stats.flush_trigger_deferred)
+                .sum(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-0076 decision 2: more tenants than the top-K cap, each with one
+    /// unresolved flush, leave exactly the cap's worth of labelled series, and
+    /// the tracked counts still sum to every flush recorded.
+    #[test]
+    fn unresolved_layout_counts_stay_bounded_and_keep_the_total() {
+        let metrics = LogIngestMetrics::default();
+        let extra = 5;
+        let tenants = crate::MAX_TRACKED_TENANTS + extra;
+        for i in 0..tenants {
+            let mut hash = [0u8; 16];
+            hash[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            metrics.record_clustering_key_unresolved(TenantHash(hash));
+        }
+        let counts = metrics.clustering_key_unresolved_by_tenant();
+        assert_eq!(counts.len(), crate::MAX_TRACKED_TENANTS);
+        assert_eq!(
+            counts.iter().map(|c| c.count).sum::<u64>(),
+            tenants as u64,
+            "every recorded flush stays in the tracked total"
+        );
+        // Each of the `extra` newcomers evicted a count-1 entry and inherited
+        // it; every other entry is exact.
+        let inherited: Vec<&TenantCount> = counts.iter().filter(|c| c.error > 0).collect();
+        assert_eq!(inherited.len(), extra);
+        assert!(inherited.iter().all(|c| c.count == 2 && c.error == 1));
+        assert_eq!(
+            metrics.tenant_put_attribution().tracked_len(),
+            0,
+            "the unresolved table is its own, not the PUT attribution"
+        );
+    }
+
+    #[test]
+    fn fresh_snapshot_is_all_zeros() {
+        assert_eq!(
+            LogIngestMetrics::default().snapshot(),
+            LogIngestMetricsSnapshot::default()
+        );
+    }
+
+    /// Each `record_*` call must move exactly one counter. The test records
+    /// one call against a fresh instance and compares the whole snapshot with
+    /// the expected one, so an increment leaking into a second counter fails
+    /// here rather than being read as a plausible number later.
+    fn assert_only(record: impl FnOnce(&LogIngestMetrics), expected: LogIngestMetricsSnapshot) {
+        let metrics = LogIngestMetrics::default();
+        record(&metrics);
+        assert_eq!(metrics.snapshot(), expected);
+    }
+
+    #[test]
+    fn each_record_method_increments_only_its_own_counter() {
+        assert_only(
+            |m| m.record_flush(0, FlushTrigger::Size),
+            LogIngestMetricsSnapshot {
+                flushes_by_size: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush(0, FlushTrigger::Age),
+            LogIngestMetricsSnapshot {
+                flushes_by_age: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush(0, FlushTrigger::Manual),
+            LogIngestMetricsSnapshot {
+                flushes_manual: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_put_retry,
+            LogIngestMetricsSnapshot {
+                put_retries: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_abandoned_retry_exhausted,
+            LogIngestMetricsSnapshot {
+                abandoned_retry_exhausted: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_abandoned_queue_deadline,
+            LogIngestMetricsSnapshot {
+                abandoned_queue_deadline: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_abandoned_input_rejected,
+            LogIngestMetricsSnapshot {
+                abandoned_input_rejected: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_stream_id_collision,
+            LogIngestMetricsSnapshot {
+                stream_id_collisions: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_regression,
+            LogIngestMetricsSnapshot {
+                clock_regressions: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_regression_refused,
+            LogIngestMetricsSnapshot {
+                clock_regressions_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_lag_refused,
+            LogIngestMetricsSnapshot {
+                clock_lag_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_lag_unchecked,
+            LogIngestMetricsSnapshot {
+                clock_lag_unchecked: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_clock_lag_bypassed_at_shutdown,
+            LogIngestMetricsSnapshot {
+                clock_lag_bypassed_at_shutdown: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_flush_all_residue(3),
+            LogIngestMetricsSnapshot {
+                flush_all_residue_tenants: 3,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_partial_write,
+            LogIngestMetricsSnapshot {
+                partial_writes: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_deferral_cap_refused,
+            LogIngestMetricsSnapshot {
+                deferral_cap_refused: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_shard_death,
+            LogIngestMetricsSnapshot {
+                shard_deaths: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_shard_condemned,
+            LogIngestMetricsSnapshot {
+                shards_condemned: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_indexed_fields_stale_fallback,
+            LogIngestMetricsSnapshot {
+                indexed_fields_stale_fallbacks: 1,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn buffered_and_acks_record_their_own_pairs() {
+        // record_buffered moves both buffered counters and nothing else; the
+        // ack counters split by outcome.
+        assert_only(
+            |m| m.record_buffered(100, 3),
+            LogIngestMetricsSnapshot {
+                buffered_bytes_total: 100,
+                buffered_records_total: 3,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_acks(2, true),
+            LogIngestMetricsSnapshot {
+                acks_ok: 2,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            |m| m.record_acks(1, false),
+            LogIngestMetricsSnapshot {
+                acks_err: 1,
+                ..Default::default()
+            },
+        );
+        // record_postings folds a whole WriteStats into the postings totals and
+        // touches nothing else. An object carrying a section increments the
+        // object count; its distinct counts and capped-field count add through.
+        assert_only(
+            |m| {
+                m.record_postings(ravel_logseg::writer::WriteStats {
+                    postings_capped_fields: 1,
+                    postings_bytes: 512,
+                    postings_indexed_fields: 3,
+                    postings_distinct_total: 40,
+                    postings_distinct_max: 25,
+                    dynamic_columns_used: 7,
+                    dynamic_columns_overflowed: 2,
+                    #[cfg(feature = "stage-timing")]
+                    bloom_total_ns: 0,
+                    #[cfg(feature = "stage-timing")]
+                    bloom_blocks: 0,
+                })
+            },
+            LogIngestMetricsSnapshot {
+                postings_objects: 1,
+                postings_bytes_total: 512,
+                postings_indexed_fields_total: 3,
+                postings_distinct_values_total: 40,
+                postings_capped_fields_total: 1,
+                dynamic_columns_used_total: 7,
+                dynamic_columns_overflowed_total: 2,
+                dynamic_columns_used_max: 7,
+                ..Default::default()
+            },
+        );
+        // An object with no section (bytes 0) moves no counter, not even the
+        // object count.
+        assert_only(
+            |m| m.record_postings(ravel_logseg::writer::WriteStats::default()),
+            LogIngestMetricsSnapshot::default(),
+        );
+    }
+
+    #[test]
+    fn counters_accumulate_across_calls() {
+        let metrics = LogIngestMetrics::default();
+        metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_buffered(10, 1);
+        metrics.record_buffered(5, 2);
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_age, 2);
+        assert_eq!(snap.buffered_bytes_total, 15);
+        assert_eq!(snap.buffered_records_total, 3);
+    }
+
+    #[test]
+    fn flush_trigger_mix_splits_by_shard_and_cause() {
+        let metrics = LogIngestMetrics::default();
+        // Shard 0: two size, one age, one final. Shard 3: one final only.
+        metrics.record_flush(0, FlushTrigger::Size);
+        metrics.record_flush(0, FlushTrigger::Size);
+        metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::Manual);
+        metrics.record_flush(3, FlushTrigger::Manual);
+
+        let mix = metrics.flush_trigger_mix_by_shard();
+        assert_eq!(
+            mix,
+            vec![
+                (
+                    0,
+                    FlushTriggerMix {
+                        size: 2,
+                        age: 1,
+                        final_drain: 1,
+                    }
+                ),
+                (
+                    3,
+                    FlushTriggerMix {
+                        size: 0,
+                        age: 0,
+                        final_drain: 1,
+                    }
+                ),
+            ],
+            "each cause lands in its own field, keyed by the flushing shard, sorted by shard index"
+        );
+        // total() is the shard's flushes-opened count.
+        assert_eq!(mix[0].1.total(), 4);
+        assert_eq!(mix[1].1.total(), 1);
+        // The process-wide flat counters equal the mix summed across shards.
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_size, 2);
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_manual, 2);
+    }
+
+    #[test]
+    fn adaptive_age_folds_into_the_age_cause() {
+        // The log actor never raises AgeAdaptive, but the shared enum has it;
+        // if a call ever does, it must count as age, not silently vanish.
+        let metrics = LogIngestMetrics::default();
+        metrics.record_flush(1, FlushTrigger::AgeAdaptive);
+        let mix = metrics.flush_trigger_mix_by_shard();
+        assert_eq!(
+            mix,
+            vec![(
+                1,
+                FlushTriggerMix {
+                    size: 0,
+                    age: 1,
+                    final_drain: 0
+                }
+            )]
+        );
+    }
+
+    /// The floor hold counts on its own process-wide counter and, like every
+    /// age cause, on the per-shard mix's `age`.
+    #[test]
+    fn age_floor_counts_separately_and_folds_into_the_age_cause() {
+        let metrics = LogIngestMetrics::default();
+        metrics.record_flush(0, FlushTrigger::Age);
+        metrics.record_flush(0, FlushTrigger::AgeFloor);
+        metrics.record_flush(0, FlushTrigger::AgeFloor);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.flushes_by_age, 1);
+        assert_eq!(snap.flushes_by_age_floor, 2);
+        assert_eq!(
+            metrics.flush_trigger_mix_by_shard(),
+            vec![(
+                0,
+                FlushTriggerMix {
+                    size: 0,
+                    age: 3,
+                    final_drain: 0
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn fresh_flush_trigger_mix_is_empty() {
+        assert!(
+            LogIngestMetrics::default()
+                .flush_trigger_mix_by_shard()
+                .is_empty(),
+            "a router that never flushed reports no shards, not zeroed ones"
+        );
+    }
+
+    #[test]
+    fn dynamic_column_counters_and_used_max_fold_into_snapshot() {
+        // Two objects, the wider one first (used 8) then a narrower one (used
+        // 5). The used and overflowed counts sum; the used_max keeps the larger
+        // 8. A sum would report 13 and a store-latest would report 5, so the
+        // fixture forces the maximum fold to be the real thing that shows budget
+        // pressure a total cannot (ADR-0100 decision 1).
+        let metrics = LogIngestMetrics::default();
+        metrics.record_postings(ravel_logseg::writer::WriteStats {
+            dynamic_columns_used: 8,
+            dynamic_columns_overflowed: 3,
+            ..Default::default()
+        });
+        metrics.record_postings(ravel_logseg::writer::WriteStats {
+            dynamic_columns_used: 5,
+            dynamic_columns_overflowed: 2,
+            ..Default::default()
+        });
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.dynamic_columns_used_total, 13, "8 + 5");
+        // Both writes overflow, and by different amounts, so this sum
+        // distinguishes a `fetch_add` fold from a `fetch_max` one: a maximum
+        // would report 3 here.
+        assert_eq!(snap.dynamic_columns_overflowed_total, 5, "3 + 2");
+        assert_eq!(
+            snap.dynamic_columns_used_max, 8,
+            "running maximum keeps the wider object's used count"
+        );
+    }
+}

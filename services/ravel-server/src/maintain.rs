@@ -1,0 +1,12407 @@
+//! Background maintenance task (storage-derived tenant set is ADR-0048
+//! decision 3).
+//! Periodically runs age-based retention, L0->L1 compaction, and the GC
+//! sweeper over every `(signal, shard)` of every tenant storage holds data
+//! for. It also brings the query-audit shard (`Signal::Audit` /
+//! `QUERY_AUDIT_SHARD`) into the maintained set: after the
+//! data-signal loop it compacts that shard, cleans up the compacted L0 inputs,
+//! and runs a dedicated age-based retention sweep on its own 90-day window,
+//! separate from the ADR-0019 per-tenant data retention. The legal-hold shard
+//! (`AUDIT_HOLD_SHARD` = 0) is never a delete target.
+//!
+//! Unlike fold (a pure query-cost optimization), this task deletes and rewrites
+//! durable objects, but it changes nothing about *what* any sweep, retention,
+//! or compaction rule decides: it is only the driver that calls
+//! [`scan_and_maintain_with_memo`] (retention-before-compaction over every
+//! sealed bucket), [`ravel_maintain::sweep_shard`] (the three per-shard GC
+//! rules), [`ravel_maintain::sweep_idempotency_markers`] (the fourth GC
+//! rule, run once per signal instead of per shard),
+//! [`ravel_maintain::sweep_unreferenced_catalog_objects`] (the fifth GC rule,
+//! reclaiming catalog snapshot/index objects no HEAD names, also once per
+//! signal), and the ADR-0064
+//! selective-erasure trio -- [`ravel_maintain::erasure_rewrite_bucket`] per
+//! bucket, the request-completion `.done` write, and
+//! [`ravel_maintain::sweep_erasure_requests`] -- once per tenant per tick.
+//! All are idempotent, so a missed or crashed tick is recovered on the next
+//! one. The loop and every tick read the clock injected through the loop
+//! context: the real [`WallClock`] in the running service, a fixed clock in
+//! tests.
+//!
+//! [`spawn`] runs one supervisor task, not one task per tenant: at the start
+//! of every tick it re-enumerates tenants from storage
+//! ([`ravel_maintain::discover_tenants`] via
+//! [`crate::tenant_discovery::discover_and_restrict_by_lifecycle`]), narrows
+//! that set by each tenant's durable lifecycle state and the flag fallback
+//! (ADR-0066 decision 6: a config record keeps a tenant maintained
+//! unconditionally regardless of its token, and no flag can exclude a
+//! config-recorded tenant), then runs [`run_tick`] for each tenant in the
+//! result. A
+//! tenant that first writes data mid-run is picked up on the next cycle with
+//! no restart, and a tenant removed from the maintained set (but still holding
+//! data) is counted as excluded rather than silently dropped. Discovery
+//! failure (the LIST errors) skips the whole cycle -- no tenant's tick runs
+//! -- with a logged warning and a failure counter; it never falls back to an
+//! empty set, because that would be indistinguishable from healthy idleness,
+//! the exact silence this avoids.
+//!
+//! [`LegalHoldCheck::refresh`] is called once per tenant per tick, before
+//! either pass, and its snapshot is the [`LeaseCheck`] threaded through every
+//! `(signal, shard)` of that tick (ADR-0048 decision 1). A refresh failure
+//! never falls back to [`NoLeases`]: the tenant's whole tick is skipped and
+//! retried next tick, so a transient store fault can never turn into an
+//! unprotected delete pass.
+//!
+//! One [`MaintainMemo`] is held across every tick and every tenant until
+//! shutdown. The memo records buckets already known
+//! terminal so a steady-state tick skips re-listing and re-reading them,
+//! until a periodic full re-verify forces a fresh evaluation. It is ephemeral
+//! and never correctness-bearing: a fresh (cold) memo on the first tick after
+//! a worker start does exactly one full rescan identical to the pre-memo
+//! behavior, and a wrong or lost entry only defers work by at most the
+//! re-verify interval. The memo key is `(tenant, signal, shard, hour)`, so one
+//! process-wide memo safely spans every tenant this supervisor discovers,
+//! across ticks.
+//!
+//! That memo is also persisted durably (ADR-0065 decision 3). On
+//! its discovery cadence [`run_loop`] writes a compact per-unit summary of the
+//! memo to `sys/maintain/memo/<process_id>`, debounced so an unchanged tick
+//! writes nothing (the debounce compares the timestamp-free snapshot body, so
+//! it piggybacks on the discovery tick and needs no dedicated timer). On
+//! startup, and whenever a membership change moves ownership of a unit to this
+//! process, the loop seeds the in-memory memo from every non-stale durable
+//! snapshot (its own previous one and siblings') for the units it now owns, so a
+//! restart or handoff warm-starts instead of rescanning the retention window
+//! cold. Every read or write here is fail-open: a fault logs and degrades to a
+//! cold start for the affected units, never blocking or crashing the loop
+//! ([`crate::maintain::seed_memo_from_snapshots`],
+//! [`crate::maintain::persist_memo_snapshot`]).
+
+use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
+
+use futures::FutureExt;
+use ravel_commit::keys;
+use ravel_commit::rng::{RngSource, SystemRng};
+use ravel_fleet::query_workers::{
+    QUERY_WORKERS_PREFIX, ReapPass, default_liveness_window_ns, reap_dead_query_workers,
+};
+use ravel_ingest::{Clock as _, SystemClock};
+use ravel_maintain::scan::{MaintainMemo, MaintainReport, scan_and_maintain_with_memo};
+use ravel_maintain::worker_set::{
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, owns, run_bounded,
+};
+use ravel_maintain::{
+    AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
+    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureAbandon, ErasureRewriteOutcome, LeaseCheck,
+    LegalHoldCheck, MaintainError, OrphanPass, PendingErasureRequest, QUERY_AUDIT_SHARD,
+    RetentionConfig, WorkerSet, erasure_rewrite_bucket, pending_erasure_requests,
+    read_all_memo_snapshots, scan_and_compact, sweep_alert_retention, sweep_audit_retention,
+    sweep_erasure_requests, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
+    sweep_unreferenced_catalog_objects, write_memo_snapshot,
+};
+use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
+use ravel_proto::commit::v1::{ErasureCompletion, ErasureDeferralCause, ErasureRequest};
+use ravel_types::{Signal, TenantHash};
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+use crate::alert_state_memo::{MemoError, read_alert_state_memo};
+use crate::alerting::ALERT_SHARD;
+use crate::tenant_discovery::{TenantDiscoveryMetrics, discover_and_restrict_by_lifecycle};
+
+/// Default `maintain_interval`: 5 minutes.
+pub const DEFAULT_MAINTAIN_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// The service-layer wall clock for [`ravel_maintain::Clock`]
+/// (`ravel_maintain`'s clock doc defers the wall-clock impl to phase 8, here).
+/// Delegates to `ravel-ingest`'s [`SystemClock`], the one blessed wall clock in
+/// this process, so no maintenance code path ever reads `SystemTime::now()`
+/// directly.
+#[derive(Clone, Copy)]
+pub(crate) struct WallClock;
+
+impl Clock for WallClock {
+    fn now_ns(&self) -> i64 {
+        SystemClock.now_ns()
+    }
+}
+
+/// The loop context's injected `Arc<dyn Clock>` as the cloneable concrete
+/// clock [`run_tick_with_clock`] takes. Clones share the one underlying clock.
+#[derive(Clone)]
+struct SharedClock(Arc<dyn Clock>);
+
+impl Clock for SharedClock {
+    fn now_ns(&self) -> i64 {
+        self.0.now_ns()
+    }
+}
+
+/// The data signals this server ingests, and therefore maintains, today.
+/// Metrics (RSEG), logs (RLOG), and spans all flow through the same
+/// signal-generic compaction/retention/sweep code (ADR-0032), carrying ADR-0019
+/// per-tenant retention and per-signal shard counts. `Signal::Audit` is
+/// deliberately absent: the query-audit shard is a fixed control-plane shard
+/// maintained separately at the end of [`run_tick`] on its own window, and
+/// the legal-hold shard is never a delete target at all.
+pub(crate) const MAINTAINED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+
+/// Position of `signal` within [`MAINTAINED_SIGNALS`], and therefore within
+/// [`MaintenanceSafetyMetrics`]'s per-signal arrays. Exhaustive over the
+/// signals this driver actually loops over (`run_tick`'s `for signal in
+/// MAINTAINED_SIGNALS`), so a signal from outside that set is a caller bug,
+/// not a case to fold into an "other" bucket.
+fn signal_index(signal: Signal) -> usize {
+    match signal {
+        Signal::Metrics => 0,
+        Signal::Logs => 1,
+        Signal::Spans => 2,
+        other => {
+            unreachable!("maintenance safety metrics only track MAINTAINED_SIGNALS, got {other:?}")
+        }
+    }
+}
+
+/// Process-global counters for the three maintenance safety controls that
+/// previously only reached an operator through a `tracing` line: a
+/// legal-hold refresh failure (ADR-0048 decision 1), a compaction
+/// conservation-gate abort (decision 6), and an orphan-GC circuit breaker
+/// trip (decision 4). Rendered on the existing `GET /metrics` endpoint by
+/// [`crate::metrics::render_maintain_safety_family`], no second registry.
+///
+/// Indexed by [`signal_index`] because each event is signal-scoped; there is
+/// deliberately no `tenant_hash` dimension here. ADR-0048's decision 4 names
+/// `tenant_hash` as a label for the breaker-trip counter, but ADR-0044
+/// section 4 blocks any per-tenant `/metrics` series on this unauthenticated
+/// route pending an authentication decision. ADR-0051's `--metrics-tenant-labels`
+/// flag now exists, but it applies only to the admission usage family
+/// (ADR-0051 section 6), not to this maintenance-safety family. Adding a
+/// raw `tenant_hash` label here would violate ADR-0044's safety
+/// precondition, the contradiction described above.
+#[derive(Debug, Default)]
+pub struct MaintenanceSafetyMetrics {
+    legal_hold_refresh_failures: AtomicU64,
+    conservation_aborts: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphan_breaker_trips: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_withheld: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_present: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_quarantined: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    orphans_quarantine_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    superseded_deletes_refused: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Rule 2's held objects per signal, indexed by
+    /// [`SupersededHeldReason::index`]. Backs
+    /// `ravel_maintain_superseded_inputs_held_total`.
+    superseded_inputs_held:
+        [[AtomicU64; SupersededHeldReason::ALL.len()]; MAINTAINED_SIGNALS.len()],
+    superseded_groups_held_by_legal_hold: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// `.dreq`s the erasure-request sweep kept past their horizon because its
+    /// observing pass held a chain group naming the request, or a chain it
+    /// could not walk to the end
+    /// ([`ravel_maintain::ErasureRequestSweepOutcome::held_by_superseded_inputs`]).
+    /// Backs `ravel_maintain_dreq_held_by_superseded_inputs_total`.
+    dreq_held_by_superseded_inputs: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    quarantine_reaped: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    l0_records_pending: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// The in-progress cycle's L0-pending accumulator, paired with
+    /// `l0_records_pending` above exactly as `owned_this_cycle` is paired with
+    /// `units_owned`: cleared by [`MaintenanceSafetyMetrics::begin_scan_cycle`],
+    /// added to by [`MaintenanceSafetyMetrics::record_scan`] for every
+    /// `(tenant, shard)` the cycle evaluates, and copied into the published
+    /// gauge by [`MaintenanceSafetyMetrics::publish_scan_cycle`] once the cycle
+    /// has covered every unit this process owns. Nothing reads it, so a scrape
+    /// landing mid-cycle sees the previous cycle's complete total rather than a
+    /// half-summed one.
+    l0_records_pending_accum: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    objects_deleted_quarantine_reaped: AtomicU64,
+    objects_deleted_superseded_records_deleted: AtomicU64,
+    objects_deleted_superseded_data_deleted: AtomicU64,
+    objects_deleted_unreferenced_parts_deleted: AtomicU64,
+    /// Bytes reclaimed by the three sweep deletions whose object size is known
+    /// without an extra request, by signal, summed over every sweep pass since
+    /// process start: the quarantine reaper and rule 3's unreferenced-part
+    /// delete at their listed size (issue #1729), and rule 2's superseded data
+    /// at the size its record carries (issue #2073). Retention deletions are
+    /// not included; they delete by key without a known size.
+    bytes_reclaimed: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// The published per-signal retention-lag gauge (issue #1729), paired with
+    /// `retention_lag_ns_accum` exactly as `l0_records_pending` is paired with
+    /// its accumulator: cleared by [`MaintenanceSafetyMetrics::begin_scan_cycle`],
+    /// raised to the per-unit maximum by
+    /// [`MaintenanceSafetyMetrics::record_scan`], and copied here by
+    /// [`MaintenanceSafetyMetrics::publish_scan_cycle`] once the cycle has
+    /// covered every unit this process owns, so a mid-cycle scrape reads the
+    /// previous cycle's complete value rather than a partial one.
+    retention_lag_ns: [AtomicI64; MAINTAINED_SIGNALS.len()],
+    /// The in-progress cycle's retention-lag accumulator. Unlike the summing
+    /// `l0_records_pending_accum`, this takes the MAXIMUM across the cycle's
+    /// units: the gauge reports the single oldest still-present expired bucket
+    /// this process observed, so a later unit with a smaller lag must not lower
+    /// it and units must not add together.
+    retention_lag_ns_accum: [AtomicI64; MAINTAINED_SIGNALS.len()],
+    /// The published count of units whose retention/compaction scan failed, or
+    /// that a failed provisioning or shard-generation read skipped, in the most
+    /// recent completed cycle (issue #2073), paired with
+    /// `units_scan_failed_accum` the same way as the two gauges above. A failed
+    /// scan reports no retention lag, so this is what an operator reads beside
+    /// `ravel_maintain_retention_lag_seconds` to know the lag did not cover
+    /// every unit.
+    units_scan_failed: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// The in-progress cycle's failed-scan count.
+    units_scan_failed_accum: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Claim acquisitions per signal since process start, from every unit's
+    /// `MaintainReport::claims_acquired` and the erasure rewrite's claim
+    /// (ADR-1029 decision 3, issue #1035, and its compaction-fence
+    /// amendment): this run took the claim, fresh or stolen. Backs
+    /// `ravel_maintain_claims_acquired_total`.
+    claims_acquired: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Subset of `claims_acquired` above taken over from an expired holder
+    /// rather than created fresh (`MaintainReport::claims_stolen`, ADR-1029
+    /// decision 3). Backs `ravel_maintain_claims_stolen_total`.
+    claims_stolen: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Claims this process held and then lost before publishing: another
+    /// process took the claim over after its lease expired and this run
+    /// cancelled at its next checkpoint, per signal since process start
+    /// (`MaintainReport::claim_cancelled` and an erasure rewrite's
+    /// `ClaimLost`, ADR-1029 decision 3). Backs
+    /// `ravel_maintain_claims_lost_total`.
+    claims_lost: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Claim renewals that failed with a genuine object-store error rather
+    /// than losing the claim (`MaintainError::ClaimRenewFailed`, ADR-1029
+    /// decision 3), per signal since process start. Backs
+    /// `ravel_maintain_claim_renew_failures_total`.
+    claim_renew_failures: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Bucket evaluations that did not compact, and erasure rewrites that
+    /// backed off, because a claim held the bucket (one per pass while the
+    /// hold lasts), per signal since process start
+    /// (`MaintainReport::claim_skipped`, ADR-1029 decision 3; this is the
+    /// Consequences list's `claimed_buckets_skipped`). Backs
+    /// `ravel_maintain_claims_skipped_total`.
+    claims_skipped: [AtomicU64; MAINTAINED_SIGNALS.len()],
+    /// Tenant ticks whose alert retention sweep was skipped for want of a
+    /// usable alert state memo (ADR-1688 decision 3 and its store-error
+    /// amendment), indexed by [`AlertRetentionSkipReason::index`].
+    alert_retention_skipped: [AtomicU64; AlertRetentionSkipReason::ALL.len()],
+    /// Mass-orphan breaker trips on the shards `sweep_shard` runs over outside
+    /// MAINTAINED_SIGNALS, indexed by position in
+    /// [`UNMAINTAINED_SWEPT_SIGNALS`]. Rendered as further `signal` samples of
+    /// the same breaker-trip family, so the one alert on that family covers
+    /// these shards too.
+    unmaintained_orphan_breaker_trips: [AtomicU64; UNMAINTAINED_SWEPT_SIGNALS.len()],
+    /// Rule 2's refusal and hold counts on those same shards, indexed like
+    /// `unmaintained_orphan_breaker_trips` and rendered the same way, as
+    /// further `signal` samples of the maintained signals' families.
+    unmaintained_superseded_deletes_refused: [AtomicU64; UNMAINTAINED_SWEPT_SIGNALS.len()],
+    unmaintained_superseded_inputs_held:
+        [[AtomicU64; SupersededHeldReason::ALL.len()]; UNMAINTAINED_SWEPT_SIGNALS.len()],
+    unmaintained_superseded_groups_held_by_legal_hold:
+        [AtomicU64; UNMAINTAINED_SWEPT_SIGNALS.len()],
+}
+
+/// Why rule 2 held a superseded input this pass: the `reason` label of
+/// `ravel_maintain_superseded_inputs_held_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupersededHeldReason {
+    /// The live catalog HEAD snapshot still names the object
+    /// ([`ravel_maintain::SweepReport::superseded_held_by_snapshot`]).
+    Named,
+    /// HEAD or a covering snapshot part was present and could not be read
+    /// ([`ravel_maintain::SweepReport::superseded_held_by_unreadable_head`]).
+    UnreadableHead,
+    /// HEAD names no object of the group, but its unnamed-since marker is
+    /// missing, mismatched or younger than the pinned-query window (ADR-1133;
+    /// [`ravel_maintain::SweepReport::superseded_held_by_pinned_window`]).
+    PinnedWindow,
+}
+
+impl SupersededHeldReason {
+    pub const ALL: [SupersededHeldReason; 3] = [
+        SupersededHeldReason::Named,
+        SupersededHeldReason::UnreadableHead,
+        SupersededHeldReason::PinnedWindow,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            SupersededHeldReason::Named => 0,
+            SupersededHeldReason::UnreadableHead => 1,
+            SupersededHeldReason::PinnedWindow => 2,
+        }
+    }
+
+    /// The `reason` label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            SupersededHeldReason::Named => "named",
+            SupersededHeldReason::UnreadableHead => "unreadable_head",
+            SupersededHeldReason::PinnedWindow => "pinned_window",
+        }
+    }
+
+    fn count(self, report: &ravel_maintain::SweepReport) -> usize {
+        match self {
+            SupersededHeldReason::Named => report.superseded_held_by_snapshot,
+            SupersededHeldReason::UnreadableHead => report.superseded_held_by_unreadable_head,
+            SupersededHeldReason::PinnedWindow => report.superseded_held_by_pinned_window,
+        }
+    }
+}
+
+/// Rule 2's refusal and hold totals for one member of
+/// [`UNMAINTAINED_SWEPT_SIGNALS`], read in one call for the snapshot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnmaintainedSupersededCounts {
+    pub deletes_refused: u64,
+    pub held_named: u64,
+    pub held_unreadable_head: u64,
+    pub held_pinned_window: u64,
+    pub groups_held_by_legal_hold: u64,
+}
+
+/// The signals whose one shard the maintain tick runs `sweep_shard` over
+/// without their being MAINTAINED_SIGNALS: the alerts shard (ADR-1688) and the
+/// query-audit shard. Their breaker trips are counted apart from the
+/// MAINTAINED_SIGNALS-sized arrays above.
+pub const UNMAINTAINED_SWEPT_SIGNALS: [Signal; 2] = [Signal::Alerts, Signal::Audit];
+
+fn unmaintained_swept_index(signal: Signal) -> Option<usize> {
+    UNMAINTAINED_SWEPT_SIGNALS
+        .iter()
+        .position(|&swept| swept == signal)
+}
+
+/// Why the alert retention driver skipped a tenant this tick (ADR-1688
+/// decision 3, as amended on 2026-09-28). A closed set: each is a state of the
+/// tenant's alert state memo under which the sweep has no keep set it can
+/// trust.
+///
+/// A tenant whose memo is absent AND whose alert commit prefix holds nothing is
+/// not one of these: it has no alert history to sweep, so the driver does
+/// nothing and counts nothing rather than reporting a skip on every tick for
+/// every tenant of a deployment that runs no alert rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertRetentionSkipReason {
+    /// No memo object exists, and the tenant does have alert commit records.
+    Absent,
+    /// The memo object does not decode.
+    Undecodable,
+    /// The memo decodes to a `format_version` this build does not support.
+    UnsupportedVersion,
+    /// The memo's `watermark_hour` is below the expiry floor's hour, so it
+    /// names no identity's latest record for part of the expired range.
+    WatermarkBelowFloor,
+    /// Reading the memo (or, on an absent memo, the one bounded listing that
+    /// tells an unused alert keyspace from a lost one) failed against object
+    /// storage with something other than not-found. Transient, and the tick
+    /// retries; counted so a store that never answers is visible as a stalled
+    /// sweep rather than as silence.
+    StoreError,
+}
+
+impl AlertRetentionSkipReason {
+    pub const ALL: [AlertRetentionSkipReason; 5] = [
+        AlertRetentionSkipReason::Absent,
+        AlertRetentionSkipReason::Undecodable,
+        AlertRetentionSkipReason::UnsupportedVersion,
+        AlertRetentionSkipReason::WatermarkBelowFloor,
+        AlertRetentionSkipReason::StoreError,
+    ];
+
+    fn index(self) -> usize {
+        match self {
+            AlertRetentionSkipReason::Absent => 0,
+            AlertRetentionSkipReason::Undecodable => 1,
+            AlertRetentionSkipReason::UnsupportedVersion => 2,
+            AlertRetentionSkipReason::WatermarkBelowFloor => 3,
+            AlertRetentionSkipReason::StoreError => 4,
+        }
+    }
+
+    /// The `reason` label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            AlertRetentionSkipReason::Absent => "absent",
+            AlertRetentionSkipReason::Undecodable => "undecodable",
+            AlertRetentionSkipReason::UnsupportedVersion => "unsupported_version",
+            AlertRetentionSkipReason::WatermarkBelowFloor => "watermark_below_floor",
+            AlertRetentionSkipReason::StoreError => "store_error",
+        }
+    }
+}
+
+impl MaintenanceSafetyMetrics {
+    pub fn alert_retention_skipped(&self, reason: AlertRetentionSkipReason) -> u64 {
+        self.alert_retention_skipped[reason.index()].load(Ordering::Relaxed)
+    }
+
+    pub fn record_alert_retention_skipped(&self, reason: AlertRetentionSkipReason) {
+        self.alert_retention_skipped[reason.index()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mass-orphan breaker trips on `signal`'s one swept shard, for a member of
+    /// [`UNMAINTAINED_SWEPT_SIGNALS`]; `0` for any other signal, whose trips
+    /// [`orphan_breaker_trips`](Self::orphan_breaker_trips) counts.
+    pub fn unmaintained_orphan_breaker_trips(&self, signal: Signal) -> u64 {
+        unmaintained_swept_index(signal).map_or(0, |index| {
+            self.unmaintained_orphan_breaker_trips[index].load(Ordering::Relaxed)
+        })
+    }
+
+    /// Count one breaker trip on a member of [`UNMAINTAINED_SWEPT_SIGNALS`].
+    /// Any other signal is a no-op: its trips go through
+    /// [`record_sweep`](Self::record_sweep).
+    pub fn record_unmaintained_orphan_breaker_trip(&self, signal: Signal) {
+        if let Some(index) = unmaintained_swept_index(signal) {
+            self.unmaintained_orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Rule 2's refusal and hold totals on `signal`'s one swept shard, for a
+    /// member of [`UNMAINTAINED_SWEPT_SIGNALS`]; all zero for any other
+    /// signal, whose counts [`record_sweep`](Self::record_sweep) keeps.
+    pub fn unmaintained_superseded(&self, signal: Signal) -> UnmaintainedSupersededCounts {
+        unmaintained_swept_index(signal).map_or_else(UnmaintainedSupersededCounts::default, |i| {
+            let held = &self.unmaintained_superseded_inputs_held[i];
+            UnmaintainedSupersededCounts {
+                deletes_refused: self.unmaintained_superseded_deletes_refused[i]
+                    .load(Ordering::Relaxed),
+                held_named: held[SupersededHeldReason::Named.index()].load(Ordering::Relaxed),
+                held_unreadable_head: held[SupersededHeldReason::UnreadableHead.index()]
+                    .load(Ordering::Relaxed),
+                held_pinned_window: held[SupersededHeldReason::PinnedWindow.index()]
+                    .load(Ordering::Relaxed),
+                groups_held_by_legal_hold: self.unmaintained_superseded_groups_held_by_legal_hold
+                    [i]
+                    .load(Ordering::Relaxed),
+            }
+        })
+    }
+
+    /// Add one `sweep_shard` pass's rule 2 refusal and hold counts for a member
+    /// of [`UNMAINTAINED_SWEPT_SIGNALS`]. Any other signal is a no-op: its
+    /// counts go through [`record_sweep`](Self::record_sweep).
+    pub fn record_unmaintained_superseded(
+        &self,
+        signal: Signal,
+        report: &ravel_maintain::SweepReport,
+    ) {
+        let Some(index) = unmaintained_swept_index(signal) else {
+            return;
+        };
+        self.unmaintained_superseded_deletes_refused[index]
+            .fetch_add(report.superseded_deletes_refused as u64, Ordering::Relaxed);
+        for reason in SupersededHeldReason::ALL {
+            self.unmaintained_superseded_inputs_held[index][reason.index()]
+                .fetch_add(reason.count(report) as u64, Ordering::Relaxed);
+        }
+        self.unmaintained_superseded_groups_held_by_legal_hold[index].fetch_add(
+            report.superseded_groups_held_by_legal_hold as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn legal_hold_refresh_failures(&self) -> u64 {
+        self.legal_hold_refresh_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn conservation_aborts(&self, signal: Signal) -> u64 {
+        self.conservation_aborts[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    pub fn orphan_breaker_trips(&self, signal: Signal) -> u64 {
+        self.orphan_breaker_trips[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Orphan candidates withheld by the most recent sweep pass for `signal`
+    /// that actually ran rule 1 (a pass that skipped it measured nothing and
+    /// leaves this gauge alone, see [`record_sweep`]).
+    /// Always `0` when that pass did not trip the breaker -- including a
+    /// pass after a previous trip, when dilution or partial restoration let
+    /// the breaker clear. That drop to `0` is the un-trip: `orphan_breaker_trips`
+    /// above is the durable record that a trip (and its withheld data) ever
+    /// happened; this gauge alone must never be read as "resolved."
+    ///
+    /// [`record_sweep`]: Self::record_sweep
+    pub fn orphans_withheld(&self, signal: Signal) -> u64 {
+        self.orphans_withheld[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Orphan candidates the most recent sweep pass for `signal` found,
+    /// whether the breaker tripped or not, summing `orphans_deleted`,
+    /// `orphans_withheld` and `orphans_quarantine_refused`. No one term is
+    /// guaranteed nonzero and more than one can be: a pass whose every copy
+    /// faulted has `deleted` and `withheld` both `0` with `refused` nonzero,
+    /// and a partially faulting pass has `deleted` and `refused` both nonzero.
+    /// This is the signal for
+    /// small-scale commit-record loss the breaker's ratio/count thresholds are
+    /// deliberately too coarse to catch (ADR-0058 decision 1): delete a handful
+    /// of commit records for one shard and the breaker never trips, so
+    /// `orphans_withheld` stays `0` even as the orphaned data objects march to
+    /// the grace horizon and get deleted like ordinary abandoned flushes. This
+    /// gauge is nonzero for exactly those passes.
+    ///
+    /// A gauge, not a counter, for the same reason as [`orphans_withheld`]:
+    /// it reflects only the most recent pass. A drop to a lower value (or to
+    /// `0`) is not "resolved" -- it is just this pass's candidate count, which
+    /// falls as orphans are deleted or their records restored. The durable
+    /// record that orphans were ever present is the operator's own
+    /// investigation the alert triggered, not a later reading of this gauge.
+    ///
+    /// "Most recent pass" means the most recent pass that ran rule 1. Since
+    /// the orphan-cadence split (issue #1734) the per-tick zoned sweep skips
+    /// rule 1 and reports structural zeros; those never reach this gauge (see
+    /// [`record_sweep`]), so it holds the last completed orphan pass's count
+    /// and its update cadence is the full-sweep interval
+    /// (`interior_reverify_ns`, default 6 h), not the maintain tick.
+    ///
+    /// [`orphans_withheld`]: Self::orphans_withheld
+    /// [`record_sweep`]: Self::record_sweep
+    pub fn orphans_present(&self, signal: Signal) -> u64 {
+        self.orphans_present[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Orphan candidates moved to `quarantine/` since this process started
+    /// (ADR-0058 amendment), summed over every sweep pass for `signal`.
+    ///
+    /// A counter, not a gauge like [`orphans_present`]: quarantining is an
+    /// event, not a state a later pass can undo, and the operator question is
+    /// the rate at which orphans are being taken out of the live set. Reading
+    /// only the last pass's count would answer that with `0` on every quiet
+    /// pass between two busy ones.
+    ///
+    /// [`orphans_present`]: Self::orphans_present
+    pub fn orphans_quarantined(&self, signal: Signal) -> u64 {
+        self.orphans_quarantined[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Orphan candidates whose copy to `quarantine/` failed, summed over every
+    /// sweep pass for `signal`. The live object was left in place, so the
+    /// candidate is still present and is counted in [`orphans_present`] too;
+    /// this counter is what separates a store fault on the quarantine prefix
+    /// from ordinary orphan presence.
+    ///
+    /// Steady state is a flat line at whatever value it reached. Alert on
+    /// `increase(...) > 0`, the same shape as the breaker-trip counter: a
+    /// refusal means quarantine cannot make progress, and the next pass
+    /// retrying the same candidate refuses again.
+    ///
+    /// [`orphans_present`]: Self::orphans_present
+    pub fn orphans_quarantine_refused(&self, signal: Signal) -> u64 {
+        self.orphans_quarantine_refused[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Superseded-input deletes the store refused (access denied, a failed
+    /// precondition, or a permanent error), summed over every sweep pass for
+    /// `signal` ([`ravel_maintain::SweepReport::superseded_deletes_refused`]).
+    /// A refusal stops only the supersession chain it belongs to and the pass
+    /// still succeeds, so this counter, not the unit's tick outcome, is where
+    /// a deny policy on part of the keyspace shows. Steady state is a flat
+    /// line; alert on `increase(...) > 0`, like
+    /// [`orphans_quarantine_refused`].
+    ///
+    /// [`orphans_quarantine_refused`]: Self::orphans_quarantine_refused
+    pub fn superseded_deletes_refused(&self, signal: Signal) -> u64 {
+        self.superseded_deletes_refused[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Objects rule 2 held for `reason`, summed over every sweep pass for
+    /// `signal`. A held object is counted again on every pass that holds it,
+    /// so this is held objects times passes. An interior hour is swept only on
+    /// the full-sweep cadence (`interior_reverify_ns`), so the operator
+    /// question is whether this grows over at least that interval, not its
+    /// rate or its total.
+    pub fn superseded_inputs_held(&self, signal: Signal, reason: SupersededHeldReason) -> u64 {
+        self.superseded_inputs_held[signal_index(signal)][reason.index()].load(Ordering::Relaxed)
+    }
+
+    /// Chain groups rule 2 skipped whole because a legal hold protects a key in
+    /// them, summed over every sweep pass for `signal`. Counted per pass, like
+    /// [`superseded_inputs_held`](Self::superseded_inputs_held).
+    pub fn superseded_groups_held_by_legal_hold(&self, signal: Signal) -> u64 {
+        self.superseded_groups_held_by_legal_hold[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// `.dreq`s the erasure-request sweep kept past their horizon, summed over
+    /// every pass for `signal`: its own observing pass held a chain group
+    /// naming the request, or held a chain it could not walk to the end
+    /// anywhere in the signal. That pass runs on every tick and covers every
+    /// hour, so this can grow while
+    /// [`superseded_inputs_held`](Self::superseded_inputs_held) stays flat.
+    pub fn dreq_held_by_superseded_inputs(&self, signal: Signal) -> u64 {
+        self.dreq_held_by_superseded_inputs[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Records the `.dreq` hold count of one `sweep_erasure_requests` result for
+    /// `signal`; the result's deleted and kept counts are not recorded.
+    pub fn record_erasure_sweep(
+        &self,
+        signal: Signal,
+        outcome: &ravel_maintain::ErasureRequestSweepOutcome,
+    ) {
+        self.dreq_held_by_superseded_inputs[signal_index(signal)]
+            .fetch_add(outcome.held_by_superseded_inputs as u64, Ordering::Relaxed);
+    }
+
+    /// Objects physically deleted from `quarantine/` past the quarantine
+    /// horizon, summed over every sweep pass for `signal`. This is the only
+    /// place orphan-GC'd data is ever physically removed.
+    ///
+    /// A counter for the same reason as [`orphans_quarantined`], and it is
+    /// read against that one: a quarantined total that climbs while this one
+    /// stays flat is a quarantine prefix that is filling and never being
+    /// reaped, which no single-pass gauge can show.
+    ///
+    /// [`orphans_quarantined`]: Self::orphans_quarantined
+    pub fn quarantine_reaped(&self, signal: Signal) -> u64 {
+        self.quarantine_reaped[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// L0 commit records this process's most recent completed maintenance
+    /// cycle found sealed but still below `min_compaction_inputs`
+    /// ([`MaintainReport::l0_records_pending`]), summed over every `(tenant,
+    /// shard)` of `signal` the cycle covered -- the whole population this
+    /// process owns, not one unit's figure.
+    ///
+    /// A gauge like [`orphans_present`], not a counter: a record leaves this
+    /// count the moment its bucket compacts or expires, not on a later event
+    /// this process needs to remember happened. Its update cadence is the
+    /// maintenance cycle, and it is only ever overwritten with a complete
+    /// cycle total ([`publish_scan_cycle`]), so a scrape that lands mid-cycle
+    /// reads the previous complete value instead of a partial sum.
+    ///
+    /// Scope is one process. A unit another replica owns is counted on that
+    /// replica, so an operator reading the whole deployment sums the series
+    /// across processes. A unit whose pass failed this cycle contributes
+    /// nothing, the same way its figures reach no other gauge here, so a dip
+    /// is ambiguous between "less work pending" and "a unit was not reached".
+    /// `ravel_maintain_units_stalled` does not resolve that on its own: it
+    /// moves only for a per-unit failure repeated past the stall threshold,
+    /// and a tenant skipped for the whole tick (a failed legal-hold refresh, a
+    /// provisioning or shard-generation check) never reaches per-unit
+    /// accounting at all. The guide names the counters that do move for those
+    /// paths.
+    ///
+    /// [`orphans_present`]: Self::orphans_present
+    /// [`publish_scan_cycle`]: Self::publish_scan_cycle
+    pub fn l0_records_pending(&self, signal: Signal) -> u64 {
+        self.l0_records_pending[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Objects physically deleted from `quarantine/` past the quarantine
+    /// horizon, summed over every sweep pass of every signal since process
+    /// start ([`ravel_maintain::SweepReport::quarantine_reaped`]). Not
+    /// signal-scoped, unlike [`quarantine_reaped`](Self::quarantine_reaped):
+    /// this is the `kind`-labeled series behind
+    /// `ravel_maintain_objects_deleted_total{kind="quarantine_reaped"}`
+    /// (issue #1729), the other is the pre-existing `signal`-labeled one.
+    pub fn objects_deleted_quarantine_reaped(&self) -> u64 {
+        self.objects_deleted_quarantine_reaped
+            .load(Ordering::Relaxed)
+    }
+
+    /// Superseded L0 commit records rule 2 physically deleted, summed over
+    /// every sweep pass since process start
+    /// ([`ravel_maintain::SweepReport::superseded_records_deleted`]).
+    pub fn objects_deleted_superseded_records_deleted(&self) -> u64 {
+        self.objects_deleted_superseded_records_deleted
+            .load(Ordering::Relaxed)
+    }
+
+    /// Superseded L0 data objects rule 2 physically deleted, summed over
+    /// every sweep pass since process start
+    /// ([`ravel_maintain::SweepReport::superseded_data_deleted`]).
+    pub fn objects_deleted_superseded_data_deleted(&self) -> u64 {
+        self.objects_deleted_superseded_data_deleted
+            .load(Ordering::Relaxed)
+    }
+
+    /// Unreferenced L1 parts rule 3 physically deleted, summed over every
+    /// sweep pass since process start
+    /// ([`ravel_maintain::SweepReport::unreferenced_parts_deleted`]).
+    pub fn objects_deleted_unreferenced_parts_deleted(&self) -> u64 {
+        self.objects_deleted_unreferenced_parts_deleted
+            .load(Ordering::Relaxed)
+    }
+
+    /// Bytes reclaimed for `signal` by the size-known sweep deletions (the
+    /// quarantine reaper, rule 3's unreferenced-part delete, and rule 2's
+    /// superseded data), summed since process start
+    /// ([`ravel_maintain::SweepReport::quarantine_reaped_bytes`],
+    /// [`ravel_maintain::SweepReport::unreferenced_parts_bytes`] and
+    /// [`ravel_maintain::SweepReport::superseded_data_bytes`]). Backs
+    /// `ravel_maintain_bytes_reclaimed_total` (issues #1729, #2073).
+    pub fn bytes_reclaimed(&self, signal: Signal) -> u64 {
+        self.bytes_reclaimed[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Units of `signal` whose retention/compaction scan returned an error in
+    /// this process's most recent completed maintenance cycle, or that were
+    /// skipped unscanned because their `(tenant, signal)`'s provisioning check
+    /// or shard-generation read failed. A gauge, backing
+    /// `ravel_maintain_units_scan_failed` (issue #2073): each such unit is
+    /// missing from [`retention_lag_ns`](Self::retention_lag_ns).
+    pub fn units_scan_failed(&self, signal: Signal) -> u64 {
+        self.units_scan_failed[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// The retention lag for `signal` this process's most recent completed
+    /// maintenance cycle observed, in nanoseconds: for the oldest bucket that is
+    /// expired yet still physically present, how far the clock was past its
+    /// retention deadline ([`MaintainReport::retention_lag_ns`]). `0` when the
+    /// cycle found no still-present expired bucket for the signal, which
+    /// includes a cycle whose scans for the signal all failed; read it beside
+    /// [`units_scan_failed`](Self::units_scan_failed).
+    ///
+    /// A gauge like [`l0_records_pending`](Self::l0_records_pending), and the
+    /// per-cycle MAXIMUM over this process's units rather than a sum: it names
+    /// the single worst bucket. Backs `ravel_maintain_retention_lag_seconds`
+    /// (issue #1729), rendered in seconds.
+    pub fn retention_lag_ns(&self, signal: Signal) -> i64 {
+        self.retention_lag_ns[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Claim acquisitions for `signal` since process start, fresh or stolen
+    /// (ADR-1029 decision 3). Backs `ravel_maintain_claims_acquired_total`.
+    pub fn claims_acquired(&self, signal: Signal) -> u64 {
+        self.claims_acquired[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Subset of [`claims_acquired`](Self::claims_acquired) taken over from
+    /// an expired holder rather than created fresh. Backs
+    /// `ravel_maintain_claims_stolen_total`.
+    pub fn claims_stolen(&self, signal: Signal) -> u64 {
+        self.claims_stolen[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Claims this process held and then lost for `signal` since process
+    /// start. Backs `ravel_maintain_claims_lost_total`.
+    pub fn claims_lost(&self, signal: Signal) -> u64 {
+        self.claims_lost[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Claim renewals for `signal` that failed with a genuine store error
+    /// since process start. Backs `ravel_maintain_claim_renew_failures_total`.
+    pub fn claim_renew_failures(&self, signal: Signal) -> u64 {
+        self.claim_renew_failures[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    /// Buckets skipped for `signal` because another run already held the
+    /// claim, since process start. Backs
+    /// `ravel_maintain_claims_skipped_total`.
+    pub fn claims_skipped(&self, signal: Signal) -> u64 {
+        self.claims_skipped[signal_index(signal)].load(Ordering::Relaxed)
+    }
+
+    pub fn record_legal_hold_refresh_failure(&self) {
+        self.legal_hold_refresh_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_conservation_abort(&self, signal: Signal) {
+        self.conservation_aborts[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One [`MaintainError::ClaimRenewFailed`] for `signal` (ADR-1029
+    /// decision 3): a renewal at a cancellation checkpoint failed with a
+    /// genuine store error rather than losing the claim. Backs
+    /// `ravel_maintain_claim_renew_failures_total`.
+    pub fn record_claim_renew_failure(&self, signal: Signal) {
+        self.claim_renew_failures[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One `sweep_shard` result for `signal`, taken whole so no figure the
+    /// pass reported can be left behind at the call site.
+    ///
+    /// Two different accumulations, and which one a field gets is the whole of
+    /// its metric type. The withheld and present gauges are overwritten with
+    /// this pass's counts (`store`, never `fetch_add`), matching
+    /// [`orphans_withheld`]'s and [`orphans_present`]'s docs on why neither
+    /// gauge alone can be read as "resolved". The trip counter, the three
+    /// quarantine counters, the superseded-delete refusal counter and the two
+    /// superseded hold counters accumulate (`fetch_add`): each counts events the
+    /// pass performed, which a later quiet pass does not undo, and
+    /// [`SweepReport`] reports them per pass rather than as running totals, so
+    /// the running total has to be kept here.
+    ///
+    /// A pass that did not run rule 1 at all ([`OrphanPass::Skip`], the
+    /// per-tick zoned sweep since the orphan-cadence split) leaves both gauges
+    /// untouched. Its orphan fields are structurally zero rather than
+    /// measured, and storing them would zero the gauges on every tick between
+    /// two full sweeps: with a 300 s tick and the default 6 h
+    /// `interior_reverify_ns`, 71 of every 72 ticks, which is well inside the
+    /// 12 h window the `ravel_maintain_orphans_present > 0` alert evaluates
+    /// over (ADR-0058 decision 1, `docs/guides/operations/troubleshooting.md`).
+    /// The counters are unaffected: a `Skip` pass adds zero, which is the
+    /// truth about events it performed. The same rule holds across the units
+    /// of one tick, since this runs once per shard while the gauges are per
+    /// signal: a `Skip` shard cannot clear what a `Run` shard just measured,
+    /// whichever order the unit loop visits them in.
+    ///
+    /// [`orphans_withheld`]: Self::orphans_withheld
+    /// [`orphans_present`]: Self::orphans_present
+    /// [`SweepReport`]: ravel_maintain::SweepReport
+    pub fn record_sweep(&self, signal: Signal, report: &ravel_maintain::SweepReport) {
+        let index = signal_index(signal);
+        if report.orphan_breaker_tripped {
+            self.orphan_breaker_trips[index].fetch_add(1, Ordering::Relaxed);
+        }
+        if report.orphan_pass == OrphanPass::Run {
+            self.orphans_withheld[index].store(report.orphans_withheld as u64, Ordering::Relaxed);
+            self.orphans_present[index]
+                .store(orphans_present_total(report) as u64, Ordering::Relaxed);
+        }
+        self.orphans_quarantined[index]
+            .fetch_add(report.orphans_quarantined as u64, Ordering::Relaxed);
+        self.orphans_quarantine_refused[index]
+            .fetch_add(report.orphans_quarantine_refused as u64, Ordering::Relaxed);
+        self.superseded_deletes_refused[index]
+            .fetch_add(report.superseded_deletes_refused as u64, Ordering::Relaxed);
+        for reason in SupersededHeldReason::ALL {
+            self.superseded_inputs_held[index][reason.index()]
+                .fetch_add(reason.count(report) as u64, Ordering::Relaxed);
+        }
+        self.superseded_groups_held_by_legal_hold[index].fetch_add(
+            report.superseded_groups_held_by_legal_hold as u64,
+            Ordering::Relaxed,
+        );
+        self.quarantine_reaped[index].fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
+
+        // The `kind`-labeled deleted-objects family (issue #1729): the four
+        // `SweepReport` fields that represent an actual physical delete, not
+        // a move to quarantine (`orphans_deleted`/`orphans_quarantined`) or a
+        // withheld/refused candidate. Unconditional, unlike the orphan gauges
+        // above: every one of these four counts an event this pass actually
+        // performed, `Skip` or `Run` alike, so there is no zeroing case to
+        // guard against.
+        self.objects_deleted_quarantine_reaped
+            .fetch_add(report.quarantine_reaped as u64, Ordering::Relaxed);
+        self.objects_deleted_superseded_records_deleted
+            .fetch_add(report.superseded_records_deleted as u64, Ordering::Relaxed);
+        self.objects_deleted_superseded_data_deleted
+            .fetch_add(report.superseded_data_deleted as u64, Ordering::Relaxed);
+        self.objects_deleted_unreferenced_parts_deleted
+            .fetch_add(report.unreferenced_parts_deleted as u64, Ordering::Relaxed);
+
+        // The per-signal reclaimed-bytes counter (issues #1729, #2073): the
+        // sweep deletions whose object size the pass knows without a request,
+        // from its own listing or from the record that named the object.
+        // Retention deletions delete by key without a size, so they contribute
+        // nothing here; the metric's HELP text says so.
+        self.bytes_reclaimed[index].fetch_add(
+            report
+                .quarantine_reaped_bytes
+                .saturating_add(report.unreferenced_parts_bytes)
+                .saturating_add(report.superseded_data_bytes),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// One unit of `signal` whose [`scan_and_maintain_with_memo`] returned an
+    /// error, added to the current cycle's failed-scan count. The unit reports
+    /// no retention lag this cycle, so without this count its absence from
+    /// `retention_lag_ns` is indistinguishable from a unit with nothing
+    /// expired.
+    pub fn record_scan_failed(&self, signal: Signal) {
+        self.units_scan_failed_accum[signal_index(signal)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One [`scan_and_maintain_with_memo`] result for `signal`, added to the
+    /// current cycle's L0-pending accumulator.
+    ///
+    /// This runs once per `(tenant, shard)`, so it must accumulate rather than
+    /// overwrite: storing here published one shard of one tenant as if it were
+    /// the signal's total, and every later unit of the cycle overwrote the
+    /// one before it. The published gauge moves only in
+    /// [`publish_scan_cycle`](Self::publish_scan_cycle), after
+    /// [`begin_scan_cycle`](Self::begin_scan_cycle) cleared the accumulator at
+    /// the top of the cycle.
+    pub fn record_scan(&self, signal: Signal, report: &MaintainReport) {
+        let index = signal_index(signal);
+        self.l0_records_pending_accum[index]
+            .fetch_add(report.l0_records_pending as u64, Ordering::Relaxed);
+        // Retention lag takes the maximum, not the sum: the gauge names the
+        // single oldest still-present expired bucket, so a later unit with a
+        // smaller lag must not lower it and two units must not add together.
+        self.retention_lag_ns_accum[index].fetch_max(report.retention_lag_ns, Ordering::Relaxed);
+        // Claim counters (ADR-1029 decision 3, issue #1035): plain running
+        // totals, unlike the two accumulators above, so they need no
+        // begin/publish pairing and are visible on the next scrape.
+        self.claims_acquired[index].fetch_add(report.claims_acquired as u64, Ordering::Relaxed);
+        self.claims_stolen[index].fetch_add(report.claims_stolen as u64, Ordering::Relaxed);
+        self.claims_lost[index].fetch_add(report.claim_cancelled as u64, Ordering::Relaxed);
+        self.claims_skipped[index].fetch_add(report.claim_skipped as u64, Ordering::Relaxed);
+    }
+
+    /// Clear the L0-pending accumulator at the top of a maintenance cycle.
+    /// Pairs with [`publish_scan_cycle`](Self::publish_scan_cycle), which must
+    /// run at the end of that same cycle; between the two the published gauge
+    /// still holds the previous cycle's complete total.
+    pub fn begin_scan_cycle(&self) {
+        for accum in &self.l0_records_pending_accum {
+            accum.store(0, Ordering::Relaxed);
+        }
+        for accum in &self.retention_lag_ns_accum {
+            accum.store(0, Ordering::Relaxed);
+        }
+        for accum in &self.units_scan_failed_accum {
+            accum.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish the finished cycle's per-signal L0-pending totals, replacing the
+    /// previous cycle's. Call once, after every `(tenant, shard)` this process
+    /// owns has had its chance to run (including the ones whose pass failed and
+    /// therefore contributed nothing).
+    ///
+    /// Each signal is its own exported series and is written with one store, so
+    /// a scrape reads a complete cycle total per series; it never sees a
+    /// partially summed one. A scrape interleaved with this call can pair a new
+    /// value for one signal with the previous value for another, which is the
+    /// ordinary cross-series skew of any multi-series scrape, not a partial sum.
+    pub fn publish_scan_cycle(&self) {
+        for (published, accum) in self
+            .l0_records_pending
+            .iter()
+            .zip(self.l0_records_pending_accum.iter())
+        {
+            published.store(accum.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for (published, accum) in self
+            .retention_lag_ns
+            .iter()
+            .zip(self.retention_lag_ns_accum.iter())
+        {
+            published.store(accum.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        for (published, accum) in self
+            .units_scan_failed
+            .iter()
+            .zip(self.units_scan_failed_accum.iter())
+        {
+            published.store(accum.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Default number of consecutive failed ticks a unit must accrue before
+/// `MaintenanceOwnershipMetrics::observe_unit_tick` counts it as stalled
+/// (ADR-0065 stuck-owner mitigation).
+const DEFAULT_STALLED_AFTER_INTERVALS: u32 = 3;
+
+/// Per-unit consecutive-failure counters backing `ravel_maintain_units_stalled`.
+///
+/// A unit (tenant, signal, shard) is "stalled" once it has failed
+/// `stalled_after_intervals` ticks in a row without an intervening success;
+/// a single success resets its counter to zero.
+#[derive(Debug, Default)]
+struct UnitStallTracker {
+    threshold: u32,
+    failures: parking_lot::Mutex<std::collections::HashMap<(TenantHash, Signal, u32), u32>>,
+}
+
+impl UnitStallTracker {
+    fn new(threshold: u32) -> Self {
+        UnitStallTracker {
+            threshold,
+            failures: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Records one tick outcome for `unit` and returns the current count of
+    /// units at or past the stall threshold.
+    fn observe(&self, unit: (TenantHash, Signal, u32), ok: bool) -> u64 {
+        let mut failures = self.failures.lock();
+        if ok {
+            failures.remove(&unit);
+        } else {
+            let count = failures.entry(unit).or_insert(0);
+            *count = count.saturating_add(1);
+        }
+        failures
+            .values()
+            .filter(|&&count| count >= self.threshold)
+            .count() as u64
+    }
+
+    /// Drops every entry not present in `owned` and returns the recomputed
+    /// stall count over what remains. A unit only accrues failures here while
+    /// `observe` is called for it, i.e. while this process owns it; once it
+    /// leaves the owned set (rendezvous re-partition, tenant deprovision, a
+    /// shard-count reduction) `observe` is never called for it again, so
+    /// without this its entry is stranded and keeps counting toward the
+    /// gauge forever. If the unit returns to this process's ownership later
+    /// and fails again, it re-accumulates from zero.
+    ///
+    /// `owned` must be the *ownership* set, not the set of units this cycle
+    /// managed to evaluate. A unit this process still owns but
+    /// did not reach this cycle -- because its tenant's legal-hold refresh
+    /// failed, or its `(tenant, signal)` pair failed the provisioning or
+    /// shard-generation read -- keeps its streak: it is exactly the stuck
+    /// unit `units_stalled` exists to surface, and pruning it on the error
+    /// tick would restart the observation from zero and let a recurring
+    /// per-tenant fault hold the alarm off indefinitely.
+    fn retain_owned(&self, owned: &std::collections::HashSet<(TenantHash, Signal, u32)>) -> u64 {
+        let mut failures = self.failures.lock();
+        failures.retain(|unit, _| owned.contains(unit));
+        failures
+            .values()
+            .filter(|&&count| count >= self.threshold)
+            .count() as u64
+    }
+}
+
+/// New metrics for ADR-0065's stuck-owner mitigation: how many owned units
+/// this process is carrying, how many workers are live in-process, how many
+/// units warm-started from a durable memo snapshot, and how many units are
+/// stalled (consecutive failing ticks). Exported on `/metrics` with closed
+/// label sets only (ADR-0044 section 4): no `tenant_hash`.
+#[derive(Debug, Default)]
+pub struct MaintenanceOwnershipMetrics {
+    workers_live: AtomicU64,
+    units_owned: AtomicU64,
+    memo_warm_start_units: AtomicU64,
+    full_sweep_passes_total: AtomicU64,
+    units_stalled: AtomicU64,
+    /// Unix nanoseconds the supervised maintenance loop last completed a full
+    /// cycle, from the injected clock; `0` until the first cycle completes.
+    /// This is the liveness signal the discovery/safety/ownership gauges lack:
+    /// they are all written at the end of a cycle that completed, so a dead
+    /// loop freezes them at their last healthy values, while the age of this
+    /// gauge grows without bound once the loop stops cycling (issue #1683,
+    /// mirroring `ravel_catalog_fold_last_success_timestamp_seconds`).
+    last_cycle_completed_unix_ns: AtomicI64,
+    /// Panics caught in the loop body and restarted by the supervisor. Its
+    /// only record: the supervisor swallows the panic so the pod stays up, so
+    /// this counter is how an operator learns the loop is crash-looping.
+    loop_panics_total: AtomicU64,
+    stalls: UnitStallTracker,
+    /// This cycle's owned-unit accumulator, paired with `set_units_owned(0)`:
+    /// cleared in `begin_cycle`, filled by `note_owned_unit` as `run_tick`
+    /// walks each tenant, then consumed by `end_cycle` to prune `stalls`.
+    /// Membership here means "this process owns the unit under the rendezvous
+    /// gate", not "this cycle evaluated it".
+    owned_this_cycle: parking_lot::Mutex<std::collections::HashSet<(TenantHash, Signal, u32)>>,
+}
+
+impl MaintenanceOwnershipMetrics {
+    pub fn new(stalled_after_intervals: u32) -> Self {
+        MaintenanceOwnershipMetrics {
+            workers_live: AtomicU64::new(0),
+            units_owned: AtomicU64::new(0),
+            memo_warm_start_units: AtomicU64::new(0),
+            full_sweep_passes_total: AtomicU64::new(0),
+            units_stalled: AtomicU64::new(0),
+            last_cycle_completed_unix_ns: AtomicI64::new(0),
+            loop_panics_total: AtomicU64::new(0),
+            stalls: UnitStallTracker::new(stalled_after_intervals),
+            owned_this_cycle: parking_lot::Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Clears the per-cycle owned-unit accumulator. Call once at the top of a
+    /// discovery cycle, alongside `set_units_owned(0)`.
+    fn begin_cycle(&self) {
+        self.owned_this_cycle.lock().clear();
+    }
+
+    /// Records that `(tenant, signal, shard)` is owned by this process this
+    /// cycle. Call it for every unit the rendezvous ownership gate assigns to
+    /// this process, whether inside a discovery cycle or a standalone
+    /// `run_tick`, and before any per-tenant or per-signal error path can
+    /// skip the unit's evaluation: what is recorded here decides
+    /// which stall streaks `end_cycle` keeps.
+    fn note_owned_unit(&self, tenant: TenantHash, signal: Signal, shard: u32) {
+        self.owned_this_cycle.lock().insert((tenant, signal, shard));
+    }
+
+    /// Prunes stall history to this cycle's owned set and recomputes
+    /// `units_stalled` over what remains. Call once at the end of a
+    /// discovery cycle, after every tenant's tick has run.
+    fn end_cycle(&self) {
+        let owned = self.owned_this_cycle.lock();
+        let stalled = self.stalls.retain_owned(&owned);
+        self.units_stalled.store(stalled, Ordering::Relaxed);
+    }
+
+    fn set_workers_live(&self, count: u64) {
+        self.workers_live.store(count, Ordering::Relaxed);
+    }
+
+    fn set_units_owned(&self, count: u64) {
+        self.units_owned.store(count, Ordering::Relaxed);
+    }
+
+    fn add_units_owned(&self, delta: u64) {
+        self.units_owned.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    fn add_memo_warm_start_units(&self, count: u64) {
+        self.memo_warm_start_units
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn inc_full_sweep_passes(&self) {
+        self.full_sweep_passes_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Stamps `now_ns` (from the injected clock) as the completion time of the
+    /// cycle that just finished. Called once at the end of every completed
+    /// cycle in [`run_loop`], never on a cycle the supervisor caught panicking.
+    fn set_last_cycle_completed(&self, now_ns: i64) {
+        self.last_cycle_completed_unix_ns
+            .store(now_ns, Ordering::Relaxed);
+    }
+
+    /// Records one panic the supervisor caught and restarted the loop after.
+    fn inc_loop_panics(&self) {
+        self.loop_panics_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one tick outcome for the given owned unit, updating the
+    /// stalled-unit count if this tick crossed (or cleared) the threshold.
+    fn observe_unit_tick(&self, tenant: TenantHash, signal: Signal, shard: u32, ok: bool) {
+        let stalled = self.stalls.observe((tenant, signal, shard), ok);
+        self.units_stalled.store(stalled, Ordering::Relaxed);
+    }
+
+    pub fn workers_live(&self) -> u64 {
+        self.workers_live.load(Ordering::Relaxed)
+    }
+
+    pub fn units_owned(&self) -> u64 {
+        self.units_owned.load(Ordering::Relaxed)
+    }
+
+    pub fn memo_warm_start_units(&self) -> u64 {
+        self.memo_warm_start_units.load(Ordering::Relaxed)
+    }
+
+    pub fn full_sweep_passes_total(&self) -> u64 {
+        self.full_sweep_passes_total.load(Ordering::Relaxed)
+    }
+
+    pub fn units_stalled(&self) -> u64 {
+        self.units_stalled.load(Ordering::Relaxed)
+    }
+
+    pub fn last_cycle_completed_unix_ns(&self) -> i64 {
+        self.last_cycle_completed_unix_ns.load(Ordering::Relaxed)
+    }
+
+    pub fn loop_panics_total(&self) -> u64 {
+        self.loop_panics_total.load(Ordering::Relaxed)
+    }
+}
+
+/// Everything the maintenance task needs beyond the store and the tenant list.
+#[derive(Debug, Clone)]
+pub struct MaintenanceTaskConfig {
+    pub enabled: bool,
+    /// Pause between maintenance passes (`--maintain-interval-secs`). A zero
+    /// interval is refused at startup with [`SpawnError::ZeroMaintainInterval`],
+    /// whether or not the loop is enabled: `validate_loop_intervals` checks it
+    /// regardless of `enabled`, matching `Cli::validate`.
+    /// [`check_spawnable`](Self::check_spawnable) re-refuses it at the enabled
+    /// loop's spawn site.
+    pub interval: Duration,
+    pub shard_count: u32,
+    /// Compactor knobs (seal margin, part cap, grace, protection horizon).
+    /// `dry_run` is always false for the running service; only the CLI's
+    /// `--dry-run` sets it.
+    pub compactor: CompactorConfig,
+    /// Validated per-tenant retention windows (ADR-0019). `RetentionConfig`'s
+    /// default is "no retention", so with no `--retention-*` flags this task
+    /// compacts and sweeps but never age-deletes.
+    pub retention: RetentionConfig,
+    /// Bounded intra-process unit concurrency (ADR-0065 decision 2's
+    /// stuck-owner mitigation): the maximum number of owned `(signal, shard)`
+    /// units this process maintains at once within a tenant's tick, replacing
+    /// the pre-ADR-0065 strictly-sequential per-shard walk. Default 4.
+    pub unit_concurrency: usize,
+    /// Consecutive failed ticks a unit must accrue before
+    /// `ravel_maintain_units_stalled` counts it (ADR-0065 stuck-owner
+    /// mitigation). Default 3.
+    pub stalled_after_intervals: u32,
+    /// Cadence of the shared `WorkerSet`'s membership heartbeat (ADR-0065
+    /// decision 1), forwarded to [`ravel_maintain::WorkerSet::new`] by
+    /// `ravel_server::start`. No CLI flag sets this; production always gets
+    /// the default below, matching the pre-existing hardcoded
+    /// `DEFAULT_HEARTBEAT_INTERVAL`. It exists as a struct field so a test
+    /// can build a `Mode::Maintain` `ServerConfig` with a heartbeat fast
+    /// enough that two-worker convergence does not depend on wall-clock
+    /// margin around the real 60s production cadence (issue #1852).
+    pub heartbeat_interval: Duration,
+}
+
+impl Default for MaintenanceTaskConfig {
+    fn default() -> Self {
+        MaintenanceTaskConfig {
+            enabled: false,
+            interval: DEFAULT_MAINTAIN_INTERVAL,
+            shard_count: 4,
+            compactor: CompactorConfig::default(),
+            retention: RetentionConfig::default(),
+            unit_concurrency: DEFAULT_UNIT_CONCURRENCY,
+            stalled_after_intervals: DEFAULT_STALLED_AFTER_INTERVALS,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+        }
+    }
+}
+
+/// Why [`spawn`] refused to start the maintenance loop. Either way nothing is
+/// spawned: the refusal is a startup error for the operator, never a loop that
+/// panics or deletes on an unsafe configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// The stored `sys/gc` horizon does not cover this sweeper's own skew.
+    #[error(transparent)]
+    GcConfig(#[from] ravel_maintain::GcConfigError),
+    /// A zero membership heartbeat period on the config or on the worker set.
+    /// The worker's period drives `tokio::time::interval`, which panics on
+    /// zero; the config's is refused with it so the two cannot disagree.
+    #[error("maintenance heartbeat_interval must be non-zero")]
+    ZeroHeartbeatInterval,
+    /// A zero `interval` would run every maintenance pass back to back.
+    #[error(
+        "--maintain-interval-secs must be non-zero: a zero maintain interval runs every pass back to back"
+    )]
+    ZeroMaintainInterval,
+}
+
+impl MaintenanceTaskConfig {
+    /// The interval refusal [`spawn`] applies before starting the loop. `start`
+    /// refuses a zero interval earlier, before spawning anything, whether or
+    /// not the loop is enabled.
+    pub fn check_spawnable(&self) -> Result<(), SpawnError> {
+        if self.enabled && self.interval.is_zero() {
+            return Err(SpawnError::ZeroMaintainInterval);
+        }
+        Ok(())
+    }
+}
+
+/// Handle to every spawned maintenance task, for clean shutdown (mirrors
+/// [`crate::fold::FoldTasks`]).
+pub struct MaintenanceTasks {
+    shutdown: Vec<oneshot::Sender<()>>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl MaintenanceTasks {
+    pub fn none() -> Self {
+        MaintenanceTasks {
+            shutdown: Vec::new(),
+            handles: Vec::new(),
+        }
+    }
+
+    pub async fn shutdown(self) {
+        for tx in self.shutdown {
+            let _ = tx.send(());
+        }
+        for handle in self.handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// The maintain compactor configuration with the pinned-query window's terms
+/// taken from `sys/gc` (ADR-1133 decision 4), the same values `ravel-cli
+/// maintain sweep` reads.
+fn compactor_config_from_gc(
+    base: &CompactorConfig,
+    stored_gc: &ravel_maintain::GcConfigValues,
+) -> CompactorConfig {
+    let mut compactor = base.clone();
+    compactor.max_query_duration_ns = stored_gc.max_query_duration_ns;
+    compactor.head_cache_ttl_ns = stored_gc.head_cache_ttl_ns;
+    compactor
+}
+
+/// Spawn one supervisor task that re-discovers the tenant set from storage
+/// every tick (ADR-0048 decision 3, ADR-0066 decision 6). `fallback_allow` is
+/// the merged `--tenant-token`/`--maintain-tenant` set: empty means unconfigured
+/// and it otherwise governs only tenants with no durable config record. A tenant
+/// carrying a config record is maintained unconditionally, so no flag can
+/// exclude it. Returns immediately; the task runs until
+/// [`MaintenanceTasks::shutdown`].
+///
+/// `stored_gc` is the durable `sys/gc` object `main` already bootstrapped and
+/// read (ADR-0050 section 4). Before this fail-closed startup RE-ASSERT: the
+/// write fence in `ravel-cli gc-config set`
+/// validates a proposed horizon against the *CLI's* declared
+/// `--clock-skew-allowance`, but that knob and THIS running sweeper's
+/// [`CompactorConfig::clock_skew_allowance_ns`] are independent -- a deployment
+/// could write `sys/gc` with a 5 min skew while running sweepers configured with
+/// a larger one, leaving the durable horizon skew-uncovered for the sweeper that
+/// actually deletes. [`ravel_server::gc_config::validate_maintain`] does not
+/// catch it (it only checks that the configured horizon and grace EQUAL the
+/// stored ones; the skew term is in neither). So before spawning the loop that
+/// runs the delete/GC path, re-assert
+/// `protection_horizon >= max_query_duration + grace + clock_skew_allowance`
+/// using the running sweeper's OWN skew. On a violation this returns
+/// [`GcConfigError::MaintainSkewUncovered`] (wrapped in
+/// [`SpawnError::GcConfig`]) and spawns nothing: FAIL CLOSED. A misconfigured,
+/// unsafe GC is an operator error to fix, strictly better than silently
+/// deleting a live reader's snapshot. This is on the shipping maintain binary's
+/// path (`ravel_server::start` -> `spawn` -> `run_loop`), so no sweep loop is
+/// ever entered with a skew-uncovered horizon.
+///
+/// The same spot refuses a stored horizon below
+/// `max_compaction_lifetime + 4 * clock_skew_allowance` for this process's
+/// compactor config, with
+/// [`GcConfigError::MaintainCompactionLifetimeUncovered`] (ADR-1133): the
+/// delete marker's gated set is stable only if no compaction or rewrite run
+/// can publish over a record's inputs once their horizon has passed.
+///
+/// A zero `heartbeat_interval` (on `config` or on `worker`) is refused the same
+/// way, with [`SpawnError::ZeroHeartbeatInterval`], and a zero `interval` with
+/// [`SpawnError::ZeroMaintainInterval`].
+#[allow(clippy::too_many_arguments)]
+pub fn spawn(
+    store: Arc<dyn ObjectStoreBackend>,
+    fallback_allow: Vec<TenantHash>,
+    config: MaintenanceTaskConfig,
+    stored_gc: ravel_maintain::GcConfigValues,
+    metrics: Arc<TenantDiscoveryMetrics>,
+    safety: Arc<MaintenanceSafetyMetrics>,
+    ownership: Arc<MaintenanceOwnershipMetrics>,
+    worker: Arc<WorkerSet>,
+    live_tx: Arc<watch::Sender<Vec<Uuid>>>,
+    clock: Arc<dyn Clock>,
+) -> Result<MaintenanceTasks, SpawnError> {
+    if !config.enabled {
+        return Ok(MaintenanceTasks::none());
+    }
+
+    config.check_spawnable()?;
+
+    // The heartbeat task's `tokio::time::interval` runs on the worker's period,
+    // which `ravel_server::start` builds from `config.heartbeat_interval`; a
+    // zero in either would panic that task rather than refuse to start.
+    if config.heartbeat_interval.is_zero() || worker.heartbeat_interval().is_zero() {
+        return Err(SpawnError::ZeroHeartbeatInterval);
+    }
+
+    // Fail-closed skew re-assert BEFORE any delete path can run:
+    // the stored `sys/gc` horizon must cover THIS running sweeper's own
+    // `clock_skew_allowance_ns`, not just the write-time skew the horizon was
+    // authored against. A violation refuses to spawn the sweep loop at all.
+    ravel_maintain::validate_maintain_skew(&stored_gc, config.compactor.clock_skew_allowance_ns)?;
+    ravel_maintain::validate_maintain_compaction_lifetime(
+        &stored_gc,
+        config.compactor.max_compaction_lifetime_ns,
+        config.compactor.clock_skew_allowance_ns,
+    )?;
+
+    // Production OS-entropy source (ADR-0068 decision 2) for the compactor
+    // writer id and the per-tick loop jitter. The server always uses the
+    // OS-entropy default; the simulation harness does not drive this loop.
+    let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
+    // One compactor writer_id per process start, shared across every tenant
+    // this supervisor maintains (recorded in each L1 part's footer;
+    // informational, never dedup-priority).
+    let mut compactor = compactor_config_from_gc(&config.compactor, &stored_gc);
+    compactor.compactor_writer_id = rng.new_uuid();
+    let compactor = Arc::new(compactor);
+    let retention = Arc::new(config.retention.clone());
+    let fallback_allow = if fallback_allow.is_empty() {
+        None
+    } else {
+        Some(fallback_allow)
+    };
+
+    let (tx, rx) = oneshot::channel();
+    let ctx = LoopContext {
+        store,
+        fallback_allow,
+        compactor,
+        retention,
+        shard_count: config.shard_count,
+        interval: config.interval,
+        metrics,
+        safety,
+        ownership,
+        worker,
+        rng,
+        // The one blessed wall clock in this process, injected by the caller so
+        // the scheduled fold reads the same instance (ADR-1693 decision 6);
+        // tests inject a `FixedClock` here instead.
+        clock,
+        live_tx,
+        // Production has no test seam, so the per-cycle hook is a no-op. Tests
+        // pass a closure that panics to exercise the supervisor's restart path.
+        cycle_hook: Arc::new(|| {}),
+    };
+    let handle = tokio::spawn(run_supervisor(
+        ctx,
+        rx,
+        RESTART_BACKOFF_INITIAL,
+        RESTART_BACKOFF_MAX,
+    ));
+    Ok(MaintenanceTasks {
+        shutdown: vec![tx],
+        handles: vec![handle],
+    })
+}
+
+/// Everything one maintenance-loop attempt needs, bundled so the supervisor can
+/// clone it and re-spawn a fresh attempt after a panic. Every field is cheap to
+/// clone (an `Arc`, a `Copy`, or a small owned value): a restart rebuilds the
+/// attempt task from the same context, and each attempt's [`run_loop`] builds
+/// its own fresh memo and heartbeat, so a torn in-memory state from a panicked
+/// cycle is discarded rather than carried into the restart.
+#[derive(Clone)]
+struct LoopContext {
+    store: Arc<dyn ObjectStoreBackend>,
+    fallback_allow: Option<Vec<TenantHash>>,
+    compactor: Arc<CompactorConfig>,
+    retention: Arc<RetentionConfig>,
+    shard_count: u32,
+    interval: Duration,
+    metrics: Arc<TenantDiscoveryMetrics>,
+    safety: Arc<MaintenanceSafetyMetrics>,
+    ownership: Arc<MaintenanceOwnershipMetrics>,
+    worker: Arc<WorkerSet>,
+    rng: Arc<dyn RngSource>,
+    clock: Arc<dyn Clock>,
+    /// Publishes each freshly computed live set. The loop's own discovery reads
+    /// it back through a subscription, and the scheduled catalog fold
+    /// subscribes to the same channel so both loops partition against one
+    /// membership view (ADR-1693 decision 1).
+    live_tx: Arc<watch::Sender<Vec<Uuid>>>,
+    /// Called once at the top of every cycle body, inside the `catch_unwind`
+    /// boundary. A no-op in production; a test seam for driving a panic through
+    /// the supervisor.
+    cycle_hook: Arc<dyn Fn() + Send + Sync>,
+}
+
+/// Backoff before the first restart after a panic. Doubles up to
+/// [`RESTART_BACKOFF_MAX`] across consecutive panics, and resets once an
+/// attempt completes at least one cycle before dying, so a genuinely healthy
+/// loop that hits a single transient panic restarts promptly while a
+/// crash-looping one is bounded rather than spinning.
+const RESTART_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+
+/// Ceiling for the panic-restart backoff.
+const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// Why one supervised [`run_loop`] attempt returned.
+enum LoopExit {
+    /// The shutdown channel fired: the supervisor must stop, not restart.
+    Shutdown,
+    /// A cycle body panicked and was caught. The supervisor restarts the loop.
+    Panicked,
+}
+
+/// The outcome of one [`run_loop`] attempt: why it ended, and how many cycles
+/// it completed first (so the supervisor can reset its backoff after a healthy
+/// run).
+struct LoopOutcome {
+    exit: LoopExit,
+    completed_cycles: u64,
+}
+
+/// Owns the loop's `JoinHandle` and restarts a fresh attempt after a caught
+/// panic, so a panic anywhere in the discovery or sweep call graph no longer
+/// leaves a Running/Ready pod with a dead maintenance loop (issue #1683).
+///
+/// Each attempt is a spawned [`run_loop`] whose cycle body is guarded by
+/// `catch_unwind`: a panic is caught inside the attempt, counted on
+/// [`MaintenanceOwnershipMetrics::inc_loop_panics`], and returned as
+/// [`LoopExit::Panicked`] so the attempt still runs its own heartbeat cleanup
+/// before ending (no leaked heartbeat task across restarts). The supervisor
+/// then backs off (bounded, [`RESTART_BACKOFF_INITIAL`]..=[`RESTART_BACKOFF_MAX`])
+/// and spawns the next attempt. Shutdown is still the existing oneshot: on it
+/// the supervisor signals the current attempt and joins it cleanly, and the
+/// backoff wait races the same receiver so a drain is never held behind it.
+async fn run_supervisor(
+    ctx: LoopContext,
+    mut shutdown: oneshot::Receiver<()>,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) {
+    let mut backoff = initial_backoff;
+    let mut pending_backoff: Option<Duration> = None;
+    loop {
+        // The backoff waits here, raced against shutdown, rather than in the
+        // resolved `select!` arm below: there the shutdown receiver is no
+        // longer polled, so a drain arriving during a 60 s backoff would wait
+        // it out and then pay for one more throwaway attempt before being
+        // observed.
+        if let Some(wait) = pending_backoff.take() {
+            tokio::select! {
+                _ = &mut shutdown => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+
+        let (attempt_tx, attempt_rx) = oneshot::channel();
+        let mut attempt = tokio::spawn(run_loop(ctx.clone(), attempt_rx));
+
+        tokio::select! {
+            // Server shutdown: stop the current attempt and join it so its
+            // heartbeat task is not left running, then return without restart.
+            _ = &mut shutdown => {
+                let _ = attempt_tx.send(());
+                let _ = attempt.await;
+                return;
+            }
+            joined = &mut attempt => {
+                match joined {
+                    Ok(LoopOutcome { exit: LoopExit::Shutdown, .. }) => return,
+                    Ok(LoopOutcome { exit: LoopExit::Panicked, completed_cycles }) => {
+                        // The panic counter was already bumped inside the
+                        // attempt. Reset the backoff if the attempt was
+                        // otherwise healthy (it completed at least one cycle).
+                        if completed_cycles > 0 {
+                            backoff = initial_backoff;
+                        }
+                        tracing::error!(
+                            completed_cycles,
+                            backoff_ms = backoff.as_millis(),
+                            "maintenance: loop task panicked; restarting after backoff \
+                             (see ravel_maintain_loop_panics_total)"
+                        );
+                    }
+                    Err(join_err) => {
+                        // A panic escaped the cycle-body guard (or the task was
+                        // aborted). Count it too so the panic total never
+                        // undercounts, then restart.
+                        ctx.ownership.inc_loop_panics();
+                        tracing::error!(
+                            error = %join_err,
+                            backoff_ms = backoff.as_millis(),
+                            "maintenance: loop task died outside the cycle guard; restarting \
+                             after backoff (see ravel_maintain_loop_panics_total)"
+                        );
+                    }
+                }
+
+                pending_backoff = Some(backoff);
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
+}
+
+/// One supervised attempt of the maintenance loop. Runs discovery cycles until
+/// either the shutdown channel fires (returns [`LoopExit::Shutdown`]) or a
+/// cycle body panics and is caught (returns [`LoopExit::Panicked`], after
+/// counting the panic and cleaning up the heartbeat task). The supervisor
+/// ([`run_supervisor`]) owns this task's handle and restarts it on a panic.
+async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> LoopOutcome {
+    let LoopContext {
+        store,
+        fallback_allow,
+        compactor,
+        retention,
+        shard_count,
+        interval,
+        metrics,
+        safety,
+        ownership,
+        worker,
+        rng,
+        clock,
+        live_tx,
+        cycle_hook,
+    } = ctx;
+    // One memo for the whole process, held across every tick and every
+    // discovered tenant until shutdown. Its key includes
+    // the tenant and signal, so this single instance safely spans every
+    // tenant this supervisor discovers. Cold on the first tick, so that tick
+    // is a full rescan identical to the pre-memo behavior -- unless warm start
+    // (below) seeds it from durable snapshots first.
+    //
+    // The memo's re-verify interval now governs only the interior zone
+    // (ADR-0065 decision 3): head and tail hours bypass the memo and
+    // evaluate every tick regardless of this value
+    // (`scan::scan_and_maintain_with_memo`), so this is
+    // `compactor.interior_reverify_ns`, not the crate's flat 1 h default.
+    let mut memo = MaintainMemo::new(compactor.interior_reverify_ns);
+
+    // Durable memo snapshot state (ADR-0065 decision 3).
+    //
+    // `reseed` requests a warm start: seed `memo` from every non-stale durable
+    // snapshot (this process's own previous one and siblings') for the units
+    // this process now owns, before the next discovery cycle runs cold. It is
+    // set once at startup and again whenever a membership change moves ownership
+    // (the live set below changes), which is exactly when a unit may have just
+    // arrived from another worker and its terminal facts live only in that
+    // worker's snapshot.
+    //
+    // `last_memo_body` debounces the durable write: it holds the last snapshot
+    // *body* (the RLE unit/exception content, without the ever-changing
+    // timestamp header) we successfully wrote, so a tick that changed nothing
+    // writes nothing. The debounce piggybacks on the existing discovery cadence;
+    // it needs no dedicated timer.
+    let mut reseed = true;
+    let mut last_memo_body: Option<Vec<u8>> = None;
+
+    // `clock` is the injected [`Clock`] from the context (the real [`WallClock`]
+    // in the running service, a `FixedClock` in tests). Every cycle-completion
+    // stamp, memo timestamp, reseed "now", heartbeat timestamp, and tenant tick
+    // below reads it, so the liveness gauge, worker membership, and every
+    // sweep and retention horizon advance by the same clock a test drives.
+
+    // Worker membership (ADR-0065 decision 1) runs on its own heartbeat cadence
+    // `H`, independent of the (coarser) discovery interval, and in its OWN
+    // spawned task rather than as a `select!` arm sharing the
+    // loop with discovery. A discovery cycle walks every tenant sequentially
+    // with no wall-time bound; when the heartbeat was a `select!` arm the macro
+    // did not re-enter while the discovery arm's future ran, so the heartbeat
+    // `interval` arm was never polled (`MissedTickBehavior::Delay` merely defers
+    // the tick). A cycle longer than the `3 * H` liveness window (180s at
+    // defaults) then starved this process's own heartbeat past that window, and
+    // siblings evicted it from their live sets mid-cycle and took over units it
+    // was still working. Running the heartbeat concurrently fires it on cadence
+    // `H` no matter how long a discovery cycle runs.
+    //
+    // The heartbeat task owns the write cadence, the `set_workers_live`
+    // accounting, and the live-set computation; it publishes each freshly
+    // computed live set over a `watch` channel that the discovery loop reads at
+    // the top of every cycle. `interval`'s first tick fires immediately, so the
+    // heartbeat is written and the live set computed before the first discovery
+    // cycle runs. A live-set read failure publishes nothing, so the receiver
+    // keeps the last-known set (fail-open, ADR-0065 decision 1): ownership stays
+    // stable rather than collapsing.
+    // The channel itself is owned by the caller (`spawn`'s `live_tx`
+    // parameter), because the scheduled catalog fold subscribes to the same
+    // live set to gate its own unit ownership (ADR-1693 decision 1). It starts
+    // holding this process's solo set, so a fold that runs before the first
+    // heartbeat owns everything rather than nothing.
+    let live_rx = live_tx.subscribe();
+    ownership.set_workers_live(live_rx.borrow().len() as u64);
+    let (heartbeat_shutdown_tx, mut heartbeat_shutdown_rx) = oneshot::channel::<()>();
+    let heartbeat_handle = {
+        let store = Arc::clone(&store);
+        let worker = Arc::clone(&worker);
+        let ownership = Arc::clone(&ownership);
+        // The injected clock, not a fresh `WallClock`: this task writes the
+        // timestamp siblings judge this process by AND judges theirs, so both
+        // halves of the membership decision must read the clock the rest of
+        // the loop reads (issue #1756). The cadence stays on
+        // `tokio::time::interval`, which a paused runtime already controls.
+        let clock = Arc::clone(&clock);
+        let live_tx = Arc::clone(&live_tx);
+        tokio::spawn(async move {
+            let mut heartbeat = tokio::time::interval(worker.heartbeat_interval());
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = heartbeat.tick() => {
+                        let now = clock.now_ns();
+                        if let Err(err) = worker.write_heartbeat(store.as_ref(), now).await {
+                            tracing::warn!(
+                                error = %err,
+                                "maintenance: worker heartbeat write failed; self-corrects next interval"
+                            );
+                        }
+                        match worker.live_set_read(store.as_ref(), now).await {
+                            Ok(read) => {
+                                // One listing serves both: the live set the
+                                // discovery loop reads, and the keys past the
+                                // reap horizon. Reaping from the same read is
+                                // what makes it free rather than a second
+                                // LIST of the same prefix, which is how the
+                                // admission path does it too.
+                                let reaped = worker.reap_keys(store.as_ref(), &read.reapable).await;
+                                if reaped > 0 {
+                                    tracing::info!(
+                                        reaped,
+                                        "maintenance: reaped dead worker heartbeat keys"
+                                    );
+                                }
+                                let computed = read.live;
+                                ownership.set_workers_live(computed.len() as u64);
+                                // Publish the latest live set for the discovery
+                                // loop. `send` fails only once the receiver has
+                                // dropped, i.e. the loop is shutting down; there
+                                // is nothing to publish to then.
+                                let _ = live_tx.send(computed);
+                            }
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "maintenance: worker live-set read failed; keeping the last-known \
+                                 live set (fail-open, ADR-0065 decision 1)"
+                            ),
+                        }
+                    }
+                    _ = &mut heartbeat_shutdown_rx => return,
+                }
+            }
+        })
+    };
+
+    // Reseed trigger (ADR-0065 decision 3), evaluated in the discovery loop:
+    // compare the live set this cycle uses against the previous cycle's and
+    // request a warm start when a membership change moved a unit's ownership
+    // onto this process. Seeded from the solo set so the startup `reseed = true`
+    // still fires once in a single-replica deployment (where the computed set
+    // equals the solo set and never changes).
+    let mut prev_live_set = worker.solo_live_set();
+
+    // A `tokio::time::sleep(...)` written directly as a `select!` branch is a
+    // fresh expression re-evaluated every time the macro re-polls at the top of
+    // the loop, so a spurious wakeup would silently restart this countdown from
+    // zero before it can ever elapse -- discovery would then never run. Pin one
+    // `Sleep` outside the loop so `select!` only ever polls the same underlying
+    // timer across iterations, and reset it (with a fresh jittered duration)
+    // only when it actually fires.
+    let discovery_sleep = tokio::time::sleep(jittered(interval, rng.as_ref()));
+    tokio::pin!(discovery_sleep);
+    let mut completed_cycles: u64 = 0;
+    let exit = loop {
+        tokio::select! {
+            () = &mut discovery_sleep => {
+                // The whole cycle body runs inside `catch_unwind` so a panic
+                // anywhere in the discovery or sweep call graph is caught here,
+                // counted, and turned into a supervised restart rather than a
+                // silently dead loop on a Running/Ready pod (issue #1683).
+                // `AssertUnwindSafe` is honest: on a caught panic this attempt
+                // is discarded entirely -- the supervisor spawns a fresh
+                // `run_loop` with a fresh memo -- so a torn `memo`/`reseed`
+                // state is never observed by the next cycle.
+                let cycle = AssertUnwindSafe(async {
+                    // Test seam (a no-op in production): drives a panic through
+                    // the guard to exercise the supervisor's restart path.
+                    (*cycle_hook)();
+
+                    // Latest live set from the heartbeat task (fail-open: the
+                    // receiver holds the last-known set across a read failure). A
+                    // membership change since the previous cycle may have moved a
+                    // unit's ownership onto this process; request a warm start so its
+                    // terminal facts are seeded from the departing worker's snapshot
+                    // rather than rescanned cold (ADR-0065 decision 3). `borrow`
+                    // returns a guard, so clone out of it immediately and never hold
+                    // it across an await.
+                    let live_set = live_rx.borrow().clone();
+                    if membership_changed(&prev_live_set, &live_set) {
+                        reseed = true;
+                    }
+                    prev_live_set = live_set.clone();
+
+                    // Warm start / handoff seeding (ADR-0065 decision 3): before a
+                    // cycle runs cold, seed the memo from durable snapshots for the
+                    // units this process now owns. Fail-open: a read fault logs and
+                    // degrades to a cold start, never blocks the loop.
+                    if reseed {
+                        match read_all_memo_snapshots(store.as_ref()).await {
+                            Ok(snapshots) => {
+                                let now = clock.now_ns();
+                                let (units, buckets) = seed_memo_from_snapshots(
+                                    &mut memo, &snapshots, now, &worker, &live_set,
+                                );
+                                ownership.add_memo_warm_start_units(units as u64);
+                                if buckets > 0 {
+                                    tracing::info!(
+                                        seeded_units = units,
+                                        seeded_buckets = buckets,
+                                        "maintenance: warm-started memo from durable snapshots"
+                                    );
+                                }
+                                // Clear the pending reseed only on a successful read.
+                                // A single transient LIST/GET fault must leave reseed
+                                // set so the next cycle retries: in a single-replica
+                                // deployment the live set never changes (it is always
+                                // solo_live_set()), so `membership_changed` is
+                                // structurally never true and this first-cycle reseed
+                                // is the only warm-start trigger the worker ever gets.
+                                // Clearing it on the Err arm would leave that worker
+                                // cold for its whole process life.
+                                reseed = false;
+                            }
+                            Err(err) => tracing::warn!(
+                                error = %err,
+                                "maintenance: memo snapshot read failed; cold start for all units \
+                                 this cycle, reseed retried next cycle (fail-open, ADR-0065 decision 3)"
+                            ),
+                        }
+                    }
+
+                    run_discovery_cycle(
+                        store.as_ref(),
+                        fallback_allow.as_deref(),
+                        &compactor,
+                        &retention,
+                        shard_count,
+                        &mut memo,
+                        metrics.as_ref(),
+                        safety.as_ref(),
+                        ownership.as_ref(),
+                        &worker,
+                        &live_set,
+                        &SharedClock(Arc::clone(&clock)),
+                    )
+                    .await;
+
+                    // Persist the updated memo, debounced (ADR-0065 decision 3): a
+                    // tick whose terminal set and verify times are unchanged writes
+                    // nothing. Fail-open: a write fault logs and retries next cycle.
+                    persist_memo_snapshot(
+                        store.as_ref(),
+                        &worker,
+                        &memo,
+                        &mut last_memo_body,
+                        clock.now_ns(),
+                    )
+                    .await;
+                });
+
+                match cycle.catch_unwind().await {
+                    Ok(()) => {
+                        // The liveness stamp is written only on a cycle that
+                        // actually completed, from the same injected clock the
+                        // rest of the loop reads (issue #1683, mirroring
+                        // `ravel_catalog_fold_last_success_timestamp_seconds`).
+                        ownership.set_last_cycle_completed(clock.now_ns());
+                        completed_cycles = completed_cycles.saturating_add(1);
+                        discovery_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + jittered(interval, rng.as_ref()));
+                    }
+                    Err(_panic) => {
+                        // Count the panic and end this attempt; the supervisor
+                        // restarts a fresh loop after a bounded backoff. The
+                        // liveness gauge is deliberately not stamped, so its age
+                        // grows while the loop is down.
+                        ownership.inc_loop_panics();
+                        break LoopExit::Panicked;
+                    }
+                }
+            }
+            _ = &mut shutdown => break LoopExit::Shutdown,
+        }
+    };
+
+    // Stop the heartbeat task so no spawned task outlives this loop: signal it
+    // and await its handle. On return the heartbeat task is
+    // guaranteed finished rather than detached, matching
+    // `MaintenanceTasks::shutdown`'s join of the supervisor task itself. This
+    // runs on the panic path too (the cycle body's `catch_unwind` returns here
+    // rather than unwinding past it), so a caught panic never leaks a heartbeat
+    // task into the restarted attempt.
+    let _ = heartbeat_shutdown_tx.send(());
+    let _ = heartbeat_handle.await;
+
+    LoopOutcome {
+        exit,
+        completed_cycles,
+    }
+}
+
+/// The rendezvous unit key of the one-per-deployment query-worker reap. Not a
+/// `(tenant, signal, shard)` unit, since the prefix belongs to no tenant, but
+/// owned by the same rendezvous rule over the same live set, so exactly one
+/// maintain process per membership view reaps it.
+pub const QUERY_WORKER_REAP_UNIT: &[u8] = QUERY_WORKERS_PREFIX.as_bytes();
+
+/// Reap dead query-worker heartbeat records under `sys/query/workers/`, if
+/// this process owns [`QUERY_WORKER_REAP_UNIT`] under `live_set`. Returns
+/// `None` when it does not own the unit (and then issues no store call at
+/// all), or when the listing failed.
+///
+/// The maintain role reaps this prefix because it holds the delete grant and
+/// the query role does not (ADR-0055 section 1). The horizon is the query
+/// workers' own ([`default_liveness_window_ns`], widened by
+/// `ravel_fleet::query_workers::reap_dead_query_workers`), judged from LIST
+/// metadata alone, so no record is read.
+pub async fn reap_query_worker_heartbeats(
+    store: &dyn ObjectStoreBackend,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    now_ns: i64,
+) -> Option<ReapPass> {
+    if !owns(QUERY_WORKER_REAP_UNIT, worker.process_id(), live_set) {
+        return None;
+    }
+    match reap_dead_query_workers(store, now_ns, default_liveness_window_ns()).await {
+        Ok(pass) => {
+            if pass.reaped > 0 {
+                tracing::info!(
+                    reaped = pass.reaped,
+                    "maintenance: reaped dead query worker heartbeat keys"
+                );
+            }
+            Some(pass)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "maintenance: query worker heartbeat listing failed; reap retried next cycle"
+            );
+            None
+        }
+    }
+}
+
+/// One discovery cycle: re-enumerate tenants from storage, narrow by lifecycle
+/// state and the flag fallback, then run [`run_tick`] for each tenant in the
+/// result (ADR-0048 decision 3, ADR-0066 decision 6).
+/// `fallback_allow` is the token-derived allow-list governing no-config tenants;
+/// a tenant carrying a config record is maintained unconditionally, so no flag
+/// can exclude it. `metrics` records the discovered and maintained gauges on
+/// success; a discovery failure -- the LIST itself erroring -- skips the whole
+/// cycle (no tenant's tick runs) and only bumps the failure counter, never
+/// falling back to an empty set. Falling back would render identically to
+/// "storage has no tenants," the exact silent failure this avoids.
+///
+/// Before discovery the cycle runs the one-per-deployment query-worker reap
+/// ([`reap_query_worker_heartbeats`]), gated on this process owning it and
+/// judged at the caller's injected `clock`. Every tenant tick reads that same
+/// clock ([`run_tick_with_clock`]), so the running service passes the real
+/// [`WallClock`] and a test's clock governs every time-gated decision in the
+/// cycle.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
+    store: &dyn ObjectStoreBackend,
+    fallback_allow: Option<&[TenantHash]>,
+    compactor: &CompactorConfig,
+    retention: &RetentionConfig,
+    shard_count: u32,
+    memo: &mut MaintainMemo,
+    metrics: &TenantDiscoveryMetrics,
+    safety: &MaintenanceSafetyMetrics,
+    ownership: &MaintenanceOwnershipMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    clock: &C,
+) -> MaintainReport {
+    // Before discovery, so a failed tenant listing does not also stall the
+    // query-worker prefix.
+    reap_query_worker_heartbeats(store, worker, live_set, clock.now_ns()).await;
+
+    let outcome = match discover_and_restrict_by_lifecycle(store, fallback_allow).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                "maintenance: tenant discovery failed; skipping this cycle entirely, retried next cycle"
+            );
+            metrics.record_discovery_failure();
+            return MaintainReport::default();
+        }
+    };
+
+    metrics.record_discovery(outcome.discovered.len(), outcome.maintained.len());
+    if outcome.excluded > 0 {
+        tracing::info!(
+            excluded = outcome.excluded,
+            "maintenance: flag restriction excluded discovered tenants holding data"
+        );
+    }
+
+    // Recomputed from scratch every cycle (ADR-0065 stuck-owner mitigation
+    // metrics): each tenant's tick below adds its owned unit count, so this
+    // gauge always reflects the current cycle's ownership, not a running
+    // total across cycles.
+    ownership.set_units_owned(0);
+    ownership.begin_cycle();
+    // Same shape for the L0-pending gauge: each tenant tick below adds its
+    // `(tenant, shard)` counts into the accumulator, and `publish_scan_cycle`
+    // below moves the finished total into the exported gauge. The per-tenant
+    // call is `run_tick_with_clock` rather than `run_tick` so the begin/publish
+    // pair spans the whole cycle instead of one tenant.
+    safety.begin_scan_cycle();
+
+    let mut total = MaintainReport::default();
+    for tenant in &outcome.maintained {
+        let report = run_tick_with_clock(
+            clock,
+            store,
+            tenant,
+            compactor,
+            retention,
+            shard_count,
+            memo,
+            safety,
+            ownership,
+            worker,
+            live_set,
+        )
+        .await;
+        total.retired += report.retired;
+        total.compacted += report.compacted;
+        total.already_done += report.already_done;
+        total.not_sealed += report.not_sealed;
+        total.skipped_terminal += report.skipped_terminal;
+        total.claim_skipped += report.claim_skipped;
+        total.claim_cancelled += report.claim_cancelled;
+        total.claims_acquired += report.claims_acquired;
+        total.claims_stolen += report.claims_stolen;
+        total.l0_records_pending += report.l0_records_pending;
+        total.lag_bound_gets += report.lag_bound_gets;
+        total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
+    }
+
+    // Prune stall history to exactly this cycle's owned set (ADR-0065
+    // stuck-owner mitigation): a unit dropped entirely out of
+    // `outcome.maintained` (tenant deprovisioned) or reassigned to a peer
+    // (rendezvous re-partition) never calls `observe_unit_tick` again, so
+    // without this its failure entry -- and its contribution to
+    // `units_stalled` -- would be stranded forever. Each tick above records
+    // its tenant's owned set from the ownership gate before any store read,
+    // so this prunes only genuinely-unowned units, never a still-owned one
+    // whose tick a transient fault skipped.
+    ownership.end_cycle();
+    safety.publish_scan_cycle();
+    total
+}
+
+/// One maintenance pass over every `(signal, shard)` of one tenant: a legal
+/// hold refresh, then retention before compaction (via
+/// [`scan_and_maintain_with_memo`]), then the GC sweeper (via
+/// [`sweep_shard`]), then, once per signal after that signal's shard loop
+/// completes, the idempotency-marker sweep (via [`sweep_idempotency_markers`])
+/// for [`Signal::Logs`] and [`Signal::Spans`] only -- markers don't exist for
+/// [`Signal::Metrics`] (ADR-0051 §5) and the marker sweep already covers every
+/// shard of a signal in one LIST, so it does not belong in the per-shard
+/// loop -- then the unreferenced-catalog-object sweep (via
+/// [`sweep_unreferenced_catalog_objects`]) once per signal for every signal,
+/// and finally the ADR-0064 selective-erasure pass
+/// ([`run_erasure_pass`]) for every signal. Every scan/sweep error is logged
+/// and retried next tick; nothing here affects query correctness. Split out
+/// from [`run_discovery_cycle`] so a test can drive a single deterministic
+/// tenant tick without discovery or the timer.
+///
+/// The legal hold refresh (ADR-0048 decision 1) runs once, before either
+/// pass, and its snapshot gates every `(signal, shard)` of this tick. If the
+/// refresh fails, the entire tenant tick is skipped -- no signal, no shard,
+/// no pass runs -- and an empty [`MaintainReport`] is returned; the driver
+/// never falls back to [`ravel_maintain::NoLeases`], because that would
+/// convert a transient store fault into an unprotected delete pass. The
+/// failure is logged at error level so it is visible to an operator, and the
+/// tick is retried next interval.
+///
+/// `memo` is the caller's per-worker [`MaintainMemo`], threaded through every
+/// `(signal, shard)` and mutated in place: buckets it already knows terminal
+/// are skipped without a per-bucket LIST or GET. The
+/// returned [`MaintainReport`] sums the per-`(signal, shard)` reports of the
+/// retention-and-compaction passes (the sweep pass is logged, not summed);
+/// `skipped_terminal` is the count of buckets the memo let this tick skip.
+///
+/// `worker`/`live_set` gate ownership (ADR-0065 decision 2): a `(signal,
+/// shard)` unit this process does not own under the current live set is skipped
+/// entirely -- neither its retention/compaction pass nor its `sweep_shard` is
+/// attempted (a discovery-time skip, not a mid-work abort). The idempotency-
+/// marker sweep is gated on ownership of shard 0 of the `(tenant, signal)` pair.
+/// Owned units run with bounded intra-process concurrency
+/// ([`WorkerSet::unit_concurrency`]) instead of a strictly sequential walk, so
+/// one pathological unit cannot starve the rest of the process's ownership
+/// (decision 2's stuck-owner mitigation). With a single-replica live set
+/// (`{self}`) every unit is owned and the behavior is byte-for-byte the
+/// pre-ADR-0065 unconditional walk. Tenant discovery and the legal-hold refresh
+/// below stay per-process, never gated on ownership (ADR-0065 decision 2).
+///
+/// That same ownership gate, evaluated over the configured shard range before
+/// the legal-hold refresh, is what feeds the per-cycle owned set behind the
+/// `units_stalled` stall-streak prune ([`note_owned_units`]). The
+/// tick reports ownership even when it then skips the tenant or a `(tenant,
+/// signal)` pair on error, so a still-owned stuck unit keeps its streak.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tick(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    compactor: &CompactorConfig,
+    retention: &RetentionConfig,
+    shard_count: u32,
+    memo: &mut MaintainMemo,
+    safety: &MaintenanceSafetyMetrics,
+    ownership: &MaintenanceOwnershipMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+) -> MaintainReport {
+    // One tenant is the whole cycle on this entry point, so the L0-pending
+    // accumulator opens and publishes around it. `run_discovery_cycle` does not
+    // call through here, so the two never nest.
+    safety.begin_scan_cycle();
+    let report = run_tick_with_clock(
+        &WallClock,
+        store,
+        tenant,
+        compactor,
+        retention,
+        shard_count,
+        memo,
+        safety,
+        ownership,
+        worker,
+        live_set,
+    )
+    .await;
+    safety.publish_scan_cycle();
+    report
+}
+
+/// Records every `(signal, shard)` unit of `tenant` that the rendezvous
+/// ownership gate assigns to this process under `live_set`, over the
+/// configured `0..shard_count` range of each [`MAINTAINED_SIGNALS`] signal.
+///
+/// This is the pure ownership question (ADR-0065 decision 2): it reads
+/// nothing from the store and cannot fail, so it answers "does this process
+/// own the unit" independently of whether this tick got far enough to
+/// evaluate it. That separation is what keeps the stall-streak accounting
+/// correct: the stall-streak prune in
+/// [`MaintenanceOwnershipMetrics::end_cycle`] keys on ownership, and
+/// a still-owned unit whose tick was skipped by a transient per-tenant or
+/// per-`(tenant, signal)` fault must keep its streak.
+///
+/// Units outside `0..shard_count` (a wider generation in the shard-generation
+/// history) are not visible without a store read, so [`run_tick_with_clock`]
+/// notes those additionally once it has read that history. That read is
+/// exactly one of the paths that can fail; when it does, the units this
+/// process owns within the configured range are still recorded here.
+fn note_owned_units(
+    ownership: &MaintenanceOwnershipMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    tenant: &TenantHash,
+    shard_count: u32,
+) {
+    for signal in MAINTAINED_SIGNALS {
+        for shard in 0..shard_count {
+            if worker.owns_unit(live_set, tenant, signal, shard) {
+                ownership.note_owned_unit(*tenant, signal, shard);
+            }
+        }
+    }
+}
+
+/// Count each unit of `signal` this process owns below `shard_count` as a
+/// failed scan, for a `(tenant, signal)` whose provisioning check or
+/// shard-generation read failed. Those units are skipped before any is scanned,
+/// so they report no retention lag, and a transient store error there
+/// increments no other counter.
+fn record_skipped_units_scan_failed(
+    safety: &MaintenanceSafetyMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    tenant: &TenantHash,
+    signal: Signal,
+    shard_count: u32,
+) {
+    for shard in 0..shard_count {
+        if worker.owns_unit(live_set, tenant, signal, shard) {
+            safety.record_scan_failed(signal);
+        }
+    }
+}
+
+/// Every orphan candidate the pass left present in the live set (ADR-0058
+/// decision 1), which is what the `orphans_present` gauge reports.
+///
+/// A refused candidate counts. Its copy to `quarantine/` failed, so the live
+/// key was deliberately not deleted, and the failure happens in exactly the
+/// store-fault case the gauge exists to surface. Summing only the first two
+/// terms read zero at the moment the signal mattered.
+///
+/// This is a named function rather than an expression at the call site so the
+/// rule has somewhere to be tested. Dropping a term is then a red test rather
+/// than a silent regression of the bug this closes.
+fn orphans_present_total(report: &ravel_maintain::SweepReport) -> usize {
+    report.orphans_deleted + report.orphans_withheld + report.orphans_quarantine_refused
+}
+
+/// [`run_tick`] with the clock injected instead of hardwired to [`WallClock`].
+/// The running service passes the loop's injected clock, which is
+/// [`WallClock`] there; tests pass a
+/// [`ravel_maintain::FixedClock`] so a tick that must observe time *passing*
+/// -- the ADR-0064 `.dreq` sweep waits out `protection_horizon` after the
+/// `.done` write -- can advance it deterministically instead of sleeping or
+/// shrinking the horizon to zero (CLAUDE.md testing patterns: time is
+/// injected).
+///
+/// Unlike [`run_tick`] it does not open or publish the per-cycle gauges
+/// (`l0_records_pending`, `retention_lag_ns`): the caller brackets one or more
+/// tenant ticks with [`MaintenanceSafetyMetrics::begin_scan_cycle`] and
+/// [`MaintenanceSafetyMetrics::publish_scan_cycle`], as
+/// [`run_discovery_cycle`] does.
+///
+/// The clock is taken as a cloneable concrete type because the advisory-claim
+/// participant installed below keeps its own `Arc<dyn Clock>`: a clone of
+/// `clock` gives it the same time source the tick reads ([`FixedClock`]
+/// clones share one instant).
+///
+/// [`FixedClock`]: ravel_maintain::FixedClock
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
+    clock: &C,
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    compactor: &CompactorConfig,
+    retention: &RetentionConfig,
+    shard_count: u32,
+    memo: &mut MaintainMemo,
+    safety: &MaintenanceSafetyMetrics,
+    ownership: &MaintenanceOwnershipMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+) -> MaintainReport {
+    // Advisory-claim participation (ADR-1029 decision 5). The supervisor is one
+    // of the two actors the ADR names, so every per-unit tick below claims the
+    // buckets it merges, inside the ownership gate that already decides which
+    // units this process looks at. With `coordination` on, every bucket it
+    // compacts or rewrites for erasure takes the claim, whatever its size
+    // (ADR-1029, the compaction-fence amendment).
+    //
+    // It is installed only when the caller left the slot empty, and on a clone
+    // of this tick's own clock, so the claim decisions read the same time as
+    // the rest of the tick.
+    let coordinated;
+    let compactor = if compactor.claim_participant.is_none() {
+        coordinated = CompactorConfig {
+            claim_participant: Some(ClaimParticipant::new(
+                worker.process_id(),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            ..compactor.clone()
+        };
+        &coordinated
+    } else {
+        compactor
+    };
+
+    // Record this tenant's owned units from the ownership gate alone, before
+    // anything that can fail. Ownership is a pure function of
+    // (live set, tenant, signal, shard) under the rendezvous hash, so it is
+    // knowable here, ahead of the legal-hold refresh and the per-(tenant,
+    // signal) provisioning and shard-generation reads below, each of which
+    // returns or continues without evaluating units this process still owns.
+    // Sourcing `owned_this_cycle` from the evaluation path instead let a
+    // transient per-tenant fault prune a still-owned unit's stall streak, so
+    // its `units_stalled` observation restarted from zero and recurring
+    // faults could hold the alarm off indefinitely.
+    note_owned_units(ownership, worker, live_set, tenant, shard_count);
+
+    let hold = match LegalHoldCheck::refresh(store, tenant).await {
+        Ok(hold) => hold,
+        Err(err) => {
+            tracing::error!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: legal hold refresh failed; skipping this tenant's tick entirely, retried next tick"
+            );
+            safety.record_legal_hold_refresh_failure();
+            return MaintainReport::default();
+        }
+    };
+
+    let mut total = MaintainReport::default();
+    for signal in MAINTAINED_SIGNALS {
+        // Durable shard_count validation before maintaining this (tenant,
+        // signal) (ADR-0050 section 5, EC5). A statically-known tenant's
+        // mismatch already refused startup; a dynamically-discovered tenant's
+        // mismatch here means this maintain process is configured for a
+        // different shard_count than the tenant's data was written under.
+        // Maintaining over `0..shard_count` would compact or sweep only a
+        // subset of shards, so skip this (tenant, signal)'s pass entirely and
+        // log loudly, rather than silently maintaining a truncated shard range
+        // or crashing the whole maintain loop for one tenant. Pre-ADR data with
+        // all shard indices in range is adopted here (the ADR names the
+        // maintenance touch as an adopter).
+        if let Err(err) = ravel_catalog::validate_or_adopt(
+            store,
+            tenant,
+            signal,
+            shard_count,
+            clock.now_ns(),
+            ravel_catalog::AbsentPolicy::AdoptIfData,
+        )
+        .await
+        {
+            // Count a hard mismatch caught here too, so an alert keyed on
+            // `ravel_provisioning_shard_count_mismatch_total` fires for a
+            // maintain-only mismatch, not just an ingest-path one.
+            crate::provisioning::note_provisioning_failure(&err);
+            record_skipped_units_scan_failed(safety, worker, live_set, tenant, signal, shard_count);
+            tracing::error!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                error = %err,
+                "maintenance: shard_count provisioning check failed; skipping this \
+                 (tenant, signal) this tick rather than maintaining a truncated shard range"
+            );
+            continue;
+        }
+
+        // Generation-aware scan range (ADR-0052 section 4): maintenance must
+        // compact and sweep every shard any generation ever wrote, not just
+        // `0..shard_count` (this process's static config value). The scan set
+        // is the union of every generation's range, i.e. the largest
+        // `shard_count` across the history: after an increase this covers the
+        // new, wider shards; after a decrease it keeps covering the old, wider
+        // shards until retention ages their hours out. Read fresh and uncached
+        // each tick (this is a separate read from the `validate_or_adopt`
+        // check above, which validates the scalar gen-0 count, not the scan
+        // range). An empty high shard lists cheaply and is tolerated. Absent
+        // record: the single implicit generation at the configured count.
+        let scan_shards =
+            match ravel_catalog::read_generations_from_store(store, tenant, signal).await {
+                Ok(Some(generations)) => generations
+                    .iter()
+                    .map(|g| g.shard_count)
+                    .max()
+                    .unwrap_or(shard_count),
+                Ok(None) => shard_count,
+                Err(err) => {
+                    crate::provisioning::note_provisioning_failure(&err);
+                    record_skipped_units_scan_failed(
+                        safety,
+                        worker,
+                        live_set,
+                        tenant,
+                        signal,
+                        shard_count,
+                    );
+                    tracing::error!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        error = %err,
+                        "maintenance: shard-generation history read failed; skipping this \
+                         (tenant, signal) this tick rather than maintaining a possibly-truncated \
+                         shard range"
+                    );
+                    continue;
+                }
+            };
+        // Ownership gate (ADR-0065 decision 2): keep only the shards this
+        // process owns under the current live set. A unit it does not own is
+        // not evaluated at all this tick (a discovery-time skip, not a mid-work
+        // abort); whichever worker the rendezvous hash assigns it to runs it.
+        let owned_shards: Vec<u32> = (0..scan_shards)
+            .filter(|shard| worker.owns_unit(live_set, tenant, signal, *shard))
+            .collect();
+        ownership.add_units_owned(owned_shards.len() as u64);
+        // Owned units the pre-refresh `note_owned_units` call could not see:
+        // a shard beyond the configured `shard_count` exists only in the
+        // shard-generation history read just above. Re-noting the shards
+        // below `shard_count` is a no-op on the set, so the loop stays a
+        // plain union rather than a range-split special case.
+        for &shard in &owned_shards {
+            ownership.note_owned_unit(*tenant, signal, shard);
+        }
+
+        // Carve each owned unit's memo slice out of the shared memo so its
+        // concurrent future can mutate it without aliasing another unit's
+        // disjoint bucket space; the slices are merged back (in ascending shard
+        // order) after the fan-out completes.
+        let units: Vec<(u32, MaintainMemo)> = owned_shards
+            .iter()
+            .map(|&shard| (shard, memo.split_unit(*tenant, signal, shard)))
+            .collect();
+
+        // Maintain owned units with bounded intra-process concurrency
+        // (decision 2's stuck-owner mitigation) instead of a strictly
+        // sequential walk, so one pathological unit cannot starve the rest of
+        // the process's ownership. `run_bounded` preserves input (ascending
+        // shard) order in its results, so the serial accounting and logging
+        // below is deterministic and, for a single-replica live set, produces
+        // byte-for-byte the pre-ADR-0065 sequential behavior. Each future runs
+        // one unit's retention/compaction pass and then its sweep, over a
+        // keyspace disjoint from every other unit's.
+        let clock_ref = clock;
+        let hold_ref = &hold;
+        let ownership_ref = ownership;
+        let unit_results = run_bounded(
+            worker.unit_concurrency(),
+            units,
+            move |(shard, mut unit_memo)| async move {
+                let scan = scan_and_maintain_with_memo(
+                    &mut unit_memo,
+                    store,
+                    clock_ref,
+                    compactor,
+                    retention,
+                    hold_ref,
+                    *tenant,
+                    signal,
+                    shard,
+                )
+                .await;
+                // Zone-scoped sweep on most ticks (ADR-0065 decision 3): rules
+                // 2 and 3 list only the head+tail hours this tick's scan just
+                // classified, reusing that classification instead of a second
+                // hour-discovery LIST. The slow safety-net cadence -- due on
+                // this unit's first tick (cold memo) and every
+                // `interior_reverify_ns` after -- runs the unscoped
+                // `sweep_shard` instead, so every hour, including one an
+                // interior-only invalidation gap or a bug in the zone split
+                // itself left permanently unswept, still gets a full pass. A
+                // failed scan carries no head+tail set to scope by, so it also
+                // falls back to a full pass rather than sweeping nothing.
+                //
+                // Rule 1 (orphan GC) rides the same cadence memo: its `l0/`
+                // data prefix LIST cannot be hour-scoped (issue #1734), so
+                // this per-tick zoned pass skips it (`OrphanPass::Skip`) and
+                // `sweep_shard` below runs it (unconditionally, as it always
+                // has) only when this branch's own guard says a full sweep is
+                // due. The gate is driven purely by `full_sweep_due`; no new
+                // interval or flag.
+                let now = clock_ref.now_ns();
+                let sweep = match &scan {
+                    Ok(report)
+                        if !unit_memo.full_sweep_due(
+                            *tenant,
+                            signal,
+                            shard,
+                            now,
+                            compactor.interior_reverify_ns,
+                        ) =>
+                    {
+                        sweep_shard_zoned_with_holds(
+                            store,
+                            clock_ref,
+                            compactor,
+                            hold_ref,
+                            tenant,
+                            signal,
+                            shard,
+                            &report.head_tail_hours,
+                            OrphanPass::Skip,
+                        )
+                        .await
+                        .map(|(zoned_report, _holds)| zoned_report)
+                    }
+                    _ => {
+                        let outcome = sweep_shard(
+                            store, clock_ref, compactor, hold_ref, tenant, signal, shard,
+                        )
+                        .await;
+                        if outcome.is_ok() {
+                            unit_memo.record_full_sweep(*tenant, signal, shard, now);
+                            ownership_ref.inc_full_sweep_passes();
+                        }
+                        outcome
+                    }
+                };
+                (shard, unit_memo, scan, sweep)
+            },
+        )
+        .await;
+
+        for (shard, unit_memo, scan_result, sweep_result) in unit_results {
+            memo.merge_unit(unit_memo);
+            ownership.observe_unit_tick(
+                *tenant,
+                signal,
+                shard,
+                scan_result.is_ok() && sweep_result.is_ok(),
+            );
+            if scan_result.is_err() {
+                safety.record_scan_failed(signal);
+            }
+            match scan_result {
+                Ok(report) => {
+                    tracing::info!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        retired = report.retired,
+                        compacted = report.compacted,
+                        already_done = report.already_done,
+                        not_sealed = report.not_sealed,
+                        skipped_terminal = report.skipped_terminal,
+                        // Buckets another attempt holds the claim on, and runs
+                        // this process cancelled because its own claim was
+                        // taken over (ADR-1029). Neither is a compaction: the
+                        // `compacted` field above counts only merges this
+                        // process actually ran.
+                        claim_skipped = report.claim_skipped,
+                        claim_cancelled = report.claim_cancelled,
+                        claims_acquired = report.claims_acquired,
+                        claims_stolen = report.claims_stolen,
+                        lag_bound_gets = report.lag_bound_gets,
+                        // Expired buckets waiting on their unnamed-since
+                        // marker (ADR-1133), and this pass's marker writes.
+                        blocked_by_pinned_window = report.blocked_by_pinned_window,
+                        unnamed_markers_written = report.unnamed_markers.written,
+                        "maintenance: retention + compaction pass complete"
+                    );
+                    safety.record_scan(signal, &report);
+                    total.retired += report.retired;
+                    total.compacted += report.compacted;
+                    total.already_done += report.already_done;
+                    total.not_sealed += report.not_sealed;
+                    total.skipped_terminal += report.skipped_terminal;
+                    total.claim_skipped += report.claim_skipped;
+                    total.claim_cancelled += report.claim_cancelled;
+                    total.claims_acquired += report.claims_acquired;
+                    total.claims_stolen += report.claims_stolen;
+                    total.l0_records_pending += report.l0_records_pending;
+                    total.lag_bound_gets += report.lag_bound_gets;
+                    total.retention_lag_ns = total.retention_lag_ns.max(report.retention_lag_ns);
+                }
+                Err(MaintainError::ConservationViolation {
+                    input_sample_count,
+                    part_sample_count,
+                    ingest_hour_bucket,
+                    ..
+                }) => {
+                    tracing::error!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        ingest_hour_bucket,
+                        input_sample_count,
+                        part_sample_count,
+                        "maintenance: compaction conservation gate aborted a publish; \
+                         inputs and built parts disagree on record count, nothing written, \
+                         retried next tick"
+                    );
+                    safety.record_conservation_abort(signal);
+                }
+                Err(MaintainError::ClaimRenewFailed { at, source }) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        checkpoint = at,
+                        error = %source,
+                        "maintenance: compaction claim renewal failed with a store error \
+                         (not a lost claim); retried next tick"
+                    );
+                    safety.record_claim_renew_failure(signal);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        error = %err,
+                        "maintenance: retention/compaction pass failed; retried next tick"
+                    );
+                }
+            }
+
+            match sweep_result {
+                Ok(report) => {
+                    tracing::info!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        orphan_pass = ?report.orphan_pass,
+                        orphans = report.orphans_deleted,
+                        superseded_records = report.superseded_records_deleted,
+                        superseded_data = report.superseded_data_deleted,
+                        unreferenced_parts = report.unreferenced_parts_deleted,
+                        superseded_held_pinned_window = report.superseded_held_by_pinned_window,
+                        unnamed_markers_written = report.unnamed_markers.written,
+                        unnamed_markers_reaped =
+                            report.unnamed_marker_reap.as_ref().map_or(0, |r| r.reaped),
+                        "maintenance: sweep pass complete"
+                    );
+                    if report.orphan_breaker_tripped {
+                        log_orphan_breaker_trip(tenant, signal, shard, &report);
+                    }
+                    safety.record_sweep(signal, &report);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        error = %err,
+                        "maintenance: sweep pass failed; retried next tick"
+                    );
+                }
+            }
+        }
+
+        // Idempotency markers exist only for logs and spans (ADR-0051 SS5);
+        // the sweep LISTs one coarse prefix covering every shard of the
+        // signal, so it runs once per signal here, not inside the per-shard
+        // loop above. Gated on ownership of shard 0 of this (tenant, signal)
+        // pair (ADR-0065 decision 2): the single worker that owns shard 0 runs
+        // the whole-signal marker sweep, so replicas do not double-pay it.
+        // Logged like the GC sweep pass, not folded into `MaintainReport`'s
+        // summed fields.
+        if matches!(signal, Signal::Logs | Signal::Spans)
+            && worker.owns_unit(live_set, tenant, signal, 0)
+        {
+            match sweep_idempotency_markers(store, clock, compactor, &hold, tenant, signal).await {
+                Ok(outcome) => {
+                    tracing::info!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        deleted = outcome.deleted,
+                        kept = outcome.kept,
+                        skipped_malformed = outcome.skipped_malformed,
+                        "maintenance: idempotency marker sweep pass complete"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        error = %err,
+                        "maintenance: idempotency marker sweep pass failed; retried next tick"
+                    );
+                }
+            }
+        }
+
+        // Unreferenced catalog snapshot and index objects (ADR-0064 §5 GC rule
+        // 5, issue #121). Every fold, and the frontier-reconcile path in
+        // `ravel_catalog::fold`, publishes a new HEAD that supersedes the prior
+        // snapshot/index objects; those superseded objects are named by no HEAD
+        // afterward and are reclaimed by nothing else. This is the only
+        // production driver of `sweep_unreferenced_catalog_objects`; without
+        // this call the already-tested rule never runs outside tests and the
+        // objects accumulate forever.
+        //
+        // Per (tenant, signal), not per shard: catalog objects carry no shard
+        // dimension, so it runs once per signal here, outside the per-shard
+        // loop above, exactly like the idempotency-marker sweep. Gated on
+        // ownership of shard 0 of this (tenant, signal) pair (ADR-0065 decision
+        // 2) so replicas do not double-pay it. Unlike the marker sweep it runs
+        // for EVERY signal: catalog objects exist for metrics, logs, and spans
+        // alike, and the sweep's own HEAD anchor (an absent HEAD sweeps
+        // nothing) is what makes it safe on a signal that has never folded.
+        // Logged like the other per-signal sweeps, not folded into
+        // `MaintainReport`'s summed fields.
+        if worker.owns_unit(live_set, tenant, signal, 0) {
+            match sweep_unreferenced_catalog_objects(store, clock, compactor, &hold, tenant, signal)
+                .await
+            {
+                Ok(outcome) => tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    deleted = outcome.deleted,
+                    kept = outcome.kept,
+                    "maintenance: unreferenced catalog object sweep pass complete"
+                ),
+                Err(err) => tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    error = %err,
+                    "maintenance: unreferenced catalog object sweep pass failed; retried next tick"
+                ),
+            }
+        }
+
+        // Selective subject erasure (ADR-0064): the
+        // rewrite pass over every bucket, the request-completion `.done`
+        // write, and the `.dreq` sweep -- in that order, so a request's
+        // `.dreq` is only ever removed after its erasure is durably complete.
+        // This is the production caller for `erasure_rewrite_bucket` and
+        // `sweep_erasure_requests`; without it a submitted request is
+        // physically erased by nothing and its `.dreq` (which carries the
+        // subject identifier) is removed by nothing.
+        //
+        // Runs after this signal's compaction pass above, which is ADR-0064
+        // decision 3 point 5's per-bucket serialization of compaction and
+        // rewrite inside the single per-tenant loop. Gated on ownership of
+        // shard 0 like the marker sweep, but unlike it the pass then walks
+        // EVERY shard in `scan_shards`, not just the ones this process owns:
+        // an erasure request is scoped to a whole (tenant, signal), so its
+        // completion condition (below) is only sound when one process has
+        // observed every shard's buckets. Another replica's compaction of a
+        // non-owned shard is fenced against this pass by the bucket's
+        // compaction claim, which both passes take, and by the re-list each
+        // runs before it publishes (ADR-1029, the compaction-fence
+        // amendment); `CreateIfAbsent` alone does not fence them, since the
+        // two records have different keys.
+        if worker.owns_unit(live_set, tenant, signal, 0) {
+            run_erasure_pass(
+                store,
+                clock,
+                compactor,
+                &hold,
+                tenant,
+                signal,
+                scan_shards,
+                memo,
+                safety,
+            )
+            .await;
+        }
+    }
+
+    // Query-audit shard maintenance. The query-audit shard
+    // (Signal::Audit / QUERY_AUDIT_SHARD) is brought into the maintained set on
+    // its own terms: a dedicated age-based retention sweep on
+    // `compactor.audit_retention_window_ns` (default 90 days), then RLOG
+    // compaction of its sealed buckets, then cleanup of the compacted L0 inputs.
+    // Retention runs before compaction, matching the data-signal path's
+    // efficiency-preferred ordering (retention.rs `maintain_bucket`): an expired
+    // bucket's records are deleted first, so compaction never rewrites data that
+    // is about to be swept. It is deliberately NOT part of the MAINTAINED_SIGNALS
+    // data-shard loop above: those carry ADR-0019 per-tenant retention and
+    // per-signal shard counts, while the query-audit shard is a fixed
+    // control-plane shard with its own lifetime. The legal-hold shard
+    // (AUDIT_HOLD_SHARD = 0) is never touched: `compact_bucket` guards on the
+    // shard, and every sweep here is scoped to QUERY_AUDIT_SHARD. Gated on
+    // ownership of this one unit (ADR-0065 decision 2); the same `hold` snapshot
+    // from above gates every delete, so a legal hold covering the query-audit
+    // shard blocks it. Logged, not folded into `MaintainReport` (whose fields
+    // describe the data-signal passes), and kept out of
+    // `MaintenanceSafetyMetrics`' per-signal arrays, which cover only
+    // MAINTAINED_SIGNALS; a breaker trip and rule 2's refusals and holds here
+    // are counted apart from them, under `signal="audit"`.
+    if worker.owns_unit(live_set, tenant, Signal::Audit, QUERY_AUDIT_SHARD) {
+        match sweep_audit_retention(store, clock, compactor, &hold, tenant).await {
+            Ok(outcome) => tracing::info!(
+                tenant = %tenant.to_hex(),
+                records = outcome.records_deleted,
+                data = outcome.data_deleted,
+                parts = outcome.parts_deleted,
+                kept = outcome.kept,
+                "maintenance: query-audit retention sweep complete"
+            ),
+            Err(err) => tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: query-audit retention sweep failed; retried next tick"
+            ),
+        }
+
+        match scan_and_compact(
+            store,
+            clock,
+            compactor,
+            *tenant,
+            Signal::Audit,
+            QUERY_AUDIT_SHARD,
+        )
+        .await
+        {
+            Ok(report) => tracing::info!(
+                tenant = %tenant.to_hex(),
+                compacted = report.compacted,
+                already_done = report.already_done,
+                "maintenance: query-audit compaction pass complete"
+            ),
+            Err(err) => tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: query-audit compaction pass failed; retried next tick"
+            ),
+        }
+
+        match sweep_shard(
+            store,
+            clock,
+            compactor,
+            &hold,
+            tenant,
+            Signal::Audit,
+            QUERY_AUDIT_SHARD,
+        )
+        .await
+        {
+            Ok(report) => {
+                tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    superseded_records = report.superseded_records_deleted,
+                    superseded_data = report.superseded_data_deleted,
+                    unreferenced_parts = report.unreferenced_parts_deleted,
+                    superseded_deletes_refused = report.superseded_deletes_refused,
+                    "maintenance: query-audit input-cleanup sweep complete"
+                );
+                report_unmaintained_breaker_trip(
+                    safety,
+                    tenant,
+                    Signal::Audit,
+                    QUERY_AUDIT_SHARD,
+                    &report,
+                );
+                safety.record_unmaintained_superseded(Signal::Audit, &report);
+            }
+            Err(err) => tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: query-audit input-cleanup sweep failed; retried next tick"
+            ),
+        }
+    }
+
+    // Alert-signal retention (ADR-1688). Gated on ownership of the one alerts
+    // unit only. A window of `0` turns off the retention sweep and its memo
+    // read inside `run_alert_retention`, not the alerts shard's orphan sweep:
+    // the evaluator's writer interlock still abandons late writes under `0`,
+    // and the orphan sweep is what reclaims them. Logged, not folded into
+    // `MaintainReport` or the per-signal safety arrays, for the same reasons as
+    // the query-audit block above.
+    if worker.owns_unit(live_set, tenant, Signal::Alerts, ALERT_SHARD) {
+        run_alert_retention(store, clock, compactor, &hold, tenant, safety).await;
+    }
+
+    total
+}
+
+/// The alert retention driver for one tenant (ADR-1688 decisions 3 and 6, and
+/// the keep-set amendment): read the alert state memo, build the keep set from
+/// it, and sweep the alerts shard; then run the shard sweep over the alerts
+/// shard, whose orphan rule reclaims a data object left behind by a crash
+/// between the retention sweep's record delete and its data delete.
+///
+/// A memo that is undecodable, of an unsupported version, unreadable for a
+/// store reason, or whose watermark sits below the expiry floor's hour skips the
+/// retention sweep for this tenant this tick and counts it. An absent memo
+/// counts only when the tenant's alert commit prefix holds something: a tenant
+/// that has never written an alert transition has no history to sweep and is
+/// neither logged nor counted, which is otherwise every tenant of a deployment
+/// that runs no alert rules, on every tick.
+///
+/// A window of `0` (`--alert-retention 0`) skips the memo read and the
+/// retention sweep entirely, and counts nothing.
+///
+/// The orphan sweep does not depend on the memo or the window and runs either
+/// way, including for a tenant with no commit records at all: a data object
+/// whose first-ever commit record never landed is exactly the leak it exists to
+/// reclaim, and the evaluator's writer interlock produces those whatever the
+/// window is. It is skipped only for a tenant whose alert keyspace and its
+/// quarantine copies hold nothing at all ([`alert_keyspace_is_empty`]), where
+/// every one of its listings would come back empty.
+async fn run_alert_retention(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &LegalHoldCheck,
+    tenant: &TenantHash,
+    safety: &MaintenanceSafetyMetrics,
+) {
+    let memo_or_records_seen = compactor.alert_retention_window_ns > 0
+        && run_alert_retention_sweep(store, clock, compactor, hold, tenant, safety).await;
+
+    if !memo_or_records_seen {
+        match alert_keyspace_is_empty(store, tenant).await {
+            Ok(true) => {
+                tracing::debug!(
+                    tenant = %tenant.to_hex(),
+                    "maintenance: alerts shard orphan sweep skipped: the tenant's alert keyspace \
+                     and its quarantine copies hold nothing"
+                );
+                return;
+            }
+            Ok(false) => {}
+            // Not knowing is not the same as empty: sweep, and let the sweep's
+            // own listings report the store fault.
+            Err(err) => tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: alerts keyspace listing failed; running the alerts shard orphan \
+                 sweep anyway"
+            ),
+        }
+    }
+
+    match sweep_shard(
+        store,
+        clock,
+        compactor,
+        hold,
+        tenant,
+        Signal::Alerts,
+        ALERT_SHARD,
+    )
+    .await
+    {
+        Ok(report) => {
+            tracing::info!(
+                tenant = %tenant.to_hex(),
+                orphans = report.orphans_deleted,
+                orphans_withheld = report.orphans_withheld,
+                orphan_breaker_tripped = report.orphan_breaker_tripped,
+                quarantine_reaped = report.quarantine_reaped,
+                "maintenance: alerts shard orphan sweep complete"
+            );
+            report_unmaintained_breaker_trip(safety, tenant, Signal::Alerts, ALERT_SHARD, &report);
+            // Zero today: nothing compacts or rewrites the alerts shard, so it
+            // has no supersession chain for rule 2 to refuse or hold.
+            safety.record_unmaintained_superseded(Signal::Alerts, &report);
+        }
+        Err(err) => tracing::warn!(
+            tenant = %tenant.to_hex(),
+            error = %err,
+            "maintenance: alerts shard orphan sweep failed; retried next tick"
+        ),
+    }
+}
+
+/// Log and count a mass-orphan breaker trip reported by a `sweep_shard` pass
+/// over a shard outside MAINTAINED_SIGNALS, the same event and runbook wording
+/// the maintained signals' trips carry. A pass that did not trip is a no-op.
+fn report_unmaintained_breaker_trip(
+    safety: &MaintenanceSafetyMetrics,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    report: &ravel_maintain::SweepReport,
+) {
+    if !report.orphan_breaker_tripped {
+        return;
+    }
+    log_orphan_breaker_trip(tenant, signal, shard, report);
+    safety.record_unmaintained_orphan_breaker_trip(signal);
+}
+
+/// The error line, with the breaker runbook wording, for a `sweep_shard` pass
+/// whose mass-orphan breaker tripped. Shared by the maintained signals' shards
+/// and the shards outside MAINTAINED_SIGNALS, so an operator's search for the
+/// runbook text finds every trip.
+fn log_orphan_breaker_trip(
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+    report: &ravel_maintain::SweepReport,
+) {
+    tracing::error!(
+        tenant = %tenant.to_hex(),
+        signal = ?signal,
+        shard,
+        withheld = report.orphans_withheld,
+        "maintenance: orphan GC mass-orphan circuit breaker tripped; \
+         deletions withheld this pass, not self-clearing in the sense an \
+         operator expects, see the breaker runbook"
+    );
+}
+
+/// The memo-driven half of [`run_alert_retention`]: read the memo, build the
+/// keep set, and run the retention sweep, or count why it cannot run.
+///
+/// Returns whether it found the memo object or an alert commit record, either
+/// of which puts an object under the tenant's alert keyspace, so the caller
+/// needs no listing of its own to know the orphan sweep has something to look
+/// at.
+async fn run_alert_retention_sweep(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &LegalHoldCheck,
+    tenant: &TenantHash,
+    safety: &MaintenanceSafetyMetrics,
+) -> bool {
+    match alert_keep_set(store, clock, compactor, tenant).await {
+        Ok(AlertKeepSetOutcome::Ready(keep)) => {
+            match sweep_alert_retention(store, clock, compactor, hold, tenant, ALERT_SHARD, &keep)
+                .await
+            {
+                Ok(outcome) => tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    records = outcome.records_deleted,
+                    data = outcome.data_deleted,
+                    kept = outcome.kept,
+                    kept_current_state = outcome.kept_current_state,
+                    "maintenance: alert retention sweep complete"
+                ),
+                Err(err) => tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    error = %err,
+                    "maintenance: alert retention sweep failed; retried next tick"
+                ),
+            }
+            true
+        }
+        // Every skip reason read a memo object, or found the commit prefix
+        // non-empty (`absent`).
+        Ok(AlertKeepSetOutcome::Skip(reason)) => {
+            safety.record_alert_retention_skipped(reason);
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                reason = reason.name(),
+                "maintenance: alert retention sweep skipped for this tenant this tick: no usable \
+                 alert state memo; the evaluator rewrites it every tick it runs"
+            );
+            true
+        }
+        Ok(AlertKeepSetOutcome::NoAlertRecords) => {
+            tracing::debug!(
+                tenant = %tenant.to_hex(),
+                "maintenance: alert retention sweep has nothing to do for this tenant: no memo \
+                 and no alert commit records"
+            );
+            false
+        }
+        Err(err) => {
+            safety.record_alert_retention_skipped(AlertRetentionSkipReason::StoreError);
+            tracing::warn!(
+                tenant = %tenant.to_hex(),
+                error = %err,
+                "maintenance: alert state memo read failed; alert retention sweep skipped, \
+                 retried next tick"
+            );
+            false
+        }
+    }
+}
+
+/// What [`alert_keep_set`] found: a keep set the sweep may run under, a reason
+/// it must not run this tick, or a tenant with no alert history at all.
+enum AlertKeepSetOutcome {
+    /// A memo the sweep can trust, reduced to its keep set.
+    Ready(AlertKeepSet),
+    /// A memo state the sweep must not run under. Counted and logged.
+    Skip(AlertRetentionSkipReason),
+    /// No memo, and the tenant's alert commit prefix is empty: nothing has ever
+    /// been written for this signal, so there is nothing to sweep and nothing
+    /// an operator would want counted.
+    NoAlertRecords,
+}
+
+/// The keep set for one tenant's alert retention sweep, or why there is none.
+///
+/// `Err` is a store failure reading the memo or the alert commit prefix, which
+/// is transient; the driver counts it under
+/// [`AlertRetentionSkipReason::StoreError`] and retries next tick.
+async fn alert_keep_set(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    tenant: &TenantHash,
+) -> anyhow::Result<AlertKeepSetOutcome> {
+    let memo = match read_alert_state_memo(store, tenant).await {
+        Ok(Some(memo)) => memo,
+        Ok(None) => {
+            return if alert_commit_prefix_is_empty(store, tenant).await? {
+                Ok(AlertKeepSetOutcome::NoAlertRecords)
+            } else {
+                Ok(AlertKeepSetOutcome::Skip(AlertRetentionSkipReason::Absent))
+            };
+        }
+        Err(err) => {
+            return match err.downcast_ref::<MemoError>() {
+                Some(MemoError::UnsupportedVersion { .. }) => Ok(AlertKeepSetOutcome::Skip(
+                    AlertRetentionSkipReason::UnsupportedVersion,
+                )),
+                Some(MemoError::Decode(_) | MemoError::Encode(_)) => Ok(AlertKeepSetOutcome::Skip(
+                    AlertRetentionSkipReason::Undecodable,
+                )),
+                None => Err(err),
+            };
+        }
+    };
+    let now_ns = clock.now_ns();
+    // `watermark_hour` is untrusted on read: `alert_state_memo::decode` accepts
+    // any `u32`, so a writer whose clock ran ahead, or a corrupted-but-decodable
+    // field, can name an hour above this reader's own. The evaluator's fold
+    // clamps it for the same reason; the sweep needs the clamp more, because its
+    // watermark is the floor below which it DELETES. Clamping to the hour of the
+    // injected `now` can only lower it, so it can only make the sweep keep more.
+    let now_hour = now_ns.div_euclid(ravel_maintain::config::NS_PER_HOUR);
+    let watermark_hour = u32::try_from(i64::from(memo.watermark_hour).min(now_hour)).unwrap_or(0);
+    let expiry_floor = now_ns.saturating_sub(compactor.alert_retention_window_ns);
+    let floor_hour = expiry_floor.div_euclid(ravel_maintain::config::NS_PER_HOUR);
+    if i64::from(watermark_hour) < floor_hour {
+        return Ok(AlertKeepSetOutcome::Skip(
+            AlertRetentionSkipReason::WatermarkBelowFloor,
+        ));
+    }
+    Ok(AlertKeepSetOutcome::Ready(AlertKeepSet::new(
+        watermark_hour,
+        memo.records.values().map(|record| record.ts_ns),
+    )))
+}
+
+/// Whether `prefix` holds nothing, in one bounded listing.
+///
+/// A page that carries a continuation token counts as non-empty even when its
+/// own object list is empty: the store is entitled to return one, and a
+/// prefix it has not shown to be empty is not treated as empty.
+async fn prefix_is_empty(store: &dyn ObjectStoreBackend, prefix: &str) -> anyhow::Result<bool> {
+    let page = store.list(prefix, None).await?;
+    Ok(page.objects.is_empty() && page.next.is_none())
+}
+
+/// Whether the tenant's alert commit prefix holds nothing, by
+/// [`prefix_is_empty`].
+async fn alert_commit_prefix_is_empty(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> anyhow::Result<bool> {
+    let prefix = keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD)?;
+    prefix_is_empty(store, &prefix).await
+}
+
+/// Whether the alerts shard's `sweep_shard` has nothing to look at for
+/// `tenant`, in at most two bounded listings, each read by
+/// [`prefix_is_empty`].
+///
+/// The commit prefix alone cannot answer it. Rule 1 exists for the data object
+/// whose first commit record never landed, which sits under `l0/` beside an
+/// empty `c/`, and the quarantine reaper still has copies to reap after rule 1
+/// has moved the last live one. So the first listing is the tenant's whole
+/// alert keyspace (`t/<hex>/a/`: every commit record, `l0/` data object and
+/// `l1/` part the sweep's rules list, plus the memo), and the second is the
+/// quarantine mirror of it the reaper lists. An object written after either
+/// listing is younger than every age gate the sweep applies, so skipping this
+/// tick cannot miss work the sweep could have done.
+async fn alert_keyspace_is_empty(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> anyhow::Result<bool> {
+    let keyspace = format!("t/{}/{}/", tenant.to_hex(), Signal::Alerts.key_prefix());
+    let quarantine = format!("quarantine/{keyspace}");
+    for prefix in [keyspace, quarantine] {
+        if !prefix_is_empty(store, &prefix).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Domain-separation prefix for [`erasure_predicate_hash`], following the same
+/// convention as ravel-commit's rewrite `input_set_hash` domain: a digest from
+/// this preimage can never collide with a digest over any other structure.
+const ERASURE_PREDICATE_HASH_DOMAIN: &[u8] = b"ravel-erasure-predicate-v1\0";
+
+/// blake3 over one erasure request's canonical predicate encoding, which is
+/// what an `ErasureCompletion` carries in place of the plaintext predicate
+/// (ADR-0064 decision 1: the `.done` is permanent, so it must hold no subject
+/// identifier).
+///
+/// The preimage is the domain prefix, the matcher count, then every
+/// `(key, value)` pair length-prefixed and **sorted**, then both window bounds.
+/// Sorting is what makes this canonical: matcher order is not significant to a
+/// conjunction, so two submissions of the same erasure with the matchers typed
+/// in a different order must hash identically. That is exactly the identity
+/// `ravel-cli erase submit`'s `same_erasure` uses to decide whether a
+/// colliding `request_id` is an idempotent retry or a genuinely different
+/// erasure (matchers as an unordered multiset, plus the window bounds), so the
+/// two agree on what "the same predicate" means.
+///
+/// This encoding lives here only because no shared helper exists yet:
+/// ADR-0064 names "a blake3 hash of the canonical predicate encoding" but
+/// neither `ravel_commit::erasure` nor any normative doc defines the bytes,
+/// and this task's scope is this file. Flagged for a follow-up that moves it
+/// next to `compute_rewrite_input_set_hash` in ravel-commit, which is where a
+/// frozen-contract preimage belongs.
+fn erasure_predicate_hash(request: &ErasureRequest) -> [u8; 32] {
+    let mut matchers: Vec<(&str, &str)> = request
+        .predicate
+        .iter()
+        .map(|m| (m.key.as_str(), m.value.as_str()))
+        .collect();
+    matchers.sort_unstable();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(ERASURE_PREDICATE_HASH_DOMAIN);
+    hasher.update(&(matchers.len() as u64).to_le_bytes());
+    for (key, value) in matchers {
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(&request.window_start_ns.to_le_bytes());
+    hasher.update(&request.window_end_ns.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// List every ingest-hour bucket present under one `(tenant, signal, shard)`,
+/// ascending -- the erasure pass's bucket discovery. One delimited LIST of the
+/// shard's `c/` prefix, exactly what `ravel_maintain::scan`'s own (private)
+/// hour listing does; a common prefix that is not an ingest hour is layout
+/// drift and errors rather than being skipped.
+async fn list_erasure_scan_hours(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> Result<Vec<u32>, MaintainError> {
+    let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+    let listed = store.list_delimited(&prefix).await?;
+    let mut hours: Vec<u32> = Vec::with_capacity(listed.common_prefixes.len());
+    for common in &listed.common_prefixes {
+        // common == "<prefix><hour>/"; extract the hour segment.
+        let rest = common
+            .strip_prefix(&prefix)
+            .and_then(|r| r.strip_suffix('/'))
+            .unwrap_or("");
+        hours.push(keys::parse_ingest_hour_string(rest)?);
+    }
+    hours.sort_unstable();
+    Ok(hours)
+}
+
+/// What one `(tenant, signal)` rewrite sweep observed, for the completion
+/// decision and the log line.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ErasureRewritePass {
+    /// Buckets this tick actually rewrote (a `RewriteRecord` was published or
+    /// converged). An abandoned publish is counted by its reason below, or
+    /// only logged, and sets `deferred`.
+    rewritten: usize,
+    /// Buckets whose live `RewriteRecord` already named every overlapping
+    /// request, so nothing was republished (the idempotence guard).
+    already_applied: usize,
+    /// Buckets whose rewrite could not take the bucket claim (ADR-1029, the
+    /// 2026-10-03 amendment): [`ErasureAbandon::ClaimHeld`]. Counted into
+    /// `ravel_maintain_claims_skipped_total`, as a compaction refused the claim
+    /// is; `deferred` is set too.
+    claim_backoffs: usize,
+    /// Buckets whose rewrite took the claim and lost it before its record PUT
+    /// ([`ErasureAbandon::ClaimLost`]). Counted into
+    /// `ravel_maintain_claims_lost_total`, as a cancelled compaction is.
+    claims_lost: usize,
+    /// Claims the rewrites took, fresh or stolen, and the stolen subset.
+    /// Counted into `ravel_maintain_claims_acquired_total` and
+    /// `ravel_maintain_claims_stolen_total`, as a compaction's are.
+    claims_acquired: usize,
+    claims_stolen: usize,
+    /// Buckets that contribute nothing to any pending request: no pending
+    /// request's event-time range overlaps them, or they are tombstoned.
+    out_of_scope: usize,
+    /// Buckets not yet sealed. ADR-0064 decision 3 point 1 defers these to a
+    /// later pass and excludes them from a request's scope; their data is
+    /// already unreturnable through the query-time filter meanwhile.
+    not_sealed: usize,
+    /// A bucket in scope was NOT brought up to date this tick: a legal hold,
+    /// an abandoned publish, a listing failure, or a rewrite error. Any of
+    /// these makes the completion verification unsound, so no `.done` is
+    /// written this tick and every request stays pending.
+    deferred: bool,
+    /// `request_id`s the CATALOG resolver
+    /// ([`ravel_maintain::bucket_erasure_completion`], built on
+    /// `ravel_catalog::resolve_rewrite_supersession`) proves are still served
+    /// out of at least one in-scope bucket -- an L0 input, a compaction part,
+    /// or a sibling rewrite the query would resolve but the rewrite pass's
+    /// one-hop `resolve_live_record` was blind to (ADR-0064 §4 F1). Their
+    /// `.done` is withheld even when `deferred` is false: completion follows the
+    /// resolver the query path trusts, not the pass's own live-record hop.
+    catalog_blocked: std::collections::HashSet<String>,
+}
+
+/// Rewrite every bucket of one `(tenant, signal)` against `pending`
+/// (ADR-0064 decision 3), and classify what happened for the completion
+/// decision the caller then makes.
+///
+/// `pending` is passed whole to every bucket: `erasure_rewrite_bucket` does
+/// its own per-bucket overlap prefilter and batches every overlapping request
+/// into ONE `RewriteRecord`, so N pending requests cost one rewrite per
+/// bucket, not N (ADR-0064 consequences, "N concurrent DSARs cost one rewrite,
+/// not N").
+///
+/// The [`ErasureRewriteOutcome::AlreadyApplied`] arm is the idempotence
+/// guard and is deliberately counted, not re-driven: a bucket whose live
+/// record already names every overlapping request must not republish, or every
+/// tick would land a fresh no-op rewrite superseding the last one and churn
+/// generations forever.
+#[allow(clippy::too_many_arguments)]
+async fn erasure_rewrite_pass(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    pending: &[PendingErasureRequest],
+    derived_hours: &std::collections::BTreeSet<u32>,
+    memo: &mut MaintainMemo,
+) -> ErasureRewritePass {
+    let mut pass = ErasureRewritePass::default();
+    for shard in 0..scan_shards {
+        let listed = match list_erasure_scan_hours(store, tenant, signal, shard).await {
+            Ok(hours) => hours,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    shard,
+                    error = %err,
+                    "maintenance: erasure rewrite could not list a shard's buckets; \
+                     no completion written this tick, retried next tick"
+                );
+                pass.deferred = true;
+                continue;
+            }
+        };
+        // Union the commit-prefix listing with `derived_hours`, the ingest
+        // hours open at each request's acknowledgement (issue #1290). A pre-ack
+        // flush that has not published a commit record yet leaves its hour out
+        // of the listing, so without this union the completion gate never sees
+        // the bucket the subject's pre-ack records will later seal into and the
+        // request completes while that bucket resurrects the subject. Whether
+        // the derived bucket puts records in a request's scope stays the single
+        // judgement inside `bucket_erasure_completion`; this only makes the
+        // bucket present for that gate to judge.
+        let listed: std::collections::BTreeSet<u32> = listed.into_iter().collect();
+        let mut hours = listed.clone();
+        hours.extend(derived_hours.iter().copied());
+        for hour in hours {
+            let bucket = Bucket::new(*tenant, signal, shard, hour);
+            // The rewrite runs only on hours the listing returned. A derived
+            // hour absent from the listing has no commit record for this shard,
+            // so there is nothing to rewrite; the completion gate below still
+            // examines it (it blocks while that bucket is unsealed and in
+            // scope, and passes once it seals empty). This also keeps the
+            // rewrite off an empty bucket, which `erasure_rewrite_bucket` does
+            // not currently accept for a windowless request (flagged in the
+            // task report). Once the derived hour's commit record lands it
+            // becomes a listed hour and the rewrite acts on it normally.
+            if listed.contains(&hour) {
+                match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
+                    .await
+                {
+                    Ok(ErasureRewriteOutcome::Rewritten {
+                        parts,
+                        publish,
+                        abandoned,
+                        claim,
+                    }) => {
+                        tally_erasure_rewrite(&mut pass, &publish, abandoned, claim);
+                        match abandoned {
+                            None => tracing::info!(
+                                tenant = %tenant.to_hex(),
+                                signal = ?signal,
+                                shard,
+                                hour,
+                                parts,
+                                publish = ?publish,
+                                "maintenance: erasure rewrite published for a bucket"
+                            ),
+                            Some(reason) => tracing::info!(
+                                tenant = %tenant.to_hex(),
+                                signal = ?signal,
+                                shard,
+                                hour,
+                                parts,
+                                reason = reason.name(),
+                                detail = ?reason,
+                                "maintenance: erasure rewrite of a bucket published nothing; \
+                                 the request stays pending and a later tick retries"
+                            ),
+                        }
+                    }
+                    Ok(ErasureRewriteOutcome::AlreadyApplied) => pass.already_applied += 1,
+                    Ok(
+                        ErasureRewriteOutcome::NoApplicableRequests
+                        | ErasureRewriteOutcome::Tombstoned,
+                    ) => pass.out_of_scope += 1,
+                    Ok(ErasureRewriteOutcome::NotSealed) => pass.not_sealed += 1,
+                    Ok(ErasureRewriteOutcome::Held) => {
+                        // ADR-0064 §6: a legal hold wins over erasure. The request
+                        // stays pending, query-time exclusion keeps hiding the
+                        // data, and the erasure clock is explicitly paused.
+                        pass.deferred = true;
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            "maintenance: erasure rewrite skipped a bucket under legal hold; \
+                             the request stays pending until the hold clears"
+                        );
+                    }
+                    Err(err) => {
+                        pass.deferred = true;
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            shard,
+                            hour,
+                            error = %err,
+                            "maintenance: erasure rewrite of a bucket failed; no completion \
+                             written this tick, retried next tick"
+                        );
+                    }
+                }
+            }
+
+            // Completion gate (ADR-0064 §4, the 2026-08-08 F1 correction): the
+            // outcome above classified the bucket off ravel-maintain's one-hop
+            // `resolve_live_record`, which is blind to an L0 input a query still
+            // resolves through the full supersession chain. Re-derive "is this
+            // bucket's contribution to every pending request current" through
+            // the SAME resolver the query path runs
+            // (`ravel_catalog::resolve_rewrite_supersession`, via
+            // `bucket_erasure_completion`), on a fresh listing that reflects any
+            // rewrite just published, so a `.done` can never be written while a
+            // resolvable snapshot still serves the subject. This runs for every
+            // bucket regardless of the rewrite outcome, and for every derived
+            // hour whether or not the listing returned it (issue #1290): a
+            // bucket the pass called `AlreadyApplied` or `NoApplicableRequests`
+            // off its one-hop view, or a derived ack-open hour still unsealed,
+            // is exactly where completion must be withheld.
+            match ravel_maintain::bucket_erasure_completion(
+                store, clock, compactor, hold, &bucket, pending,
+            )
+            .await
+            {
+                Ok(completion) => {
+                    if completion.unresolved {
+                        pass.deferred = true;
+                    }
+                    pass.catalog_blocked.extend(completion.blocked);
+                }
+                Err(err) => {
+                    // The resolver could not establish this bucket's served
+                    // view (list/decode/supersession failure). Treat it exactly
+                    // as a rewrite failure: defer every request this tick rather
+                    // than complete on an unverified view.
+                    pass.deferred = true;
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        shard,
+                        hour,
+                        error = %err,
+                        "maintenance: erasure completion resolution failed; no completion \
+                         written this tick, retried next tick"
+                    );
+                }
+            }
+        }
+    }
+    pass
+}
+
+/// Count one [`ErasureRewriteOutcome::Rewritten`] into `pass`.
+///
+/// An abandoned publish wrote no record, so the bucket does not yet name the
+/// pending requests and the tick defers, whatever the reason. Only the two
+/// claim reasons land on claim counters: a re-list that found the record set
+/// changed and a deadline abandonment have nothing to do with a claim, and the
+/// caller logs them with their reason.
+fn tally_erasure_rewrite(
+    pass: &mut ErasureRewritePass,
+    publish: &ravel_maintain::PublishOutcome,
+    abandoned: Option<ErasureAbandon>,
+    claim: Option<ravel_maintain::ClaimAcquisition>,
+) {
+    if let Some(claim) = claim {
+        pass.claims_acquired += 1;
+        if claim.stolen {
+            pass.claims_stolen += 1;
+        }
+    }
+    if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
+        pass.deferred = true;
+    }
+    match abandoned {
+        None => pass.rewritten += 1,
+        Some(ErasureAbandon::ClaimHeld { .. }) => pass.claim_backoffs += 1,
+        Some(ErasureAbandon::ClaimLost { .. }) => pass.claims_lost += 1,
+        Some(ErasureAbandon::RecordSetChanged | ErasureAbandon::Deadline) => {}
+    }
+}
+
+/// Write one request's `.done` completion record (ADR-0064 decision 1 and 4).
+/// `CreateIfAbsent`, like every other durable record here: an already-present
+/// `.done` is a completed earlier tick, reported as `Ok(false)`, never an
+/// error and never an overwrite (the `.done` is immutable permanent evidence).
+///
+/// The record carries no plaintext predicate -- only its blake3 hash
+/// ([`erasure_predicate_hash`]), the request id, the two timestamps, and the
+/// deferral cause -- so a permanent completion record holds no subject
+/// identifier, which is the entire reason `.dreq` and `.done` are separate
+/// objects.
+///
+/// `bucket_drops` is left empty: the authoritative per-bucket dropped counts
+/// are durable in each bucket's own `RewriteRecord.drops`, and
+/// `ErasureRewriteOutcome` does not surface them to a driver (the live-record
+/// resolution that would read them back is private to ravel-maintain).
+/// Fabricating zeroes here would put wrong counts in a permanent audit record,
+/// so the field stays empty until ravel-maintain returns real ones; flagged as
+/// a follow-up.
+async fn write_erasure_completion(
+    store: &dyn ObjectStoreBackend,
+    now_ns: i64,
+    tenant: &TenantHash,
+    signal: Signal,
+    request: &ErasureRequest,
+) -> Result<bool, MaintainError> {
+    let completion = ErasureCompletion {
+        format_version: ravel_commit::erasure::FORMAT_VERSION,
+        tenant_hash: tenant.0.to_vec(),
+        signal: ravel_commit::signal::to_proto(signal) as i32,
+        request_id: request.request_id.clone(),
+        predicate_hash: erasure_predicate_hash(request).to_vec(),
+        bucket_drops: Vec::new(),
+        requested_unix_ns: request.created_unix_ns,
+        // A completion can never precede its own request in the durable
+        // record (the codec rejects that pair outright), so a backwards or
+        // skewed clock clamps to the request time rather than writing a
+        // record no decoder will accept and stalling the erasure forever.
+        completed_unix_ns: now_ns.max(request.created_unix_ns),
+        deferral_cause: ErasureDeferralCause::Unspecified as i32,
+    };
+    // Validate before writing, matching `erase submit`'s discipline: a record
+    // that would not decode must never reach the store.
+    ravel_commit::erasure::validate_completion(&completion)?;
+    let key = keys::erasure_completion_key_for(&completion)?;
+    let body = ravel_commit::erasure::encode_completion(&completion);
+    match store.put(&key, body, PutOptions::create_if_absent()).await {
+        Ok(_) => Ok(true),
+        Err(StoreError::AlreadyExists) => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// One `(tenant, signal)` selective-erasure pass (ADR-0064 decisions 3, 4,
+/// and 5), in the order those decisions require:
+///
+/// 1. **Rewrite** every bucket against every pending `.dreq`
+///    ([`erasure_rewrite_pass`]).
+/// 2. **Complete**: write each pending request's `.done` only when the CATALOG
+///    resolver proves every bucket in its scope no longer serves the subject.
+/// 3. **Sweep** the `.dreq`s whose `.done` is older than
+///    `protection_horizon` ([`sweep_erasure_requests`]).
+///
+/// The order is the safety property: a `.dreq` (and with it the query-time
+/// exclusion filter) can only be removed after the `.done` exists and the
+/// horizon has passed, so the filter never retires while a pre-rewrite input
+/// could still be resolvable. Step 3 runs even when nothing is pending,
+/// because a request completed by an earlier tick is by definition no longer
+/// pending and its `.dreq` still has to be swept.
+///
+/// **How completion is computed (ADR-0064 §4, the 2026-08-08 F1 correction).**
+/// The rewrite pass classifies each bucket off ravel-maintain's one-hop
+/// `resolve_live_record`, which picks the bucket's live compaction/rewrite
+/// record but never computes which raw L0 inputs a query still resolves through
+/// the full supersession chain. So `AlreadyApplied` (or a clean `Rewritten`)
+/// off that one-hop view can read "done" while a snapshot keeps serving the
+/// subject out of an L0 input the chain failed to exclude -- the
+/// absent-predecessor / partial-input case, or a live sibling rewrite, that §4
+/// names. Completion therefore is NOT derived from the pass's own outcomes.
+/// After the rewrite pass, [`erasure_rewrite_pass`] re-derives each in-scope
+/// bucket's served view through [`ravel_maintain::bucket_erasure_completion`],
+/// which reconstructs exactly what `ravel_catalog::Catalog::process_bucket`
+/// serves via `ravel_catalog::resolve_rewrite_supersession` -- the same
+/// resolver a snapshot resolve and the fold run. A request is recorded in
+/// `pass.catalog_blocked` if any in-scope bucket still serves it (a live L0
+/// record, a live compaction part, or a live sibling rewrite that does not name
+/// it, overlapping its window). A `.done` is written only for a request that is
+/// neither `deferred` nor `catalog_blocked`, so completion can never diverge
+/// from what queries return. If any bucket was held, errored, abandoned its
+/// publish, could not be listed, or could not be resolved through the catalog
+/// resolver, `deferred` is set and NO `.done` is written this tick: completion
+/// is verified against the query path, never assumed.
+///
+/// **Residual (stated honestly, tracked by ADR-0064 §4's open item).** Because
+/// the rewrite still resolves its own live inputs one-hop, a genuinely
+/// inconsistent bucket where the two resolvers disagree (an L0 input live per
+/// the catalog resolver but invisible to the one-hop view) is not re-rewritten
+/// this tick; the completion gate here blocks its `.done` and the pending
+/// request alarms on `erasure_rewrite_deadline` rather than falsely completing.
+/// Blocking is the safe failure: a stuck-pending request retains its `.dreq`
+/// and query-time exclusion, where a false `.done` would resurrect the subject.
+///
+/// **The ack-open ingest hour (issue #1290).** The hour open at a request's
+/// acknowledgement whose pre-ack flush has not published a commit record yet is
+/// absent from the commit-prefix listing, so discovery derives it from the
+/// request's timestamp ([`ravel_maintain::erasure_rewrite::ack_open_ingest_hours`])
+/// and unions it into every shard's listed hours. That derived bucket is
+/// unsealed at the ack, so [`ravel_maintain::bucket_erasure_completion`] blocks
+/// completion until it seals and a later pass rewrites it. Only the hour open at
+/// the ack is derived: a later hour that opened after the ack is out of the
+/// request's scope, so ingest that never stops does not stall completion, and
+/// the wait is bounded to
+/// [`ravel_maintain::erasure_rewrite::erasure_seal_wait_bound_ns`].
+#[allow(clippy::too_many_arguments)]
+async fn run_erasure_pass(
+    store: &dyn ObjectStoreBackend,
+    clock: &dyn Clock,
+    compactor: &CompactorConfig,
+    hold: &dyn LeaseCheck,
+    tenant: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    memo: &mut MaintainMemo,
+    safety: &MaintenanceSafetyMetrics,
+) {
+    match pending_erasure_requests(store, tenant, signal).await {
+        Ok(pending) if !pending.is_empty() => {
+            // Discovery unions the per-shard commit-prefix listing (inside
+            // `erasure_rewrite_pass`) with the ingest hours open at each
+            // request's acknowledgement (issue #1290): a pre-ack flush that has
+            // not published a commit record leaves its hour absent from the
+            // listing, so deriving it here is the only way the completion gate
+            // ever considers that bucket. This mirrors the crate-level test's
+            // `erasure_tick`. Scope stays one judgement in
+            // `bucket_erasure_completion`; this only decides the bucket is
+            // present for it to judge.
+            let derived_hours = ravel_maintain::erasure_rewrite::ack_open_ingest_hours(&pending);
+            let pass = erasure_rewrite_pass(
+                store,
+                clock,
+                compactor,
+                hold,
+                tenant,
+                signal,
+                scan_shards,
+                &pending,
+                &derived_hours,
+                memo,
+            )
+            .await;
+            let index = signal_index(signal);
+            safety.claims_skipped[index].fetch_add(pass.claim_backoffs as u64, Ordering::Relaxed);
+            safety.claims_lost[index].fetch_add(pass.claims_lost as u64, Ordering::Relaxed);
+            safety.claims_acquired[index].fetch_add(pass.claims_acquired as u64, Ordering::Relaxed);
+            safety.claims_stolen[index].fetch_add(pass.claims_stolen as u64, Ordering::Relaxed);
+            tracing::info!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                pending = pending.len(),
+                rewritten = pass.rewritten,
+                claim_backoffs = pass.claim_backoffs,
+                claims_lost = pass.claims_lost,
+                claims_acquired = pass.claims_acquired,
+                already_applied = pass.already_applied,
+                out_of_scope = pass.out_of_scope,
+                not_sealed = pass.not_sealed,
+                deferred = pass.deferred,
+                catalog_blocked = pass.catalog_blocked.len(),
+                "maintenance: erasure rewrite pass complete"
+            );
+
+            if pass.deferred {
+                tracing::info!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    pending = pending.len(),
+                    "maintenance: erasure completion deferred; at least one in-scope bucket \
+                     was not brought up to date this tick, so no .done is written and every \
+                     request stays pending"
+                );
+            } else {
+                for entry in &pending {
+                    // Completion follows the CATALOG resolver, not the rewrite
+                    // pass's one-hop live-record classification (ADR-0064 §4
+                    // F1): if `bucket_erasure_completion` proved any in-scope
+                    // bucket still serves this request's subject, its `.done` is
+                    // withheld this tick even though no bucket deferred. This is
+                    // the exact gate the divergence test flips -- drop the
+                    // `contains` guard and a `.done` lands while a snapshot
+                    // still resolves the subject out of an L0 input the one-hop
+                    // resolver never saw.
+                    if pass.catalog_blocked.contains(&entry.request.request_id) {
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            request_id = %entry.request.request_id,
+                            "maintenance: erasure completion withheld; the catalog resolver \
+                             still serves the subject from an in-scope bucket, so no .done is \
+                             written and the request stays pending"
+                        );
+                        continue;
+                    }
+                    match write_erasure_completion(
+                        store,
+                        clock.now_ns(),
+                        tenant,
+                        signal,
+                        &entry.request,
+                    )
+                    .await
+                    {
+                        Ok(true) => tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            request_id = %entry.request.request_id,
+                            "maintenance: erasure request complete; .done written"
+                        ),
+                        Ok(false) => tracing::debug!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            request_id = %entry.request.request_id,
+                            "maintenance: erasure .done already present; left untouched"
+                        ),
+                        Err(err) => tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            signal = ?signal,
+                            request_id = %entry.request.request_id,
+                            error = %err,
+                            "maintenance: erasure .done write failed; the request stays \
+                             pending and its .dreq is kept, retried next tick"
+                        ),
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            error = %err,
+            "maintenance: pending erasure request listing failed; no rewrite or completion \
+             this tick, retried next tick"
+        ),
+    }
+
+    // Rule 6 (ADR-0064 decision 5), last: a `.dreq` is deleted only once its
+    // `.done` exists, the protection horizon has passed, and the legal-hold
+    // check allows it. Runs unconditionally, including when nothing is
+    // pending: a request completed by an earlier tick no longer appears in
+    // `pending_erasure_requests`, and its `.dreq` still needs sweeping.
+    match sweep_erasure_requests(store, clock, compactor, hold, tenant, signal).await {
+        Ok(outcome) => {
+            tracing::info!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                deleted = outcome.deleted,
+                kept = outcome.kept,
+                held_by_superseded_inputs = outcome.held_by_superseded_inputs,
+                "maintenance: erasure request sweep pass complete"
+            );
+            safety.record_erasure_sweep(signal, &outcome);
+        }
+        Err(err) => tracing::warn!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            error = %err,
+            "maintenance: erasure request sweep pass failed; retried next tick"
+        ),
+    }
+}
+
+/// Whether a recomputed live set differs from the one last held, which is the
+/// warm-start reseed trigger (ADR-0065 decision 3): a membership change may have
+/// moved a unit's rendezvous ownership onto this process, so its terminal facts
+/// should be seeded from the departing worker's snapshot rather than rescanned
+/// cold. Extracted from the discovery loop so the trigger is unit-testable: it
+/// must fire on a genuine handoff (live set changed) and stay quiet on stable
+/// membership. Both sets are sorted-and-deduped by [`WorkerSet::live_set`], so a
+/// plain slice comparison is order-stable.
+fn membership_changed(previous: &[Uuid], computed: &[Uuid]) -> bool {
+    previous != computed
+}
+
+/// Seed `memo` from durable memo snapshots (ADR-0065 decision 3's warm start
+/// and handoff). Each snapshot is gated on ownership -- only units this process
+/// owns under `live_set` are seeded, so a departing worker's units are picked up
+/// by whichever survivor the rendezvous hash now assigns them to -- and on
+/// staleness ([`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`]). Merging several snapshots
+/// keeps the freshest verdict per bucket. An undecodable snapshot is skipped
+/// with a debug line (fail-open: cold start for whatever it would have seeded),
+/// never a panic. Returns `(seeded_units, seeded_buckets)` summed across the
+/// snapshots, for the caller's log line.
+fn seed_memo_from_snapshots(
+    memo: &mut MaintainMemo,
+    snapshots: &[Vec<u8>],
+    now_ns: i64,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+) -> (usize, usize) {
+    let mut units = 0usize;
+    let mut buckets = 0usize;
+    for bytes in snapshots {
+        match memo.seed_from_snapshot(
+            bytes,
+            now_ns,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |tenant, signal, shard| worker.owns_unit(live_set, &tenant, signal, shard),
+        ) {
+            Ok(stats) => {
+                units += stats.seeded_units;
+                buckets += stats.seeded_buckets;
+            }
+            Err(err) => tracing::debug!(
+                error = %err,
+                "maintenance: skipping an undecodable memo snapshot (cold start for its units)"
+            ),
+        }
+    }
+    (units, buckets)
+}
+
+/// Write the memo snapshot only when its content changed since the last write
+/// (ADR-0065 decision 3's debounce). Compares the timestamp-free snapshot body
+/// against `last_body`: identical bodies mean this tick verified nothing new, so
+/// the write is skipped and the durable object left as-is. On a real change the
+/// body is framed with `now_ns` and written `Overwrite`; a write fault is logged
+/// and `last_body` left unchanged so the next cycle retries (fail-open). Returns
+/// whether a write happened (for tests and callers that count writes).
+async fn persist_memo_snapshot(
+    store: &dyn ObjectStoreBackend,
+    worker: &WorkerSet,
+    memo: &MaintainMemo,
+    last_body: &mut Option<Vec<u8>>,
+    now_ns: i64,
+) -> bool {
+    let body = memo.snapshot_body();
+    if last_body.as_deref() == Some(body.as_slice()) {
+        return false;
+    }
+    let bytes = MaintainMemo::snapshot_bytes_from_body(&body, now_ns);
+    match write_memo_snapshot(store, &worker.process_id(), bytes).await {
+        Ok(()) => {
+            *last_body = Some(body);
+            true
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "maintenance: memo snapshot write failed; retried next cycle (fail-open, \
+                 ADR-0065 decision 3)"
+            );
+            false
+        }
+    }
+}
+
+/// Up to 10% jitter over `base`, so co-started replicas' maintenance ticks do
+/// not run in lockstep (same rationale as the fold task's jitter).
+fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
+    let jitter_bound_ms = u64::try_from(base.as_millis() / 10).unwrap_or(u64::MAX);
+    if jitter_bound_ms == 0 {
+        return base;
+    }
+    let extra_ms = rng.jitter_ms(jitter_bound_ms);
+    base + Duration::from_millis(extra_ms)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_maintain::{
+        AUDIT_HOLD_SHARD, Coordination, FixedClock, RequestLedger, RetentionPolicy,
+        shard_hold_scopes, write_hold_set,
+    };
+    use ravel_object_store::GetRange;
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
+    use ravel_object_store::list_all;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+
+    use ravel_ingest::{IdempotencyReceipt, marker_key, write_marker};
+
+    /// Real wall-clock nanoseconds per hour, matching the private constant
+    /// every ingest-hour-bucket computation in this crate and ravel-ingest
+    /// shares (`run_tick` always uses the real [`WallClock`], never an
+    /// injected one, so tests that exercise the idempotency sweep must derive
+    /// "now" the same way production does rather than fix a clock).
+    const TEST_NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// A single-replica worker for the deterministic tenant-tick tests: its
+    /// solo live set (`{self}`) owns every unit, so `run_tick` and
+    /// `run_discovery_cycle` behave exactly as the pre-ADR-0065 unconditional
+    /// walk. It keeps the default unit concurrency (4), so these tests also
+    /// exercise the bounded-concurrent per-unit path, whose per-shard effects
+    /// are over disjoint keyspaces and therefore identical to a sequential walk.
+    fn solo_worker() -> WorkerSet {
+        WorkerSet::with_defaults(0)
+    }
+
+    /// The pinned membership identity the rendezvous-repartition tests below
+    /// resolve ownership against, plus a peer id that outweighs it for
+    /// `(TenantId::new("acme"), Signal::Metrics, shard 0)`.
+    ///
+    /// Rendezvous weight is a function of the process id, so a test that needs
+    /// a peer to take a specific unit must pin both ids. Searching a candidate
+    /// range for a peer that outweighs a randomly drawn own id fails outright
+    /// whenever that draw lands near the top of the weight range: with an own
+    /// id of `Uuid::from_u128(7282)`, no peer in the old `1..10_000` candidate
+    /// range flips this unit at all. The flip is asserted at each use, so a
+    /// change to `unit_key` or the weight function fails loudly here instead of
+    /// silently leaving the peer without ownership.
+    const PINNED_WORKER_ID: Uuid = Uuid::from_u128(1);
+    const PINNED_PEER_ID: Uuid = Uuid::from_u128(2);
+
+    /// A solo worker on [`PINNED_WORKER_ID`], otherwise identical to
+    /// [`solo_worker`].
+    fn pinned_worker() -> WorkerSet {
+        solo_worker().with_process_id(PINNED_WORKER_ID)
+    }
+
+    /// The acceptance test for shared-store ownership (ADR-0065
+    /// decisions 1 and 2): two maintain replicas sharing one store partition the
+    /// unit set rather than both paying for it.
+    ///
+    /// Two `WorkerSet`s each heartbeat into one shared `MemoryStore`; both
+    /// compute a live set, which must converge to include both processes and be
+    /// identical. For every `(Metrics, shard)` unit both must compute the same
+    /// rendezvous owner (the formula is deterministic given the same live set),
+    /// and exactly one of the two must own it. Finally, running each process's
+    /// `run_tick` over the same tenant with its own cold memo must process every
+    /// unit exactly once across the two -- proven by the combined `already_done`
+    /// equalling the unit count (not twice it: no double-pay), and by the two
+    /// memos partitioning the owned shards disjointly.
+    #[tokio::test]
+    async fn two_replicas_partition_units_without_double_pay() {
+        const SHARDS: u32 = 8;
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // One below-threshold (terminal) bucket per shard: each is a real unit
+        // of maintenance work, classified `already_done` when evaluated.
+        for shard in 0..SHARDS {
+            publish_terminal_bucket_at_shard(&store, &tenant_id, shard).await;
+        }
+
+        // Two replicas, each with the default membership/timing. A single clock
+        // reading for both heartbeats keeps both fresh within the liveness
+        // window.
+        //
+        // Both process ids are pinned, for the reason [`PINNED_WORKER_ID`]
+        // records: rendezvous ownership is a pure function of the process id,
+        // so with two random ids the split this test is named for is a draw,
+        // not a fact. All 8 shards land on one replica one run in 256, and the
+        // old draw-independent assertions below (each shard owned by exactly
+        // one of the two, the two memos summing to the unit count) all still
+        // hold on that draw while proving nothing about partitioning. Pinned,
+        // the split itself is asserted.
+        let now = 1_000 * TEST_NS_PER_HOUR;
+        let a = WorkerSet::with_defaults(now).with_process_id(PINNED_WORKER_ID);
+        let b = WorkerSet::with_defaults(now).with_process_id(PINNED_PEER_ID);
+        a.write_heartbeat(&store, now).await.expect("a heartbeat");
+        b.write_heartbeat(&store, now).await.expect("b heartbeat");
+
+        // Live sets converge: each sees both processes, and the sorted sets are
+        // identical (so the rendezvous input is identical on both sides).
+        let live_a = a.live_set(&store, now).await.expect("a live set");
+        let live_b = b.live_set(&store, now).await.expect("b live set");
+        assert_eq!(live_a, live_b, "both replicas compute the same live set");
+        assert!(live_a.contains(&a.process_id()) && live_a.contains(&b.process_id()));
+        assert_eq!(live_a.len(), 2);
+
+        // Ownership is computed identically by both, and every unit is owned by
+        // exactly one replica (disjoint and complete).
+        let mut a_shards = Vec::new();
+        let mut b_shards = Vec::new();
+        for shard in 0..SHARDS {
+            let a_owns = a.owns_unit(&live_a, &tenant, Signal::Metrics, shard);
+            let b_owns = b.owns_unit(&live_b, &tenant, Signal::Metrics, shard);
+            assert_ne!(
+                a_owns, b_owns,
+                "shard {shard} must be owned by exactly one of the two replicas"
+            );
+            if a_owns {
+                a_shards.push(shard);
+            } else {
+                b_shards.push(shard);
+            }
+        }
+        // The exact split the two pinned ids produce under (acme, Metrics).
+        // Any other partition, including one that still leaves both replicas
+        // non-empty, means `unit_key` or the weight function changed and the
+        // ids must be re-pinned deliberately; the same expected split is
+        // asserted in `reseed_and_seeding_track_genuine_ownership_handoff`.
+        assert_eq!(
+            a_shards,
+            [1, 2, 3, 4, 5, 7],
+            "PINNED_WORKER_ID's rendezvous share under (acme, Metrics) moved"
+        );
+        assert_eq!(
+            b_shards,
+            [0, 6],
+            "PINNED_PEER_ID's rendezvous share under (acme, Metrics) moved"
+        );
+        let owned_by_a = a_shards.len() as u32;
+        let owned_by_b = b_shards.len() as u32;
+        assert_eq!(owned_by_a + owned_by_b, SHARDS, "every unit is owned");
+
+        // Run both replicas' ticks over the same tenant, each with its own cold
+        // memo. Every unit is processed by exactly one: the combined
+        // `already_done` is the unit count (not double it), and each memo holds
+        // exactly that replica's owned shards.
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+
+        let mut memo_a = MaintainMemo::with_default_interval();
+        let report_a = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_a,
+            &safety,
+            &ownership,
+            &a,
+            &live_a,
+        )
+        .await;
+
+        let mut memo_b = MaintainMemo::with_default_interval();
+        let report_b = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &b,
+            &live_b,
+        )
+        .await;
+
+        assert_eq!(
+            report_a.already_done + report_b.already_done,
+            SHARDS as usize,
+            "every unit processed exactly once across the two replicas (no double-pay)"
+        );
+        assert_eq!(
+            report_a.already_done, owned_by_a as usize,
+            "replica A processed exactly the units it owns"
+        );
+        assert_eq!(
+            report_b.already_done, owned_by_b as usize,
+            "replica B processed exactly the units it owns"
+        );
+        assert_eq!(
+            memo_a.len() + memo_b.len(),
+            SHARDS as usize,
+            "the two memos partition the owned shards disjointly and completely"
+        );
+    }
+
+    /// The ADR-1029 acceptance test: two supervisors whose ownership overlaps
+    /// pay for one merge of a bucket when coordination is on, and for two when
+    /// it is off. Either way only one of them publishes it.
+    ///
+    /// `two_replicas_partition_units_without_double_pay` above cannot show
+    /// this. It seeds one below-threshold bucket per shard and asserts only on
+    /// `already_done`, so it runs no merge at all and never reads
+    /// `MaintainReport::compacted` (ADR-1029's 2026-09-28 amendment, point 3).
+    /// The duplicate this ADR removes lives where ownership OVERLAPS, so this
+    /// test forces the overlap: each replica uses its own SOLO live set, so
+    /// each believes it owns every unit, which is exactly the membership
+    /// handoff window ADR-0065 accepts.
+    ///
+    /// The interleaving is deterministic rather than raced: the store pauses
+    /// the first L1 part PUT (replica A's) until replica B's whole tick has
+    /// finished, so B always reaches the bucket while A is mid-merge and no
+    /// compaction record exists yet. Without that, A would publish first and B
+    /// would stop at the already-compacted gate, which proves nothing about
+    /// claims. The fixture is four one-series inputs under a 1-byte part
+    /// target, so a full merge is FOUR part PUTs and a run cancelled at its
+    /// first part boundary is one: the difference is what makes the
+    /// merge-phase counters discriminating.
+    ///
+    /// Three phases, each asserting on summed `compacted` AND on the request
+    /// counters:
+    ///
+    /// 1. coordination off: both replicas pay a full four-part merge, but
+    ///    `compacted` sums to 1. B publishes while A is paused, and A's
+    ///    pre-publish re-list (the 2026-10-03 amendment) finds B's record, so A
+    ///    reports the bucket already compacted and publishes nothing.
+    /// 2. coordination on, no steal: `compacted` sums to 1, only A's ledger
+    ///    shows part PUTs, B reports the bucket `claim_skipped`, and each
+    ///    replica's coordinate phase shows exactly the claim requests it made.
+    /// 3. coordination on, A's lease expires while it is paused and B steals
+    ///    the claim: B merges, and A cancels at the part boundary right after
+    ///    it resumes, having PUT exactly ONE part and published nothing.
+    ///
+    /// Phase 3 is what makes this test discriminating, shown failing against
+    /// both wrong implementations:
+    ///
+    /// - a guard that acquires and never checks (`claim_guard::checkpoint`'s
+    ///   body replaced by `Ok(())`): "still exactly one merge is credited"
+    ///   fails, left 2, right 1, because A finishes its merge and converges.
+    /// - a guard that cancels only at the publish checkpoint (the same
+    ///   function returning early for every other checkpoint): "A stopped at
+    ///   the part boundary right after it resumed" fails, left 4, right 1,
+    ///   because A pays the whole merge before stopping.
+    #[tokio::test]
+    async fn two_supervisors_with_overlapping_ownership_merge_once() {
+        // Phase 1, coordination off: no claim, so both replicas merge. The
+        // pre-publish re-list still stops the second publish: B published
+        // while A was paused mid-merge, A's re-list after its merge sees B's
+        // compaction record, and A reports the bucket already compacted.
+        let off = overlapping_supervisor_tick(Coordination::Off, Interleave::Pause).await;
+        assert_eq!(
+            (off.a.compacted, off.b.compacted),
+            (0, 1),
+            "without claims only B, which published first, is credited the merge"
+        );
+        assert_eq!(
+            off.a.already_done, 1,
+            "A's re-list found B's record and reported the bucket already compacted"
+        );
+        assert_eq!(
+            off.a_ledger.publish.requests, 0,
+            "A never reached the publish protocol"
+        );
+        assert_eq!(
+            (
+                off.a_ledger.part_put.requests,
+                off.b_ledger.part_put.requests
+            ),
+            (PARTS, PARTS),
+            "two sets of merge-phase part PUTs: both full merges were paid for"
+        );
+        assert_eq!(
+            off.a.claim_skipped + off.b.claim_skipped,
+            0,
+            "nothing is skipped when nothing is claimed"
+        );
+        assert_eq!(
+            off.a_ledger.coordinate.requests + off.b_ledger.coordinate.requests,
+            0,
+            "and the claim protocol issues no request at all"
+        );
+        assert_eq!(
+            (
+                off.safety.claims_acquired(Signal::Metrics),
+                off.safety.claims_stolen(Signal::Metrics),
+                off.safety.claims_lost(Signal::Metrics),
+                off.safety.claim_renew_failures(Signal::Metrics),
+                off.safety.claims_skipped(Signal::Metrics),
+            ),
+            (0, 0, 0, 0, 0),
+            "with coordination off none of the five claim counters move"
+        );
+
+        // Phase 2, coordination on: exactly one merge runs.
+        let on = overlapping_supervisor_tick(Coordination::On, Interleave::Pause).await;
+        assert_eq!(
+            on.a.compacted + on.b.compacted,
+            1,
+            "with claims exactly one replica merges the bucket"
+        );
+        assert_eq!(on.a.compacted, 1, "A holds the claim and merges");
+        assert_eq!(on.b.compacted, 0, "B does not");
+        assert_eq!(
+            on.b.claim_skipped, 1,
+            "B reports the bucket skipped, with the reason, rather than compacted"
+        );
+        assert_eq!(
+            (on.a_ledger.part_put.requests, on.b_ledger.part_put.requests),
+            (PARTS, 0),
+            "exactly one merge ran: only A's ledger shows part PUTs"
+        );
+        assert_eq!(
+            on.a_ledger.coordinate.requests, 2,
+            "A's claim protocol: one acquisition and one completion"
+        );
+        assert_eq!(
+            on.b_ledger.coordinate.requests, 3,
+            "B's: the rejected CreateIfAbsent, and the one GET and one HEAD \
+             that observed the holder"
+        );
+        assert_eq!(
+            on.b_ledger.publish.requests, 0,
+            "and B never reached the publish protocol"
+        );
+        assert_eq!(
+            (
+                on.safety.claims_acquired(Signal::Metrics),
+                on.safety.claims_stolen(Signal::Metrics),
+                on.safety.claims_lost(Signal::Metrics),
+                on.safety.claim_renew_failures(Signal::Metrics),
+                on.safety.claims_skipped(Signal::Metrics),
+            ),
+            (1, 0, 0, 0, 1),
+            "A's fresh acquisition and B's skip, with no steal, loss, or \
+             renewal failure"
+        );
+
+        // Phase 3, coordination on with A's lease expiring under it: B steals
+        // the claim and merges, and A stops at its next checkpoint.
+        let stolen = overlapping_supervisor_tick(Coordination::On, Interleave::Steal).await;
+        assert_eq!(
+            stolen.a.compacted + stolen.b.compacted,
+            1,
+            "still exactly one merge is credited"
+        );
+        assert_eq!(stolen.b.compacted, 1, "the thief finished the merge");
+        assert_eq!(
+            stolen.a.claim_cancelled, 1,
+            "and the dispossessed owner cancelled rather than compacting"
+        );
+        assert_eq!(stolen.a.compacted, 0);
+        assert_eq!(
+            stolen.a_ledger.part_put.requests, 1,
+            "A stopped at the part boundary right after it resumed: one part \
+             PUT, not the {PARTS} a full merge pays"
+        );
+        assert_eq!(
+            stolen.b_ledger.part_put.requests, PARTS,
+            "B paid the one full merge"
+        );
+        assert_eq!(
+            stolen.a_ledger.publish.requests, 0,
+            "a cancelled run publishes nothing: zero record PUTs"
+        );
+        assert_eq!(
+            stolen.a_ledger.coordinate.requests, 2,
+            "A's claim protocol: the acquisition, and the renewal that \
+             discovered the steal; no completion, because it no longer owns it"
+        );
+        assert_eq!(
+            stolen.b_ledger.coordinate.requests, 5,
+            "B's: the rejected CreateIfAbsent, the GET and HEAD that observed \
+             the expired claim, the steal, and the completion"
+        );
+        assert_eq!(
+            (
+                stolen.safety.claims_acquired(Signal::Metrics),
+                stolen.safety.claims_stolen(Signal::Metrics),
+                stolen.safety.claims_lost(Signal::Metrics),
+                stolen.safety.claim_renew_failures(Signal::Metrics),
+                stolen.safety.claims_skipped(Signal::Metrics),
+            ),
+            (2, 1, 1, 0, 0),
+            "acquired counts A's fresh acquisition AND B's steal (stolen is a \
+             subset of acquired, not separate from it); lost counts A's claim \
+             taken from it; no renewal failure, because A's renewal at the \
+             checkpoint succeeded and simply reported the steal"
+        );
+    }
+
+    /// OBSERVABILITY: a real supervisor pass's claim counters reach the
+    /// actual `/metrics` body, not just the in-process accessors. Runs the
+    /// steal phase of the ADR-1029 acceptance fixture above (the one
+    /// scenario that touches all five counters at once: A's fresh
+    /// acquisition, B's steal, A's loss) and asserts every one of the five
+    /// families this issue adds is present with its accumulated sample.
+    #[tokio::test]
+    async fn claim_counters_render_on_metrics_after_a_real_supervisor_pass() {
+        let stolen = overlapping_supervisor_tick(Coordination::On, Interleave::Steal).await;
+        let body = rendered_metrics(&stolen.safety);
+
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_acquired_total{mode=\"maintain\",signal=\"metrics\"} 2"
+            ),
+            "claims_acquired_total must render A's fresh acquisition plus B's \
+             steal:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_stolen_total{mode=\"maintain\",signal=\"metrics\"} 1"
+            ),
+            "claims_stolen_total must render B's steal:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_lost_total{mode=\"maintain\",signal=\"metrics\"} 1"
+            ),
+            "claims_lost_total must render A's cancelled claim:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claim_renew_failures_total{mode=\"maintain\",signal=\"metrics\"} 0"
+            ),
+            "claim_renew_failures_total must render, even at zero:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_claims_skipped_total{mode=\"maintain\",signal=\"metrics\"} 0"
+            ),
+            "claims_skipped_total must render, even at zero:\n{body}"
+        );
+        for name in [
+            "ravel_maintain_claims_acquired_total",
+            "ravel_maintain_claims_stolen_total",
+            "ravel_maintain_claims_lost_total",
+            "ravel_maintain_claim_renew_failures_total",
+            "ravel_maintain_claims_skipped_total",
+        ] {
+            assert!(
+                body.contains(&format!("# TYPE {name} counter")),
+                "{name} must render as a counter:\n{body}"
+            );
+        }
+    }
+
+    /// The claim participant a tick installs for itself reads the tick's own
+    /// injected clock, so lease expiry is judged against that clock and not
+    /// against wall time.
+    ///
+    /// Another process holds the bucket's claim, written at a 2023 instant by
+    /// the store's clock. A tick whose fixed clock sits one second after that
+    /// write finds the lease live and skips the bucket; a second tick whose
+    /// clock is past the lease steals the claim and compacts. Wall time is
+    /// years past the lease either way, so a participant on the wall clock
+    /// steals on the first tick.
+    ///
+    /// Shown failing against the tick that installed its participant on
+    /// `WallClock`: "a lease live by the injected clock holds the bucket"
+    /// reads left 0, right 1.
+    #[tokio::test]
+    async fn a_ticks_own_claim_participant_reads_the_injected_clock() {
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
+        let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let store = MemoryStore::new();
+        store.set_clock_ms((written_ns / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        for seq in 1..=2 {
+            publish_compactable_input(&store, &tenant_id, 0, seq).await;
+        }
+
+        let clock = FixedClock::new(written_ns);
+        let holder = ravel_maintain::claim_guard::ClaimGuard::new(
+            &Bucket::new(tenant, Signal::Metrics, 0, 0),
+            &ClaimParticipant::new(
+                Uuid::from_u128(0xC1A1),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            ),
+            ravel_fleet::claim::ClaimConfig {
+                lease_duration: LEASE,
+                ..ravel_fleet::claim::ClaimConfig::default()
+            },
+            None,
+        );
+        assert!(matches!(
+            holder.acquire(&store).await.expect("holder acquires"),
+            ravel_maintain::claim_guard::Acquire::Acquired
+        ));
+
+        let worker = WorkerSet::with_defaults(written_ns).with_process_id(PINNED_WORKER_ID);
+        let live = worker.solo_live_set();
+        // No participant: the tick installs its own.
+        let config = CompactorConfig {
+            coordination: Coordination::On,
+            claim_min_input_bytes: 1,
+            claim_lease_duration: LEASE,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        clock.set(written_ns + 1_000_000_000);
+        let live_tick = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(
+            live_tick.claim_skipped, 1,
+            "a lease live by the injected clock holds the bucket"
+        );
+        assert_eq!(live_tick.compacted, 0);
+
+        clock.set(written_ns + LEASE.as_nanos() as i64 + 1_000_000_000);
+        let expired_tick = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(
+            (expired_tick.compacted, expired_tick.claim_skipped),
+            (1, 0),
+            "past the lease by the injected clock, the tick steals and compacts"
+        );
+    }
+
+    /// A store that advances a shared [`FixedClock`] past the claim's
+    /// renewal threshold the instant the first L1 part is written, so the
+    /// [`crate::claim_guard::Checkpoint::PartBoundary`] check right after
+    /// that part (which runs after the PUT) renews rather than finding the
+    /// lease fresh.
+    struct AdvanceClockPastRenewalOnFirstPartPut<S> {
+        inner: S,
+        clock: FixedClock,
+        advance_to_ns: i64,
+        fired: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for AdvanceClockPastRenewalOnFirstPartPut<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            let outcome = self.inner.put(key, data, opts).await;
+            if key.contains("/l1/")
+                && self
+                    .fired
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.clock.set(self.advance_to_ns);
+            }
+            outcome
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A claim renewal that fails with a genuine object-store error is
+    /// reported as `ravel_maintain_claim_renew_failures_total`, not as
+    /// `ravel_maintain_claims_lost_total`. `ClaimGuard::checkpoint` maps a
+    /// scripted `PreconditionFailed` to `Renewal::ClaimLost` (an ordinary
+    /// steal, [`scripted_precondition_failure_on_renew_is_claim_lost`] in
+    /// ravel-fleet), but any OTHER store error propagates as
+    /// [`MaintainError::ClaimRenewFailed`], which `maintain.rs`'s dedicated
+    /// match arm records as a renewal failure and nothing else.
+    ///
+    /// Shown failing against a supervisor whose `ClaimRenewFailed` error arm
+    /// recorded a lost claim instead of a renewal failure: the renew-failure
+    /// count reads 0 instead of 1.
+    #[tokio::test]
+    async fn claim_renewal_store_error_counts_as_a_renew_failure_not_a_loss() {
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
+        let now_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let inner = MemoryStore::new();
+        inner.set_clock_ms((now_ns / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        for seq in 1..=2 {
+            publish_compactable_input(&inner, &tenant_id, 0, seq).await;
+        }
+
+        // Fault the SECOND PUT to the claim key: the first is the acquire's
+        // CreateIfAbsent, which must succeed for the run to reach a renewal
+        // at all.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Transient("renewal store error".into()),
+            )
+            .with_key_contains(ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX)
+            .with_occurrence(ravel_object_store::fault::Occurrence::Nth(2)),
+        );
+        let faulted = FaultStore::new(inner, plan);
+        let clock = FixedClock::new(now_ns);
+        let store = AdvanceClockPastRenewalOnFirstPartPut {
+            inner: faulted,
+            clock: clock.clone(),
+            advance_to_ns: now_ns + (LEASE.as_nanos() / 3) as i64 + 1_000_000_000,
+            fired: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let worker = pinned_worker();
+        let live = worker.solo_live_set();
+        let config = CompactorConfig {
+            coordination: Coordination::On,
+            claim_min_input_bytes: 1,
+            claim_lease_duration: LEASE,
+            claim_participant: Some(ClaimParticipant::new(
+                worker.process_id(),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            // One part per series, so the first part's PUT is exactly the
+            // PartBoundary checkpoint this test needs to trip.
+            max_l1_part_bytes: 1,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .inner
+                .fault_count(Op::Put, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the scripted renewal fault fired exactly once"
+        );
+        assert_eq!(
+            safety.claim_renew_failures(Signal::Metrics),
+            1,
+            "a genuine store error on renewal counts as a renew failure"
+        );
+        assert_eq!(
+            safety.claims_lost(Signal::Metrics),
+            0,
+            "and not as a lost claim: nothing stole or cancelled this one"
+        );
+        assert_eq!(safety.claims_acquired(Signal::Metrics), 0);
+        assert_eq!(safety.claims_stolen(Signal::Metrics), 0);
+        assert_eq!(safety.claims_skipped(Signal::Metrics), 0);
+
+        // A second tick, same process, same bucket: the claim the first tick
+        // left in place (never confirmed lost) is reclaimed at once rather
+        // than skipped as held by another owner, and the bucket compacts
+        // (ADR-1029, 2026-09-30 amendment; issue #2156). The scripted fault
+        // only fires on its first occurrence, so this tick's renewal (if any)
+        // succeeds normally.
+        //
+        // Shown failing (mutation c: reverting the `contend` branch that
+        // recognizes a matching process id) with claims_skipped rising to 1
+        // instead of claims_acquired.
+        let second = run_tick_with_clock(
+            &clock, &store, &tenant, &config, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+
+        assert_eq!(
+            second.compacted, 1,
+            "the second tick compacts the bucket under the reclaimed claim"
+        );
+        assert_eq!(
+            safety.claims_acquired(Signal::Metrics),
+            1,
+            "the second tick reclaims its own leftover claim"
+        );
+        assert_eq!(
+            safety.claims_stolen(Signal::Metrics),
+            0,
+            "a same-process reclaim is reported as an acquisition, not a steal"
+        );
+        assert_eq!(
+            safety.claims_skipped(Signal::Metrics),
+            0,
+            "the bucket is not skipped as held by another owner"
+        );
+    }
+
+    /// Parts a full merge of the acceptance fixture writes: one per input
+    /// series, under a part target of one byte.
+    const PARTS: u64 = 4;
+
+    /// How the second replica's tick is interleaved with the first's.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Interleave {
+        /// B runs while A is paused mid-merge, with A's claim still live.
+        Pause,
+        /// The same, but A's lease expires first, so B steals the claim.
+        Steal,
+    }
+
+    /// What one overlapping-ownership run produced, per replica.
+    struct OverlappingTick {
+        a: MaintainReport,
+        b: MaintainReport,
+        a_ledger: ravel_maintain::RunRequestReport,
+        b_ledger: ravel_maintain::RunRequestReport,
+        /// Both replicas' claim counters, accumulated into the one recorder
+        /// the fixture shares across A and B: a real deployment gives each
+        /// process its own, so these are the SUM of what A and B each
+        /// reported, not either replica's contribution alone.
+        safety: MaintenanceSafetyMetrics,
+    }
+
+    /// Drive two supervisors over one compactable bucket with overlapping
+    /// (solo) ownership, pausing A mid-merge so B reaches the bucket before any
+    /// record exists. Returns both ticks' reports and request ledgers.
+    async fn overlapping_supervisor_tick(
+        coordination: Coordination,
+        interleave: Interleave,
+    ) -> OverlappingTick {
+        const SHARDS: u32 = 1;
+        // A lease long enough that a `MemoryStore` merge never renews inside
+        // it, and short enough that the acquisition jitter (10% of the lease)
+        // costs the test milliseconds. The shipped default is ravel-maintain's
+        // `DEFAULT_CLAIM_LEASE_DURATION` (300 s).
+        const LEASE: std::time::Duration = std::time::Duration::from_secs(3);
+        // A modern instant: ingest hour 0 is long sealed by it, and it is the
+        // store's clock too, so a claim written now is not already expired.
+        let now_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let store = Arc::new(PauseFirstPartPut {
+            inner: MemoryStore::new(),
+            a_at_part: tokio::sync::Notify::new(),
+            b_done: tokio::sync::Notify::new(),
+            paused: std::sync::atomic::AtomicBool::new(false),
+        });
+        store.inner.set_clock_ms((now_ns / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        // Four L0 inputs, one series each: over the default
+        // `min_compaction_inputs` of 2, so the bucket is compacted rather than
+        // classified `already_done`, and enough series to split into `PARTS`
+        // parts under the one-byte part target below.
+        for seq in 1..=PARTS {
+            publish_compactable_input(store.as_ref(), &tenant_id, 0, seq).await;
+        }
+
+        // One clock for both replicas: they model two processes on one host,
+        // and phase 3 advances it past A's lease while A is paused, which is
+        // what makes A's next checkpoint renew and discover the steal.
+        let clock = FixedClock::new(now_ns);
+        let a = WorkerSet::with_defaults(now_ns).with_process_id(PINNED_WORKER_ID);
+        let b = WorkerSet::with_defaults(now_ns).with_process_id(PINNED_PEER_ID);
+        // Solo live sets: each replica believes it owns every unit, which is
+        // the double-ownership window a membership change opens.
+        let live_a = a.solo_live_set();
+        let live_b = b.solo_live_set();
+
+        let a_ledger = RequestLedger::new();
+        let b_ledger = RequestLedger::new();
+        let config = |worker: &WorkerSet, ledger: &RequestLedger| CompactorConfig {
+            coordination,
+            // Every bucket clears this, so the fixture does not have to carry
+            // 64 MiB to exercise the claim (the gate itself is pinned by
+            // ravel-maintain's `compaction_claims.rs`).
+            claim_min_input_bytes: 1,
+            claim_lease_duration: LEASE,
+            claim_participant: Some(ClaimParticipant::new(
+                worker.process_id(),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            request_ledger: Some(ledger.clone()),
+            // One part per series, so a run cancelled at its first part
+            // boundary is distinguishable from one that merged everything.
+            max_l1_part_bytes: 1,
+            ..CompactorConfig::default()
+        };
+        let a_config = config(&a, &a_ledger);
+        let b_config = config(&b, &b_ledger);
+
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo_a = MaintainMemo::with_default_interval();
+        let mut memo_b = MaintainMemo::with_default_interval();
+
+        let a_store = Arc::clone(&store);
+        let b_store = Arc::clone(&store);
+        let a_tick = run_tick_with_clock(
+            &clock,
+            a_store.as_ref(),
+            &tenant,
+            &a_config,
+            &retention,
+            SHARDS,
+            &mut memo_a,
+            &safety,
+            &ownership,
+            &a,
+            &live_a,
+        );
+        let tick_clock = clock.clone();
+        let b_tick = async {
+            // B starts only once A is mid-merge, holding its claim with its
+            // first part already written and no record published.
+            b_store.a_at_part.notified().await;
+            if interleave == Interleave::Steal {
+                // Past A's lease, on the store's clock (the expiry base every
+                // contender shares) and on the node clock both read.
+                let expired_ns = now_ns + LEASE.as_nanos() as i64 + 1_000_000_000;
+                b_store.inner.set_clock_ms((expired_ns / 1_000_000) as u64);
+                tick_clock.set(expired_ns);
+            }
+            let report = run_tick_with_clock(
+                &tick_clock,
+                b_store.as_ref(),
+                &tenant,
+                &b_config,
+                &retention,
+                SHARDS,
+                &mut memo_b,
+                &safety,
+                &ownership,
+                &b,
+                &live_b,
+            )
+            .await;
+            b_store.b_done.notify_one();
+            report
+        };
+        let (a_report, b_report) = tokio::join!(a_tick, b_tick);
+
+        OverlappingTick {
+            a: a_report,
+            b: b_report,
+            a_ledger: a_ledger.report(),
+            b_ledger: b_ledger.report(),
+            safety,
+        }
+    }
+
+    /// Seed one real L0 metrics input into `(tenant, Metrics, shard)` at ingest
+    /// hour 0, with a distinct series per `seq` so the merge has content.
+    /// Returns the data object's size as its commit record carries it.
+    async fn publish_compactable_input(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        shard: u32,
+        seq: u64,
+    ) -> u64 {
+        let tenant_hash = tenant.hash();
+        let metric = format!("up{seq}");
+        let label_set = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.clone(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, &metric, &label_set).expect("series id"),
+            labels: label_set,
+            samples: vec![Sample {
+                ts_ns: 1_000 * seq as i64,
+                value: seq as f64,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(u128::from(9_000 + seq));
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: u32::from(ravel_segment::VERSION_V7),
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        rec.object_size
+    }
+
+    /// A store that pauses the first L1 part PUT until the second replica's
+    /// tick has finished. This is what makes the two-supervisor overlap
+    /// deterministic instead of a race: the paused replica is mid-merge,
+    /// holding its claim, with no compaction record published.
+    struct PauseFirstPartPut {
+        inner: MemoryStore,
+        a_at_part: tokio::sync::Notify,
+        b_done: tokio::sync::Notify,
+        paused: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for PauseFirstPartPut {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            let outcome = self.inner.put(key, data, opts).await;
+            if key.contains("/l1/")
+                && self
+                    .paused
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.a_at_part.notify_one();
+                self.b_done.notified().await;
+            }
+            outcome
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The maintain compactor carries `sys/gc`'s maximum query duration and
+    /// HEAD cache TTL, not the compiled defaults.
+    #[test]
+    fn compactor_config_carries_sys_gc_query_terms() {
+        let base = CompactorConfig::default();
+        let defaults = ravel_maintain::GcConfigValues::maintain_defaults();
+        let stored = ravel_maintain::GcConfigValues {
+            max_query_duration_ns: 7_777_000_000_001,
+            head_cache_ttl_ns: 13_000_000_007,
+            ..defaults
+        };
+        for value in [stored.max_query_duration_ns, stored.head_cache_ttl_ns] {
+            assert_ne!(value, base.max_query_duration_ns);
+            assert_ne!(value, base.head_cache_ttl_ns);
+            assert_ne!(value, defaults.max_query_duration_ns);
+            assert_ne!(value, defaults.head_cache_ttl_ns);
+        }
+
+        let config = compactor_config_from_gc(&base, &stored);
+        assert_eq!(config.max_query_duration_ns, 7_777_000_000_001);
+        assert_eq!(config.head_cache_ttl_ns, 13_000_000_007);
+        assert_eq!(config.protection_horizon_ns, base.protection_horizon_ns);
+        assert_eq!(config.grace_ns, base.grace_ns);
+    }
+
+    /// The retention floor is validated against the catalog's max_ingest_lag,
+    /// which must equal ravel-maintain's own DEFAULT_MAX_INGEST_LAG_NS: the two
+    /// crates duplicate the constant behind a sync-contract comment (no
+    /// ravel-maintain -> ravel-catalog dependency), so if either ever drifts
+    /// this test fails and the retention floor would silently be validated
+    /// against a different lag than the catalog resolves with.
+    #[test]
+    fn catalog_and_maintain_ingest_lag_agree() {
+        assert_eq!(
+            ravel_catalog::CatalogConfig::default().max_ingest_lag_ns,
+            ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS,
+            "catalog and maintain max_ingest_lag drifted; the retention floor \
+             would be validated against a different lag than the catalog uses"
+        );
+    }
+
+    /// One maintenance tick over an empty store touches every (signal, shard)
+    /// and returns cleanly: it proves the driver actually walks both signals
+    /// and all shards and calls scan_and_maintain + sweep_shard for each,
+    /// without needing seeded segments (the underlying functions are tested in
+    /// ravel-maintain).
+    #[tokio::test]
+    async fn run_tick_over_empty_store_is_clean() {
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        let report = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            4,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        // Nothing to maintain, nothing memoized: a subsequent tick would still
+        // find nothing to skip.
+        assert_eq!(report, MaintainReport::default());
+        assert!(memo.is_empty());
+    }
+
+    /// Wraps a store and counts real `list()` calls whose prefix is exactly a
+    /// shard's `l0/` data prefix (issue #1734).
+    ///
+    /// `FaultStore`'s own counters only track calls a scripted fault actually
+    /// fired on, and even a passthrough `Sequence` step's `key_contains` is a
+    /// substring match that cannot separate this prefix from the quarantine
+    /// reaper's, which is this exact string with `quarantine/` prepended (so
+    /// any pattern matching one matches the other too). An exact-string
+    /// comparison against a precomputed prefix sidesteps both limits.
+    struct L0ListCounter<S> {
+        inner: S,
+        l0_prefix: String,
+        l0_list_calls: AtomicU64,
+    }
+
+    impl<S> L0ListCounter<S> {
+        fn new(inner: S, l0_prefix: String) -> Self {
+            L0ListCounter {
+                inner,
+                l0_prefix,
+                l0_list_calls: AtomicU64::new(0),
+            }
+        }
+
+        fn l0_list_calls(&self) -> u64 {
+            self.l0_list_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for L0ListCounter<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            if prefix == self.l0_prefix {
+                self.l0_list_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// THE deliverable-1 acceptance test (issue #1734): ten maintain ticks
+    /// over a clock that never advances must together issue exactly one
+    /// LIST of the shard's `l0/` data prefix, not ten.
+    ///
+    /// A cold `MaintainMemo` makes tick 1 the due full sweep
+    /// (`sweep_shard`, unconditional rule 1) and records it; since the clock
+    /// never advances, `full_sweep_due` reads `now - last_ns == 0` on every
+    /// later tick, so ticks 2 through 10 all take the zoned,
+    /// `OrphanPass::Skip` branch in `run_tick_with_clock` instead. Before the
+    /// orphan-cadence split, that zoned branch ran rule 1's candidate
+    /// selection unconditionally, so the same ten-tick drive listed the
+    /// prefix once per tick: flipping the zoned call site's `OrphanPass::Skip`
+    /// back to `OrphanPass::Run` reproduces that regression (10 calls, not
+    /// 1).
+    #[tokio::test]
+    async fn ten_ticks_drain_the_l0_prefix_once_after_the_orphan_cadence_split() {
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let l0_prefix = format!(
+            "t/{}/{}/l0/{:04}/",
+            tenant.to_hex(),
+            Signal::Metrics.key_prefix(),
+            0u32
+        );
+        let store = L0ListCounter::new(MemoryStore::new(), l0_prefix);
+
+        let clock = ravel_maintain::FixedClock::new(1_000);
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        for _ in 0..10 {
+            run_tick_with_clock(
+                &clock,
+                &store,
+                &tenant,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &worker.solo_live_set(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            store.l0_list_calls(),
+            1,
+            "10 ticks over a clock that never advances past the full-sweep \
+             cadence must list the l0 data prefix exactly once: tick 1's \
+             cold-memo full sweep, and none of ticks 2 through 10's \
+             OrphanPass::Skip zoned passes"
+        );
+    }
+
+    /// THE deliverable-3 acceptance test (ADR-0066 decision 6): retention keeps
+    /// running for a tenant whose token was removed from `sys/auth`. This closes
+    /// the named bug -- removing a token to "deprovision" a tenant must not
+    /// silently stop compacting, sweeping, or retention-enforcing its still
+    /// present data.
+    ///
+    /// The tenant has a durable config record (active) and one sealed bucket at
+    /// ingest hour 0 (1970), decades past any retention window. The discovery
+    /// cycle is run with the flag restriction EMPTY -- exactly what a
+    /// token-derived restriction becomes once the tenant's token is removed --
+    /// and retention must still retire the expired bucket, because the
+    /// lifecycle-aware discovery keeps the tenant maintained on the strength of
+    /// its config record, not its token. As a control, the pre-fix
+    /// `discover_and_restrict` excludes the tenant under the same empty
+    /// restriction, so its retention would NOT run.
+    #[tokio::test]
+    async fn retention_continues_after_token_removal_when_a_config_record_is_present() {
+        use ravel_catalog::{TenantConfig, TenantLifecycleState, set_tenant_config};
+
+        use crate::tenant_discovery::{
+            TenantDiscoveryMetrics, discover_and_restrict, discover_and_restrict_by_lifecycle,
+        };
+
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // One sealed bucket at ingest hour 0 (1970): decades older than any
+        // retention window, so retention must retire it.
+        publish_terminal_bucket(&store, &tenant_id).await;
+        // A durable config record marks the tenant active. This is what keeps it
+        // maintained after its token is gone.
+        set_tenant_config(
+            &store,
+            &tenant,
+            &TenantConfig::new(TenantLifecycleState::Active),
+            1_000,
+        )
+        .await
+        .expect("write config record");
+
+        // A retention config that would retire the 1970 bucket: a one-year
+        // window, comfortably above the ADR-0019 floor and far below the
+        // bucket's age against the real wall clock.
+        const YEAR_NS: i64 = 365 * 24 * 3_600 * 1_000_000_000;
+        let compactor = CompactorConfig::default();
+        let max_lag = ravel_catalog::CatalogConfig::default().max_ingest_lag_ns;
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(YEAR_NS),
+                tenants: Vec::new(),
+            },
+            &compactor,
+            max_lag,
+        )
+        .expect("valid retention config");
+
+        // The token was removed, so the flag restriction is now empty. Control:
+        // the pre-fix restriction drops the tenant entirely.
+        let empty_restrict: Vec<TenantHash> = Vec::new();
+        let old = discover_and_restrict(&store, Some(&empty_restrict))
+            .await
+            .expect("discover");
+        assert!(
+            old.maintained.is_empty(),
+            "control: the pre-fix restriction drops the tenant once its token is gone"
+        );
+
+        // The fix: the lifecycle-aware discovery keeps the tenant maintained.
+        // The empty set is the token-derived fallback; no explicit
+        // `--maintain-tenant` narrowing is configured.
+        let discovered = discover_and_restrict_by_lifecycle(&store, Some(&empty_restrict))
+            .await
+            .expect("lifecycle discover");
+        assert_eq!(
+            discovered.maintained,
+            vec![tenant],
+            "the tenant stays maintained on its config record despite the empty token restriction"
+        );
+
+        // Drive the real maintenance discovery cycle (which uses the
+        // lifecycle-aware discovery) with the empty restriction and assert its
+        // retention actually retired the expired bucket -- maintenance genuinely
+        // continues for the deprovisioned-by-token tenant.
+        let metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        let mut memo = MaintainMemo::with_default_interval();
+        let report = run_discovery_cycle(
+            &store,
+            Some(&empty_restrict),
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+            &WallClock,
+        )
+        .await;
+        assert!(
+            report.retired >= 1,
+            "retention retired the expired bucket for the token-removed tenant \
+             (retention enforcement continues), got {report:?}"
+        );
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "the discovery cycle recorded the tenant as maintained"
+        );
+    }
+
+    /// `run_tick` must actually call the idempotency-marker sweep for logs
+    /// and spans, once per signal, using the real [`WallClock`] (the sweep
+    /// previously had no production caller). Seeds one marker per maintained signal at ingest hour 0
+    /// (1970, far past any real dedup window) and one at the real current
+    /// ingest hour (still within window), then asserts the past-window
+    /// marker is gone and the in-window one survives after a single tick --
+    /// for logs and spans. A metrics marker is never written in production
+    /// (ADR-0051 §5), so this also proves the sweep is not mistakenly called
+    /// for `Signal::Metrics`: a metrics marker seeded the same way must
+    /// survive regardless of age, since nothing calls the marker sweep for
+    /// that signal at all.
+    #[tokio::test]
+    async fn run_tick_sweeps_idempotency_markers_for_logs_and_spans_only() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let now_hour = u32::try_from(SystemClock.now_ns().div_euclid(TEST_NS_PER_HOUR))
+            .expect("real wall clock ingest hour bucket fits in u32");
+
+        for signal in [Signal::Logs, Signal::Spans, Signal::Metrics] {
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                b"past-window",
+                0,
+                &IdempotencyReceipt {
+                    written_count: 1,
+                    commit_token: "v2:token".to_string(),
+                },
+            )
+            .await
+            .expect("seed past-window marker");
+            write_marker(
+                &store,
+                &tenant_id,
+                signal,
+                b"in-window",
+                now_hour,
+                &IdempotencyReceipt {
+                    written_count: 1,
+                    commit_token: "v2:token".to_string(),
+                },
+            )
+            .await
+            .expect("seed in-window marker");
+        }
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        for signal in [Signal::Logs, Signal::Spans] {
+            let past_key = marker_key(&tenant_id, signal, b"past-window", 0);
+            assert!(
+                store.get(&past_key, GetRange::Full).await.is_err(),
+                "{signal:?}'s past-window marker must be swept by a real tick"
+            );
+            let in_window_key = marker_key(&tenant_id, signal, b"in-window", now_hour);
+            assert!(
+                store.get(&in_window_key, GetRange::Full).await.is_ok(),
+                "{signal:?}'s in-window marker must survive a real tick"
+            );
+        }
+
+        // Metrics markers are never produced in production and the sweep is
+        // never called for that signal; both survive regardless of age.
+        for hour in [0, now_hour] {
+            let key = marker_key(
+                &tenant_id,
+                Signal::Metrics,
+                if hour == 0 {
+                    b"past-window"
+                } else {
+                    b"in-window"
+                },
+                hour,
+            );
+            assert!(
+                store.get(&key, GetRange::Full).await.is_ok(),
+                "a Metrics marker must never be touched: the sweep is not called for that signal"
+            );
+        }
+    }
+
+    /// A real tick drives the unreferenced-catalog-object sweep (ADR-0064 §5
+    /// GC rule 5, issue #121): an old catalog snapshot object that the live
+    /// HEAD no longer names is reclaimed, while the object the HEAD still names
+    /// survives. This is the reachability proof that
+    /// `run_tick_with_clock` actually calls `sweep_unreferenced_catalog_objects`
+    /// on the per-(tenant, signal) tick.
+    ///
+    /// Deliberately run on `Signal::Metrics`, which produces no idempotency
+    /// markers: the sweep call must NOT be gated on the `matches!(signal,
+    /// Logs | Spans)` predicate the marker sweep above uses, so exercising it
+    /// on Metrics is what makes the two naive-wrong states fail here. If the
+    /// `sweep_unreferenced_catalog_objects` call were removed, or copied under
+    /// the marker sweep's logs/spans gate (so it never fires for Metrics), the
+    /// superseded object would survive and the
+    /// `store.get(&superseded_key, ...).await.is_err()` assertion below would
+    /// fail; the surviving-referenced-object assertion additionally proves the
+    /// sweep is the real HEAD-anchored rule, not a blanket delete.
+    #[tokio::test]
+    async fn run_tick_sweeps_unreferenced_catalog_objects() {
+        use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef};
+
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let signal = Signal::Metrics;
+
+        // Catalog key layout (docs/catalog-and-mvcc.md), reconstructed from the
+        // same pieces `ravel_maintain`'s sweep builds them from: no public
+        // builder is exported.
+        let snap_prefix = format!(
+            "t/{}/catalog/{}/snap/",
+            tenant.to_hex(),
+            signal.key_prefix()
+        );
+        let head_key = format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix());
+        let referenced_key = format!("{snap_prefix}20260101T00.aaaa.csnap");
+        let superseded_key = format!("{snap_prefix}20251231T00.cccc.csnap");
+
+        // Both objects seeded at the store's default clock (0), so both are far
+        // older than the protection horizon once "now" is advanced below.
+        for key in [&referenced_key, &superseded_key] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from_static(b"catalog-object"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed catalog object");
+        }
+
+        // A HEAD that names only `referenced_key`, so `superseded_key` is
+        // unreferenced and eligible once past the horizon.
+        let head = SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 100,
+            parts: vec![SnapshotPartRef {
+                key: referenced_key.clone(),
+                blake3: vec![1u8; 32],
+                size: 1,
+                entry_count: 1,
+                watermark_hour: 100,
+                min_hour: 0,
+                column_stats: None,
+            }],
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        store
+            .put(
+                &head_key,
+                bytes::Bytes::from(ravel_catalog::encode_head(&head).expect("valid HEAD encodes")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        // "now" two horizons out: the store clock-0 objects are both old, so the
+        // sweep's age gate does not spare the unreferenced one.
+        let clock =
+            ravel_maintain::FixedClock::new(compactor.protection_horizon_ns.saturating_mul(2));
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(
+            store.get(&superseded_key, GetRange::Full).await.is_err(),
+            "an old catalog object no HEAD names must be swept by a real Metrics tick; \
+             it survives if the sweep call is missing or gated on logs/spans"
+        );
+        assert!(
+            store.get(&referenced_key, GetRange::Full).await.is_ok(),
+            "the object the live HEAD still names must survive the sweep"
+        );
+    }
+
+    /// Every tenant tick inside a discovery cycle reads the clock the cycle is
+    /// given, not the wall clock (issue #2251). An unreferenced catalog object
+    /// is written with a store mtime in 2100, so by wall time it is decades
+    /// from being old enough to sweep; the injected clock sits two protection
+    /// horizons past that mtime, so a tick on it deletes the object.
+    ///
+    /// Flip to watch it fail: pass `&WallClock` instead of `clock` to
+    /// `run_tick_with_clock` in `run_discovery_cycle`. The sweep's age gate
+    /// then reads 2026, spares the object, and the `is_err()` assertion fails.
+    #[tokio::test]
+    async fn a_discovery_cycle_tick_reads_the_injected_clock() {
+        use ravel_proto::catalog::v1::{SnapshotHead, SnapshotPartRef};
+
+        /// 2100-01-01T00:00:00Z.
+        const WRITTEN_MS: u64 = 4_102_444_800_000;
+
+        let store = MemoryStore::new();
+        store.set_clock_ms(WRITTEN_MS);
+        let tenant = TenantId::new("acme").hash();
+        let signal = Signal::Metrics;
+        let snap_prefix = format!(
+            "t/{}/catalog/{}/snap/",
+            tenant.to_hex(),
+            signal.key_prefix()
+        );
+        let referenced_key = format!("{snap_prefix}21000101T01.aaaa.csnap");
+        let unreferenced_key = format!("{snap_prefix}21000101T00.cccc.csnap");
+        for key in [&referenced_key, &unreferenced_key] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from_static(b"catalog-object"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed catalog object");
+        }
+        let head = SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 100,
+            parts: vec![SnapshotPartRef {
+                key: referenced_key.clone(),
+                blake3: vec![1u8; 32],
+                size: 1,
+                entry_count: 1,
+                watermark_hour: 100,
+                min_hour: 0,
+                column_stats: None,
+            }],
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        store
+            .put(
+                &format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix()),
+                bytes::Bytes::from(ravel_catalog::encode_head(&head).expect("valid HEAD encodes")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+
+        let compactor = CompactorConfig::default();
+        let written_ns = i64::try_from(WRITTEN_MS).expect("fits i64") * 1_000_000;
+        let clock = ravel_maintain::FixedClock::new(
+            written_ns + compactor.protection_horizon_ns.saturating_mul(2),
+        );
+        let metrics = TenantDiscoveryMetrics::default();
+        let worker = solo_worker();
+        run_discovery_cycle(
+            &store,
+            None,
+            &compactor,
+            &RetentionConfig::default(),
+            1,
+            &mut MaintainMemo::with_default_interval(),
+            &metrics,
+            &MaintenanceSafetyMetrics::default(),
+            &MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS),
+            &worker,
+            &worker.solo_live_set(),
+            &clock,
+        )
+        .await;
+
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "the cycle discovered and ticked the tenant"
+        );
+        assert!(
+            store.get(&unreferenced_key, GetRange::Full).await.is_err(),
+            "two protection horizons past its mtime by the injected clock, the unreferenced \
+             catalog object must be swept; it survives if the tick reads the wall clock"
+        );
+        assert!(
+            store.get(&referenced_key, GetRange::Full).await.is_ok(),
+            "the object the live HEAD still names must survive the sweep"
+        );
+    }
+
+    // --- ADR-0064 selective erasure, driven through `run_tick` ---
+
+    /// The injected "now" every erasure test ticks at: hour 10_000 (1971), far
+    /// past the seal margin for the ingest-hour-0 bucket those tests publish,
+    /// so the rewrite pass sees a sealed bucket without any wall-clock
+    /// dependence.
+    const TEST_ERASURE_NOW_NS: i64 = 10_000 * TEST_NS_PER_HOUR;
+
+    /// The label whose value the erasure predicate names (the "subject").
+    const TEST_SUBJECT_LABEL: &str = "user_id";
+    /// The subject to erase, and the one that must survive untouched.
+    const TEST_ERASED_SUBJECT: &str = "u123";
+    const TEST_SURVIVING_SUBJECT: &str = "u999";
+
+    fn subject_labels(subject: &str) -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: "http_requests".to_string(),
+            },
+            Label {
+                name: TEST_SUBJECT_LABEL.to_string(),
+                value: subject.to_string(),
+            },
+        ])
+        .expect("valid labels")
+    }
+
+    /// Publish one sealed metrics bucket at ingest hour 0 holding two series:
+    /// the erasure subject and one bystander, one sample each. A single L0
+    /// input keeps the bucket below `min_compaction_inputs`, so the tick's
+    /// compaction pass leaves the live record set as raw L0 and the erasure
+    /// rewrite is what acts on it.
+    async fn publish_erasable_bucket(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+        let tenant_hash = tenant.hash();
+        let mut series: Vec<SeriesInput> = [TEST_ERASED_SUBJECT, TEST_SURVIVING_SUBJECT]
+            .into_iter()
+            .map(|subject| {
+                let labels = subject_labels(subject);
+                SeriesInput {
+                    series_id: SeriesId::compute(tenant, "http_requests", &labels)
+                        .expect("series id"),
+                    labels,
+                    samples: vec![Sample {
+                        ts_ns: 1_000,
+                        value: 1.0,
+                    }],
+                }
+            })
+            .collect();
+        series.sort_by_key(|s| s.series_id);
+
+        let writer_id = Uuid::from_u128(9_100);
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// Publish one metrics bucket holding the erasure subject and one bystander
+    /// into ingest hour `hour` (a single L0 input, samples timestamped inside
+    /// the hour). This models issue #1290's delayed pre-ack flush: the ack
+    /// hour's commit record only appears once this is called, so the
+    /// commit-prefix listing returns the hour to nobody before it.
+    async fn publish_erasable_bucket_at_hour(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        hour: u32,
+    ) {
+        let tenant_hash = tenant.hash();
+        let ts_ns = i64::from(hour) * TEST_NS_PER_HOUR + 1_000;
+        let mut series: Vec<SeriesInput> = [TEST_ERASED_SUBJECT, TEST_SURVIVING_SUBJECT]
+            .into_iter()
+            .map(|subject| {
+                let labels = subject_labels(subject);
+                SeriesInput {
+                    series_id: SeriesId::compute(tenant, "http_requests", &labels)
+                        .expect("series id"),
+                    labels,
+                    samples: vec![Sample { ts_ns, value: 1.0 }],
+                }
+            })
+            .collect();
+        series.sort_by_key(|s| s.series_id);
+
+        let writer_id = Uuid::from_u128(9_300 + u128::from(hour));
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: ts_ns,
+                max_ingest_ts_ns: ts_ns,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: ts_ns,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// Publish one L0 commit holding only the erasure subject at
+    /// `(Metrics, shard 0, hour 0)`, with the given `writer_seq`, and return its
+    /// [`CompactionInputIdentity`]. Two of these seed a bucket with two distinct
+    /// L0 inputs that both hold the subject -- the setup the divergence test
+    /// needs, so a forged rewrite can supersede one and leave the other live.
+    async fn publish_subject_l0(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        writer_seq: u64,
+    ) -> ravel_proto::commit::v1::CompactionInputIdentity {
+        let tenant_hash = tenant.hash();
+        let labels = subject_labels(TEST_ERASED_SUBJECT);
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, "http_requests", &labels).expect("series id"),
+            labels,
+            samples: vec![Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(9_200 + u128::from(writer_seq));
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10 + writer_seq as i64,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        ravel_proto::commit::v1::CompactionInputIdentity {
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        }
+    }
+
+    /// Forge a `RewriteRecord` at `(Metrics, shard 0, hour 0)` that supersedes
+    /// ONLY `superseded` (a single L0 identity) and names `request_id` in its
+    /// drops, with one non-empty output part overlapping the subject's event
+    /// time. This is a deliberately inconsistent bucket state -- a real rewrite
+    /// pass always supersedes the whole live input set -- constructed to expose
+    /// the F1 divergence: ravel-maintain's one-hop `resolve_live_record` picks
+    /// this record as the single live generation and reports the request
+    /// `AlreadyApplied`, while the catalog resolver excludes only the one named
+    /// L0 and keeps serving the subject out of any other live L0.
+    async fn forge_partial_rewrite(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        superseded: &ravel_proto::commit::v1::CompactionInputIdentity,
+        request_id: Uuid,
+    ) {
+        let part = ravel_proto::commit::v1::CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: vec![0u8; 32],
+            object_size: 64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: 1_000,
+            max_event_ts_ns: 1_000,
+            segment_format_version: 3,
+            declared_column_stats: Vec::new(),
+        };
+        let inputs = vec![superseded.clone()];
+        let applied = vec![request_id.to_string()];
+        let input_set_hash =
+            ravel_commit::erasure::compute_rewrite_input_set_hash(&inputs, None, &applied);
+        let record = ravel_proto::commit::v1::RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 0,
+            inputs,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            drops: vec![ravel_proto::commit::v1::RewriteDrop {
+                request_id: request_id.to_string(),
+                dropped_count: 1,
+            }],
+            created_unix_ns: 20,
+            superseded_record_key: String::new(),
+        };
+        ravel_commit::erasure::validate_rewrite(&record).expect("forged rewrite is valid");
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite record key");
+        store
+            .put(
+                &key,
+                ravel_commit::erasure::encode_rewrite(&record),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put forged rewrite");
+    }
+
+    /// ADR-0064 §4 (2026-08-08 F1 correction): a `.done` is written ONLY when
+    /// the CATALOG resolver -- the same `resolve_rewrite_supersession` a snapshot
+    /// resolve runs -- agrees every in-scope bucket is erased, never when only
+    /// the rewrite pass's one-hop `resolve_live_record` does.
+    ///
+    /// Construct exactly the state where the two disagree: a sealed bucket with
+    /// two L0 inputs that both hold the subject, plus a forged rewrite that
+    /// supersedes only the first and names the request. The one-hop resolver
+    /// picks that rewrite as the single live record and reports the request
+    /// `AlreadyApplied` (so the rewrite pass is not deferred and would, on the
+    /// pre-fix code, write `.done`). The catalog resolver excludes only the
+    /// named L0, sees the second L0 still live and still holding the subject,
+    /// and must block completion. Drive the real `run_erasure_pass` and assert
+    /// the `.done` follows the catalog resolver: it is NOT written, and the
+    /// `.dreq` survives.
+    ///
+    /// The flip that proves this test bites: in `run_erasure_pass`, remove the
+    /// `if pass.catalog_blocked.contains(&entry.request.request_id) { continue; }`
+    /// guard (revert completion to the rewrite pass's one-hop classification)
+    /// and the `.done` is written here, resurrecting the subject that l0_two
+    /// still serves.
+    #[tokio::test]
+    async fn done_follows_the_catalog_resolver_not_the_one_hop_live_record() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // Two live L0 inputs, both holding the subject, in one sealed bucket.
+        let l0_one = publish_subject_l0(&store, &tenant_id, 1).await;
+        let _l0_two = publish_subject_l0(&store, &tenant_id, 2).await;
+
+        let request_id = Uuid::from_u128(0xF10);
+        // A rewrite that supersedes only l0_one and names the request. l0_two
+        // stays live and keeps serving the subject.
+        forge_partial_rewrite(&store, &tenant, &l0_one, request_id).await;
+
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Drive the real production completion path.
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+            &MaintenanceSafetyMetrics::default(),
+        )
+        .await;
+
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "the catalog resolver still serves the subject out of l0_two, so no .done may be \
+             written -- even though the one-hop resolver reports the request AlreadyApplied. \
+             Flip: drop the `pass.catalog_blocked.contains(...)` guard in run_erasure_pass and a \
+             .done lands here while l0_two still holds the subject."
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the .dreq (which carries the subject) must survive: the erasure is not complete"
+        );
+    }
+
+    /// Reachability through the SERVER's own pass (issue #1290). The previous
+    /// round proved the mechanism in the crate's `erasure_tick` mirror, but the
+    /// shipping driver `run_erasure_pass` still built its hour set from
+    /// `list_erasure_scan_hours` alone. This drives `run_erasure_pass` -- the
+    /// exact pattern `done_follows_the_catalog_resolver_not_the_one_hop_live_record`
+    /// uses -- to prove the driver now discovers the ack-open hour the listing
+    /// misses.
+    ///
+    /// Tick 1: the request is acknowledged while its ingest hour is open and
+    /// holds NO commit record (its pre-ack flush has not published yet). The
+    /// commit-prefix listing returns that hour to nobody, so only
+    /// `ack_open_ingest_hours` surfaces it; the derived bucket is unsealed, so
+    /// completion is blocked and no `.done` is written -- the request does not
+    /// complete. Tick 2: the delayed flush finally publishes its commit record
+    /// into that hour and the clock advances past the hour's seal bound, so it
+    /// is now listed and sealed; the rewrite drops the subject and the request
+    /// completes exactly once, the subject gone from the survivors.
+    ///
+    /// The flip that proves this test bites: replace
+    /// `ack_open_ingest_hours(&pending)` in `run_erasure_pass` with
+    /// `BTreeSet::new()` and tick 1 writes `.done` over an empty listing,
+    /// resurrecting the subject the delayed flush later seals into the hour.
+    #[tokio::test]
+    async fn run_erasure_pass_discovers_the_ack_open_hour_the_listing_misses() {
+        const ACK_HOUR: u32 = 10_000;
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        let request_id = Uuid::from_u128(0x1290);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let compactor = CompactorConfig::default();
+        let hold = ravel_maintain::NoLeases;
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Tick 1: the ack hour is open and holds no commit record. The listing
+        // is empty; only the derived hour makes the unsealed bucket visible,
+        // and an unsealed in-scope bucket blocks completion.
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+            &MaintenanceSafetyMetrics::default(),
+        )
+        .await;
+
+        assert_eq!(
+            rewrite_records_at_hour(&store, &tenant, ACK_HOUR)
+                .await
+                .len(),
+            0,
+            "the ack hour holds no commit record yet, so nothing is rewritten this tick"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "the ack-open hour is derived and unsealed, so completion is blocked and no .done \
+             is written -- without the driver's union this listing is empty and .done lands"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the request stays pending: its .dreq (carrying the subject) survives"
+        );
+
+        // The delayed pre-ack flush finally publishes its commit record into
+        // the ack hour, and the clock advances past that hour's seal bound.
+        publish_erasable_bucket_at_hour(&store, &tenant_id, ACK_HOUR).await;
+        let sealed_ns = i64::from(ACK_HOUR + 1) * TEST_NS_PER_HOUR + compactor.seal_margin_ns() + 1;
+        clock.set(sealed_ns);
+
+        // Tick 2: the hour is now listed and sealed; the rewrite drops the
+        // subject and the request completes exactly once.
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &hold,
+            &tenant,
+            Signal::Metrics,
+            1,
+            &mut memo,
+            &MaintenanceSafetyMetrics::default(),
+        )
+        .await;
+
+        let records = rewrite_records_at_hour(&store, &tenant, ACK_HOUR).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "the sealed ack bucket is rewritten exactly once"
+        );
+        assert_eq!(
+            records[0].drops.len(),
+            1,
+            "the rewrite applies exactly the one pending request"
+        );
+        assert_eq!(records[0].drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            records[0].drops[0].dropped_count, 1,
+            "exactly the subject's one sample is dropped"
+        );
+        assert_eq!(
+            rewritten_label_sets(&store, &records[0]).await,
+            vec![subject_labels(TEST_SURVIVING_SUBJECT)],
+            "the subject is gone from the survivors and the bystander is intact"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "every in-scope bucket now carries the request, so it completes exactly once"
+        );
+    }
+
+    /// Submit one erasure request exactly as `ravel-cli erase submit` does: a
+    /// validated `ErasureRequest` written `CreateIfAbsent` to its `.dreq` key.
+    /// Returns the key.
+    async fn submit_erasure_request(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        signal: Signal,
+        request_id: Uuid,
+        subject: &str,
+        now_ns: i64,
+    ) -> String {
+        let request = ErasureRequest {
+            format_version: ravel_commit::erasure::FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: now_ns,
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: TEST_SUBJECT_LABEL.to_string(),
+                value: subject.to_string(),
+            }],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: "dsar".to_string(),
+        };
+        ravel_commit::erasure::validate_request(&request).expect("valid request");
+        let key = keys::erasure_request_key(tenant, signal, request_id).expect("dreq key");
+        store
+            .put(
+                &key,
+                ravel_commit::erasure::encode_request(&request),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("submit .dreq");
+        key
+    }
+
+    /// Every `RewriteRecord` present in `(tenant, Metrics, shard 0, hour 0)`,
+    /// decoded, in key order.
+    async fn rewrite_records(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+    ) -> Vec<ravel_proto::commit::v1::RewriteRecord> {
+        rewrite_records_at_hour(store, tenant, 0).await
+    }
+
+    /// Every `RewriteRecord` present in `(tenant, Metrics, shard 0, hour)`,
+    /// decoded, in key order.
+    async fn rewrite_records_at_hour(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        hour: u32,
+    ) -> Vec<ravel_proto::commit::v1::RewriteRecord> {
+        let prefix = keys::commit_shard_hour_prefix(tenant, Signal::Metrics, 0, hour)
+            .expect("bucket prefix");
+        let mut keys_found: Vec<String> = list_all(store, &prefix)
+            .await
+            .expect("list bucket")
+            .into_iter()
+            .map(|meta| meta.key)
+            .filter(|key| key.contains("/rw."))
+            .collect();
+        keys_found.sort();
+        let mut out = Vec::with_capacity(keys_found.len());
+        for key in keys_found {
+            let got = store.get(&key, GetRange::Full).await.expect("get rewrite");
+            out.push(ravel_commit::erasure::decode_rewrite(&got.data).expect("decode rewrite"));
+        }
+        out
+    }
+
+    /// The label sets a rewrite record's output parts actually hold, read back
+    /// out of the published segment objects. This is the "survivors are intact"
+    /// oracle: it reads what a query would read, not what the record claims.
+    async fn rewritten_label_sets(
+        store: &dyn ObjectStoreBackend,
+        record: &ravel_proto::commit::v1::RewriteRecord,
+    ) -> Vec<LabelSet> {
+        use ravel_segment::{ReaderLimits, decode_catalog_v5, open_from_full};
+
+        let limits = ReaderLimits::default();
+        let mut out = Vec::new();
+        for part in &record.parts {
+            let key = keys::reconstruct_rewrite_part_key(record, part).expect("part key");
+            let got = store.get(&key, GetRange::Full).await.expect("get part");
+            let object = got.data;
+            let loc = open_from_full(&object, limits).expect("open part");
+            for entry in decode_catalog_v5(&loc.footer, &object, limits).expect("decode catalog") {
+                out.push(entry.entry.labels);
+            }
+        }
+        out
+    }
+
+    /// The reachability acceptance test for selective erasure (ADR-0064 decisions 3,
+    /// 4, and 5): everything is driven through `run_tick` itself, never by
+    /// calling `erasure_rewrite_bucket` or `sweep_erasure_requests` directly.
+    ///
+    /// Ingest one sealed bucket holding the erasure subject and one bystander,
+    /// submit a `.dreq` naming the subject, and run a tick. The tick must
+    /// publish a `RewriteRecord` that names the request, drops exactly the
+    /// subject's one sample, and leaves the bystander's series intact in the
+    /// output part -- and must write the request's `.done` in the same tick,
+    /// because every bucket in the request's scope now carries a rewrite
+    /// naming it. The `.dreq` must still be there: the protection horizon has
+    /// not elapsed. Advance the injected clock past that horizon, tick again,
+    /// and the `.dreq` must be gone while the (permanent, PII-free) `.done`
+    /// survives.
+    ///
+    /// The flip that proves this test bites: comment out the
+    /// `run_erasure_pass(...)` call in `run_tick_with_clock`'s per-signal loop
+    /// and it fails at the first assertion (no rewrite record is ever
+    /// published). Flipping only the `.dreq` sweep (dropping the
+    /// `sweep_erasure_requests` call inside `run_erasure_pass`) fails at the
+    /// final assertion instead.
+    #[tokio::test]
+    async fn run_tick_rewrites_for_an_erasure_request_then_sweeps_its_dreq() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7A5);
+        // Acknowledge the request inside the data's own ingest hour (hour 0),
+        // which is long sealed at `TEST_ERASURE_NOW_NS` (hour 10_000). This
+        // keeps the ack-open hour from being an obstacle in its own right, so
+        // this test stays about the rewrite/complete/sweep arc; the ack-open
+        // hour that the listing misses is covered separately by
+        // `run_erasure_pass_discovers_the_ack_open_hour_the_listing_misses`.
+        let ack_ns = 1_000;
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            ack_ns,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        // The pinned-query window (ADR-1133) zeroed: tick 2's deleting rule 2
+        // pass writes the chain's marker and reclaims it at once, so the
+        // erasure-request sweep sees nothing held.
+        let compactor = CompactorConfig {
+            max_query_duration_ns: 0,
+            head_cache_ttl_ns: 0,
+            clock_skew_allowance_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Tick 1: the rewrite runs and the request completes.
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        let records = rewrite_records(&store, &tenant).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "the tick must publish exactly one RewriteRecord for the bucket"
+        );
+        let record = &records[0];
+        assert_eq!(
+            record.drops.len(),
+            1,
+            "the rewrite applies exactly the one pending request"
+        );
+        assert_eq!(record.drops[0].request_id, request_id.to_string());
+        assert_eq!(
+            record.drops[0].dropped_count, 1,
+            "exactly the subject's one sample is dropped"
+        );
+
+        let survivors = rewritten_label_sets(&store, record).await;
+        assert_eq!(
+            survivors,
+            vec![subject_labels(TEST_SURVIVING_SUBJECT)],
+            "the bystander series survives the rewrite intact and the subject is gone"
+        );
+
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "every bucket in scope carries the request, so the tick writes .done"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            ".dreq must survive until protection_horizon has elapsed past .done"
+        );
+
+        // Tick 2, past the horizon: the `.dreq` (which carries the subject
+        // identifier) is swept; the PII-free `.done` is permanent.
+        clock.set(TEST_ERASURE_NOW_NS + compactor.protection_horizon_ns + 1);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_err(),
+            ".dreq must be swept once its .done is older than protection_horizon"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            ".done is permanent erasure evidence and must never be swept"
+        );
+    }
+
+    /// A `.dreq` the erasure-request sweep holds past its horizon reaches the
+    /// tick's safety snapshot, exactly once, under the signal it belongs to.
+    ///
+    /// Tick 1 rewrites the bucket and writes `.done`. A legal hold over the
+    /// shard's L0 data prefix then covers the input the rewrite superseded, but
+    /// not `del/`, so the `.dreq` itself is not protected: past the horizon it
+    /// is a candidate, and rule 6's observing pass holds it because a held
+    /// chain group names the request.
+    ///
+    /// Watch it fail: delete the `safety.record_erasure_sweep(signal, &outcome)`
+    /// call in `run_erasure_pass`. The `.dreq` is still held, and the metrics
+    /// count reads 0 instead of 1.
+    #[tokio::test]
+    async fn a_tick_counts_a_dreq_the_erasure_request_sweep_holds() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7AD);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            1_000,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "tick 1 completes the request"
+        );
+
+        let l0_prefix = &shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("scopes")[0];
+        write_hold_set(
+            &store,
+            &tenant,
+            Uuid::from_u128(0x401D),
+            TEST_ERASURE_NOW_NS,
+            l0_prefix,
+            "hold over the rewrite's superseded input",
+        )
+        .await
+        .expect("set hold");
+
+        clock.set(TEST_ERASURE_NOW_NS + compactor.protection_horizon_ns + 1);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the .dreq outlives its horizon while the input its rewrite superseded is held"
+        );
+        let snapshot = crate::metrics::MaintenanceSafetySnapshot::from_metrics(&safety);
+        let held: Vec<(Signal, u64)> = snapshot
+            .signals
+            .iter()
+            .map(|s| (s.signal, s.dreq_held_by_superseded_inputs))
+            .collect();
+        assert_eq!(
+            held,
+            vec![(Signal::Metrics, 1), (Signal::Logs, 0), (Signal::Spans, 0)],
+            "tick 2's one held .dreq is counted once, under signal metrics"
+        );
+    }
+
+    /// The idempotence guard, observed through the loop: a second tick
+    /// over a bucket whose live `RewriteRecord` already names every pending
+    /// request must publish nothing new. Without the `AlreadyApplied` skip the
+    /// second tick would land a no-op rewrite superseding the first, every
+    /// tick, forever.
+    ///
+    /// Driven by keeping the request pending across two ticks: the first tick
+    /// writes `.done`, so the request would drop out of the pending set --
+    /// deleting the `.done` between the ticks puts it back and re-runs the
+    /// rewrite against an already-rewritten bucket, which is exactly the state
+    /// the guard exists for.
+    #[tokio::test]
+    async fn second_tick_over_an_already_erased_bucket_publishes_no_new_rewrite() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7A6);
+        submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        for _ in 0..2 {
+            run_tick_with_clock(
+                &clock,
+                &store,
+                &tenant,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &worker.solo_live_set(),
+            )
+            .await;
+            // Put the request back in the pending set for the next tick.
+            store.delete(&done_key).await.expect("delete .done");
+        }
+
+        let records = rewrite_records(&store, &tenant).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "a bucket already rewritten for every pending request must not be \
+             republished: {records:?}"
+        );
+    }
+
+    /// Failure path: the `.done` write faults. The ordering guarantee must
+    /// hold anyway -- no `.done`, so the `.dreq` stays even once the
+    /// protection horizon has passed, and the request stays pending. A later
+    /// fault-free tick completes it, without redoing the rewrite (the bucket
+    /// is `AlreadyApplied` by then).
+    #[tokio::test]
+    async fn a_failed_done_write_keeps_the_dreq_and_completes_on_a_later_tick() {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&inner, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7A7);
+        let dreq_key = submit_erasure_request(
+            &inner,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        // Fault the FIRST PUT of a `.done` object and nothing else, so the
+        // same store serves the recovery ticks untouched.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Transient("completion write unavailable".into()),
+            )
+            .with_key_contains(".done")
+            .with_occurrence(ravel_object_store::fault::Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Tick 1 under the fault, already past the horizon: the rewrite lands,
+        // the `.done` write fails, and the `.dreq` must survive regardless.
+        clock.set(TEST_ERASURE_NOW_NS + compactor.protection_horizon_ns + 1);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert_eq!(
+            store.fault_count(Op::Put, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the injected .done write fault must actually have fired"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "no .done was written"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "a .dreq must never be swept while its .done is absent, horizon or not"
+        );
+        assert_eq!(
+            rewrite_records(&store, &tenant).await.len(),
+            1,
+            "the rewrite itself landed before the completion write failed"
+        );
+
+        // Tick 2, past the one-shot fault: the request completes, and its
+        // `.dreq` is swept on the tick after the horizon passes.
+        clock.set(TEST_ERASURE_NOW_NS + 2 * compactor.protection_horizon_ns + 2);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_ok(),
+            "the fault-free tick completes the request"
+        );
+        assert_eq!(
+            rewrite_records(&store, &tenant).await.len(),
+            1,
+            "the completing tick must not republish a rewrite for a bucket that \
+             already names the request"
+        );
+
+        clock.set(TEST_ERASURE_NOW_NS + 3 * compactor.protection_horizon_ns + 3);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_err(),
+            "once the .done exists and its horizon passes, the .dreq is swept"
+        );
+    }
+
+    /// A legal hold over the bucket pauses erasure (ADR-0064 §6): the rewrite
+    /// is skipped, so no `.done` may be written and the `.dreq` must survive
+    /// even past the protection horizon. Legal hold wins over erasure until an
+    /// authorized human clears it.
+    #[tokio::test]
+    async fn a_held_bucket_defers_erasure_completion_and_keeps_the_dreq() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+
+        let clock = ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS);
+        let request_id = Uuid::from_u128(0xE7A8);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        // Hold every scope covering (Metrics, shard 0).
+        for scope in shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("valid hold scopes") {
+            write_hold_set(
+                &store,
+                &tenant,
+                Uuid::new_v4(),
+                TEST_ERASURE_NOW_NS,
+                &scope,
+                "litigation hold over the erasure subject's bucket",
+            )
+            .await
+            .expect("set hold");
+        }
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        clock.set(TEST_ERASURE_NOW_NS + compactor.protection_horizon_ns + 1);
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(
+            rewrite_records(&store, &tenant).await.is_empty(),
+            "a held bucket must not be rewritten"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "a deferred request must not be marked complete"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the request stays pending while the hold is in force"
+        );
+    }
+
+    /// An erasure rewrite refused the bucket claim (ADR-1029, the 2026-10-03
+    /// amendment) reports `Rewritten { parts: 0, publish: Abandoned, .. }`
+    /// with `ErasureAbandon::ClaimHeld`. The pass counts that as a back-off on
+    /// `ravel_maintain_claims_skipped_total`, as it counts a compaction refused
+    /// the claim, and on no other claim counter, logs that nothing was
+    /// published, and never logs it as a published rewrite. The request stays
+    /// pending.
+    #[tokio::test]
+    async fn an_erasure_rewrite_refused_the_claim_counts_a_back_off_not_a_publish() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        struct Messages(Arc<parking_lot::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Messages {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                #[derive(Default)]
+                struct Visitor(String);
+                impl tracing::field::Visit for Visitor {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "message" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut visitor = Visitor::default();
+                event.record(&mut visitor);
+                self.0.lock().push(visitor.0);
+            }
+        }
+
+        let store = MemoryStore::new();
+        store.set_clock_ms((TEST_ERASURE_NOW_NS / 1_000_000) as u64);
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_erasable_bucket(&store, &tenant_id).await;
+        let request_id = Uuid::from_u128(0x2199);
+        let dreq_key = submit_erasure_request(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            request_id,
+            TEST_ERASED_SUBJECT,
+            TEST_ERASURE_NOW_NS,
+        )
+        .await;
+        let done_key =
+            keys::erasure_completion_key(&tenant, Signal::Metrics, request_id).expect("done key");
+
+        // Another process holds the bucket's claim, live by the pass's clock.
+        let clock = FixedClock::new(TEST_ERASURE_NOW_NS);
+        let holder = ravel_maintain::claim_guard::ClaimGuard::new(
+            &Bucket::new(tenant, Signal::Metrics, 0, 0),
+            &ClaimParticipant::new(
+                Uuid::from_u128(0xC1A1),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            ),
+            ravel_fleet::claim::ClaimConfig::default(),
+            None,
+        );
+        assert!(matches!(
+            holder.acquire(&store).await.expect("holder acquires"),
+            ravel_maintain::claim_guard::Acquire::Acquired
+        ));
+
+        let compactor = CompactorConfig {
+            coordination: Coordination::On,
+            claim_participant: Some(ClaimParticipant::new(
+                Uuid::from_u128(0xE2A5),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let messages: Arc<parking_lot::Mutex<Vec<String>>> = Arc::default();
+        let subscriber = tracing_subscriber::registry().with(Messages(messages.clone()));
+        {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            run_erasure_pass(
+                &store,
+                &clock,
+                &compactor,
+                &ravel_maintain::NoLeases,
+                &tenant,
+                Signal::Metrics,
+                1,
+                &mut memo,
+                &safety,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            safety.claims_skipped(Signal::Metrics),
+            1,
+            "the back-off is counted as a claim skip"
+        );
+        assert_eq!(safety.claims_lost(Signal::Metrics), 0, "no claim was lost");
+        assert_eq!(
+            safety.claims_acquired(Signal::Metrics),
+            0,
+            "no claim was acquired"
+        );
+        let messages = messages.lock().clone();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("erasure rewrite of a bucket published nothing")),
+            "the back-off is logged: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| m.contains("erasure rewrite published")),
+            "nothing is logged as published: {messages:?}"
+        );
+        assert!(
+            rewrite_records(&store, &tenant).await.is_empty(),
+            "a pass refused the claim publishes no rewrite record"
+        );
+        assert!(
+            store.get(&done_key, GetRange::Full).await.is_err(),
+            "a backed-off request must not be marked complete"
+        );
+        assert!(
+            store.get(&dreq_key, GetRange::Full).await.is_ok(),
+            "the request stays pending for a later pass"
+        );
+    }
+
+    /// The `.done` predicate hash is what makes a permanent completion record
+    /// PII-free, so it must be stable across matcher orderings (two
+    /// submissions of the same erasure hash the same) and must never contain
+    /// the plaintext subject.
+    #[test]
+    fn erasure_predicate_hash_is_order_stable_and_carries_no_plaintext() {
+        let matcher = |key: &str, value: &str| ravel_proto::commit::v1::ErasurePredicateMatcher {
+            key: key.to_string(),
+            value: value.to_string(),
+        };
+        let base = ErasureRequest {
+            format_version: ravel_commit::erasure::FORMAT_VERSION,
+            tenant_hash: TenantId::new("acme").hash().0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            request_id: Uuid::from_u128(1).to_string(),
+            created_unix_ns: 10,
+            predicate: vec![matcher("user_id", "u123"), matcher("region", "eu")],
+            window_start_ns: 0,
+            window_end_ns: 0,
+            reason: "dsar".to_string(),
+        };
+        let mut reordered = base.clone();
+        reordered.predicate.reverse();
+        // A different reason and submit time is the same erasure.
+        reordered.reason = "second submit".to_string();
+        reordered.created_unix_ns = 99;
+        assert_eq!(
+            erasure_predicate_hash(&base),
+            erasure_predicate_hash(&reordered),
+            "matcher order and non-predicate fields must not change the hash"
+        );
+
+        let mut different_value = base.clone();
+        different_value.predicate[0] = matcher("user_id", "u124");
+        assert_ne!(
+            erasure_predicate_hash(&base),
+            erasure_predicate_hash(&different_value),
+            "a different subject must hash differently"
+        );
+
+        let mut windowed = base.clone();
+        windowed.window_start_ns = 1;
+        windowed.window_end_ns = 2;
+        assert_ne!(
+            erasure_predicate_hash(&base),
+            erasure_predicate_hash(&windowed),
+            "the event-time window is part of what is erased, so it is hashed"
+        );
+
+        let hash = erasure_predicate_hash(&base);
+        assert!(
+            !hash.windows(4).any(|w| w == b"u123"),
+            "the digest must not contain the subject identifier"
+        );
+    }
+
+    /// Publish one real sealed segment plus its commit record into a past ingest
+    /// hour of `(tenant, Metrics, shard 0)`. One input is below the default
+    /// `min_compaction_inputs`, and with no retention policy the bucket stays
+    /// live, so maintenance classifies it terminal (below-threshold): exactly
+    /// the steady state the memo is meant to skip. The ingest hour is 0 (1970)
+    /// so the real [`WallClock`] `run_tick` uses always sees it as sealed.
+    async fn publish_terminal_bucket(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+        let tenant_hash = tenant.hash();
+        let metric = "up";
+        let label_set = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, metric, &label_set).expect("series id"),
+            labels: label_set,
+            samples: vec![Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(7_000);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// Publish one below-threshold (terminal) sealed bucket into a specific
+    /// `(tenant, Metrics, shard)` at ingest hour 0 (1970, always sealed vs the
+    /// real `WallClock`), for the resharding scan-range test. Mirrors
+    /// [`publish_terminal_bucket`] but lets the caller place data in a shard
+    /// index outside the process's static `shard_count`.
+    async fn publish_terminal_bucket_at_shard(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        shard: u32,
+    ) {
+        let tenant_hash = tenant.hash();
+        let metric = "up";
+        let label_set = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(tenant, metric, &label_set).expect("series id"),
+            labels: label_set,
+            samples: vec![Sample {
+                ts_ns: 1_000,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = Uuid::from_u128(u128::from(7_000 + shard));
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// ADR-0052 section 4: `run_tick` must maintain the post-reshard shard
+    /// range, not the pre-reshard one. With a provisioning record recording an
+    /// increase (generation 0 count 2, generation 1 count 4) and a bucket
+    /// placed in shard 3 -- outside the process's static `shard_count` of 2 --
+    /// the tick must still discover and evaluate that bucket. Under the old
+    /// static `0..shard_count` loop shard 3 was never scanned; the
+    /// generation-aware union range (max count across generations = 4) reaches
+    /// it.
+    #[tokio::test]
+    async fn run_tick_maintains_post_reshard_shard_range() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // Record generation 0 (count 2) before any out-of-range data exists,
+        // then append generation 1 (count 4) activating at hour 1.
+        ravel_catalog::validate_or_adopt(
+            &store,
+            &tenant,
+            Signal::Metrics,
+            2,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+        ravel_catalog::append_generation(&store, &tenant, Signal::Metrics, 4, 1, 0)
+            .await
+            .expect("append generation 1");
+
+        // A terminal bucket in shard 3: reachable only under the widened count.
+        publish_terminal_bucket_at_shard(&store, &tenant_id, 3).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Static shard_count is 2, matching generation 0's count; the scan
+        // range must nonetheless cover shard 3 via the generation history.
+        let report = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            2,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert_eq!(
+            report.already_done, 1,
+            "the shard-3 bucket (outside the static count-2 range) must be evaluated"
+        );
+        assert_eq!(
+            memo.len(),
+            1,
+            "exactly the shard-3 terminal bucket is memoized; the pre-reshard \
+             0..2 loop would have found nothing"
+        );
+    }
+
+    /// A second `run_tick` with the same memo (a second tick) skips the buckets
+    /// the first tick proved terminal: `skipped_terminal` rises from 0 to the
+    /// bucket count, and the second tick issues strictly fewer GETs because the
+    /// skipped bucket's per-bucket LIST/GET reads are elided.
+    #[tokio::test]
+    async fn second_tick_with_shared_memo_skips_terminal_buckets() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Per-bucket object reads: the memo elides the per-bucket LIST and GET
+        // reads, so this is what shrinks between the cold and warm ticks. The
+        // shard-level `list_delimited` runs on every tick and is excluded.
+        let per_bucket_reads = |s: &StoreMetricsSnapshot| -> u64 { s.list.calls + s.get.calls };
+
+        // Tick 1 (cold memo): full evaluation, nothing skipped. The single-input
+        // bucket is below the compaction threshold, so it is already-done and
+        // gets memoized as terminal.
+        let before_first = store.metrics().snapshot();
+        let first = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        let first_reads =
+            per_bucket_reads(&store.metrics().snapshot()) - per_bucket_reads(&before_first);
+        assert_eq!(first.skipped_terminal, 0, "cold memo skips nothing");
+        assert_eq!(first.already_done, 1, "the below-threshold bucket is done");
+        assert_eq!(memo.len(), 1, "the terminal bucket is memoized");
+        assert!(first_reads > 0, "cold tick did per-bucket reads");
+
+        // Tick 2 (warm memo): the bucket is skipped straight from the memo.
+        let before_second = store.metrics().snapshot();
+        let second = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        let second_reads =
+            per_bucket_reads(&store.metrics().snapshot()) - per_bucket_reads(&before_second);
+        assert_eq!(second.skipped_terminal, 1, "warm memo skips the bucket");
+        assert_eq!(second.already_done, 0, "no per-bucket work redone");
+        assert!(
+            second_reads < first_reads,
+            "the skipped tick reads fewer objects (first={first_reads}, second={second_reads})"
+        );
+    }
+
+    /// ADR-0048 decision 1 / ADR-0042: a legal hold covering a bucket stops
+    /// the real driver's retention path from ever physically deleting it.
+    ///
+    /// Retention's physical delete is horizon-gated (`retention_sweep_bucket`
+    /// only sweeps once `now >= tombstone.retired_at_ns + protection_horizon_ns`),
+    /// and a tombstone write itself is not lease-gated (only the physical
+    /// delete is), so reaching the delete path this driver actually guards
+    /// takes two ticks even with a zero horizon: the first tombstones the
+    /// already-expired bucket, the second attempts the now horizon-elapsed
+    /// physical sweep. The hold must block every delete in that second tick.
+    #[tokio::test]
+    async fn held_bucket_survives_retention_tick() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        // Cover all three prefixes a shard-level hold must (L0 data, commit
+        // records, L1 parts), exactly as the CLI's --signal/--shard
+        // convenience form does, so nothing in this bucket is left
+        // unprotected.
+        for scope in shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("valid hold scopes") {
+            write_hold_set(
+                &store,
+                &tenant,
+                Uuid::new_v4(),
+                SystemClock.now_ns(),
+                &scope,
+                "held for held_bucket_survives_retention_tick",
+            )
+            .await
+            .expect("write hold set");
+        }
+
+        let compactor = CompactorConfig {
+            protection_horizon_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let max_ingest_lag_ns = ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
+        let floor_ns = compactor.retention_floor_ns(max_ingest_lag_ns);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(floor_ns),
+                tenants: Vec::new(),
+            },
+            &compactor,
+            max_ingest_lag_ns,
+        )
+        .expect("valid retention policy");
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Tick 1: the bucket's one sample is from ingest hour 0 (1970), so any
+        // valid retention window is already expired against the real wall
+        // clock. Not memoized terminal (Tombstoned isn't a terminal state),
+        // so tick 2 re-evaluates it for real rather than skipping it.
+        let first = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(first.retired, 1, "the expired bucket is tombstoned");
+
+        // Tick 2: the tombstone's horizon has elapsed (zero protection
+        // horizon), so this tick attempts the physical sweep. The hold must
+        // block it entirely.
+        let second = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(
+            second.retired, 1,
+            "still counted retired (tombstoned), never actually swept"
+        );
+
+        let l0_prefix = &shard_hold_scopes(&tenant, Signal::Metrics, 0).expect("scopes")[0];
+        let surviving = list_all(&store, l0_prefix)
+            .await
+            .expect("list held l0 prefix");
+        assert!(
+            !surviving.is_empty(),
+            "held bucket's L0 data object must still exist after a retention tick"
+        );
+
+        let commit_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid commit shard prefix");
+        let surviving_commit = list_all(&store, &commit_prefix)
+            .await
+            .expect("list held commit prefix");
+        assert!(
+            surviving_commit
+                .iter()
+                .any(|meta| keys::partition_bucket_entry(&meta.key)
+                    .is_ok_and(|entry| matches!(entry, keys::BucketEntry::CommitRecord(_)))),
+            "held bucket's commit record must still exist after a retention tick"
+        );
+    }
+
+    /// ADR-0048 decision 1: a legal-hold refresh failure must never fall back
+    /// to `NoLeases`. It must skip the whole tenant tick -- no bucket
+    /// touched, nothing deleted -- and the failure must be visible (not
+    /// swallowed). Uses `FaultStore` to fail the one LIST `LegalHoldCheck::refresh`
+    /// issues (the audit hold shard's commit prefix) and asserts its fault
+    /// counter to prove the fault actually fired, not just that nothing
+    /// happened to be due for deletion.
+    #[tokio::test]
+    async fn hold_refresh_failure_skips_tenant_tick_and_deletes_nothing() {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&inner, &tenant_id).await;
+
+        let hold_prefix = keys::commit_shard_prefix(&tenant, Signal::Audit, AUDIT_HOLD_SHARD)
+            .expect("valid audit hold shard prefix");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("hold shard unavailable".into()),
+            )
+            .with_key_contains(hold_prefix),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        let compactor = CompactorConfig {
+            protection_horizon_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let max_ingest_lag_ns = ravel_maintain::config::DEFAULT_MAX_INGEST_LAG_NS;
+        let floor_ns = compactor.retention_floor_ns(max_ingest_lag_ns);
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(floor_ns),
+                tenants: Vec::new(),
+            },
+            &compactor,
+            max_ingest_lag_ns,
+        )
+        .expect("valid retention policy");
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        let report = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            MaintainReport::default(),
+            "a refresh failure must skip the whole tick, not just gate deletes"
+        );
+        assert_eq!(
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the injected refresh fault must actually have fired"
+        );
+        assert!(memo.is_empty(), "a skipped tick memoizes nothing");
+        assert_eq!(
+            safety.legal_hold_refresh_failures(),
+            1,
+            "the refresh failure must be visible on the metrics endpoint, not just as a log line"
+        );
+
+        let commit_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid commit shard prefix");
+        let surviving = list_all(store.inner(), &commit_prefix)
+            .await
+            .expect("list commit prefix");
+        assert!(
+            !surviving.is_empty(),
+            "the tenant's bucket must be untouched when the hold refresh fails"
+        );
+    }
+
+    /// A tenant known only to
+    /// storage (no `--tenant-token`, no `--maintain-tenant`, i.e. `restrict =
+    /// None`) is discovered and maintained by the real driver wiring
+    /// (ADR-0048 decision 3). This is exactly the
+    /// OIDC/mTLS-authenticated-tenant scenario the discovery path must cover:
+    /// the flag-derived set used to be empty and nothing ran.
+    #[tokio::test]
+    async fn storage_discovered_tenant_is_maintained_without_flags() {
+        let store = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        let report = run_discovery_cycle(
+            &store,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+            &WallClock,
+        )
+        .await;
+
+        assert_eq!(
+            report.already_done, 1,
+            "the storage-discovered tenant's bucket must actually be evaluated"
+        );
+        assert_eq!(metrics.tenants_discovered(), 1);
+        assert_eq!(metrics.tenants_maintained(), 1);
+        assert_eq!(metrics.discovery_failures(), 0);
+    }
+
+    /// A flag restriction narrows the discovered set: a discovered tenant not
+    /// named by `--tenant-token`/`--maintain-tenant` is excluded from the
+    /// cycle (never maintained) and counted, rather than either running
+    /// unconditionally or being indistinguishable from "storage didn't report
+    /// it."
+    #[tokio::test]
+    async fn flag_restriction_excludes_a_discovered_tenant_and_counts_it() {
+        let store = MemoryStore::new();
+        let acme = TenantId::new("acme");
+        let globex = TenantId::new("globex");
+        publish_terminal_bucket(&store, &acme).await;
+        publish_terminal_bucket(&store, &globex).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        let restrict = [acme.hash()];
+
+        let report = run_discovery_cycle(
+            &store,
+            Some(&restrict),
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+            &WallClock,
+        )
+        .await;
+
+        assert_eq!(
+            report.already_done, 1,
+            "only the restricted-in tenant's bucket is evaluated"
+        );
+        assert_eq!(metrics.tenants_discovered(), 2, "both tenants hold data");
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "only the restriction-named tenant is maintained"
+        );
+        assert_eq!(
+            memo.len(),
+            1,
+            "only the maintained tenant's bucket is memoized"
+        );
+    }
+
+    /// ADR-0048 decision 3: a tenant discovery failure (the `list_delimited("t/")`
+    /// LIST erroring) must skip the entire cycle -- no tenant's tick runs --
+    /// and must never fall back to an empty tenant set and report success.
+    /// Uses `FaultStore` to fail the discovery LIST specifically and asserts
+    /// its fault counter to prove the fault actually fired, not just that
+    /// there happened to be nothing to do.
+    #[tokio::test]
+    async fn discovery_failure_skips_cycle_without_running_empty_set() {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        publish_terminal_bucket(&inner, &tenant_id).await;
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("tenant discovery unavailable".into()),
+            )
+            .with_key_contains("t/"),
+        );
+        let store = FaultStore::new(inner, plan);
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        let report = run_discovery_cycle(
+            &store,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+            &WallClock,
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            MaintainReport::default(),
+            "a discovery failure must skip the whole cycle, never run an empty set"
+        );
+        assert_eq!(
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient),
+            1,
+            "the injected discovery fault must actually have fired"
+        );
+        assert_eq!(metrics.discovery_failures(), 1);
+        assert_eq!(
+            metrics.tenants_discovered(),
+            0,
+            "gauges stay at their last known-good value, never reporting this failed cycle"
+        );
+        assert!(memo.is_empty(), "a skipped cycle memoizes nothing");
+    }
+
+    /// `run_loop`'s discovery arm must survive across `select!` iterations:
+    /// with the default heartbeat cadence (60s) shorter than the discovery
+    /// interval (300s), a discovery sleep written as a bare `select!` branch
+    /// expression is silently rebuilt (and its countdown restarted) every
+    /// time the heartbeat arm fires first, so discovery never elapses.
+    /// Drives the real `run_loop` under a paused clock, injecting a
+    /// persistent discovery-LIST fault so each actual discovery attempt is
+    /// observable via `discovery_failures()` -- proving the discovery arm
+    /// fired repeatedly over simulated time, not just that the loop didn't
+    /// panic.
+    #[tokio::test(start_paused = true)]
+    async fn discovery_arm_fires_repeatedly_despite_a_shorter_heartbeat() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("discovery unavailable (test)".into()),
+            )
+            .with_key_contains("t/"),
+        );
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(FaultStore::new(inner, plan));
+
+        let compactor = Arc::new(CompactorConfig::default());
+        let retention = Arc::new(RetentionConfig::default());
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let safety = Arc::new(MaintenanceSafetyMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let worker = Arc::new(WorkerSet::with_defaults(0));
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let discovery_interval = Duration::from_secs(300);
+        let live_tx = Arc::new(watch::channel(worker.solo_live_set()).0);
+        let handle = tokio::spawn(run_loop(
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                interval: discovery_interval,
+                metrics: metrics.clone(),
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                live_tx,
+                cycle_hook: Arc::new(|| {}),
+            },
+            shutdown_rx,
+        ));
+
+        // 30 simulated minutes: 30 heartbeats at the default 60s cadence
+        // (which used to starve discovery outright), against roughly 6
+        // discovery cycles at 300s (plus up to 10% jitter). Advance in small
+        // steps so the paused-time runtime actually polls and wakes the
+        // spawned task between each, rather than one giant jump.
+        for _ in 0..180 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            metrics.discovery_failures() >= 4,
+            "discovery must have fired repeatedly over 30 simulated minutes at a 300s interval, \
+             got {} -- the discovery arm is starved again",
+            metrics.discovery_failures()
+        );
+
+        handle.abort();
+    }
+
+    /// ADR-0065 decision 3: the durable memo write is debounced.
+    /// A first persist writes the snapshot object; a second persist over an
+    /// unchanged memo writes nothing (no PUT); and a persist after the memo
+    /// gained a bucket writes again. Counts PUTs through an `InstrumentedStore`
+    /// around each `persist_memo_snapshot` call so the assertion isolates the
+    /// persist's own write from the publishing/tick writes.
+    #[tokio::test]
+    async fn memo_snapshot_write_is_debounced_on_unchanged_tick() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // A tick populates the memo with the one terminal bucket.
+        run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+        assert_eq!(memo.len(), 1, "the tick memoized the terminal bucket");
+
+        let now = SystemClock.now_ns();
+        let mut last_body: Option<Vec<u8>> = None;
+
+        // First persist: writes the snapshot object (one PUT).
+        let before = store.metrics().snapshot();
+        assert!(
+            persist_memo_snapshot(&store, &worker, &memo, &mut last_body, now).await,
+            "first persist writes"
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(after.put.calls - before.put.calls, 1, "one snapshot PUT");
+
+        // Second persist over the unchanged memo: writes nothing, even though
+        // the timestamp advanced (debounce compares the timestamp-free body).
+        let before = store.metrics().snapshot();
+        assert!(
+            !persist_memo_snapshot(&store, &worker, &memo, &mut last_body, now + 1_000_000).await,
+            "an unchanged memo persists nothing"
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(
+            after.put.calls - before.put.calls,
+            0,
+            "the debounced tick issues no PUT"
+        );
+
+        // A memo change writes again: here the terminal set emptied (as it
+        // would after the bucket was swept), so the body differs from the last
+        // written one and the debounce lets the write through.
+        let emptied = MaintainMemo::with_default_interval();
+        let before = store.metrics().snapshot();
+        assert!(
+            persist_memo_snapshot(&store, &worker, &emptied, &mut last_body, now + 2_000_000).await,
+            "a changed memo persists again"
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(
+            after.put.calls - before.put.calls,
+            1,
+            "the changed memo re-writes"
+        );
+    }
+
+    /// ADR-0065 decision 3: warm start and ownership handoff
+    /// through real store objects. Worker A maintains a unit, memoizes its
+    /// terminal bucket, and persists a durable snapshot. Worker B -- a distinct
+    /// process that now owns the unit -- reads the snapshots back from the store
+    /// and seeds its cold memo from A's, then stops cold-rescanning the bucket A
+    /// already proved terminal.
+    ///
+    /// The bucket here is below the compaction threshold, and the snapshot body
+    /// carries states and verify times but not L0 record counts, so B's first
+    /// tick re-verifies it once to learn the count its `l0_records_pending`
+    /// total must report; every tick after that skips it. Both ticks report the
+    /// bucket's one pending L0 record, which is the point of the re-verify: the
+    /// gauge is exact on the warm-start cycle too, not only once the memo has
+    /// been rebuilt locally.
+    #[tokio::test]
+    async fn warm_start_seeds_successor_from_predecessor_snapshot_through_store() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        publish_terminal_bucket(&store, &tenant_id).await;
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+
+        // Worker A warms and persists its snapshot.
+        let worker_a = solo_worker();
+        let mut memo_a = MaintainMemo::with_default_interval();
+        run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo_a,
+            &safety,
+            &ownership,
+            &worker_a,
+            &worker_a.solo_live_set(),
+        )
+        .await;
+        assert_eq!(memo_a.len(), 1);
+        let now = SystemClock.now_ns();
+        let mut last_body = None;
+        assert!(
+            persist_memo_snapshot(&store, &worker_a, &memo_a, &mut last_body, now).await,
+            "A persists its snapshot"
+        );
+
+        // Worker B (a different process id) reads the snapshots and warm-starts.
+        let worker_b = WorkerSet::with_defaults(0);
+        let live_b = worker_b.solo_live_set();
+        let snapshots = read_all_memo_snapshots(&store)
+            .await
+            .expect("read snapshots");
+        assert_eq!(snapshots.len(), 1, "A's one snapshot is on the store");
+
+        let mut memo_b = MaintainMemo::with_default_interval();
+        let (b_units, b_buckets) =
+            seed_memo_from_snapshots(&mut memo_b, &snapshots, now, &worker_b, &live_b);
+        assert_eq!(b_units, 1, "B seeds the one unit it owns from A's snapshot");
+        assert_eq!(b_buckets, 1);
+        assert_eq!(memo_b.len(), 1, "B's memo warm-started from the store");
+
+        // B's first tick re-verifies the seeded below-threshold bucket once,
+        // because the snapshot carried no L0 record count for it.
+        let first = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &worker_b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            first.skipped_terminal, 0,
+            "a seeded below-threshold bucket carries no count, so B's first tick re-verifies it"
+        );
+        assert_eq!(
+            first.l0_records_pending, 1,
+            "that re-verify is what makes the warm-start cycle's pending total exact"
+        );
+
+        // Every tick after that skips it, which is the warm start paying off.
+        let second = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &worker_b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            second.skipped_terminal, 1,
+            "B skips A's terminal bucket once its count is known"
+        );
+        assert_eq!(second.already_done, 0, "no per-bucket work redone by B");
+        assert_eq!(
+            second.l0_records_pending, 1,
+            "the skipped bucket keeps contributing its one pending L0 record"
+        );
+    }
+
+    /// ADR-0065 decision 3: the reseed trigger and the ownership
+    /// filter under a *genuine* handoff, with two independent live-set views
+    /// rather than two `solo_live_set()`s (which make ownership unconditional and
+    /// the `computed != live_set` filter vacuous). Two replicas A and B share a
+    /// live set `{A, B}`; a shard the rendezvous assigns to A is warmed and
+    /// snapshotted by A. When A departs, B's live set becomes `{B}` and that
+    /// shard's ownership moves to B. This test asserts:
+    ///
+    /// 1. `membership_changed` fires on the real change (`{A,B}` -> `{B}`) and
+    ///    stays quiet on stable membership (`{A,B}` == `{A,B}`), so a transient
+    ///    single-replica worker is not stuck cold and a stable one does not
+    ///    reseed every heartbeat.
+    /// 2. Seeding from A's snapshot with B's *pre-handoff* view `{A,B}` seeds
+    ///    nothing (B did not own the shard then) -- proving the `owns_unit`
+    ///    filter is genuine, not vacuously true.
+    /// 3. Seeding with B's *post-handoff* view `{B}` seeds the shard, B's first
+    ///    tick re-verifies it once to learn its L0 record count (the snapshot
+    ///    body carries no counts), and B's next tick skips it rather than
+    ///    cold-rescanning.
+    #[tokio::test]
+    async fn reseed_and_seeding_track_genuine_ownership_handoff() {
+        const SHARDS: u32 = 8;
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+
+        // Two live replicas sharing one store; both compute the same live set.
+        // Both process ids are pinned rather than drawn by `with_defaults`:
+        // rendezvous ownership is a pure function of the process id, so the
+        // "A owns some shard, B owns some shard" split this test needs is a fact
+        // about fixed inputs, not a property of a random draw. With two random
+        // ids all 8 shards land on B one run in 256 (2^-8), which is the
+        // 1-in-256 flake this pins out. Under (tenant "acme", Metrics) these two
+        // ids hand A shards {1,2,3,4,5,7} and B shards {0,6}; the split is
+        // asserted below, so a change to `unit_key` or the weight function fails
+        // loudly here instead of flaking.
+        let now = SystemClock.now_ns();
+        let a = WorkerSet::with_defaults(now).with_process_id(PINNED_WORKER_ID);
+        let b = WorkerSet::with_defaults(now).with_process_id(PINNED_PEER_ID);
+        a.write_heartbeat(&store, now).await.expect("a heartbeat");
+        b.write_heartbeat(&store, now).await.expect("b heartbeat");
+        let live_ab = a.live_set(&store, now).await.expect("a live set");
+        assert_eq!(live_ab, b.live_set(&store, now).await.expect("b live set"));
+        assert_eq!(live_ab.len(), 2, "both replicas are live");
+
+        // The pinned ids were chosen for exactly this split. Any other
+        // partition of the 8 shards, including one that still leaves both
+        // replicas non-empty, means `unit_key` or the weight function changed
+        // and the ids must be re-pinned deliberately rather than left to flake.
+        let a_owned: Vec<u32> = (0..SHARDS)
+            .filter(|shard| a.owns_unit(&live_ab, &tenant, Signal::Metrics, *shard))
+            .collect();
+        let b_owned: Vec<u32> = (0..SHARDS)
+            .filter(|shard| b.owns_unit(&live_ab, &tenant, Signal::Metrics, *shard))
+            .collect();
+        assert_eq!(
+            a_owned,
+            [1, 2, 3, 4, 5, 7],
+            "PINNED_WORKER_ID's rendezvous share under (acme, Metrics) moved; \
+             re-pin the ids and this expected split together"
+        );
+        assert_eq!(
+            b_owned,
+            [0, 6],
+            "PINNED_PEER_ID's rendezvous share under (acme, Metrics) moved; \
+             re-pin the ids and this expected split together"
+        );
+
+        // Pick a shard the rendezvous assigns to A under {A, B}: B does not own
+        // it yet, so the pre-handoff filter must reject it.
+        let a_shard = (0..SHARDS)
+            .find(|shard| a.owns_unit(&live_ab, &tenant, Signal::Metrics, *shard))
+            .expect("A owns at least one shard");
+        assert!(
+            !b.owns_unit(&live_ab, &tenant, Signal::Metrics, a_shard),
+            "the chosen shard is A's, not B's, before the handoff"
+        );
+        publish_terminal_bucket_at_shard(&store, &tenant_id, a_shard).await;
+
+        // A warms its memo over its owned shards and persists a durable snapshot.
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo_a = MaintainMemo::with_default_interval();
+        run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_a,
+            &safety,
+            &ownership,
+            &a,
+            &live_ab,
+        )
+        .await;
+        assert_eq!(memo_a.len(), 1, "A memoized its one terminal bucket");
+        let snap_now = SystemClock.now_ns();
+        let mut last_body = None;
+        assert!(
+            persist_memo_snapshot(&store, &a, &memo_a, &mut last_body, snap_now).await,
+            "A persists its snapshot"
+        );
+
+        // Reseed trigger: stable membership is quiet; the real handoff fires it.
+        assert!(
+            !membership_changed(&live_ab, &live_ab),
+            "stable membership must not trigger a reseed"
+        );
+        let live_b = b.solo_live_set();
+        assert!(
+            membership_changed(&live_ab, &live_b),
+            "A's departure ({{A,B}} -> {{B}}) must trigger a reseed"
+        );
+
+        let snapshots = read_all_memo_snapshots(&store)
+            .await
+            .expect("read snapshots");
+
+        // Counter-case: B's PRE-handoff view {A,B} does not own the shard, so
+        // seeding filters it out. Proves the ownership filter is not vacuous.
+        let mut memo_b_before = MaintainMemo::with_default_interval();
+        let (units_before, buckets_before) =
+            seed_memo_from_snapshots(&mut memo_b_before, &snapshots, snap_now, &b, &live_ab);
+        assert_eq!(
+            (units_before, buckets_before),
+            (0, 0),
+            "B seeds nothing while it does not yet own the shard"
+        );
+        assert_eq!(memo_b_before.len(), 0);
+
+        // Post-handoff view {B}: B now owns the shard and seeds it from A's
+        // snapshot, then skips it on its own tick (no cold rescan).
+        let mut memo_b = MaintainMemo::with_default_interval();
+        let (units, buckets) =
+            seed_memo_from_snapshots(&mut memo_b, &snapshots, snap_now, &b, &live_b);
+        assert_eq!(units, 1, "B seeds the one unit it took over");
+        assert_eq!(buckets, 1);
+
+        // The handed-over bucket is below the compaction threshold and the
+        // snapshot carries no count for it, so B's first tick re-verifies it
+        // once (keeping that cycle's pending total exact) and skips it from the
+        // next tick on, rather than cold-rescanning it every tick.
+        let first = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            first.skipped_terminal, 0,
+            "the seeded below-threshold bucket carries no count, so it is re-verified once"
+        );
+        assert_eq!(
+            first.l0_records_pending, 1,
+            "the handed-over bucket's one pending L0 record is reported on that cycle"
+        );
+
+        let second = run_tick(
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo_b,
+            &safety,
+            &ownership,
+            &b,
+            &live_b,
+        )
+        .await;
+        assert_eq!(
+            second.skipped_terminal, 1,
+            "B skips the handed-over terminal bucket instead of cold-rescanning"
+        );
+        assert_eq!(
+            second.l0_records_pending, 1,
+            "and the skipped bucket still contributes its pending L0 record"
+        );
+    }
+
+    /// A sweep pass's report shaped the way `sweep_shard` builds one: a
+    /// tripped pass withholds and deletes nothing, an untripped one deletes
+    /// and quarantines the same candidates (`orphans_quarantined` mirrors
+    /// `orphans_deleted` in `ravel-maintain`).
+    fn sweep_report(tripped: bool, withheld: usize, deleted: usize) -> ravel_maintain::SweepReport {
+        ravel_maintain::SweepReport {
+            orphans_deleted: deleted,
+            orphans_quarantined: deleted,
+            orphan_breaker_tripped: tripped,
+            orphans_withheld: withheld,
+            ..Default::default()
+        }
+    }
+
+    /// The un-trip an operator must not read as "resolved" (ADR-0048 decision
+    /// 4): a second, non-tripped sweep pass for the same signal
+    /// drops `orphans_withheld` back to `0`, but `orphan_breaker_trips` -- the
+    /// counter a first-trip alert fires on -- keeps the earlier trip on the
+    /// record.
+    #[test]
+    fn orphan_breaker_withheld_gauge_drops_but_trip_counter_does_not() {
+        let safety = MaintenanceSafetyMetrics::default();
+        safety.record_sweep(Signal::Metrics, &sweep_report(true, 42, 0));
+        assert_eq!(safety.orphan_breaker_trips(Signal::Metrics), 1);
+        assert_eq!(safety.orphans_withheld(Signal::Metrics), 42);
+
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 0));
+        assert_eq!(
+            safety.orphan_breaker_trips(Signal::Metrics),
+            1,
+            "a cleared pass must never erase that a trip happened"
+        );
+        assert_eq!(
+            safety.orphans_withheld(Signal::Metrics),
+            0,
+            "the withheld gauge reflects only the most recent pass"
+        );
+
+        // A different signal's counters are untouched.
+        assert_eq!(safety.orphan_breaker_trips(Signal::Logs), 0);
+        assert_eq!(safety.conservation_aborts(Signal::Logs), 0);
+        assert_eq!(safety.legal_hold_refresh_failures(), 0);
+    }
+
+    /// The `orphans_present` fold counts a refused quarantine. A candidate
+    /// whose copy failed is left live, so it is still present, and the copy
+    /// fails in exactly the store-fault case the gauge exists to surface.
+    ///
+    /// This guards the fold itself rather than the per-rule outcome one layer
+    /// below it: without it, an edit dropping the refused term regresses the
+    /// bug silently, because `orphans_present_gauge_tracks_latest_pass_and_is_not_sticky`
+    /// hands `record_sweep` a precomputed total and never exercises the sum.
+    ///
+    /// Flip to watch it fail: drop `+ report.orphans_quarantine_refused` from
+    /// `orphans_present_total`. The all-refused case then reports 0 present
+    /// while three objects sit live in the keyspace.
+    #[test]
+    fn orphans_present_total_counts_a_refused_quarantine() {
+        // Every copy faulted: nothing left the live set, nothing was withheld
+        // by the breaker, and three candidates are still there.
+        let all_refused = ravel_maintain::SweepReport {
+            orphans_deleted: 0,
+            orphans_withheld: 0,
+            orphans_quarantine_refused: 3,
+            ..Default::default()
+        };
+        assert_eq!(
+            orphans_present_total(&all_refused),
+            3,
+            "a pass whose every copy faulted still has three orphans present"
+        );
+
+        // The partially faulting pass: two terms nonzero at once, which the
+        // old "exactly one is nonzero" reading of this gauge ruled out.
+        let mixed = ravel_maintain::SweepReport {
+            orphans_deleted: 2,
+            orphans_withheld: 0,
+            orphans_quarantine_refused: 1,
+            ..Default::default()
+        };
+        assert_eq!(orphans_present_total(&mixed), 3);
+
+        // The breaker-tripped pass is unchanged by the new term.
+        let tripped = ravel_maintain::SweepReport {
+            orphans_deleted: 0,
+            orphans_withheld: 55,
+            orphans_quarantine_refused: 0,
+            ..Default::default()
+        };
+        assert_eq!(orphans_present_total(&tripped), 55);
+    }
+
+    /// ADR-0058 decision 1: `orphans_present` is a last-observed-value gauge
+    /// that catches small-scale record loss the breaker never trips on. It
+    /// carries the pass's total orphan-candidate count regardless of what
+    /// happened to those candidates, and drops to whatever the latest pass
+    /// found -- it is never sticky and never monotonic.
+    #[test]
+    fn orphans_present_gauge_tracks_latest_pass_and_is_not_sticky() {
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // Breaker not tripped: candidates were deleted, so `present` is the
+        // deleted count while `withheld` stays 0. This is exactly the
+        // small-scale-loss case the breaker's thresholds are too coarse for.
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 3));
+        assert_eq!(safety.orphans_present(Signal::Metrics), 3);
+        assert_eq!(safety.orphans_withheld(Signal::Metrics), 0);
+        assert_eq!(
+            safety.orphan_breaker_trips(Signal::Metrics),
+            0,
+            "a below-threshold pass with orphans present must not trip the breaker"
+        );
+
+        // Breaker tripped: candidates were withheld, so `present` equals the
+        // withheld count (deleted is 0 on a tripped pass).
+        safety.record_sweep(Signal::Metrics, &sweep_report(true, 55, 0));
+        assert_eq!(safety.orphans_present(Signal::Metrics), 55);
+        assert_eq!(safety.orphans_withheld(Signal::Metrics), 55);
+
+        // A subsequent clean pass with zero candidates resets the gauge to 0:
+        // gauge semantics, last observed value, not a monotonic counter that
+        // remembers the earlier 55.
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 0));
+        assert_eq!(
+            safety.orphans_present(Signal::Metrics),
+            0,
+            "orphans_present reflects only the most recent pass, never sticky"
+        );
+        // The trip that happened is still on the durable counter, untouched by
+        // the present gauge dropping to 0.
+        assert_eq!(safety.orphan_breaker_trips(Signal::Metrics), 1);
+
+        // A different signal is untouched throughout.
+        assert_eq!(safety.orphans_present(Signal::Logs), 0);
+    }
+
+    /// The three quarantine figures accumulate across passes, which is what
+    /// makes their `_total` names honest. `SweepReport` reports each one per
+    /// pass, so storing instead of adding would publish a counter that drops
+    /// to `0` on the first pass that quarantines, refuses or reaps nothing,
+    /// and `rate()` over it would read as a reset rather than as quiet.
+    ///
+    /// Flip to watch it fail: change any of the three `fetch_add` calls in
+    /// `record_sweep` to `store`. The second assertion block then reports the
+    /// third pass's figures instead of the sum of all three.
+    #[test]
+    fn quarantine_counters_accumulate_across_passes() {
+        let safety = MaintenanceSafetyMetrics::default();
+
+        let first = ravel_maintain::SweepReport {
+            orphans_deleted: 4,
+            orphans_quarantined: 4,
+            orphans_quarantine_refused: 1,
+            quarantine_reaped: 2,
+            ..Default::default()
+        };
+        safety.record_sweep(Signal::Metrics, &first);
+        assert_eq!(safety.orphans_quarantined(Signal::Metrics), 4);
+        assert_eq!(safety.orphans_quarantine_refused(Signal::Metrics), 1);
+        assert_eq!(safety.quarantine_reaped(Signal::Metrics), 2);
+
+        let second = ravel_maintain::SweepReport {
+            orphans_deleted: 3,
+            orphans_quarantined: 3,
+            orphans_quarantine_refused: 5,
+            quarantine_reaped: 7,
+            ..Default::default()
+        };
+        safety.record_sweep(Signal::Metrics, &second);
+
+        // A quiet pass: nothing to quarantine, nothing refused, nothing past
+        // the quarantine horizon. The totals must not move, and must not drop.
+        safety.record_sweep(Signal::Metrics, &ravel_maintain::SweepReport::default());
+
+        assert_eq!(
+            safety.orphans_quarantined(Signal::Metrics),
+            7,
+            "quarantined is the sum over passes, not the last pass's count"
+        );
+        assert_eq!(
+            safety.orphans_quarantine_refused(Signal::Metrics),
+            6,
+            "refused is the sum over passes, not the last pass's count"
+        );
+        assert_eq!(
+            safety.quarantine_reaped(Signal::Metrics),
+            9,
+            "reaped is the sum over passes, not the last pass's count"
+        );
+
+        // A different signal shares none of it.
+        assert_eq!(safety.orphans_quarantined(Signal::Logs), 0);
+        assert_eq!(safety.orphans_quarantine_refused(Signal::Logs), 0);
+        assert_eq!(safety.quarantine_reaped(Signal::Logs), 0);
+    }
+
+    /// The `/metrics` body one scrape would return with `safety` as its only
+    /// populated family. Asserting on this rather than on the accessors is
+    /// what makes a gauge test speak about the sample an operator's alert
+    /// rule reads.
+    fn rendered_metrics(safety: &MaintenanceSafetyMetrics) -> String {
+        let snapshot = crate::metrics::MaintenanceSafetySnapshot::from_metrics(safety);
+        crate::metrics::render(
+            crate::config::Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &crate::metrics::CatalogCountersSnapshot::default(),
+            None,
+            Some(&snapshot),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &crate::metrics::AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            crate::metrics::IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::metrics::MemoryBudgetSnapshot::default(),
+            false,
+        )
+    }
+
+    /// `bytes_reclaimed` sums the two size-known sweep deletions (quarantine
+    /// reap and unreferenced parts) per signal and accumulates across passes; a
+    /// quiet pass moves nothing and a different signal shares none of it (issue
+    /// #1729). Flip-line proof: drop either term from the `fetch_add` in
+    /// `record_sweep` and the rendered total changes.
+    #[test]
+    fn bytes_reclaimed_accumulates_size_known_deletions_per_signal() {
+        let safety = MaintenanceSafetyMetrics::default();
+        safety.record_sweep(
+            Signal::Metrics,
+            &ravel_maintain::SweepReport {
+                quarantine_reaped_bytes: 100,
+                unreferenced_parts_bytes: 20,
+                ..Default::default()
+            },
+        );
+        safety.record_sweep(
+            Signal::Metrics,
+            &ravel_maintain::SweepReport {
+                quarantine_reaped_bytes: 3,
+                unreferenced_parts_bytes: 4,
+                ..Default::default()
+            },
+        );
+        // A pass that reclaimed nothing must neither move nor drop the total.
+        safety.record_sweep(Signal::Metrics, &ravel_maintain::SweepReport::default());
+
+        assert_eq!(
+            safety.bytes_reclaimed(Signal::Metrics),
+            127,
+            "the sum of quarantine and unreferenced-part bytes over every pass"
+        );
+        assert_eq!(safety.bytes_reclaimed(Signal::Logs), 0);
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"metrics\"} 127"
+            ),
+            "the reclaimed-bytes sample must render the accumulated total:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_bytes_reclaimed_total{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+    }
+
+    /// `retention_lag_seconds` publishes the per-cycle MAXIMUM across a signal's
+    /// units, in seconds, reads the previous complete value mid-cycle, and is a
+    /// gauge a later shorter cycle lowers (issue #1729). Flip-line proof:
+    /// change the `fetch_max` in `record_scan` to `fetch_add` and cycle 1 sums
+    /// the two units to 240 instead of reporting the worse one, 150.
+    #[test]
+    fn retention_lag_publishes_per_cycle_maximum_in_seconds() {
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // Cycle 1: two metrics units at 90 s and 150 s; the gauge takes the max.
+        safety.begin_scan_cycle();
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 90_000_000_000,
+                ..Default::default()
+            },
+        );
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 150_000_000_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            0,
+            "mid-cycle, before publish, the gauge holds the previous complete value"
+        );
+        safety.publish_scan_cycle();
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            150_000_000_000,
+            "the published value is the cycle maximum, not the sum or the last unit"
+        );
+        assert_eq!(safety.retention_lag_ns(Signal::Logs), 0);
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"metrics\"} 150"
+            ),
+            "150 s of lag must render as 150:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_lag_seconds{mode=\"maintain\",signal=\"logs\"} 0"
+            ),
+            "a zero-valued signal must still render:\n{body}"
+        );
+
+        // Cycle 2: a shorter lag replaces it; the gauge is not sticky.
+        safety.begin_scan_cycle();
+        safety.record_scan(
+            Signal::Metrics,
+            &MaintainReport {
+                retention_lag_ns: 30_000_000_000,
+                ..Default::default()
+            },
+        );
+        safety.publish_scan_cycle();
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            30_000_000_000,
+            "a later, smaller cycle maximum replaces the old one"
+        );
+    }
+
+    /// One tick over a tenant with two metrics shards: shard 0's commit listing
+    /// fails on every tick, and shard 1 holds one expired bucket whose only
+    /// event sits 1 us into ingest hour 0.
+    ///
+    /// Issue #2073 item 1: the failing unit is counted, exactly once per cycle,
+    /// on `units_scan_failed`, and does not zero the lag the other unit
+    /// measured. Watch it fail: delete the `safety.record_scan_failed(signal)`
+    /// call in `run_tick_with_clock`; "the failing unit is counted" reads left
+    /// 0, right 1.
+    ///
+    /// Item 2: the bucket expires 30 minutes before `now` by its newest event,
+    /// while its hour's nominal deadline is still 30 minutes away, so the old
+    /// nominal figure read 0. The tombstoning tick reports the exact 30
+    /// minutes, and the next tick on the same memo still does although the
+    /// tombstone itself records no event time. Watch it fail: replace the
+    /// `ObservedExpiry::Exact` on the tombstoning path of
+    /// `retention_sweep_bucket_observed` with `None`; "the tombstoning tick
+    /// measures from the newest event" reads left 0, right 1800000000000.
+    ///
+    /// A fresh memo (a restart, or a new owner) has only the tombstone's
+    /// `retired_at_ns` and the nominal deadline, and reads the documented
+    /// under-read exactly: 10 minutes past the tombstone against a true lag of
+    /// 40.
+    #[tokio::test]
+    async fn a_failing_unit_is_counted_and_the_lag_measures_from_the_newest_event() {
+        const YEAR_NS: i64 = 365 * 24 * 3_600 * 1_000_000_000;
+        const MINUTE_NS: i64 = 60 * 1_000_000_000;
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let inner = MemoryStore::new();
+        publish_terminal_bucket_at_shard(&inner, &tenant_id, 1).await;
+        let failing = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0).expect("prefix");
+        let store = FaultStore::new(
+            inner,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("scan unavailable".into()),
+                )
+                .with_key_contains(failing),
+            ),
+        );
+
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::from_policy(
+            RetentionPolicy {
+                default: Some(YEAR_NS),
+                tenants: Vec::new(),
+            },
+            &compactor,
+            ravel_catalog::CatalogConfig::default().max_ingest_lag_ns,
+        )
+        .expect("valid retention config");
+        // The fixture's only event is at 1_000 ns, so the bucket expires at
+        // 1_000 + YEAR_NS; its hour's nominal deadline is one hour later.
+        let expiry_ns = 1_000 + YEAR_NS;
+        let clock = FixedClock::new(expiry_ns + 30 * MINUTE_NS);
+        let worker = solo_worker();
+        let live = worker.solo_live_set();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        safety.begin_scan_cycle();
+        let first = run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 2, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        safety.publish_scan_cycle();
+        let faults_after_first =
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient);
+        assert!(faults_after_first > 0, "shard 0's listing really faulted");
+        assert_eq!(first.retired, 1, "shard 1's expired bucket was tombstoned");
+        assert_eq!(
+            safety.units_scan_failed(Signal::Metrics),
+            1,
+            "the failing unit is counted"
+        );
+        assert_eq!(safety.units_scan_failed(Signal::Logs), 0);
+        assert_eq!(safety.units_scan_failed(Signal::Spans), 0);
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            30 * MINUTE_NS,
+            "the tombstoning tick measures from the newest event"
+        );
+
+        safety.begin_scan_cycle();
+        run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 2, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        safety.publish_scan_cycle();
+        assert!(
+            store.fault_count(Op::List, ravel_object_store::fault::FaultKind::Transient)
+                > faults_after_first,
+            "shard 0's listing faulted again on tick 2"
+        );
+        assert_eq!(
+            safety.units_scan_failed(Signal::Metrics),
+            1,
+            "a gauge per cycle: the same failing unit counts once, not once per tick"
+        );
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            30 * MINUTE_NS,
+            "the memo carries the exact expiry to the passes after the tombstone"
+        );
+
+        clock.set(expiry_ns + 40 * MINUTE_NS);
+        let mut fresh = MaintainMemo::with_default_interval();
+        safety.begin_scan_cycle();
+        run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 2, &mut fresh, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        safety.publish_scan_cycle();
+        assert_eq!(
+            safety.retention_lag_ns(Signal::Metrics),
+            10 * MINUTE_NS,
+            "without the memo, the lag is read from the tombstone's retired_at_ns"
+        );
+    }
+
+    /// Issue #2073: a `(tenant, signal)` whose provisioning check or
+    /// shard-generation read fails with a store error skips every unit it owns
+    /// before scanning any, and each of those units counts on
+    /// `units_scan_failed`. A store error is not a hard provisioning failure,
+    /// so nothing else counts it. Both reads GET the provisioning record: on an
+    /// empty store the check issues the first GET and, finding no record and no
+    /// data, passes; the generation read issues the second.
+    ///
+    /// Watch it fail: delete the `record_skipped_units_scan_failed` call on
+    /// the failing read's `continue` path in `run_tick_with_clock`; the
+    /// matching assertion reads left 0, right 2.
+    #[tokio::test]
+    async fn a_failed_provisioning_read_counts_its_skipped_units_as_scan_failed() {
+        use ravel_object_store::fault::{FaultKind, Occurrence};
+
+        let tenant = TenantId::new("acme").hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let worker = solo_worker();
+        let live = worker.solo_live_set();
+        let prov_key = ravel_catalog::provisioning_key(&tenant, Signal::Metrics);
+
+        for (occurrence, read) in [
+            (Occurrence::Nth(1), "the provisioning check"),
+            (Occurrence::Nth(2), "the shard-generation read"),
+        ] {
+            let store = FaultStore::new(
+                MemoryStore::new(),
+                FaultPlan::empty().with_rule(
+                    Rule::new(
+                        Op::Get,
+                        ScriptedFault::Transient("provisioning record unavailable".into()),
+                    )
+                    .with_key_contains(prov_key.clone())
+                    .with_occurrence(occurrence),
+                ),
+            );
+            let safety = MaintenanceSafetyMetrics::default();
+            let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+            let mut memo = MaintainMemo::with_default_interval();
+
+            safety.begin_scan_cycle();
+            run_tick_with_clock(
+                &FixedClock::new(1_700_000_000 * 1_000_000_000),
+                &store,
+                &tenant,
+                &compactor,
+                &retention,
+                2,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &live,
+            )
+            .await;
+            safety.publish_scan_cycle();
+
+            assert_eq!(
+                store.fault_count(Op::Get, FaultKind::Transient),
+                1,
+                "{read} really faulted"
+            );
+            assert_eq!(
+                safety.units_scan_failed(Signal::Metrics),
+                2,
+                "both owned units {read} skipped are counted"
+            );
+            assert_eq!(safety.units_scan_failed(Signal::Logs), 0);
+            assert_eq!(safety.units_scan_failed(Signal::Spans), 0);
+        }
+    }
+
+    /// Issue #2073 item 3: a superseded-input sweep adds the exact recorded
+    /// size of every L0 data object it deletes to `bytes_reclaimed`. Tick 1
+    /// compacts two inputs; tick 2, past the compaction record's protection
+    /// horizon, holds them on the pinned-query window (ADR-1133), and tick 3,
+    /// once the window has passed, deletes both inputs and nothing else that
+    /// carries a size.
+    /// Watch it fail: drop `.saturating_add(report.superseded_data_bytes)` from
+    /// `record_sweep`; "every superseded input" reads left 0, right the two
+    /// sizes' sum.
+    #[tokio::test]
+    async fn a_superseded_sweep_counts_the_recorded_size_of_each_deleted_input() {
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let written_ns: i64 = 1_700_000_000 * 1_000_000_000;
+        let store = MemoryStore::new();
+        store.set_clock_ms((written_ns / 1_000_000) as u64);
+        // A longer metric name at seq 1000 gives the two inputs distinct
+        // recorded sizes, so charging one input's size for both cannot pass.
+        let mut input_sizes = Vec::new();
+        for seq in [1, 1_000] {
+            input_sizes.push(publish_compactable_input(&store, &tenant_id, 0, seq).await);
+        }
+        assert_ne!(input_sizes[0], input_sizes[1], "the inputs' sizes differ");
+        let sizes: u64 = input_sizes.iter().sum();
+        // A full sweep on every tick: tick 3 falls inside the default full-sweep
+        // cadence, and its zone-scoped sweep does not reach the compacted hour.
+        let compactor = CompactorConfig {
+            interior_reverify_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let retention = RetentionConfig::default();
+        let worker = solo_worker();
+        let live = worker.solo_live_set();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+        let clock = FixedClock::new(written_ns);
+
+        let compacted = run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(compacted.compacted, 1, "tick 1 compacts the two inputs");
+        assert_eq!(safety.objects_deleted_superseded_data_deleted(), 0);
+        assert_eq!(safety.bytes_reclaimed(Signal::Metrics), 0);
+
+        // Tick 2, past the horizon: HEAD names neither input, so the tick
+        // writes the group's unnamed-since marker and holds both inputs for
+        // the pinned-query window (ADR-1133).
+        let past_horizon = written_ns + compactor.protection_horizon_ns + 1_000_000_000;
+        clock.set(past_horizon);
+        store.set_clock_ms((past_horizon / 1_000_000) as u64);
+        run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(safety.objects_deleted_superseded_data_deleted(), 0);
+        assert_eq!(
+            safety.superseded_inputs_held(Signal::Metrics, SupersededHeldReason::PinnedWindow),
+            4,
+            "tick 2 holds both inputs and their commit records on the pinned-query window"
+        );
+
+        // Tick 3, once the marker is exactly as old as the window.
+        let window_ns = compactor.max_query_duration_ns
+            + compactor.head_cache_ttl_ns
+            + 4 * compactor.clock_skew_allowance_ns;
+        clock.set(past_horizon + window_ns);
+        store.set_clock_ms(((past_horizon + window_ns) / 1_000_000) as u64);
+        run_tick_with_clock(
+            &clock, &store, &tenant, &compactor, &retention, 1, &mut memo, &safety, &ownership,
+            &worker, &live,
+        )
+        .await;
+        assert_eq!(
+            safety.objects_deleted_superseded_data_deleted(),
+            2,
+            "tick 3 deletes both superseded inputs"
+        );
+        assert_eq!(
+            safety.bytes_reclaimed(Signal::Metrics),
+            sizes,
+            "every superseded input is charged at its commit record's object_size"
+        );
+        assert_eq!(safety.bytes_reclaimed(Signal::Logs), 0);
+    }
+
+    /// An `OrphanPass::Skip` pass never ran rule 1, so its zero orphan figures
+    /// are structural, not a measurement: they must not reach the
+    /// `ravel_maintain_orphans_present` gauge. Since the orphan-cadence split
+    /// (issue #1734) that is 71 of every 72 ticks on the defaults (300 s tick,
+    /// 6 h `interior_reverify_ns`), so a `Skip` pass that stores its zeros
+    /// resets the gauge within one tick of every nonzero sample and the
+    /// `> 0 for 12h` alert in `docs/guides/operations/troubleshooting.md` can
+    /// never fire.
+    ///
+    /// The `Skip` reports come from `sweep_shard_zoned_with_holds`, the same
+    /// call `run_tick_with_clock` makes on a non-due tick, so a change to what
+    /// a skipped pass reports is exercised here rather than frozen into a
+    /// hand-built literal.
+    ///
+    /// Flip to watch it fail: drop the `report.orphan_pass == OrphanPass::Run`
+    /// guard in `record_sweep` (i.e. store both gauges unconditionally, as
+    /// this branch did before the fix). The rendered gauge reads 0 after the
+    /// first skipped pass instead of 7.
+    #[tokio::test]
+    async fn skip_pass_does_not_clear_the_orphans_present_gauge() {
+        let store = MemoryStore::new();
+        let clock = ravel_maintain::FixedClock::new(1_000);
+        let compactor = CompactorConfig::default();
+        let tenant = TenantId::new("acme").hash();
+        let safety = MaintenanceSafetyMetrics::default();
+
+        // One pass that really ran rule 1 and found seven candidates present.
+        safety.record_sweep(Signal::Metrics, &sweep_report(false, 0, 7));
+        assert!(
+            rendered_metrics(&safety)
+                .contains("ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 7"),
+            "the measuring pass publishes its count"
+        );
+
+        // Several ticks' worth of skipped passes over an empty shard.
+        for _ in 0..5 {
+            let (skipped, _holds) = ravel_maintain::sweep_shard_zoned_with_holds(
+                &store,
+                &clock,
+                &compactor,
+                &ravel_maintain::NoLeases,
+                &tenant,
+                Signal::Metrics,
+                0,
+                &[],
+                OrphanPass::Skip,
+            )
+            .await
+            .expect("zoned sweep with rule 1 skipped");
+            assert_eq!(
+                orphans_present_total(&skipped),
+                0,
+                "a skipped pass reports structural zeros; that is the input this test is about"
+            );
+            safety.record_sweep(Signal::Metrics, &skipped);
+        }
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains("ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 7"),
+            "five skipped passes must leave the last measured count of 7 standing:\n{body}"
+        );
+
+        // The withheld gauge is written by the same two lines and carries the
+        // same defect, so it is pinned the same way: a tripped measuring pass,
+        // then skipped passes that must not erase it.
+        safety.record_sweep(Signal::Metrics, &sweep_report(true, 55, 0));
+        for _ in 0..5 {
+            let (skipped, _holds) = ravel_maintain::sweep_shard_zoned_with_holds(
+                &store,
+                &clock,
+                &compactor,
+                &ravel_maintain::NoLeases,
+                &tenant,
+                Signal::Metrics,
+                0,
+                &[],
+                OrphanPass::Skip,
+            )
+            .await
+            .expect("zoned sweep with rule 1 skipped");
+            safety.record_sweep(Signal::Metrics, &skipped);
+        }
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains(
+                "ravel_maintain_orphans_withheld{mode=\"maintain\",signal=\"metrics\"} 55"
+            ),
+            "skipped passes must not erase the withheld count either:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 55"
+            ),
+            "and the tripped pass's present total stands too:\n{body}"
+        );
+    }
+
+    /// The gauges are per signal while `record_sweep` runs once per shard, so
+    /// the rule above has to hold across the units of a single tick as well:
+    /// a unit that skipped rule 1 must not clear what a unit that ran it just
+    /// measured, whichever order the unit loop visits them in.
+    ///
+    /// Drives the real `run_tick_with_clock` over two shards of one signal.
+    /// Shard 0 has one record-less L0 data object past the orphan age gate and
+    /// a cold memo, so it takes the full-sweep branch and measures one orphan
+    /// present. Shard 1's memo is primed with a full sweep at this tick's own
+    /// `now`, so it takes the zoned `OrphanPass::Skip` branch. `run_bounded`
+    /// preserves ascending shard order in its results, so the accounting loop
+    /// sees the measuring unit first and the skipping unit second: the order
+    /// in which a last-write-wins gauge loses the measurement.
+    ///
+    /// Flip to watch it fail: drop the `report.orphan_pass == OrphanPass::Run`
+    /// guard in `record_sweep`. Shard 1's structural zero lands after shard
+    /// 0's measurement and the rendered gauge reads 0 instead of 1.
+    #[tokio::test]
+    async fn a_skip_unit_does_not_clear_a_run_unit_in_the_same_tick() {
+        const SHARDS: u32 = 2;
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let store = MemoryStore::new();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+
+        // One L0 data object in shard 0 with no commit record anywhere: an
+        // orphan candidate, as soon as the clock puts it past the age gate.
+        let orphan_key = keys::data_key(
+            &tenant,
+            Signal::Metrics,
+            0,
+            Uuid::from_u128(7),
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .expect("orphan data key");
+        store
+            .put(
+                &orphan_key,
+                bytes::Bytes::from_static(b"orphaned flush"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the orphan");
+
+        // `MemoryStore` stamps `last_modified` from its own clock, which
+        // starts at 0, so one nanosecond past the gate is past it.
+        let now = compactor.orphan_age_gate_ns() + 1;
+        let clock = ravel_maintain::FixedClock::new(now);
+
+        let mut memo = MaintainMemo::with_default_interval();
+        // Shard 1 swept fully at this same instant: not due again this tick.
+        memo.record_full_sweep(tenant, Signal::Metrics, 1, now);
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &retention,
+            SHARDS,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        let body = rendered_metrics(&safety);
+        assert!(
+            body.contains("ravel_maintain_orphans_present{mode=\"maintain\",signal=\"metrics\"} 1"),
+            "shard 0 measured one orphan present; shard 1's skipped pass in the same tick \
+             must not clear it:\n{body}"
+        );
+        assert_eq!(
+            safety.orphans_quarantined(Signal::Metrics),
+            1,
+            "the measuring unit really did run rule 1 and quarantine the orphan"
+        );
+    }
+
+    /// The chained-horizon interlock through the real tick path: a tripped
+    /// mass-orphan breaker holds the quarantine reaper, and the skipped tick
+    /// that follows must not reap what the trip held.
+    ///
+    /// Tick 1 has a cold memo, so it takes the `sweep_shard` full-sweep branch:
+    /// 60 record-less L0 objects trip the breaker and the reaper is held. The
+    /// clock never advances, so tick 2 takes the zoned `OrphanPass::Skip`
+    /// branch, which never evaluates the breaker and therefore reports
+    /// not-tripped. The quarantined copy is past `quarantine_horizon_ns` the
+    /// whole time, so only the pass's own gate can keep it.
+    ///
+    /// The existing `a_tripped_breaker_holds_the_quarantine_reaper` in
+    /// `ravel-maintain` drives `sweep_shard` alone, which cannot see this: the
+    /// reaping pass is the tick after the tripping one.
+    ///
+    /// Flip to watch it fail: change the reaper's condition in
+    /// `sweep_shard_zoned_with_holds` from
+    /// `orphan_pass == OrphanPass::Run && !orphan_breaker_tripped` back to
+    /// `!orphan_breaker_tripped`. Tick 2 reaps the copy and the quarantine
+    /// prefix is empty.
+    #[tokio::test]
+    async fn a_skipped_tick_after_a_tripped_breaker_keeps_the_quarantined_copies() {
+        const MASS_ORPHANS: u64 = 60;
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let store = MemoryStore::new();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+
+        // A live mass orphan population: 60 record-less L0 data objects, which
+        // is both over `orphan_breaker_min_count` and the whole shard, so the
+        // ratio condition holds too.
+        for seq in 1..=MASS_ORPHANS {
+            let key = keys::data_key(
+                &tenant,
+                Signal::Metrics,
+                0,
+                Uuid::from_u128(u128::from(seq)),
+                1,
+                seq,
+                &[0u8; 32],
+            )
+            .expect("orphan data key");
+            store
+                .put(
+                    &key,
+                    bytes::Bytes::from_static(b"orphaned flush"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed an orphan");
+        }
+
+        // One copy quarantined at timestamp 0, before the loss grew: the only
+        // recovery copy of an object an earlier pass took out of the live set.
+        // The key layout is `quarantine/<original key>/q<ns>` (ADR-0058
+        // amendment, docs/deletion-and-gc.md).
+        let original = keys::data_key(
+            &tenant,
+            Signal::Metrics,
+            0,
+            Uuid::from_u128(0xfeed),
+            1,
+            0,
+            &[0u8; 32],
+        )
+        .expect("original data key");
+        let quarantined_key = format!("quarantine/{original}/q{:020}", 0);
+        store
+            .put(
+                &quarantined_key,
+                bytes::Bytes::from_static(b"the only copy"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed the quarantined copy");
+
+        // Past both horizons: the L0 objects are older than the orphan age
+        // gate, and the quarantined copy is older than `quarantine_horizon_ns`.
+        let now = compactor.quarantine_horizon_ns + 1;
+        let clock = ravel_maintain::FixedClock::new(now);
+
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+
+        // Tick 1: the full sweep that trips. Tick 2: the skipped pass 300 s
+        // later in production, on the same clock here.
+        for _ in 0..2 {
+            run_tick_with_clock(
+                &clock,
+                &store,
+                &tenant,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &safety,
+                &ownership,
+                &worker,
+                &worker.solo_live_set(),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            safety.orphan_breaker_trips(Signal::Metrics),
+            1,
+            "exactly one tick evaluated the breaker, and it tripped"
+        );
+        assert_eq!(
+            safety.quarantine_reaped(Signal::Metrics),
+            0,
+            "neither the tripping tick nor the skipped tick after it may reap"
+        );
+        let still_quarantined = list_all(&store, "quarantine/")
+            .await
+            .expect("list quarantine");
+        assert_eq!(
+            still_quarantined.iter().map(|m| &m.key).collect::<Vec<_>>(),
+            vec![&quarantined_key],
+            "the only recovery copy survives both ticks"
+        );
+    }
+
+    /// A store wrapper that instruments `list_delimited` -- the call
+    /// `scan_and_maintain_with_memo` makes first, via `list_shard_hours`,
+    /// before touching anything else for a unit -- with a run of
+    /// `tokio::task::yield_now` before delegating to `inner`. Widening this
+    /// window gives every unit `run_bounded` has actually admitted a chance to
+    /// reach the probe before any of them release it, so `peak` reports the
+    /// true number of units `run_tick` runs concurrently rather than an
+    /// artifact of one future finishing before the next starts.
+    struct ConcurrencyProbeStore<S> {
+        inner: S,
+        in_flight: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl<S> ConcurrencyProbeStore<S> {
+        fn new(inner: S) -> Self {
+            ConcurrencyProbeStore {
+                inner,
+                in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for ConcurrencyProbeStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            use std::sync::atomic::Ordering;
+            let cur = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(cur, Ordering::SeqCst);
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            let result = self.inner.list_delimited(prefix).await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// `run_tick` never admits more than `worker.unit_concurrency()` units'
+    /// scans at once, proven end to end through the real driver (not just
+    /// through `run_bounded` in isolation, which ravel-fleet's
+    /// `run_bounded_respects_the_concurrency_cap` already covers). Eight
+    /// shards against a cap of 2, over both maintained signals, gives 16
+    /// probed calls, far more than the cap, so a peak below or above 2 cannot
+    /// be a scheduling coincidence.
+    ///
+    /// Proved to actually bind: with the `worker.unit_concurrency()` argument
+    /// at the `run_bounded` call site in `run_tick` (this file) temporarily
+    /// replaced by `units.len()`, this test's `peak == CAP` assertion failed
+    /// with `peak == 8` (all of one signal's shards admitted at once); reverting
+    /// that one-line substitution restored the pass.
+    #[tokio::test]
+    async fn run_tick_never_exceeds_configured_unit_concurrency() {
+        use std::sync::atomic::Ordering;
+
+        const SHARDS: u32 = 8;
+        const CAP: usize = 2;
+
+        let store = ConcurrencyProbeStore::new(MemoryStore::new());
+        let in_flight = store.in_flight.clone();
+        let peak = store.peak.clone();
+
+        let tenant = TenantId::new("acme").hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = WorkerSet::new(0, Duration::from_secs(60), 3, CAP);
+        let live_set = worker.solo_live_set();
+
+        let _report = run_tick(
+            &store, &tenant, &compactor, &retention, SHARDS, &mut memo, &safety, &ownership,
+            &worker, &live_set,
+        )
+        .await;
+
+        assert_eq!(
+            in_flight.load(Ordering::SeqCst),
+            0,
+            "every probed call released by the time the tick returns"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            CAP,
+            "run_tick admits at most, and (with more units than the cap) exactly, \
+             worker.unit_concurrency() unit scans concurrently"
+        );
+    }
+
+    /// A unit that fails every tick, tenant lifecycle otherwise unchanged,
+    /// accrues toward `ownership.units_stalled()` once it reaches
+    /// `stalled_after_intervals` consecutive failures, and a single
+    /// intervening success resets its counter to zero (no partial credit
+    /// carried across a recovered tick). Failure is injected via `FaultStore`
+    /// on `list_delimited`, the first call `scan_and_maintain_with_memo` makes
+    /// for a unit, so the whole per-unit tick (scan and sweep both) reports an
+    /// error for that unit on the faulted ticks.
+    #[tokio::test]
+    async fn units_stalled_fires_after_threshold_consecutive_failures_and_resets_on_success() {
+        const THRESHOLD: u32 = 3;
+
+        let tenant = TenantId::new("acme").hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let worker = solo_worker();
+        let live_set = worker.solo_live_set();
+        let ownership = MaintenanceOwnershipMetrics::new(THRESHOLD);
+
+        // Faults only (tenant, Metrics, shard 0)'s own listing: the legal-hold
+        // refresh (a different shard, Signal::Audit) and the Logs/Spans shard-0
+        // units stay clean, so only the one unit's tick fails.
+        let shard_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid metrics shard prefix");
+
+        // Three consecutive faulted ticks: the unit fails every time, so the
+        // third crosses the threshold and the gauge goes to 1.
+        for tick in 0..THRESHOLD {
+            let plan = FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("scan unavailable".into()),
+                )
+                .with_key_contains(shard_prefix.clone()),
+            );
+            let faulted = FaultStore::new(MemoryStore::new(), plan);
+            let mut memo = MaintainMemo::with_default_interval();
+            let _report = run_tick(
+                &faulted,
+                &tenant,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &MaintenanceSafetyMetrics::default(),
+                &ownership,
+                &worker,
+                &live_set,
+            )
+            .await;
+            let expected = u64::from(tick + 1 >= THRESHOLD);
+            assert_eq!(
+                ownership.units_stalled(),
+                expected,
+                "tick {tick}: stalled gauge must reflect exactly whether the \
+                 threshold has been reached, not fire early or stay pinned"
+            );
+        }
+        assert_eq!(ownership.units_stalled(), 1);
+
+        // A clean tick (no fault) succeeds and resets this unit's streak.
+        let clean = MemoryStore::new();
+        let mut memo = MaintainMemo::with_default_interval();
+        let _report = run_tick(
+            &clean,
+            &tenant,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &MaintenanceSafetyMetrics::default(),
+            &ownership,
+            &worker,
+            &live_set,
+        )
+        .await;
+        assert_eq!(
+            ownership.units_stalled(),
+            0,
+            "a single success resets the unit's consecutive-failure streak"
+        );
+    }
+
+    /// A unit that reaches the stall threshold and then LEAVES this process's
+    /// owned set entirely -- a rendezvous re-partition when a peer joins,
+    /// here -- must not keep pinning `units_stalled` (ADR-0065). Drives
+    /// `(tenant, Metrics, shard 0)` to the threshold under a solo live set,
+    /// then runs one more discovery cycle under a two-worker live set chosen
+    /// so shard 0's rendezvous owner moves to the peer. This process's
+    /// `run_tick` then never evaluates shard 0 at all, so
+    /// `observe_unit_tick` is never called for it again; only
+    /// `run_discovery_cycle`'s per-cycle `ownership.end_cycle()` (which
+    /// prunes `UnitStallTracker.failures` to the current owned set) can
+    /// clear its stranded entry. Reverting that call -- or reverting
+    /// `UnitStallTracker::retain_owned`'s body to a no-op -- leaves the final
+    /// assertion at 1 forever instead of 0.
+    #[tokio::test]
+    async fn units_stalled_drops_a_unit_that_leaves_the_owned_set() {
+        const THRESHOLD: u32 = 3;
+
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let discovery_metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(THRESHOLD);
+        let worker = pinned_worker();
+        let live_solo = worker.solo_live_set();
+
+        // Both ids are pinned, so the repartition this test needs is a fact
+        // about fixed inputs rather than a property of a random draw. Asserted,
+        // not assumed: shard 0 is owned here under the solo live set, and the
+        // peer's presence takes it away.
+        let live_ab = vec![worker.process_id(), PINNED_PEER_ID];
+        assert!(
+            worker.owns_unit(&live_solo, &tenant, Signal::Metrics, 0),
+            "the solo worker must own shard 0 under rendezvous hashing"
+        );
+        assert!(
+            !worker.owns_unit(&live_ab, &tenant, Signal::Metrics, 0),
+            "the pinned peer id must flip shard 0's rendezvous owner away from \
+             the solo worker"
+        );
+
+        let inner = MemoryStore::new();
+        publish_terminal_bucket(&inner, &tenant_id).await;
+
+        // Faults only (tenant, Metrics, shard 0)'s own listing, exactly as
+        // `units_stalled_fires_after_threshold_consecutive_failures_and_resets_on_success`
+        // does: tenant discovery's `list_delimited("t/")` and the legal-hold
+        // refresh (a different shard, Signal::Audit) stay clean.
+        let shard_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid metrics shard prefix");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Transient("scan unavailable".into()),
+            )
+            .with_key_contains(shard_prefix),
+        );
+        let store = FaultStore::new(inner, plan);
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Three consecutive faulted cycles while shard 0 is still owned:
+        // drives its failure streak to the threshold.
+        for _ in 0..THRESHOLD {
+            let _report = run_discovery_cycle(
+                &store,
+                None,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &discovery_metrics,
+                &safety,
+                &ownership,
+                &worker,
+                &live_solo,
+                &WallClock,
+            )
+            .await;
+        }
+        assert_eq!(
+            ownership.units_stalled(),
+            1,
+            "shard 0 must cross the stall threshold while still owned"
+        );
+
+        // The peer joins: shard 0's rendezvous owner moves to it, so
+        // `worker`'s owned set for this cycle no longer includes shard 0 at
+        // all. Its failing entry is never observed again by this process.
+        let _report = run_discovery_cycle(
+            &store,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &discovery_metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &live_ab,
+            &WallClock,
+        )
+        .await;
+
+        assert_eq!(
+            ownership.units_stalled(),
+            0,
+            "a unit that leaves the owned set must not keep pinning units_stalled \
+             forever -- without pruning stall history to the current cycle's \
+             owned set, this stays at 1 even though the unit no longer ticks here"
+        );
+    }
+
+    /// A `MemoryStore` holding one tenant's terminal bucket, so tenant
+    /// discovery finds the tenant and its units are real maintenance work.
+    /// A test that needs several stores with different fault plans over the
+    /// same tenant builds one per phase with this.
+    async fn store_with_tenant_data(tenant_id: &TenantId) -> MemoryStore {
+        let store = MemoryStore::new();
+        publish_terminal_bucket(&store, tenant_id).await;
+        store
+    }
+
+    /// A stuck unit's stall streak survives a tick that a transient
+    /// per-tenant or per-`(tenant, signal)` error kept from evaluating it,
+    /// because this process still OWNS the unit. A unit that is
+    /// genuinely no longer owned is still pruned, so the fix does not
+    /// reintroduce the stranded-entry bug
+    /// `units_stalled_drops_a_unit_that_leaves_the_owned_set` covers.
+    ///
+    /// Four discovery-cycle phases over `(tenant, Metrics, shard 0)`:
+    ///
+    /// 1. Its own listing faults on `THRESHOLD` consecutive cycles, so it
+    ///    reaches the stall threshold and `units_stalled` is 1.
+    /// 2. A cycle whose legal-hold refresh faults (`Signal::Audit` shard
+    ///    `AUDIT_HOLD_SHARD`'s listing). `run_tick_with_clock` returns before
+    ///    any signal loop runs, so no unit of this tenant is evaluated at
+    ///    all. Asserted through `safety.legal_hold_refresh_failures()`, not
+    ///    inferred: the tick really took the error return.
+    /// 3. A cycle whose `(tenant, Metrics)` provisioning read faults (a GET
+    ///    of `t/<hash>/<signal>/prov`), the per-`(tenant, signal)` `continue`
+    ///    path, so Logs and Spans run normally but shard 0 of Metrics is
+    ///    again never evaluated. Asserted through the `FaultStore` GET
+    ///    counter.
+    /// 4. A peer joins the live set and takes shard 0's rendezvous ownership.
+    ///    Now the unit is genuinely not owned, and its entry must go.
+    ///
+    /// Phases 2 and 3 are exactly the ticks the pre-fix code reported an
+    /// empty owned set for, because `note_owned_unit` was only reached after
+    /// both error paths. Non-vacuity, flipped one line at a time in
+    /// `run_tick_with_clock`: deleting the `note_owned_units(ownership,
+    /// worker, live_set, tenant, shard_count)` call before the legal-hold
+    /// refresh (leaving only the in-loop `note_owned_unit` calls, i.e. the
+    /// pre-fix source) fails phase 2's assertion with `units_stalled` at 0
+    /// instead of 1, and, with phase 2 also cut so phase 3 is reached with
+    /// the streak intact, fails phase 3's assertion the same way -- each
+    /// error path is proven on its own, not just through the earlier one.
+    /// Phase 4 is what fails if that call is instead made unconditional over
+    /// `0..shard_count` without the `owns_unit` gate.
+    #[tokio::test]
+    async fn units_stalled_survives_a_transient_error_that_skips_a_still_owned_tick() {
+        const THRESHOLD: u32 = 3;
+
+        let tenant_id = TenantId::new("acme");
+        let tenant = tenant_id.hash();
+        let compactor = CompactorConfig::default();
+        let retention = RetentionConfig::default();
+        let discovery_metrics = TenantDiscoveryMetrics::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(THRESHOLD);
+        let worker = pinned_worker();
+        let live_solo = worker.solo_live_set();
+        let mut memo = MaintainMemo::with_default_interval();
+
+        // Phase 1: fault only (tenant, Metrics, shard 0)'s own listing, so
+        // that one unit fails every cycle while everything else -- tenant
+        // discovery, the legal-hold refresh, the other units -- stays clean.
+        let shard_prefix = keys::commit_shard_prefix(&tenant, Signal::Metrics, 0)
+            .expect("valid metrics shard prefix");
+        let stuck = FaultStore::new(
+            store_with_tenant_data(&tenant_id).await,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("scan unavailable".into()),
+                )
+                .with_key_contains(shard_prefix),
+            ),
+        );
+        for _ in 0..THRESHOLD {
+            let _report = run_discovery_cycle(
+                &stuck,
+                None,
+                &compactor,
+                &retention,
+                1,
+                &mut memo,
+                &discovery_metrics,
+                &safety,
+                &ownership,
+                &worker,
+                &live_solo,
+                &WallClock,
+            )
+            .await;
+        }
+        assert_eq!(
+            ownership.units_stalled(),
+            1,
+            "shard 0 must cross the stall threshold while still owned"
+        );
+
+        // Phase 2: the tenant's legal-hold refresh faults, so its whole tick
+        // is skipped. The unit is still owned and still stuck.
+        let hold_prefix = keys::commit_shard_prefix(&tenant, Signal::Audit, AUDIT_HOLD_SHARD)
+            .expect("valid audit hold shard prefix");
+        let hold_faulted = FaultStore::new(
+            store_with_tenant_data(&tenant_id).await,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("legal hold unavailable".into()),
+                )
+                .with_key_contains(hold_prefix),
+            ),
+        );
+        let _report = run_discovery_cycle(
+            &hold_faulted,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &discovery_metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &live_solo,
+            &WallClock,
+        )
+        .await;
+        assert_eq!(
+            safety.legal_hold_refresh_failures(),
+            1,
+            "this phase is only meaningful if the tick really took the \
+             legal-hold error return"
+        );
+        assert_eq!(
+            ownership.units_stalled(),
+            1,
+            "a transient legal-hold failure must not reset a still-owned \
+             stuck unit's stall streak: the unit is unevaluated this tick, \
+             not unowned"
+        );
+
+        // Phase 3: the (tenant, Metrics) provisioning read faults, the
+        // per-(tenant, signal) `continue` path. Logs and Spans still run.
+        let prov_key = ravel_catalog::provisioning_key(&tenant, Signal::Metrics);
+        let prov_faulted = FaultStore::new(
+            store_with_tenant_data(&tenant_id).await,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Transient("provisioning record unavailable".into()),
+                )
+                .with_key_contains(prov_key),
+            ),
+        );
+        let _report = run_discovery_cycle(
+            &prov_faulted,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &discovery_metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &live_solo,
+            &WallClock,
+        )
+        .await;
+        assert!(
+            prov_faulted.fault_count(Op::Get, ravel_object_store::fault::FaultKind::Transient) > 0,
+            "this phase is only meaningful if the provisioning read really faulted"
+        );
+        assert_eq!(
+            ownership.units_stalled(),
+            1,
+            "a transient provisioning-read failure must not reset a \
+             still-owned stuck unit's stall streak"
+        );
+
+        // Phase 4: a peer joins and takes shard 0 under the rendezvous hash.
+        // The unit is now genuinely unowned, so its entry must be pruned --
+        // the behavior the evaluated-keyed prune was written for, which
+        // keying on ownership must preserve.
+        let live_ab = vec![worker.process_id(), PINNED_PEER_ID];
+        assert!(
+            worker.owns_unit(&live_solo, &tenant, Signal::Metrics, 0),
+            "the solo worker must own shard 0 under rendezvous hashing"
+        );
+        assert!(
+            !worker.owns_unit(&live_ab, &tenant, Signal::Metrics, 0),
+            "the pinned peer id must flip shard 0's rendezvous owner away from \
+             the solo worker"
+        );
+        let clean = store_with_tenant_data(&tenant_id).await;
+        let _report = run_discovery_cycle(
+            &clean,
+            None,
+            &compactor,
+            &retention,
+            1,
+            &mut memo,
+            &discovery_metrics,
+            &safety,
+            &ownership,
+            &worker,
+            &live_ab,
+            &WallClock,
+        )
+        .await;
+        assert_eq!(
+            ownership.units_stalled(),
+            0,
+            "a unit this process no longer owns must still be pruned: keying \
+             the prune on ownership rather than evaluation must not strand \
+             its entry"
+        );
+    }
+
+    /// A store that (1) counts heartbeat PUTs (writes to `sys/maintain/workers/`)
+    /// and (2) blocks tenant discovery: its `list_delimited("t/")` awaits a
+    /// `tokio::time::sleep(block)` before delegating, so a discovery cycle stays
+    /// stuck inside that await for `block` of simulated time. Every other
+    /// operation delegates straight through -- crucially the heartbeat's own
+    /// `live_set` read, which uses `list_all` (`.list`), not `list_delimited`,
+    /// so it is never blocked by this wrapper.
+    struct BlockingDiscoveryStore<S> {
+        inner: S,
+        heartbeat_writes: Arc<AtomicU64>,
+        entered_block: Arc<std::sync::atomic::AtomicBool>,
+        block: Duration,
+    }
+
+    impl<S> BlockingDiscoveryStore<S> {
+        fn new(inner: S, block: Duration) -> Self {
+            BlockingDiscoveryStore {
+                inner,
+                heartbeat_writes: Arc::new(AtomicU64::new(0)),
+                entered_block: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                block,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for BlockingDiscoveryStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            if key.starts_with("sys/maintain/workers/") {
+                self.heartbeat_writes.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            if prefix.starts_with("t/") {
+                self.entered_block.store(true, Ordering::SeqCst);
+                tokio::time::sleep(self.block).await;
+            }
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The heartbeat must keep firing on cadence `H`
+    /// even while a single discovery cycle runs far longer than the `3 * H`
+    /// liveness window. When the heartbeat was a `select!` arm sharing
+    /// `run_loop` with the discovery arm, so once `run_discovery_cycle(...).await`
+    /// began the macro never re-entered and the heartbeat `interval` arm was
+    /// never polled (`MissedTickBehavior::Delay` merely defers the tick). A cycle
+    /// longer than `3 * H` therefore starved this process's own heartbeat, and
+    /// siblings evicted it from their live sets mid-cycle.
+    ///
+    /// Drives the real `run_loop` under a paused clock with a store whose tenant-
+    /// discovery `list_delimited("t/")` blocks for far longer than the whole test
+    /// window, so every discovery cycle is stuck inside that await. It advances
+    /// simulated time well past `3 * H` and asserts the heartbeat PUT count
+    /// advanced during the blocked cycle.
+    ///
+    /// The flip that proves it bites: move the heartbeat back into `run_loop`'s
+    /// `select!` as a `_ = heartbeat.tick()` arm alongside the (blocked)
+    /// `discovery_sleep` arm. The heartbeat is then never polled while discovery
+    /// awaits, so the write count does not advance during the block and the
+    /// `>= 3` assertion fails at 0.
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_continues_during_a_discovery_cycle_longer_than_the_liveness_window() {
+        use std::sync::atomic::Ordering;
+
+        // H = 1s, liveness factor 3 (so the window is 3 * H = 3s), default unit
+        // concurrency. Discovery interval 1s so a cycle starts almost at once;
+        // the blocking LIST then holds it for 3600s -- effectively forever for
+        // this test.
+        let worker = Arc::new(WorkerSet::new(0, Duration::from_secs(1), 3, 4));
+        let store_impl = BlockingDiscoveryStore::new(MemoryStore::new(), Duration::from_secs(3600));
+        let heartbeat_writes = store_impl.heartbeat_writes.clone();
+        let entered_block = store_impl.entered_block.clone();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store_impl);
+
+        let compactor = Arc::new(CompactorConfig::default());
+        let retention = Arc::new(RetentionConfig::default());
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let safety = Arc::new(MaintenanceSafetyMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let live_tx = Arc::new(watch::channel(worker.solo_live_set()).0);
+        let handle = tokio::spawn(run_loop(
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                interval: Duration::from_secs(1),
+                metrics,
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                live_tx,
+                cycle_hook: Arc::new(|| {}),
+            },
+            shutdown_rx,
+        ));
+
+        // Advance until the discovery cycle has entered its (blocked) tenant
+        // LIST. The immediate first heartbeat has already fired by now.
+        for _ in 0..60 {
+            if entered_block.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(200)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            entered_block.load(Ordering::SeqCst),
+            "the discovery cycle must have entered its blocked tenant LIST"
+        );
+        let writes_before = heartbeat_writes.load(Ordering::SeqCst);
+
+        // Advance ~5s = 5 * H, well past the 3s liveness window, while discovery
+        // stays blocked. Small steps so the paused runtime actually wakes the
+        // heartbeat task on each 1s boundary.
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        let writes_after = heartbeat_writes.load(Ordering::SeqCst);
+
+        assert!(
+            entered_block.load(Ordering::SeqCst),
+            "the discovery cycle is still blocked (its LIST sleep dwarfs the test window)"
+        );
+        assert!(
+            writes_after - writes_before >= 3,
+            "the heartbeat must keep firing on cadence H (>= 3 writes across a > 3*H window) \
+             while a discovery cycle is blocked, got {} (before={writes_before}, after={writes_after}) \
+             -- the heartbeat is starved again",
+            writes_after - writes_before
+        );
+
+        handle.abort();
+    }
+
+    /// clean shutdown: the heartbeat task `run_loop` spawns must stop
+    /// when the loop ends -- no leaked task. `run_loop` signals and awaits the
+    /// heartbeat handle before returning, so once the loop's own join handle
+    /// resolves the heartbeat task is guaranteed finished, not detached.
+    ///
+    /// Runs `run_loop` (heartbeat H = 1s, discovery interval 300s so no discovery
+    /// cycle fires during the test), lets a few heartbeats write, sends shutdown,
+    /// and joins the loop. It then advances simulated time well past several `H`
+    /// and asserts the heartbeat write count does not move: a detached (leaked)
+    /// task would keep writing.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_joins_the_heartbeat_task_without_leaking_it() {
+        use std::sync::atomic::Ordering;
+
+        let worker = Arc::new(WorkerSet::new(0, Duration::from_secs(1), 3, 4));
+        let store_impl = BlockingDiscoveryStore::new(MemoryStore::new(), Duration::from_secs(3600));
+        let heartbeat_writes = store_impl.heartbeat_writes.clone();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store_impl);
+
+        let compactor = Arc::new(CompactorConfig::default());
+        let retention = Arc::new(RetentionConfig::default());
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let safety = Arc::new(MaintenanceSafetyMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let live_tx = Arc::new(watch::channel(worker.solo_live_set()).0);
+        let handle = tokio::spawn(run_loop(
+            LoopContext {
+                store,
+                fallback_allow: None,
+                compactor,
+                retention,
+                shard_count: 1,
+                // Discovery interval far past the test window: only the
+                // heartbeat task runs, so this test isolates its lifecycle.
+                interval: Duration::from_secs(300),
+                metrics,
+                safety,
+                ownership,
+                worker,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(WallClock),
+                live_tx,
+                cycle_hook: Arc::new(|| {}),
+            },
+            shutdown_rx,
+        ));
+
+        // Let a few heartbeats fire.
+        for _ in 0..40 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            heartbeat_writes.load(Ordering::SeqCst) >= 2,
+            "the heartbeat task must fire while the loop runs"
+        );
+
+        // Shut down and join the loop; run_loop must join the heartbeat task
+        // before returning (no time advance is needed: shutdown is a oneshot).
+        shutdown_tx.send(()).expect("send shutdown");
+        handle.await.expect("run_loop joins cleanly on shutdown");
+
+        // No leaked task: past the loop's return, advancing several H produces
+        // no further heartbeat writes.
+        let writes_at_stop = heartbeat_writes.load(Ordering::SeqCst);
+        for _ in 0..50 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            heartbeat_writes.load(Ordering::SeqCst),
+            writes_at_stop,
+            "the heartbeat task must stop when the loop ends -- no writes after shutdown, no leak"
+        );
+    }
+
+    /// Issue #1756: both halves of the membership decision read the ONE
+    /// injected clock. The heartbeat task writes `heartbeat_unix_ns` from it
+    /// and judges sibling staleness against it, so a test that drives a
+    /// `FixedClock` drives eviction rather than reporting on how fast the
+    /// machine ran.
+    ///
+    /// Two real `run_loop` workers heartbeat into one shared store until each
+    /// sees a live set of two. Worker B is then shut down and ONLY the injected
+    /// clock moves, past `DEFAULT_LIVENESS_FACTOR * DEFAULT_HEARTBEAT_INTERVAL`.
+    /// Worker A must drop B from its live set. Real time does not advance: the
+    /// runtime is paused, every advance below is simulated, and nothing here
+    /// sleeps or reads a wall clock.
+    ///
+    /// Flip to watch it fail against pre-fix code: build a `WallClock` inside
+    /// the spawned heartbeat task instead of cloning the context's clock. The
+    /// timestamps B wrote and the `now` A compares them against then both come
+    /// from real time, which moves by milliseconds over the whole test, so B
+    /// never ages out and the live set stays at two.
+    #[tokio::test(start_paused = true)]
+    async fn an_injected_clock_advance_evicts_a_stopped_worker() {
+        use ravel_maintain::worker_set::{DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR};
+
+        // `MemoryStore` reports no modification time: its `clock_ms` defaults to
+        // 0 and nothing here sets it, so `live_set_read`'s LIST-metadata
+        // shortcut takes `mtime_stale`'s unknown-mtime path and the heartbeat
+        // body's stamp is what decides liveness. The value below does not gate
+        // that shortcut; it is epoch-relative only so the arithmetic below is
+        // readable.
+        const NOW_NS: i64 = 1_000 * TEST_NS_PER_HOUR;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+        let context_for = |worker: Arc<WorkerSet>, ownership: Arc<MaintenanceOwnershipMetrics>| {
+            LoopContext {
+                store: Arc::clone(&store),
+                fallback_allow: None,
+                compactor: Arc::new(CompactorConfig::default()),
+                retention: Arc::new(RetentionConfig::default()),
+                shard_count: 1,
+                // Past the whole simulated test window, so no discovery cycle
+                // fires and only the heartbeat task's behavior is under test.
+                interval: Duration::from_secs(3600),
+                metrics: Arc::new(TenantDiscoveryMetrics::default()),
+                safety: Arc::new(MaintenanceSafetyMetrics::default()),
+                ownership,
+                rng: Arc::new(SystemRng),
+                clock: Arc::new(clock.clone()),
+                live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
+                worker,
+                cycle_hook: Arc::new(|| {}),
+            }
+        };
+
+        let ownership_a = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let ownership_b = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let (shutdown_a_tx, shutdown_a_rx) = oneshot::channel();
+        let (shutdown_b_tx, shutdown_b_rx) = oneshot::channel();
+        let loop_a = tokio::spawn(run_loop(
+            context_for(
+                Arc::new(WorkerSet::with_defaults(NOW_NS)),
+                Arc::clone(&ownership_a),
+            ),
+            shutdown_a_rx,
+        ));
+        let loop_b = tokio::spawn(run_loop(
+            context_for(
+                Arc::new(WorkerSet::with_defaults(NOW_NS)),
+                Arc::clone(&ownership_b),
+            ),
+            shutdown_b_rx,
+        ));
+
+        let converged = advance_until(600, Duration::from_secs(1), || {
+            ownership_a.workers_live() == 2 && ownership_b.workers_live() == 2
+        })
+        .await;
+        assert!(
+            converged,
+            "two workers sharing a store must converge to a live set of two, saw a={} b={}",
+            ownership_a.workers_live(),
+            ownership_b.workers_live()
+        );
+
+        // Worker B stops: its heartbeat key is never refreshed again, and
+        // nothing else in the store changes.
+        shutdown_b_tx.send(()).expect("send shutdown to worker b");
+        loop_b.await.expect("worker b joins cleanly on shutdown");
+
+        // Move ONLY the injected clock, to one heartbeat interval past the
+        // liveness window, and let worker A's heartbeat cadence fire on the
+        // paused runtime.
+        let heartbeat_ns =
+            i64::try_from(DEFAULT_HEARTBEAT_INTERVAL.as_nanos()).expect("H fits in i64");
+        let window_ns = heartbeat_ns * i64::from(DEFAULT_LIVENESS_FACTOR);
+        clock.set(NOW_NS + window_ns + heartbeat_ns);
+
+        let evicted = advance_until(600, Duration::from_secs(1), || {
+            ownership_a.workers_live() == 1
+        })
+        .await;
+        assert!(
+            evicted,
+            "advancing the injected clock past {}s must evict the stopped worker, saw {} live",
+            (window_ns / 1_000_000_000),
+            ownership_a.workers_live()
+        );
+
+        shutdown_a_tx.send(()).expect("send shutdown to worker a");
+        loop_a.await.expect("worker a joins cleanly on shutdown");
+    }
+
+    /// A `LoopContext` for the liveness/supervisor tests: one discovered tenant
+    /// behind a fault-free `FaultStore`, a solo worker, a 1s discovery interval,
+    /// and the injected `FixedClock`/`cycle_hook` the test drives. Returns the
+    /// context plus the shared `ownership` and `metrics` handles the test reads
+    /// its assertions off.
+    async fn liveness_loop_context(
+        clock: ravel_maintain::FixedClock,
+        cycle_hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> (
+        LoopContext,
+        Arc<MaintenanceOwnershipMetrics>,
+        Arc<TenantDiscoveryMetrics>,
+    ) {
+        let inner = MemoryStore::new();
+        let tenant_id = TenantId::new("acme");
+        publish_terminal_bucket(&inner, &tenant_id).await;
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(FaultStore::new(inner, FaultPlan::empty()));
+
+        let metrics = Arc::new(TenantDiscoveryMetrics::default());
+        let ownership = Arc::new(MaintenanceOwnershipMetrics::new(
+            DEFAULT_STALLED_AFTER_INTERVALS,
+        ));
+        let worker = Arc::new(solo_worker());
+        let ctx = LoopContext {
+            store,
+            fallback_allow: None,
+            compactor: Arc::new(CompactorConfig::default()),
+            retention: Arc::new(RetentionConfig::default()),
+            shard_count: 1,
+            interval: Duration::from_secs(1),
+            metrics: Arc::clone(&metrics),
+            safety: Arc::new(MaintenanceSafetyMetrics::default()),
+            ownership: Arc::clone(&ownership),
+            rng: Arc::new(SystemRng),
+            clock: Arc::new(clock),
+            live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
+            worker,
+            cycle_hook,
+        };
+        (ctx, ownership, metrics)
+    }
+
+    /// Advances the paused clock in small steps until `pred` holds or the step
+    /// budget runs out, returning whether it held. Small steps so the paused
+    /// runtime actually wakes the spawned loop between each.
+    async fn advance_until(steps: usize, step: Duration, pred: impl Fn() -> bool) -> bool {
+        for _ in 0..steps {
+            if pred() {
+                return true;
+            }
+            tokio::time::advance(step).await;
+            tokio::task::yield_now().await;
+        }
+        pred()
+    }
+
+    /// Deliverable 1+2: a completed cycle stamps
+    /// `ravel_maintain_last_cycle_completed_timestamp_seconds` from the injected
+    /// clock, to that clock's exact value (issue #1683). Asserts the exact
+    /// number, not merely that it moved off zero: a stamp taken from the wrong
+    /// clock, or scaled wrong, fails here.
+    ///
+    /// Flip to watch it fail against pre-fix code: delete the
+    /// `ownership.set_last_cycle_completed(clock.now_ns())` call in `run_loop`'s
+    /// `Ok(())` arm. The gauge then never leaves zero and the `NOW_NS` assertion
+    /// fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_completed_cycle_stamps_the_liveness_gauge_from_the_injected_clock() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        let (ctx, ownership, metrics) = liveness_loop_context(clock, Arc::new(|| {})).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_loop(ctx, shutdown_rx));
+
+        let completed = advance_until(200, Duration::from_millis(100), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(completed, "a discovery cycle must have completed");
+
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            NOW_NS,
+            "the liveness gauge must hold the injected clock's exact value"
+        );
+        assert_eq!(
+            metrics.tenants_maintained(),
+            1,
+            "the storage-discovered tenant was maintained this cycle"
+        );
+        assert_eq!(
+            ownership.loop_panics_total(),
+            0,
+            "a healthy cycle records no panic"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
+    }
+
+    /// The contrast that is the whole point of the ticket (issue #1683): once
+    /// the loop stops, the liveness gauge does NOT advance even as the clock
+    /// moves past two intervals, while `ravel_maintain_tenants_maintained` still
+    /// reads its old value. A gauge that merely passed the wall clock through
+    /// would keep moving and read as healthy on a dead loop; both figures
+    /// freezing at their last healthy value is exactly the failure this gauge
+    /// exists to make visible through its age.
+    ///
+    /// Flip to watch it fail against pre-fix code: move the
+    /// `ownership.set_last_cycle_completed(...)` stamp out of the completed-cycle
+    /// guard and into the top of the `run_loop` iteration (or drive it off
+    /// `WallClock`). It would then advance without a completed cycle and the
+    /// "did not advance" assertion below fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_loop_freezes_the_gauge_and_the_maintained_count() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+        const INTERVAL_NS: i64 = 1_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+        // Keep a handle to drive the clock forward after the loop stops.
+        let clock_handle = clock.clone();
+        let (ctx, ownership, metrics) = liveness_loop_context(clock, Arc::new(|| {})).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_loop(ctx, shutdown_rx));
+
+        let completed = advance_until(200, Duration::from_millis(100), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(
+            completed,
+            "one cycle must complete before the loop is stopped"
+        );
+        let stamped = ownership.last_cycle_completed_unix_ns();
+        let maintained = metrics.tenants_maintained();
+        assert_eq!(stamped, NOW_NS);
+        assert_eq!(maintained, 1);
+
+        // End the loop, then advance the injected clock past two intervals.
+        shutdown_tx.send(()).expect("send shutdown");
+        handle.await.expect("run_loop joins cleanly on shutdown");
+        clock_handle.set(NOW_NS + 3 * INTERVAL_NS);
+        // Advance simulated time past two intervals too, proving no cycle sneaks
+        // in after shutdown.
+        let _ = advance_until(30, Duration::from_millis(100), || false).await;
+
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            stamped,
+            "the liveness gauge must not advance once the loop stopped, even as the clock moves \
+             past two intervals -- its frozen age is the dead-loop signal"
+        );
+        assert_eq!(
+            metrics.tenants_maintained(),
+            maintained,
+            "ravel_maintain_tenants_maintained also freezes at its last healthy value, which is \
+             exactly why it cannot itself distinguish a dead loop from a healthy one"
+        );
+    }
+
+    /// Shutdown is observed DURING the restart backoff, not after it. The
+    /// backoff is 60 s and the drain is wrapped in a 5 s deadline, both on the
+    /// paused runtime's virtual clock: a supervisor that waits the backoff out
+    /// leaves both timers pending, the runtime advances to the earlier one,
+    /// and the deadline elides. No real time is measured, so the assertion is
+    /// deterministic rather than a band.
+    ///
+    /// Flip to watch it fail: move the wait back into the resolved `select!`
+    /// arm (`tokio::time::sleep(backoff).await;` in place of
+    /// `pending_backoff = Some(backoff);`). The receiver is no longer polled
+    /// while that sleep runs, so the drain misses the deadline below.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_the_restart_backoff_is_not_held_behind_it() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+        const BACKOFF: Duration = Duration::from_secs(60);
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+
+        // Every cycle panics, so the supervisor is always inside its backoff
+        // when the shutdown below arrives.
+        let cycle_hook: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(|| panic!("injected maintenance loop panic (test)"));
+
+        let (ctx, ownership, _metrics) = liveness_loop_context(clock, cycle_hook).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_supervisor(ctx, shutdown_rx, BACKOFF, BACKOFF));
+
+        let panicked = advance_until(400, Duration::from_millis(50), || {
+            ownership.loop_panics_total() >= 1
+        })
+        .await;
+        assert!(panicked, "the first attempt must panic and be counted");
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let drained = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(
+            drained.is_ok(),
+            "a drain arriving during the {BACKOFF:?} backoff must be observed at once, not held \
+             behind it"
+        );
+        drained.expect("deadline").expect("supervisor joins");
+        assert_eq!(
+            ownership.loop_panics_total(),
+            1,
+            "no further attempt is spawned once shutdown arrives, so the panic total stays at \
+             the one attempt that ran"
+        );
+    }
+
+    /// Deliverables 3+4: a panic in the loop body is caught, counted exactly
+    /// once on `ravel_maintain_loop_panics_total`, and the supervisor restarts
+    /// the loop so a later cycle stamps the liveness gauge again (issue #1683).
+    ///
+    /// Flip to watch it fail against pre-fix code: in `run_loop`'s cycle arm,
+    /// drop the `catch_unwind` and `await` the cycle body directly. The injected
+    /// panic then aborts the whole task; `run_supervisor`'s `Err(join_err)` arm
+    /// still restarts it, but `inc_loop_panics` runs there too, so to see the
+    /// count assertion fail also remove that arm's `inc_loop_panics()` -- the
+    /// counter then reads 0. To see the restart itself matter, replace
+    /// `run_supervisor` with a bare `tokio::spawn(run_loop(...))`: the gauge
+    /// never leaves zero after the panic and the `NOW_NS` assertion fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_caught_panic_is_counted_and_the_supervisor_restarts_the_loop() {
+        const NOW_NS: i64 = 1_700_000_000_000_000_000;
+
+        let clock = ravel_maintain::FixedClock::new(NOW_NS);
+
+        // Panic on the first cycle only; every later cycle runs normally. The
+        // supervisor clones the context (and this shared flag) into each attempt,
+        // so the second attempt sees the flag already consumed.
+        let panic_armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let hook_flag = Arc::clone(&panic_armed);
+        let cycle_hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if hook_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                panic!("injected maintenance loop panic (test)");
+            }
+        });
+
+        let (ctx, ownership, _metrics) = liveness_loop_context(clock, cycle_hook).await;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        // Small, fixed backoff so the paused-time advance drives the restart.
+        let handle = tokio::spawn(run_supervisor(
+            ctx,
+            shutdown_rx,
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        ));
+
+        let recovered = advance_until(400, Duration::from_millis(50), || {
+            ownership.last_cycle_completed_unix_ns() != 0
+        })
+        .await;
+        assert!(
+            recovered,
+            "the supervisor must restart the loop and complete a later cycle after the panic"
+        );
+        assert_eq!(
+            ownership.loop_panics_total(),
+            1,
+            "exactly one panic was caught and counted, not zero (uncounted) or a restart loop"
+        );
+        assert_eq!(
+            ownership.last_cycle_completed_unix_ns(),
+            NOW_NS,
+            "the restarted loop stamps the liveness gauge from the injected clock"
+        );
+        assert!(
+            !panic_armed.load(std::sync::atomic::Ordering::SeqCst),
+            "the one-shot panic must have fired"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown");
+        let _ = handle.await;
+    }
+
+    /// The fail-closed re-assert (closing the write-fence gap): a stored
+    /// `sys/gc` that satisfies its OWN write-time skew is still refused when the
+    /// RUNNING sweeper is configured with a LARGER `clock_skew_allowance`, so the
+    /// sweep loop that actually deletes is never spawned with a skew-uncovered
+    /// horizon. `spawn` returns [`ravel_maintain::GcConfigError::MaintainSkewUncovered`]
+    /// and no supervisor task is started -- no delete/GC path can run.
+    ///
+    /// The mirror: a stored horizon that DOES cover the running sweeper's skew
+    /// spawns normally.
+    ///
+    /// Flip line to watch the fail-closed check pass through (the sweep loop
+    /// would then spawn and delete): in `spawn`, change the re-assert to pass
+    /// `0` instead of `config.compactor.clock_skew_allowance_ns` (drop the
+    /// sweeper-skew term). The stored default horizon then meets the reduced
+    /// bound, `validate_maintain_skew` returns `Ok`, `spawn` returns `Ok`, and
+    /// the `expect_err` below panics.
+    #[tokio::test]
+    async fn spawn_fails_closed_when_running_sweeper_skew_exceeds_stored_horizon() {
+        // The stored durable object: the maintain defaults, whose horizon
+        // covers exactly the default 5m skew (`max_query_duration + grace + 5m`).
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let default_skew = CompactorConfig::default().clock_skew_allowance_ns;
+
+        // A running sweeper configured with a LARGER skew than the stored
+        // horizon budgets for: an independent knob, cross-checked only by this re-assert.
+        let over_skew = default_skew + 60_000_000_000; // +1 min
+        let fail_config = MaintenanceTaskConfig {
+            enabled: true,
+            compactor: CompactorConfig {
+                clock_skew_allowance_ns: over_skew,
+                ..CompactorConfig::default()
+            },
+            ..MaintenanceTaskConfig::default()
+        };
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let make_args = || {
+            (
+                Arc::new(TenantDiscoveryMetrics::default()),
+                Arc::new(MaintenanceSafetyMetrics::default()),
+                Arc::new(MaintenanceOwnershipMetrics::new(
+                    DEFAULT_STALLED_AFTER_INTERVALS,
+                )),
+                Arc::new(solo_worker()),
+            )
+        };
+
+        let (metrics, safety, ownership, worker) = make_args();
+        // `MaintenanceTasks` is not `Debug`, so match the Result rather than
+        // `expect_err` (which would need the Ok payload to be printable).
+        match spawn(
+            store.clone(),
+            Vec::new(),
+            fail_config,
+            stored_gc,
+            metrics,
+            safety,
+            ownership,
+            Arc::clone(&worker),
+            Arc::new(watch::channel(worker.solo_live_set()).0),
+            Arc::new(WallClock),
+        ) {
+            Err(SpawnError::GcConfig(ravel_maintain::GcConfigError::MaintainSkewUncovered {
+                clock_skew_allowance_ns,
+                stored_horizon_ns,
+                ..
+            })) => {
+                assert_eq!(clock_skew_allowance_ns, over_skew);
+                assert_eq!(stored_horizon_ns, stored_gc.protection_horizon_ns);
+            }
+            Err(other) => panic!("expected MaintainSkewUncovered, got: {other}"),
+            Ok(_) => panic!(
+                "a running sweeper skew the stored horizon does not cover must fail spawn, \
+                 not enter the sweep loop"
+            ),
+        }
+
+        // Mirror: the running sweeper's skew equals the default the stored
+        // horizon covers, so spawn succeeds and returns a running supervisor.
+        let ok_config = MaintenanceTaskConfig {
+            enabled: true,
+            compactor: CompactorConfig::default(),
+            ..MaintenanceTaskConfig::default()
+        };
+        let (metrics, safety, ownership, worker) = make_args();
+        let tasks = spawn(
+            store,
+            Vec::new(),
+            ok_config,
+            stored_gc,
+            metrics,
+            safety,
+            ownership,
+            Arc::clone(&worker),
+            Arc::new(watch::channel(worker.solo_live_set()).0),
+            Arc::new(WallClock),
+        )
+        .expect("a horizon that covers the running sweeper's skew spawns normally");
+        tasks.shutdown().await;
+    }
+
+    /// ADR-1133's gated-set stability premise is a spawn refusal: a stored
+    /// horizon below `max_compaction_lifetime + 4 * clock_skew_allowance` for
+    /// the running compactor config returns
+    /// [`ravel_maintain::GcConfigError::MaintainCompactionLifetimeUncovered`]
+    /// and spawns nothing. One nanosecond less lifetime, at the bound, spawns.
+    ///
+    /// Flip to watch it fail: remove the
+    /// `validate_maintain_compaction_lifetime` call in `spawn`; the first case
+    /// then spawns and the `Ok` arm panics.
+    #[tokio::test]
+    async fn spawn_fails_closed_when_compaction_lifetime_outlasts_stored_horizon() {
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let skew = CompactorConfig::default().clock_skew_allowance_ns;
+        let at_bound = stored_gc.protection_horizon_ns - 4 * skew;
+        let config_with = |max_compaction_lifetime_ns: i64| MaintenanceTaskConfig {
+            enabled: true,
+            compactor: CompactorConfig {
+                max_compaction_lifetime_ns,
+                ..CompactorConfig::default()
+            },
+            ..MaintenanceTaskConfig::default()
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let spawn_with = |config: MaintenanceTaskConfig| {
+            let worker = Arc::new(solo_worker());
+            spawn(
+                store.clone(),
+                Vec::new(),
+                config,
+                stored_gc,
+                Arc::new(TenantDiscoveryMetrics::default()),
+                Arc::new(MaintenanceSafetyMetrics::default()),
+                Arc::new(MaintenanceOwnershipMetrics::new(
+                    DEFAULT_STALLED_AFTER_INTERVALS,
+                )),
+                Arc::clone(&worker),
+                Arc::new(watch::channel(worker.solo_live_set()).0),
+                Arc::new(WallClock),
+            )
+        };
+
+        match spawn_with(config_with(at_bound + 1)) {
+            Err(SpawnError::GcConfig(
+                ravel_maintain::GcConfigError::MaintainCompactionLifetimeUncovered {
+                    stored_horizon_ns,
+                    max_compaction_lifetime_ns,
+                    clock_skew_allowance_ns,
+                },
+            )) => {
+                assert_eq!(stored_horizon_ns, stored_gc.protection_horizon_ns);
+                assert_eq!(max_compaction_lifetime_ns, at_bound + 1);
+                assert_eq!(clock_skew_allowance_ns, skew);
+            }
+            Err(other) => panic!("expected MaintainCompactionLifetimeUncovered, got: {other}"),
+            Ok(_) => panic!(
+                "a compaction lifetime the stored horizon does not outlast must fail spawn, \
+                 not enter the sweep loop"
+            ),
+        }
+
+        let tasks = spawn_with(config_with(at_bound))
+            .expect("a compaction lifetime exactly at the bound spawns normally");
+        tasks.shutdown().await;
+    }
+
+    /// A zero heartbeat period is refused at `spawn` with
+    /// [`SpawnError::ZeroHeartbeatInterval`] instead of reaching the heartbeat
+    /// task's `tokio::time::interval`, which panics on it (issue #1956). The
+    /// first case is the shape `ravel_server::start` builds, a worker made
+    /// from the config's zero; the other two cover each source on its own.
+    ///
+    /// Flip to watch it fail: delete the `is_zero()` guard in `spawn`. The
+    /// first case then spawns, the shutdown below lets the heartbeat task run,
+    /// it panics with "`period` must be non-zero.", and the `Ok` arm fails the
+    /// test.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_heartbeat_interval() {
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let zero_worker = || WorkerSet::new(0, Duration::ZERO, 3, DEFAULT_UNIT_CONCURRENCY);
+        let cases = [
+            (
+                "a zero heartbeat_interval on config and worker",
+                Duration::ZERO,
+                zero_worker(),
+            ),
+            (
+                "a zero config heartbeat_interval",
+                Duration::ZERO,
+                WorkerSet::with_defaults(0),
+            ),
+            (
+                "a worker built with a zero heartbeat period",
+                DEFAULT_HEARTBEAT_INTERVAL,
+                zero_worker(),
+            ),
+        ];
+        for (case, heartbeat_interval, worker) in cases {
+            let worker = Arc::new(worker);
+            let config = MaintenanceTaskConfig {
+                enabled: true,
+                heartbeat_interval,
+                ..MaintenanceTaskConfig::default()
+            };
+            match spawn(
+                Arc::clone(&store),
+                Vec::new(),
+                config,
+                stored_gc,
+                Arc::new(TenantDiscoveryMetrics::default()),
+                Arc::new(MaintenanceSafetyMetrics::default()),
+                Arc::new(MaintenanceOwnershipMetrics::new(
+                    DEFAULT_STALLED_AFTER_INTERVALS,
+                )),
+                Arc::clone(&worker),
+                Arc::new(watch::channel(worker.solo_live_set()).0),
+                Arc::new(WallClock),
+            ) {
+                Err(SpawnError::ZeroHeartbeatInterval) => {}
+                Err(other) => panic!("{case}: expected ZeroHeartbeatInterval, got: {other}"),
+                Ok(tasks) => {
+                    tasks.shutdown().await;
+                    panic!("{case} must be refused at spawn, not handed to the heartbeat task");
+                }
+            }
+        }
+    }
+
+    /// [`spawn`] refuses an enabled config with a zero `interval` directly at
+    /// its spawn site with [`SpawnError::ZeroMaintainInterval`], before any task
+    /// is spawned, with the default (non-zero) heartbeat so the refusal is the
+    /// interval and not the heartbeat. `maintain` is a `pub` module, so an
+    /// outside caller reaches this function without passing through
+    /// `validate_loop_intervals`.
+    ///
+    /// Flip to watch it fail: delete the `config.check_spawnable()?` call in
+    /// [`spawn`]. The function then proceeds past the interval on a zero and
+    /// spawns the maintenance supervisor.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_maintain_interval() {
+        let stored_gc = ravel_maintain::GcConfigValues::maintain_defaults();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let worker = Arc::new(WorkerSet::with_defaults(0));
+        let config = MaintenanceTaskConfig {
+            enabled: true,
+            interval: Duration::ZERO,
+            ..MaintenanceTaskConfig::default()
+        };
+        match spawn(
+            Arc::clone(&store),
+            Vec::new(),
+            config,
+            stored_gc,
+            Arc::new(TenantDiscoveryMetrics::default()),
+            Arc::new(MaintenanceSafetyMetrics::default()),
+            Arc::new(MaintenanceOwnershipMetrics::new(
+                DEFAULT_STALLED_AFTER_INTERVALS,
+            )),
+            Arc::clone(&worker),
+            Arc::new(watch::channel(worker.solo_live_set()).0),
+            Arc::new(WallClock),
+        ) {
+            Err(SpawnError::ZeroMaintainInterval) => {}
+            Err(other) => panic!("expected ZeroMaintainInterval, got: {other}"),
+            Ok(tasks) => {
+                tasks.shutdown().await;
+                panic!("a zero maintain interval must be refused at spawn");
+            }
+        }
+    }
+}
+
+/// The alert retention driver as the maintain tick runs it (ADR-1688 follow-up
+/// task 2): memo read, keep set, watermark check, skip counter, ownership gate,
+/// the `alert_retention_window_ns` opt-out, and the alerts-shard orphan sweep.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod alert_retention_tests {
+    use std::collections::{BTreeSet, HashMap};
+
+    use bytes::Bytes;
+    use ravel_alerting::{AlertId, AlertRecord, AlertState, encode_record_object};
+    use ravel_commit::publish::RetryPolicy;
+    use ravel_commit::record::NewCommitRecord;
+    use ravel_commit::{keys, publish, record};
+    use ravel_ingest::LOG_SEGMENT_FORMAT_VERSION;
+    use ravel_logseg::{ObjectIdentity, RlogConfig};
+    use ravel_maintain::FixedClock;
+    use ravel_maintain::config::NS_PER_HOUR;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{PutMode, list_all};
+    use ravel_types::TenantId;
+
+    use super::*;
+    use crate::alert_state_memo::{AlertStateMemo, alert_state_memo_key, write_alert_state_memo};
+
+    const NS_PER_DAY: i64 = 24 * NS_PER_HOUR;
+    /// 2027-01-15T08:00:00Z, well clear of the epoch so every expired hour in
+    /// the fixture is a positive ingest hour.
+    const NOW_NS: i64 = 1_800_000_000 * 1_000_000_000;
+    const WRITER: Uuid = Uuid::from_u128(0xA1E7);
+    /// The evaluator's `ALERT_WRITER_EPOCH`.
+    const WRITER_EPOCH: u64 = 1;
+
+    fn hour_of(ts_ns: i64) -> u32 {
+        u32::try_from(ts_ns.div_euclid(NS_PER_HOUR)).expect("hour")
+    }
+
+    fn alert_record(id: u8, state: AlertState, ts_ns: i64) -> AlertRecord {
+        AlertRecord {
+            alert_id: AlertId([id; 16]),
+            rule_id: format!("rule-{id}"),
+            state,
+            generation: 1,
+            ts_ns,
+            labels: vec![("alertname".to_string(), format!("rule-{id}"))],
+            annotations: Vec::new(),
+            body: format!("rule-{id} {}", state.as_str()),
+        }
+    }
+
+    /// The keys one written alert transition occupies.
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct Written {
+        commit_key: String,
+        data_key: String,
+    }
+
+    /// Write one alert transition the way the evaluator's `publish` does: a
+    /// real one-record RLOG object, then an L0 commit record whose event,
+    /// ingest and creation stamps and `ingest_hour_bucket` all come from the
+    /// record's `ts_ns`.
+    async fn write_transition(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        seq: u64,
+        alert: &AlertRecord,
+    ) -> Written {
+        let ts = alert.ts_ns;
+        let bytes = encode_record_object(
+            alert,
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant.0,
+                shard: ALERT_SHARD,
+                writer_id: WRITER.into_bytes(),
+                writer_epoch: WRITER_EPOCH,
+                writer_seq: seq,
+            },
+        )
+        .expect("encode alert record");
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Alerts,
+            shard: ALERT_SHARD,
+            writer_id: WRITER,
+            writer_epoch: WRITER_EPOCH,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: ts,
+            max_event_ts_ns: ts,
+            min_ingest_ts_ns: ts,
+            max_ingest_ts_ns: ts,
+            segment_format_version: u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: ts,
+            ingest_hour_bucket: hour_of(ts),
+        })
+        .expect("build commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data");
+        publish::publish(store, &commit, &RetryPolicy::default())
+            .await
+            .expect("publish commit");
+        Written {
+            commit_key: keys::commit_key_for_record(&commit).expect("commit key"),
+            data_key,
+        }
+    }
+
+    async fn write_memo(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        watermark_hour: u32,
+        latest: &[&AlertRecord],
+    ) {
+        let records: HashMap<AlertId, AlertRecord> =
+            latest.iter().map(|r| (r.alert_id, (*r).clone())).collect();
+        write_alert_state_memo(
+            store,
+            tenant,
+            &AlertStateMemo {
+                watermark_hour,
+                records,
+            },
+        )
+        .await
+        .expect("write memo");
+    }
+
+    /// Every live key under the tenant's alert commit and data prefixes.
+    async fn alert_keys(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for prefix in [
+            keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD).expect("prefix"),
+            format!("t/{}/a/l0/", tenant.to_hex()),
+        ] {
+            for meta in list_all(store, &prefix).await.expect("list") {
+                out.insert(meta.key);
+            }
+        }
+        out
+    }
+
+    async fn quarantined(store: &dyn ObjectStoreBackend, tenant: &TenantHash) -> Vec<String> {
+        list_all(store, &format!("quarantine/t/{}/a/", tenant.to_hex()))
+            .await
+            .expect("list quarantine")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect()
+    }
+
+    fn keys_of(written: &[&Written]) -> BTreeSet<String> {
+        written
+            .iter()
+            .flat_map(|w| [w.commit_key.clone(), w.data_key.clone()])
+            .collect()
+    }
+
+    async fn tick(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        compactor: &CompactorConfig,
+        safety: &MaintenanceSafetyMetrics,
+        worker: &WorkerSet,
+        live_set: &[Uuid],
+    ) {
+        tick_at(NOW_NS, store, tenant, compactor, safety, worker, live_set).await;
+    }
+
+    /// [`tick`] at an explicit clock reading, for the tests whose point is where
+    /// `now` sits relative to an hour boundary or to the memo's watermark.
+    async fn tick_at(
+        now_ns: i64,
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        compactor: &CompactorConfig,
+        safety: &MaintenanceSafetyMetrics,
+        worker: &WorkerSet,
+        live_set: &[Uuid],
+    ) {
+        let clock = FixedClock::new(now_ns);
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let mut memo = MaintainMemo::with_default_interval();
+        run_tick_with_clock(
+            &clock,
+            store,
+            tenant,
+            compactor,
+            &RetentionConfig::default(),
+            1,
+            &mut memo,
+            safety,
+            &ownership,
+            worker,
+            live_set,
+        )
+        .await;
+    }
+
+    fn skipped(safety: &MaintenanceSafetyMetrics) -> Vec<(AlertRetentionSkipReason, u64)> {
+        AlertRetentionSkipReason::ALL
+            .iter()
+            .map(|&reason| (reason, safety.alert_retention_skipped(reason)))
+            .collect()
+    }
+
+    fn no_skips() -> Vec<(AlertRetentionSkipReason, u64)> {
+        AlertRetentionSkipReason::ALL
+            .iter()
+            .map(|&r| (r, 0))
+            .collect()
+    }
+
+    async fn exists(store: &dyn ObjectStoreBackend, key: &str) -> bool {
+        match store.get(key, ravel_object_store::GetRange::Full).await {
+            Ok(_) => true,
+            Err(StoreError::NotFound) => false,
+            Err(err) => panic!("get {key}: {err}"),
+        }
+    }
+
+    fn skipped_once(reason: AlertRetentionSkipReason) -> Vec<(AlertRetentionSkipReason, u64)> {
+        AlertRetentionSkipReason::ALL
+            .iter()
+            .map(|&r| (r, u64::from(r == reason)))
+            .collect()
+    }
+
+    /// The fixture every test below starts from: a store whose objects were
+    /// all written 100 days before `NOW_NS`, and five transitions over three
+    /// identities.
+    ///
+    /// - identity 1: firing at -100d, resolved at -99d. The resolve is its
+    ///   current state, expired.
+    /// - identity 2: firing at -98d (expired, not current), resolved at -2d.
+    /// - identity 3: firing in `NOW_NS`'s own hour, at or above any watermark
+    ///   below it, and absent from the memo.
+    struct Fixture {
+        store: MemoryStore,
+        tenant: TenantHash,
+        expired_superseded: [Written; 2],
+        expired_current: Written,
+        in_window_current: Written,
+        above_watermark: Written,
+        latest: [AlertRecord; 2],
+    }
+
+    async fn fixture() -> Fixture {
+        let store = MemoryStore::new();
+        store.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+
+        let a_firing = alert_record(1, AlertState::Firing, NOW_NS - 100 * NS_PER_DAY);
+        let a_resolved = alert_record(1, AlertState::Resolved, NOW_NS - 99 * NS_PER_DAY);
+        let b_firing = alert_record(2, AlertState::Firing, NOW_NS - 98 * NS_PER_DAY);
+        let b_resolved = alert_record(2, AlertState::Resolved, NOW_NS - 2 * NS_PER_DAY);
+        let c_firing = alert_record(3, AlertState::Firing, NOW_NS - 60_000_000_000);
+
+        let w1 = write_transition(&store, &tenant, 1, &a_firing).await;
+        let w2 = write_transition(&store, &tenant, 2, &a_resolved).await;
+        let w3 = write_transition(&store, &tenant, 3, &b_firing).await;
+        let w4 = write_transition(&store, &tenant, 4, &b_resolved).await;
+        let w5 = write_transition(&store, &tenant, 5, &c_firing).await;
+        Fixture {
+            store,
+            tenant,
+            expired_superseded: [w1, w3],
+            expired_current: w2,
+            in_window_current: w4,
+            above_watermark: w5,
+            latest: [a_resolved, b_resolved],
+        }
+    }
+
+    impl Fixture {
+        fn all_keys(&self) -> BTreeSet<String> {
+            keys_of(&[
+                &self.expired_superseded[0],
+                &self.expired_current,
+                &self.expired_superseded[1],
+                &self.in_window_current,
+                &self.above_watermark,
+            ])
+        }
+
+        /// A memo as the evaluator writes it: complete below the hour before
+        /// `NOW_NS`, naming each of identities 1 and 2 by its latest record.
+        async fn write_current_memo(&self) {
+            write_memo(
+                &self.store,
+                &self.tenant,
+                hour_of(NOW_NS) - 1,
+                &[&self.latest[0], &self.latest[1]],
+            )
+            .await;
+        }
+    }
+
+    fn solo() -> (WorkerSet, Vec<Uuid>) {
+        let worker = WorkerSet::with_defaults(NOW_NS).with_process_id(Uuid::from_u128(1));
+        let live = worker.solo_live_set();
+        (worker, live)
+    }
+
+    /// The acceptance test: one maintain tick over a tenant with a memo whose
+    /// watermark is inside the window deletes exactly the two expired records
+    /// that are no identity's current state, and their data objects, and keeps
+    /// the expired current-state record, the in-window record and the record at
+    /// or above the watermark. Nothing is skipped and nothing is quarantined.
+    #[tokio::test]
+    async fn maintain_tick_sweeps_expired_alert_history_and_keeps_current_state() {
+        let f = fixture().await;
+        f.write_current_memo().await;
+        assert_eq!(alert_keys(&f.store, &f.tenant).await, f.all_keys());
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        let survivors = keys_of(&[&f.expired_current, &f.in_window_current, &f.above_watermark]);
+        assert_eq!(
+            alert_keys(&f.store, &f.tenant).await,
+            survivors,
+            "exactly the two expired non-current transitions, record and data, are deleted"
+        );
+        assert_eq!(
+            survivors.len(),
+            6,
+            "three records and three data objects remain"
+        );
+        for gone in &f.expired_superseded {
+            assert!(
+                !exists(&f.store, &gone.commit_key).await
+                    && !exists(&f.store, &gone.data_key).await,
+                "{gone:?} must be gone"
+            );
+        }
+        assert!(
+            quarantined(&f.store, &f.tenant).await.is_empty(),
+            "a swept data object is deleted with its record, never left for the orphan sweep"
+        );
+        assert_eq!(skipped(&safety), no_skips());
+        assert!(
+            exists(&f.store, &alert_state_memo_key(&f.tenant)).await,
+            "the sweep never touches the memo"
+        );
+    }
+
+    /// No memo: the tenant is skipped under `absent`, exactly once, and no
+    /// alert object is deleted.
+    #[tokio::test]
+    async fn a_tenant_with_no_memo_is_skipped_as_absent_and_nothing_is_deleted() {
+        let f = fixture().await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(alert_keys(&f.store, &f.tenant).await, f.all_keys());
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::Absent)
+        );
+    }
+
+    /// A memo whose watermark sits below the expiry floor's hour: skipped under
+    /// `watermark_below_floor`, exactly once, nothing deleted, even though the
+    /// memo names both expired identities.
+    #[tokio::test]
+    async fn a_memo_watermark_below_the_expiry_floor_is_skipped_and_nothing_is_deleted() {
+        let f = fixture().await;
+        let floor_hour = hour_of(NOW_NS - CompactorConfig::default().alert_retention_window_ns);
+        write_memo(
+            &f.store,
+            &f.tenant,
+            floor_hour - 1,
+            &[&f.latest[0], &f.latest[1]],
+        )
+        .await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(alert_keys(&f.store, &f.tenant).await, f.all_keys());
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::WatermarkBelowFloor)
+        );
+    }
+
+    /// An undecodable memo and one of an unsupported version each skip under
+    /// their own reason, exactly once, with nothing deleted.
+    #[tokio::test]
+    async fn an_unreadable_memo_is_skipped_under_its_own_reason() {
+        for (body, reason) in [
+            (&b"not json"[..], AlertRetentionSkipReason::Undecodable),
+            (
+                &br#"{"format_version":99,"watermark_hour":0,"records":[]}"#[..],
+                AlertRetentionSkipReason::UnsupportedVersion,
+            ),
+        ] {
+            let f = fixture().await;
+            f.store
+                .put(
+                    &alert_state_memo_key(&f.tenant),
+                    Bytes::copy_from_slice(body),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        checksum: None,
+                    },
+                )
+                .await
+                .expect("put memo");
+            let safety = MaintenanceSafetyMetrics::default();
+            let (worker, live) = solo();
+            tick(
+                &f.store,
+                &f.tenant,
+                &CompactorConfig::default(),
+                &safety,
+                &worker,
+                &live,
+            )
+            .await;
+
+            assert_eq!(alert_keys(&f.store, &f.tenant).await, f.all_keys());
+            assert_eq!(skipped(&safety), skipped_once(reason), "{reason:?}");
+        }
+    }
+
+    /// A worker that does not own `(tenant, Alerts, ALERT_SHARD)` under the live
+    /// set sweeps nothing and reads no memo, so it counts no skip either.
+    ///
+    /// The orphan seeded here is what makes the ownership gate load-bearing in
+    /// this test rather than decorative: the retention sweep alone would delete
+    /// nothing under the memo it is given (every expired record it names is a
+    /// current state), so without an orphan the assertions hold whether or not
+    /// `sweep_shard` ran. Watch it fail: move the `sweep_shard` call in
+    /// `run_alert_retention` out to the `run_tick_with_clock` caller, outside
+    /// the `worker.owns_unit` gate.
+    ///
+    /// "Reads no memo" is proven by a Get fault on the memo key whose counter
+    /// must stay at 0; the memo in place is current, so reading it would change
+    /// nothing else this test could see. Watch that fail: drop the
+    /// `worker.owns_unit` condition from the alerts block in
+    /// `run_tick_with_clock`, and the fault fires once.
+    #[tokio::test]
+    async fn a_worker_that_does_not_own_the_alerts_unit_sweeps_nothing() {
+        let f = fixture().await;
+        f.write_current_memo().await;
+        let orphan = orphan_data_key(&f.tenant);
+        f.store
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let mut expected = f.all_keys();
+        expected.insert(orphan);
+        let store = FaultStore::new(f.store, memo_get_fault());
+        let (worker, _) = solo();
+        let peer = (2..1_000u128)
+            .map(Uuid::from_u128)
+            .find(|peer| {
+                !worker.owns_unit(
+                    &[worker.process_id(), *peer],
+                    &f.tenant,
+                    Signal::Alerts,
+                    ALERT_SHARD,
+                )
+            })
+            .expect("some peer outweighs this worker for the alerts unit");
+        let live = vec![worker.process_id(), peer];
+        let safety = MaintenanceSafetyMetrics::default();
+        tick(
+            &store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "a non-owner never reads the memo"
+        );
+        assert_eq!(alert_keys(&store, &f.tenant).await, expected);
+        assert!(
+            quarantined(&store, &f.tenant).await.is_empty(),
+            "a non-owner runs neither sweep, so the orphan the owner would quarantine stays put"
+        );
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// A Get fault on the tenant's alert state memo, the latest-state object.
+    /// A test asserting its counter stayed at 0 proves no memo was read.
+    fn memo_get_fault() -> FaultPlan {
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("alert state memo read".to_string()),
+            )
+            .with_key_contains("/a/state/latest"),
+        )
+    }
+
+    /// `--alert-retention 0` disables the retention sweep and its memo read,
+    /// and nothing else: the same tick that deletes two records under the
+    /// default window deletes no record and reads no memo, while the alerts
+    /// shard's orphan sweep still reclaims an orphan older than its age gate.
+    /// The evaluator's writer interlock abandons late writes under a window of
+    /// `0` too, and this sweep is the only thing that reclaims them.
+    ///
+    /// "Reads no memo" is a Get fault on the memo key whose counter must stay
+    /// at 0: the memo here is current, so reading it would otherwise leave no
+    /// trace. Watch it fail: drop the `alert_retention_window_ns > 0` condition
+    /// in `run_alert_retention`. The fault then fires once, and the tick counts
+    /// a `store_error` skip. Put that condition back around the
+    /// `run_alert_retention` call in `run_tick_with_clock` instead, and the
+    /// orphan is never quarantined.
+    #[tokio::test]
+    async fn a_zero_alert_retention_window_disables_the_sweep_but_not_the_orphan_sweep() {
+        let f = fixture().await;
+        f.write_current_memo().await;
+        let orphan = orphan_data_key(&f.tenant);
+        f.store
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let expected = f.all_keys();
+        let store = FaultStore::new(f.store, memo_get_fault());
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        let disabled = CompactorConfig {
+            alert_retention_window_ns: 0,
+            ..CompactorConfig::default()
+        };
+        tick(&store, &f.tenant, &disabled, &safety, &worker, &live).await;
+
+        assert_eq!(
+            alert_keys(&store, &f.tenant).await,
+            expected,
+            "no record is deleted, and the orphan left the live keyspace"
+        );
+        let moved = quarantined(&store, &f.tenant).await;
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(
+            moved[0].starts_with(&format!("quarantine/{orphan}/")),
+            "{moved:?}"
+        );
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "a window of 0 reads no memo"
+        );
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// A data key in the alerts shard's `l0/` space that no commit record
+    /// names: what a crash between the retention sweep's record delete and its
+    /// data delete leaves behind.
+    fn orphan_data_key(tenant: &TenantHash) -> String {
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Alerts,
+            shard: ALERT_SHARD,
+            writer_id: WRITER,
+            writer_epoch: WRITER_EPOCH,
+            writer_seq: 99,
+            object_size: 6,
+            content_hash: *blake3::hash(b"orphan").as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: NOW_NS - 100 * NS_PER_DAY,
+            max_event_ts_ns: NOW_NS - 100 * NS_PER_DAY,
+            min_ingest_ts_ns: NOW_NS - 100 * NS_PER_DAY,
+            max_ingest_ts_ns: NOW_NS - 100 * NS_PER_DAY,
+            segment_format_version: u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: NOW_NS - 100 * NS_PER_DAY,
+            ingest_hour_bucket: hour_of(NOW_NS - 100 * NS_PER_DAY),
+        })
+        .expect("build commit record");
+        keys::reconstruct_data_key(&commit).expect("data key")
+    }
+
+    /// The orphan sweep runs over the alerts shard: a data object with no
+    /// commit record, older than the orphan age gate, is moved out of the live
+    /// keyspace into quarantine, and every referenced object stays. It runs
+    /// whether or not the memo lets the retention sweep run; here there is no
+    /// memo at all.
+    #[tokio::test]
+    async fn the_alerts_shard_orphan_sweep_reclaims_a_record_less_data_object() {
+        let f = fixture().await;
+        let orphan = orphan_data_key(&f.tenant);
+        f.store
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &f.store,
+            &f.tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert!(
+            !exists(&f.store, &orphan).await,
+            "the orphan left the live keyspace"
+        );
+        let moved = quarantined(&f.store, &f.tenant).await;
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(
+            moved[0].starts_with(&format!("quarantine/{orphan}/")),
+            "{moved:?}"
+        );
+        assert_eq!(
+            alert_keys(&f.store, &f.tenant).await,
+            f.all_keys(),
+            "every referenced alert object stays"
+        );
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::Absent)
+        );
+    }
+
+    /// The other half of the absent-memo pair (the first is
+    /// `a_tenant_with_no_memo_is_skipped_as_absent_and_nothing_is_deleted`): a
+    /// tenant that has never written an alert transition has no memo either, and
+    /// that is not a skip. It is the steady state of every tenant in a
+    /// deployment that configures no alert rules, so counting it would make the
+    /// counter climb forever on a healthy deployment and log a warning per
+    /// tenant per tick.
+    #[tokio::test]
+    async fn a_tenant_with_no_alert_records_and_no_memo_is_not_counted_at_all() {
+        let store = MemoryStore::new();
+        store.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("quiet").hash();
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert!(alert_keys(&store, &tenant).await.is_empty());
+        assert!(quarantined(&store, &tenant).await.is_empty());
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// Records the prefix of every listing a tick issues, in call order.
+    struct ListLog<S> {
+        inner: S,
+        prefixes: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl<S> ListLog<S> {
+        fn new(inner: S) -> Self {
+            ListLog {
+                inner,
+                prefixes: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Drain the log, keeping the listings under `tenant`'s alert keyspace
+        /// or its quarantine mirror.
+        fn take_alert_listings(&self, tenant: &TenantHash) -> Vec<String> {
+            let keyspace = alert_keyspace(tenant);
+            let quarantine = format!("quarantine/{keyspace}");
+            std::mem::take(&mut *self.prefixes.lock())
+                .into_iter()
+                .filter(|p| p.starts_with(&keyspace) || p.starts_with(&quarantine))
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for ListLog<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.prefixes.lock().push(prefix.to_string());
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.prefixes.lock().push(prefix.to_string());
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    fn alert_keyspace(tenant: &TenantHash) -> String {
+        format!("t/{}/a/", tenant.to_hex())
+    }
+
+    /// The listings the alerts shard's `sweep_shard` issues over a tenant with
+    /// no alert commit record, in call order: two of the commit prefix for rule
+    /// 2, the `l1/` prefix for rule 3, the `l0/` prefix and one of the commit
+    /// prefix for rule 1, one more of the commit prefix when rule 1 found a
+    /// candidate to re-verify, and the quarantine reaper's. Six on an empty
+    /// keyspace, which is what the gate saves.
+    fn sweep_listings(tenant: &TenantHash, orphan_candidate: bool) -> Vec<String> {
+        let commit =
+            keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let keyspace = alert_keyspace(tenant);
+        let mut listings = vec![
+            commit.clone(),
+            commit.clone(),
+            format!("{keyspace}l1/0000/"),
+            format!("{keyspace}l0/0000/"),
+            commit.clone(),
+        ];
+        if orphan_candidate {
+            listings.push(commit);
+        }
+        listings.push(format!("quarantine/{keyspace}l0/0000/"));
+        listings
+    }
+
+    /// Issue #2134: a tenant with no object under its alert keyspace or its
+    /// quarantine mirror issues none of the alerts shard sweep's listings on a
+    /// tick. It pays the gate's two bounded listings instead, and, with a
+    /// nonzero window, the absent-memo check's listing of the commit prefix
+    /// before them.
+    ///
+    /// Watch it fail: delete the `if !memo_or_records_seen { ... }` block in
+    /// `run_alert_retention`. Both ticks then issue the sweep's six listings
+    /// ([`sweep_listings`]) instead of the gate's two, and the first assertion
+    /// reads a list of 7 against 3.
+    #[tokio::test]
+    async fn a_tenant_with_no_alert_objects_issues_none_of_the_sweep_listings() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let store = ListLog::new(memory);
+        let tenant = TenantId::new("quiet").hash();
+        let keyspace = alert_keyspace(&tenant);
+        let gate = vec![keyspace.clone(), format!("quarantine/{keyspace}")];
+        let commit =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+        let mut expected = vec![commit];
+        expected.extend(gate.iter().cloned());
+        assert_eq!(store.take_alert_listings(&tenant), expected);
+
+        let disabled = CompactorConfig {
+            alert_retention_window_ns: 0,
+            ..CompactorConfig::default()
+        };
+        tick(&store, &tenant, &disabled, &safety, &worker, &live).await;
+        assert_eq!(store.take_alert_listings(&tenant), gate);
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// The other side of the gate: a tenant with one alerts-shard object still
+    /// sweeps. Tick 1 finds the record-less data object under the keyspace and
+    /// quarantines it. Tick 2 finds the live keyspace empty and the quarantine
+    /// copy under its mirror, and still runs the sweep, whose reaper is the
+    /// only thing that ever deletes that copy.
+    ///
+    /// Watch it fail: drop the quarantine prefix from the gate's loop in
+    /// `alert_keyspace_is_empty`. Tick 2 then reads the gate listing alone.
+    #[tokio::test]
+    async fn a_tenant_with_one_alerts_object_still_sweeps() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        let orphan = orphan_data_key(&tenant);
+        memory
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let store = ListLog::new(memory);
+        let keyspace = alert_keyspace(&tenant);
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        let disabled = CompactorConfig {
+            alert_retention_window_ns: 0,
+            ..CompactorConfig::default()
+        };
+
+        tick(&store, &tenant, &disabled, &safety, &worker, &live).await;
+        let mut expected = vec![keyspace.clone()];
+        expected.extend(sweep_listings(&tenant, true));
+        assert_eq!(store.take_alert_listings(&tenant), expected);
+        assert!(
+            !exists(&store.inner, &orphan).await,
+            "tick 1 quarantined the orphan"
+        );
+        assert_eq!(quarantined(&store.inner, &tenant).await.len(), 1);
+
+        tick(&store, &tenant, &disabled, &safety, &worker, &live).await;
+        let mut expected = vec![keyspace.clone(), format!("quarantine/{keyspace}")];
+        expected.extend(sweep_listings(&tenant, false));
+        assert_eq!(store.take_alert_listings(&tenant), expected);
+    }
+
+    /// The gate's soundness rests on its error path: a gate listing that fails
+    /// has not shown the keyspace empty, so the sweep still runs and its own
+    /// listings report the store fault. Only the gate's first listing faults
+    /// here (the first listing under the alert keyspace on a tick with the
+    /// memo read disabled); the sweep's listings after it succeed.
+    ///
+    /// Watch it fail: make the `Err(err)` arm of the gate match in
+    /// `run_alert_retention` return early. The tick then issues the failed
+    /// gate listing alone, a list of 1 against 7.
+    #[tokio::test]
+    async fn a_failed_gate_listing_still_runs_the_sweep() {
+        use ravel_object_store::fault::{FaultKind, Occurrence};
+
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("quiet").hash();
+        let keyspace = alert_keyspace(&tenant);
+        let store = ListLog::new(FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Transient("alert keyspace unavailable".into()),
+                )
+                .with_key_contains(keyspace.clone())
+                .with_occurrence(Occurrence::Nth(1)),
+            ),
+        ));
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        let disabled = CompactorConfig {
+            alert_retention_window_ns: 0,
+            ..CompactorConfig::default()
+        };
+
+        tick(&store, &tenant, &disabled, &safety, &worker, &live).await;
+
+        assert_eq!(
+            store.inner.fault_count(Op::List, FaultKind::Transient),
+            1,
+            "the gate's listing really faulted"
+        );
+        let mut expected = vec![keyspace];
+        expected.extend(sweep_listings(&tenant, false));
+        assert_eq!(store.take_alert_listings(&tenant), expected);
+    }
+
+    /// Issue #2134: a memo read puts an object under the alert keyspace, so a
+    /// tick that read one, whether the memo was usable or a skip reason, issues
+    /// neither of the gate's two listings and runs the sweep's listings
+    /// directly. Watch it fail: return `false` from the `Ready` arm of
+    /// `run_alert_retention_sweep`, and the usable-memo tick reads the gate's
+    /// keyspace listing ahead of the sweep's (one listing, not two: the memo
+    /// object it finds there ends the gate before the quarantine listing); the
+    /// same from the `Skip` arm, and the undecodable-memo tick does.
+    #[tokio::test]
+    async fn a_memo_read_issues_neither_gate_listing() {
+        let skip_body: &[u8] = b"not json";
+        for usable in [true, false] {
+            let memory = MemoryStore::new();
+            memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+            let tenant = TenantId::new("memo-only").hash();
+            if usable {
+                write_memo(&memory, &tenant, hour_of(NOW_NS) - 1, &[]).await;
+            } else {
+                memory
+                    .put(
+                        &alert_state_memo_key(&tenant),
+                        Bytes::from_static(skip_body),
+                        PutOptions::default(),
+                    )
+                    .await
+                    .expect("put memo");
+            }
+            let store = ListLog::new(memory);
+            let safety = MaintenanceSafetyMetrics::default();
+            let (worker, live) = solo();
+
+            tick(
+                &store,
+                &tenant,
+                &CompactorConfig::default(),
+                &safety,
+                &worker,
+                &live,
+            )
+            .await;
+
+            let case = if usable { "usable memo" } else { "skip memo" };
+            let keyspace = alert_keyspace(&tenant);
+            let listings = store.take_alert_listings(&tenant);
+            for gate in [keyspace.clone(), format!("quarantine/{keyspace}")] {
+                assert!(!listings.contains(&gate), "{case}: no gate listing {gate}");
+            }
+            // A usable memo runs the retention sweep, which lists the commit
+            // prefix once ahead of the orphan sweep.
+            let mut expected = Vec::new();
+            if usable {
+                expected.push(
+                    keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD)
+                        .expect("prefix"),
+                );
+            }
+            expected.extend(sweep_listings(&tenant, false));
+            assert_eq!(listings, expected, "{case}");
+            let expected_skips = if usable {
+                no_skips()
+            } else {
+                skipped_once(AlertRetentionSkipReason::Undecodable)
+            };
+            assert_eq!(skipped(&safety), expected_skips, "{case}");
+        }
+    }
+
+    /// A memo read that fails against object storage with something other than
+    /// not-found is counted under `store_error`, exactly once, and deletes
+    /// nothing. It is not one of the memo-state reasons: the memo may be
+    /// perfectly good and the store may be having a bad minute, so the tick
+    /// retries. Counting it is what tells a stalled sweep from a quiet one.
+    #[tokio::test]
+    async fn a_memo_read_that_fails_against_the_store_is_counted_as_store_error() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let store = FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Permanent("alert state memo unreadable".to_string()),
+                )
+                .with_key_contains("/a/state/latest"),
+            ),
+        );
+        let tenant = TenantId::new("acme").hash();
+
+        // One expired transition the sweep would delete under a readable memo,
+        // and a memo that names neither it nor anything else.
+        let expired = alert_record(1, AlertState::Firing, NOW_NS - 100 * NS_PER_DAY);
+        let written = write_transition(&store, &tenant, 1, &expired).await;
+        write_memo(&store, &tenant, hour_of(NOW_NS) - 1, &[]).await;
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(alert_keys(&store, &tenant).await, keys_of(&[&written]));
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::StoreError)
+        );
+    }
+
+    /// A memo whose `watermark_hour` is ahead of the clock cannot widen what the
+    /// sweep may delete. The driver clamps the watermark to the hour of the
+    /// injected `now`, so a record in an hour at or after `now` is kept without
+    /// a GET, exactly as a record in the watermark hour is.
+    ///
+    /// The window here is 45 minutes and `now` is 50 minutes into an hour, which
+    /// is what makes an expired record in `now`'s own hour possible at all: with
+    /// an hour-aligned `now` and a window of whole hours, every record in an
+    /// hour at or above `now`'s is younger than the expiry floor and the clamp
+    /// decides nothing. The control record two hours back proves the sweep ran.
+    ///
+    /// Watch it fail: drop `.min(now_hour)` from the `watermark_hour` binding in
+    /// `alert_keep_set`. The unclamped watermark sits three hours ahead, the
+    /// record's hour is then strictly below it, and it is deleted.
+    #[tokio::test]
+    async fn a_memo_watermark_ahead_of_now_cannot_delete_a_record_in_the_current_hour() {
+        const MINUTE_NS: i64 = 60 * 1_000_000_000;
+        let now_ns = NOW_NS + 50 * MINUTE_NS;
+
+        let store = MemoryStore::new();
+        store.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+
+        // Expired against a 45-minute window (the floor is NOW + 5 min), and in
+        // the same ingest hour as `now`.
+        let in_current_hour = alert_record(1, AlertState::Firing, NOW_NS + 2 * MINUTE_NS);
+        // Expired and two hours below the clamped watermark: the control.
+        let below = alert_record(2, AlertState::Firing, NOW_NS - 2 * NS_PER_HOUR);
+        let kept = write_transition(&store, &tenant, 1, &in_current_hour).await;
+        let swept = write_transition(&store, &tenant, 2, &below).await;
+        // A watermark three hours past `now`, naming no identity at all: a
+        // decodable memo from a replica whose clock ran ahead.
+        write_memo(&store, &tenant, hour_of(now_ns) + 3, &[]).await;
+
+        let compactor = CompactorConfig {
+            alert_retention_window_ns: 45 * MINUTE_NS,
+            // Both records are minutes old on this clock, so the horizon has to
+            // be out of the way for the expiry gate to be the one under test.
+            protection_horizon_ns: 0,
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let worker = WorkerSet::with_defaults(now_ns).with_process_id(Uuid::from_u128(1));
+        let live = worker.solo_live_set();
+        tick_at(now_ns, &store, &tenant, &compactor, &safety, &worker, &live).await;
+
+        assert_eq!(
+            alert_keys(&store, &tenant).await,
+            keys_of(&[&kept]),
+            "the record in `now`'s own hour survives and the one below the watermark does not"
+        );
+        assert!(
+            !exists(&store, &swept.commit_key).await,
+            "the sweep really ran: the control record two hours below the watermark is gone"
+        );
+        assert_eq!(skipped(&safety), no_skips());
+    }
+
+    /// The watermark boundary the driver's floor check sits on, which no other
+    /// driver test reaches: a memo whose `watermark_hour` is exactly the expiry
+    /// floor's hour is usable, and an expired record in that hour survives
+    /// because the sweep deletes only strictly below the watermark.
+    ///
+    /// The window is 90 days plus half an hour so that the expiry floor falls
+    /// mid-hour. With the default whole-hour window the floor hour starts
+    /// exactly at the floor, no record in it can be expired, and the hour
+    /// prefilter answers before the watermark rule is consulted at all.
+    ///
+    /// Watch it fail two ways:
+    ///
+    /// - replace `watermark_hour` with `u32::MAX` at the `AlertKeepSet::new`
+    ///   call in `alert_keep_set`: the floor-hour record is then strictly below
+    ///   the watermark, is fetched, is expired and past the horizon, is not in
+    ///   the keep set, and is deleted.
+    /// - change `if i64::from(watermark_hour) < floor_hour` to `<=` in
+    ///   `alert_keep_set`: the tenant is skipped under `watermark_below_floor`
+    ///   and nothing is deleted at all, so the two expired records below the
+    ///   watermark survive with it. The record this test is named for survives
+    ///   either way, which is why the survivor set is asserted whole rather than
+    ///   one key at a time.
+    #[tokio::test]
+    async fn a_memo_watermark_at_the_floor_hour_keeps_an_expired_record_in_that_hour() {
+        const HALF_HOUR_NS: i64 = 30 * 60 * 1_000_000_000;
+        let f = fixture().await;
+        let window_ns = 90 * NS_PER_DAY + HALF_HOUR_NS;
+        let floor_hour = hour_of(NOW_NS - window_ns);
+
+        // 45 minutes before the end of the floor hour: inside it, and older than
+        // the expiry floor 30 minutes further on.
+        let in_floor_hour = alert_record(
+            4,
+            AlertState::Firing,
+            NOW_NS - 90 * NS_PER_DAY - 45 * 60 * 1_000_000_000,
+        );
+        assert_eq!(hour_of(in_floor_hour.ts_ns), floor_hour);
+        let survivor = write_transition(&f.store, &f.tenant, 6, &in_floor_hour).await;
+        // The memo names identities 1 and 2 only, never identity 4.
+        write_memo(
+            &f.store,
+            &f.tenant,
+            floor_hour,
+            &[&f.latest[0], &f.latest[1]],
+        )
+        .await;
+
+        let compactor = CompactorConfig {
+            alert_retention_window_ns: window_ns,
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(&f.store, &f.tenant, &compactor, &safety, &worker, &live).await;
+
+        assert_eq!(
+            alert_keys(&f.store, &f.tenant).await,
+            keys_of(&[
+                &f.expired_current,
+                &f.in_window_current,
+                &f.above_watermark,
+                &survivor,
+            ]),
+            "the expired record in the watermark hour survives, and the two expired records \
+             below it do not"
+        );
+        assert_eq!(
+            skipped(&safety),
+            no_skips(),
+            "a watermark equal to the floor hour is usable, not a skip"
+        );
+    }
+
+    /// Enough record-less, old data objects in one shard to trip the
+    /// mass-orphan breaker under the default thresholds: over
+    /// `orphan_breaker_min_count`, and the whole shard, so the ratio holds too.
+    const MASS_ORPHANS: u64 = 60;
+
+    /// Seed [`MASS_ORPHANS`] record-less data objects into `(signal, shard)`,
+    /// written 100 days before `NOW_NS` so every one is past the orphan age
+    /// gate. Returns their keys.
+    async fn seed_mass_orphans(
+        store: &MemoryStore,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+    ) -> Vec<String> {
+        store.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let mut seeded = Vec::new();
+        for seq in 1..=MASS_ORPHANS {
+            let key = keys::data_key(
+                tenant,
+                signal,
+                shard,
+                Uuid::from_u128(u128::from(seq)),
+                1,
+                seq,
+                &[0u8; 32],
+            )
+            .expect("orphan data key");
+            store
+                .put(&key, Bytes::from_static(b"orphan"), PutOptions::default())
+                .await
+                .expect("seed an orphan");
+            seeded.push(key);
+        }
+        seeded
+    }
+
+    /// A breaker trip on the alerts shard's orphan sweep is counted, exactly
+    /// once, under `signal="alerts"` of the breaker-trip family, and nothing is
+    /// deleted or quarantined. The alerts shard is outside MAINTAINED_SIGNALS,
+    /// so `record_sweep` cannot count it.
+    ///
+    /// Watch it fail: delete the `record_unmaintained_orphan_breaker_trip` call
+    /// in `report_unmaintained_breaker_trip`. The count stays at 0.
+    #[tokio::test]
+    async fn an_alerts_shard_breaker_trip_is_counted_and_deletes_nothing() {
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let seeded = seed_mass_orphans(&store, &tenant, Signal::Alerts, ALERT_SHARD).await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(safety.unmaintained_orphan_breaker_trips(Signal::Alerts), 1);
+        assert_eq!(safety.unmaintained_orphan_breaker_trips(Signal::Audit), 0);
+        for key in &seeded {
+            assert!(exists(&store, key).await, "{key} was withheld, not deleted");
+        }
+        assert!(
+            list_all(&store, "quarantine/")
+                .await
+                .expect("list quarantine")
+                .is_empty(),
+            "a tripped breaker quarantines nothing"
+        );
+    }
+
+    /// The same for the query-audit shard's input-cleanup sweep: counted once
+    /// under `signal="audit"`, nothing deleted or quarantined.
+    ///
+    /// Watch it fail: delete the `record_unmaintained_orphan_breaker_trip` call
+    /// in `report_unmaintained_breaker_trip`. The count stays at 0.
+    #[tokio::test]
+    async fn a_query_audit_shard_breaker_trip_is_counted_and_deletes_nothing() {
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let seeded = seed_mass_orphans(&store, &tenant, Signal::Audit, QUERY_AUDIT_SHARD).await;
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(safety.unmaintained_orphan_breaker_trips(Signal::Audit), 1);
+        assert_eq!(safety.unmaintained_orphan_breaker_trips(Signal::Alerts), 0);
+        for key in &seeded {
+            assert!(exists(&store, key).await, "{key} was withheld, not deleted");
+        }
+        assert!(
+            list_all(&store, "quarantine/")
+                .await
+                .expect("list quarantine")
+                .is_empty(),
+            "a tripped breaker quarantines nothing"
+        );
+    }
+
+    /// A legal hold over the query-audit shard's L0 data prefix stops rule 2
+    /// on that shard's supersession chain groups, and the tick counts them
+    /// under `signal="audit"` of the legal-hold family.
+    ///
+    /// Tick 1 compacts two sealed query-audit records. Each raw L0 input of a
+    /// compaction is its own chain group, so the count is 2. The hold lands
+    /// after tick 1, and tick 2, past the compaction's protection horizon, runs
+    /// the input-cleanup sweep that would otherwise delete both inputs.
+    ///
+    /// Watch it fail: delete the
+    /// `safety.record_unmaintained_superseded(Signal::Audit, &report)` call in
+    /// `run_tick_with_clock`'s query-audit block. The inputs are still kept,
+    /// and the audit entry's `groups_held_by_legal_hold` reads 0 instead of 2.
+    #[tokio::test]
+    async fn a_tick_counts_a_query_audit_chain_a_legal_hold_keeps() {
+        let store = MemoryStore::new();
+        store.set_clock_ms(((NOW_NS - 6 * NS_PER_HOUR) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        for text in ["up", "rate(x[5m])"] {
+            ravel_maintain::write_query_audit(
+                &store,
+                &tenant,
+                NOW_NS - 6 * NS_PER_HOUR,
+                text,
+                "promql",
+                ravel_maintain::QueryStatus::Ok,
+                0,
+                0,
+            )
+            .await
+            .expect("write a query-audit record");
+        }
+        let [l0_prefix, _, _] =
+            ravel_maintain::shard_hold_scopes(&tenant, Signal::Audit, QUERY_AUDIT_SHARD)
+                .expect("scopes");
+        let inputs = list_all(&store, &l0_prefix).await.expect("list inputs");
+        assert_eq!(inputs.len(), 2);
+
+        let compactor = CompactorConfig::default();
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(&store, &tenant, &compactor, &safety, &worker, &live).await;
+        ravel_maintain::write_hold_set(
+            &store,
+            &tenant,
+            Uuid::from_u128(0xA0D1),
+            NOW_NS,
+            &l0_prefix,
+            "hold over the query-audit inputs",
+        )
+        .await
+        .expect("set hold");
+        tick_at(
+            NOW_NS + compactor.protection_horizon_ns + 1,
+            &store,
+            &tenant,
+            &compactor,
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        for meta in &inputs {
+            assert!(
+                exists(&store, &meta.key).await,
+                "{} is under the hold, so rule 2 keeps it",
+                meta.key
+            );
+        }
+        let snapshot = crate::metrics::MaintenanceSafetySnapshot::from_metrics(&safety);
+        assert_eq!(
+            snapshot.unmaintained_superseded,
+            vec![
+                (Signal::Alerts, UnmaintainedSupersededCounts::default()),
+                (
+                    Signal::Audit,
+                    UnmaintainedSupersededCounts {
+                        groups_held_by_legal_hold: 2,
+                        ..UnmaintainedSupersededCounts::default()
+                    }
+                ),
+            ],
+            "tick 2 skips both held chain groups, counted under signal audit"
+        );
+    }
+
+    /// No memo, and the one bounded listing that tells an unused alert keyspace
+    /// from a lost memo fails against the store: counted under `store_error`,
+    /// exactly once, not as `absent` and not as an unused keyspace. The
+    /// tenant does have a transition, so a skip is owed either way.
+    ///
+    /// Watch it fail: in `alert_keep_set`, replace
+    /// `alert_commit_prefix_is_empty(store, tenant).await?` with
+    /// `alert_commit_prefix_is_empty(store, tenant).await.unwrap_or(true)`. The
+    /// failed listing then reads as an empty keyspace and nothing is counted.
+    #[tokio::test]
+    async fn a_failed_absent_memo_listing_is_counted_as_store_error() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let store = FaultStore::new(
+            memory,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::List,
+                    ScriptedFault::Permanent("alert commit listing".to_string()),
+                )
+                .with_key_contains(commit_prefix)
+                .with_occurrence(Occurrence::Nth(1)),
+            ),
+        );
+        let expired = alert_record(1, AlertState::Firing, NOW_NS - 100 * NS_PER_DAY);
+        let written = write_transition(&store, &tenant, 1, &expired).await;
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Permanent),
+            1,
+            "the absent-memo listing is the call that failed"
+        );
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::StoreError)
+        );
+        assert_eq!(alert_keys(&store, &tenant).await, keys_of(&[&written]));
+    }
+
+    /// A store whose first listing of `prefix` from the start returns an empty
+    /// page that still carries a continuation token, which the listing
+    /// contract permits. Every other call passes through.
+    struct EmptyFirstPage {
+        inner: MemoryStore,
+        prefix: String,
+        served: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for EmptyFirstPage {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            if prefix == self.prefix
+                && page.is_none()
+                && !self.served.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(ravel_object_store::ListPage {
+                    objects: Vec::new(),
+                    next: Some(ravel_object_store::PageToken("more".to_string())),
+                });
+            }
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+
+        fn observed_store_time_ns(&self) -> Option<i64> {
+            self.inner.observed_store_time_ns()
+        }
+    }
+
+    /// No memo, and the absent-memo listing's first page is empty but carries a
+    /// continuation token: the keyspace may hold records, so it is counted as
+    /// `absent`, exactly once, not taken for an unused alert keyspace.
+    ///
+    /// Watch it fail: in `prefix_is_empty`, drop `&& page.next.is_none()`. The
+    /// empty first page then reads as an unused keyspace and nothing is
+    /// counted.
+    #[tokio::test]
+    async fn an_empty_first_page_with_a_continuation_token_is_not_an_unused_keyspace() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        let expired = alert_record(1, AlertState::Firing, NOW_NS - 100 * NS_PER_DAY);
+        let written = write_transition(&memory, &tenant, 1, &expired).await;
+        let store = EmptyFirstPage {
+            inner: memory,
+            prefix: keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD)
+                .expect("prefix"),
+            served: std::sync::atomic::AtomicBool::new(false),
+        };
+
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        tick(
+            &store,
+            &tenant,
+            &CompactorConfig::default(),
+            &safety,
+            &worker,
+            &live,
+        )
+        .await;
+
+        assert!(
+            store.served.load(std::sync::atomic::Ordering::SeqCst),
+            "the absent-memo listing saw the empty page"
+        );
+        assert_eq!(
+            skipped(&safety),
+            skipped_once(AlertRetentionSkipReason::Absent)
+        );
+        assert_eq!(alert_keys(&store, &tenant).await, keys_of(&[&written]));
+    }
+
+    /// The same page shape at the orphan sweep's gate: the gate's listing of
+    /// the alert keyspace comes back empty with a continuation token, over a
+    /// keyspace that really holds a record-less data object. The gate reads
+    /// that as non-empty, issues no quarantine listing, and the sweep runs and
+    /// quarantines the orphan.
+    ///
+    /// Watch it fail: in `prefix_is_empty`, drop `&& page.next.is_none()`. The
+    /// gate then lists the quarantine mirror too, finds it empty and skips the
+    /// sweep, and the listings read a list of 2 against 8.
+    #[tokio::test]
+    async fn an_empty_first_gate_page_with_a_continuation_token_still_sweeps() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(((NOW_NS - 100 * NS_PER_DAY) / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        let orphan = orphan_data_key(&tenant);
+        memory
+            .put(
+                &orphan,
+                Bytes::from_static(b"orphan"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put orphan");
+        let keyspace = alert_keyspace(&tenant);
+        let store = ListLog::new(EmptyFirstPage {
+            inner: memory,
+            prefix: keyspace.clone(),
+            served: std::sync::atomic::AtomicBool::new(false),
+        });
+        let safety = MaintenanceSafetyMetrics::default();
+        let (worker, live) = solo();
+        let disabled = CompactorConfig {
+            alert_retention_window_ns: 0,
+            ..CompactorConfig::default()
+        };
+
+        tick(&store, &tenant, &disabled, &safety, &worker, &live).await;
+
+        assert!(
+            store.inner.served.load(std::sync::atomic::Ordering::SeqCst),
+            "the gate's keyspace listing saw the empty page"
+        );
+        let mut expected = vec![keyspace];
+        expected.extend(sweep_listings(&tenant, true));
+        assert_eq!(store.take_alert_listings(&tenant), expected);
+        assert!(
+            !exists(&store.inner.inner, &orphan).await,
+            "the sweep quarantined the orphan"
+        );
+        assert_eq!(quarantined(&store.inner.inner, &tenant).await.len(), 1);
+    }
+}
+
+/// The one-per-deployment reap of dead query-worker heartbeat records under
+/// `sys/query/workers/`, which the maintain role runs because the query role
+/// holds no delete grant (ADR-0055 section 1).
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod query_worker_reap_tests {
+    use std::sync::atomic::AtomicU64;
+
+    use bytes::Bytes;
+    use parking_lot::Mutex;
+    use ravel_fleet::query_workers::{QueryWorkers, query_worker_key};
+    use ravel_maintain::owner;
+    use ravel_object_store::instrument::InstrumentedStore;
+    use ravel_object_store::list_all;
+    use ravel_object_store::memory::MemoryStore;
+
+    use super::*;
+
+    const H_NS: i64 = 60 * 1_000_000_000;
+    const H_MS: u64 = 60 * 1_000;
+    const NOW_NS: i64 = 1_000 * H_NS;
+    const NOW_MS: u64 = 1_000 * H_MS;
+
+    /// Write one query worker's record so the store reports `mtime_ms` as its
+    /// modification time, then put the store clock back at `restore_ms`.
+    async fn seed(memory: &MemoryStore, mtime_ms: u64, restore_ms: u64, stamp_ns: i64) -> String {
+        let worker = QueryWorkers::with_defaults("10.0.0.1:9443", "10.0.0.1:9000", 1);
+        memory.set_clock_ms(mtime_ms);
+        worker
+            .write_heartbeat(memory, stamp_ns)
+            .await
+            .expect("seed a query worker record");
+        memory.set_clock_ms(restore_ms);
+        query_worker_key(&worker.process_id().to_string())
+    }
+
+    async fn query_worker_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+        let mut keys: Vec<String> = list_all(store, QUERY_WORKERS_PREFIX)
+            .await
+            .expect("list the query worker prefix")
+            .into_iter()
+            .map(|meta| meta.key)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Two maintain processes share one live set. The one that owns the reap
+    /// unit deletes exactly the records past the reap horizon and keeps a live
+    /// one and one inside the clock-skew margin; the other issues no LIST and
+    /// no delete under the prefix at all.
+    #[tokio::test]
+    async fn only_the_reap_unit_owner_reaps_dead_query_worker_keys() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(NOW_MS);
+        let live_key = seed(&memory, NOW_MS, NOW_MS, NOW_NS).await;
+        let margin_key = seed(&memory, NOW_MS - 4 * H_MS, NOW_MS, NOW_NS - 4 * H_NS).await;
+        for _ in 0..2 {
+            seed(&memory, NOW_MS - 10 * H_MS, NOW_MS, NOW_NS - 10 * H_NS).await;
+        }
+        let store = InstrumentedStore::new(memory);
+
+        let a = WorkerSet::with_defaults(NOW_NS).with_process_id(Uuid::from_u128(1));
+        let b = WorkerSet::with_defaults(NOW_NS).with_process_id(Uuid::from_u128(2));
+        let live_set = vec![a.process_id(), b.process_id()];
+        let owner_id = owner(QUERY_WORKER_REAP_UNIT, &live_set).expect("a non-empty live set");
+        let (owning, other) = if owner_id == a.process_id() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+
+        let before = store.metrics().snapshot();
+        let pass = reap_query_worker_heartbeats(&store, other, &live_set, NOW_NS).await;
+        let after = store.metrics().snapshot();
+        assert_eq!(pass, None, "the non-owner does not reap");
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            0,
+            "the non-owner lists nothing"
+        );
+        assert_eq!(
+            after.delete.calls - before.delete.calls,
+            0,
+            "the non-owner deletes nothing"
+        );
+
+        let before = store.metrics().snapshot();
+        let pass = reap_query_worker_heartbeats(&store, owning, &live_set, NOW_NS).await;
+        let after = store.metrics().snapshot();
+        assert_eq!(
+            pass,
+            Some(ReapPass {
+                reaped: 2,
+                access_denied: false
+            }),
+            "the owner reaps exactly the two dead records"
+        );
+        assert!(after.list_calls() > before.list_calls(), "the owner listed");
+        assert_eq!(after.delete.calls - before.delete.calls, 2);
+
+        let mut expected = vec![live_key, margin_key];
+        expected.sort();
+        assert_eq!(query_worker_keys(&store).await, expected);
+    }
+
+    /// The maintain tick is the caller: one discovery cycle on a single
+    /// maintain process reaps a dead query-worker record, over a store holding
+    /// no tenant at all. The horizon is judged at the clock the caller
+    /// injects: [`NOW_NS`] is decades before the wall clock, so a cycle that
+    /// read the wall clock instead would reap the live record too.
+    #[tokio::test]
+    async fn a_discovery_cycle_reaps_dead_query_worker_keys() {
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(NOW_MS);
+        let live_key = seed(&memory, NOW_MS, NOW_MS, NOW_NS).await;
+        seed(&memory, NOW_MS - 10 * H_MS, NOW_MS, NOW_NS - 10 * H_NS).await;
+
+        let worker = WorkerSet::with_defaults(0);
+        let mut memo = MaintainMemo::with_default_interval();
+        run_discovery_cycle(
+            &memory,
+            None,
+            &CompactorConfig::default(),
+            &RetentionConfig::default(),
+            1,
+            &mut memo,
+            &TenantDiscoveryMetrics::default(),
+            &MaintenanceSafetyMetrics::default(),
+            &MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS),
+            &worker,
+            &worker.solo_live_set(),
+            &ravel_maintain::FixedClock::new(NOW_NS),
+        )
+        .await;
+
+        assert_eq!(query_worker_keys(&memory).await, vec![live_key]);
+    }
+
+    /// A store that refuses every delete as `AccessDenied`, as S3 does for a
+    /// credential without `s3:DeleteObject`, and counts the deletes.
+    struct DenyDeletes {
+        inner: MemoryStore,
+        deletes: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for DenyDeletes {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::AccessDenied("no s3:DeleteObject".to_string()))
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Every event at WARN or above, as `(level, fields)`.
+    struct EventCapture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let level = *event.metadata().level();
+            if level > tracing::Level::WARN {
+                return;
+            }
+            #[derive(Default)]
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            self.0.lock().push((level, visitor.0));
+        }
+    }
+
+    /// Under a credential with no delete grant, a reap pass over five dead
+    /// records issues exactly one delete, logs the denial once at error with
+    /// the prefix and the undeleted count, logs no per-key warning, and
+    /// returns with the denial reported.
+    #[tokio::test]
+    async fn a_denied_reap_issues_one_delete_and_logs_once() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let memory = MemoryStore::new();
+        memory.set_clock_ms(NOW_MS);
+        for _ in 0..5 {
+            seed(&memory, NOW_MS - 10 * H_MS, NOW_MS, NOW_NS - 10 * H_NS).await;
+        }
+        let store = DenyDeletes {
+            inner: memory,
+            deletes: AtomicU64::new(0),
+        };
+        let worker = WorkerSet::with_defaults(NOW_NS);
+
+        let captured: Arc<Mutex<Vec<(tracing::Level, String)>>> = Arc::default();
+        let subscriber = tracing_subscriber::registry().with(EventCapture(captured.clone()));
+        let pass = {
+            let _guard = tracing::subscriber::set_default(subscriber);
+            reap_query_worker_heartbeats(&store, &worker, &worker.solo_live_set(), NOW_NS).await
+        };
+
+        assert_eq!(
+            pass,
+            Some(ReapPass {
+                reaped: 0,
+                access_denied: true
+            })
+        );
+        assert_eq!(
+            store.deletes.load(Ordering::SeqCst),
+            1,
+            "the pass stops at the first denied delete"
+        );
+        let events = captured.lock().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one event at warn or above: {events:?}"
+        );
+        let (level, fields) = &events[0];
+        assert_eq!(*level, tracing::Level::ERROR);
+        assert!(
+            fields.contains("prefix=\"sys/query/workers/\"") && fields.contains("undeleted=5"),
+            "the error names the prefix and the undeleted count: {fields}"
+        );
+        assert_eq!(query_worker_keys(&store).await.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod erasure_rewrite_accounting_tests {
+    //! How one erasure rewrite outcome is counted (ADR-1029, the 2026-10-03
+    //! amendment): each abandonment reason lands on its own counter, or on
+    //! none, and every abandoned publish defers the tick's completion.
+
+    use ravel_maintain::{Checkpoint, ClaimAcquisition, ClaimSkipReason, PublishOutcome};
+
+    use super::*;
+
+    fn tally(
+        publish: PublishOutcome,
+        abandoned: Option<ErasureAbandon>,
+        claim: Option<ClaimAcquisition>,
+    ) -> ErasureRewritePass {
+        let mut pass = ErasureRewritePass::default();
+        tally_erasure_rewrite(&mut pass, &publish, abandoned, claim);
+        pass
+    }
+
+    /// A claim held by another process is a claim skip, and nothing else.
+    /// Fails if the `ClaimHeld` arm of `tally_erasure_rewrite` counts onto
+    /// `claims_lost` or `rewritten` instead.
+    #[test]
+    fn a_claim_held_by_another_process_counts_as_a_claim_skip() {
+        let pass = tally(
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::ClaimHeld {
+                reason: ClaimSkipReason::HeldByAnother,
+            }),
+            None,
+        );
+        assert_eq!(
+            pass,
+            ErasureRewritePass {
+                claim_backoffs: 1,
+                deferred: true,
+                ..ErasureRewritePass::default()
+            }
+        );
+    }
+
+    /// A claim taken (here, stolen) and then lost counts as acquired, stolen
+    /// and lost, never as a skip.
+    #[test]
+    fn a_claim_lost_mid_run_counts_as_lost_and_its_acquisition_counts() {
+        let pass = tally(
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::ClaimLost {
+                at: Checkpoint::Publish,
+            }),
+            Some(ClaimAcquisition { stolen: true }),
+        );
+        assert_eq!(
+            pass,
+            ErasureRewritePass {
+                claims_lost: 1,
+                claims_acquired: 1,
+                claims_stolen: 1,
+                deferred: true,
+                ..ErasureRewritePass::default()
+            }
+        );
+    }
+
+    /// A re-list that found the record set changed, with no claim involved, and
+    /// a deadline abandonment under a held claim land on no claim-skip or
+    /// claim-lost counter, and still defer the tick. Before the reason was
+    /// carried, either was counted as a claim skip whenever it built no parts.
+    #[test]
+    fn a_relist_abort_and_a_deadline_count_on_no_claim_counter() {
+        let relist = tally(
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::RecordSetChanged),
+            None,
+        );
+        assert_eq!(
+            relist,
+            ErasureRewritePass {
+                deferred: true,
+                ..ErasureRewritePass::default()
+            }
+        );
+
+        let deadline = tally(
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::Deadline),
+            Some(ClaimAcquisition { stolen: false }),
+        );
+        assert_eq!(
+            deadline,
+            ErasureRewritePass {
+                claims_acquired: 1,
+                deferred: true,
+                ..ErasureRewritePass::default()
+            }
+        );
+    }
+
+    /// A published rewrite is counted as rewritten and does not defer; its
+    /// fresh claim counts as acquired and not stolen.
+    #[test]
+    fn a_published_rewrite_counts_as_rewritten_and_does_not_defer() {
+        let pass = tally(
+            PublishOutcome::Published,
+            None,
+            Some(ClaimAcquisition { stolen: false }),
+        );
+        assert_eq!(
+            pass,
+            ErasureRewritePass {
+                rewritten: 1,
+                claims_acquired: 1,
+                ..ErasureRewritePass::default()
+            }
+        );
+    }
+}

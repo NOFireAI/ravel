@@ -1,0 +1,634 @@
+#!/usr/bin/env node
+// PreToolUse guard: refuses tool calls that CLAUDE.md forbids, so the rule
+// does not depend on a session choosing to remember it.
+//
+// Contract: reads the hook payload on stdin, prints a PreToolUse decision on
+// stdout, exits 0. Any parse or filesystem error means allow: a guard that
+// blocks on its own bug would kill unattended fleet tasks.
+
+import { readFileSync, existsSync, statSync } from "node:fs";
+import { dirname, resolve, sep } from "node:path";
+
+const WAKEUP_FLOOR_SECONDS = 900;
+
+function allow() {
+  process.stdout.write("{}");
+  process.exit(0);
+}
+
+function deny(reason) {
+  process.stdout.write(
+    JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: reason,
+      },
+    }),
+  );
+  process.exit(0);
+}
+
+function readStdin() {
+  try {
+    return JSON.parse(readFileSync(0, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// --- Bash rules ---------------------------------------------------------
+
+// Commands whose exit code is a gate. Matched only in command position, so
+// a gate name quoted inside a grep pattern is not a gate.
+// A guard's own test suite is a gate too: its exit code is the evidence that
+// a change to the guard is safe, and `[a-z0-9-]+\.sh` did not match
+// `disk-watchdog.test.sh`, whose extra dot falls outside the class. Both
+// guard directories are listed; the hook itself lives under `.claude`.
+// cargo's own flags sit BEFORE the subcommand (`cargo --locked test`,
+// `cargo +nightly clippy`, `cargo -q test`), and a pattern anchored on
+// `cargo\s+(test|clippy|...)` matches none of them: `cargo --locked test |
+// tail -1` was allowed, which is the exact command this rule exists to
+// refuse. Flags take an `=value` form only here; a flag with a separate
+// value argument would need the value consumed too, and over-consuming
+// turns a false allow into a false deny.
+const GATE_HEAD =
+  /^(cargo(\s+(\+[A-Za-z0-9._-]+|--?[A-Za-z][A-Za-z0-9-]*(=\S+)?))*\s+(clippy|test|nextest|fmt|build|check)|(\.\/)?(scripts\/((gates|affected-tests|verify-dispatch-gates)\.sh|guards\/[a-z0-9.-]+\.sh)|\.claude\/guards\/[a-z0-9.-]+\.sh))\b/;
+// Things that may legitimately precede a gate on the same command line.
+// A bare assignment may precede a gate (`FOO=1 cargo test`). One plain
+// alternative for it: an earlier version added a separate `NAME=$(`
+// alternative so the command inside a substitution would be matched, and
+// that made `FOO=$(date) cargo test | tail -1` ALLOW, because the prefix
+// consumed `FOO=$(` and left `date) cargo test`, which is not a gate. The
+// substitution case does not need an alternative here at all; `scanTexts`
+// scans substitution bodies as commands in their own right, and
+// `blankSubstitutions` below collapses a substitution to one word so the
+// gate AFTER it is still seen.
+const HARMLESS_PREFIX =
+  /^(\s*(cd\s+[^&;|]+&&|[A-Za-z_][A-Za-z0-9_]*=[^\s]*|timeout(\s+-[A-Za-z-]+(=[^\s]+)?)*(\s+\d+[smhd]?)?\s+\d+(\.\d+)?[smhd]?|time|nice(\s+-n\s*-?\d+)?|env|bash|sh|zsh|if|while|until|!)\s*)+/;
+const MASKING_FILTER = /^\s*(tail|head|grep|rg|sed)\b/;
+const MASKING_ECHO = /&&\s*echo\b/;
+
+// zsh marks these read-only; assigning to one kills the enclosing loop with
+// no output that looks like a failure.
+const RESERVED_ASSIGN = /(^|[;&|(]|\bdo\b|\bthen\b|\blocal\b|\bexport\b)\s*(status|path|argv|PWD)=/;
+
+// --- destructive git rules ----------------------------------------------
+//
+// These three discard work that no later command can recover: a reset onto
+// a remote ref drops local commits, filter-branch rewrites every id, and a
+// force-push to main or to a reviewed branch deletes published history.
+// .githooks/pre-push catches the push at the git level (it detects the
+// history drop structurally, since the hook never sees the flag), but it
+// runs too late for a reset and never for filter-branch, and a hook is only
+// installed where someone ran the installer. This is the copy that binds
+// every session in this repository.
+//
+// The escape hatch must be read from the command TEXT. Shell state does not
+// persist between tool calls, so `export ALLOW_DESTRUCTIVE=1` in an earlier
+// call is gone; the only spelling that works is the inline assignment, and
+// that is exactly what HARMLESS_PREFIX strips. So this is tested against the
+// raw statement, before any prefix is removed -- stripping first would
+// delete the escape hatch and then refuse the command for lacking it.
+const ALLOW_DESTRUCTIVE =
+  /(^|[\s;&|(])ALLOW_DESTRUCTIVE=(1|true|yes)(\s|$)/;
+const GIT_HEAD = /^git(\s+-[A-Za-z-]+(\s+\S+)?)*\s/;
+// The quote before the ref is not decoration: `git reset --hard 'origin/main'`
+// discards exactly as much as the unquoted spelling, and a pattern demanding
+// whitespace immediately before `origin/` allows it. A guard that a habit of
+// quoting turns off is not a guard.
+const REMOTE_REF = `['"]?(origin\\/|upstream\\/|refs\\/remotes\\/|@\\{u(pstream)?\\}|FETCH_HEAD)`;
+const RESET_REMOTE = new RegExp(
+  `\\breset\\b[^|;&]*\\s--(hard|soft|merge|keep)\\b[^|;&]*\\s${REMOTE_REF}`,
+);
+const RESET_REMOTE_FLAG_LAST = new RegExp(
+  `\\breset\\b[^|;&]*\\s${REMOTE_REF}\\S*\\s+--(hard|soft|merge|keep)\\b`,
+);
+const FILTER_BRANCH = /\bfilter-branch\b/;
+// Any leading-`+` refspec, not only the fully-qualified one. `git push origin
+// +main` is the common spelling and it rewrites published history exactly like
+// `+refs/heads/main`; requiring `refs/` here made PUSH_TARGETS_MAIN's own
+// `+main` and `HEAD:main` alternatives unreachable for this path.
+const FORCE_PUSH = /\bpush\b[^|;&]*(\s(-f|--force|--force-with-lease(=\S*)?)\b|\s\+\S)/;
+// Only the spellings that name main. A force-push to any other branch is
+// left to the pre-push hook, which can ask whether that branch has an open
+// pull request; this guard cannot, because it must stay offline and fast.
+//
+// The target must END at main. A bare `\b` after it also matched
+// `main-experiment`, `main/foo` and `main.2`, which refused ordinary work on
+// branches that merely start with the word.
+const PUSH_TARGETS_MAIN =
+  /(\s['"]?\+?(refs\/heads\/)?main['"]?(\s|$)|\s['"]?\+?\S+:(refs\/heads\/)?main['"]?(\s|$))/;
+
+// --- bare 40-hex-char SHA literal rule ----------------------------------
+//
+// A 40-character hex run typed into a Bash command is almost always a git
+// SHA completed from a shorter prefix read off adjacent tool output. A
+// wrong digit has been recorded six times in this repository's sessions;
+// every time it was the RECEIVING system that caught it (GitHub's
+// --match-head-commit, --force-with-lease, the fleet control plane), never
+// the person, and twice in a session that had already read the note
+// forbidding it. The fix is always the same shape: resolve the SHA with a
+// command substitution in the same command that consumes it, so the
+// literal text never exists for a person to mistype.
+//
+// The boundary requires a non-hex character (or a string edge) on both
+// sides, so this matches a run of EXACTLY 40 hex characters: a 39- or
+// 41-char run cannot satisfy it, and neither can a 40-char window sitting
+// inside a longer unbroken hex run, because every such window has a hex
+// character just outside one of its two edges.
+const BARE_SHA_LITERAL = /(^|[^0-9a-fA-F])[0-9a-fA-F]{40}([^0-9a-fA-F]|$)/;
+// Same spelling and same reasoning as ALLOW_DESTRUCTIVE above: shell state
+// does not persist between tool calls, so the inline assignment in the
+// command text is the only spelling that can work.
+const ALLOW_LITERAL_SHA = /(^|[\s;&|(])ALLOW_LITERAL_SHA=(1|true|yes)(\s|$)/;
+
+// Tested once against the whole command rather than per statement: the
+// literal can sit on a continuation line or inside a substitution body, each
+// of which is its own statement here, and the prefix is only ever on the
+// first. The hatch is voluntary, so widening its scope admits nothing a
+// session could not already spell.
+function shaLiteralAllowed(rawCommand) {
+  return (
+    ALLOW_LITERAL_SHA.test(rawCommand) ||
+    process.env.ALLOW_LITERAL_SHA === "1"
+  );
+}
+
+// Judged on the raw statement, same as checkDestructiveGit: a substitution
+// body reaches this too, because scanTexts queues every substitution body
+// as its own statement, and a heredoc body never reaches it at all, because
+// checkBash strips heredoc bodies before scanTexts ever runs. A fixture SHA
+// written into a heredoc is data, not a command, and needs no escape hatch.
+function checkBareSha(rawStatement, allowed) {
+  const stmt = rawStatement.trim();
+  if (!BARE_SHA_LITERAL.test(stmt)) return;
+  if (allowed) return;
+  deny(
+    "This command contains a bare 40-character hex literal. Which fix is " +
+      "right depends on where the literal came from. " +
+      "TYPED OR COMPLETED FROM MEMORY (a prefix read off earlier output and " +
+      "finished by hand): resolve it in the same command instead, e.g. " +
+      '`sha=$(git rev-parse origin/main)` for a dispatch ref. A wrong ' +
+      "digit is otherwise only caught by whatever receives it. " +
+      "COPIED FROM A CHECK YOU JUST RAN (the --match-head-commit value " +
+      "scripts/pr-review-status.sh printed, a ref you are asking a guard " +
+      "to validate): the literal IS the check. Do NOT re-resolve it: a " +
+      "re-resolved head matches whatever the head is now, so a push that " +
+      "landed after the check merges unreviewed, and a guard handed a " +
+      "freshly resolved value passes vacuously. Keep the literal and prefix " +
+      "the command with ALLOW_LITERAL_SHA=1; pr-review-status.sh already " +
+      "prints its merge line that way. The same prefix covers fixtures, " +
+      "doc examples and non-SHA hashes.",
+  );
+}
+
+// Command substitutions are checked as commands in their own right. Extending
+// the harmless-prefix list instead only ever covers the spellings someone
+// thought to enumerate: `out=$(gate | tail -1)` was covered and the same line
+// with quotes around the substitution, or in backticks, was not, though all
+// three run the gate and read the pipe's status. Single-quoted text is skipped
+// because no substitution happens inside it.
+function substitutionBodies(text) {
+  const bodies = [];
+  let sq = false;
+  let dq = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "'" && !dq) {
+      sq = !sq;
+      continue;
+    }
+    if (c === '"' && !sq) {
+      dq = !dq;
+      continue;
+    }
+    if (sq) continue;
+    if (c === "$" && text[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < text.length && depth > 0; j++) {
+        if (text[j] === "(") depth++;
+        else if (text[j] === ")") depth--;
+      }
+      bodies.push(text.slice(i + 2, depth === 0 ? j - 1 : text.length));
+      i = j - 1;
+      continue;
+    }
+    if (c === "`") {
+      const end = text.indexOf("`", i + 1);
+      bodies.push(text.slice(i + 1, end === -1 ? text.length : end));
+      i = end === -1 ? text.length : end;
+    }
+  }
+  return bodies;
+}
+
+// A heredoc body is data, not shell. Statements split on newlines, so a
+// document that QUOTES a piped gate is otherwise refused line by line: the
+// commit message describing this rule could not be written by the tool that
+// writes commit messages. Only the body is dropped, so a real gate elsewhere
+// in the same command is still judged; exempting the whole command whenever
+// it contains `<<` is what the reserved-name rule did, and that let a real
+// `status=` through beside an unrelated heredoc.
+// Fails closed: a body is dropped only once its terminator is actually
+// found. An earlier version consumed to end-of-input when no terminator
+// existed, which silently deleted every remaining line from every rule. A
+// herestring (`<<<WORD`) and a bare `<<` inside a quoted string both matched
+// as openers, so `git commit -m "use << HEAD trick"` followed by a piped gate
+// disabled the guard for the rest of the command. That is this rule's own
+// motivating case, quoting shell in a commit message, turned into a hole.
+// The heredoc openers on one line, found by walking it with quote state
+// rather than by matching a regex over the whole line.
+//
+// A regex cannot do this. `<<` inside a quoted string is ordinary text, but a
+// pattern scanning the line parses a tag out of it anyway, and when a later
+// line coincidentally equals that tag a terminator IS found, so the real
+// commands between them are deleted from every rule. Fail-closed on a missing
+// terminator does not help, because the terminator exists. Six spellings of
+//
+//     git commit -m 'use << EOF here'
+//     cargo test -p x | tail -1
+//     EOF
+//
+// were refused by the guard on main and allowed here until this replaced the
+// pattern. Found by an uncurated corpus, not by cases written from the
+// findings: every case written by hand was two lines long and so exercised
+// the fail-closed path instead of this one.
+function heredocDelims(line) {
+  const delims = [];
+  let sq = false;
+  let dq = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === "\\" && !sq) {
+      i++;
+      continue;
+    }
+    if (c === "'" && !dq) {
+      sq = !sq;
+      continue;
+    }
+    if (c === '"' && !sq) {
+      dq = !dq;
+      continue;
+    }
+    if (sq || dq) continue;
+    if (c !== "<" || line[i + 1] !== "<") continue;
+    // `<<<` is a herestring, not a heredoc: no body follows. Consume the
+    // WHOLE run of `<`, not just three. Skipping a fixed two left the
+    // behaviour alternating with the run length: `<<<< EOF` parsed no tag
+    // (fail closed) while `<<<<< EOF` parsed `EOF` and stripped the lines
+    // after it (fail open). Neither spelling is valid shell, but only one of
+    // those two answers is safe, and a rule that alternates is not a rule.
+    // Found by enumerating 444,440 strings, which reported 30 differences
+    // where the argument said there would be none.
+    if (line[i + 2] === "<") {
+      let k = i + 2;
+      while (line[k] === "<") k++;
+      i = k - 1;
+      continue;
+    }
+    let j = i + 2;
+    let dash = false;
+    if (line[j] === "-") {
+      dash = true;
+      j++;
+    }
+    while (line[j] === " " || line[j] === "\t") j++;
+    const quote = line[j] === "'" || line[j] === '"' ? line[j] : "";
+    if (quote) j++;
+    let tag = "";
+    while (j < line.length && /[A-Za-z0-9_]/.test(line[j])) {
+      tag += line[j];
+      j++;
+    }
+    // Consume the delimiter's own closing quote so the walk does not read it
+    // as opening a string for the rest of the line.
+    if (quote && line[j] === quote) j++;
+    if (tag !== "" && /[A-Za-z_]/.test(tag[0])) delims.push({ tag, dash });
+    i = j - 1;
+  }
+  return delims;
+}
+
+function stripHeredocBodies(text) {
+  const lines = text.split("\n");
+  const kept = [];
+  for (let i = 0; i < lines.length; i++) {
+    kept.push(lines[i]);
+    const delims = heredocDelims(lines[i]);
+    for (const d of delims) {
+      let j = i + 1;
+      while (j < lines.length) {
+        const line = d.dash ? lines[j].replace(/^\t+/, "") : lines[j];
+        if (line === d.tag) break;
+        j++;
+      }
+      // No terminator: this was not a heredoc opener. Keep the lines.
+      if (j >= lines.length) break;
+      i = j;
+    }
+  }
+  return kept.join("\n");
+}
+
+// Collapse a command substitution to a single whitespace-free token, for the
+// prefix decision only. An assignment whose VALUE is a substitution is then
+// one word, so the gate after the closing paren is still seen, and a value
+// containing a space (`TS=$(date +%s) cargo test | tail -1`) no longer hides
+// it either. The bodies themselves are scanned separately by `scanTexts`, so
+// nothing is lost by blanking them here.
+//
+// THIS is the load-bearing defence, and the single plain assignment
+// alternative in HARMLESS_PREFIX is the fallback. Reverting the alternation
+// alone leaves the suite green, which reads as "unpinned, delete it" and is
+// the opposite of the truth: neutering this function alone fails a case, and
+// reverting both fails four. If this is ever removed or reordered, the plain
+// `NAME=[^\s]*` alternative still catches every space-free value; the older
+// two-alternative form caught none of them. Keep both.
+//
+// A mis-slice here cannot produce a false ALLOW, and the reason is
+// structural rather than careful coding: this feeds only the prefix
+// decision, while `scanTexts` scans every substitution body as its own
+// command. When this swallows too much (an unterminated `$(` collapses the
+// tail to one token), the body scan still sees the gate. A false allow needs
+// both to miss at once.
+function blankSubstitutions(text) {
+  let out = "";
+  let sq = false;
+  let dq = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === "\\" && !sq) {
+      out += text.slice(i, i + 2);
+      i++;
+      continue;
+    }
+    if (c === "'" && !dq) {
+      sq = !sq;
+      out += c;
+      continue;
+    }
+    if (c === '"' && !sq) {
+      dq = !dq;
+      out += c;
+      continue;
+    }
+    if (!sq && c === "$" && text[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      for (; j < text.length && depth > 0; j++) {
+        if (text[j] === "(") depth++;
+        else if (text[j] === ")") depth--;
+      }
+      out += "SUB";
+      i = j - 1;
+      continue;
+    }
+    if (!sq && c === "`") {
+      const end = text.indexOf("`", i + 1);
+      out += "SUB";
+      i = end === -1 ? text.length : end;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+function splitStatements(command) {
+  // Rough statement split. Over-splitting only weakens a rule; it never
+  // invents a violation, because each rule needs its whole pattern in one
+  // fragment.
+  return command.split(/\n|;/);
+}
+
+// Split on a real pipe, leaving `||` alone.
+function splitPipeline(stmt) {
+  return stmt.split(/\|(?!\|)/);
+}
+
+function startsWithGate(fragment) {
+  return GATE_HEAD.test(
+    blankSubstitutions(fragment).replace(HARMLESS_PREFIX, ""),
+  );
+}
+
+// The git subcommand, or "". Matched on the ARGUMENT position rather than
+// anywhere in the line: `git commit -m "document git push --force origin
+// main"` contains every token of a force-push and is a commit.
+function gitSubcommand(fragment) {
+  const stripped = blankSubstitutions(fragment)
+    .replace(HARMLESS_PREFIX, "")
+    .trim();
+  if (!GIT_HEAD.test(stripped + " ")) return "";
+  const tokens = stripped.split(/\s+/).slice(1);
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i];
+    if (t === "-C" || t === "-c" || t === "--git-dir" || t === "--work-tree") {
+      i++;
+      continue;
+    }
+    if (t.startsWith("-")) continue;
+    return t;
+  }
+  return "";
+}
+
+// Judged on the raw statement: see the comment on ALLOW_DESTRUCTIVE.
+function destructiveAllowed(rawStatement) {
+  return (
+    ALLOW_DESTRUCTIVE.test(rawStatement) ||
+    process.env.ALLOW_DESTRUCTIVE === "1"
+  );
+}
+
+function checkDestructiveGit(rawStatement) {
+  const stmt = rawStatement.trim();
+  const sub = gitSubcommand(stmt);
+  if (sub !== "reset" && sub !== "push" && sub !== "filter-branch") return;
+  const allowed = destructiveAllowed(stmt);
+
+  const loss =
+    "Print what it would discard first: " +
+    "`scripts/guards/show-destructive-loss.sh <target-ref> [--from <ref>] [--hard]`. " +
+    "Then re-run the command with ALLOW_DESTRUCTIVE=1 in front of it if the loss is what you want.";
+
+  if (RESET_REMOTE.test(stmt) || RESET_REMOTE_FLAG_LAST.test(stmt)) {
+    if (allowed) return;
+    deny(
+      "`git reset --hard/--soft` onto a remote ref drops every local commit " +
+        "that is not on that ref, and --hard also erases uncommitted work " +
+        "with no reflog entry to recover it. " +
+        loss,
+    );
+  }
+
+  if (FILTER_BRANCH.test(stmt)) {
+    if (allowed) return;
+    deny(
+      "`git filter-branch` rewrites every commit id on the branch, which " +
+        "orphans anything built on the old ids (open pull requests, fleet " +
+        "task refs, other sessions' worktrees). " +
+        loss,
+    );
+  }
+
+  if (FORCE_PUSH.test(stmt) && PUSH_TARGETS_MAIN.test(stmt)) {
+    if (allowed) return;
+    deny(
+      "A force-push to main deletes published history for everyone, and " +
+        "main is protected: land through a pull request instead. " +
+        "(.githooks/pre-push covers the same push at the git level, plus " +
+        "any branch with an open pull request.) " +
+        loss,
+    );
+  }
+}
+
+// The command itself plus every command substitution nested inside it. The
+// depth cap is a backstop against pathological input, not a real limit: two
+// levels covers anything a session writes by hand.
+function scanTexts(command) {
+  const texts = [];
+  const queue = [command];
+  while (queue.length > 0 && texts.length < 64) {
+    const text = queue.shift();
+    texts.push(text);
+    for (const body of substitutionBodies(text)) queue.push(body);
+  }
+  return texts;
+}
+
+function checkBash(rawCommand) {
+  if (typeof rawCommand !== "string" || rawCommand === "") return;
+  const command = stripHeredocBodies(rawCommand);
+  const shaAllowed = shaLiteralAllowed(command);
+
+  for (const raw of scanTexts(command).flatMap(splitStatements)) {
+    const stmt = raw.trim();
+    if (stmt === "") continue;
+
+    const stages = splitPipeline(stmt);
+    if (stages.length > 1 && startsWithGate(stages[0].trim())) {
+      const filtered = stages.slice(1).some((s) => MASKING_FILTER.test(s));
+      if (filtered) {
+        deny(
+          "A gate piped into tail/head/grep/rg/sed reports the pipe's exit " +
+            "code, not the gate's. Run the gate on its own and read its " +
+            "output, or write the output to a file and grep the file " +
+            "afterwards.",
+        );
+      }
+    }
+
+    if (startsWithGate(stmt) && MASKING_ECHO.test(stmt)) {
+      deny(
+        "`&& echo MARKER` after a gate masks the gate's exit code. Run the " +
+          "gate alone and check its status directly.",
+      );
+    }
+
+    // Heredoc bodies are already gone, so this judges real shell only. The
+    // condition here used to be `!command.includes("<<")`, which exempted a
+    // reserved assignment sitting beside an unrelated heredoc.
+    if (RESERVED_ASSIGN.test(stmt)) {
+      deny(
+        "zsh reserves status, path, argv and PWD. Assigning to one fails " +
+          "with `read-only variable` and silently kills the enclosing " +
+          "loop. Use a different name (rc, target_path, args).",
+      );
+    }
+
+    checkDestructiveGit(stmt);
+    checkBareSha(stmt, shaAllowed);
+  }
+}
+
+// --- Edit/Write rules ---------------------------------------------------
+
+function gitDirFor(startPath) {
+  let dir = existsSync(startPath) && statSync(startPath).isDirectory()
+    ? startPath
+    : dirname(startPath);
+  for (let i = 0; i < 64; i += 1) {
+    const candidate = resolve(dir, ".git");
+    if (existsSync(candidate)) return { repoRoot: dir, gitPath: candidate };
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return null;
+}
+
+// A dispatched fleet clone IS the isolated workspace, and CLAUDE.md exempts
+// it. Two independent signals, because a false block there loses a task:
+// the clone lives under the fleet work root, and it hosts no linked
+// worktrees of its own.
+function isExemptCheckout(repoRoot, gitPath) {
+  if (process.env.RAVEL_GUARD_ALLOW_PRIMARY === "1") return true;
+  const normalized = repoRoot.split(sep).join("/");
+  if (normalized.includes("/fleet/work/") || normalized.includes("/var/lib/fleet")) {
+    return true;
+  }
+  return !existsSync(resolve(gitPath, "worktrees"));
+}
+
+function checkFileWrite(filePath) {
+  if (typeof filePath !== "string" || filePath === "") return;
+  const found = gitDirFor(resolve(filePath));
+  if (!found) return; // outside any repo: scratchpad, /tmp, home dotfiles
+  const { repoRoot, gitPath } = found;
+
+  // A linked worktree records .git as a file pointing at the real git dir.
+  if (!statSync(gitPath).isDirectory()) return;
+
+  if (isExemptCheckout(repoRoot, gitPath)) return;
+
+  deny(
+    `${repoRoot} is the primary checkout, and another session can hold ` +
+      "in-flight state there. Create a worktree first " +
+      "(`git worktree add -b <branch> ../<name> origin/main`) and edit " +
+      "inside it. This rule has no doc-only or one-file exception.",
+  );
+}
+
+// --- ScheduleWakeup rule ------------------------------------------------
+
+function checkWakeup(input) {
+  if (input?.stop === true) return;
+  const delay = input?.delaySeconds;
+  if (typeof delay !== "number") return;
+  if (delay < WAKEUP_FLOOR_SECONDS) {
+    deny(
+      `delaySeconds ${delay} is below the ${WAKEUP_FLOOR_SECONDS}s floor. ` +
+        "Each wakeup re-reads the whole session context, and 56% of them " +
+        "in the last review found nothing. Arm a Monitor on the event " +
+        "instead, and keep the wakeup as a long fallback.",
+    );
+  }
+}
+
+// --- entry --------------------------------------------------------------
+
+try {
+  const payload = readStdin();
+  if (!payload) allow();
+
+  const tool = payload.tool_name;
+  const input = payload.tool_input ?? {};
+
+  if (tool === "Bash") checkBash(input.command);
+  else if (tool === "Write" || tool === "Edit" || tool === "MultiEdit") {
+    checkFileWrite(input.file_path);
+  } else if (tool === "ScheduleWakeup") checkWakeup(input);
+} catch {
+  // fall through to allow
+}
+
+allow();

@@ -1,0 +1,885 @@
+# Distributed query and cross-cluster federation
+
+Ravel can serve one read with more than one process, and it can serve one read
+from more than one cluster. Both are off by default and both need explicit
+configuration: intra-cluster fan-out needs `--distributed-query` together with
+`--fragment-key-file`, and federation needs at least one `--remote-cluster`.
+This guide is the operator and user view: when distribution engages, how to
+turn it on, what a client sees, and what happens when something fails.
+
+Two scope limits before anything else. On the engine's own fan-out lane only
+the metrics signal distributes: a slice for logs or spans is answered
+`Unsupported` and the whole query runs on the coordinator. The SQL lane has a
+separate distributed scan, installed on the Flight SQL service, so it exists
+only in a build carrying the `flight-sql` cargo feature. The published image
+is such a build.
+
+For the engine-internal specification (slice partitioning, the merge order,
+the budget re-enforcement rules, the credential model) read
+[query-engine.md](../query-engine.md#intra-cluster-read-fan-out-adr-0071).
+
+Contents:
+
+- [What distribution does, and what it does not do](#what-distribution-does-and-what-it-does-not-do)
+- [When it engages: the cost gate](#when-it-engages-the-cost-gate)
+- [The lifecycle of a distributed query](#the-lifecycle-of-a-distributed-query)
+- [Turning it on](#turning-it-on)
+- [The worker registry and heartbeat](#the-worker-registry-and-heartbeat)
+- [Cross-cluster federation](#cross-cluster-federation)
+- [Reading `stats.fragments[]`](#reading-statsfragments)
+- [Metrics](#metrics)
+- [Failure behavior](#failure-behavior)
+- [What is not distributed](#what-is-not-distributed)
+
+## What distribution does, and what it does not do
+
+Distribution changes **where bytes are fetched and decoded**, never **what a
+query computes**. A distributed result is bit-for-bit identical to the result
+the same query would produce on one process, over any corpus and any slice
+partition.
+
+Concretely:
+
+- The query node that receives a request is that query's **coordinator**. This
+  is a per-query role, not a process type: every node is a coordinator for the
+  requests it receives and a worker for its peers' slices. There is no
+  scheduler process, no leader, and no assignment object.
+- The coordinator resolves **one** pinned snapshot, exactly as a single-process
+  query does, and ships explicit segment identities to workers. Workers never
+  resolve their own snapshot for an intra-cluster slice, so a distributed query
+  reads exactly one consistent view of the data.
+- Workers fetch, decode, matcher-prune, apply erasure predicates, and pre-merge
+  their slice. They do not aggregate and they do not evaluate.
+- The coordinator k-way merges every slice under the existing total order and
+  then runs the unchanged PromQL evaluator, or the unchanged single-partition
+  SQL aggregation.
+
+What does not move: aggregation, evaluation, and the authoritative
+cross-segment deduplication. Those stay on the coordinator, which means the
+coordinator is still the ceiling for a query whose cost is dominated by final
+aggregation over very high cardinality. Distribution buys you more NICs, CPUs,
+and page cache for the fetch and decode phase, which is where a large query
+spends its time.
+
+## When it engages: the cost gate
+
+Distribution is cost-gated, so a cheap query never pays for the machinery. The
+coordinator computes the same pre-execution `CostEstimate` the accounting layer
+already produces over the resolved snapshot, and distributes only when the
+estimate reaches **either** threshold:
+
+| Axis | Flag | Default |
+|---|---|---|
+| Estimated store bytes | `--distribute-bytes-threshold` | 256 MiB (268435456) |
+| Segment count | `--distribute-segments-threshold` | 256 |
+
+Either axis alone trips the gate; a query below both runs the fully local path,
+byte-identical to a build without the flag. A third flag,
+`--max-parallel-slices` (default 8), caps how many slices one query fans out
+into, and therefore how many concurrent remote fetches it can start.
+
+The defaults are deliberately conservative. On a zero-latency store the
+fan-out is pure overhead; it pays off when object-store latency, not CPU, is
+the bound. Tune both thresholds against your own store before leaving the
+defaults in place.
+
+## The lifecycle of a distributed query
+
+![Lifecycle of a distributed query: request, resolve, cost gate, slice dispatch, merge, evaluate, respond](../diagrams/distributed-query-lifecycle.svg)
+
+## Turning it on
+
+Distribution is enabled per query node, and the first two flags below are a pair:
+either without the other fails startup rather than exposing an
+unauthenticated fetch surface or leaving a configured secret inert.
+
+```sh
+# On every query-serving node in the cluster (same key file everywhere).
+ravel-server --mode all \
+  --listen-http 0.0.0.0:4318 \
+  --listen-grpc 10.0.0.11:4317 \
+  --distributed-query \
+  --fragment-key-file /etc/ravel/fragment.keys \
+  --sql-ticket-key-file /etc/ravel/sql-ticket.keys
+```
+
+- `--distributed-query` opts this process in. In `--mode all` or
+  `--mode query` it does two things at once: it registers the internal
+  `SeriesFetch` fragment service on the cluster-internal gRPC listener, and it
+  makes the process a coordinator that may fan a large query out. Other modes
+  ignore it (no query surface, nothing to distribute).
+- `--fragment-key-file` names the cluster fragment key file. It is not a
+  bearer-token file: it is a list of 32-byte keys, one per non-empty line,
+  each line exactly 64 hex characters. Blank lines and lines starting with `#`
+  are ignored. A file with no key line, or a line that is not exactly 64 hex
+  characters, fails startup rather than padding or truncating a wrong-length
+  key into place. A file, never an inline value or an environment variable, so
+  the key never appears in a process listing. **Every node in one cluster must
+  read the same key set.**
+- `--sql-ticket-key-file` names the SQL ticket key file, which signs the
+  Flight SQL tickets: the whole-set ticket a client redeems and the slice
+  ticket a coordinator hands a worker, each under its own key derived from
+  every file key. Same file shape and rotation rule as
+  `--fragment-key-file` (the first key mints, every key verifies), but a
+  separate file: one key file no longer covers both lanes. **Every node in one
+  cluster must read the same SQL ticket key set.** Two nodes that disagree
+  cost more than parallelism: a client's whole-set ticket comes back from
+  `GetFlightInfo` as an endpoint with no location, so a client behind a
+  balancer can redeem it on any node, and a node that does not hold the key
+  it was minted under answers `DoGet` with `invalid_argument` ("malformed
+  flight ticket"). That is a client-visible query failure. SQL slice tickets
+  between two such nodes fail the worker's MAC and those slices fall back to
+  the coordinator. Setting the flag without `--distributed-query` fails
+  startup. In this release it is optional: without it the SQL ticket key is
+  derived from the first fragment key, as before, and startup logs one
+  warning naming the flags release B (the release after the operator
+  renders the dedicated listener) requires with
+  `--distributed-query` (`--fragment-listener` and `--sql-ticket-key-file`).
+  The same warning fires when only `--fragment-listener` is missing. To move
+  a running fleet onto the file without a mixed window, follow the switch in
+  the [deployment guide](operations/deployment.md#the-dedicated-fragment-listener).
+- Where SQL slice tickets travel depends on `--fragment-listener`. With it,
+  the SQL lane dials each worker's dedicated fragment listener over mutual
+  TLS, and the public gRPC listener refuses a slice ticket outright (see
+  [Putting the fragment surface on its own TLS
+  listener](#putting-the-fragment-surface-on-its-own-tls-listener)). Without
+  it, the SQL lane dials each worker's `--listen-grpc` address and slice
+  tickets travel there in plaintext. A slice ticket read off that network is a
+  replayable read capability for its tenant and segment set until its
+  deadline, so keep the public gRPC port on a network you trust. Every
+  `--distributed-query` process in `--mode all` or `--mode query` that serves
+  Flight SQL without `--fragment-listener` logs this once at startup.
+- `--listen-grpc` is required in practice. By default the fragment surface is
+  bound only on the cluster-internal gRPC listener, never on the client HTTP
+  listener and never on the mTLS listener. A node with no gRPC listener never
+  registers itself as a worker, so every slice of every query runs
+  coordinator-local. That is correct, just not distributed.
+- `--max-inflight-fragments` (default 32) caps how many inbound `Pinned`
+  (intra-cluster) slice fetches this process serves concurrently for other
+  coordinators in the same cluster. This is a **distinct admission class**
+  from `--max-concurrent-queries`: a coordinator holding a client-query
+  permit while it waits on its own dispatched fragments can never deadlock
+  behind client queries queued on the client cap. Over the cap a fragment
+  request queues; it is not rejected.
+- `--max-inflight-federated-resolves` (default 8) caps how many inbound
+  `Resolve` (cross-cluster federation) slice fetches this process serves
+  concurrently for peer-cluster coordinators. It admits against an
+  **independent semaphore** from `--max-inflight-fragments`: a peer cluster driving
+  federation reads at this cap can never delay this cluster's own `Pinned`
+  slices, because the two classes never share a permit pool. Over the cap a
+  `Resolve` request queues; it is not rejected. The `/metrics` fragment
+  in-flight gauge and admission-wait counter carry a `class` label
+  (`pinned`|`resolve`) so the two classes' queueing can be told apart.
+
+### How a slice fetch is authorized
+
+The fragment keys are not presented on the wire. Each key is a MAC key, and
+what crosses the hop is a capability the coordinator mints per query:
+
+- The capability is a fixed-width claim set followed by a keyed-BLAKE3 MAC over
+  those claims. The claims name one tenant hash, one signal, one query id, and
+  an absolute expiry, which the coordinator sets to that query's own deadline.
+- The coordinator mints under the **first** key in the file and attaches the
+  capability to the request body of every slice of that query, including a
+  re-dispatch. Minting is deterministic in key and claims, so every slice of
+  one query carries byte-identical bytes and there is no per-slice bookkeeping.
+- A worker verifies statelessly: it recomputes the MAC over the presented
+  claims and compares it in constant time against **every** key it has
+  configured, checks the expiry against its own clock, and then requires the
+  request's own tenant hash, signal, and query id to equal the claims. No store
+  read, no cache, no coordination. A capability minted for one tenant therefore
+  cannot authorize a fetch that names another, and one minted for one query
+  cannot authorize another query.
+- Every rejection is one of five typed reasons (missing, bad MAC, expired,
+  tenant mismatch, query mismatch), counted per reason on the worker's
+  `ravel_distrib_fragment_capability_rejects_total{reason}`, and returned to
+  the coordinator as gRPC `Unauthenticated`.
+- The slice a coordinator owns by rendezvous runs in-process on the same code
+  path and mints nothing: there is no hop to authorize.
+
+Because verification accepts a MAC under any configured key while minting uses
+only the first, **rotation needs no flag day**. Append the new key as a second
+line and roll the fleet: every node now verifies both, and coordinators still
+mint under the old one. Then move the new key to the first line and roll again:
+coordinators mint under the new key, which every node already verifies. Then
+delete the old line and roll a third time. At no point in that sequence is a
+node presented a capability it cannot verify.
+
+A stale key set on one node is not silent. On the worker that holds it,
+`ravel_distrib_fragment_capability_rejects_total{reason="bad_mac"}` rises: it
+is refusing capabilities minted under a key it does not hold. On the
+coordinator, the worker's `Unauthenticated` arrives as a transport-class
+failure, so the slice is re-dispatched to the next rendezvous worker, that
+endpoint is quarantined, and the slice ends up running coordinator-local.
+Watch `ravel_distrib_slices_redispatched_total`,
+`ravel_distrib_slices_fallback_total`, and
+`ravel_distrib_quarantine_marks_total` there, plus the coordinator's `warn`
+log naming the endpoint, whose error text carries the worker's refusal
+message.
+
+Keep the cluster-internal gRPC listener off any network a client can reach. A
+capability authorizes a read of one tenant's pinned segments for the lifetime
+of one query, which is less authority than the bucket credentials every process
+already holds, but it is still authority.
+
+### Putting the fragment surface on its own TLS listener
+
+By default the fragment service shares the cluster-internal gRPC listener with
+`Resolve`-scope federation traffic and with Flight SQL, and SQL slice `DoGet`
+is served there too. `--fragment-listener <addr>` moves the `Pinned` fragment
+scope and SQL slice `DoGet` onto a fourth listener that terminates TLS
+in-process and serves nothing else. When it is set:
+
+- The public gRPC listener stops serving the `Pinned` scope entirely.
+  `Resolve` (federation, under ordinary tenant credentials) stays there, and
+  the dedicated listener rejects `Resolve` outright.
+- SQL slices move with it. The dedicated listener mounts the Flight service
+  in a slice-only role: it serves `DoGet` for a slice ticket and refuses every
+  other Flight and Flight SQL method, and no method other than a slice `DoGet`
+  returns data. The client Flight SQL methods answer `permission_denied`,
+  methods the service does not implement (prepared statements, `Handshake`,
+  `DoPut` and the like) answer `unimplemented`, `ListActions` returns its
+  static list, and a `DoGet` that is not a valid slice capability answers
+  `unauthenticated`, or `permission_denied` ("slice fetch rejected:
+  wrong_surface") for a client ticket. The public gRPC listener keeps the
+  client Flight SQL surface and refuses a slice ticket whose MAC verifies
+  under this node's slice keys with `permission_denied` ("slice fetch
+  rejected: wrong_surface"). A forged slice ticket, or one minted under a key
+  this node does not hold, is not recognised as a slice ticket: it takes the
+  client path and is refused there (`unauthenticated` without a credential,
+  `invalid_argument` "malformed flight ticket" with one), uncounted. A
+  coordinator dials each worker's `fragment_endpoint` over
+  `https` with the same pinned CA, server name and client certificate as a
+  fragment fetch, and no client credential travels with the slice: the slice
+  ticket is the capability.
+- All three of `--fragment-tls-cert`, `--fragment-tls-key`, and
+  `--fragment-tls-ca` are required, and the address must differ from every
+  other listener. The certificate must carry a `ravel-fragment` dNSName
+  subject alternative name, the one fixed name every coordinator verifies
+  against. Ravel mints no certificates; the operator provisions them, and
+  rotation is a rolling restart.
+- The CA is dedicated to this surface, so any certificate it signed means "a
+  fragment worker of this cluster". Per-process certificate identity is
+  deliberately not required: the capability, not the certificate, is the
+  authorization.
+- TLS on this listener is mutual. `--fragment-tls-ca` is both the CA a
+  coordinator verifies a worker against and the CA the worker verifies its
+  callers against, so a peer holding no certificate from it is refused at the
+  handshake, before any capability is read. A coordinator presents this
+  process's own `--fragment-tls-cert` and `--fragment-tls-key` when it dials a
+  peer; one key pair serves both directions, because every fragment process is
+  both a worker and a coordinator. The certificate therefore needs the
+  `clientAuth` extended key usage as well as `serverAuth`. A certificate
+  carrying only `serverAuth` will serve fragments but cannot dial them, one
+  carrying only `clientAuth` dials them but cannot serve them, and
+  `anyExtendedKeyUsage` satisfies neither check, because the TLS stack matches
+  the required purpose exactly rather than treating that value as a wildcard.
+  Startup parses the certificate and refuses when either usage is absent,
+  naming the file and the missing usage, so this is an upgrade that fails to
+  start rather than one that silently stops distributing in one direction.
+  Provision both usages, or rotate to a certificate that has them, before
+  enabling the dedicated listener. The same certificate serves SQL slice
+  `DoGet`; the SQL lane needs no certificate of its own.
+
+- The dedicated listener's address is what this node publishes as its
+  `fragment_endpoint`, so binding it to a wildcard needs
+  `--advertise-fragment-endpoint` (see [The worker registry and
+  heartbeat](#the-worker-registry-and-heartbeat)).
+
+Without the flag the fragment surface and SQL slice `DoGet` stay on the public
+gRPC listener, so distribution keeps working through a rolling deploy that
+adds it. During that deploy a slice between a node with the flag and a node
+without it fails its first dial, is re-dispatched once to another worker, and
+runs coordinator-local only if that attempt fails too; results do not change.
+
+Adding capacity is adding processes. A new node with the same flags and the
+same bucket appears in the live worker set within one heartbeat interval and
+starts receiving slices; a removed node ages out of it. There is nothing to
+rebalance and no state to drain.
+
+## The worker registry and heartbeat
+
+Membership needs no new durable state and no consensus. Each distributed query
+node writes one object it alone ever writes:
+
+```
+sys/query/workers/<process_id>
+```
+
+The record is a small JSON control-plane payload carrying the process id, two
+endpoints, the `queryfrag` protocol version it speaks, and a liveness timestamp
+re-stamped on every beat. The two endpoints are the two surfaces the two
+distributed lanes dial:
+
+- `fragment_endpoint`: the `queryfrag` `SeriesFetch` surface the PromQL lane
+  dials. With a dedicated fragment listener it is that listener's TLS address,
+  and the SQL lane dials it for slice `DoGet` too; without one it is the
+  public gRPC listener.
+- `flight_sql_endpoint`: always the public gRPC listener, which mounts Flight
+  SQL. Only a coordinator without `--fragment-listener` dials it for SQL
+  slices, in plaintext. A coordinator with `--fragment-listener` never dials
+  it for a slice, and does not dial a worker whose record carries no
+  `fragment_endpoint` at all: that worker's slices run elsewhere or
+  coordinator-local.
+
+Both endpoints default to the address the listener actually bound, and a
+sibling coordinator dials that string verbatim. A listener bound to a wildcard
+(`0.0.0.0` or `::`) therefore publishes an address no peer can dial, and the
+failure is silent at startup: the node registers, siblings route slices to it,
+and every dispatch fails at connect time. Startup refuses that combination
+instead. `--advertise-fragment-endpoint <host[:port]>` supplies the routable
+host to publish:
+
+```sh
+ravel-server --mode all \
+  --listen-grpc 0.0.0.0:4317 \
+  --distributed-query \
+  --fragment-key-file /etc/ravel/fragment.keys \
+  --advertise-fragment-endpoint node-11.internal
+```
+
+- The host applies to **both** advertised endpoints. A port, if given, applies
+  to the fragment endpoint only; the Flight SQL endpoint always carries the
+  public gRPC listener's own bound port, because the two endpoints name
+  different services and one port cannot stand for both.
+- A port is therefore only accepted alongside a dedicated `--fragment-listener`.
+  In the combined layout both endpoints are the one public gRPC socket, so a
+  port override would reach the fragment endpoint and leave the Flight SQL
+  endpoint on the bound port: one of the two published endpoints for the same
+  socket would be wrong. Startup refuses `host:port` there and names the
+  listener both lanes share. Advertise a host only, or give the fragment lane
+  its own listener.
+- Omit the port unless a NAT or port mapping makes the fragment listener
+  reachable on a port other than the one it bound. A host-only value keeps each
+  listener's own bound port.
+- An IPv6 literal may be written bare (`fd00::1`) or bracketed
+  (`[fd00::1]:4319`), and is always advertised bracketed.
+- The flag is only meaningful with `--distributed-query`; setting it without
+  that flag fails startup rather than leaving the value inert.
+
+An existing cluster whose listeners already bind specific addresses is
+unaffected. One that binds a wildcard with `--distributed-query` on was already
+publishing an undialable endpoint; it now refuses to start until the flag names
+a host, so the misconfiguration surfaces at startup rather than as fan-out that
+silently never works.
+
+The write is an unconditional overwrite: one writer per key, no compare-and-swap,
+no contention. This is the same pattern `maintain` mode processes already use for
+their own heartbeats.
+
+On the same cadence (`H` = 60 s by default) every node lists the prefix and
+refreshes its view. The **live set** is itself plus every sibling whose stamp
+is within `3 * H` of the reader's own clock, in either direction: a stuck
+future-dated record drops out just like a stale past-dated one. Worker
+identity comes from the key, not the record body, so a record whose body
+disagrees with its key is skipped rather than admitted under another worker's
+identity. That check does not keep a new identity out: the shipped query role
+(`deploy/iam/query.json`) may `PutObject` anywhere under `sys/query/workers/`
+and records carry no MAC, so any principal holding that role can write a
+self-consistent record at a fresh UUID key and join the live set.
+
+A query node never deletes a record: the query role (`deploy/iam/query.json`)
+holds `s3:DeleteObject` only on its own bucket-probe scratch objects under
+`sys/pq-probe/`, nothing under `sys/query/workers/`. A node that drains gracefully overwrites its
+own record on the way out with a stamp no reader accepts as live, so every
+sibling drops it from its live set on its next listing, at most one heartbeat
+interval later, and stops dialing it. The record itself stays behind, like the
+record of a node lost to a crash, a kill or a node failure.
+
+A key whose modification time is already older than the liveness window is not
+fetched at all: its stamp can only be older still, so the read cost of a
+coordinator tracks the live fleet rather than every node that ever ran.
+
+**Maintain-mode processes** keep the prefix bounded. On each maintain cycle,
+the maintain process that owns a fixed unit under the same rendezvous rule that
+spreads the other maintain work lists `sys/query/workers/` and deletes every
+key whose modification time is older than twice the liveness window. That is
+one process per view of the maintain membership: while two processes briefly
+disagree about membership both may reap, which is harmless because a delete of
+an absent key is a no-op. The doubled width is the clock-skew margin between
+the object store's clock and the maintain process's; a live node reaped by a
+skewed clock reappears on its next beat, at most one interval later. A store
+that reports no modification time keeps such a key forever; a key whose
+modification time is in the future stays until that time is more than twice
+the window in the past. The shipped `deploy/iam/maintain.json` grants the list
+and the delete on `sys/query/workers/*`; no maintain process needs to read a
+record. A deployment that runs no maintain-mode process reaps nothing, and the
+prefix grows by one key for every query node that ever ran. That includes a
+deployment that runs every role in one `--mode all` process with distributed
+query on: `--mode all` runs no maintenance loop.
+
+The admission family still carries the gap this reap closes for query workers:
+its reconciler deletes stale snapshots under a role the shipped templates give
+no delete on that prefix, so its prefix is not reaped either.
+
+If the reaping credential lacks the delete, the pass logs one error naming the
+prefix and the number of keys left, and stops deleting until the next cycle,
+instead of one warning per key.
+
+To place a slice, the coordinator rendezvous-hashes the slice's
+`(tenant_hash, signal, shard)` unit over the live set and takes the top owner,
+then the next, and so on, giving a deterministic failover order. Two
+consequences an operator should expect:
+
+- **Cache affinity for free.** The same shard of the same tenant lands on the
+  same worker as long as membership is stable, so the per-process
+  content-addressed read caches behave as one aggregate cache. Segments are
+  immutable, so there is no invalidation protocol.
+- **Version skew costs nothing.** Workers whose advertised protocol version
+  differs from the coordinator's are dropped at routing time, before any
+  dispatch. During a rolling upgrade a coordinator sees fewer eligible
+  workers, and in the limit runs everything locally. The rule covers both
+  lanes. The release that moves SQL slices onto the dedicated listener
+  moves the protocol version from 4 to 5, so for the one rolling
+  deploy onto it version 4 and version 5 nodes send each other no PromQL or
+  SQL slices: those run coordinator-local. That deploy costs parallelism, and
+  results do not change.
+
+Until the first heartbeat cycle completes after startup, a node sees an empty
+live set and runs every slice locally. Expect a distributed cluster to take up
+to one heartbeat interval after a restart to start fanning out again.
+
+## Cross-cluster federation
+
+Federation is the other half of distributed reads: a coordinator asks
+**independent Ravel clusters**, separate buckets and separate trust domains, to
+each resolve their own snapshot, and merges what they return into the same pool
+its own selectors feed. It is configured per remote, is independent of the
+intra-cluster cost gate (a federated query federates whether or not it also
+fans out locally), and is entirely absent from a deployment that configures no
+remotes.
+
+```sh
+ravel-server --mode query \
+  --listen-http 0.0.0.0:4318 \
+  --listen-grpc 10.0.0.11:4317 \
+  --distributed-query \
+  --fragment-key-file /etc/ravel/fragment.keys \
+  --remote-cluster name=eu,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu.token,tls-ca-file=/etc/ravel/eu-ca.pem,skip-unavailable=true \
+  --remote-cluster name=apac,endpoint=apac.internal:9443,credential-file=/etc/ravel/apac.token,soft-timeout=15s \
+  --remote-cluster-soft-timeout 10s
+```
+
+`--remote-cluster` is repeatable, once per remote, and its value is a
+comma-separated `key=value` spec:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | yes | The cluster's stable operator-facing label. This is the only identity a client ever sees for the remote (in `warnings`). |
+| `endpoint` | yes | `host:port` of the remote's fragment surface. |
+| `credential-file` | yes | File holding the bearer token this coordinator presents to that remote. |
+| `tenant` | no | The one local tenant whose queries fan out to this remote. Omitting it makes the remote reachable by every local tenant, which only a coordinator resolving at most one local tenant may do. See [One remote credential per local tenant](#one-remote-credential-per-local-tenant). |
+| `tls` | no | `true` or `false`, default `true`. Those two literals only; any other value fails startup with a message naming it. |
+| `tls-ca-file` | no | CA bundle for the remote's server certificate. A spec carrying this key and no `tls` key means TLS is on with that CA trusted, and is accepted. Only the explicit `tls=false` alongside a CA file fails startup, because there the bundle would be inert. |
+| `skip-unavailable` | no | `true` or `false`, default `false`. Same two literals only. |
+| `soft-timeout` | no | Per-remote override of `--remote-cluster-soft-timeout`. |
+
+TLS is on unless a spec says `tls=false`. That escape hatch exists for a hop
+already encrypted at a lower layer; it sends the operator credential, the
+query, and every result stream in cleartext, and startup logs a security
+warning naming the remote.
+
+`--remote-cluster-soft-timeout` sets the default bound for every remote
+(default 10 s) as a humantime duration (`10s`, `500ms`). A remote that has not
+answered within its bound is treated as unavailable.
+
+Every one of these is validated at startup, not at the first federated query:
+a malformed spec, an unknown key, a `tls` or `skip-unavailable` value that is
+not `true` or `false`, a duplicate cluster name, `tls=false` next to a
+`tls-ca-file`, a zero soft timeout, an empty `tenant` value, or an unreadable or
+empty credential file all fail the process before it binds a listener. A remote
+cluster that names no local tenant on a coordinator that runs queries for more
+than one also fails startup here; see [One remote credential per local
+tenant](#one-remote-credential-per-local-tenant).
+
+### What crosses the boundary, and what does not
+
+A federated request carries **matchers, a time window, and budgets**, never
+segment references and never object-store credentials. The remote resolves its
+own snapshot over that window and runs it through its ordinary query path, so
+it enforces its own admission limits, its own tenancy hashing, and its own
+selective-erasure predicates. The budgets travel with the request and are the
+caller's carried limits, applied by the remote; the coordinator re-enforces
+them over the folded remote spend regardless.
+
+A carried budget can only lower what the remote does, never raise it. The
+remote clamps every budget on the wire to its own configuration, so the byte
+limit it applies is the smaller of the carried value and its own
+`max_bytes_scanned`, and a request that carries no cap at all gets the
+remote's own limit rather than an unlimited scan. On this resolve path the
+remote also applies its own matched-series and sample caps to the result it is
+about to return. Sizing a remote's limits is therefore a decision that binds
+every coordinator that queries it: raising a coordinator's budget does not
+raise what its remotes will scan.
+
+The credential is an **operator** secret, and the tenant the remote serves is
+derived from that credential by the remote's own resolver chain. A coordinator
+cannot name a tenant on a remote: whatever `tenant_hash` sits on the wire is
+overwritten with the locally resolved value, never read. The calling client's
+own credential is never forwarded across a cluster boundary. A fragment
+capability is never a federation credential either: a remote runs its ordinary
+tenant resolver chain over the request metadata, and a capability is not in any
+tenant registry.
+
+`RemoteClusterConfig`'s debug formatting prints `credential: <redacted>`, so a
+config dump or a panic message never leaks the operator secret.
+
+### One remote credential per local tenant
+
+A remote cluster's `credential-file` holds **one** bearer token, and the remote
+resolves **one** tenant from it. So that credential belongs to one local tenant,
+and `tenant` names which. A query from any other local tenant does not reach
+that remote at all: it presents no credential, issues no request, and gets no
+remote series.
+
+A coordinator serving local tenants `acme` and `beta`, each with its own account
+on a shared remote, writes one spec per local tenant:
+
+```sh
+ravel-server --mode query \
+  --tenant-token acme-token:acme \
+  --tenant-token beta-token:beta \
+  --remote-cluster name=eu-acme,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-acme.token,tenant=acme \
+  --remote-cluster name=eu-beta,endpoint=eu.internal:9443,credential-file=/etc/ravel/eu-beta.token,tenant=beta
+```
+
+Two specs to the same endpoint under distinct `name`s is the supported shape.
+There is no syntax for naming several local tenants on one spec, because that
+would put them back behind one credential, which is the whole problem.
+
+**A local tenant no remote names gets local data only.** Its queries and its
+discovery calls resolve against this cluster's data and nothing else. That is a
+complete answer, not partial coverage: a remote it holds no credential for is
+outside its query rather than missing from it, so no `warnings` entry and no
+`partial: true` appear. Configuring a remote for a tenant that has none is
+adding a spec with its `tenant`.
+
+Omitting `tenant` makes a remote reachable by **every** local tenant. That is
+correct on a coordinator that runs queries for only one local tenant, and it is
+what a single-tenant deployment writes. Anywhere else it is the exposure this
+key exists to remove, so **a coordinator that runs queries for more than one
+local tenant refuses to start with an unmapped remote cluster**, naming every
+spec that needs a `tenant`. A coordinator runs queries for more than one local
+tenant when:
+
+- two or more `--tenant-token` values or `--tenant-token-file` lines name
+  different tenants, or
+- `--alert-rules-file` names a tenant that no `--tenant-token` value or
+  `--tenant-token-file` line does,
+  since one alert evaluator runs per tenant in that file and its queries go
+  through the same engine, or
+- any dynamic resolver is enabled: `--dev-insecure-tenant-header`,
+  `--oidc-issuer`, or `--mtls-enabled`, each of which derives the tenant from a
+  request header or a token claim.
+
+Startup also refuses a `tenant` that no `--tenant-token`, `--tenant-token-file`,
+or `--alert-rules-file` names, where the tenant set is fully known (static
+configuration, no dynamic resolver). Such a mapping can never fire, and its only
+symptom would be a remote that quietly answers nobody. Under a dynamic resolver
+the static configuration is not the tenant set, so the check does not apply
+there.
+
+Mapping a remote to a tenant that only `--alert-rules-file` names is supported
+and is a real deployment: alert rules for a tenant whose data lives partly on a
+remote.
+
+None of this changes what the remote does with the credential it is presented:
+it resolves its own tenant from it and ignores any tenant on the wire. The
+mapping decides **which local tenant may present a given credential**; the
+remote still decides what that credential is entitled to see.
+
+Both the value-bearing endpoints (`/api/v1/query`, `/api/v1/query_range`) and
+the discovery endpoints (`/api/v1/series`, `/api/v1/labels`,
+`/api/v1/label/<name>/values`) federate, through the same coordinator and with
+the same semantics, so both honour the mapping.
+
+### What a client sees when a remote is degraded
+
+With `skip-unavailable=false` (the default), a remote that fails or times out
+fails the whole request with a typed error. With `skip-unavailable=true` the
+query continues without that cluster and says so, in two places at once:
+
+```json
+{
+  "status": "success",
+  "data": { "resultType": "vector", "result": [] },
+  "warnings": [
+    "remote cluster eu unavailable; results are partial"
+  ]
+}
+```
+
+and, in the query's stats block, `partial: true`. Warnings name only the
+operator-facing cluster name; the remote's IP:port and errno are redacted,
+because a client reading the envelope is not entitled to the coordinator's
+internal topology. Warnings are deduplicated, so a multi-selector request that
+federates once per selector still reports one warning per skipped cluster.
+
+Two behaviors worth knowing:
+
+- **A budget overrun is never skippable.** The coordinator re-enforces
+  `max_bytes_scanned` over the folded remote spend and fails typed regardless
+  of `skip-unavailable`. A budget cap is a correctness bound, not an
+  availability property.
+- **A malformed frame is never skippable.** A remote's response that fails to
+  decode (including a corrupt native-histogram frame) is treated as
+  corruption, not availability, and fails typed regardless of
+  `skip-unavailable`. Version skew is the only histogram-related coverage
+  gap: a remote at a different `PROTOCOL_VERSION` answers `Unsupported`
+  before it ever encodes a frame, and that is skippable.
+
+Federation assumes each cluster owns a **disjoint** slice of series identity.
+The intended deployment is region- or tenant-sharded, so one series lives in
+exactly one cluster. If the same series and timestamp arrive from two clusters
+with different values, the merge still emits exactly one sample per timestamp,
+but which cluster wins is unspecified, because the provenance fields the total
+order tie-breaks on are only comparable within one cluster. The discovery
+endpoints carry no such ambiguity (a series id is a canonical function of its
+labels, so the cross-cluster union is a plain set union). See
+[query-engine.md](../query-engine.md#cross-cluster-federation-adr-0071) for
+the full statement.
+
+## What bounds a slice the coordinator decodes
+
+A worker decides how many response frames a slice carries and how large each
+one is. The coordinator decodes them incrementally through one bounded
+decoder, shared by the intra-cluster fetcher and the federation fetcher, and
+that decoder applies two caps per slice:
+
+| Cap | Value | Why it exists |
+|---|---|---|
+| Response frames | `MAX_SLICE_RESPONSE_FRAMES`, 1048576 | A slice emits one frame per returned run plus one terminal summary, so this is far above any ordinary slice. An empty frame costs two wire bytes, so the byte cap does not bound a frame count at the sizes a remote chooses. |
+| Aggregate wire bytes | `MAX_SLICE_RESPONSE_BYTES`, 230331648 bytes (about 219.7 MiB), fixed | Applied to the encoded size of the frames this coordinator accepts. The ceiling is derived, not chosen: it is `DEFAULT_MAX_SAMPLES` (10000000) times the widest wire cost of one scalar sample (18 bytes: a 10-byte zig-zag `ts_delta` varint plus an 8-byte `fixed64` value), plus `MAX_SLICE_RESPONSE_FRAMES` times 48 bytes of per-frame framing as headroom. What the derivation guarantees is narrow: a slice of plain scalar runs carrying the whole sample budget, every sample at its widest encoding, spread over as many frames as the frame cap admits, encodes inside the ceiling. It is not a bound no legitimate slice can cross, and it is not meant to be. Runs carrying per-sample provenance columns (`Run` fields 6-9), frames with many or long labels, and native-histogram frames all cost more than that derivation counts. Nor is there a per-slice sample limit everywhere for such a bound to rest on: a federated (resolve-scope) slice is refused by the worker itself at `max_samples` over the result it is about to return, but an intra-cluster slice has no per-slice sample limit at all, because the coordinator enforces `max_samples` once, query-wide, over the merged pool. A slice that does cross the ceiling is refused as a budget error naming both figures, the same class of refusal as a bytes-scanned trip. The ceiling is fixed and applies with no configuration at all. No setting raises or lowers it, `max_bytes_scanned` included: that is a store-byte budget on the compressed segment data a slice reads, enforced on a different path, and response frames are uncompressed wire bytes, so treating one as the other would refuse a slice that scanned well inside its configured budget. |
+
+Both caps are **per slice**, and each in-flight slice decodes through its own
+decoder holding the full cap. What multiplies that cap differs by path, so
+size a coordinator from the one it runs:
+
+- A **local fan-out** runs two nested bounded stages: the engine fetches up to
+  `promql_fetch_fanout` selectors at once (default 8, from
+  `DEFAULT_FETCH_CONCURRENCY`), and each of those dispatches up to
+  `max_parallel_slices` slices at once (default 8). The in-flight decoder
+  count is the product, 64 at the defaults, not 8, so one such query holds up
+  to 64 times the per-slice byte cap in wire bytes, 14741225472 bytes (about
+  13.7 GiB), and more once those bytes are decoded into the in-memory series
+  shapes. Lowering either setting bounds this path.
+- A **federated query** is not bounded by `max_parallel_slices`.
+  `Federation::fetch` spawns one task per configured remote cluster, all in
+  flight together, each with its own decoder at the full ceiling. One
+  federated query therefore holds up to the per-slice cap times the number of
+  remote clusters, and lowering `max_parallel_slices` does not reduce it.
+
+Both figures bound ONE query. The process-wide total is that figure times the
+number of queries running at once, which has no ceiling unless an operator
+sets `--max-concurrent-queries`; it is unset by default.
+
+`max_bytes_scanned` does not bound any of this, because it does not move the
+per-slice wire cap.
+
+Both caps are checked before a frame is decoded or kept, and the client stops
+pulling from the stream at the first breach rather than reading it to the end.
+Dropping the stream cancels the RPC, so the worker stops producing. The
+coordinator therefore holds the frame that tripped the cap and whatever the
+HTTP/2 flow-control window had already put on the wire, not the rest of the
+slice. A single frame is capped separately, at the 4 MiB
+`max_decoding_message_size` the coordinator sets on its fragment client: a
+frame larger than that is refused by the gRPC layer before this decoder sees
+it.
+
+A breach is a **refusal, not an outage**. It renders as HTTP 422 naming both
+the observed figure and the cap (`TooManySliceFrames` for the frame cap,
+`TooManySliceBytes` for the byte cap, whose message says wire bytes so it is
+not read as the store bytes `TooManyBytesScanned` counts), in the same
+`execution` error class a local budget trip uses. It is deliberately not the
+redacted 503 that every other distributed slice failure becomes: the counts
+are the coordinator's own, so there is no server state to redact, and retrying
+the same query against the same remote would break the same way.
+
+A refusal fails the whole query, and an error response carries no stats block,
+so the figures for a refused slice are in the 422 body and in the coordinator's
+`warn` log (naming the endpoint or the federated cluster, the frame count, and
+the wire bytes) and nowhere else. They are not in `stats.fragments[]`, and the
+wire bytes are not folded into the query's accounting totals, which count store
+bytes.
+
+A federated slice is refused the same way, and has no `stats.fragments[]` entry
+even when it succeeds.
+
+## Reading `stats.fragments[]`
+
+A distributed query's stats block gains one `fragments` array, with one object
+per dispatched slice. The field is absent entirely on a query that did not
+distribute, so its presence is itself the signal that fan-out happened.
+
+```json
+"stats": {
+  "fragments": [
+    { "workerEndpoint": "10.0.0.12:4317", "segmentCount": 41, "bytesReported": 189743104, "wireBytesConsumed": 24117248, "status": "ok" },
+    { "workerEndpoint": "10.0.0.13:4317", "segmentCount": 38, "bytesReported": 174260224, "wireBytesConsumed": 22020096, "status": "ok" },
+    { "workerEndpoint": "local", "segmentCount": 40, "bytesReported": 181403648, "wireBytesConsumed": 0, "status": "fallback" }
+  ]
+}
+```
+
+- `workerEndpoint`: where the slice actually ran. A slice the coordinator
+  owned by rendezvous, or one that fell back, reports local execution rather
+  than a peer's address.
+- `segmentCount`: how many pinned segments the slice carried. Badly skewed
+  counts across entries mean your ingest shards are unevenly sized; slices are
+  cut shard-major and a shard is never split, so shard skew becomes slice skew.
+- `bytesReported`: the store bytes that worker reported scanning, already
+  folded into the query's own accounting total.
+- `wireBytesConsumed`: the encoded size of the response frames this
+  coordinator accepted off the slice's stream. This is a different quantity
+  from `bytesReported`: those are store bytes the worker read, these are wire
+  bytes the coordinator held. A slice the coordinator ran with no remote
+  attempt reports `0`, because nothing was encoded; a `fallback` entry reports
+  what its failed remote attempt had already accepted before it failed. The
+  field is not a place to read a decode-cap refusal: a refused slice fails the
+  whole query, and an error response carries no stats block, so only `ok` and
+  `fallback` entries ever reach a client.
+- `status`: `ok` or `fallback` (the slice ran on the coordinator after a remote
+  attempt failed). `error` (a hard error or a `Corrupt` summary) and `timeout`
+  (the slice ended `TIMEOUT` at the query's deadline) entries are recorded
+  internally, but a slice that ends either way fails the query, so no response
+  body renders one.
+
+A `fallback` entry is the single most useful diagnostic here: it means a peer
+was unreachable or reported itself unavailable, the query still returned a
+complete and correct result, and it cost more than it should have. Correlate
+with `ravel_distrib_slices_fallback_total` and the worker's own logs.
+
+Per-slice cardinality lives only in this response body, never as a metric
+label.
+
+## Metrics
+
+`GET /metrics` renders the `ravel_distrib_*` family on any process with
+distribution enabled, under the closed `mode` label alone (no per-shard,
+per-worker, or per-tenant label), except the fragment in-flight gauge and
+admission-wait counter, which also carry a `class` label (`pinned`|`resolve`),
+and the fragment capability reject counter, which also carries a `reason`
+label. The family is
+absent entirely when distribution is off. `ravel_sql_slice_rejects_total` is
+listed here because it counts the SQL lane's slice fetches, but it is not part
+of that family: it carries a `reason` label beside `mode`, and it renders on
+every process that serves Flight SQL, with or without distribution.
+
+| Metric | Type | What it tells you |
+|---|---|---|
+| `ravel_distrib_fragment_requests_total` | counter | Inbound slice fetches this process served for other coordinators. |
+| `ravel_distrib_fragment_auth_failures_total` | counter | Inbound `Resolve`-scope federation requests whose presented credential did not resolve to a tenant. It does not count `Pinned` capability rejections: those are `ravel_distrib_fragment_capability_rejects_total`, and reach the coordinator as re-dispatch and fallback. |
+| `ravel_distrib_fragment_capability_rejects_total{reason}` | counter | Inbound `Pinned` fragment requests this worker refused at fragment capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `tenant_mismatch`, `query_mismatch`. What each reason counts is defined in [the observability guide](observability.md#distributed-read-fan-out-ravel_distrib_). A rising `bad_mac` during a key rotation means some coordinator is minting under a key this worker does not hold. A `Pinned` fetch refused on the public listener because `--fragment-listener` is set is refused before verification and counted under no reason. |
+| `ravel_sql_slice_rejects_total{reason}` | counter | Inbound SQL slice `DoGet` requests refused at slice capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `wrong_surface`. What each reason counts, and which refusals are counted under none, is defined in [the observability guide](observability.md#sql-slice-capability-rejects-ravel_sql_slice_rejects_total). Absent on a process that serves no Flight SQL. |
+| `ravel_distrib_fragment_inflight{class}` | gauge | Fragments in flight now, split by admission class. `class="pinned"` riding at `--max-inflight-fragments` or `class="resolve"` riding at `--max-inflight-federated-resolves` means that class's inbound slices are queueing; the two never contend for the same permits. |
+| `ravel_distrib_fragment_admission_waits_total{class}` | counter | Inbound fragment requests, by admission class, that found their class's semaphore saturated and had to queue rather than being admitted immediately. |
+| `ravel_distrib_slices_local_total` | counter | Slices this coordinator ran itself with no hop. |
+| `ravel_distrib_slices_remote_total` | counter | Slices dispatched to a peer. |
+| `ravel_distrib_slices_redispatched_total` | counter | Slices re-dispatched after a failed first attempt. |
+| `ravel_distrib_slices_fallback_total` | counter | Slices that ended up running coordinator-local after remote attempts failed. |
+| `ravel_distrib_slice_fetch_seconds` | histogram | Per-slice fetch latency, sharing the object-store histogram's bucket layout. |
+| `ravel_distrib_quarantine_marks_total` | counter | Dead endpoints marked into the coordinator's quarantine map after a re-dispatchable dispatch failure. A jump after a node loss is expected; a steady climb means workers keep failing. |
+| `ravel_distrib_quarantine_readmits_total` | counter | Quarantined endpoints readmitted by a strictly newer worker heartbeat (the recovered worker's own probe). |
+| `ravel_distrib_quarantine_current` | gauge | Endpoints quarantined right now. Rides above zero for the ~2 heartbeat intervals a dead worker takes to readmit or age out. |
+
+`slices_local_total` staying high while `slices_remote_total` stays at zero on
+a multi-node cluster is the signature of a membership problem: no gRPC
+listener, a clock skew wider than `3 * H`, or a protocol-version mismatch
+during a partial upgrade. See [observability.md](observability.md) for how to
+read the rest of the query cost families alongside these.
+
+## Failure behavior
+
+The rule behind every case below: **intra-cluster execution is
+all-or-nothing.** A slice failure is retried, then absorbed locally, then
+raised as a typed error. It is never turned into a partial merge. Only
+cross-cluster federation can return partial coverage, and only when an
+operator opted that remote into it.
+
+The rule holds on both lanes for metrics. A metrics statement over the cost gate
+runs the same three steps per slice (the assigned worker, one re-dispatch to
+another worker, then a coordinator-local read of the same slice ticket), and its
+local read runs the identical worker fragment over the identical pinned
+segments, so a statement that falls back returns the same bytes it would have
+returned with every worker healthy. Two differences from the PromQL lane are
+worth knowing while reading a trace: the SQL lane places slice `k` on roster
+entry `k % len` rather than by rendezvous rank, and it keeps no quarantine map,
+so a dead worker is tried again by the next statement instead of being skipped
+until its heartbeat stamp advances. It costs one refused connection per slice
+assigned to that worker, not a failed statement. The SQL lane's own counters are
+per query rather than on `/metrics`; its coordinator logs a `warn` naming the
+slice on every re-dispatch and every local read.
+
+Log and trace *search* on the SQL lane does not have this sequence yet: a worker
+error there still fails the statement, so a dead-but-registered worker is
+visible for the rest of its staleness window on those tables.
+
+![Failure flow: intra-cluster slice re-dispatch and local fallback, and the cross-cluster skip path](../diagrams/distributed-query-failure.svg)
+
+What an operator will actually observe, case by case:
+
+| Condition | Behavior | Visible as |
+|---|---|---|
+| A worker is unreachable, or the stream dies mid-slice | Re-dispatch once to the next rendezvous worker, then run the slice on the coordinator, then fail typed | `slices_redispatched_total`, `slices_fallback_total`, a `fallback` entry in `stats.fragments[]`, a `warn` log naming the endpoint |
+| A worker answers `Unavailable` | Same sequence as unreachable | Same |
+| A pinned segment vanished (concurrent GC or compaction) | The coordinator re-resolves the snapshot once and re-dispatches the whole query, not one slice; a second occurrence fails | The same single-retry behavior a local query already has |
+| A worker reports a corrupt segment, or a frame fails to decode | Terminal immediately: no retry, no local fallback | Typed error; a retry would mask real corruption behind a clean local read |
+| A CAP trips on a slice, or on the folded total (bytes, series, samples, or the request count) | The same typed `TooManySeries` / `TooManyBytesScanned` a local query raises, never a transport error | HTTP 422 with the usual budget error |
+| A slice outruns a coordinator decode cap (the frame cap, or the per-slice wire-byte ceiling) | The client stops pulling at the first breach and fails typed: `TooManySliceFrames` or `TooManySliceBytes`, never a transport error. See [What bounds a slice the coordinator decodes](#what-bounds-a-slice-the-coordinator-decodes) | HTTP 422 naming both figures, not a 503, and a `warn` log naming the endpoint (or the federated cluster) with both figures. The refusal fails the query, so there is no stats block and no `stats.fragments[]` entry for it |
+| A worker trips its FETCH MEMORY budget on a slice | `FetchMemoryExhausted`, which is backpressure rather than a cap on the query | HTTP 503, deliberately: the same slice may succeed when the worker has room, so a retry is the right response |
+| The query deadline is reached | The coordinator cancels the fan-out; stream teardown reaches the workers and drop-based cancellation frees their in-flight GETs and fragment permits | Normal deadline error; no leaked permits |
+| Protocol version skew during a rolling deploy | Skewed workers are dropped at routing time, so a mismatch costs no round trip; if none are eligible, the query runs fully local | `slices_local_total` rising, `slices_remote_total` flat |
+| A non-metrics signal | The worker answers `Unsupported` and the coordinator silently re-runs the whole query locally | Nothing to the client; the already-paid remote fetch is still folded into the reported cost, so such a query reports both fetches |
+| A remote cluster is slow or down | Fails typed by default; with `skip-unavailable=true`, continues with `partial: true` and one warning | `warnings[]` in the response envelope |
+
+Two invariants that make the retry logic safe, and that are worth knowing when
+you read a trace: a slice contributes to the merge only after its terminal
+summary frame arrives, so partial frames from a failed attempt are discarded
+whole and re-dispatch needs no deduplication bookkeeping; and every slice's
+real spend is folded into the query's accounting before any failure or
+fallback, so the reported cost never under-counts work already paid for.
+
+## What is not distributed
+
+Deliberately:
+
+- **Aggregation and evaluation.** Both stay on the coordinator. The SQL engine
+  forces single-partition aggregation for bit-stable float accumulation, and
+  that reasoning applies unchanged to distributed partials.
+- **Logs and spans, on the engine's fan-out lane.** Only the metrics signal
+  distributes there. A slice for any other signal is answered `Unsupported`,
+  and the whole query runs locally.
+- **Anything at all, in a build without `flight-sql`.** The SQL-lane
+  distributed scan is installed on the Flight SQL service, which only exists
+  behind the `flight-sql` cargo feature. The published image builds it; a
+  source build that leaves the feature off distributes no SQL statement
+  regardless of the `--distributed-query` flags.
+- **Straggler hedging and slice rebalancing.** A slow-but-alive worker is
+  waited on; only a failed or unavailable one is re-dispatched. An oversized
+  ingest shard makes an oversized slice, because a shard is never split.
+- **Client-visible multi-endpoint Flight SQL.** The Flight SQL surface returns
+  exactly one endpoint to a client, whatever the fan-out does behind it. Slice
+  tickets are an internal coordinator-to-worker contract.
+
+## See also
+
+- [query-engine.md](../query-engine.md#intra-cluster-read-fan-out-adr-0071):
+  the engine-internal specification of slicing, merging, and budget
+  re-enforcement.
+- [architecture.md](../architecture.md#where-the-trust-and-failure-boundaries-are):
+  where a remote cluster and the cluster-internal fragment surface sit among
+  the trust boundaries.
+- [reference/ravel-server-flags.md](../reference/ravel-server-flags.md): every
+  flag named on this page, generated from the command definition.
+- [observability.md](observability.md): reading `/metrics` and per-query cost.
+- [consistency-model.md](../consistency-model.md): the snapshot, deadline, and
+  GC-horizon guarantees distribution inherits unchanged.
+
+## Background
+
+The decision behind both capabilities, its rejected alternatives, and the
+security model are in
+[ADR-0071](../adrs/0071-distributed-read-fanout.md); its amendment is what
+replaced the earlier shared bearer token with the per-query capability
+described above.
+

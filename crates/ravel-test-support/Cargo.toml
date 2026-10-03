@@ -1,0 +1,14 @@
+[package]
+name = "ravel-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Shared test scaffolding for off-worker and blocking-pool tests (ADR-1702). Dev-only; never a dependency of any production crate."
+
+[dependencies]
+parking_lot = { workspace = true }
+
+[lints]
+workspace = true

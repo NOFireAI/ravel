@@ -1,0 +1,7325 @@
+//! Per-tenant alert-rule evaluator (ADR-0043).
+//!
+//! One background tokio task per tenant that has rules, mirroring
+//! [`crate::maintain`]'s shape exactly: a config struct, `spawn`/`run_loop`, a
+//! jittered interval, and a `oneshot` shutdown per task. Each tick evaluates
+//! every rule configured for that tenant, writes a `Signal::Alerts` record for
+//! any state transition, and then notifies the configured sinks.
+//!
+//! This module is only the driver. The rule shape, the condition test, the
+//! state machine, the generation guard, and the record encoding all live in
+//! `ravel-alerting`, which is pure logic with no I/O; the query engines are the
+//! same `QueryEngine` and `SqlExecutor` instances `/api/v1/query` and
+//! `/api/v1/sql` serve from, reused as libraries rather than called over the
+//! network (ADR-0043 consequence 2).
+//!
+//! # No in-memory alert state
+//!
+//! Ravel's compute processes are disposable, so "how long has this been
+//! pending" is never a timer in this process (ADR-0043 decision 3). Every tick
+//! folds the tenant's durable `Signal::Alerts` history to the most recent
+//! record per `alert_id` and hands that to
+//! [`ravel_alerting::evaluate_transition`], which derives pending-duration from
+//! the record's own timestamp. A restarted evaluator resumes exactly where the
+//! records left it.
+//!
+//! The one piece of state that is deliberately in-memory is the undelivered
+//! notification set ([`AlertEvaluator::run_tick`]). Losing it on a crash would
+//! silently downgrade delivery to at-most-once across a restart, since nothing
+//! would ever re-enter it for an alert that is still firing but was not the
+//! reason for this tick's read. [`AlertEvaluator::bootstrap_undelivered`]
+//! closes that gap: the first tick after a (re)start that successfully reads
+//! history re-queues every non-terminal alert for one delivery attempt, which
+//! is what keeps sinks inside the ADR-0043 decision 6 at-least-once contract
+//! across a restart, not just within one process's uptime.
+//!
+//! # Reading alert history
+//!
+//! [`AlertEvaluator::load_latest_records`] is a direct RLOG read over the
+//! tenant's alert commit records, not a query. It lists
+//! `t/<tenant>/a/c/<shard>/`, decodes each commit record, reads the RLOG object
+//! it names, and keeps the greatest-timestamp record per `alert_id`. Going
+//! through commit records rather than listing data objects is what makes an
+//! abandoned write invisible: a data object with no commit record is an orphan
+//! and must never be folded into state.
+//!
+//! This is deliberately not a query planner. The `alerts` SQL table (ADR-0043
+//! decision 7) is separate work; the evaluator needs only "the latest record
+//! per alert_id for one tenant", and the cost is bounded by the number of
+//! transitions, not by ingest volume, because a record is written only on a
+//! transition (ADR-0043 decision 4).
+//!
+//! # The state memo
+//!
+//! `Signal::Alerts` is absent from `maintain::MAINTAINED_SIGNALS` and no alert
+//! record is ever compacted, so a full fold every tick costs `2N` GETs for a
+//! transition count `N`, independent of the rule count actually needed. `N` is
+//! bounded rather than cumulative since ADR-1688: the maintenance tick sweeps
+//! alert transitions older than its retention window, keeping each identity's
+//! current-state record whatever its age, so the history holds one window's
+//! transitions plus one record per identity. [`AlertEvaluator::fold_latest`]
+//! avoids that with a tenant-wide derived cache, the alert state memo
+//! ([`crate::alert_state_memo`], issue #1294): each tick seeds from the memo and
+//! folds only the ingest hours at or after its watermark, clamped to the
+//! reader's own seal bound so a watermark from a fast clock cannot move the tail
+//! cursor past hours that still hold commit keys. The memo is never source of
+//! truth (the transition records remain the only durable state, ADR-0040
+//! decision 3); a lost, stale, or corrupt memo costs a full fold, never
+//! correctness, because the tail listing re-folds every hour that could hold a
+//! record written since the memo. Only the lease holder writes it.
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use bytes::Bytes;
+use ravel_alerting::{
+    AlertError, AlertId, AlertInstance, AlertRecord, AlertState, DEFAULT_REPEAT_INTERVAL,
+    QueryResultSummary, Rule, RuleCondition, RuleQuery, StateTransition, ThresholdOp,
+    alert_instances, evaluate_transition, write_alert_record,
+};
+use ravel_commit::publish::RetryPolicy;
+use ravel_commit::record::NewCommitRecord;
+use ravel_commit::rng::{RngSource, SystemRng};
+use ravel_commit::{keys, publish, record};
+use ravel_ingest::{Clock, LOG_SEGMENT_FORMAT_VERSION};
+use ravel_logseg::{ObjectIdentity, Predicate, RlogConfig, RlogReader};
+use ravel_object_store::{
+    GetRange, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions, StoreError,
+};
+use ravel_promql::Value as PromqlValue;
+use ravel_query::{Coverage, QueryEngine};
+use ravel_types::{Signal, TenantHash, TenantId};
+use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use uuid::Uuid;
+
+use crate::alert_sink::{AlertNotification, AlertSink, DEFAULT_SINK_TIMEOUT, deliver};
+use crate::alert_state_memo::{AlertStateMemo, read_alert_state_memo, write_alert_state_memo};
+
+/// Default `--alert-eval-interval-secs`: 60 seconds, Prometheus' own default
+/// rule-evaluation interval.
+pub const DEFAULT_ALERT_EVAL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Default listing window for a SQL detection rule: the query sees segments
+/// whose event time falls in the last 5 minutes. Only bounds which segments
+/// `Catalog::resolve` lists; the statement's own `WHERE` still applies above
+/// the scan.
+pub const DEFAULT_SQL_LOOKBACK: Duration = Duration::from_secs(5 * 60);
+
+/// Wall-clock ceiling on one rule's query. Matches the query engine's own
+/// default request deadline, so a rule cannot outlive what an HTTP client of
+/// the same engine would be granted.
+pub const DEFAULT_QUERY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The shard every alert record is written to.
+///
+/// Alerts are transition-rate data, not ingest-rate data: one object per state
+/// change per rule. Sharding exists to spread flush contention across
+/// concurrent writers, and there is exactly one alert writer per tenant per
+/// process, so a second shard would only widen the fold's LIST fan-out for no
+/// write-path benefit. Fixed rather than configurable so a reader always knows
+/// where an alert history lives.
+pub const ALERT_SHARD: u32 = 0;
+// Moving this writer to a shard outside the reader's floor (ADR-1101
+// decision 2) fails the build here rather than silently dropping every alert
+// record from alerts queries.
+const _: () = assert!(ALERT_SHARD < Signal::Alerts.fixed_read_shards());
+
+/// The writer epoch every alert record carries. Flush identity is
+/// `(writer_id, epoch, seq)` and each evaluator task mints a fresh v4
+/// `writer_id` at spawn, so uniqueness comes from the id and the per-task
+/// sequence; the epoch is a constant rather than a fencing token because
+/// nothing leases the alert keyspace.
+const ALERT_WRITER_EPOCH: u64 = 1;
+
+const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
+const NS_PER_MS: i64 = 1_000_000;
+
+/// How far behind the clock an evaluator on `eval_interval` holds the memo's
+/// `watermark_hour`: `lease_ttl + query_deadline`, the margin
+/// [`AlertEvaluator::seal_bound_hour`] applies, which is where that reasoning
+/// lives.
+///
+/// Public because the alert retention window is only usable above it: the
+/// maintenance driver refuses to sweep under a memo whose watermark sits below
+/// the expiry floor's hour, so a window shorter than this margin puts the floor
+/// above every watermark the evaluator can write and the sweep never runs. The
+/// `query_deadline` term is the compiled-in [`DEFAULT_QUERY_DEADLINE`] rather
+/// than an evaluator's own, because nothing configures that field away from it.
+pub fn alert_memo_seal_margin(eval_interval: Duration) -> Duration {
+    eval_interval
+        .saturating_mul(LEASE_TTL_TICKS)
+        .saturating_add(DEFAULT_QUERY_DEADLINE)
+}
+
+/// How long an alert transition's two-object write may stay in flight before
+/// the evaluator abandons it rather than publishing its commit record.
+///
+/// This is the ingest writers' own `max_flush_lifetime`, read through the one
+/// function that answers that question for the whole workspace rather than
+/// copied as a second constant. Orphan GC's age gate (`grace +
+/// max_flush_lifetime`) is sound only for writers that honour it, and since
+/// ADR-1688's keep-set amendment the alerts shard has an orphan sweep; see
+/// [`AlertEvaluator::publish`] for what breaks without this.
+fn alert_publish_lifetime_ns() -> i64 {
+    ravel_maintain::ingest_max_flush_lifetime_floor_ns()
+}
+
+/// Lease lifetime as a multiple of the evaluation interval. A holder
+/// renews the lease at the start of every tick, so the lease must outlive a
+/// couple of missed ticks (a slow query, jitter, a brief GC pause) or a healthy
+/// holder would keep losing it to a standby. Three intervals lets a holder miss
+/// two consecutive ticks before a standby may take over, while still bounding
+/// how long a genuinely dead holder blocks failover to roughly three intervals.
+const LEASE_TTL_TICKS: u32 = 3;
+
+/// Fraction of one evaluation interval that sink delivery may consume in a
+/// single tick, as `(numerator, denominator)`. Without it a pass against a slow
+/// or failing sink costs `notifications * sinks * sink_timeout`, which grows
+/// with the undelivered queue and is bounded by nothing the operator chose.
+/// The deadline is an offset from the tick's start, not from the start of
+/// delivery, so the work that precedes delivery in the same tick (the memo
+/// read, the history fold, the lease acquire, rule evaluation, the repeat pass
+/// and the memo write) spends the same first half of the interval that
+/// delivery does; the fraction reserves no share for either. Notifications not
+/// attempted before the deadline stay in the undelivered map and keep their
+/// place in the queue for the next tick.
+///
+/// # What this bounds, exactly
+///
+/// [`AlertEvaluator::flush_sinks`] returns at the latest at
+///
+/// ```text
+/// max(tick start + interval * fraction, start of delivery)
+///     + sinks * sink_timeout
+/// ```
+///
+/// where the start of delivery is wherever the work before it ended. On the
+/// lease holder that is after rule evaluation, the repeat pass and the
+/// `write_alert_state_memo` PUT; on a tick whose history read failed it is
+/// after the memo read and the failed fold, with no rule evaluation; on a tick
+/// where another replica holds the lease, or the lease acquire failed, it is
+/// after `acquire_lease`, again with no rule evaluation.
+///
+/// The deadline is checked before each attempt rather than during one, and the
+/// first attempt of a tick is unconditional, so the pass can overshoot by one
+/// whole attempt: every sink of the one notification in flight, each bounded by
+/// `sink_timeout`. When the work before delivery already ran past the deadline,
+/// that unconditional attempt is the whole of the delivery phase.
+///
+/// Nothing before delivery is bounded by this constant: a tick whose queries or
+/// store calls are slow still runs as long as they take, so a tick can exceed
+/// one interval without any delivery at all. [`run_loop`] sleeps for a
+/// jittered interval, up to 10% longer than the configured one, *after* a tick
+/// returns, so an overrunning tick delays the next tick rather than
+/// overlapping it.
+const SINK_DELIVERY_DEADLINE_FRACTION: (u32, u32) = (1, 2);
+
+/// The per-tenant alert lease object body: who holds it and until when.
+/// Small JSON, mirroring how the rules file is already JSON; the value is
+/// advisory coordination state, not a frozen persistent format.
+#[derive(Debug, Serialize, Deserialize)]
+struct AlertLease {
+    /// The holding evaluator's `writer_id`, hex-encoded. Minted fresh per task,
+    /// so a replica can distinguish its own lease from a peer's.
+    holder: String,
+    /// Wall-clock nanosecond at or after which any replica may take the lease
+    /// over, even one held by a different `holder`.
+    expiry_ns: i64,
+}
+
+/// The lease object key for a tenant's alert evaluation.
+///
+/// Lives under the tenant's alert keyspace (`Signal::Alerts` prefix `a`) but
+/// deliberately outside the `c/<shard>/` commit prefix that
+/// [`AlertEvaluator::load_latest_records`] folds, so the fold never lists it and
+/// never mistakes it for a commit record. It is mutable coordination state, not
+/// an immutable data/commit object, so the object-key immutability rule does not
+/// apply to it.
+fn alert_lease_key(tenant: &TenantHash) -> String {
+    format!("t/{}/a/alert-lease", tenant.to_hex())
+}
+
+/// The query engines an evaluator runs rules against: the very instances the
+/// query endpoints serve from, not a second construction of them.
+#[derive(Clone)]
+pub struct AlertQueryEngines {
+    /// The `QueryEngine` behind `/api/v1/query`, for [`RuleQuery::Promql`].
+    pub promql: Arc<QueryEngine>,
+    /// The `SqlExecutor` behind `/api/v1/sql`, for [`RuleQuery::Sql`]. `None`
+    /// in a build with the `sql` feature on but no SQL surface mounted.
+    #[cfg(feature = "sql")]
+    pub sql: Option<Arc<ravel_sql::SqlExecutor>>,
+}
+
+/// Everything the evaluator task needs beyond the store and the engines.
+/// Shaped after [`crate::maintain::MaintenanceTaskConfig`].
+#[derive(Debug, Clone)]
+pub struct AlertEvalConfig {
+    pub enabled: bool,
+    /// Pause between evaluation ticks (`--alert-eval-interval-secs`). A zero
+    /// interval is refused at startup with [`SpawnError::ZeroEvalInterval`],
+    /// whether or not the loop is enabled: `validate_loop_intervals` checks it
+    /// regardless of `enabled`, matching `Cli::validate`.
+    /// [`check_spawnable`](Self::check_spawnable) re-refuses it at the enabled
+    /// loop's spawn site.
+    pub interval: Duration,
+    /// Static per-tenant rules (ADR-0043 decision 2), loaded once at startup by
+    /// [`load_rules_file`]. One evaluator task is spawned per key.
+    pub rules: Arc<HashMap<TenantHash, Vec<Rule>>>,
+    /// Notification targets, shared by every tenant's evaluator.
+    pub sinks: Arc<Vec<AlertSink>>,
+    /// Wall deadline for one rule's query.
+    pub query_deadline: Duration,
+    /// Wall deadline for one sink HTTP request.
+    pub sink_timeout: Duration,
+    /// Listing window a SQL rule's query resolves over, ending at the tick's
+    /// clock reading.
+    pub sql_lookback: Duration,
+}
+
+impl Default for AlertEvalConfig {
+    fn default() -> Self {
+        AlertEvalConfig {
+            enabled: false,
+            interval: DEFAULT_ALERT_EVAL_INTERVAL,
+            rules: Arc::new(HashMap::new()),
+            sinks: Arc::new(Vec::new()),
+            query_deadline: DEFAULT_QUERY_DEADLINE,
+            sink_timeout: DEFAULT_SINK_TIMEOUT,
+            sql_lookback: DEFAULT_SQL_LOOKBACK,
+        }
+    }
+}
+
+/// Why [`spawn`] refused to start the evaluator loops. Nothing is spawned.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    /// A zero `interval` would run every evaluation tick back to back.
+    #[error(
+        "--alert-eval-interval-secs must be non-zero: a zero evaluation interval runs every tick back to back"
+    )]
+    ZeroEvalInterval,
+}
+
+impl AlertEvalConfig {
+    /// The refusal [`spawn`] applies before starting any evaluator. `start`
+    /// refuses a zero interval earlier, before spawning anything, whether or
+    /// not evaluation is enabled.
+    pub fn check_spawnable(&self) -> Result<(), SpawnError> {
+        if self.enabled && self.interval.is_zero() {
+            return Err(SpawnError::ZeroEvalInterval);
+        }
+        Ok(())
+    }
+}
+
+/// Handle to every spawned evaluator task, for clean shutdown (mirrors
+/// [`crate::maintain::MaintenanceTasks`]).
+pub struct AlertEvalTasks {
+    shutdown: Vec<oneshot::Sender<()>>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl AlertEvalTasks {
+    pub fn none() -> Self {
+        AlertEvalTasks {
+            shutdown: Vec::new(),
+            handles: Vec::new(),
+        }
+    }
+
+    pub async fn shutdown(self) {
+        for tx in self.shutdown {
+            let _ = tx.send(());
+        }
+        for handle in self.handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Spawn one evaluator loop per tenant that has rules. Returns immediately;
+/// tasks run until [`AlertEvalTasks::shutdown`].
+///
+/// Fails if the shared HTTP client cannot be built, or with
+/// [`SpawnError::ZeroEvalInterval`] for an enabled config with a zero
+/// `interval`: both are startup misconfigurations rather than runtime
+/// conditions.
+pub fn spawn(
+    store: Arc<dyn ObjectStoreBackend>,
+    engines: AlertQueryEngines,
+    clock: Arc<dyn Clock>,
+    config: AlertEvalConfig,
+) -> anyhow::Result<AlertEvalTasks> {
+    config.check_spawnable()?;
+    if !config.enabled || config.rules.is_empty() {
+        return Ok(AlertEvalTasks::none());
+    }
+
+    let mut shutdown = Vec::new();
+    let mut handles = Vec::new();
+    // Sorted so the spawn order (and therefore the log order) is stable across
+    // runs; a HashMap iteration order is not.
+    let mut tenants: Vec<TenantHash> = config.rules.keys().copied().collect();
+    tenants.sort_unstable_by_key(|t| t.0);
+
+    for tenant in tenants {
+        let Some(rules) = config.rules.get(&tenant) else {
+            continue;
+        };
+        let mut evaluator = AlertEvaluator::new(
+            store.clone(),
+            engines.clone(),
+            clock.clone(),
+            tenant,
+            rules.clone(),
+            &config,
+        )?;
+        // Warn once per rule whose repeat cadence is finer than the tick can
+        // deliver: the effective cadence is `repeat_interval` rounded up to the
+        // next tick, so a sub-tick interval is silently coarsened to the tick
+        // (ADR-0043 "repeat notifications while firing", decision 3). A `None`
+        // interval uses the default and an explicit zero disables repeats, so
+        // neither warns.
+        for rule in rules.iter() {
+            if let Some(repeat) = rule.repeat_interval
+                && !repeat.is_zero()
+                && repeat < config.interval
+            {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    rule_id = %rule.rule_id,
+                    repeat_interval_secs = repeat.as_secs(),
+                    eval_interval_secs = config.interval.as_secs(),
+                    "alert rule repeat_interval is shorter than the evaluation interval; the \
+                     tick bounds the effective repeat cadence"
+                );
+            }
+        }
+        let (tx, rx) = oneshot::channel();
+        let interval = config.interval;
+        // Production OS-entropy jitter (ADR-0068 decision 2); the harness does
+        // not drive alert evaluators, so there is no injected variant.
+        let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
+        let handle = tokio::spawn(async move {
+            run_loop(&mut evaluator, interval, rng, rx).await;
+        });
+        shutdown.push(tx);
+        handles.push(handle);
+        tracing::info!(
+            tenant = %tenant.to_hex(),
+            rules = config.rules.get(&tenant).map_or(0, Vec::len),
+            interval_secs = config.interval.as_secs(),
+            "alert evaluator started"
+        );
+    }
+    Ok(AlertEvalTasks { shutdown, handles })
+}
+
+async fn run_loop(
+    evaluator: &mut AlertEvaluator,
+    interval: Duration,
+    rng: Arc<dyn RngSource>,
+    mut shutdown: oneshot::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(jittered(interval, rng.as_ref())) => {}
+            _ = &mut shutdown => return,
+        }
+        let report = evaluator.run_tick().await;
+        tracing::info!(
+            tenant = %evaluator.tenant.to_hex(),
+            rules_evaluated = report.rules_evaluated,
+            rules_failed = report.rules_failed,
+            records_written = report.records_written,
+            repeats_queued = report.repeats_queued,
+            notifications_delivered = report.notifications_delivered,
+            notifications_failed = report.notifications_failed,
+            notifications_deferred = report.notifications_deferred,
+            "alert evaluation tick complete"
+        );
+    }
+}
+
+/// Up to 10% jitter over `base`, so co-started replicas' evaluation ticks do
+/// not run in lockstep (same rationale as the fold and maintenance tasks).
+fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
+    let jitter_bound_ms = u64::try_from(base.as_millis() / 10).unwrap_or(u64::MAX);
+    if jitter_bound_ms == 0 {
+        return base;
+    }
+    let extra_ms = rng.jitter_ms(jitter_bound_ms);
+    base + Duration::from_millis(extra_ms)
+}
+
+/// What one tick did, for logs and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AlertEvalReport {
+    /// Rules whose query ran and whose condition was decided.
+    pub rules_evaluated: u32,
+    /// Rules skipped this tick because the query, the condition, or the write
+    /// failed. Every one is logged; the rule is retried next tick.
+    pub rules_failed: u32,
+    /// Transition records durably written this tick.
+    pub records_written: u32,
+    /// Repeat notifications this tick queued for a still-`Firing` alert
+    /// (ADR-0043 "repeat notifications while firing" amendment). A repeat
+    /// re-sends the folded latest record with no new durable write; it is
+    /// delivered by the same `flush_sinks` path, so it is also counted in
+    /// `notifications_delivered` once a sink accepts it.
+    pub repeats_queued: u32,
+    /// Notifications this tick delivered to every configured sink, including
+    /// ones carried over from an earlier tick's failure.
+    pub notifications_delivered: u32,
+    /// Notifications this tick attempted but that at least one sink did not
+    /// accept, counted once per tick per notification while they are retried.
+    pub notifications_failed: u32,
+    /// Notifications this tick did not attempt because the per-tick delivery
+    /// deadline ([`SINK_DELIVERY_DEADLINE_FRACTION`] of the interval) elapsed
+    /// first. Counted once per notification per tick: a notification deferred
+    /// on several consecutive ticks advances this once on each of them. They
+    /// keep their place at the front of the queue, so the next tick attempts
+    /// them before anything enqueued since.
+    pub notifications_deferred: u32,
+    /// `true` when the alert history could not be read, so no rule was
+    /// evaluated at all. Never acts on a partial history: doing so would
+    /// re-fire an alert that is already firing.
+    pub history_unavailable: bool,
+    /// `true` when another replica held the tenant's alert lease this tick, so
+    /// this replica skipped rule evaluation. Expected steady state in a
+    /// multi-replica deployment, not an error.
+    pub lease_not_held: bool,
+    /// `true` when the lease could not be acquired or renewed because the
+    /// object store failed. Distinct from `lease_not_held`: this is a
+    /// store error, not a peer holding the lease. Rule evaluation is skipped and
+    /// retried next tick.
+    pub lease_unavailable: bool,
+}
+
+impl AlertEvalReport {
+    /// How this tick ended, as one value of a closed set.
+    ///
+    /// The three state flags are mutually exclusive by construction in
+    /// [`AlertEvaluator::run_tick`]: an unreadable history returns before the
+    /// lease is touched, and the lease attempt sets at most one of
+    /// `lease_unavailable` and `lease_not_held`. Collapsing them into one
+    /// outcome is what lets `/metrics` render them as one counter split by a
+    /// closed `outcome` label rather than three independent flags whose
+    /// combinations an operator would have to reason about.
+    pub fn outcome(&self) -> AlertTickOutcome {
+        if self.history_unavailable {
+            AlertTickOutcome::HistoryUnavailable
+        } else if self.lease_unavailable {
+            AlertTickOutcome::LeaseUnavailable
+        } else if self.lease_not_held {
+            AlertTickOutcome::LeaseNotHeld
+        } else {
+            AlertTickOutcome::Evaluated
+        }
+    }
+}
+
+/// How one evaluation tick ended, the `outcome` dimension of
+/// `ravel_alert_ticks_total`.
+///
+/// `LeaseNotHeld` is a healthy outcome, not a failure: in a multi-replica
+/// deployment every replica but the lease holder reports it on every tick. It
+/// is a separate outcome rather than folded into a failure count precisely so
+/// an alert rule can leave the steady state alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertTickOutcome {
+    /// The lease was held and every configured rule was evaluated.
+    Evaluated,
+    /// A peer replica held the tenant's lease, so rule evaluation was skipped.
+    /// Expected steady state, not an error.
+    LeaseNotHeld,
+    /// The lease could not be acquired or renewed because the object store
+    /// failed.
+    LeaseUnavailable,
+    /// The alert history could not be read, so no rule was evaluated at all.
+    HistoryUnavailable,
+}
+
+impl AlertTickOutcome {
+    /// Every outcome, so the renderer emits one series per variant on every
+    /// scrape rather than only the ones seen so far. Adding a variant without
+    /// adding it here is caught by the exhaustive match in
+    /// `crate::metrics::alert_outcome_name`.
+    pub const ALL: [AlertTickOutcome; 4] = [
+        AlertTickOutcome::Evaluated,
+        AlertTickOutcome::LeaseNotHeld,
+        AlertTickOutcome::LeaseUnavailable,
+        AlertTickOutcome::HistoryUnavailable,
+    ];
+
+    /// Whether a tick with this outcome advances the liveness gauge. Only a
+    /// tick that observed the tenant's state and reached its end does:
+    /// `LeaseNotHeld` qualifies (a standby replica is alive and evaluating
+    /// nothing by design), the two failure outcomes do not.
+    fn completed(self) -> bool {
+        match self {
+            AlertTickOutcome::Evaluated | AlertTickOutcome::LeaseNotHeld => true,
+            AlertTickOutcome::LeaseUnavailable | AlertTickOutcome::HistoryUnavailable => false,
+        }
+    }
+}
+
+/// The alerting pipeline's `/metrics` counters, folded across every tenant this
+/// process evaluates.
+///
+/// Process-wide with no `tenant_hash` dimension, the same constraint every
+/// other family on this unauthenticated route carries (ADR-0044 section 4).
+/// One handle per process, reached through [`active_alert_metrics`]; an
+/// evaluator built for a test can hold its own instead, so a test asserts
+/// exact values without racing the process-global one.
+#[derive(Debug, Default)]
+pub struct AlertMetrics {
+    rules_evaluated: AtomicU64,
+    rules_failed: AtomicU64,
+    records_written: AtomicU64,
+    repeats_queued: AtomicU64,
+    notifications_delivered: AtomicU64,
+    notifications_failed: AtomicU64,
+    /// Notifications deferred to a later tick because the per-tick delivery
+    /// deadline elapsed. Cumulative across ticks and tenants.
+    notifications_deferred: AtomicU64,
+    /// The sum of every live evaluator's undelivered map size. A gauge, kept
+    /// by each evaluator adding the change in its own size after every tick
+    /// and taking its share back out when it is dropped.
+    undelivered_notifications: AtomicU64,
+    ticks_evaluated: AtomicU64,
+    ticks_lease_not_held: AtomicU64,
+    ticks_lease_unavailable: AtomicU64,
+    ticks_history_unavailable: AtomicU64,
+    /// Unix nanoseconds of the last tick that reached its end, from the
+    /// injected clock; `0` until one does. Every other figure here is
+    /// cumulative and stops moving when the loop dies, so only this gauge's age
+    /// separates a dead evaluator from a healthy one with nothing to do.
+    last_tick_completed_unix_ns: AtomicI64,
+}
+
+impl AlertMetrics {
+    /// Fold one finished tick in. `now_ns` is the clock reading that tick ran
+    /// at, so the liveness gauge is the injected clock's value and never
+    /// `SystemTime::now`.
+    ///
+    /// Called once per tick from [`AlertEvaluator::run_tick`], on every path
+    /// including the ones that fail: a tick that could not read history still
+    /// records what it observed, and only the liveness gauge distinguishes it.
+    pub fn record_tick(&self, report: &AlertEvalReport, now_ns: i64) {
+        let add = |counter: &AtomicU64, value: u32| {
+            counter.fetch_add(u64::from(value), Ordering::Relaxed);
+        };
+        add(&self.rules_evaluated, report.rules_evaluated);
+        add(&self.rules_failed, report.rules_failed);
+        add(&self.records_written, report.records_written);
+        add(&self.repeats_queued, report.repeats_queued);
+        add(
+            &self.notifications_delivered,
+            report.notifications_delivered,
+        );
+        add(&self.notifications_failed, report.notifications_failed);
+        add(&self.notifications_deferred, report.notifications_deferred);
+
+        let outcome = report.outcome();
+        self.tick_counter(outcome).fetch_add(1, Ordering::Relaxed);
+        if outcome.completed() {
+            self.last_tick_completed_unix_ns
+                .store(now_ns, Ordering::Relaxed);
+        }
+    }
+
+    fn tick_counter(&self, outcome: AlertTickOutcome) -> &AtomicU64 {
+        match outcome {
+            AlertTickOutcome::Evaluated => &self.ticks_evaluated,
+            AlertTickOutcome::LeaseNotHeld => &self.ticks_lease_not_held,
+            AlertTickOutcome::LeaseUnavailable => &self.ticks_lease_unavailable,
+            AlertTickOutcome::HistoryUnavailable => &self.ticks_history_unavailable,
+        }
+    }
+
+    pub fn rules_evaluated(&self) -> u64 {
+        self.rules_evaluated.load(Ordering::Relaxed)
+    }
+
+    pub fn rules_failed(&self) -> u64 {
+        self.rules_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn records_written(&self) -> u64 {
+        self.records_written.load(Ordering::Relaxed)
+    }
+
+    pub fn repeats_queued(&self) -> u64 {
+        self.repeats_queued.load(Ordering::Relaxed)
+    }
+
+    pub fn notifications_delivered(&self) -> u64 {
+        self.notifications_delivered.load(Ordering::Relaxed)
+    }
+
+    pub fn notifications_failed(&self) -> u64 {
+        self.notifications_failed.load(Ordering::Relaxed)
+    }
+
+    pub fn notifications_deferred(&self) -> u64 {
+        self.notifications_deferred.load(Ordering::Relaxed)
+    }
+
+    /// Replace one evaluator's share of the undelivered gauge, `previous`,
+    /// with its current map size.
+    fn move_undelivered(&self, previous: u64, current: u64) {
+        if current >= previous {
+            self.undelivered_notifications
+                .fetch_add(current - previous, Ordering::Relaxed);
+        } else {
+            self.undelivered_notifications
+                .fetch_sub(previous - current, Ordering::Relaxed);
+        }
+    }
+
+    pub fn undelivered_notifications(&self) -> u64 {
+        self.undelivered_notifications.load(Ordering::Relaxed)
+    }
+
+    pub fn ticks(&self, outcome: AlertTickOutcome) -> u64 {
+        self.tick_counter(outcome).load(Ordering::Relaxed)
+    }
+
+    pub fn last_tick_completed_unix_ns(&self) -> i64 {
+        self.last_tick_completed_unix_ns.load(Ordering::Relaxed)
+    }
+}
+
+/// The one handle every evaluator in this process folds into, created on the
+/// first [`AlertEvaluator::new`].
+static ALERT_METRICS: OnceLock<Arc<AlertMetrics>> = OnceLock::new();
+
+/// The process handle, creating it if this is the first evaluator.
+fn global_alert_metrics() -> Arc<AlertMetrics> {
+    Arc::clone(ALERT_METRICS.get_or_init(|| Arc::new(AlertMetrics::default())))
+}
+
+/// The process handle for `/metrics`, or `None` when this process has built no
+/// evaluator at all.
+///
+/// `None` is what keeps the whole `ravel_alert_*` family off the exposition of
+/// a deployment that configured no alert rules, rather than exporting a row of
+/// permanent zeros there (the same choice `render_durable_auth_family` makes).
+/// It is also what keeps the alert rules in docs/guides/observability.md quiet
+/// on such a deployment: with no series to match, each rule's expression is the
+/// empty vector.
+pub fn active_alert_metrics() -> Option<Arc<AlertMetrics>> {
+    ALERT_METRICS.get().map(Arc::clone)
+}
+
+/// One undelivered notification and its place in the delivery queue.
+///
+/// The place is a sequence number rather than the record's `ts_ns` because the
+/// two are different quantities: `ts_ns` is how old the transition is, `seq` is
+/// how long the notification has been waiting for a sink. A repeat re-queues
+/// the firing record unchanged, so its `ts_ns` stays at the original onset for
+/// as long as the alert fires; ordering by `ts_ns` would hand the same oldest
+/// few notifications the whole of every tick's budget and never reach a newer
+/// one (issue #2063).
+struct QueuedNotification {
+    /// Ascending in enqueue order. Lower is earlier in the queue.
+    seq: u64,
+    notification: AlertNotification,
+}
+
+/// The evaluator for one tenant.
+pub struct AlertEvaluator {
+    store: Arc<dyn ObjectStoreBackend>,
+    engines: AlertQueryEngines,
+    clock: Arc<dyn Clock>,
+    tenant: TenantHash,
+    rules: Vec<Rule>,
+    sinks: Arc<Vec<AlertSink>>,
+    http: reqwest::Client,
+    query_deadline: Duration,
+    /// How long a lease this evaluator writes stays valid before any replica may
+    /// take it over. Derived from the evaluation interval at construction
+    /// ([`LEASE_TTL_TICKS`] times it).
+    lease_ttl: Duration,
+    /// Offset from the tick's start, on the injected clock, after which
+    /// [`Self::flush_sinks`] starts no further delivery attempt beyond its
+    /// first. Measured from the tick's own reading, so the work before delivery
+    /// consumes it too. Derived from the evaluation interval at construction
+    /// ([`SINK_DELIVERY_DEADLINE_FRACTION`] of it); see that constant for the
+    /// bound the budget actually buys, which is not the whole tick.
+    sink_delivery_budget: Duration,
+    /// Only read by the `sql` feature's [`AlertEvaluator::run_sql`]; a build
+    /// without that feature rejects SQL rules before it would be needed.
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    sql_lookback: Duration,
+    /// Fresh per task, so `(writer_id, epoch, seq)` is unique without any
+    /// cross-process coordination.
+    writer_id: Uuid,
+    next_seq: u64,
+    /// Transitions written but not yet accepted by every sink, keyed by
+    /// `alert_id` so a newer transition supersedes an older undelivered one.
+    /// An entry, a full [`AlertRecord`] clone, leaves only when every sink
+    /// accepted it, so the map holds the live firing identities plus every
+    /// identity whose latest transition some sink has not yet accepted. While
+    /// a sink keeps failing that is unbounded: a rule over a churning series
+    /// label adds an entry per series that ever fired and resolved (issue
+    /// #1438). Its size is the `ravel_alert_undelivered_notifications` gauge.
+    ///
+    /// It is a queue, not a set: each entry carries the
+    /// [`QueuedNotification::seq`] that orders [`Self::flush_sinks`].
+    undelivered: HashMap<AlertId, QueuedNotification>,
+    /// Next value of [`QueuedNotification::seq`]. Monotonic for the life of the
+    /// evaluator, incremented by [`Self::take_enqueue_seq`] on every enqueue
+    /// and on every move to the back of the queue.
+    next_enqueue_seq: u64,
+    /// This evaluator's share of the `ravel_alert_undelivered_notifications`
+    /// gauge: `undelivered.len()` as of the last tick, taken back out on drop.
+    undelivered_reported: u64,
+    /// Per-alert duplicate suppressor for the repeat pass (ADR-0043 "repeat
+    /// notifications while firing" amendment, decision 2): the
+    /// `(anchor_ts_ns, window)` of the last repeat window a notification was
+    /// queued in. `anchor_ts_ns` is the firing record's own `ts_ns`; a mark
+    /// whose anchor differs from the current firing record's `ts_ns` is stale
+    /// (a resolve-then-refire re-anchored the episode) and is ignored, so the
+    /// new episode re-anchors cleanly instead of inheriting the old window
+    /// count. This is a suppressor, not the schedule: the schedule is derived
+    /// from `record.ts_ns` plus the clock every tick, so losing this map
+    /// (restart, lease failover) costs at most one extra send and never a
+    /// silence. Pruned after every repeat pass to the identities whose folded
+    /// latest record is still Firing, so it is bounded by the live firing
+    /// alerts rather than by every identity that ever fired.
+    repeat_marks: HashMap<AlertId, (i64, u64)>,
+    /// Set after the first tick that successfully reads alert history.
+    /// `undelivered` is process-local, so a restart loses whatever was
+    /// in flight; without this, that loss is permanent (a still-firing alert
+    /// that was mid-retry when the process died is never notified again,
+    /// since nothing re-enters `undelivered` for it). On the first successful
+    /// tick, every alert whose folded state is not terminal is seeded into
+    /// `undelivered` once, which is what keeps sink delivery inside the
+    /// at-least-once contract ADR-0043 decision 6 actually states, rather
+    /// than at-most-once across a restart.
+    bootstrapped: bool,
+    /// Where every tick's report is folded for `/metrics`. The process-global
+    /// handle by default; a test swaps in its own with
+    /// [`AlertEvaluator::with_metrics`] so it can assert exact counter values.
+    metrics: Arc<AlertMetrics>,
+}
+
+impl AlertEvaluator {
+    /// Build an evaluator for one tenant. `rules` are that tenant's rules only.
+    pub fn new(
+        store: Arc<dyn ObjectStoreBackend>,
+        engines: AlertQueryEngines,
+        clock: Arc<dyn Clock>,
+        tenant: TenantHash,
+        rules: Vec<Rule>,
+        config: &AlertEvalConfig,
+    ) -> anyhow::Result<AlertEvaluator> {
+        let http = reqwest::Client::builder()
+            .timeout(config.sink_timeout)
+            .build()?;
+        Ok(AlertEvaluator {
+            store,
+            engines,
+            clock,
+            tenant,
+            rules,
+            sinks: config.sinks.clone(),
+            http,
+            query_deadline: config.query_deadline,
+            lease_ttl: config.interval * LEASE_TTL_TICKS,
+            sink_delivery_budget: config.interval * SINK_DELIVERY_DEADLINE_FRACTION.0
+                / SINK_DELIVERY_DEADLINE_FRACTION.1,
+            sql_lookback: config.sql_lookback,
+            writer_id: Uuid::new_v4(),
+            next_seq: 1,
+            undelivered: HashMap::new(),
+            next_enqueue_seq: 0,
+            undelivered_reported: 0,
+            repeat_marks: HashMap::new(),
+            bootstrapped: false,
+            // Constructing an evaluator is what marks this process as one that
+            // runs alerting, and therefore what makes `/metrics` render the
+            // family at all.
+            metrics: global_alert_metrics(),
+        })
+    }
+
+    /// The tenant this evaluator was built for.
+    pub fn tenant(&self) -> TenantHash {
+        self.tenant
+    }
+
+    /// A snapshot of the rules this evaluator evaluates, for its own tenant, in
+    /// the order [`parse_rules`] read them out of the rules document.
+    ///
+    /// A clone rather than a borrow, so a caller holding the snapshot does not
+    /// hold the evaluator. The set is static per process (ADR-0043 decision 2):
+    /// it is fixed at construction and never changes for the life of the task,
+    /// so two calls to this method on one evaluator return the same rules.
+    /// [`crate::alerts_api`] serves the same per-tenant set, from the same map
+    /// [`spawn`] built this evaluator from.
+    pub fn rules(&self) -> Vec<Rule> {
+        self.rules.clone()
+    }
+
+    /// Fold this evaluator's ticks into `metrics` instead of the process-global
+    /// handle. For tests: a shared global cannot carry an exact-value
+    /// assertion when other tests in the same binary tick their own evaluators.
+    #[cfg(test)]
+    fn with_metrics(mut self, metrics: Arc<AlertMetrics>) -> AlertEvaluator {
+        self.metrics = metrics;
+        self
+    }
+
+    /// The next place at the back of the delivery queue.
+    ///
+    /// `u64` and saturating: one evaluator would have to enqueue a notification
+    /// every nanosecond for 584 years to reach the ceiling, and saturating
+    /// there degrades the order rather than wrapping it into a front-of-queue
+    /// value that would starve everything already waiting.
+    fn take_enqueue_seq(&mut self) -> u64 {
+        let seq = self.next_enqueue_seq;
+        self.next_enqueue_seq = self.next_enqueue_seq.saturating_add(1);
+        seq
+    }
+
+    /// Queue `notification` for `alert_id` at the back of the delivery queue,
+    /// unless an entry for that identity is already queued.
+    ///
+    /// An existing entry keeps both its notification and its place: it has
+    /// already been waiting, and a bootstrap or a repeat for the same identity
+    /// is a re-send of the same thing, not a newer one. Only
+    /// [`Self::write_transition`] supersedes the notification, and it keeps the
+    /// place too.
+    fn enqueue_if_absent(&mut self, alert_id: AlertId, notification: AlertNotification) {
+        if self.undelivered.contains_key(&alert_id) {
+            return;
+        }
+        let seq = self.take_enqueue_seq();
+        self.undelivered
+            .insert(alert_id, QueuedNotification { seq, notification });
+    }
+
+    /// One evaluation pass over every rule of this tenant, then one delivery
+    /// pass over every undelivered notification.
+    ///
+    /// Split out from [`run_loop`] so a test can drive a single deterministic
+    /// tick without the timer, exactly as [`crate::maintain::run_tick`] is.
+    ///
+    /// Ordering is the ADR-0043 decision 6 guarantee in code: every record is
+    /// PUT and its commit record published before [`Self::flush_sinks`] is
+    /// reached, and a sink failure only leaves an entry in `undelivered` for
+    /// the next tick. No sink result can prevent, delay past its own write, or
+    /// alter a record.
+    ///
+    /// Every exit of the tick body funnels through the single
+    /// [`AlertMetrics::record_tick`] call here, so a tick that ends in a
+    /// failure still records what it observed. Splitting the body out is what
+    /// makes that structural rather than a rule to remember at each early
+    /// return.
+    pub async fn run_tick(&mut self) -> AlertEvalReport {
+        let now_ns = self.clock.now_ns();
+        let report = self.evaluate_tick(now_ns).await;
+        self.metrics.record_tick(&report, now_ns);
+        let current = self.undelivered.len() as u64;
+        self.metrics
+            .move_undelivered(self.undelivered_reported, current);
+        self.undelivered_reported = current;
+        report
+    }
+
+    /// The tick body, at the clock reading [`Self::run_tick`] took.
+    async fn evaluate_tick(&mut self, now_ns: i64) -> AlertEvalReport {
+        let mut report = AlertEvalReport::default();
+
+        // Read the derived state memo first, before the lease and unguarded: it
+        // is an advisory cache every replica reads, so each folds only the ingest
+        // hours since the memo instead of the whole history (issue #1294). A
+        // missing memo (cold start), a corrupt one, or an unsupported-version one
+        // is not an error here; it falls back to a full fold below, and the lease
+        // holder rewrites a valid memo at the end of the tick.
+        let memo = match read_alert_state_memo(self.store.as_ref(), &self.tenant).await {
+            Ok(memo) => memo,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %self.tenant.to_hex(),
+                    error = %err,
+                    "alert evaluation: alert state memo unreadable; folding full history this tick"
+                );
+                None
+            }
+        };
+
+        let mut latest = match self.fold_latest(memo.as_ref(), now_ns).await {
+            Ok(latest) => latest,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %self.tenant.to_hex(),
+                    error = %err,
+                    "alert evaluation: could not read alert history; skipping tick"
+                );
+                report.history_unavailable = true;
+                // Still attempt delivery: a notification stuck from an earlier
+                // tick does not depend on this tick's history read.
+                self.flush_sinks(now_ns, &mut report).await;
+                return report;
+            }
+        };
+
+        if !self.bootstrapped {
+            self.bootstrap_undelivered(&latest);
+            self.bootstrapped = true;
+        }
+
+        // only the lease holder for this tenant evaluates rules and writes
+        // transition records this tick, so two `--mode all`/`--mode query`
+        // replicas configured with the same rules do not both fire and notify
+        // every transition. History reading and bootstrap above are unguarded on
+        // purpose (they are read-only and idempotent, and bootstrap must still
+        // recover this process's own in-flight notifications after a restart);
+        // only the write path is gated. `flush_sinks` below always runs, so a
+        // notification already queued at this replica is still retried even on a
+        // tick where a peer holds the lease.
+        let hold_lease = match self.acquire_lease(now_ns).await {
+            Ok(held) => held,
+            Err(err) => {
+                tracing::warn!(
+                    tenant = %self.tenant.to_hex(),
+                    error = %err,
+                    "alert evaluation: could not acquire the tenant lease; skipping rule \
+                     evaluation this tick"
+                );
+                report.lease_unavailable = true;
+                false
+            }
+        };
+
+        if hold_lease {
+            // `rules` is moved out for the loop so `self` stays mutably
+            // borrowable for the write path; it is put back before returning.
+            let rules = std::mem::take(&mut self.rules);
+            for rule in &rules {
+                let mut written = 0;
+                let result = self
+                    .evaluate_rule(rule, &mut latest, now_ns, &mut written)
+                    .await;
+                report.records_written += written;
+                match result {
+                    Ok(()) => report.rules_evaluated += 1,
+                    Err(err) => {
+                        report.rules_failed += 1;
+                        if let Some(AlertError::TooManyAlerts { count, limit, .. }) =
+                            err.downcast_ref::<AlertError>()
+                        {
+                            tracing::warn!(
+                                tenant = %self.tenant.to_hex(),
+                                rule_id = %rule.rule_id,
+                                count,
+                                limit,
+                                "alert evaluation: rule failed with TooManyAlerts: it matched \
+                                 {count} series, over the limit of {limit} alerts per rule; no \
+                                 record written, retried next tick. Narrow the selector or \
+                                 aggregate"
+                            );
+                        } else {
+                            tracing::warn!(
+                                tenant = %self.tenant.to_hex(),
+                                rule_id = %rule.rule_id,
+                                error = %err,
+                                "alert evaluation: rule failed; retried next tick"
+                            );
+                        }
+                    }
+                }
+            }
+            // Repeat pass (ADR-0043 "repeat notifications while firing"): after
+            // rule evaluation, on the lease holder only, re-queue a notification
+            // for each of a rule's alerts whose folded latest record is still
+            // Firing and whose repeat window has advanced. This reads the same `latest` the loop
+            // above updated on any transition, so a rule that just resolved this
+            // tick folds to Resolved here and does not repeat. No durable record
+            // is written for a repeat (decision 4 stands); it rides the existing
+            // `undelivered` map and `flush_sinks` drain.
+            let firing = firing_by_rule(&latest);
+            for rule in &rules {
+                self.queue_repeat_if_due(rule, firing_of(&firing, rule), now_ns, &mut report);
+            }
+            self.prune_repeat_marks(&latest);
+            self.rules = rules;
+
+            // Refresh the derived state memo from the just-folded latest state
+            // (issue #1294). Lease holder only, so there is a single writer per
+            // key; debounced so a tick that changed neither the watermark hour
+            // nor any record skips the write. The memo is advisory and
+            // reconstructible (ADR-0065 precedent): a failed write costs the next
+            // tick a full fold, never correctness.
+            //
+            // The watermark is the seal bound, not `hour_bucket(now_ns)`. The
+            // alert lease permits a two-holder overlap (see `acquire_lease`): a
+            // prior holder can still publish one in-flight transition after this
+            // holder's tail LIST, stamped at that holder's clock reading at its
+            // own publish (`evaluate_rule`). If that stamp lands in an hour below
+            // the watermark, the tail would exclude it from every future tick and
+            // the memo would omit it permanently. `seal_bound_hour` holds the
+            // watermark back far enough that a stamp taken on a clock disagreeing
+            // with this one still lands at or above it, so the tail always
+            // re-reads such a late transition (ADR-1294 decision 5).
+            let watermark_hour = self.seal_bound_hour(now_ns);
+            let unchanged = memo
+                .as_ref()
+                .is_some_and(|m| m.watermark_hour == watermark_hour && m.records == latest);
+            if !unchanged {
+                let refreshed = AlertStateMemo {
+                    watermark_hour,
+                    records: latest.clone(),
+                };
+                if let Err(err) =
+                    write_alert_state_memo(self.store.as_ref(), &self.tenant, &refreshed).await
+                {
+                    tracing::warn!(
+                        tenant = %self.tenant.to_hex(),
+                        error = %err,
+                        "alert evaluation: could not refresh the alert state memo; a full fold \
+                         recovers it next tick"
+                    );
+                }
+            }
+        } else if !report.lease_unavailable {
+            report.lease_not_held = true;
+            tracing::debug!(
+                tenant = %self.tenant.to_hex(),
+                "alert evaluation: another replica holds the tenant lease; skipping rule \
+                 evaluation this tick"
+            );
+        }
+
+        self.flush_sinks(now_ns, &mut report).await;
+        report
+    }
+
+    /// The newest ingest hour that is sealed for alert writes as of `now_ns`:
+    /// the memo watermark. No overlapping lease holder can still stamp a
+    /// transition into this hour or any older one, so a tail LIST that starts at
+    /// this hour re-reads every transition an in-flight prior holder might
+    /// publish after this tick's own tail LIST.
+    ///
+    /// The alert lease documents a two-holder overlap (see [`Self::acquire_lease`]):
+    /// a prior holder whose lease has expired can still finish an in-flight tick
+    /// and publish one transition. [`Self::evaluate_rule`] reads the clock
+    /// immediately before that write, so the margin has to bound the prior
+    /// holder's *stamp*, not the duration of its tick: a tick of any length
+    /// stamps at the reading it holds when it publishes, which on one clock is at
+    /// or after the reading this holder computed its own watermark from. What is
+    /// left for the margin to absorb is disagreement between the two holders'
+    /// clocks. [`DEFAULT_QUERY_DEADLINE`] (this evaluator's `query_deadline`) is
+    /// the only wall-clock tolerance the alerting path defines, so it stands in
+    /// for a cross-node skew constant the path does not have; [`Self::lease_ttl`]
+    /// (`LEASE_TTL_TICKS` times the eval interval) is carried on top of it
+    /// because a holder that fell that far behind is already the case a handover
+    /// produces. The seal margin is therefore `lease_ttl + query_deadline`, and
+    /// the watermark is the ingest hour of `now_ns - seal_margin`. A deployment
+    /// whose inter-node clock skew exceeds that margin would need to widen it.
+    fn seal_bound_hour(&self, now_ns: i64) -> u32 {
+        let seal_margin_ns = i64::try_from(
+            self.lease_ttl
+                .saturating_add(self.query_deadline)
+                .as_nanos(),
+        )
+        .unwrap_or(i64::MAX);
+        hour_bucket(now_ns.saturating_sub(seal_margin_ns))
+    }
+
+    /// Try to own this tenant's alert lease for this tick.
+    ///
+    /// Two replicas can be configured with the same rules for the same tenant.
+    /// Their folds are independent, so without coordination both evaluate every
+    /// tick, both write a transition record, and both notify it. This is a
+    /// lightweight object-store lease, not a general leader election: the
+    /// evaluator tries to own a small lease object under the tenant's alert
+    /// keyspace before it writes anything.
+    ///
+    /// Returns `Ok(true)` when this replica now holds the lease (it created it,
+    /// renewed its own, or took over an expired one), `Ok(false)` when a live
+    /// lease is held by a different replica or a takeover race was lost, and
+    /// `Err` only on an object-store failure.
+    ///
+    /// The lease is not a fencing token and does not make the record write
+    /// mutually exclusive at the store layer: alert records are still unique by
+    /// `(writer_id, epoch, seq)`, so a brief two-owner overlap during a handover
+    /// at worst duplicates a transition record and its at-least-once
+    /// notification, which the fold's `(ts_ns, epoch, seq)` tie-break already
+    /// tolerates and ADR-0043 decision 6 already permits. What it removes is the
+    /// steady-state case of two healthy replicas both firing every rule every
+    /// tick.
+    async fn acquire_lease(&self, now_ns: i64) -> anyhow::Result<bool> {
+        let key = alert_lease_key(&self.tenant);
+        let identity = self.writer_id.to_string();
+        let ttl_ns = i64::try_from(self.lease_ttl.as_nanos()).unwrap_or(i64::MAX);
+        let lease = AlertLease {
+            holder: identity.clone(),
+            expiry_ns: now_ns.saturating_add(ttl_ns),
+        };
+        let body = Bytes::from(serde_json::to_vec(&lease)?);
+
+        // Fast path: no lease object yet. `CreateIfAbsent` is atomic (ADR-0002),
+        // so at most one racing replica wins the create.
+        match self
+            .store
+            .put(&key, body.clone(), PutOptions::create_if_absent())
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(StoreError::AlreadyExists) => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        // A lease already exists. Read it: we may renew our own or take over one
+        // that has expired, but never displace a live lease held by a peer.
+        let current = self.store.get(&key, GetRange::Full).await?;
+        let existing: AlertLease = serde_json::from_slice(&current.data)?;
+        let held_by_other = existing.holder != identity;
+        if held_by_other && existing.expiry_ns > now_ns {
+            return Ok(false);
+        }
+
+        // Ours to renew, or expired and up for grabs. Version-guard the write so
+        // two replicas that both observe the same expired lease cannot both take
+        // it: exactly one CAS succeeds, the loser skips this tick.
+        match self
+            .store
+            .put(
+                &key,
+                body,
+                PutOptions {
+                    mode: PutMode::CasVersion(current.version),
+                    checksum: None,
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(StoreError::PreconditionFailed) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Seeds `undelivered` from durable history, once, on the first tick that
+    /// successfully reads it. Every alert whose folded state is `Pending` or
+    /// `Firing` (a live, unresolved episode) is queued for one delivery
+    /// attempt this tick; `Resolved` needs no notification restart (nothing
+    /// is pending on it), and `Suppressed` is an intentional silence that a
+    /// restart must not undo by notifying on it.
+    ///
+    /// Without this, `undelivered` is empty on every fresh process, so a
+    /// notification stuck in flight when the process died before this fix is
+    /// never retried: the record it names is durable and correct, but the
+    /// sink call for it is gone forever, silently downgrading the ADR-0043
+    /// decision 6 at-least-once contract to at-most-once across a restart.
+    /// `previous_state: None` here is a known approximation (this evaluator
+    /// has no prior record to pair the seeded one with, only the latest),
+    /// the same approximation `AlertNotification::new` already documents for
+    /// a pending-then-firing episode longer than one transition.
+    ///
+    /// A record whose rule is no longer configured has no rule labels to read
+    /// an `alertname` from, so its notification names the rule id.
+    fn bootstrap_undelivered(&mut self, latest: &HashMap<AlertId, AlertRecord>) {
+        for (alert_id, record) in latest {
+            if matches!(record.state, AlertState::Pending | AlertState::Firing) {
+                let rule_labels = self
+                    .rules
+                    .iter()
+                    .find(|rule| rule.rule_id == record.rule_id)
+                    .map_or(&[][..], |rule| rule.labels.as_slice());
+                let notification = AlertNotification::new(record.clone(), None, rule_labels);
+                self.enqueue_if_absent(*alert_id, notification);
+            }
+        }
+    }
+
+    /// Re-queue a repeat notification for each alert of `rule` whose folded
+    /// latest record is still `Firing` and whose current repeat window has not
+    /// yet been queued (ADR-0043 "repeat notifications while firing"
+    /// amendment). A rule's alerts are the folded records carrying its
+    /// `rule_id`, one per identity (ADR-0117 decision 4); `firing` is the
+    /// rule's `Firing` slice of them, grouped once per tick by
+    /// [`firing_by_rule`].
+    ///
+    /// The window index is
+    ///
+    /// ```text
+    /// k = (now_ns - record.ts_ns) / repeat_interval
+    /// ```
+    ///
+    /// with integer division and a backward-clock-step clamp to zero (matching
+    /// the pending-duration clamp elsewhere in this file). A repeat is due when
+    /// `k >= 1` and the per-alert mark shows window `k` was not already queued
+    /// for this firing episode.
+    ///
+    /// # No durable write, ever
+    ///
+    /// This method touches only `undelivered` and `repeat_marks`. It never calls
+    /// [`Self::publish`] or [`write_alert_record`], so a repeat can never write a
+    /// durable record: the record is state, a notification is not (decision 4).
+    ///
+    /// # Anchor staleness
+    ///
+    /// A mark whose `anchor_ts_ns` differs from the current firing record's
+    /// `ts_ns` is from a prior episode (a resolve-then-refire re-anchored the
+    /// alert) and is ignored, so a new episode re-anchors cleanly instead of
+    /// inheriting the old episode's window count and staying silent. Losing the
+    /// mark entirely (restart, lease failover) costs at most one extra send, not
+    /// a silence, because `k` is re-derived from the durable record every tick.
+    ///
+    /// # Only firing repeats
+    ///
+    /// `Pending`, `Resolved`, and `Suppressed` never repeat, and a rule with no
+    /// folded record (it never fired) has nothing to repeat. A rule removed from
+    /// the config is not in `self.rules`, so this method is never called for it
+    /// and its alert falls silent for Alertmanager to auto-resolve.
+    fn queue_repeat_if_due(
+        &mut self,
+        rule: &Rule,
+        firing: &[(AlertId, &AlertRecord)],
+        now_ns: i64,
+        report: &mut AlertEvalReport,
+    ) {
+        // `None` is the default cadence; an explicit zero disables repeats for
+        // this rule (a consumer that opens a ticket per POST).
+        let interval = rule.repeat_interval.unwrap_or(DEFAULT_REPEAT_INTERVAL);
+        if interval.is_zero() {
+            return;
+        }
+        // `.max(1)` guards against a zero interval_ns from an overflow saturation
+        // (unreachable: the zero interval already returned above), keeping the
+        // division well-defined.
+        let interval_ns = i64::try_from(interval.as_nanos())
+            .unwrap_or(i64::MAX)
+            .max(1);
+        for (alert_id, record) in firing {
+            self.queue_repeat_for_alert(
+                *alert_id,
+                record,
+                &rule.labels,
+                interval_ns,
+                now_ns,
+                report,
+            );
+        }
+    }
+
+    /// [`Self::queue_repeat_if_due`] for one firing alert.
+    fn queue_repeat_for_alert(
+        &mut self,
+        alert_id: AlertId,
+        record: &AlertRecord,
+        rule_labels: &[(String, String)],
+        interval_ns: i64,
+        now_ns: i64,
+        report: &mut AlertEvalReport,
+    ) {
+        let elapsed_ns = now_ns.saturating_sub(record.ts_ns).max(0);
+        let window = (elapsed_ns / interval_ns) as u64;
+        if window < 1 {
+            return;
+        }
+        let already_queued = match self.repeat_marks.get(&alert_id) {
+            // Same episode: this window is already covered only if a mark at or
+            // beyond it exists.
+            Some((anchor, marked)) if *anchor == record.ts_ns => *marked >= window,
+            // No mark, or a mark from a prior (resolved) episode: not covered.
+            _ => false,
+        };
+        if already_queued {
+            return;
+        }
+        // Compose with any entry already queued for this alert this tick (a
+        // fresh transition write, or a bootstrap redelivery): the map is keyed
+        // by `alert_id`, so enqueueing only when absent never doubles a send,
+        // that existing send counts as this window's send, and the waiting
+        // entry keeps its queue place rather than being pushed to the back by
+        // its own repeat. `previous_state: None` mirrors
+        // `bootstrap_undelivered`: a repeat is a non-transition re-send with no
+        // prior record to pair, the same single-step-fold approximation
+        // `AlertNotification::new` already documents.
+        //
+        // Tested for absence here as well as inside `enqueue_if_absent` so a
+        // stuck queue does not pay a record clone per firing alert per tick.
+        if !self.undelivered.contains_key(&alert_id) {
+            let notification = AlertNotification::new(record.clone(), None, rule_labels);
+            self.enqueue_if_absent(alert_id, notification);
+        }
+        self.repeat_marks.insert(alert_id, (record.ts_ns, window));
+        report.repeats_queued += 1;
+    }
+
+    /// Drop every repeat mark whose alert is no longer Firing in the folded
+    /// latest state. A mark only suppresses a repeat of a Firing record, and
+    /// losing one costs at most one extra send, so pruning it is safe.
+    fn prune_repeat_marks(&mut self, latest: &HashMap<AlertId, AlertRecord>) {
+        self.repeat_marks.retain(|alert_id, _| {
+            latest
+                .get(alert_id)
+                .is_some_and(|record| record.state == AlertState::Firing)
+        });
+    }
+
+    /// Evaluate one rule: run its query, decide which series match, and write
+    /// a record for every alert whose state transitions. `written` counts each
+    /// record as it becomes durable, so a write that fails partway through the
+    /// rule's alerts still leaves the earlier ones counted.
+    ///
+    /// Each matched series is its own alert (ADR-0117 decisions 1 and 2), fed
+    /// through [`evaluate_transition`] with its own prior record. An alert of
+    /// this rule that is Pending or Firing in `latest` and absent from the
+    /// matched set is fed `condition_met = false` and so resolves (decision 4).
+    /// A rule that matches more than [`ravel_alerting::MAX_ALERTS_PER_RULE`]
+    /// series, or two series that merge to one label set, fails before
+    /// anything is written, leaving its prior state untouched.
+    async fn evaluate_rule(
+        &mut self,
+        rule: &Rule,
+        latest: &mut HashMap<AlertId, AlertRecord>,
+        now_ns: i64,
+        written: &mut u32,
+    ) -> anyhow::Result<()> {
+        let summary = self.run_query(rule, now_ns).await?;
+        let matched = alert_instances(rule, &summary)?;
+        let matched_ids: HashSet<AlertId> = matched.iter().map(|m| m.alert_id).collect();
+
+        let mut absent: Vec<AlertInstance> = latest
+            .values()
+            .filter(|r| {
+                r.rule_id == rule.rule_id
+                    && matches!(r.state, AlertState::Pending | AlertState::Firing)
+                    && !matched_ids.contains(&r.alert_id)
+            })
+            .map(AlertInstance::of_record)
+            .collect();
+        absent.sort_unstable_by(|a, b| a.labels.cmp(&b.labels));
+
+        for (instance, met) in matched
+            .iter()
+            .map(|m| (m, true))
+            .chain(absent.iter().map(|a| (a, false)))
+        {
+            let prior = latest.get(&instance.alert_id).cloned();
+            let transition = evaluate_transition(rule, prior.as_ref(), met, now_ns);
+            if self
+                .write_transition(rule, instance, &transition, prior, latest)
+                .await?
+            {
+                *written += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the record for one alert's transition, if `transition` warrants
+    /// one, queue its notification, and fold it into `latest`. Returns whether
+    /// a record was written.
+    async fn write_transition(
+        &mut self,
+        rule: &Rule,
+        instance: &AlertInstance,
+        transition: &StateTransition,
+        prior: Option<AlertRecord>,
+        latest: &mut HashMap<AlertId, AlertRecord>,
+    ) -> anyhow::Result<bool> {
+        if !transition.write_record {
+            return Ok(false);
+        }
+
+        // The durable stamp is read here, immediately before the write, not at
+        // tick start. A tick evaluates its rules sequentially under a per-rule
+        // query deadline and has no tick-level cap, so a slow tick can outlive
+        // the lease it started under and publish long after `now_ns`. The memo
+        // watermark a successor holder writes is a seal bound strictly below
+        // that successor's own clock reading, so a stamp taken at publish time
+        // is always at or above any watermark any holder can have written by
+        // then, and the transition stays inside the tail the next fold re-reads.
+        // A tick-start stamp carries no such bound: it can land in an hour below
+        // the watermark, which the tail never descends to, and the transition is
+        // then lost from the memo for good.
+        //
+        // The `max` over the prior record guards a backward wall-clock step (an
+        // NTP correction can move the reading behind the prior record's
+        // `ts_ns`). `load_latest_records` orders records by `(ts_ns, epoch, seq)`
+        // with `ts_ns` first, so a record stamped at or before its predecessor
+        // sorts behind it and never becomes the folded "latest" -- the evaluator
+        // would then re-transition from the same stale state every tick instead
+        // of converging.
+        //
+        // The transition decision in `evaluate_rule` still uses the tick's own `now_ns`:
+        // pending-duration elapse is a property of when the rule was evaluated,
+        // not of when its record reached the store.
+        let publish_ns = self.clock.now_ns();
+        let stamp_ns = match prior.as_ref() {
+            Some(p) => publish_ns.max(p.ts_ns.saturating_add(1)),
+            None => publish_ns,
+        };
+
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let identity = ObjectIdentity {
+            tenant_hash: self.tenant.0,
+            shard: ALERT_SHARD,
+            writer_id: self.writer_id.into_bytes(),
+            writer_epoch: ALERT_WRITER_EPOCH,
+            writer_seq: seq,
+        };
+        // `input_alert_generations` is empty because no rule can consume alert
+        // records yet: the `alerts` SQL table (ADR-0043 decision 7) is separate
+        // work. `compute_generation` handles that case explicitly - a rule
+        // whose query names the alerts table still gets generation 1, its
+        // structural hop depth, rather than being mistaken for an ordinary
+        // metric rule. Once the table lands, the generations of the rows a
+        // tick actually consumed pass through here.
+        let Some(bytes) = write_alert_record(
+            rule,
+            instance,
+            transition,
+            prior.as_ref(),
+            &[],
+            stamp_ns,
+            RlogConfig::default(),
+            identity,
+        )?
+        else {
+            return Ok(false);
+        };
+
+        // Decode what was encoded rather than rebuilding it: the notification
+        // then carries exactly the record that is about to become durable,
+        // generation included, with no second computation to drift.
+        let written = decode_single_record(&bytes)?;
+        // Publish with the same corrected stamp so the commit record's event
+        // time matches the record's `ts_ns`.
+        self.publish(bytes, seq, stamp_ns).await?;
+
+        tracing::info!(
+            tenant = %self.tenant.to_hex(),
+            rule_id = %rule.rule_id,
+            alert_id = %written.alert_id.to_hex(),
+            state = written.state.as_str(),
+            generation = written.generation,
+            "alert transition recorded"
+        );
+
+        // The record is durable from here on; everything below is notification.
+        //
+        // A newer transition supersedes whatever was queued for this identity,
+        // but it inherits that entry's queue place rather than going to the
+        // back: the identity has already been waiting for a sink, and an alert
+        // that transitions on every tick would otherwise re-queue itself behind
+        // everything else forever and never be delivered at all.
+        let notification = AlertNotification::new(written.clone(), prior.as_ref(), &rule.labels);
+        let seq = match self.undelivered.get(&written.alert_id) {
+            Some(queued) => queued.seq,
+            None => self.take_enqueue_seq(),
+        };
+        self.undelivered
+            .insert(written.alert_id, QueuedNotification { seq, notification });
+        latest.insert(written.alert_id, written);
+        Ok(true)
+    }
+
+    /// Run a rule's query and summarize the result into the shape its condition
+    /// tests.
+    ///
+    /// Partial federated coverage is a failed evaluation, not a usable answer
+    /// (ADR-0071 "partial results are consent-gated and envelope-visible"
+    /// amendment, decision 5). A rule evaluated over a result that omits a
+    /// skipped remote's data can fire, or worse resolve, on data that was never
+    /// read. Returning an error here puts the rule on the existing per-rule
+    /// failure path in [`Self::run_tick`]: it is logged, counted in
+    /// `rules_failed`, the prior alert state is left exactly as it was, no
+    /// transition record is written, and the next tick retries. A per-rule
+    /// opt-in to evaluate on partial coverage is deliberately not offered here;
+    /// the amendment leaves that to the alerting surface's own work.
+    ///
+    /// Two instants reach the engine. `now_ns` is the tick's reading: the
+    /// instant the rule is evaluated at, shared with the transition decision
+    /// [`Self::evaluate_rule`] makes from the result. The engine's entry
+    /// reading is taken here instead, immediately before the engine call: the
+    /// engine adds this rule's `query_deadline` to it for the query's
+    /// wall-clock deadline, which every fragment capability expires at and
+    /// every federated request carries. Rules run one after another, so a
+    /// tick-start reading would hand each later rule a wall-clock deadline
+    /// earlier than its own timer's, short by however long the earlier rules
+    /// took.
+    async fn run_query(&self, rule: &Rule, now_ns: i64) -> anyhow::Result<QueryResultSummary> {
+        match &rule.query {
+            RuleQuery::Promql(text) => {
+                let entry_ns = self.clock.now_ns();
+                let (value, coverage) = self
+                    .engines
+                    .promql
+                    .instant(
+                        self.tenant,
+                        text,
+                        now_ns.div_euclid(NS_PER_MS),
+                        &[],
+                        entry_ns,
+                        self.query_deadline,
+                    )
+                    .await?;
+                if let Coverage::Partial { skipped } = coverage {
+                    anyhow::bail!(
+                        "alert rule query ran over partial federated coverage (degraded \
+                         clusters: {}); refusing to evaluate the rule on an incomplete result",
+                        skipped.join(", ")
+                    );
+                }
+                promql_summary(value)
+            }
+            RuleQuery::Sql(text) => self.run_sql(text, now_ns).await,
+        }
+    }
+
+    #[cfg(feature = "sql")]
+    async fn run_sql(&self, text: &str, now_ns: i64) -> anyhow::Result<QueryResultSummary> {
+        let Some(executor) = self.engines.sql.as_ref() else {
+            anyhow::bail!("SQL alert rule needs a SQL executor, and this process mounts none");
+        };
+        let lookback_ns = i64::try_from(self.sql_lookback.as_nanos()).unwrap_or(i64::MAX);
+        let request = ravel_sql::SqlRequest {
+            sql: text.to_string(),
+            window: ravel_types::TimeRange {
+                start_ns: now_ns.saturating_sub(lookback_ns),
+                end_ns: now_ns,
+            },
+            // A rule reads whatever is committed at tick time; there is no
+            // read-your-write token to honour, because nothing wrote on this
+            // rule's behalf.
+            min_tokens: Vec::new(),
+            // The engine's entry reading, as for a PromQL rule (see
+            // `run_query`); the window above stays at the tick's instant.
+            now_ns: self.clock.now_ns(),
+            deadline: self.query_deadline,
+            row_window: false,
+            max_rows: None,
+            budgets: None,
+        };
+        let outcome = executor.execute(self.tenant, &request).await?;
+        Ok(QueryResultSummary::RowCount(
+            outcome.output.num_rows() as u64
+        ))
+    }
+
+    #[cfg(not(feature = "sql"))]
+    async fn run_sql(&self, _text: &str, _now_ns: i64) -> anyhow::Result<QueryResultSummary> {
+        anyhow::bail!(
+            "SQL alert rules require the `sql` feature; this build of ravel-server has it disabled"
+        )
+    }
+
+    /// PUT the RLOG object and publish its commit record, the same two-step any
+    /// signal-tagged write in this codebase performs: a `CreateIfAbsent` data
+    /// PUT with a CRC32C upload checksum, then a `CreateIfAbsent` commit record
+    /// (ADR-0002). Until the commit record lands the object is an orphan, and
+    /// [`Self::load_latest_records`] does not read orphans.
+    ///
+    /// # The writer interlock
+    ///
+    /// The commit record is refused once more than
+    /// [`alert_publish_lifetime_ns`] has passed since this call read the clock
+    /// for its data PUT: no commit attempt starts past that point, and one in
+    /// flight when it passes is abandoned rather than waited on, so the bound
+    /// covers the whole write, data PUT and commit publish together, as the
+    /// ingest writers' single flush deadline does. That bound is the ingest
+    /// writers' own `max_flush_lifetime`, and honouring it here is what makes
+    /// orphan GC over the alerts shard safe (ADR-1688's keep-set amendment put
+    /// an orphan sweep on this shard). Orphan GC reclaims a record-less `l0/` object once it is
+    /// older than `grace + max_flush_lifetime`, on the promise that no writer
+    /// ever publishes a commit record for a flush that old. A publish that
+    /// stalled past the bound and then wrote its commit record anyway would
+    /// break that promise: the sweep could already have quarantined the data
+    /// object, and the commit record would name an object that is no longer
+    /// there, which every reader of this history treats as corruption rather
+    /// than as an abandoned write.
+    ///
+    /// Refusing is the recoverable direction. The transition record was never
+    /// made durable, so the rule fails this tick, the prior state is left
+    /// exactly as it was, and the next tick re-evaluates and rewrites the
+    /// transition under a fresh stamp. What it leaves behind is one orphan data
+    /// object, which is precisely what orphan GC reclaims.
+    async fn publish(&self, bytes: Vec<u8>, seq: u64, now_ns: i64) -> anyhow::Result<()> {
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data = Bytes::from(bytes);
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: self.tenant,
+            signal: Signal::Alerts,
+            shard: ALERT_SHARD,
+            writer_id: self.writer_id,
+            writer_epoch: ALERT_WRITER_EPOCH,
+            writer_seq: seq,
+            object_size: data.len() as u64,
+            content_hash,
+            // One alert record per object, on one stream (the rule's).
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: now_ns,
+            max_event_ts_ns: now_ns,
+            min_ingest_ts_ns: now_ns,
+            max_ingest_ts_ns: now_ns,
+            segment_format_version: u32::from(LOG_SEGMENT_FORMAT_VERSION),
+            created_unix_ns: now_ns,
+            ingest_hour_bucket: hour_bucket(now_ns),
+        })?;
+        let data_key = keys::reconstruct_data_key(&commit)?;
+        let put_started_ns = self.clock.now_ns();
+        publish::put_data_object(self.store.as_ref(), &data_key, data).await?;
+        self.publish_commit_within_lifetime(&commit, &data_key, put_started_ns)
+            .await
+    }
+
+    /// The commit-record half of [`Self::publish`], retried here one attempt at
+    /// a time rather than inside `ravel_commit::publish`, so the writer
+    /// interlock is checked before every attempt and each attempt is bounded to
+    /// what is left of the lifetime, the way the ingest writers bound theirs.
+    /// No attempt starts, and none is waited on, once more than
+    /// [`alert_publish_lifetime_ns`] has passed since `put_started_ns`.
+    async fn publish_commit_within_lifetime(
+        &self,
+        commit: &ravel_proto::commit::v1::CommitRecord,
+        data_key: &str,
+        put_started_ns: i64,
+    ) -> anyhow::Result<()> {
+        let lifetime_ns = alert_publish_lifetime_ns();
+        let retries = RetryPolicy::default();
+        let single_attempt = RetryPolicy {
+            max_attempts: 0,
+            ..retries
+        };
+        let mut attempt: u32 = 0;
+        loop {
+            let elapsed_ns = self.clock.now_ns().saturating_sub(put_started_ns);
+            if elapsed_ns > lifetime_ns {
+                anyhow::bail!(
+                    "alert transition publish abandoned: {elapsed_ns} ns elapsed since the data \
+                     PUT for {data_key} began, past the {lifetime_ns} ns writer interlock, so the \
+                     commit record is not written and the transition is rewritten next tick"
+                );
+            }
+            let remaining = Duration::from_nanos(
+                u64::try_from(lifetime_ns.saturating_sub(elapsed_ns)).unwrap_or(0),
+            );
+            let outcome = tokio::select! {
+                result = publish::publish(self.store.as_ref(), commit, &single_attempt) => result,
+                () = self.clock.sleep(remaining) => anyhow::bail!(
+                    "alert transition publish abandoned: the commit record PUT for {data_key} \
+                     was still in flight when the {lifetime_ns} ns writer interlock expired; the \
+                     transition is rewritten next tick"
+                ),
+            };
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(publish::PublishError::Store { source, .. })
+                    if source.is_retryable() && attempt < retries.max_attempts =>
+                {
+                    let shift = attempt.min(20);
+                    let delay = retries
+                        .base_delay
+                        .saturating_mul(1u32 << shift)
+                        .min(retries.max_delay);
+                    let delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                    self.clock
+                        .sleep(Duration::from_millis(SystemRng.jitter_ms(delay_ms)))
+                        .await;
+                    attempt += 1;
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    /// Fold this tenant's whole alert history to the most recent record per
+    /// `alert_id` (ADR-0040 decision 3).
+    ///
+    /// Records are reached through commit records, never by listing data
+    /// objects: an object whose commit never landed is an abandoned write and
+    /// must not influence state. Ties on `ts_ns` break on the writer's
+    /// `(epoch, seq)`, which is monotonic per writer, so two records stamped in
+    /// the same nanosecond still fold deterministically.
+    ///
+    /// Any malformed entry aborts the whole read rather than being skipped: a
+    /// partial history would look like "this alert is not firing" and re-fire
+    /// an alert that already is.
+    async fn load_latest_records(&self) -> anyhow::Result<HashMap<AlertId, AlertRecord>> {
+        Ok(flatten_fold(self.full_fold().await?))
+    }
+
+    /// Fold the tenant's alert history to latest-per-`alert_id`, using `memo` as
+    /// a derived cache when one is present (issue #1294).
+    ///
+    /// With a memo, this seeds from its folded snapshot and then folds only the
+    /// commit records at or after the memo's effective watermark, so the
+    /// per-tick cost is bounded by the transitions written since the memo rather
+    /// than by the whole history. The tail listing is non-optional: it is what
+    /// makes a stale memo detectable rather than silently wrong, since any
+    /// record written since the memo is stamped at an ingest hour at or above
+    /// its watermark and is therefore re-listed here. Records below the
+    /// watermark come only from the memo, which is why an arbitrarily old
+    /// still-`Firing` record survives a tail that a bounded lookback would step
+    /// past.
+    ///
+    /// The effective watermark is the minimum of the persisted
+    /// `memo.watermark_hour` and this reader's own `seal_bound_hour(now_ns)`
+    /// (ADR-1294 decision 3). `decode` accepts any `u32`, so a memo written by a
+    /// replica whose clock runs ahead, or one whose watermark field was
+    /// corrupted into a decodable but too-large value, would otherwise start the
+    /// tail cursor past the hours the current commit keys live in: the tail
+    /// would skip them, the seed would serve state from before them, and
+    /// `evaluate_rule` would take a skipped firing transition for a resolved
+    /// alert and write the transition again. Clamping restores the staleness
+    /// invariant's precondition (the watermark is at or below every hour the
+    /// tail must cover) and only ever widens the tail, which the fold tolerates
+    /// by construction: a re-read record wins the tie against its byte-identical
+    /// memoized copy.
+    ///
+    /// With no memo (cold, absent, corrupt, or unsupported version) this is a
+    /// full fold, identical to [`Self::load_latest_records`].
+    async fn fold_latest(
+        &self,
+        memo: Option<&AlertStateMemo>,
+        now_ns: i64,
+    ) -> anyhow::Result<HashMap<AlertId, AlertRecord>> {
+        let best = match memo {
+            Some(memo) => {
+                // Seed each memoized record at fold order `(ts_ns, 0, 0)` so any
+                // real commit the tail re-reads (order `(ts_ns, epoch, seq)` with
+                // a nonzero seq) wins the tie against its own memoized copy. The
+                // two are byte-identical, so the tie-break only decides which
+                // clone survives, never the folded state.
+                let mut best: HashMap<AlertId, ((i64, u64, u64), AlertRecord)> = memo
+                    .records
+                    .iter()
+                    .map(|(id, record)| (*id, ((record.ts_ns, 0, 0), record.clone())))
+                    .collect();
+                // A watermark above this reader's seal bound is not trusted: the
+                // seal bound is the newest hour no writer can still be stamping
+                // into, so it is the highest cursor this fold may start from.
+                let watermark = memo.watermark_hour.min(self.seal_bound_hour(now_ns));
+                self.fold_tail(&mut best, watermark).await?;
+                best
+            }
+            // No memo: the cold path is a full fold, the same read
+            // `load_latest_records` performs.
+            None => return self.load_latest_records().await,
+        };
+        Ok(flatten_fold(best))
+    }
+
+    /// Full fold over the whole alert commit history, keyed by fold order.
+    async fn full_fold(&self) -> anyhow::Result<FoldedByOrder> {
+        let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
+        let entries = list_all_after(self.store.as_ref(), &prefix, None).await?;
+        let mut best = HashMap::new();
+        self.fold_commit_entries(entries, &mut best).await?;
+        Ok(best)
+    }
+
+    /// Fold the commit records at or after `watermark_hour` into `best`.
+    ///
+    /// One `start-after` LIST over the commit prefix, skipping every ingest hour
+    /// strictly below the watermark server-side, then a commit+data GET pair per
+    /// transition in that window. The watermark hour itself is included (its keys
+    /// sort after the bare `prefix + hour_string` cursor), so the hour a memo was
+    /// stamped in is always re-folded.
+    async fn fold_tail(&self, best: &mut FoldedByOrder, watermark_hour: u32) -> anyhow::Result<()> {
+        let prefix = keys::commit_shard_prefix(&self.tenant, Signal::Alerts, ALERT_SHARD)?;
+        let start_after = format!("{prefix}{}", keys::ingest_hour_string(watermark_hour));
+        let entries = list_all_after(self.store.as_ref(), &prefix, Some(&start_after)).await?;
+        self.fold_commit_entries(entries, best).await
+    }
+
+    /// Read each commit record in `entries` and the RLOG object it names, folding
+    /// every alert record into `best` by `(ts_ns, epoch, seq)`.
+    ///
+    /// Records are reached through commit records, never by listing data objects:
+    /// an object whose commit never landed is an abandoned write and must not
+    /// influence state. Any malformed entry aborts the whole read rather than
+    /// being skipped: a partial history would look like "this alert is not
+    /// firing" and re-fire an alert that already is.
+    async fn fold_commit_entries(
+        &self,
+        entries: Vec<ObjectMeta>,
+        best: &mut FoldedByOrder,
+    ) -> anyhow::Result<()> {
+        let cfg = RlogConfig::default();
+        for meta in entries {
+            let parsed = match keys::partition_bucket_entry(&meta.key)? {
+                keys::BucketEntry::CommitRecord(parsed) => parsed,
+                // tolerate (skip) a compaction record rather than
+                // hard-erroring. Alerts are not a maintained signal today
+                // (`Signal::Alerts` is absent from `maintain::MAINTAINED_SIGNALS`),
+                // so nothing writes a `CompactionRecord` under this prefix yet.
+                // But the moment compaction is enabled for this signal, one will
+                // appear here, and a fold that bailed on it would hard-error
+                // every tick. Skip it so the fold keeps working from whatever L0
+                // `CommitRecord`s remain reachable.
+                //
+                // Scope note: this is only "does not crash". Once compaction is
+                // actually enabled for `Signal::Alerts`, the records folded into
+                // the L1 part this `CompactionRecord` names must be read from
+                // that part for full correctness. Reading L1 alert parts is out
+                // of scope here (no producer exists yet) and is deliberately left
+                // to the change that turns compaction on for this signal.
+                keys::BucketEntry::CompactionRecord(_) => continue,
+                // A retention tombstone (or any other shape) under the alerts
+                // commit prefix is still unexpected and a real signal of layout
+                // drift; refuse rather than guess.
+                other => anyhow::bail!(
+                    "unexpected {other:?} under the alerts commit prefix; the evaluator folds \
+                     only L0 alert commit records and skips L1 compaction records"
+                ),
+            };
+            let commit = record::decode(&self.store.get(&meta.key, GetRange::Full).await?.data)?;
+            let data_key = keys::verify_object_key(&commit)?;
+            let object = self.store.get(&data_key, GetRange::Full).await?;
+            let reader = RlogReader::new(&object.data, &cfg)?;
+            let (rows, _stats) = reader.scan(&Predicate::And(Vec::new()))?;
+            for row in &rows {
+                let alert = AlertRecord::from_log_record(row)?;
+                let order = (alert.ts_ns, parsed.epoch, parsed.seq);
+                match best.get(&alert.alert_id) {
+                    Some((seen, _)) if *seen >= order => {}
+                    _ => {
+                        best.insert(alert.alert_id, (order, alert));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Attempt delivery of every undelivered notification to every sink,
+    /// dropping an entry only once all sinks accepted it, and bounded to a
+    /// fraction of one interval on the injected clock.
+    ///
+    /// A sink that fails leaves its notification in place, so a later tick
+    /// retries it from the latest record (ADR-0043 decision 6) without needing
+    /// a new transition to occur. A partial success re-sends to the sinks that
+    /// already accepted, which is inside the at-least-once contract.
+    ///
+    /// # The per-tick deadline
+    ///
+    /// The pass stops attempting at `now_ns + sink_delivery_budget`, where
+    /// `now_ns` is the tick's own clock reading rather than the start of
+    /// delivery, and the first notification of a pass is attempted whether or
+    /// not that deadline has already passed. Notifications not attempted stay
+    /// in the undelivered map, keep their queue places, and are counted in
+    /// [`AlertEvalReport::notifications_deferred`]. See
+    /// [`SINK_DELIVERY_DEADLINE_FRACTION`] for what this bounds and what it
+    /// does not, which is not "before the next tick is due".
+    ///
+    /// # Round-robin over the queue, not oldest transition first
+    ///
+    /// The pass runs in [`QueuedNotification::seq`] order: queue position, not
+    /// record age. Age is the wrong key because it starves outright.
+    /// `queue_repeat_for_alert` re-queues a repeat carrying the firing record's
+    /// original `ts_ns`, and [`DEFAULT_REPEAT_INTERVAL`] equals the default
+    /// evaluation interval, so with a sink that drains `k` notifications per
+    /// tick and more than `k` alerts firing, the same oldest `k` are delivered,
+    /// re-queued by the repeat pass, and sorted to the front again on the next
+    /// tick. Every newer notification, including a new alert's first firing, is
+    /// never attempted at all.
+    ///
+    /// Queue position makes the pass a round robin instead:
+    ///
+    /// - An entry that is attempted and not completed (some sink refused it)
+    ///   goes to the back, so the next tick reaches whatever was behind it.
+    ///   Delivery is at-least-once, so re-sending it later costs nothing but a
+    ///   duplicate at the sinks that had accepted.
+    /// - An entry that is never attempted, because the deadline elapsed before
+    ///   the pass reached it, keeps its place. It waited without being served;
+    ///   moving it back would undo exactly the fairness this ordering buys.
+    /// - An entry delivered to every sink leaves the map. A repeat or a new
+    ///   transition for that identity enqueues at the back, behind everything
+    ///   still waiting.
+    ///
+    /// # One dead sink still throttles the healthy ones
+    ///
+    /// An entry leaves the map only once *every* sink accepted it, so with one
+    /// blackholed sink the queue never drains and total delivery is capped at
+    /// what fits in one tick's budget, for every sink. What the rotation
+    /// guarantees is that the cap is spread: a healthy sink receives every
+    /// notification eventually, rather than the same few forever. The guide
+    /// states this cost.
+    async fn flush_sinks(&mut self, now_ns: i64, report: &mut AlertEvalReport) {
+        if self.sinks.is_empty() {
+            self.undelivered.clear();
+            return;
+        }
+        let deadline_ns = now_ns.saturating_add(
+            i64::try_from(self.sink_delivery_budget.as_nanos()).unwrap_or(i64::MAX),
+        );
+        // Only the queue order is materialized here. The notification itself is
+        // cloned inside the loop, after the deadline check has let it be
+        // attempted, so a pass that attempts one notification out of a long
+        // queue pays for one clone and not for the whole queue.
+        let mut pending: Vec<(u64, AlertId)> = self
+            .undelivered
+            .iter()
+            .map(|(id, queued)| (queued.seq, *id))
+            .collect();
+        pending.sort_unstable_by_key(|(seq, _)| *seq);
+        let mut attempted = false;
+        for (_, alert_id) in pending {
+            if attempted && self.clock.now_ns() >= deadline_ns {
+                // Past the per-tick deadline: leave this and every later
+                // notification in the undelivered map, at their current queue
+                // places, so the next tick attempts them before anything
+                // enqueued since.
+                report.notifications_deferred += 1;
+                continue;
+            }
+            attempted = true;
+            // Each `alert_id` appears once in `pending`, and the only removal
+            // below is of the entry just delivered, so the lookup holds for
+            // every entry of the pass.
+            let Some(notification) = self
+                .undelivered
+                .get(&alert_id)
+                .map(|queued| queued.notification.clone())
+            else {
+                continue;
+            };
+            let mut all_ok = true;
+            for sink in self.sinks.iter() {
+                if let Err(err) = deliver(&self.http, sink, &notification).await {
+                    all_ok = false;
+                    tracing::warn!(
+                        tenant = %self.tenant.to_hex(),
+                        sink = sink.kind(),
+                        url = sink.url(),
+                        alert_id = %alert_id.to_hex(),
+                        error = %err,
+                        "alert sink delivery failed; the record is durable and delivery is \
+                         retried on a later tick"
+                    );
+                }
+            }
+            if all_ok {
+                self.undelivered.remove(&alert_id);
+                report.notifications_delivered += 1;
+            } else {
+                report.notifications_failed += 1;
+                // Attempted and not completed: to the back, so this tick's
+                // budget does not belong to the same entry on every tick.
+                let seq = self.take_enqueue_seq();
+                if let Some(queued) = self.undelivered.get_mut(&alert_id) {
+                    queued.seq = seq;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for AlertEvaluator {
+    /// A dropped evaluator's undelivered map is gone, so its share of the
+    /// process-wide gauge goes with it.
+    fn drop(&mut self) {
+        self.metrics.move_undelivered(self.undelivered_reported, 0);
+    }
+}
+
+/// The `Firing` records of `latest`, grouped by `rule_id` in one pass so the
+/// repeat pass reads `latest` once per tick rather than once per rule.
+fn firing_by_rule(
+    latest: &HashMap<AlertId, AlertRecord>,
+) -> HashMap<&str, Vec<(AlertId, &AlertRecord)>> {
+    let mut groups: HashMap<&str, Vec<(AlertId, &AlertRecord)>> = HashMap::new();
+    for (alert_id, record) in latest {
+        if record.state == AlertState::Firing {
+            groups
+                .entry(record.rule_id.as_str())
+                .or_default()
+                .push((*alert_id, record));
+        }
+    }
+    groups
+}
+
+/// `rule`'s slice of [`firing_by_rule`], empty when none of its alerts fire.
+fn firing_of<'a>(
+    groups: &'a HashMap<&str, Vec<(AlertId, &'a AlertRecord)>>,
+    rule: &Rule,
+) -> &'a [(AlertId, &'a AlertRecord)] {
+    groups.get(rule.rule_id.as_str()).map_or(&[], Vec::as_slice)
+}
+
+/// A fold in progress: the winning `(ts_ns, epoch, seq)` order and record for
+/// each `alert_id` seen so far.
+type FoldedByOrder = HashMap<AlertId, ((i64, u64, u64), AlertRecord)>;
+
+/// Drop the fold-order key, leaving the latest record per `alert_id`.
+fn flatten_fold(best: FoldedByOrder) -> HashMap<AlertId, AlertRecord> {
+    best.into_iter()
+        .map(|(id, (_order, record))| (id, record))
+        .collect()
+}
+
+/// Page ceiling for one listing drain over the alert commit prefix.
+///
+/// The prefix is a single shard per tenant, and at the object store's 1000-key
+/// page size this bounds one drain to 100 million keys, far above any tenant's
+/// cumulative alert-transition count (the history grows without maintenance,
+/// but not that fast). It only ever trips on a backend that never terminates.
+/// The repeated-token guard below catches the common spin (a backend returning
+/// the same continuation token) on the second page; this ceiling is the
+/// backstop for a token that keeps changing without advancing.
+const MAX_LIST_PAGES: usize = 100_000;
+
+/// A paged listing could not be folded. `RepeatedToken` and `PageCeiling` mean
+/// the backend kept reporting "another page" without making progress; draining
+/// returns the error rather than spinning forever (the last-key check below
+/// dedups a permitted repeat but never breaks the loop). `OrderViolation` means
+/// the backend delivered a key strictly below one already delivered, breaking
+/// the contract's lexicographic-order guarantee; folding out of order is wrong,
+/// so draining returns the error rather than silently reordering.
+#[derive(Debug, thiserror::Error)]
+enum ListDrainError {
+    #[error("listing under {prefix:?} repeated its continuation token; refusing to spin")]
+    RepeatedToken { prefix: String },
+    #[error("listing under {prefix:?} exceeded the {ceiling}-page ceiling")]
+    PageCeiling { prefix: String, ceiling: usize },
+    #[error(
+        "listing under {prefix:?} delivered {offending:?} after {previous:?}, \
+         out of lexicographic order"
+    )]
+    OrderViolation {
+        prefix: String,
+        previous: String,
+        offending: String,
+    },
+}
+
+/// Drain every page of a listing under `prefix`, deduplicating by key. With
+/// `start_after` set, every returned key sorts strictly after it (`list_after`
+/// with `None` is identical to `list`, per the object-store contract), so this
+/// serves both the full fold (`None`) and the tail fold (`Some(cursor)`).
+///
+/// Two object-store contract guarantees (docs/object-store-contract.md,
+/// "Listing") drive the dedup: keys arrive in lexicographic order, and a key
+/// MAY appear more than once so callers MUST dedup. Because a permitted repeat
+/// is therefore always equal to the last key already delivered, [`drain_pages`]
+/// dedups by holding only that last key rather than a set of every key: an
+/// equal key is dropped, a strictly smaller key breaks the order guarantee and
+/// becomes [`ListDrainError::OrderViolation`], and a larger key is kept. That
+/// is constant extra memory over the returned set.
+///
+/// The loop terminates on `page.next == None`, on a repeated continuation
+/// token, or at [`MAX_LIST_PAGES`]; the last two are typed errors, never a
+/// spin.
+async fn list_all_after(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    start_after: Option<&str>,
+) -> anyhow::Result<Vec<ObjectMeta>> {
+    drain_pages(store, prefix, start_after, MAX_LIST_PAGES).await
+}
+
+/// [`list_all_after`] with an explicit page ceiling, so a test can exercise the
+/// [`ListDrainError::PageCeiling`] path without draining 100 000 pages.
+async fn drain_pages(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    start_after: Option<&str>,
+    max_pages: usize,
+) -> anyhow::Result<Vec<ObjectMeta>> {
+    let mut out: Vec<ObjectMeta> = Vec::new();
+    let mut last_key: Option<String> = None;
+    let mut page_token: Option<PageToken> = None;
+    let mut prev_token: Option<PageToken> = None;
+    let mut pages = 0usize;
+    loop {
+        if pages >= max_pages {
+            return Err(ListDrainError::PageCeiling {
+                prefix: prefix.to_string(),
+                ceiling: max_pages,
+            }
+            .into());
+        }
+        pages += 1;
+        let page = store.list_after(prefix, start_after, page_token).await?;
+        for meta in page.objects {
+            match last_key.as_deref() {
+                // Lexicographic order plus a permitted repeat means a key at or
+                // below the last delivered one is either that same key again
+                // (dropped) or a backend that broke ordering (a typed error).
+                Some(last) if meta.key.as_str() < last => {
+                    return Err(ListDrainError::OrderViolation {
+                        prefix: prefix.to_string(),
+                        previous: last.to_string(),
+                        offending: meta.key,
+                    }
+                    .into());
+                }
+                Some(last) if meta.key.as_str() == last => {}
+                _ => {
+                    last_key = Some(meta.key.clone());
+                    out.push(meta);
+                }
+            }
+        }
+        match page.next {
+            Some(next) => {
+                if prev_token.as_ref() == Some(&next) {
+                    return Err(ListDrainError::RepeatedToken {
+                        prefix: prefix.to_string(),
+                    }
+                    .into());
+                }
+                prev_token = Some(next.clone());
+                page_token = Some(next);
+            }
+            None => break,
+        }
+    }
+    Ok(out)
+}
+
+/// The hour bucket a commit record stamped at `now_ns` belongs to. A pre-epoch
+/// reading yields 0, which `ravel_commit::record::validate` treats as "not
+/// meaningfully set" and skips, rather than failing the write on a skewed
+/// clock.
+fn hour_bucket(now_ns: i64) -> u32 {
+    u32::try_from(now_ns.div_euclid(NS_PER_HOUR)).unwrap_or(0)
+}
+
+/// Decode the single alert record out of a freshly encoded one-record object.
+fn decode_single_record(bytes: &[u8]) -> anyhow::Result<AlertRecord> {
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(bytes, &cfg)?;
+    let (rows, _stats) = reader.scan(&Predicate::And(Vec::new()))?;
+    let [row] = rows.as_slice() else {
+        anyhow::bail!(
+            "an alert object must hold exactly one record, found {}",
+            rows.len()
+        );
+    };
+    Ok(AlertRecord::from_log_record(row)?)
+}
+
+/// Map a PromQL result onto the numeric summary a threshold condition tests,
+/// keeping each series' labels: every matching series becomes its own alert
+/// (ADR-0117 decision 1).
+///
+/// A scalar result is a one-element vector with an empty label set, so a rule
+/// over a scalar keeps the rule-labels-only alert identity. A range vector or
+/// string is a rule-authoring error, surfaced rather than silently treated as
+/// "not firing".
+///
+/// Native-histogram elements are dropped: their `value` is a `0.0` placeholder
+/// (the real data is in the histogram), and comparing that against a threshold
+/// would fire on a meaningless zero. This matches Prometheus, which drops
+/// histogram samples from float-only operations.
+fn promql_summary(value: PromqlValue) -> anyhow::Result<QueryResultSummary> {
+    match value {
+        PromqlValue::Vector(samples) => Ok(QueryResultSummary::Numeric(
+            samples
+                .iter()
+                .filter(|s| s.histogram.is_none())
+                .map(|s| (s.labels.clone(), s.value))
+                .collect(),
+        )),
+        PromqlValue::Scalar(v) => Ok(QueryResultSummary::Numeric(vec![(
+            ravel_types::LabelSet::default(),
+            v,
+        )])),
+        other => anyhow::bail!(
+            "a PromQL alert rule must evaluate to an instant vector or a scalar, got {}",
+            other.type_name()
+        ),
+    }
+}
+
+// --- Rule configuration (ADR-0043 decision 2) ------------------------------
+//
+// Rules come from a JSON file named by `--alert-rules-file`, not from a
+// repeatable CLI flag. `--tenant-token TOKEN=TENANT` and
+// `--retention-tenant TENANT=DURATION` are repeatable flags because their value
+// is a single scalar per tenant; a rule is not. It carries free-form PromQL or
+// SQL text (spaces, quotes, `=`, `>`), a label map, an annotation map, and an
+// optional duration, and squeezing that into a `KEY=VALUE` flag would mean
+// inventing an escaping mini-language for shell-hostile query text. ADR-0043
+// decision 2 explicitly allows either form.
+//
+// JSON rather than YAML because `serde_json` is already a workspace dependency
+// and no YAML parser is; the file is also valid YAML for anyone who prefers to
+// author it that way and convert.
+
+/// The `--alert-rules-file` document.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlertRulesFile {
+    pub rules: Vec<RuleSpec>,
+}
+
+/// One rule as written in the config file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleSpec {
+    /// The tenant id this rule belongs to, matching a `--tenant-token`'s
+    /// tenant.
+    pub tenant: String,
+    pub rule_id: String,
+    /// The PromQL expression to evaluate. Exactly one of `promql` or `sql`.
+    #[serde(default)]
+    pub promql: Option<String>,
+    /// The SQL statement to evaluate. Exactly one of `promql` or `sql`.
+    #[serde(default)]
+    pub sql: Option<String>,
+    pub condition: ConditionSpec,
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    #[serde(default)]
+    pub annotations: HashMap<String, String>,
+    /// Pending-before-firing delay as a humantime duration (`5m`, `30s`),
+    /// PromQL alerting's `for`. Omitted fires on the first tick the condition
+    /// holds.
+    #[serde(default, rename = "for")]
+    pub for_duration: Option<String>,
+    #[serde(default)]
+    pub max_alert_generation: Option<u32>,
+    /// How often a rule that stays firing re-notifies its sinks, as a humantime
+    /// duration (`1m`, `30s`), the ADR-0043 "repeat notifications while firing"
+    /// amendment. Omitted uses [`ravel_alerting::DEFAULT_REPEAT_INTERVAL`];
+    /// `0s` disables repeats for this rule. Parsed exactly like `for`, so an
+    /// unparseable value rejects the rules file at startup with the rule id.
+    #[serde(default)]
+    pub repeat_interval: Option<String>,
+}
+
+/// How a rule's query result maps to firing.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConditionSpec {
+    /// Fires for each series whose value satisfies `value <op> threshold`;
+    /// a PromQL vector rule raises one alert per such series.
+    Threshold { op: ThresholdOpSpec, value: f64 },
+    /// Fires when the query returned at least one row.
+    NonEmptyResult,
+}
+
+/// The six PromQL alerting comparators.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThresholdOpSpec {
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    Eq,
+    Ne,
+}
+
+impl From<ThresholdOpSpec> for ThresholdOp {
+    fn from(spec: ThresholdOpSpec) -> ThresholdOp {
+        match spec {
+            ThresholdOpSpec::Gt => ThresholdOp::Gt,
+            ThresholdOpSpec::Ge => ThresholdOp::Ge,
+            ThresholdOpSpec::Lt => ThresholdOp::Lt,
+            ThresholdOpSpec::Le => ThresholdOp::Le,
+            ThresholdOpSpec::Eq => ThresholdOp::Eq,
+            ThresholdOpSpec::Ne => ThresholdOp::Ne,
+        }
+    }
+}
+
+/// Read and validate the `--alert-rules-file` document at `path`.
+pub fn load_rules_file(path: &Path) -> anyhow::Result<HashMap<TenantHash, Vec<Rule>>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("could not read alert rules file {path:?}: {e}"))?;
+    parse_rules(&text)
+        .map_err(|e| anyhow::anyhow!("invalid alert rules file {}: {e}", path.display()))
+}
+
+/// Parse and validate a rules document, grouping the rules by tenant.
+///
+/// Validation is strict at startup rather than per tick: an unknown field, a
+/// rule naming neither or both query languages, an unparseable `for`, a
+/// condition that cannot apply to its query's result shape, or two rules in one
+/// tenant sharing a `rule_id` all fail the process here instead of logging once
+/// a minute forever. A `rule_id` is unique per tenant, not only per label set:
+/// the evaluator resolves every alert carrying the rule's `rule_id` that its
+/// query no longer matches (ADR-0117 decision 4), so two rules sharing one
+/// would resolve each other's alerts every tick.
+pub fn parse_rules(text: &str) -> anyhow::Result<HashMap<TenantHash, Vec<Rule>>> {
+    let file: AlertRulesFile = serde_json::from_str(text)?;
+    let mut out: HashMap<TenantHash, Vec<Rule>> = HashMap::new();
+    let mut seen: HashSet<(TenantHash, String)> = HashSet::new();
+
+    for spec in file.rules {
+        if spec.tenant.is_empty() {
+            anyhow::bail!("rule {:?} has an empty tenant", spec.rule_id);
+        }
+        if spec.rule_id.is_empty() {
+            anyhow::bail!("a rule for tenant {:?} has an empty rule_id", spec.tenant);
+        }
+        let query = match (&spec.promql, &spec.sql) {
+            (Some(text), None) => RuleQuery::Promql(text.clone()),
+            (None, Some(text)) => RuleQuery::Sql(text.clone()),
+            _ => anyhow::bail!(
+                "rule {:?} must set exactly one of \"promql\" or \"sql\"",
+                spec.rule_id
+            ),
+        };
+        let condition = match spec.condition {
+            ConditionSpec::Threshold { op, value } => RuleCondition::Threshold {
+                op: op.into(),
+                threshold: value,
+            },
+            ConditionSpec::NonEmptyResult => RuleCondition::NonEmptyResult,
+        };
+        // The two shapes are not interchangeable: a threshold reads per-series
+        // values (PromQL) and a nonempty-result reads a row count (SQL).
+        // `matching_series` would return a typed error every tick; catch it once,
+        // here.
+        match (&query, &condition) {
+            (RuleQuery::Promql(_), RuleCondition::NonEmptyResult) => anyhow::bail!(
+                "rule {:?} pairs a PromQL query with a non_empty_result condition; PromQL rules \
+                 take a threshold condition",
+                spec.rule_id
+            ),
+            (RuleQuery::Sql(_), RuleCondition::Threshold { .. }) => anyhow::bail!(
+                "rule {:?} pairs a SQL query with a threshold condition; SQL rules take a \
+                 non_empty_result condition",
+                spec.rule_id
+            ),
+            _ => {}
+        }
+        let for_duration = match &spec.for_duration {
+            Some(text) => Some(humantime::parse_duration(text).map_err(|e| {
+                anyhow::anyhow!(
+                    "rule {:?} has an invalid \"for\" {text:?}: {e}",
+                    spec.rule_id
+                )
+            })?),
+            None => None,
+        };
+        let repeat_interval = match &spec.repeat_interval {
+            Some(text) => Some(humantime::parse_duration(text).map_err(|e| {
+                anyhow::anyhow!(
+                    "rule {:?} has an invalid \"repeat_interval\" {text:?}: {e}",
+                    spec.rule_id
+                )
+            })?),
+            None => None,
+        };
+
+        let labels = sorted_pairs(spec.labels);
+        let rule = Rule {
+            rule_id: spec.rule_id.clone(),
+            query,
+            condition,
+            labels,
+            annotations: sorted_pairs(spec.annotations),
+            for_duration,
+            max_alert_generation: spec.max_alert_generation,
+            repeat_interval,
+        };
+
+        let tenant = TenantId::new(&spec.tenant).hash();
+        if !seen.insert((tenant, rule.rule_id.clone())) {
+            anyhow::bail!(
+                "rule id {:?} is used by more than one rule in tenant {:?}; rule ids must be \
+                 unique per tenant",
+                rule.rule_id,
+                spec.tenant
+            );
+        }
+        out.entry(tenant).or_default().push(rule);
+    }
+    Ok(out)
+}
+
+/// A label or annotation map as the sorted `(name, value)` pairs `Rule` holds.
+fn sorted_pairs(map: HashMap<String, String>) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = map.into_iter().collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn rules_for(text: &str, tenant: &str) -> Vec<Rule> {
+        let parsed = parse_rules(text).expect("valid rules");
+        parsed
+            .get(&TenantId::new(tenant).hash())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// deploy/iam/query.json's QueryRead/QueryWrite `t/*/a/alert-lease` depend
+    /// on this key; `alert_lease_key` and
+    /// `query_template_covers_every_alert_evaluator_call` in
+    /// crates/ravel-commit/tests/iam_templates.rs copy it by hand.
+    #[test]
+    fn alert_lease_key_matches_the_iam_template_witness() {
+        assert_eq!(
+            alert_lease_key(&TenantHash([0xab; 16])),
+            "t/abababababababababababababababab/a/alert-lease"
+        );
+    }
+
+    const PROMQL_RULE: &str = r#"{
+      "rules": [
+        {
+          "tenant": "acme",
+          "rule_id": "high-cpu",
+          "promql": "cpu_usage",
+          "condition": {"type": "threshold", "op": "gt", "value": 0.9},
+          "labels": {"severity": "page", "team": "sre"},
+          "annotations": {"summary": "cpu is hot"},
+          "for": "5m",
+          "max_alert_generation": 3
+        }
+      ]
+    }"#;
+
+    #[test]
+    fn parses_a_promql_threshold_rule() {
+        let rules = rules_for(PROMQL_RULE, "acme");
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
+        assert_eq!(rule.rule_id, "high-cpu");
+        assert_eq!(rule.query, RuleQuery::Promql("cpu_usage".to_string()));
+        assert_eq!(
+            rule.condition,
+            RuleCondition::Threshold {
+                op: ThresholdOp::Gt,
+                threshold: 0.9
+            }
+        );
+        assert_eq!(
+            rule.labels,
+            vec![
+                ("severity".to_string(), "page".to_string()),
+                ("team".to_string(), "sre".to_string()),
+            ],
+            "labels are sorted so the alert identity is order-independent"
+        );
+        assert_eq!(rule.for_duration, Some(Duration::from_secs(300)));
+        assert_eq!(rule.max_alert_generation, Some(3));
+    }
+
+    #[test]
+    fn parses_a_sql_detection_rule() {
+        let text = r#"{
+          "rules": [
+            {
+              "tenant": "acme",
+              "rule_id": "failed-logins",
+              "sql": "select * from logs where has_word(body, 'denied')",
+              "condition": {"type": "non_empty_result"}
+            }
+          ]
+        }"#;
+        let rules = rules_for(text, "acme");
+        assert!(matches!(rules[0].query, RuleQuery::Sql(_)));
+        assert_eq!(rules[0].condition, RuleCondition::NonEmptyResult);
+        assert_eq!(rules[0].for_duration, None);
+    }
+
+    #[test]
+    fn groups_rules_by_tenant() {
+        let text = r#"{
+          "rules": [
+            {"tenant": "a", "rule_id": "r1", "promql": "x",
+             "condition": {"type": "threshold", "op": "gt", "value": 1}},
+            {"tenant": "b", "rule_id": "r2", "promql": "y",
+             "condition": {"type": "threshold", "op": "lt", "value": 1}},
+            {"tenant": "a", "rule_id": "r3", "promql": "z",
+             "condition": {"type": "threshold", "op": "ne", "value": 1}}
+          ]
+        }"#;
+        let parsed = parse_rules(text).expect("valid");
+        assert_eq!(parsed.len(), 2, "two tenants");
+        assert_eq!(parsed[&TenantId::new("a").hash()].len(), 2);
+        assert_eq!(parsed[&TenantId::new("b").hash()].len(), 1);
+    }
+
+    #[test]
+    fn rejects_a_rule_with_neither_or_both_query_languages() {
+        let neither = r#"{"rules": [{"tenant": "a", "rule_id": "r",
+          "condition": {"type": "non_empty_result"}}]}"#;
+        assert!(parse_rules(neither).is_err());
+
+        let both = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x", "sql": "y",
+          "condition": {"type": "non_empty_result"}}]}"#;
+        assert!(parse_rules(both).is_err());
+    }
+
+    #[test]
+    fn rejects_a_condition_that_cannot_apply_to_its_query() {
+        // Caught at startup, not once per tick as a ResultShapeMismatch.
+        let promql_nonempty = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x",
+          "condition": {"type": "non_empty_result"}}]}"#;
+        assert!(parse_rules(promql_nonempty).is_err());
+
+        let sql_threshold = r#"{"rules": [{"tenant": "a", "rule_id": "r", "sql": "select 1",
+          "condition": {"type": "threshold", "op": "gt", "value": 1}}]}"#;
+        assert!(parse_rules(sql_threshold).is_err());
+    }
+
+    #[test]
+    fn rejects_two_rules_with_the_same_rule_id_in_one_tenant() {
+        // Same rule_id and same labels in one tenant: both would write records
+        // under one alert_id and fight over its state every tick.
+        let text = r#"{
+          "rules": [
+            {"tenant": "a", "rule_id": "r", "promql": "x",
+             "condition": {"type": "threshold", "op": "gt", "value": 1}},
+            {"tenant": "a", "rule_id": "r", "promql": "y",
+             "condition": {"type": "threshold", "op": "gt", "value": 2}}
+          ]
+        }"#;
+        let err = parse_rules(text).expect_err("a shared rule_id fails startup");
+        assert_eq!(
+            err.to_string(),
+            "rule id \"r\" is used by more than one rule in tenant \"a\"; rule ids must \
+             be unique per tenant"
+        );
+
+        // Distinguishing labels do not separate them: resolution by absence
+        // walks every alert carrying the rule_id (ADR-0117 decision 4), so
+        // each rule would resolve the other's alerts every tick.
+        let labelled = r#"{
+          "rules": [
+            {"tenant": "a", "rule_id": "r", "promql": "x", "labels": {"shard": "1"},
+             "condition": {"type": "threshold", "op": "gt", "value": 1}},
+            {"tenant": "a", "rule_id": "r", "promql": "y", "labels": {"shard": "2"},
+             "condition": {"type": "threshold", "op": "gt", "value": 2}}
+          ]
+        }"#;
+        let err = parse_rules(labelled).expect_err("a shared rule_id fails startup");
+        assert_eq!(
+            err.to_string(),
+            "rule id \"r\" is used by more than one rule in tenant \"a\"; rule ids must \
+             be unique per tenant"
+        );
+
+        // The same rule_id in two tenants is two independent rules.
+        let two_tenants = r#"{
+          "rules": [
+            {"tenant": "a", "rule_id": "r", "promql": "x",
+             "condition": {"type": "threshold", "op": "gt", "value": 1}},
+            {"tenant": "b", "rule_id": "r", "promql": "x",
+             "condition": {"type": "threshold", "op": "gt", "value": 1}}
+          ]
+        }"#;
+        assert_eq!(rules_for(two_tenants, "a").len(), 1);
+        assert_eq!(rules_for(two_tenants, "b").len(), 1);
+    }
+
+    #[test]
+    fn rejects_unknown_fields_and_bad_durations() {
+        let typo = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x",
+          "condition": {"type": "threshold", "op": "gt", "value": 1}, "labelz": {}}]}"#;
+        assert!(
+            parse_rules(typo).is_err(),
+            "a misspelled field must fail startup, not be silently ignored"
+        );
+
+        let bad_for = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x",
+          "condition": {"type": "threshold", "op": "gt", "value": 1}, "for": "soon"}]}"#;
+        assert!(parse_rules(bad_for).is_err());
+    }
+
+    #[test]
+    fn parses_repeat_interval_with_default_and_disable() {
+        let doc = |ri: &str| {
+            format!(
+                r#"{{"rules": [{{"tenant": "a", "rule_id": "r", "promql": "x",
+              "condition": {{"type": "threshold", "op": "gt", "value": 1}},
+              "repeat_interval": "{ri}"}}]}}"#
+            )
+        };
+        // An explicit duration parses like `for`.
+        assert_eq!(
+            rules_for(&doc("2m"), "a")[0].repeat_interval,
+            Some(Duration::from_secs(120))
+        );
+        // An explicit zero is legal and disables repeats for the rule.
+        assert_eq!(
+            rules_for(&doc("0s"), "a")[0].repeat_interval,
+            Some(Duration::ZERO)
+        );
+        // Absent means None, so the evaluator applies DEFAULT_REPEAT_INTERVAL.
+        let absent = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x",
+          "condition": {"type": "threshold", "op": "gt", "value": 1}}]}"#;
+        assert_eq!(rules_for(absent, "a")[0].repeat_interval, None);
+    }
+
+    #[test]
+    fn rejects_an_unparseable_repeat_interval_naming_the_rule() {
+        let bad = r#"{"rules": [{"tenant": "a", "rule_id": "r", "promql": "x",
+          "condition": {"type": "threshold", "op": "gt", "value": 1},
+          "repeat_interval": "soon"}]}"#;
+        let err = parse_rules(bad)
+            .expect_err("an unparseable repeat_interval rejects the rules file")
+            .to_string();
+        assert!(
+            err.contains("repeat_interval"),
+            "the error names the field: {err}"
+        );
+        assert!(err.contains("\"r\""), "the error names the rule id: {err}");
+    }
+
+    #[test]
+    fn every_threshold_comparator_parses() {
+        for (text, expected) in [
+            ("gt", ThresholdOp::Gt),
+            ("ge", ThresholdOp::Ge),
+            ("lt", ThresholdOp::Lt),
+            ("le", ThresholdOp::Le),
+            ("eq", ThresholdOp::Eq),
+            ("ne", ThresholdOp::Ne),
+        ] {
+            let doc = format!(
+                r#"{{"rules": [{{"tenant": "a", "rule_id": "r", "promql": "x",
+                   "condition": {{"type": "threshold", "op": "{text}", "value": 1}}}}]}}"#
+            );
+            assert_eq!(
+                rules_for(&doc, "a")[0].condition,
+                RuleCondition::Threshold {
+                    op: expected,
+                    threshold: 1.0
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn promql_summary_maps_each_result_shape() {
+        use ravel_promql::InstantSample;
+        use ravel_types::LabelSet;
+
+        let empty = LabelSet::new(Vec::new()).expect("empty label set");
+        let host = |instance: &str| {
+            LabelSet::new(vec![ravel_types::Label {
+                name: "instance".to_string(),
+                value: instance.to_string(),
+            }])
+            .expect("valid labels")
+        };
+        let host_a = host("a");
+        let host_b = host("b");
+        let vector = PromqlValue::Vector(vec![
+            InstantSample {
+                labels: host_a.clone(),
+                ts_ns: 0,
+                orig_sample_ts_ns: 0,
+                value: 1.5,
+                histogram: None,
+            },
+            InstantSample {
+                labels: host_b.clone(),
+                ts_ns: 0,
+                orig_sample_ts_ns: 0,
+                value: 2.5,
+                histogram: None,
+            },
+        ]);
+        assert_eq!(
+            promql_summary(vector).expect("vector summarizes"),
+            QueryResultSummary::Numeric(vec![(host_a, 1.5), (host_b, 2.5)]),
+            "each series keeps its labels"
+        );
+
+        assert_eq!(
+            promql_summary(PromqlValue::Scalar(7.0)).expect("scalar summarizes"),
+            QueryResultSummary::Numeric(vec![(empty, 7.0)]),
+            "a scalar is a one-value vector with no series labels"
+        );
+
+        // A range vector or a string is a rule-authoring error, surfaced
+        // rather than silently read as "not firing".
+        assert!(promql_summary(PromqlValue::Matrix(Vec::new())).is_err());
+        assert!(promql_summary(PromqlValue::String("x".into())).is_err());
+    }
+
+    #[test]
+    fn hour_bucket_is_the_unix_hour_and_never_panics() {
+        assert_eq!(hour_bucket(0), 0);
+        assert_eq!(hour_bucket(NS_PER_HOUR), 1);
+        assert_eq!(hour_bucket(NS_PER_HOUR + 1), 1);
+        assert_eq!(hour_bucket(NS_PER_HOUR - 1), 0);
+        // A pre-epoch clock reading yields 0, which commit-record validation
+        // treats as "not set" rather than rejecting the write.
+        assert_eq!(hour_bucket(-1), 0);
+        assert_eq!(hour_bucket(i64::MIN), 0);
+    }
+
+    #[test]
+    fn notification_started_at_follows_the_prior_record() {
+        let rule = &rules_for(PROMQL_RULE, "acme")[0];
+        let pending = ravel_alerting::build_transition_record(rule, AlertState::Pending, 0, 100);
+        let firing = ravel_alerting::build_transition_record(rule, AlertState::Firing, 0, 400);
+        let notification = AlertNotification::new(firing, Some(&pending), &[]);
+        assert_eq!(notification.started_at_ns, 100);
+        assert_eq!(notification.previous_state, Some(AlertState::Pending));
+    }
+
+    #[test]
+    fn a_disabled_config_spawns_no_tasks() {
+        let tasks = AlertEvalTasks::none();
+        assert!(tasks.shutdown.is_empty());
+        assert!(tasks.handles.is_empty());
+    }
+}
+
+/// Tick-level tests that need a real store, catalog, and `QueryEngine`: the
+/// backward-clock monotonic stamp, the compaction-record tolerance in
+/// the fold, and the cross-replica lease. Kept apart from the
+/// pure parsing tests above because they pull in the ingest/segment/query
+/// stack; the seeding here mirrors `tests/alerting_e2e.rs`'s harness.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tick_tests {
+    use super::*;
+    use ravel_alerting::compute_alert_id;
+
+    use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use ravel_alerting::build_transition_record;
+    use ravel_catalog::{Catalog, CatalogConfig};
+    use ravel_object_store::InstrumentedStore;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule as FaultRule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{Capabilities, DelimitedList, GetOutcome, ListPage, PutOutcome};
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId};
+
+    const NS_PER_SEC: i64 = 1_000_000_000;
+    /// Half an hour past the epoch, inside the first ingest hour, exactly as the
+    /// e2e harness uses so `Catalog::resolve`'s listing window covers the seed.
+    const NOW_NS: i64 = 30 * 60 * NS_PER_SEC;
+    const METRIC: &str = "cpu_usage";
+    const TENANT: &str = "acme";
+
+    /// A clock a test moves by hand, forward or backward, to drive clock-skew
+    /// paths with no wall-clock sleep.
+    struct TestClock(AtomicI64);
+
+    impl TestClock {
+        fn at(now_ns: i64) -> Arc<TestClock> {
+            Arc::new(TestClock(AtomicI64::new(now_ns)))
+        }
+
+        fn set(&self, now_ns: i64) {
+            self.0.store(now_ns, Ordering::SeqCst);
+        }
+
+        fn advance(&self, delta_ns: i64) {
+            self.0.fetch_add(delta_ns, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for TestClock {
+        fn now_ns(&self) -> i64 {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+
+    fn label_set(metric: &str) -> LabelSet {
+        LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels")
+    }
+
+    /// Publish one real RSEG segment holding `metric` at `samples`, plus its
+    /// commit record, for `tenant`. Mirrors the e2e harness.
+    async fn publish_metric(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        samples: &[(i64, f64)],
+    ) {
+        publish_series(store, tenant, vec![(label_set(METRIC), samples.to_vec())]).await;
+    }
+
+    /// `METRIC` with an `instance` label.
+    fn instance_label_set(instance: &str) -> LabelSet {
+        LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: METRIC.to_string(),
+            },
+            Label {
+                name: "instance".to_string(),
+                value: instance.to_string(),
+            },
+        ])
+        .expect("valid labels")
+    }
+
+    /// [`publish_metric`] for several series in one segment, each with its own
+    /// label set and samples.
+    async fn publish_series(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        series: Vec<(LabelSet, Vec<(i64, f64)>)>,
+    ) {
+        publish_series_at_seq(store, tenant, series, 1).await;
+    }
+
+    /// [`publish_series`] under an explicit writer seq, so a second segment in
+    /// one test does not collide with the first on its object and commit keys.
+    async fn publish_series_at_seq(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantId,
+        series: Vec<(LabelSet, Vec<(i64, f64)>)>,
+        writer_seq: u64,
+    ) {
+        let tenant_hash = tenant.hash();
+        let series: Vec<SeriesInput> = series
+            .into_iter()
+            .map(|(labels, samples)| SeriesInput {
+                series_id: SeriesId::compute(tenant, METRIC, &labels).expect("series id"),
+                labels,
+                samples: samples
+                    .iter()
+                    .map(|(ts_ns, value)| Sample {
+                        ts_ns: *ts_ns,
+                        value: *value,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let writer_id = Uuid::from_u128(9_001);
+        let identity = SegmentIdentity {
+            tenant_hash: tenant_hash.0,
+            shard: 0,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq,
+        };
+        let written = SegmentWriter::write(
+            series,
+            identity,
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            // Created in the same hour the object's events fall in, so the
+            // commit-record cross-check (`ingest_hour_bucket` at or before the
+            // created hour) holds when the seed is in a later hour than epoch.
+            created_unix_ns: written.summary.max_event_ts_ns,
+            // Key the commit under the ingest hour of its own event time so a
+            // query whose window falls in a later hour still resolves it. At the
+            // hour-0 timestamps most tests use this is 0, unchanged; the memo
+            // seal-bound tests seed a metric in hour 1 and need it keyed there.
+            ingest_hour_bucket: hour_bucket(written.summary.max_event_ts_ns),
+        })
+        .expect("valid commit record");
+
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, written.bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// A store seeded with one series at 1.0 (above the rule threshold 0.9)
+    /// shortly before `NOW_NS`.
+    async fn seeded_store() -> Arc<dyn ObjectStoreBackend> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT);
+        publish_metric(store.as_ref(), &tenant, &[(NOW_NS - 30 * NS_PER_SEC, 1.0)]).await;
+        store
+    }
+
+    fn threshold_rule() -> Rule {
+        Rule {
+            rule_id: "high-cpu".to_string(),
+            query: RuleQuery::Promql(METRIC.to_string()),
+            condition: RuleCondition::Threshold {
+                op: ThresholdOp::Gt,
+                threshold: 0.9,
+            },
+            labels: vec![("severity".to_string(), "page".to_string())],
+            annotations: vec![("summary".to_string(), "cpu is hot".to_string())],
+            for_duration: None,
+            max_alert_generation: None,
+            repeat_interval: None,
+        }
+    }
+
+    /// `threshold_rule` with an explicit repeat cadence.
+    fn repeat_rule(repeat_interval: Option<Duration>) -> Rule {
+        Rule {
+            repeat_interval,
+            ..threshold_rule()
+        }
+    }
+
+    /// A one-entry folded-latest map holding `rule`'s alert in `state` at
+    /// `ts_ns`, keyed exactly as the evaluator folds it.
+    fn latest_with(rule: &Rule, state: AlertState, ts_ns: i64) -> HashMap<AlertId, AlertRecord> {
+        let record = ravel_alerting::build_transition_record(rule, state, 0, ts_ns);
+        let mut latest = HashMap::new();
+        latest.insert(compute_alert_id(&rule.rule_id, &rule.labels), record);
+        latest
+    }
+
+    /// Build an evaluator over `store`, sharing `clock` so a test can move time.
+    /// Each call mints a fresh `writer_id`, so two evaluators over one store are
+    /// two distinct "replicas" for the lease test.
+    fn evaluator(store: Arc<dyn ObjectStoreBackend>, clock: Arc<TestClock>) -> AlertEvaluator {
+        evaluator_with(store, clock, Vec::new(), Arc::new(AlertMetrics::default()))
+    }
+
+    /// [`evaluator`] with explicit sinks and an explicit metrics handle. The
+    /// handle is never the process-global one: other tests in this binary tick
+    /// their own evaluators, so only a per-test handle can carry an exact-value
+    /// assertion.
+    fn evaluator_with(
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        sinks: Vec<AlertSink>,
+        metrics: Arc<AlertMetrics>,
+    ) -> AlertEvaluator {
+        evaluator_for_rules(store, clock, sinks, metrics, vec![threshold_rule()])
+    }
+
+    /// [`evaluator_with`] over an explicit rule set.
+    fn evaluator_for_rules(
+        store: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        sinks: Vec<AlertSink>,
+        metrics: Arc<AlertMetrics>,
+        rules: Vec<Rule>,
+    ) -> AlertEvaluator {
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
+        let config = AlertEvalConfig {
+            enabled: true,
+            sinks: Arc::new(sinks),
+            ..AlertEvalConfig::default()
+        };
+        AlertEvaluator::new(
+            store,
+            AlertQueryEngines {
+                promql: Arc::new(engine),
+                #[cfg(feature = "sql")]
+                sql: None,
+            },
+            clock,
+            TenantId::new(TENANT).hash(),
+            rules,
+            &config,
+        )
+        .expect("build evaluator")
+        .with_metrics(metrics)
+    }
+
+    /// Every alert record this tenant has, read through its commit records and
+    /// sorted by `ts_ns`, exactly as any reader would.
+    async fn read_alert_records(
+        store: &dyn ObjectStoreBackend,
+        tenant: TenantHash,
+    ) -> Vec<AlertRecord> {
+        let prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let cfg = RlogConfig::default();
+        let mut out = Vec::new();
+        for meta in list_all_after(store, &prefix, None).await.expect("list") {
+            // Skip anything that is not an L0 commit record (e.g. the
+            // compaction-record test injects one under this prefix).
+            if !matches!(
+                keys::partition_bucket_entry(&meta.key).expect("classify"),
+                keys::BucketEntry::CommitRecord(_)
+            ) {
+                continue;
+            }
+            let commit = record::decode(
+                &store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get commit")
+                    .data,
+            )
+            .expect("decode commit");
+            let data_key = keys::verify_object_key(&commit).expect("object key");
+            let object = store
+                .get(&data_key, GetRange::Full)
+                .await
+                .expect("get data");
+            let reader = RlogReader::new(&object.data, &cfg).expect("open rlog");
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            for row in &rows {
+                out.push(AlertRecord::from_log_record(row).expect("decode alert record"));
+            }
+        }
+        out.sort_by_key(|r| r.ts_ns);
+        out
+    }
+
+    /// Every written transition's commit record carries `max_event_ts_ns`
+    /// equal to its RLOG record's `ts_ns`. The alert retention sweep keys its
+    /// keep set on exactly this (ADR-1688, keep-set amendment): it matches a
+    /// record's `max_event_ts_ns` against the memo's `ts_ns` values, so a
+    /// commit stamp that drifts from the record's stamp would let the sweep
+    /// delete an identity's current-state record.
+    ///
+    /// The second transition is written under a backward clock step, where the
+    /// record's `ts_ns` is the corrected `prior.ts_ns + 1` rather than the
+    /// clock reading, so a publish that took the clock instead of the stamp
+    /// fails here.
+    #[tokio::test]
+    async fn a_written_transitions_commit_max_event_ts_ns_equals_its_record_ts_ns() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert_eq!(evaluator.run_tick().await.records_written, 1, "onset fires");
+        clock.set(NOW_NS - 100 * NS_PER_SEC);
+        assert_eq!(evaluator.run_tick().await.records_written, 1, "resolves");
+
+        let prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let cfg = RlogConfig::default();
+        let mut pairs = Vec::new();
+        for meta in list_all_after(store.as_ref(), &prefix, None)
+            .await
+            .expect("list")
+        {
+            let commit = record::decode(
+                &store
+                    .get(&meta.key, GetRange::Full)
+                    .await
+                    .expect("get commit")
+                    .data,
+            )
+            .expect("decode commit");
+            let data_key = keys::verify_object_key(&commit).expect("object key");
+            let object = store
+                .get(&data_key, GetRange::Full)
+                .await
+                .expect("get data");
+            let reader = RlogReader::new(&object.data, &cfg).expect("open rlog");
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            assert_eq!(rows.len(), 1, "one alert record per object");
+            let alert = AlertRecord::from_log_record(&rows[0]).expect("decode alert record");
+            pairs.push((commit.max_event_ts_ns, alert.ts_ns));
+        }
+        pairs.sort_unstable();
+        assert_eq!(
+            pairs,
+            vec![(NOW_NS, NOW_NS), (NOW_NS + 1, NOW_NS + 1)],
+            "each commit record's max_event_ts_ns is its record's ts_ns, including the \
+             corrected stamp written under a backward clock step"
+        );
+    }
+
+    /// A store that moves the injected clock forward as an alert data object's
+    /// PUT completes, so a test can put a publish past the writer interlock with
+    /// no wall-clock wait and no sleep. `stall_ns` is settable at runtime so one
+    /// test can stall a publish and then let the next one through.
+    struct StallingDataPut {
+        inner: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        data_prefix: String,
+        stall_ns: AtomicI64,
+        data_puts: AtomicU64,
+        commit_prefix: String,
+        /// When nonzero, the next commit-record PUT fails with a retryable
+        /// store error after moving the clock forward by this much, then
+        /// resets to zero.
+        commit_fault_stall_ns: AtomicI64,
+        commit_puts: AtomicU64,
+    }
+
+    impl StallingDataPut {
+        fn new(inner: Arc<dyn ObjectStoreBackend>, clock: Arc<TestClock>, stall_ns: i64) -> Self {
+            let tenant = TenantId::new(TENANT).hash();
+            StallingDataPut {
+                inner,
+                clock,
+                data_prefix: format!("t/{}/a/l0/", tenant.to_hex()),
+                stall_ns: AtomicI64::new(stall_ns),
+                data_puts: AtomicU64::new(0),
+                commit_prefix: keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD)
+                    .expect("prefix"),
+                commit_fault_stall_ns: AtomicI64::new(0),
+                commit_puts: AtomicU64::new(0),
+            }
+        }
+
+        fn data_puts(&self) -> u64 {
+            self.data_puts.load(Ordering::SeqCst)
+        }
+
+        fn commit_puts(&self) -> u64 {
+            self.commit_puts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for StallingDataPut {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            if key.starts_with(&self.commit_prefix) {
+                self.commit_puts.fetch_add(1, Ordering::SeqCst);
+                let stall = self.commit_fault_stall_ns.swap(0, Ordering::SeqCst);
+                if stall != 0 {
+                    self.clock.advance(stall);
+                    return Err(StoreError::Transient("injected commit fault".into()));
+                }
+            }
+            let outcome = self.inner.put(key, data, opts).await?;
+            if key.starts_with(&self.data_prefix) {
+                self.data_puts.fetch_add(1, Ordering::SeqCst);
+                self.clock.advance(self.stall_ns.load(Ordering::SeqCst));
+            }
+            Ok(outcome)
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Every live key under the tenant's alert commit prefix and its `l0/` data
+    /// space, read straight off the store.
+    async fn alert_keyspace(store: &dyn ObjectStoreBackend, tenant: TenantHash) -> (usize, usize) {
+        let commits = list_all_after(
+            store,
+            &keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix"),
+            None,
+        )
+        .await
+        .expect("list commits");
+        let data = list_all_after(store, &format!("t/{}/a/l0/", tenant.to_hex()), None)
+            .await
+            .expect("list data");
+        (commits.len(), data.len())
+    }
+
+    /// A publish whose data PUT stalls past the ingest writers' own
+    /// `max_flush_lifetime` writes no commit record, and the transition is
+    /// rewritten on a later tick.
+    ///
+    /// The interlock is what makes orphan GC over the alerts shard safe: it
+    /// reclaims a record-less data object older than `grace +
+    /// max_flush_lifetime` on the promise that no writer publishes a commit
+    /// record for a flush that old. A publish that stalled past the bound and
+    /// then wrote its commit record anyway would leave a commit record naming an
+    /// object the sweep is entitled to have quarantined already.
+    ///
+    /// The stall is on the injected clock, not on the wall clock: the store
+    /// wrapper advances the evaluator's own clock as the data PUT completes.
+    ///
+    /// Watch it fail: delete the `elapsed_ns > lifetime_ns` bail in
+    /// `AlertEvaluator::publish`. The first tick then writes its commit record
+    /// and the first assertion, that the tick wrote no record, fails.
+    #[tokio::test]
+    async fn a_data_put_stalled_past_the_writer_interlock_publishes_no_commit_record() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            alert_publish_lifetime_ns() + NS_PER_SEC,
+        ));
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "the transition was not made durable"
+        );
+        assert_eq!(report.rules_failed, 1, "the rule is on the retry path");
+        assert_eq!(store.data_puts(), 1, "the data object was written first");
+        assert_eq!(
+            alert_keyspace(memory.as_ref(), tenant).await,
+            (0, 1),
+            "one orphan data object, no commit record: exactly what orphan GC reclaims"
+        );
+
+        // The same evaluator, with the stall removed and the clock back where it
+        // started: the transition is rewritten under a fresh object.
+        store.stall_ns.store(0, Ordering::SeqCst);
+        clock.set(NOW_NS);
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.records_written, 1, "the retry writes the transition");
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(
+            alert_keyspace(memory.as_ref(), tenant).await,
+            (1, 2),
+            "the abandoned object is still an orphan beside the published pair"
+        );
+        assert_eq!(
+            read_alert_records(memory.as_ref(), tenant)
+                .await
+                .into_iter()
+                .map(|r| (r.state, r.ts_ns))
+                .collect::<Vec<_>>(),
+            vec![(AlertState::Firing, NOW_NS)],
+            "one transition, stamped at the retry's clock reading"
+        );
+    }
+
+    /// A stall shorter than the interlock is not a refusal: the bound is a
+    /// ceiling on an in-flight publish, not a ban on a slow one.
+    #[tokio::test]
+    async fn a_data_put_inside_the_writer_interlock_publishes_normally() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            alert_publish_lifetime_ns() - NS_PER_SEC,
+        ));
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.records_written, 1);
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(alert_keyspace(memory.as_ref(), tenant).await, (1, 1));
+    }
+
+    /// The interlock bounds the commit publish too, not only the data PUT: a
+    /// commit attempt that fails retryably once the lifetime has passed is not
+    /// retried, so no commit record lands for an object older than the bound.
+    ///
+    /// The data PUT is instant here; the first commit PUT fails with a
+    /// retryable error and moves the injected clock past the lifetime.
+    ///
+    /// Watch it fail: in `AlertEvaluator::publish`, replace the
+    /// `publish_commit_within_lifetime` call with the former
+    /// `publish::publish(.., &RetryPolicy::default())`. Its internal retry then
+    /// writes the commit record on the second attempt, and the first
+    /// assertion, that the tick wrote no record, fails.
+    #[tokio::test]
+    async fn a_commit_retry_past_the_writer_interlock_is_not_attempted() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            0,
+        ));
+        store
+            .commit_fault_stall_ns
+            .store(alert_publish_lifetime_ns() + NS_PER_SEC, Ordering::SeqCst);
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "the transition was not made durable"
+        );
+        assert_eq!(report.rules_failed, 1, "the rule is on the retry path");
+        assert_eq!(
+            store.commit_puts(),
+            1,
+            "no commit attempt starts once the lifetime has passed"
+        );
+        assert_eq!(
+            alert_keyspace(memory.as_ref(), tenant).await,
+            (0, 1),
+            "one orphan data object, no commit record"
+        );
+    }
+
+    /// A retryable commit failure inside the lifetime is still retried: the
+    /// bound refuses a late publish, it does not remove the retry.
+    #[tokio::test]
+    async fn a_commit_retry_inside_the_writer_interlock_publishes() {
+        let memory = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let store = Arc::new(StallingDataPut::new(
+            Arc::clone(&memory),
+            Arc::clone(&clock),
+            0,
+        ));
+        store
+            .commit_fault_stall_ns
+            .store(NS_PER_SEC, Ordering::SeqCst);
+        let mut evaluator = evaluator(
+            Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+            Arc::clone(&clock),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.records_written, 1);
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(store.commit_puts(), 2, "one failed attempt, one retry");
+        assert_eq!(alert_keyspace(memory.as_ref(), tenant).await, (1, 1));
+    }
+
+    /// a backward wall-clock step between ticks must still produce a
+    /// strictly-increasing `ts_ns`, and the evaluator must converge rather than
+    /// re-transition from stale state every tick. The instant query sees the
+    /// seed at `NOW`, then a clock stepped behind the seed empties the vector so
+    /// the condition clears and the alert resolves -- and that resolve must be
+    /// stamped after the firing record it supersedes, or the fold would keep
+    /// picking the firing record and re-resolve forever.
+    #[tokio::test]
+    async fn a_backward_clock_step_keeps_ts_ns_monotonic_and_converges() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        // Tick 1 at NOW: fires.
+        assert_eq!(evaluator.run_tick().await.records_written, 1, "onset fires");
+        let firing = &read_alert_records(store.as_ref(), tenant).await[0];
+        assert_eq!(firing.state, AlertState::Firing);
+        assert_eq!(firing.ts_ns, NOW_NS);
+        let firing_ts = firing.ts_ns;
+
+        // Clock steps 100s behind NOW. The only sample now sits in the future
+        // relative to the query instant, so the instant vector empties and the
+        // condition clears: this tick resolves.
+        let stepped_back = NOW_NS - 100 * NS_PER_SEC;
+        clock.set(stepped_back);
+        assert_eq!(
+            evaluator.run_tick().await.records_written,
+            1,
+            "the cleared condition resolves even under a backward clock step"
+        );
+
+        let records = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(records.len(), 2, "firing then resolved");
+        let resolved = records
+            .iter()
+            .find(|r| r.state == AlertState::Resolved)
+            .expect("a resolved record");
+        assert!(
+            resolved.ts_ns > firing_ts,
+            "the resolved record must be stamped strictly after the firing record it \
+             supersedes (got resolved ts {} vs firing ts {}), even though the wall clock \
+             stepped back to {}",
+            resolved.ts_ns,
+            firing_ts,
+            stepped_back
+        );
+        assert_eq!(
+            resolved.ts_ns,
+            firing_ts + 1,
+            "the corrected stamp is exactly prior.ts_ns + 1 when now_ns is behind it"
+        );
+
+        // Tick 3, clock still behind: the fold must land on the resolved record
+        // (greatest ts), so the still-cleared condition writes nothing. Without
+        // the fix the fold would keep picking the firing record and resolve
+        // again every tick -- an infinite re-transition loop.
+        assert_eq!(
+            evaluator.run_tick().await.records_written,
+            0,
+            "the evaluator converges: no re-transition once resolved is the folded latest"
+        );
+        assert_eq!(
+            read_alert_records(store.as_ref(), tenant).await.len(),
+            2,
+            "history is unchanged; no runaway resolve records"
+        );
+    }
+
+    // --- Per-series evaluation (ADR-0117) -------------------------------------
+
+    /// `n` series `cpu_usage{instance="host-NNNN"}` at 1.0, above the
+    /// threshold rule's 0.9, shortly before `NOW_NS`, plus two healthy series
+    /// at 0.1 that must raise nothing.
+    async fn store_with_hot_instances(n: usize) -> Arc<dyn ObjectStoreBackend> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let sample_ts = NOW_NS - 30 * NS_PER_SEC;
+        let mut series: Vec<(LabelSet, Vec<(i64, f64)>)> = (0..n)
+            .map(|i| {
+                (
+                    instance_label_set(&format!("host-{i:04}")),
+                    vec![(sample_ts, 1.0)],
+                )
+            })
+            .collect();
+        for healthy in ["idle-a", "idle-b"] {
+            series.push((instance_label_set(healthy), vec![(sample_ts, 0.1)]));
+        }
+        publish_series(store.as_ref(), &TenantId::new(TENANT), series).await;
+        store
+    }
+
+    fn instance_alert_labels(instance: &str) -> Vec<(String, String)> {
+        vec![
+            ("instance".to_string(), instance.to_string()),
+            ("severity".to_string(), "page".to_string()),
+        ]
+    }
+
+    /// One PromQL rule over ten hot series raises ten alerts: ten Firing
+    /// records, each carrying its own `instance` label next to the rule's
+    /// `severity`, `__name__` dropped, and ten distinct alert ids, each the
+    /// hash of the rule id and exactly that merged label set.
+    #[tokio::test]
+    async fn one_rule_over_ten_series_writes_ten_alert_records_with_distinct_ids() {
+        let store = store_with_hot_instances(10).await;
+        let tenant = TenantId::new(TENANT).hash();
+        let mut evaluator = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.rules_evaluated, 1);
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(report.records_written, 10);
+
+        let mut records = read_alert_records(store.as_ref(), tenant).await;
+        records.sort_by(|a, b| a.labels.cmp(&b.labels));
+        assert_eq!(records.len(), 10);
+        for (i, record) in records.iter().enumerate() {
+            let labels = instance_alert_labels(&format!("host-{i:04}"));
+            assert_eq!(record.state, AlertState::Firing);
+            assert_eq!(record.rule_id, "high-cpu");
+            assert_eq!(record.alert_id, compute_alert_id("high-cpu", &labels));
+            assert_eq!(record.labels, labels);
+        }
+        let distinct: std::collections::BTreeSet<AlertId> =
+            records.iter().map(|r| r.alert_id).collect();
+        assert_eq!(distinct.len(), 10);
+
+        // A second tick over the same data re-confirms all ten and writes
+        // nothing.
+        assert_eq!(evaluator.run_tick().await.records_written, 0);
+        assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 10);
+    }
+
+    /// One matched series over `MAX_ALERTS_PER_RULE` fails the rule with the
+    /// typed `TooManyAlerts` before anything is written: the tick counts it in
+    /// `rules_failed` and the store holds no alert record.
+    #[tokio::test]
+    async fn a_rule_over_the_alert_cap_fails_with_too_many_alerts_and_writes_nothing() {
+        let over = ravel_alerting::MAX_ALERTS_PER_RULE + 1;
+        let store = store_with_hot_instances(over).await;
+        let tenant = TenantId::new(TENANT).hash();
+        let mut evaluator = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        let mut latest = HashMap::new();
+        let err = evaluator
+            .evaluate_rule(&threshold_rule(), &mut latest, NOW_NS, &mut 0)
+            .await
+            .expect_err("1001 matched series is over the cap");
+        match err.downcast_ref::<AlertError>() {
+            Some(AlertError::TooManyAlerts {
+                rule_id,
+                count,
+                limit,
+            }) => {
+                assert_eq!(rule_id, "high-cpu");
+                assert_eq!(*count, 1001);
+                assert_eq!(*limit, 1000);
+            }
+            other => panic!("expected TooManyAlerts, got {other:?}"),
+        }
+        assert!(latest.is_empty());
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.rules_evaluated, 0);
+        assert_eq!(report.rules_failed, 1);
+        assert_eq!(report.records_written, 0);
+        assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 0);
+    }
+
+    /// A store holding one hot series whose labels include `alertname="x"`,
+    /// as a recording rule's output or an alerts-on-alerts query would.
+    async fn store_with_an_alertname_series() -> Arc<dyn ObjectStoreBackend> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let labels = LabelSet::new(vec![
+            Label {
+                name: "__name__".to_string(),
+                value: METRIC.to_string(),
+            },
+            Label {
+                name: "alertname".to_string(),
+                value: "x".to_string(),
+            },
+            Label {
+                name: "instance".to_string(),
+                value: "host-a".to_string(),
+            },
+        ])
+        .expect("valid labels");
+        publish_series(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            vec![(labels, vec![(NOW_NS - 30 * NS_PER_SEC, 1.0)])],
+        )
+        .await;
+        store
+    }
+
+    /// The Alertmanager `alertname` of the one notification `rule` queues
+    /// over [`store_with_an_alertname_series`], with the record it names. The
+    /// sink is unreachable so the notification stays queued to be read.
+    async fn alertmanager_alertname_for(rule: Rule) -> (String, AlertRecord) {
+        let store = store_with_an_alertname_series().await;
+        let mut ev = evaluator_for_rules(
+            store,
+            TestClock::at(NOW_NS),
+            vec![AlertSink::alertmanager(dead_sink_url().await)],
+            Arc::new(AlertMetrics::default()),
+            vec![rule],
+        );
+        let report = ev.run_tick().await;
+        assert_eq!(report.records_written, 1, "the one hot series fires");
+        assert_eq!(ev.undelivered.len(), 1);
+        let notification = &ev
+            .undelivered
+            .values()
+            .next()
+            .expect("one queued")
+            .notification;
+        let body = crate::alert_sink::alertmanager_payload(notification).expect("firing notifies");
+        let alertname = body[0]["labels"]["alertname"]
+            .as_str()
+            .expect("alertname is a string")
+            .to_string();
+        (alertname, notification.record.clone())
+    }
+
+    /// A series label named `alertname` does not replace the rule id as the
+    /// Alertmanager `alertname`, so routing and silences keyed on the rule id
+    /// keep matching. The alert's identity still hashes the series label.
+    #[tokio::test]
+    async fn a_series_alertname_label_does_not_override_the_rule_id() {
+        let (alertname, record) = alertmanager_alertname_for(threshold_rule()).await;
+        assert_eq!(alertname, "high-cpu");
+        let labels = vec![
+            ("alertname".to_string(), "x".to_string()),
+            ("instance".to_string(), "host-a".to_string()),
+            ("severity".to_string(), "page".to_string()),
+        ];
+        assert_eq!(record.labels, labels, "the record keeps the series label");
+        assert_eq!(record.alert_id, compute_alert_id("high-cpu", &labels));
+    }
+
+    /// A rule label named `alertname` still wins over the rule id, and over a
+    /// series label of the same name.
+    #[tokio::test]
+    async fn a_rule_alertname_label_overrides_the_rule_id() {
+        let mut rule = threshold_rule();
+        rule.labels.push(("alertname".to_string(), "y".to_string()));
+        let (alertname, record) = alertmanager_alertname_for(rule).await;
+        assert_eq!(alertname, "y");
+        let labels = vec![
+            ("alertname".to_string(), "y".to_string()),
+            ("instance".to_string(), "host-a".to_string()),
+            ("severity".to_string(), "page".to_string()),
+        ];
+        assert_eq!(record.labels, labels);
+        assert_eq!(record.alert_id, compute_alert_id("high-cpu", &labels));
+    }
+
+    /// A tick over three hot series that leaves three Firing records, returned
+    /// with the evaluator that wrote them and those records as read back.
+    async fn three_firing_alerts(
+        store: &Arc<dyn ObjectStoreBackend>,
+    ) -> (AlertEvaluator, Vec<AlertRecord>) {
+        let tenant = TenantId::new(TENANT).hash();
+        let mut evaluator = evaluator(Arc::clone(store), TestClock::at(NOW_NS));
+        assert_eq!(evaluator.run_tick().await.records_written, 3);
+        let records = read_alert_records(store.as_ref(), tenant).await;
+        let mut labels: Vec<(Vec<(String, String)>, AlertState)> = records
+            .iter()
+            .map(|r| (r.labels.clone(), r.state))
+            .collect();
+        labels.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            labels,
+            vec![
+                (instance_alert_labels("host-0000"), AlertState::Firing),
+                (instance_alert_labels("host-0001"), AlertState::Firing),
+                (instance_alert_labels("host-0002"), AlertState::Firing),
+            ]
+        );
+        (evaluator, records)
+    }
+
+    /// A rule whose query fails is not a rule that matched nothing: its three
+    /// Firing alerts are not resolved by absence. The tick writes zero Resolved
+    /// records and the stored history is exactly what it was.
+    #[tokio::test]
+    async fn a_failing_query_resolves_none_of_the_rules_firing_alerts() {
+        let store = store_with_hot_instances(3).await;
+        let tenant = TenantId::new(TENANT).hash();
+        let (mut evaluator, before) = three_firing_alerts(&store).await;
+
+        // A range-vector result is refused before the condition runs.
+        evaluator.rules = vec![Rule {
+            query: RuleQuery::Promql(format!("{METRIC}[5m]")),
+            ..threshold_rule()
+        }];
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.rules_evaluated, 0);
+        assert_eq!(report.rules_failed, 1);
+        assert_eq!(report.records_written, 0);
+
+        let after = read_alert_records(store.as_ref(), tenant).await;
+        let resolved = after
+            .iter()
+            .filter(|r| r.state == AlertState::Resolved)
+            .count();
+        assert_eq!(resolved, 0);
+        assert_eq!(after, before);
+    }
+
+    /// Three Firing alerts, then 998 more hot series arrive so the rule matches
+    /// 1001, one over the cap. The rule fails with `TooManyAlerts` and the three
+    /// alerts it already raised are not resolved: zero Resolved records, and the
+    /// stored history is exactly what it was.
+    #[tokio::test]
+    async fn a_rule_over_the_alert_cap_resolves_none_of_its_firing_alerts() {
+        let store = store_with_hot_instances(3).await;
+        let tenant = TenantId::new(TENANT).hash();
+        let (mut evaluator, before) = three_firing_alerts(&store).await;
+
+        let sample_ts = NOW_NS - 30 * NS_PER_SEC;
+        let more: Vec<(LabelSet, Vec<(i64, f64)>)> = (3..=ravel_alerting::MAX_ALERTS_PER_RULE)
+            .map(|i| {
+                (
+                    instance_label_set(&format!("host-{i:04}")),
+                    vec![(sample_ts, 1.0)],
+                )
+            })
+            .collect();
+        assert_eq!(more.len(), 998);
+        publish_series_at_seq(store.as_ref(), &TenantId::new(TENANT), more, 2).await;
+
+        let mut latest = evaluator.load_latest_records().await.expect("fold");
+        let err = evaluator
+            .evaluate_rule(&threshold_rule(), &mut latest, NOW_NS, &mut 0)
+            .await
+            .expect_err("1001 matched series is over the cap");
+        assert!(matches!(
+            err.downcast_ref::<AlertError>(),
+            Some(AlertError::TooManyAlerts {
+                count: 1001,
+                limit: 1000,
+                ..
+            })
+        ));
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.rules_evaluated, 0);
+        assert_eq!(report.rules_failed, 1);
+        assert_eq!(report.records_written, 0);
+
+        let after = read_alert_records(store.as_ref(), tenant).await;
+        let resolved = after
+            .iter()
+            .filter(|r| r.state == AlertState::Resolved)
+            .count();
+        assert_eq!(resolved, 0);
+        assert_eq!(after, before);
+    }
+
+    /// Five hot series and the third alert-record PUT fails: the rule fails,
+    /// but the two records written before the failure are durable, and the
+    /// tick counts exactly those two. The next tick writes the other three.
+    #[tokio::test]
+    async fn a_write_failing_mid_rule_counts_the_records_already_durable() {
+        let tenant = TenantId::new(TENANT).hash();
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert record write unavailable".into()),
+            )
+            .with_key_contains(format!("t/{}/a/l0/", tenant.to_hex()))
+            .with_occurrence(Occurrence::Nth(3)),
+        );
+        let fault = Arc::new(FaultStore::new(store_with_hot_instances(5).await, plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let metrics = Arc::new(AlertMetrics::default());
+        let mut evaluator = evaluator_with(
+            Arc::clone(&store),
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+
+        let report = evaluator.run_tick().await;
+        assert_eq!(fault.fault_count(Op::Put, FaultKind::Transient), 1);
+        assert_eq!(report.rules_evaluated, 0);
+        assert_eq!(report.rules_failed, 1);
+        assert_eq!(report.records_written, 2);
+        assert_eq!(metrics.records_written(), 2);
+        let mut durable: Vec<Vec<(String, String)>> = read_alert_records(store.as_ref(), tenant)
+            .await
+            .into_iter()
+            .map(|r| r.labels)
+            .collect();
+        durable.sort();
+        assert_eq!(
+            durable,
+            vec![
+                instance_alert_labels("host-0000"),
+                instance_alert_labels("host-0001"),
+            ]
+        );
+
+        let retry = evaluator.run_tick().await;
+        assert_eq!(retry.rules_evaluated, 1);
+        assert_eq!(retry.rules_failed, 0);
+        assert_eq!(retry.records_written, 3);
+        assert_eq!(metrics.records_written(), 5);
+        assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 5);
+    }
+
+    /// Three hot series fire three alerts. When one series stops reporting
+    /// (its last sample falls out of the instant query's lookback), only that
+    /// series' alert resolves; the other two stay Firing and write nothing.
+    #[tokio::test]
+    async fn a_disappearing_series_resolves_only_its_own_alert() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        let later = NOW_NS + 10 * 60 * NS_PER_SEC;
+        let early = NOW_NS - 30 * NS_PER_SEC;
+        let late = later - 30 * NS_PER_SEC;
+        publish_series(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            vec![
+                (
+                    instance_label_set("host-0"),
+                    vec![(early, 1.0), (late, 1.0)],
+                ),
+                (
+                    instance_label_set("host-1"),
+                    vec![(early, 1.0), (late, 1.0)],
+                ),
+                (instance_label_set("host-2"), vec![(early, 1.0)]),
+            ],
+        )
+        .await;
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        assert_eq!(evaluator.run_tick().await.records_written, 3);
+
+        clock.set(later);
+        let report = evaluator.run_tick().await;
+        assert_eq!(report.rules_failed, 0);
+        assert_eq!(report.records_written, 1);
+
+        let records = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(records.len(), 4);
+        let resolved: Vec<&AlertRecord> = records
+            .iter()
+            .filter(|r| r.state == AlertState::Resolved)
+            .collect();
+        assert_eq!(resolved.len(), 1);
+        let gone = instance_alert_labels("host-2");
+        assert_eq!(resolved[0].labels, gone);
+        assert_eq!(resolved[0].alert_id, compute_alert_id("high-cpu", &gone));
+        assert_eq!(resolved[0].ts_ns, later);
+
+        let latest = evaluator.load_latest_records().await.expect("fold");
+        let mut states: Vec<(Vec<(String, String)>, AlertState)> = latest
+            .values()
+            .map(|r| (r.labels.clone(), r.state))
+            .collect();
+        states.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            states,
+            vec![
+                (instance_alert_labels("host-0"), AlertState::Firing),
+                (instance_alert_labels("host-1"), AlertState::Firing),
+                (gone, AlertState::Resolved),
+            ]
+        );
+
+        // The resolved alert is not resolved again.
+        assert_eq!(evaluator.run_tick().await.records_written, 0);
+        assert_eq!(read_alert_records(store.as_ref(), tenant).await.len(), 4);
+    }
+
+    /// Each firing alert of a rule repeats on its own: two firing series queue
+    /// two repeats once the window advances.
+    #[tokio::test]
+    async fn each_firing_series_queues_its_own_repeat() {
+        let store = store_with_hot_instances(2).await;
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator_for_rules(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Vec::new(),
+            Arc::new(AlertMetrics::default()),
+            vec![repeat_rule(Some(Duration::from_secs(60)))],
+        );
+
+        let onset = evaluator.run_tick().await;
+        assert_eq!(onset.records_written, 2);
+        assert_eq!(onset.repeats_queued, 0);
+
+        clock.set(NOW_NS + 90 * NS_PER_SEC);
+        let repeat = evaluator.run_tick().await;
+        assert_eq!(repeat.records_written, 0);
+        assert_eq!(repeat.repeats_queued, 2);
+    }
+
+    /// `load_latest_records` must skip a `CompactionRecord` under the
+    /// alerts commit prefix instead of erroring. Constructed directly in the
+    /// store: today nothing produces one, so this is forward-compatible
+    /// groundwork for when compaction is enabled for `Signal::Alerts`.
+    #[tokio::test]
+    async fn load_latest_records_skips_a_compaction_record() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        // A validly-shaped L1 compaction record key under the alerts commit
+        // prefix. The fold classifies it by key shape and skips before ever
+        // reading the object, so the body is irrelevant.
+        let key = keys::compaction_record_key(
+            &tenant,
+            Signal::Alerts,
+            ALERT_SHARD,
+            0,
+            "0123456789abcdef",
+        )
+        .expect("compaction record key");
+        store
+            .put(&key, Bytes::from_static(b"unused"), PutOptions::default())
+            .await
+            .expect("put compaction record");
+
+        let evaluator = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let latest = evaluator
+            .load_latest_records()
+            .await
+            .expect("a compaction record is skipped, not an error");
+        assert!(
+            latest.is_empty(),
+            "no commit records remain once the compaction record is skipped"
+        );
+    }
+
+    /// two evaluator instances (two "replicas") over the same store,
+    /// evaluating the same tick, must not both fire and write. The lease holder
+    /// writes the transition; the other finds a live lease held by a different
+    /// identity and skips evaluation entirely.
+    #[tokio::test]
+    async fn only_the_lease_holder_writes_when_two_replicas_evaluate_one_tick() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+
+        let mut a = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        let mut b = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        let a_report = a.run_tick().await;
+        let b_report = b.run_tick().await;
+
+        assert_eq!(
+            a_report.records_written, 1,
+            "the lease holder fires the transition"
+        );
+        assert!(!a_report.lease_not_held, "replica a holds the lease");
+
+        assert_eq!(
+            b_report.records_written, 0,
+            "the replica without the lease does not write"
+        );
+        assert!(
+            b_report.lease_not_held,
+            "replica b saw a live lease held by replica a and skipped evaluation"
+        );
+
+        assert_eq!(
+            read_alert_records(store.as_ref(), tenant).await.len(),
+            1,
+            "exactly one transition record exists across both replicas"
+        );
+    }
+
+    /// once the holder's lease expires, a second replica takes it over and
+    /// then evaluates. Proves the lease is a lease, not a permanent lock: a dead
+    /// holder does not block a tenant forever.
+    #[tokio::test]
+    async fn a_second_replica_takes_over_an_expired_lease() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+
+        let a = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        let b = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        // a acquires; b is blocked while a's lease is live.
+        assert!(a.acquire_lease(NOW_NS).await.expect("a acquires"));
+        assert!(
+            !b.acquire_lease(NOW_NS).await.expect("b blocked"),
+            "b cannot take a live lease held by a"
+        );
+
+        // Past a's lease lifetime (LEASE_TTL_TICKS * default interval), b takes
+        // over; a, now the non-holder, is in turn blocked by b's fresh lease.
+        let past_expiry = NOW_NS
+            + (LEASE_TTL_TICKS as i64) * DEFAULT_ALERT_EVAL_INTERVAL.as_nanos() as i64
+            + NS_PER_SEC;
+        assert!(
+            b.acquire_lease(past_expiry).await.expect("b takes over"),
+            "b takes over once a's lease has expired"
+        );
+        assert!(
+            !a.acquire_lease(past_expiry).await.expect("a now blocked"),
+            "a no longer holds the lease after b took it over"
+        );
+    }
+
+    // --- Repeat pass (ADR-0043 "repeat notifications while firing") ----------
+    //
+    // These drive `queue_repeat_if_due` directly with a hand-built folded-latest
+    // map, so the state gate, the anchor-staleness rule, the backward-clock
+    // clamp, the disable switch, and the default cadence are each pinned without
+    // the query stack. `queue_repeat_if_due` writes no durable record by
+    // construction (it calls neither `publish` nor `write_alert_record`), which
+    // the tick-level e2e tests confirm end to end.
+
+    /// Only a `Firing` folded record repeats. `Pending`, `Resolved`, and
+    /// `Suppressed` never do, even long past the interval.
+    #[tokio::test]
+    async fn repeat_pass_only_queues_for_a_firing_record() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(Some(Duration::from_secs(60)));
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        // Five windows past a record stamped at NOW_NS.
+        let due = NOW_NS + 300 * NS_PER_SEC;
+
+        for state in [
+            AlertState::Pending,
+            AlertState::Resolved,
+            AlertState::Suppressed,
+        ] {
+            let latest = latest_with(&rule, state, NOW_NS);
+            let mut report = AlertEvalReport::default();
+            ev.repeat_marks.clear();
+            ev.undelivered.clear();
+            ev.queue_repeat_if_due(
+                &rule,
+                firing_of(&firing_by_rule(&latest), &rule),
+                due,
+                &mut report,
+            );
+            assert_eq!(report.repeats_queued, 0, "{state:?} must never repeat");
+            assert!(
+                ev.undelivered.is_empty(),
+                "{state:?} queues no notification"
+            );
+        }
+
+        let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
+        let mut report = AlertEvalReport::default();
+        ev.repeat_marks.clear();
+        ev.undelivered.clear();
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            due,
+            &mut report,
+        );
+        assert_eq!(report.repeats_queued, 1, "a firing record repeats when due");
+        assert!(
+            ev.undelivered.contains_key(&alert_id),
+            "the repeat is queued into undelivered"
+        );
+    }
+
+    /// A window mark left by a prior (resolved) episode must not suppress the
+    /// new episode's repeats: the mark's anchor differs from the new firing
+    /// record's `ts_ns`, so it is ignored and the schedule re-anchors. Made
+    /// non-vacuous by the old mark sitting at a strictly higher window (5) than
+    /// the new episode's first repeat (1).
+    #[tokio::test]
+    async fn a_stale_window_mark_does_not_suppress_a_new_firing_episode() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(Some(Duration::from_secs(60)));
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // A mark from a prior episode that reached window 5.
+        ev.repeat_marks.insert(alert_id, (NOW_NS, 5));
+
+        // The new firing episode is anchored much later; only window 1 elapsed.
+        let new_anchor = NOW_NS + 10_000 * NS_PER_SEC;
+        let latest = latest_with(&rule, AlertState::Firing, new_anchor);
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            new_anchor + 60 * NS_PER_SEC,
+            &mut report,
+        );
+
+        assert_eq!(
+            report.repeats_queued, 1,
+            "window 1 of the new episode repeats despite the stale window-5 mark"
+        );
+        assert_eq!(
+            ev.repeat_marks[&alert_id],
+            (new_anchor, 1),
+            "the mark re-anchored to the new episode's firing record"
+        );
+    }
+
+    /// Pruning keeps the mark of an alert that is still Firing and drops the
+    /// marks of an alert that resolved and of an identity no longer folded at
+    /// all, so the map is bounded by the live firing alerts.
+    #[tokio::test]
+    async fn repeat_marks_are_pruned_to_the_firing_alerts() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let firing = repeat_rule(Some(Duration::from_secs(60)));
+        let firing_id = compute_alert_id(&firing.rule_id, &firing.labels);
+        let mut resolved = repeat_rule(Some(Duration::from_secs(60)));
+        resolved.rule_id = "resolved-rule".to_owned();
+        let resolved_id = compute_alert_id(&resolved.rule_id, &resolved.labels);
+        let gone_id = compute_alert_id("gone-rule", &[]);
+
+        let mut latest = latest_with(&firing, AlertState::Firing, NOW_NS);
+        latest.extend(latest_with(&resolved, AlertState::Resolved, NOW_NS));
+        ev.repeat_marks.insert(firing_id, (NOW_NS, 1));
+        ev.repeat_marks.insert(resolved_id, (NOW_NS, 2));
+        ev.repeat_marks.insert(gone_id, (NOW_NS, 3));
+
+        ev.prune_repeat_marks(&latest);
+
+        assert_eq!(
+            ev.repeat_marks.len(),
+            1,
+            "only the firing alert's mark stays"
+        );
+        assert_eq!(ev.repeat_marks[&firing_id], (NOW_NS, 1));
+    }
+
+    /// The per-tick grouping hands each rule exactly its own Firing alerts: a
+    /// resolved alert of the same rule and a firing alert of another rule are
+    /// both left out of its slice.
+    #[test]
+    fn firing_by_rule_hands_each_rule_only_its_own_firing_alerts() {
+        let a = repeat_rule(Some(Duration::from_secs(60)));
+        let mut b = repeat_rule(Some(Duration::from_secs(60)));
+        b.rule_id = "other-rule".to_owned();
+        let a_firing_id = compute_alert_id(&a.rule_id, &a.labels);
+        let b_firing_id = compute_alert_id(&b.rule_id, &b.labels);
+        let a_resolved_labels = vec![("instance".to_owned(), "gone".to_owned())];
+        let a_resolved_id = compute_alert_id(&a.rule_id, &a_resolved_labels);
+
+        let mut latest = latest_with(&a, AlertState::Firing, NOW_NS);
+        latest.extend(latest_with(&b, AlertState::Firing, NOW_NS));
+        let mut resolved = latest_with(&a, AlertState::Resolved, NOW_NS)
+            .into_values()
+            .next()
+            .expect("one record");
+        resolved.alert_id = a_resolved_id;
+        resolved.labels = a_resolved_labels;
+        latest.insert(a_resolved_id, resolved);
+
+        let groups = firing_by_rule(&latest);
+        let ids = |rule: &Rule| -> Vec<AlertId> {
+            firing_of(&groups, rule).iter().map(|(id, _)| *id).collect()
+        };
+        assert_eq!(groups.len(), 2);
+        assert_eq!(ids(&a), vec![a_firing_id]);
+        assert_eq!(ids(&b), vec![b_firing_id]);
+        let mut c = repeat_rule(None);
+        c.rule_id = "silent-rule".to_owned();
+        assert_eq!(ids(&c), Vec::<AlertId>::new());
+    }
+
+    /// A backward clock step clamps the window to zero, so no repeat is queued
+    /// (matching the pending-duration clamp).
+    #[tokio::test]
+    async fn a_backward_clock_step_queues_no_repeat() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(Some(Duration::from_secs(60)));
+        let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
+
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            NOW_NS - 120 * NS_PER_SEC,
+            &mut report,
+        );
+        assert_eq!(
+            report.repeats_queued, 0,
+            "a clock behind the firing record clamps to window 0"
+        );
+    }
+
+    /// An explicit `0s` repeat_interval disables repeats for the rule, no matter
+    /// how much time has elapsed.
+    #[tokio::test]
+    async fn an_explicit_zero_interval_disables_repeats() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(Some(Duration::ZERO));
+        let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
+
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            NOW_NS + 600 * NS_PER_SEC,
+            &mut report,
+        );
+        assert_eq!(report.repeats_queued, 0, "0s disables repeats for the rule");
+    }
+
+    /// An absent repeat_interval uses `DEFAULT_REPEAT_INTERVAL` (60s): no repeat
+    /// just under it, one repeat at it.
+    #[tokio::test]
+    async fn an_absent_interval_uses_the_default_cadence() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let mut ev = evaluator(store, TestClock::at(NOW_NS));
+        let rule = repeat_rule(None);
+        let latest = latest_with(&rule, AlertState::Firing, NOW_NS);
+
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            NOW_NS + 59 * NS_PER_SEC,
+            &mut report,
+        );
+        assert_eq!(
+            report.repeats_queued, 0,
+            "just under the 60s default: no repeat"
+        );
+
+        ev.repeat_marks.clear();
+        ev.undelivered.clear();
+        let mut report = AlertEvalReport::default();
+        ev.queue_repeat_if_due(
+            &rule,
+            firing_of(&firing_by_rule(&latest), &rule),
+            NOW_NS + 60 * NS_PER_SEC,
+            &mut report,
+        );
+        assert_eq!(
+            report.repeats_queued, 1,
+            "at the 60s default cadence a repeat is due"
+        );
+    }
+
+    // --- Alert state memo (issue #1294) --------------------------------------
+    //
+    // These pin the fold's per-tick object-store cost. A counting store
+    // (`InstrumentedStore`) makes the request count an assertion, not a comment:
+    // the whole point of the memo is that a steady-state tick reads only the
+    // tail, not the whole history, so the number of GETs it issues is the claim.
+
+    /// Publish `records` as real alert transition objects, one commit + one data
+    /// object each, at the ingest hour of each record's own `ts_ns`. Distinct
+    /// writer seqs keep the commit keys from colliding, so `n` records yield `n`
+    /// commit records under the alerts prefix.
+    async fn seed_alert_history(evaluator: &AlertEvaluator, records: &[AlertRecord]) {
+        seed_alert_history_from(evaluator, records, 10_000).await;
+    }
+
+    /// [`seed_alert_history`] with an explicit base writer seq, so two seeding
+    /// calls against one evaluator (a prior-holder write published after the
+    /// first batch) do not collide on `(writer_id, epoch, seq)` and its commit
+    /// key.
+    async fn seed_alert_history_from(
+        evaluator: &AlertEvaluator,
+        records: &[AlertRecord],
+        base_seq: u64,
+    ) {
+        for (i, record) in records.iter().enumerate() {
+            let seq = base_seq + i as u64;
+            let identity = ObjectIdentity {
+                tenant_hash: evaluator.tenant.0,
+                shard: ALERT_SHARD,
+                writer_id: evaluator.writer_id.into_bytes(),
+                writer_epoch: ALERT_WRITER_EPOCH,
+                writer_seq: seq,
+            };
+            let bytes =
+                ravel_alerting::encode_record_object(record, RlogConfig::default(), identity)
+                    .expect("encode alert record");
+            evaluator
+                .publish(bytes, seq, record.ts_ns)
+                .await
+                .expect("publish alert record");
+        }
+    }
+
+    /// A full fold reads exactly one commit GET and one data GET per transition
+    /// record, so its cost grows with the cumulative history `N`. This is the
+    /// baseline the memo removes.
+    #[tokio::test]
+    async fn a_full_fold_reads_two_gets_per_transition() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+
+        let n: u64 = 4;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| build_transition_record(&rule, AlertState::Firing, 0, NOW_NS + i as i64))
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        let before = metrics.snapshot();
+        let latest = ev.load_latest_records().await.expect("full fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(latest.len(), 1, "all transitions share one alert_id");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2 * n,
+            "a full fold reads one commit GET and one data GET per transition record"
+        );
+    }
+
+    /// ADR-1688 decision 4: the retention window is the cold-start fold horizon.
+    /// After the maintain tick's alert retention sweep, a cold start (no memo,
+    /// a fresh evaluator, a full fold over the store alone) folds to exactly
+    /// the map the unswept history folded to, full record per identity.
+    ///
+    /// Four identities over ten transitions, against the default 90-day
+    /// window:
+    ///
+    /// - `a`: firing at -100d, resolved at -99d. Its current state is expired.
+    /// - `b`: firing at -98d, resolved at -97d, refired (generation 2) at -96d.
+    ///   Its current state is expired and carries the generation a refire
+    ///   must continue from.
+    /// - `c`: firing at -95d, resolved at -10d, refired at -1d.
+    /// - `d`: firing at -5d, resolved at -2d. Nothing expired.
+    ///
+    /// The sweep deletes exactly the four expired records that are no
+    /// identity's latest (`a` -100d, `b` -98d and -97d, `c` -95d), each with its
+    /// data object, so ten commit records and ten data objects become six of
+    /// each. The count is what stops this passing by deleting nothing, and the
+    /// empty quarantine prefix is what stops it passing by deleting only the
+    /// commit records and leaving the data to the orphan sweep.
+    ///
+    /// The memo the sweep keys on is written the way `run_tick` writes it: the
+    /// evaluator's own fold as `records`, its seal bound as `watermark_hour`.
+    ///
+    /// Watch it fail: in `maintain::alert_keep_set`, replace
+    /// `memo.records.values().map(|record| record.ts_ns)` with
+    /// `std::iter::empty::<i64>()`. The sweep then deletes all six expired
+    /// records, `a` and `b` vanish from the cold-start fold, and the count
+    /// assertion reports four commit records left instead of six.
+    #[tokio::test]
+    async fn a_cold_start_fold_after_the_alert_retention_sweep_equals_the_unswept_fold() {
+        const NS_PER_DAY: i64 = 24 * 60 * 60 * NS_PER_SEC;
+        // 2027-01-15T08:00:00Z: every expired hour is a positive ingest hour.
+        const COLD_NOW_NS: i64 = 1_800_000_000 * NS_PER_SEC;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ev = evaluator(Arc::clone(&store), TestClock::at(COLD_NOW_NS));
+        let tenant = ev.tenant;
+
+        let rule = |id: &str| Rule {
+            rule_id: id.to_string(),
+            ..threshold_rule()
+        };
+        let at = |days: i64| COLD_NOW_NS - days * NS_PER_DAY;
+        let (a, b, c, d) = (rule("a"), rule("b"), rule("c"), rule("d"));
+        let history = [
+            build_transition_record(&a, AlertState::Firing, 1, at(100)),
+            build_transition_record(&a, AlertState::Resolved, 1, at(99)),
+            build_transition_record(&b, AlertState::Firing, 1, at(98)),
+            build_transition_record(&b, AlertState::Resolved, 1, at(97)),
+            build_transition_record(&b, AlertState::Firing, 2, at(96)),
+            build_transition_record(&c, AlertState::Firing, 1, at(95)),
+            build_transition_record(&c, AlertState::Resolved, 1, at(10)),
+            build_transition_record(&c, AlertState::Firing, 2, at(1)),
+            build_transition_record(&d, AlertState::Firing, 1, at(5)),
+            build_transition_record(&d, AlertState::Resolved, 1, at(2)),
+        ];
+        seed_alert_history(&ev, &history).await;
+
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let data_prefix = format!("t/{}/a/l0/", tenant.to_hex());
+        let count = |prefix: String| {
+            let store = Arc::clone(&store);
+            async move {
+                ravel_object_store::list_all(store.as_ref(), &prefix)
+                    .await
+                    .expect("list")
+                    .len()
+            }
+        };
+        assert_eq!(count(commit_prefix.clone()).await, 10);
+        assert_eq!(count(data_prefix.clone()).await, 10);
+
+        let unswept = ev.load_latest_records().await.expect("pre-sweep fold");
+        assert_eq!(unswept.len(), 4, "four identities fold");
+        write_alert_state_memo(
+            store.as_ref(),
+            &tenant,
+            &AlertStateMemo {
+                watermark_hour: ev.seal_bound_hour(COLD_NOW_NS),
+                records: unswept.clone(),
+            },
+        )
+        .await
+        .expect("write memo");
+
+        let safety = run_maintain_tick(store.as_ref(), &tenant, COLD_NOW_NS).await;
+
+        for reason in crate::maintain::AlertRetentionSkipReason::ALL {
+            assert_eq!(safety.alert_retention_skipped(reason), 0, "{reason:?}");
+        }
+        assert_eq!(
+            count(commit_prefix).await,
+            6,
+            "the sweep deletes exactly the four expired records that are no identity's latest"
+        );
+        assert_eq!(
+            count(data_prefix.clone()).await,
+            6,
+            "each deleted record's data object goes with it"
+        );
+        assert_eq!(
+            count(format!("quarantine/{data_prefix}")).await,
+            0,
+            "the retention sweep deletes the data objects itself, not the orphan sweep"
+        );
+
+        store
+            .delete(&crate::alert_state_memo::alert_state_memo_key(&tenant))
+            .await
+            .expect("delete memo");
+        assert!(
+            read_alert_state_memo(store.as_ref(), &tenant)
+                .await
+                .expect("read memo")
+                .is_none(),
+            "the cold start has no memo to seed from"
+        );
+        let cold = evaluator(Arc::clone(&store), TestClock::at(COLD_NOW_NS))
+            .fold_latest(None, COLD_NOW_NS)
+            .await
+            .expect("cold-start fold");
+
+        for (id, record) in &unswept {
+            assert_eq!(
+                cold.get(id),
+                Some(record),
+                "identity {} folds to the same record after the sweep",
+                record.rule_id
+            );
+        }
+        assert_eq!(cold, unswept);
+    }
+
+    /// One maintain tick for `tenant` at `now_ns` under the default configs,
+    /// returning the safety metrics it counted into.
+    async fn run_maintain_tick(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        now_ns: i64,
+    ) -> crate::maintain::MaintenanceSafetyMetrics {
+        let clock = ravel_maintain::FixedClock::new(now_ns);
+        let worker =
+            ravel_maintain::WorkerSet::with_defaults(now_ns).with_process_id(Uuid::from_u128(1));
+        let live = worker.solo_live_set();
+        let safety = crate::maintain::MaintenanceSafetyMetrics::default();
+        let ownership = crate::maintain::MaintenanceOwnershipMetrics::new(3);
+        let mut maintain_memo = ravel_maintain::scan::MaintainMemo::with_default_interval();
+        crate::maintain::run_tick_with_clock(
+            &clock,
+            store,
+            tenant,
+            &ravel_maintain::CompactorConfig::default(),
+            &ravel_maintain::RetentionConfig::default(),
+            1,
+            &mut maintain_memo,
+            &safety,
+            &ownership,
+            &worker,
+            &live,
+        )
+        .await;
+        safety
+    }
+
+    /// The keep set's watermark end to end, through a stale memo written before
+    /// the newest records landed.
+    ///
+    /// The tick runs at half past an hour, so the expiry floor falls inside
+    /// its hour and that hour holds expired records. Three identities:
+    ///
+    /// - `a`: firing at -100d, resolved at -99d. In the memo.
+    /// - `e`: firing and resolved in the expiry floor's hour, both before the
+    ///   floor, so both expired. Absent from the memo, which predates them.
+    /// - `d`: firing at -2d. Absent from the memo.
+    ///
+    /// A memo whose watermark is one hour below the floor makes the tick skip
+    /// with `watermark_below_floor` and delete nothing. Rewritten with its
+    /// watermark at the floor's hour, the sweep deletes `a`'s firing record
+    /// (below the watermark, expired, not in the keep set) and keeps both of
+    /// `e`'s records, which sit at the watermark hour, so the cold-start fold
+    /// still equals the unswept fold.
+    ///
+    /// Watch it fail: in `ravel_maintain::alert_retention::sweep_alert_retention`,
+    /// change `parsed.ingest_hour_bucket >= keep.watermark_hour()` to `>`, and
+    /// both of `e`'s records are deleted (two commit records left, not four).
+    /// Or remove the `WatermarkBelowFloor` early return in
+    /// `maintain::alert_keep_set`, and the first tick counts no skip and
+    /// deletes `a`'s firing record.
+    #[tokio::test]
+    async fn a_stale_memo_keeps_expired_records_at_its_watermark_and_below_the_floor_skips() {
+        const NS_PER_DAY: i64 = 24 * 60 * 60 * NS_PER_SEC;
+        const STALE_NOW_NS: i64 = 1_800_000_000 * NS_PER_SEC + 30 * 60 * NS_PER_SEC;
+
+        let expiry_floor =
+            STALE_NOW_NS - ravel_maintain::CompactorConfig::default().alert_retention_window_ns;
+        let floor_hour = hour_bucket(expiry_floor);
+        let floor_hour_start = i64::from(floor_hour) * NS_PER_HOUR;
+        assert!(
+            floor_hour_start + 10 * 60 * NS_PER_SEC < expiry_floor,
+            "e's records, placed 5 and 10 minutes into the floor's hour, must be \
+             expired, or they survive for a reason unrelated to the watermark"
+        );
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ev = evaluator(Arc::clone(&store), TestClock::at(STALE_NOW_NS));
+        let tenant = ev.tenant;
+
+        let rule = |id: &str| Rule {
+            rule_id: id.to_string(),
+            ..threshold_rule()
+        };
+        let at = |days: i64| STALE_NOW_NS - days * NS_PER_DAY;
+        let (a, e, d) = (rule("a"), rule("e"), rule("d"));
+        let a_id = compute_alert_id(&a.rule_id, &a.labels);
+        let e_id = compute_alert_id(&e.rule_id, &e.labels);
+        seed_alert_history(
+            &ev,
+            &[
+                build_transition_record(&a, AlertState::Firing, 1, at(100)),
+                build_transition_record(&a, AlertState::Resolved, 1, at(99)),
+            ],
+        )
+        .await;
+        let stale_records = ev.load_latest_records().await.expect("stale fold");
+        seed_alert_history_from(
+            &ev,
+            &[
+                build_transition_record(
+                    &e,
+                    AlertState::Firing,
+                    1,
+                    floor_hour_start + 5 * 60 * NS_PER_SEC,
+                ),
+                build_transition_record(
+                    &e,
+                    AlertState::Resolved,
+                    1,
+                    floor_hour_start + 10 * 60 * NS_PER_SEC,
+                ),
+                build_transition_record(&d, AlertState::Firing, 1, at(2)),
+            ],
+            20_000,
+        )
+        .await;
+
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let data_prefix = format!("t/{}/a/l0/", tenant.to_hex());
+        let count = |prefix: String| {
+            let store = Arc::clone(&store);
+            async move {
+                ravel_object_store::list_all(store.as_ref(), &prefix)
+                    .await
+                    .expect("list")
+                    .len()
+            }
+        };
+        assert_eq!(count(commit_prefix.clone()).await, 5);
+        assert_eq!(count(data_prefix.clone()).await, 5);
+
+        let unswept = ev.load_latest_records().await.expect("pre-sweep fold");
+        assert_eq!(unswept.len(), 3, "three identities fold");
+        assert!(
+            stale_records.contains_key(&a_id) && !stale_records.contains_key(&e_id),
+            "the stale memo holds a and not e"
+        );
+        let write_memo = |watermark_hour: u32| {
+            let store = Arc::clone(&store);
+            let records = stale_records.clone();
+            async move {
+                write_alert_state_memo(
+                    store.as_ref(),
+                    &tenant,
+                    &AlertStateMemo {
+                        watermark_hour,
+                        records,
+                    },
+                )
+                .await
+                .expect("write memo");
+            }
+        };
+
+        write_memo(floor_hour - 1).await;
+        let safety = run_maintain_tick(store.as_ref(), &tenant, STALE_NOW_NS).await;
+        for reason in crate::maintain::AlertRetentionSkipReason::ALL {
+            let expected =
+                u64::from(reason == crate::maintain::AlertRetentionSkipReason::WatermarkBelowFloor);
+            assert_eq!(
+                safety.alert_retention_skipped(reason),
+                expected,
+                "{reason:?}"
+            );
+        }
+        assert_eq!(
+            count(commit_prefix.clone()).await,
+            5,
+            "a watermark below the floor deletes nothing"
+        );
+        assert_eq!(count(data_prefix.clone()).await, 5);
+
+        write_memo(floor_hour).await;
+        let safety = run_maintain_tick(store.as_ref(), &tenant, STALE_NOW_NS).await;
+        for reason in crate::maintain::AlertRetentionSkipReason::ALL {
+            assert_eq!(safety.alert_retention_skipped(reason), 0, "{reason:?}");
+        }
+        assert_eq!(
+            count(commit_prefix).await,
+            4,
+            "only a's firing record is deleted: e's expired records sit at the watermark hour"
+        );
+        assert_eq!(count(data_prefix.clone()).await, 4);
+        assert_eq!(
+            count(format!("quarantine/{data_prefix}")).await,
+            0,
+            "the retention sweep deletes the data object itself"
+        );
+
+        store
+            .delete(&crate::alert_state_memo::alert_state_memo_key(&tenant))
+            .await
+            .expect("delete memo");
+        let cold = evaluator(Arc::clone(&store), TestClock::at(STALE_NOW_NS))
+            .fold_latest(None, STALE_NOW_NS)
+            .await
+            .expect("cold-start fold");
+        assert_eq!(
+            cold.get(&e_id).map(|r| r.state),
+            Some(AlertState::Resolved),
+            "e's newest record survives the sweep"
+        );
+        assert_eq!(cold, unswept);
+    }
+
+    /// The memo path folds only the ingest hours at or after the watermark. With
+    /// every seeded record below the watermark, a steady-state fold reads zero
+    /// commit/data GETs and issues exactly one tail LIST, yet still returns the
+    /// full folded state, including a `Firing` record that lives only in the memo
+    /// (the case a bounded newest-first lookback would lose).
+    #[tokio::test]
+    async fn the_memo_path_reads_only_hours_at_or_after_the_watermark() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Three transitions for one alert, all in ingest hour 0, last is Firing.
+        let n = 3;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| {
+                let state = if i + 1 == n {
+                    AlertState::Firing
+                } else {
+                    AlertState::Pending
+                };
+                build_transition_record(&rule, state, 0, NOW_NS)
+            })
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        // A memo whose watermark is hour 1, above every seeded record's hour 0.
+        let memo = AlertStateMemo {
+            watermark_hour: 1,
+            records: full.clone(),
+        };
+
+        // Fold two hours on, so the reader's own seal bound is at or above the
+        // memo's watermark and the effective-watermark clamp is a no-op here:
+        // this test is about the tail cursor, not about the clamp.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= memo.watermark_hour,
+            "the clamp must not lower the watermark under test"
+        );
+
+        let before = metrics.snapshot();
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            via_memo, full,
+            "the memo path folds to the same latest state as a full fold"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "an hour-0 Firing below the watermark survives via the memo, not the tail"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            0,
+            "the memo path issues no commit or data GETs for hours below the watermark"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+    }
+
+    /// A transition written after the memo, at an hour at or above its
+    /// watermark, is folded in by the non-optional tail LIST: the memo path
+    /// matches a full fold rather than returning the stale memoized state.
+    #[tokio::test]
+    async fn a_transition_after_the_memo_is_caught_by_the_tail_list() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Memo snapshot: Firing as of hour 0, watermark hour 1. This record is
+        // never written to the store; it exists only in the memo.
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+        let mut memo_records = HashMap::new();
+        memo_records.insert(alert_id, firing);
+        let memo = AlertStateMemo {
+            watermark_hour: 1,
+            records: memo_records,
+        };
+
+        // A newer Resolved transition lands in hour 1, at the watermark.
+        let hour1_ts = NS_PER_HOUR + NOW_NS;
+        let resolved = build_transition_record(&rule, AlertState::Resolved, 0, hour1_ts);
+        seed_alert_history(&ev, &[resolved]).await;
+
+        // Fold two hours on, so the effective-watermark clamp is a no-op and the
+        // tail cursor really is the memo's own hour 1.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= memo.watermark_hour,
+            "the clamp must not lower the watermark under test"
+        );
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        assert_eq!(
+            via_memo, full,
+            "the tail list folds in the transition written after the memo"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Resolved),
+            "the memo path reflects the Resolved written after the memo, not the stale Firing"
+        );
+    }
+
+    /// The lease holder writes the state memo after a tick, stamping the
+    /// seal-bound hour as the watermark and recording every folded alert.
+    #[tokio::test]
+    async fn the_lease_holder_writes_the_state_memo() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the lease holder wrote a memo");
+        assert_eq!(
+            memo.watermark_hour,
+            ev.seal_bound_hour(NOW_NS),
+            "the watermark is the seal-bound hour, not the tick's own hour"
+        );
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        assert_eq!(
+            memo.records.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the memo records the firing alert the tick just wrote"
+        );
+
+        // Finding 4 (issue #1438): the fold seeds the memo with no active-rule
+        // filter, so an identity for a rule that is no longer configured stays in
+        // the memo. Seed one transition for a rule this evaluator is NOT
+        // configured with (a rule since deleted, whose history remains), fold
+        // again, and the identity is still present. The memo's growth is bounded
+        // by distinct identities ever configured, not by ticks or transitions, and
+        // pruning that growth is deferred to issue #1438. The day that prune lands,
+        // this exact-key-set assertion is the one that changes.
+        let deleted_rule = Rule {
+            rule_id: "since-deleted-rule".to_string(),
+            ..threshold_rule()
+        };
+        let deleted_id = compute_alert_id(&deleted_rule.rule_id, &deleted_rule.labels);
+        assert_ne!(
+            deleted_id, alert_id,
+            "the deleted rule has its own identity"
+        );
+        let ghost = build_transition_record(&deleted_rule, AlertState::Firing, 0, NOW_NS);
+        seed_alert_history(&ev, &[ghost]).await;
+
+        let refolded = ev.load_latest_records().await.expect("refold");
+        assert_eq!(
+            refolded
+                .keys()
+                .copied()
+                .collect::<std::collections::HashSet<_>>(),
+            [alert_id, deleted_id]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>(),
+            "the deleted rule's identity is retained in the fold: no active-rule filter prunes it"
+        );
+    }
+
+    /// A corrupt memo is not fatal: the tick falls back to a full fold, still
+    /// fires, and the lease holder overwrites the garbage with a valid memo.
+    #[tokio::test]
+    async fn a_corrupt_memo_is_ignored_and_rewritten() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        store
+            .put(
+                &crate::alert_state_memo::alert_state_memo_key(&tenant),
+                Bytes::from_static(b"not a memo"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put garbage memo");
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        assert_eq!(
+            ev.run_tick().await.records_written,
+            1,
+            "a corrupt memo falls back to a full fold, not a skipped tick"
+        );
+
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo now decodes")
+            .expect("memo present after rewrite");
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        assert_eq!(
+            memo.records.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the holder rewrote a valid memo over the garbage"
+        );
+    }
+
+    /// A memo body that repeats an alert_id is refused as a corrupt memo, so the
+    /// tick falls back to a full fold exactly as `a_corrupt_memo_is_ignored_and_
+    /// rewritten` does, and the fallback fold reads the same `2N` GETs as any
+    /// full fold (finding 1, issue #1294).
+    #[tokio::test]
+    async fn a_duplicate_alert_id_memo_falls_back_to_a_full_fold() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let tenant = TenantId::new(TENANT).hash();
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+
+        // A single transition in the durable history: a full fold of it is 2 GETs.
+        let n: u64 = 1;
+        let records: Vec<AlertRecord> = (0..n)
+            .map(|i| build_transition_record(&rule, AlertState::Firing, 0, NOW_NS + i as i64))
+            .collect();
+        seed_alert_history(&ev, &records).await;
+
+        // A well-formed memo body that lists the one alert_id twice.
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        let hex = alert_id.to_hex();
+        let body = format!(
+            r#"{{"format_version":1,"watermark_hour":1,"records":[
+                {{"alert_id":"{hex}","rule_id":"high-cpu","state":"firing",
+                 "generation":0,"ts_ns":1,"labels":[],"annotations":[],"body":"b"}},
+                {{"alert_id":"{hex}","rule_id":"high-cpu","state":"resolved",
+                 "generation":1,"ts_ns":2,"labels":[],"annotations":[],"body":"b"}}]}}"#
+        );
+        store
+            .put(
+                &crate::alert_state_memo::alert_state_memo_key(&tenant),
+                Bytes::from(body),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put duplicate-alert_id memo");
+
+        // The reader refuses the duplicate memo outright.
+        assert!(
+            read_alert_state_memo(store.as_ref(), &tenant)
+                .await
+                .is_err(),
+            "a memo repeating an alert_id is refused, not silently deduped"
+        );
+
+        // So the tick folds `None`: a full fold, exactly 2 GETs per transition.
+        let before = metrics.snapshot();
+        let latest = ev
+            .fold_latest(None, NOW_NS)
+            .await
+            .expect("full fold fallback");
+        let after = metrics.snapshot();
+        assert_eq!(latest.len(), 1, "all transitions share one alert_id");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2 * n,
+            "the duplicate-memo fallback is a full fold: one commit GET and one \
+             data GET per transition"
+        );
+    }
+
+    /// A failed memo write does not clear the prior memo, so the next tick reads
+    /// the surviving memo and folds only the tail, not the whole history (finding
+    /// 1, issue #1294). `run_tick` logs the `write_alert_state_memo` error and
+    /// leaves the object as it was; the full-fold path is reached only when no
+    /// readable memo exists, never merely because a write failed. The fault layer
+    /// fails the tick's memo `Overwrite`; the prior memo sits below that layer, so
+    /// it stays readable and its own seeding write is not the faulted one.
+    #[tokio::test]
+    async fn a_failed_memo_write_leaves_the_prior_memo_so_the_next_tick_folds_the_tail() {
+        let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = instrumented.metrics();
+        let tenant = TenantId::new(TENANT).hash();
+        let memo_key = crate::alert_state_memo::alert_state_memo_key(&tenant);
+
+        // A metric above the threshold so the alert stays Firing and the tick
+        // writes no new transition: the durable history is fixed at one record.
+        publish_metric(
+            instrumented.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        // Fail the FIRST memo PUT the fault layer sees. The prior memo below is
+        // seeded straight into the counting store, under the fault layer, so it is
+        // not that first PUT; the tick's own memo `Overwrite` is.
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert state memo write unavailable".into()),
+            )
+            .with_key_contains(memo_key.clone())
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let fault = Arc::new(FaultStore::new(Arc::clone(&instrumented), plan));
+        let store: Arc<dyn ObjectStoreBackend> = fault.clone();
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+
+        // One Firing transition in ingest hour 0 is the whole durable history.
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+        assert_eq!(hour_bucket(NOW_NS), 0, "the firing record is in hour 0");
+        seed_alert_history(&ev, &[firing]).await;
+
+        // The full fold of that history: the state the memo must reproduce.
+        let full = ev.load_latest_records().await.expect("full fold");
+
+        // A prior, valid memo whose watermark (hour 1) is above the record's hour
+        // 0, so a fold over it re-reads no commit/data objects. Seeded below the
+        // fault layer, so it stays readable and does not trip the PUT fault.
+        let prior = AlertStateMemo {
+            watermark_hour: 1,
+            records: full.clone(),
+        };
+        write_alert_state_memo(instrumented.as_ref(), &tenant, &prior)
+            .await
+            .expect("seed prior memo below the fault layer");
+
+        // The tick reads the prior memo, stays Firing (writes no transition), and
+        // attempts to rewrite the memo at the seal-bound watermark (hour 0, below
+        // the prior hour 1), which the fault fails.
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "already firing: the tick writes no new transition"
+        );
+        assert_eq!(
+            fault.fault_count(Op::Put, FaultKind::Transient),
+            1,
+            "the memo write was attempted and the injected fault fired exactly once"
+        );
+
+        // The failed write did not clear the memo: the prior memo (watermark hour
+        // 1) is still readable, not gone.
+        let surviving = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the failed write left the prior memo in place");
+        assert_eq!(
+            surviving.watermark_hour, 1,
+            "the surviving memo is the prior one, untouched by the failed overwrite"
+        );
+
+        // A later tick's read path (memo GET then tail fold) takes the fold_tail
+        // path over the surviving memo, not a full fold: one memo GET, no
+        // commit/data GETs for the below-watermark record, and one tail LIST.
+        // "Later" is two hours on so this reader's seal bound is at or above the
+        // surviving watermark and the effective-watermark clamp is a no-op; the
+        // claim under test is that a failed write left a usable memo behind.
+        let fold_at = NOW_NS + 2 * NS_PER_HOUR;
+        assert!(
+            ev.seal_bound_hour(fold_at) >= 1,
+            "the clamp must not lower the surviving watermark under test"
+        );
+        let before = metrics.snapshot();
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("memo present");
+        let via_memo = ev
+            .fold_latest(Some(&memo), fold_at)
+            .await
+            .expect("memo fold");
+        let after = metrics.snapshot();
+
+        assert_eq!(
+            via_memo, full,
+            "the served state still equals the full fold, record for record"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            1,
+            "the memo path reads only the memo object: no commit/data GETs below the watermark"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+
+        // Contrast: a full fold over the same history costs two GETs (one commit,
+        // one data) for the one transition, so the memo path above really did skip
+        // the full fold rather than accidentally matching its cost.
+        let before = metrics.snapshot();
+        let full_again = ev.load_latest_records().await.expect("full fold");
+        let after = metrics.snapshot();
+        assert_eq!(full_again, full, "the full fold is stable");
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2,
+            "a full fold reads one commit GET and one data GET per transition"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the memo path still serves the firing alert from the surviving memo"
+        );
+    }
+
+    /// The memo watermark is the seal-bound hour, strictly older than the tick's
+    /// own hour when the tick runs within the seal margin of an hour boundary.
+    /// Pinning it to `hour_bucket(now_ns)` (the flip) would let it advance past an
+    /// hour an overlapping prior holder can still write into (finding 2,
+    /// issue #1294).
+    #[tokio::test]
+    async fn the_watermark_never_exceeds_the_seal_bound() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        // A `now` just inside hour 1, within the seal margin of the hour-0
+        // boundary, so the seal bound is hour 0 while the tick's own hour is 1.
+        let now = NS_PER_HOUR + 60 * NS_PER_SEC;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(now - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(now));
+
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+
+        let seal = ev.seal_bound_hour(now);
+        assert!(
+            seal < hour_bucket(now),
+            "test is only meaningful when the seal bound (hour {seal}) is strictly \
+             older than the tick's own hour (hour {})",
+            hour_bucket(now)
+        );
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the lease holder wrote a memo");
+        assert_eq!(
+            memo.watermark_hour, seal,
+            "the watermark is pinned to the seal-bound hour, not the tick's own hour"
+        );
+    }
+
+    /// A transition an overlapping prior holder publishes into an hour below the
+    /// tick's own hour, after this holder's tail LIST, is still folded in on the
+    /// next tick: the seal-bound watermark keeps that hour inside the tail. With
+    /// the watermark reverted to the tick's own hour (the flip) the tail skips
+    /// the hour and the transition is lost forever from the memo (finding 2,
+    /// issue #1294).
+    #[tokio::test]
+    async fn a_transition_published_by_an_overlapping_prior_holder_is_not_lost() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // A `now` just inside hour 1, within the seal margin of the hour-0
+        // boundary: the seal-bound watermark is hour 0, the tick's own hour is 1.
+        let now = NS_PER_HOUR + 60 * NS_PER_SEC;
+        // Metric above the threshold so holder A stays Firing and writes no new
+        // transition this tick.
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(now - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        let mut a = evaluator(Arc::clone(&store), TestClock::at(now));
+
+        // Pre-seed a Firing transition in hour 0, so A folds to Firing.
+        let firing_ts = NS_PER_HOUR - 200 * NS_PER_SEC;
+        assert_eq!(hour_bucket(firing_ts), 0, "the firing record is in hour 0");
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, firing_ts);
+        seed_alert_history_from(&a, &[firing], 10_000).await;
+
+        // A's tick: folds Firing, writes no transition, writes the memo.
+        assert_eq!(
+            a.run_tick().await.records_written,
+            0,
+            "already firing: no new transition written this tick"
+        );
+
+        // The prior holder B, still in flight after A's tail LIST, publishes a
+        // Resolved transition. Its skewed clock stamps it in hour 0 (below A's own
+        // hour 1) but later in ts than A's firing record, so it is the new latest.
+        let resolved_ts = NS_PER_HOUR - 100 * NS_PER_SEC;
+        assert_eq!(hour_bucket(resolved_ts), 0, "the late resolve is in hour 0");
+        assert!(resolved_ts > firing_ts, "the resolve supersedes the firing");
+        let resolved = build_transition_record(&rule, AlertState::Resolved, 0, resolved_ts);
+        seed_alert_history_from(&a, &[resolved], 20_000).await;
+
+        // The next tick reads the memo A wrote and folds its tail on top.
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("A wrote a memo");
+        let via_memo = a.fold_latest(Some(&memo), now).await.expect("memo fold");
+        let full = a.load_latest_records().await.expect("full fold");
+
+        assert_eq!(
+            via_memo, full,
+            "the seal-bound watermark keeps the prior holder's hour in the tail, so \
+             the memo fold matches the full fold exactly"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Resolved),
+            "the late Resolved from the overlapping prior holder is not lost"
+        );
+    }
+
+    /// A holder whose tick outlives its own lease stamps its transition at the
+    /// clock reading it holds when it publishes, not at its tick start, so the
+    /// transition lands at or above the watermark a successor wrote while that
+    /// tick was still in flight (issue #1294, review finding 1).
+    ///
+    /// A tick evaluates its rules sequentially under a per-rule query deadline
+    /// and has no tick-level cap, so it can run far longer than the seal margin
+    /// (`lease_ttl + query_deadline`); a slow tick is exactly what causes the
+    /// handover in the first place. The flip is stamping with the tick-start
+    /// reading, which carries no such bound: the transition lands in an hour
+    /// below the watermark, the tail never descends there, and every later memo
+    /// re-seeds from the last, so the record is lost from the memo path for good.
+    #[tokio::test]
+    async fn a_slow_prior_holder_publishing_after_handover_stays_inside_the_tail() {
+        let inner = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let metrics = inner.metrics();
+        let store: Arc<dyn ObjectStoreBackend> = inner;
+        let tenant = TenantId::new(TENANT).hash();
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // Both holders read one clock, so this is about the tick outliving the
+        // seal margin, not about clock skew between nodes.
+        let clock = TestClock::at(NOW_NS);
+        let mut a = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        let mut b = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        assert_ne!(
+            a.writer_id, b.writer_id,
+            "A and B are distinct lease holders"
+        );
+
+        // A metric above the threshold at A's tick start, so A's in-flight tick
+        // decides a Firing onset.
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        // A starts its tick at NOW: it takes the lease and folds an empty
+        // history.
+        assert!(
+            a.acquire_lease(NOW_NS).await.expect("lease store ok"),
+            "A holds the lease at its tick start"
+        );
+        let mut a_latest = a
+            .load_latest_records()
+            .await
+            .expect("A folds at its tick start");
+        assert!(
+            a_latest.is_empty(),
+            "no prior transition: A's tick decides the onset"
+        );
+
+        // A's tick is slow: two hours pass before it reaches its write. That is
+        // past A's lease and far past the seal margin.
+        let slow_ns = 2 * NS_PER_HOUR;
+        let seal_margin_ns = i64::try_from(a.lease_ttl.saturating_add(a.query_deadline).as_nanos())
+            .expect("seal margin fits an i64");
+        assert!(
+            slow_ns > seal_margin_ns,
+            "the tick must outlast the seal margin ({slow_ns} ns vs {seal_margin_ns} ns) or the \
+             margin alone would cover the stamp"
+        );
+        let handover_ns = NOW_NS + slow_ns;
+        clock.set(handover_ns);
+
+        // B takes over the expired lease, folds (A has still written nothing),
+        // and writes a memo at its own seal-bound watermark W.
+        let report = b.run_tick().await;
+        assert!(!report.lease_not_held, "B took over A's expired lease");
+        assert_eq!(
+            report.records_written, 0,
+            "the only sample is two hours stale: B decides no transition"
+        );
+        let memo = read_alert_state_memo(store.as_ref(), &tenant)
+            .await
+            .expect("memo readable")
+            .expect("B wrote a memo");
+        let watermark = memo.watermark_hour;
+        assert_eq!(
+            watermark,
+            b.seal_bound_hour(handover_ns),
+            "B's watermark is its own seal bound"
+        );
+        assert!(
+            watermark > hour_bucket(NOW_NS),
+            "the watermark (hour {watermark}) has advanced past A's tick-start hour (hour {}), \
+             which is what makes a tick-start stamp fall out of the tail",
+            hour_bucket(NOW_NS)
+        );
+        assert!(
+            memo.records.is_empty(),
+            "B memoized an empty state: A's transition does not exist yet"
+        );
+
+        // Only now does A's in-flight tick reach its write.
+        let mut a_written = 0;
+        a.evaluate_rule(&rule, &mut a_latest, NOW_NS, &mut a_written)
+            .await
+            .expect("A publishes its transition");
+        assert_eq!(
+            a_written, 1,
+            "A writes the onset transition its tick decided at NOW"
+        );
+
+        // B's next fold over the memo it just wrote still sees that transition:
+        // seed plus tail equals a full fold, record for record.
+        let before = metrics.snapshot();
+        let via_memo = b
+            .fold_latest(Some(&memo), handover_ns)
+            .await
+            .expect("memo fold");
+        let after = metrics.snapshot();
+        let full = b.load_latest_records().await.expect("full fold");
+        assert_eq!(
+            full.len(),
+            1,
+            "the durable history holds exactly A's one transition"
+        );
+        assert_eq!(
+            via_memo, full,
+            "the late transition is inside the tail, so the memo fold equals the full fold"
+        );
+        assert_eq!(
+            via_memo.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "A's late Firing is not lost from the memo path"
+        );
+        assert_eq!(
+            after.get.calls - before.get.calls,
+            2,
+            "the tail read A's transition: one commit GET and one data GET"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            1,
+            "the memo path issues exactly one tail LIST"
+        );
+
+        // The mechanism: the stamp is the publish-time reading, so its ingest
+        // hour is at or above the watermark B wrote.
+        let history = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(history.len(), 1, "A published exactly one transition");
+        assert_eq!(
+            history[0].ts_ns, handover_ns,
+            "stamped at publish, not at NOW"
+        );
+        assert!(
+            hour_bucket(history[0].ts_ns) >= watermark,
+            "the transition's ingest hour ({}) must be at or above the watermark ({watermark})",
+            hour_bucket(history[0].ts_ns)
+        );
+    }
+
+    /// Store calls split by keyspace: the tenant's alert keyspace
+    /// (`t/<hash>/a/`, holding the memo, the lease, and the commit and data
+    /// objects the fold reads) against everything else, which for an evaluation
+    /// tick is the rule query's own reads. A single pooled counter cannot say
+    /// which layer a per-tick figure belongs to, and the tick's cost claim is
+    /// about the alerting layer only.
+    struct KeyspaceCountingStore {
+        inner: Arc<dyn ObjectStoreBackend>,
+        alert_prefix: String,
+        alert: OpCounts,
+        other: OpCounts,
+    }
+
+    #[derive(Default)]
+    struct OpCounts {
+        gets: AtomicU64,
+        puts: AtomicU64,
+        lists: AtomicU64,
+    }
+
+    /// A `Copy` reading of both counters, so a test can bracket one call.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct KeyspaceCounts {
+        alert_gets: u64,
+        alert_puts: u64,
+        alert_lists: u64,
+        other_gets: u64,
+        other_puts: u64,
+        other_lists: u64,
+    }
+
+    impl KeyspaceCountingStore {
+        fn new(inner: Arc<dyn ObjectStoreBackend>, tenant: &TenantHash) -> Self {
+            KeyspaceCountingStore {
+                inner,
+                alert_prefix: format!("t/{}/{}/", tenant.to_hex(), Signal::Alerts.key_prefix()),
+                alert: OpCounts::default(),
+                other: OpCounts::default(),
+            }
+        }
+
+        fn counts_for(&self, key: &str) -> &OpCounts {
+            if key.starts_with(&self.alert_prefix) {
+                &self.alert
+            } else {
+                &self.other
+            }
+        }
+
+        fn snapshot(&self) -> KeyspaceCounts {
+            KeyspaceCounts {
+                alert_gets: self.alert.gets.load(Ordering::SeqCst),
+                alert_puts: self.alert.puts.load(Ordering::SeqCst),
+                alert_lists: self.alert.lists.load(Ordering::SeqCst),
+                other_gets: self.other.gets.load(Ordering::SeqCst),
+                other_puts: self.other.puts.load(Ordering::SeqCst),
+                other_lists: self.other.lists.load(Ordering::SeqCst),
+            }
+        }
+    }
+
+    impl KeyspaceCounts {
+        /// This reading minus `before`, so a test states one tick's own cost.
+        fn since(self, before: KeyspaceCounts) -> KeyspaceCounts {
+            KeyspaceCounts {
+                alert_gets: self.alert_gets - before.alert_gets,
+                alert_puts: self.alert_puts - before.alert_puts,
+                alert_lists: self.alert_lists - before.alert_lists,
+                other_gets: self.other_gets - before.other_gets,
+                other_puts: self.other_puts - before.other_puts,
+                other_lists: self.other_lists - before.other_lists,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for KeyspaceCountingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.counts_for(key).puts.fetch_add(1, Ordering::SeqCst);
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.counts_for(key).gets.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.counts_for(prefix).lists.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The whole cost of one steady-state `run_tick`, bracketed end to end
+    /// (issue #1294, review finding 2). The fold tests above pin the fold's own
+    /// reads; nothing pinned the lease and memo calls a tick makes around them,
+    /// and `acquire_lease` in steady state is three calls, not one.
+    ///
+    /// Two consecutive quiet ticks at one clock reading, differing only in
+    /// whether the memo write is debounced:
+    ///
+    /// - not debounced (the watermark hour advanced since the last memo): 4
+    ///   alert GETs (memo, lease, and a commit plus data GET for the one
+    ///   transition the tail still covers), 3 alert PUTs (the lease's
+    ///   `CreateIfAbsent` attempt, its CAS renewal, and the memo `Overwrite`),
+    ///   1 alert LIST.
+    /// - debounced, and the tail now covers no transition: 2 alert GETs, 2 alert
+    ///   PUTs (the lease only), 1 alert LIST.
+    ///
+    /// The LIST is one call only because the tail fits in a single page; a tail
+    /// spanning more pages costs one LIST per page.
+    ///
+    /// The figures outside the alert keyspace are the rule query's own reads of
+    /// the metrics it evaluates, pinned here so they cannot drift into the
+    /// alerting figures unnoticed. They are not identical across the two ticks
+    /// (the second reads one object fewer, from a warm query-engine cache), which
+    /// is exactly why the two keyspaces are counted apart.
+    #[tokio::test]
+    async fn one_steady_state_tick_costs_its_lease_memo_and_tail_calls_exactly() {
+        let tenant = TenantId::new(TENANT).hash();
+        let counting = Arc::new(KeyspaceCountingStore::new(
+            Arc::new(MemoryStore::new()),
+            &tenant,
+        ));
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+
+        // One sample per hour, each 30s before the tick that reads it, so the
+        // alert fires on the first tick and stays Firing across the hour
+        // boundary without any further transition.
+        let hour_one_ns = NOW_NS + NS_PER_HOUR;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(hour_one_ns - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        // Tick 1 is the cold path: no memo, a full fold, and the Firing onset.
+        assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
+        assert_eq!(
+            hour_bucket(NOW_NS),
+            0,
+            "the onset transition is written in hour 0"
+        );
+
+        // An hour on, so the seal-bound watermark has moved to hour 1 and the
+        // memo write is not debounced. The memo still says hour 0, so the tail
+        // covers the onset transition.
+        clock.set(hour_one_ns);
+        assert_eq!(
+            ev.seal_bound_hour(hour_one_ns),
+            1,
+            "the tick's seal-bound watermark is hour 1"
+        );
+
+        let before = counting.snapshot();
+        let report = ev.run_tick().await;
+        let refresh = counting.snapshot().since(before);
+        assert_eq!(
+            report.records_written, 0,
+            "already firing on a fresh sample: no transition this tick"
+        );
+        assert!(!report.lease_not_held, "the sole replica holds the lease");
+        assert_eq!(
+            refresh,
+            KeyspaceCounts {
+                alert_gets: 4,
+                alert_puts: 3,
+                alert_lists: 1,
+                other_gets: 3,
+                other_puts: 0,
+                other_lists: 2,
+            },
+            "a steady-state tick whose memo write is not debounced"
+        );
+
+        // Tick 3 at the same reading: the watermark and the records are both
+        // unchanged, so the memo write is debounced, and the tail now starts at
+        // hour 1, above the onset transition, so it reads no commit or data
+        // object at all.
+        let before = counting.snapshot();
+        let report = ev.run_tick().await;
+        let debounced = counting.snapshot().since(before);
+        assert_eq!(report.records_written, 0, "still no transition");
+        assert_eq!(
+            debounced,
+            KeyspaceCounts {
+                alert_gets: 2,
+                alert_puts: 2,
+                alert_lists: 1,
+                other_gets: 2,
+                other_puts: 0,
+                other_lists: 2,
+            },
+            "a debounced steady-state tick over an empty tail"
+        );
+    }
+
+    /// A memo watermark above this reader's seal bound is clamped to the seal
+    /// bound, so the tail cursor never starts past the hours the current commit
+    /// keys live in. `decode` accepts any `u32`, so such a memo is reachable from
+    /// a replica whose clock runs ahead or from a corrupted-but-decodable field.
+    /// Without the clamp the tail skips the current hour, the fold serves the
+    /// memo's pre-transition state, and the tick re-writes a firing transition
+    /// that is already durable.
+    #[tokio::test]
+    async fn a_watermark_above_the_seal_bound_is_clamped_to_it() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+        publish_metric(
+            store.as_ref(),
+            &TenantId::new(TENANT),
+            &[(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+        )
+        .await;
+
+        let mut ev = evaluator(Arc::clone(&store), TestClock::at(NOW_NS));
+        let rule = threshold_rule();
+        let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+
+        // One firing transition, committed in the current hour: the hour the
+        // tail must cover, and the hour an over-high watermark skips.
+        let seal = ev.seal_bound_hour(NOW_NS);
+        let firing_ts = NOW_NS - 10 * NS_PER_SEC;
+        assert_eq!(
+            hour_bucket(firing_ts),
+            seal,
+            "the firing transition sits in the seal-bound hour, so only a watermark \
+             above the seal bound can skip it"
+        );
+        let firing = build_transition_record(&rule, AlertState::Firing, 0, firing_ts);
+        seed_alert_history(&ev, &[firing]).await;
+
+        let full = ev.load_latest_records().await.expect("full fold");
+        assert_eq!(
+            full.get(&alert_id).map(|r| r.state),
+            Some(AlertState::Firing),
+            "the durable history folds to Firing"
+        );
+
+        // A memo one hour above the seal bound, holding no record for the alert:
+        // the state as of before the firing transition was written.
+        let memo = AlertStateMemo {
+            watermark_hour: seal + 1,
+            records: HashMap::new(),
+        };
+        write_alert_state_memo(store.as_ref(), &tenant, &memo)
+            .await
+            .expect("seed the over-high memo");
+
+        // The served state is the full fold, record for record, not the memo's
+        // empty snapshot.
+        let via_memo = ev
+            .fold_latest(Some(&memo), NOW_NS)
+            .await
+            .expect("memo fold");
+        assert_eq!(
+            via_memo, full,
+            "the clamped watermark keeps the current hour in the tail, so the memo \
+             fold equals the full fold exactly"
+        );
+
+        // And the next evaluation writes no duplicate transition: the tick reads
+        // the same over-high memo from the store, folds to Firing, and finds no
+        // transition to make. The history stays at the one record seeded above.
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report.records_written, 0,
+            "already firing: the tick writes no duplicate firing transition"
+        );
+        let history = read_alert_records(store.as_ref(), tenant).await;
+        assert_eq!(
+            history.len(),
+            1,
+            "the durable history still holds exactly the one seeded transition"
+        );
+        assert_eq!(
+            history[0].state,
+            AlertState::Firing,
+            "and it is the firing record the memo's watermark would have skipped"
+        );
+    }
+
+    /// A failed encode never overwrites the prior memo (finding 1, issue #1294).
+    /// The old `encode` returned an empty `Vec` on a serialize failure, so the
+    /// writer put a zero-byte object over a good memo; now the write path
+    /// propagates the encode error and issues no `put` at all.
+    #[tokio::test]
+    async fn a_failed_encode_writes_nothing_and_leaves_the_prior_memo() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT).hash();
+
+        // Seed a good, readable memo.
+        let prior = AlertStateMemo {
+            watermark_hour: 5,
+            records: HashMap::new(),
+        };
+        write_alert_state_memo(&store, &tenant, &prior)
+            .await
+            .expect("seed prior memo");
+        assert_eq!(
+            store.metrics().snapshot().put.calls,
+            1,
+            "the seeding write issued exactly one put"
+        );
+
+        // A write whose encode fails must short-circuit before the put.
+        let err = crate::alert_state_memo::write_with_failing_encode_for_test(&store, &tenant)
+            .await
+            .expect_err("a failing encode is propagated");
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::alert_state_memo::MemoError>(),
+                Some(crate::alert_state_memo::MemoError::Encode(_))
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.metrics().snapshot().put.calls,
+            1,
+            "the failed encode issued no additional put"
+        );
+
+        // The prior memo is untouched and still readable.
+        let surviving = read_alert_state_memo(&store, &tenant)
+            .await
+            .expect("memo readable")
+            .expect("the failed encode left the prior memo in place");
+        assert_eq!(surviving.watermark_hour, 5, "the prior watermark is intact");
+    }
+
+    /// A store whose `list_after` never signals a last page: it always reports
+    /// another page. With `distinct` it hands back a fresh continuation token
+    /// each call (exercising the page ceiling); otherwise it repeats one token
+    /// (exercising the repeated-token guard). Every call is counted.
+    struct NeverEndingList {
+        inner: MemoryStore,
+        calls: AtomicUsize,
+        distinct: bool,
+    }
+
+    impl NeverEndingList {
+        fn new(distinct: bool) -> Self {
+            NeverEndingList {
+                inner: MemoryStore::new(),
+                calls: AtomicUsize::new(0),
+                distinct,
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for NeverEndingList {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let token = if self.distinct {
+                PageToken(format!("tok-{n}"))
+            } else {
+                PageToken("stuck".to_string())
+            };
+            Ok(ListPage {
+                objects: Vec::new(),
+                next: Some(token),
+            })
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A backend that repeats one continuation token is a typed error on the
+    /// second page, never an infinite loop (finding 2, issue #1294).
+    #[tokio::test]
+    async fn a_repeated_continuation_token_is_a_typed_error_after_two_pages() {
+        let store = NeverEndingList::new(false);
+        let err = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect_err("a repeated token must not spin");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::RepeatedToken { .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the repeat is detected on exactly the second page"
+        );
+    }
+
+    /// A backend whose token keeps changing without ever ending trips the page
+    /// ceiling at exactly `max_pages` pages (finding 2, issue #1294).
+    #[tokio::test]
+    async fn an_ever_advancing_token_trips_the_page_ceiling_exactly() {
+        let store = NeverEndingList::new(true);
+        let err = drain_pages(&store, "p/", None, 3)
+            .await
+            .expect_err("an unbounded listing must stop at the ceiling");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::PageCeiling { ceiling: 3, .. })
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            3,
+            "exactly three pages are drained before the ceiling fires"
+        );
+    }
+
+    /// The shared helper dedupes by key and returns keys in order across pages,
+    /// through both the `None` (full) and `Some` (tail) cursor modes.
+    #[tokio::test]
+    async fn list_all_after_dedupes_and_orders_through_both_cursor_modes() {
+        // Page size 2 forces three pages over five keys.
+        let store = MemoryStore::with_page_size(2);
+        for key in ["p/a", "p/b", "p/c", "p/d", "p/e"] {
+            store
+                .put(
+                    key,
+                    Bytes::from_static(b"x"),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("seed key");
+        }
+
+        let all: Vec<String> = list_all_after(&store, "p/", None)
+            .await
+            .expect("full drain")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            all,
+            vec!["p/a", "p/b", "p/c", "p/d", "p/e"],
+            "the full drain returns every key once, in order"
+        );
+
+        let tail: Vec<String> = list_all_after(&store, "p/", Some("p/c"))
+            .await
+            .expect("tail drain")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            tail,
+            vec!["p/d", "p/e"],
+            "the tail drain skips keys at or before the cursor"
+        );
+    }
+
+    /// A backend that replays a fixed script of pages, so a test can place an
+    /// exact key sequence across page boundaries: a contract-permitted repeat,
+    /// or a contract-violating backward key. `MemoryStore` cannot repeat a key,
+    /// so the dedup and order paths need a driver that can. Every call is
+    /// counted; the last scripted page ends the listing (`next == None`).
+    struct ScriptedList {
+        pages: Vec<Vec<String>>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedList {
+        fn new(pages: &[&[&str]]) -> Self {
+            ScriptedList {
+                pages: pages
+                    .iter()
+                    .map(|page| page.iter().map(|k| k.to_string()).collect())
+                    .collect(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn meta(key: &str) -> ObjectMeta {
+            ObjectMeta {
+                key: key.to_string(),
+                size: 1,
+                etag: ravel_object_store::Etag("e".to_string()),
+                version: ravel_object_store::Version("v".to_string()),
+                last_modified_unix_ms: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for ScriptedList {
+        async fn put(
+            &self,
+            _key: &str,
+            _data: Bytes,
+            _opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn head(&self, _key: &str) -> Result<ObjectMeta, StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        async fn list(
+            &self,
+            _prefix: &str,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            unreachable!("ScriptedList is list-after-only")
+        }
+
+        async fn list_after(
+            &self,
+            _prefix: &str,
+            _start_after: Option<&str>,
+            _page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let objects = self.pages[n].iter().map(|k| Self::meta(k)).collect();
+            let next = if n + 1 < self.pages.len() {
+                Some(PageToken(format!("tok-{n}")))
+            } else {
+                None
+            };
+            Ok(ListPage { objects, next })
+        }
+
+        async fn list_delimited(&self, _prefix: &str) -> Result<DelimitedList, StoreError> {
+            unreachable!("ScriptedList is list-after-only")
+        }
+
+        async fn delete(&self, _key: &str) -> Result<(), StoreError> {
+            unreachable!("ScriptedList is list-only")
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::mandatory()
+        }
+    }
+
+    /// The object-store contract permits a key to appear more than once across
+    /// pages. When the last key of one page repeats as the first key of the
+    /// next, the fold keeps it exactly once (finding on PR #1451, issue #1294).
+    #[tokio::test]
+    async fn a_repeat_at_a_page_boundary_is_folded_once() {
+        let store = ScriptedList::new(&[&["p/a", "p/b"], &["p/b", "p/c"]]);
+        let keys: Vec<String> = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect("a permitted repeat must not error")
+            .into_iter()
+            .map(|m| m.key)
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["p/a", "p/b", "p/c"],
+            "the boundary repeat of p/b is folded once, not twice"
+        );
+        assert_eq!(store.call_count(), 2, "both scripted pages are drained");
+    }
+
+    /// A key strictly below the last delivered one breaks the contract's
+    /// lexicographic-order guarantee. Folding out of order is wrong, so the
+    /// drain returns a typed error rather than reordering (finding on PR #1451,
+    /// issue #1294).
+    #[tokio::test]
+    async fn a_backward_key_is_a_typed_order_violation() {
+        let store = ScriptedList::new(&[&["p/a", "p/c"], &["p/b"]]);
+        let err = drain_pages(&store, "p/", None, MAX_LIST_PAGES)
+            .await
+            .expect_err("a backward key must be rejected");
+        assert!(
+            matches!(
+                err.downcast_ref::<ListDrainError>(),
+                Some(ListDrainError::OrderViolation {
+                    previous,
+                    offending,
+                    ..
+                }) if previous == "p/c" && offending == "p/b"
+            ),
+            "got {err:?}"
+        );
+        assert_eq!(
+            store.call_count(),
+            2,
+            "the violation is detected on the second page, after both are fetched"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // `/metrics` (issue #532). Every counter of the family is pinned at an
+    // exact value driven by a real tick, not asserted to be merely nonzero.
+    // ---------------------------------------------------------------------
+
+    /// A webhook URL whose port was bound and immediately released, so every
+    /// POST to it is refused at once. Refused, not hung: there is no wall-clock
+    /// wait anywhere in this test, and the delivery failure is deterministic.
+    /// The same technique `analytics_endpoint.rs`'s `dead_endpoint` uses.
+    async fn dead_sink_url() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind dead sink");
+        let addr = listener.local_addr().expect("dead sink addr");
+        drop(listener);
+        format!("http://{addr}/hook")
+    }
+
+    /// A webhook endpoint that answers every POST `200`, so `flush_sinks`
+    /// records a delivery. Aborted on drop.
+    struct OkSink {
+        url: String,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for OkSink {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Read one whole HTTP request off `socket` (headers, then `content-length`
+    /// bytes) and return its body. Answering while the client is still writing
+    /// its body would surface as a broken pipe and read as a delivery failure,
+    /// which is the opposite of what the sinks below exist to produce.
+    async fn read_request_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match socket.read(&mut chunk).await {
+                Ok(0) | Err(_) => return Vec::new(),
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+            let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            let body_start = head_end + 4;
+            if buf.len() >= body_start + body_len {
+                return buf[body_start..body_start + body_len].to_vec();
+            }
+        }
+    }
+
+    async fn ok_sink() -> OkSink {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ok sink");
+        let addr = listener.local_addr().expect("ok sink addr");
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let _ = read_request_body(&mut socket).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+        OkSink {
+            url: format!("http://{addr}/hook"),
+            task,
+        }
+    }
+
+    /// A webhook endpoint that records the `alert_id` of every POST, advances
+    /// the injected clock by a fixed step before it answers, and answers a
+    /// fixed status. One delivery therefore costs injected time exactly as a
+    /// slow sink costs wall time, with no wall-clock wait anywhere, and
+    /// [`RecordingSink::seen`] is the delivery order the evaluator chose.
+    /// Aborted on drop.
+    struct RecordingSink {
+        url: String,
+        /// The hex `alert_id` of every POST this sink saw, in arrival order.
+        seen: Arc<std::sync::Mutex<Vec<String>>>,
+        task: JoinHandle<()>,
+    }
+
+    impl Drop for RecordingSink {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    impl RecordingSink {
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().expect("seen").clone()
+        }
+
+        /// [`Self::seen`] as a set, for "every one of these was delivered at
+        /// least once" assertions that do not depend on the order two
+        /// notifications enqueued in the same tick happen to take.
+        fn seen_set(&self) -> std::collections::BTreeSet<String> {
+            self.seen().into_iter().collect()
+        }
+    }
+
+    /// [`RecordingSink`] answering `status` (a full HTTP status line, e.g.
+    /// `200 OK`) and costing `delta_ns` of injected time per delivery.
+    async fn recording_sink(
+        clock: Arc<TestClock>,
+        delta_ns: i64,
+        status: &'static str,
+    ) -> RecordingSink {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind recording sink");
+        let addr = listener.local_addr().expect("recording sink addr");
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let response = format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\n\r\n");
+        let task = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body = read_request_body(&mut socket).await;
+                if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&body)
+                    && let Some(id) = json["alert_id"].as_str()
+                {
+                    recorded.lock().expect("seen").push(id.to_string());
+                }
+                // The clock moves before the answer, so the caller's next
+                // deadline check already sees this delivery's cost.
+                clock.advance(delta_ns);
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        RecordingSink {
+            url: format!("http://{addr}/hook"),
+            seen,
+            task,
+        }
+    }
+
+    /// The failing half of [`recording_sink`]: the `500` keeps the notification
+    /// in the undelivered map, so a later tick's delivery order can be read off
+    /// [`RecordingSink::seen`].
+    async fn slow_sink(clock: Arc<TestClock>, delta_ns: i64) -> RecordingSink {
+        recording_sink(clock, delta_ns, "500 Internal Server Error").await
+    }
+
+    /// Every counter the family exports, folded from one real tick and asserted
+    /// against that tick's own report field by field. The sink is unreachable,
+    /// so this tick is the one that pins `notifications_failed`; the repeat and
+    /// delivery counters are pinned by the test below it.
+    #[tokio::test]
+    async fn one_tick_records_every_counter_exactly() {
+        let store = seeded_store().await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = AlertSink::webhook(dead_sink_url().await);
+        let mut ev = evaluator_with(
+            store,
+            TestClock::at(NOW_NS),
+            vec![sink],
+            Arc::clone(&metrics),
+        );
+
+        let report = ev.run_tick().await;
+        assert_eq!(
+            report,
+            AlertEvalReport {
+                rules_evaluated: 1,
+                rules_failed: 0,
+                records_written: 1,
+                repeats_queued: 0,
+                notifications_delivered: 0,
+                notifications_failed: 1,
+                notifications_deferred: 0,
+                history_unavailable: false,
+                lease_not_held: false,
+                lease_unavailable: false,
+            },
+            "the tick fires the one rule, writes its transition, and fails to \
+             deliver it to the unreachable sink"
+        );
+
+        assert_eq!(metrics.rules_evaluated(), 1);
+        assert_eq!(metrics.rules_failed(), 0);
+        assert_eq!(metrics.records_written(), 1);
+        assert_eq!(metrics.repeats_queued(), 0);
+        assert_eq!(metrics.notifications_delivered(), 0);
+        assert_eq!(metrics.notifications_failed(), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseNotHeld), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseUnavailable), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 0);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "the liveness gauge carries the injected clock's reading, not a wall clock"
+        );
+    }
+
+    /// The two counters the test above leaves at zero: a second tick one
+    /// repeat window later re-queues the still-firing alert and a reachable
+    /// sink accepts both sends.
+    #[tokio::test]
+    async fn a_repeat_tick_counts_the_repeat_and_both_deliveries() {
+        let store = seeded_store().await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = ok_sink().await;
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator_with(
+            store,
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::clone(&metrics),
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, 1, "the onset fires");
+        assert_eq!(first.notifications_delivered, 1, "the sink accepted it");
+
+        // One default repeat window (60s) later: still firing, so no new
+        // record, but the repeat pass re-queues the folded latest record.
+        clock.set(NOW_NS + 60 * NS_PER_SEC);
+        let second = ev.run_tick().await;
+        assert_eq!(
+            second,
+            AlertEvalReport {
+                rules_evaluated: 1,
+                rules_failed: 0,
+                records_written: 0,
+                repeats_queued: 1,
+                notifications_delivered: 1,
+                notifications_failed: 0,
+                notifications_deferred: 0,
+                history_unavailable: false,
+                lease_not_held: false,
+                lease_unavailable: false,
+            },
+            "a repeat re-sends the folded record and writes nothing durable"
+        );
+
+        assert_eq!(metrics.rules_evaluated(), 2);
+        assert_eq!(metrics.rules_failed(), 0);
+        assert_eq!(metrics.records_written(), 1);
+        assert_eq!(metrics.repeats_queued(), 1);
+        assert_eq!(metrics.notifications_delivered(), 2);
+        assert_eq!(metrics.notifications_failed(), 0);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 2);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS + 60 * NS_PER_SEC,
+            "the second tick re-stamps the gauge"
+        );
+    }
+
+    /// The undelivered gauge is the size of the evaluator's undelivered map,
+    /// not a count of attempts: three identities behind one failing sink hold
+    /// it at 3 across ticks, and dropping the evaluator takes its share back
+    /// out of the process sum.
+    #[tokio::test]
+    async fn undelivered_gauge_counts_each_identity_behind_a_failing_sink() {
+        let store = store_with_hot_instances(3).await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator_with(
+            store,
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(dead_sink_url().await)],
+            Arc::clone(&metrics),
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, 3);
+        assert_eq!(first.notifications_failed, 3);
+        assert_eq!(metrics.undelivered_notifications(), 3);
+
+        clock.set(NOW_NS + 10 * NS_PER_SEC);
+        let second = ev.run_tick().await;
+        assert_eq!(second.records_written, 0);
+        assert_eq!(second.notifications_failed, 3);
+        assert_eq!(
+            metrics.undelivered_notifications(),
+            3,
+            "a gauge of the map, not a counter of failed attempts"
+        );
+
+        drop(ev);
+        assert_eq!(metrics.undelivered_notifications(), 0);
+    }
+
+    /// The per-tick delivery budget in nanoseconds, as
+    /// [`AlertEvaluator::new`] derives it from the default interval.
+    fn sink_delivery_budget_ns() -> i64 {
+        let interval = DEFAULT_ALERT_EVAL_INTERVAL * SINK_DELIVERY_DEADLINE_FRACTION.0
+            / SINK_DELIVERY_DEADLINE_FRACTION.1;
+        i64::try_from(interval.as_nanos()).expect("budget fits i64")
+    }
+
+    /// One slow sink cannot hold a tick past its delivery budget (issue #2063).
+    /// Each delivery costs the whole budget on the injected clock, so a tick
+    /// attempts one notification and defers the rest: the deferred counter moves
+    /// by exactly the number not attempted, the tick's delivery phase ends at
+    /// the deadline, and the undelivered gauge is the whole carried remainder.
+    /// The second tick attempts the oldest carried notification, not one of the
+    /// four newer ones queued in the meantime.
+    #[tokio::test]
+    async fn alert_sink_delivery_is_bounded_per_tick() {
+        let budget_ns = sink_delivery_budget_ns();
+        let later = NOW_NS + 10 * 60 * NS_PER_SEC;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT);
+        // One series is hot for the first tick.
+        publish_series(
+            store.as_ref(),
+            &tenant,
+            vec![(
+                instance_label_set("host-0000"),
+                vec![(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+            )],
+        )
+        .await;
+
+        let clock = TestClock::at(NOW_NS);
+        let sink = slow_sink(Arc::clone(&clock), budget_ns).await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let mut ev = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::clone(&metrics),
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, 1, "the one hot series fires");
+        assert_eq!(first.notifications_failed, 1, "the sink answers 500");
+        assert_eq!(
+            first.notifications_deferred, 0,
+            "the only notification is attempted, so nothing is deferred"
+        );
+        assert_eq!(
+            clock.now_ns(),
+            NOW_NS + budget_ns,
+            "the one delivery consumed the whole budget"
+        );
+        let oldest = compute_alert_id("high-cpu", &instance_alert_labels("host-0000")).to_hex();
+        assert_eq!(sink.seen(), vec![oldest.clone()]);
+
+        // Four more series turn hot ten minutes on, in a second segment. The
+        // first series is in it too, so it keeps matching rather than resolving.
+        let late = later - 30 * NS_PER_SEC;
+        publish_series_at_seq(
+            store.as_ref(),
+            &tenant,
+            (0..5)
+                .map(|i| {
+                    (
+                        instance_label_set(&format!("host-{i:04}")),
+                        vec![(late, 1.0)],
+                    )
+                })
+                .collect(),
+            2,
+        )
+        .await;
+
+        clock.set(later);
+        let second = ev.run_tick().await;
+        assert_eq!(
+            second.records_written, 4,
+            "the four new series fire; the first is already Firing"
+        );
+        assert_eq!(
+            second.notifications_failed, 1,
+            "one delivery is attempted before the deadline"
+        );
+        assert_eq!(
+            second.notifications_deferred, 4,
+            "the four not attempted are deferred, counted exactly"
+        );
+        assert_eq!(
+            clock.now_ns(),
+            later + budget_ns,
+            "the delivery phase ends at the deadline, not after five sink calls"
+        );
+        assert_eq!(
+            metrics.notifications_deferred(),
+            4,
+            "the deferrals reach ravel_alert_notifications_deferred_total"
+        );
+        assert_eq!(
+            metrics.undelivered_notifications(),
+            5,
+            "the gauge is the carried remainder: the deferred four plus the failed one"
+        );
+        assert_eq!(
+            sink.seen(),
+            vec![oldest.clone(), oldest],
+            "the notification carried from tick one is at the front of the queue, \
+             so it is the one attempted, not one of the four enqueued since"
+        );
+    }
+
+    /// The healthy case the bound must not touch: five notifications and a sink
+    /// that answers at once all clear in one tick, with nothing deferred.
+    #[tokio::test]
+    async fn a_healthy_sink_delivers_every_notification_in_one_tick() {
+        let store = store_with_hot_instances(5).await;
+        let metrics = Arc::new(AlertMetrics::default());
+        let sink = ok_sink().await;
+        let mut ev = evaluator_with(
+            store,
+            TestClock::at(NOW_NS),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::clone(&metrics),
+        );
+
+        let report = ev.run_tick().await;
+        assert_eq!(report.records_written, 5);
+        assert_eq!(report.notifications_delivered, 5);
+        assert_eq!(report.notifications_failed, 0);
+        assert_eq!(report.notifications_deferred, 0);
+        assert_eq!(metrics.notifications_deferred(), 0);
+        assert_eq!(
+            metrics.undelivered_notifications(),
+            0,
+            "every notification left the map"
+        );
+    }
+
+    /// Delivery order is queue position, not transition age, and that is what
+    /// keeps a working-but-slow sink from starving every notification behind
+    /// the oldest few (issue #2063).
+    ///
+    /// The sink costs half the budget per delivery and accepts, so a tick
+    /// delivers exactly two notifications and defers the rest. Three alerts
+    /// fire on tick one and their repeats fall due on every later tick, so
+    /// under `(ts_ns, alert_id)` ordering the two lowest alert ids are
+    /// delivered and re-queued at the same `ts_ns` forever: the third alert is
+    /// never attempted at all, and neither is a fourth that starts firing
+    /// later. Under queue-position ordering the pass is a round robin, so every
+    /// alert reaches a sink.
+    #[tokio::test]
+    async fn a_slow_but_working_sink_reaches_every_alert_in_turn() {
+        let budget_ns = sink_delivery_budget_ns();
+        let tick_ns = 60 * NS_PER_SEC;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT);
+        // Three series hot from the first tick.
+        publish_series(
+            store.as_ref(),
+            &tenant,
+            (0..3)
+                .map(|i| {
+                    (
+                        instance_label_set(&format!("host-{i:04}")),
+                        vec![(NOW_NS - 30 * NS_PER_SEC, 1.0)],
+                    )
+                })
+                .collect(),
+        )
+        .await;
+
+        let clock = TestClock::at(NOW_NS);
+        // Half the budget per delivery, and accepted: the first attempt is
+        // unconditional and the second still starts before the deadline, so the
+        // capacity of a tick is exactly two.
+        let sink = recording_sink(Arc::clone(&clock), budget_ns / 2, "200 OK").await;
+        let mut ev = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::new(AlertMetrics::default()),
+        );
+
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, 3, "the three hot series fire");
+        assert_eq!(
+            (first.notifications_delivered, first.notifications_deferred),
+            (2, 1),
+            "two deliveries fit in one budget at half a budget each"
+        );
+
+        // Tick two, one evaluation interval on. Every alert is still firing and
+        // one repeat window has passed, so the repeat pass re-queues the two
+        // that were delivered; the one deferred on tick one keeps its place at
+        // the front.
+        clock.set(NOW_NS + tick_ns);
+        let second = ev.run_tick().await;
+        assert_eq!(second.records_written, 0, "no transition, only repeats");
+        assert_eq!(second.repeats_queued, 3);
+        let hot: std::collections::BTreeSet<String> = (0..3)
+            .map(|i| {
+                compute_alert_id("high-cpu", &instance_alert_labels(&format!("host-{i:04}")))
+                    .to_hex()
+            })
+            .collect();
+        assert_eq!(
+            sink.seen_set(),
+            hot,
+            "after two ticks every alert has reached the sink at least once; \
+             ordering by record age delivers the same two on both ticks and \
+             never the third"
+        );
+
+        // A fourth series turns hot between tick two and tick three.
+        publish_series_at_seq(
+            store.as_ref(),
+            &tenant,
+            vec![(
+                instance_label_set("host-0003"),
+                vec![(NOW_NS + tick_ns + 30 * NS_PER_SEC, 1.0)],
+            )],
+            2,
+        )
+        .await;
+
+        clock.set(NOW_NS + 2 * tick_ns);
+        let third = ev.run_tick().await;
+        assert_eq!(
+            third.records_written, 1,
+            "the new series fires on tick three"
+        );
+        clock.set(NOW_NS + 3 * tick_ns);
+        ev.run_tick().await;
+
+        let newcomer = compute_alert_id("high-cpu", &instance_alert_labels("host-0003")).to_hex();
+        let mut every = hot.clone();
+        every.insert(newcomer.clone());
+        assert!(
+            sink.seen_set().contains(&newcomer),
+            "the alert that first fired on tick three reached the sink by tick \
+             four, rather than queueing behind three older transitions that \
+             re-queue themselves every tick; seen: {:?}",
+            sink.seen_set()
+        );
+        assert_eq!(
+            sink.seen_set(),
+            every,
+            "every alert id was delivered at least once across the four ticks"
+        );
+    }
+
+    /// One blackholed sink must not stop a healthy one from ever seeing
+    /// anything newer than the front of the queue (issue #2063).
+    ///
+    /// The first sink costs the whole budget and answers `500`, so an entry
+    /// never leaves the map and exactly one notification is attempted per tick.
+    /// The second sink accepts every attempt. Ordering by record age hands that
+    /// one attempt to the same entry on every tick, so the healthy sink sees
+    /// one alert forever; rotating the queue spreads the attempts, so it
+    /// receives all six.
+    #[tokio::test]
+    async fn a_healthy_sink_behind_a_dead_one_receives_every_notification() {
+        let budget_ns = sink_delivery_budget_ns();
+        let queued = 6;
+        let store = store_with_hot_instances(queued).await;
+        let clock = TestClock::at(NOW_NS);
+        let dead = slow_sink(Arc::clone(&clock), budget_ns).await;
+        let healthy = recording_sink(Arc::clone(&clock), 0, "200 OK").await;
+        let mut ev = evaluator_with(
+            store,
+            Arc::clone(&clock),
+            vec![
+                AlertSink::webhook(dead.url.clone()),
+                AlertSink::webhook(healthy.url.clone()),
+            ],
+            Arc::new(AlertMetrics::default()),
+        );
+
+        // Each tick starts where the last one's delivery left the clock, so the
+        // rule's samples stay inside the query lookback for all six.
+        let first = ev.run_tick().await;
+        assert_eq!(first.records_written, queued as u32);
+        assert_eq!(
+            (first.notifications_failed, first.notifications_deferred),
+            (1, queued as u32 - 1),
+            "the dead sink spends the whole budget on the one unconditional \
+             attempt, and nothing it touches leaves the map"
+        );
+        for _ in 1..queued {
+            let report = ev.run_tick().await;
+            assert_eq!(report.records_written, 0, "no series changed state");
+            assert_eq!(report.notifications_delivered, 0, "the dead sink refuses");
+        }
+
+        let all: std::collections::BTreeSet<String> = (0..queued)
+            .map(|i| {
+                compute_alert_id("high-cpu", &instance_alert_labels(&format!("host-{i:04}")))
+                    .to_hex()
+            })
+            .collect();
+        assert_eq!(
+            healthy.seen_set(),
+            all,
+            "over six ticks of one attempt each, the healthy sink received \
+             every queued notification; seen in order: {:?}",
+            healthy.seen()
+        );
+        assert_eq!(
+            ev.undelivered.len(),
+            queued,
+            "and none of them left the map, because the dead sink never accepted"
+        );
+    }
+
+    /// A transition that supersedes a queued, undelivered notification keeps the
+    /// replaced entry's queue place (`write_transition`), so an alert that
+    /// changes state on every tick is still attempted behind a dead sink.
+    ///
+    /// The sink costs the whole budget and answers `500`, so each tick attempts
+    /// exactly the front of the queue and moves it to the back. Three alerts
+    /// fire on tick one; a fourth fires on tick two, behind them, and then
+    /// resolves and re-fires on every later tick, superseding its own queued
+    /// notification each time. Keeping its place, it reaches the front on
+    /// tick five, ahead of the entry tick two moved to the back after it was
+    /// first queued. Sent to the back on every supersede instead, it would stay
+    /// behind the rotating three and never be attempted at all.
+    #[tokio::test]
+    async fn a_superseding_transition_keeps_the_queue_place_of_the_one_it_replaces() {
+        let budget_ns = sink_delivery_budget_ns();
+        // Ten minutes apart, so a series not hot on a tick has fallen out of the
+        // PromQL lookback and its alert resolves.
+        let tick_at = |t: i64| NOW_NS + t * 10 * 60 * NS_PER_SEC;
+        let ticks = 5;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT);
+        let clock = TestClock::at(tick_at(0));
+        let dead = slow_sink(Arc::clone(&clock), budget_ns).await;
+        let mut ev = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(dead.url.clone())],
+            Arc::new(AlertMetrics::default()),
+        );
+        let flapper = compute_alert_id("high-cpu", &instance_alert_labels("host-0003"));
+
+        let mut written = Vec::new();
+        for t in 0..ticks {
+            // Three series hot on every tick; the fourth on ticks two and four
+            // only (indices 1 and 3).
+            let hot = if t % 2 == 1 { 4 } else { 3 };
+            publish_series_at_seq(
+                store.as_ref(),
+                &tenant,
+                (0..hot)
+                    .map(|i| {
+                        (
+                            instance_label_set(&format!("host-{i:04}")),
+                            vec![(tick_at(t) - 30 * NS_PER_SEC, 1.0)],
+                        )
+                    })
+                    .collect(),
+                t as u64 + 1,
+            )
+            .await;
+            clock.set(tick_at(t));
+            let report = ev.run_tick().await;
+            written.push(report.records_written);
+            assert_eq!(
+                report.notifications_failed, 1,
+                "tick {t}: exactly one attempt, refused; {report:?}"
+            );
+        }
+        assert_eq!(
+            written,
+            vec![3, 1, 1, 1, 1],
+            "three fire on tick one; from tick two the fourth alert transitions \
+             on every tick (Firing, Resolved, Firing, Resolved)"
+        );
+        assert!(
+            ev.undelivered.contains_key(&flapper),
+            "the dead sink never accepted, so the flapping alert stayed queued and \
+             every transition after its first superseded a queued notification"
+        );
+
+        let seen = dead.seen();
+        let flapper = flapper.to_hex();
+        assert_eq!(seen.len(), ticks as usize, "one attempt per tick");
+        assert!(
+            !seen[..4].contains(&flapper),
+            "the three queued ahead of it are attempted first; seen: {seen:?}"
+        );
+        assert_eq!(
+            seen[3], seen[0],
+            "tick one's attempt went to the back before the fourth alert was \
+             queued, so it is ahead of it; seen: {seen:?}"
+        );
+        assert_eq!(
+            seen[4], flapper,
+            "after three supersedes the flapping alert still holds the place it \
+             was first queued at, so tick five attempts it ahead of tick two's \
+             attempt, which went to the back after it; seen: {seen:?}"
+        );
+    }
+
+    /// The deadline is measured from the tick's own clock reading, not from the
+    /// start of the delivery phase, and the first attempt of a pass is
+    /// unconditional. Both are load-bearing and neither is observable from a
+    /// tick whose rule evaluation costs nothing, so this drives `flush_sinks`
+    /// directly with a tick start two budgets in the past: the pass is already
+    /// past its deadline when it begins, so it makes exactly the one attempt it
+    /// owes and defers the rest.
+    #[tokio::test]
+    async fn a_pass_that_starts_past_its_deadline_still_delivers_exactly_one() {
+        let sink = ok_sink().await;
+        let clock = TestClock::at(NOW_NS);
+        let mut ev = evaluator_with(
+            Arc::new(MemoryStore::new()),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::new(AlertMetrics::default()),
+        );
+
+        // Three identities queued by hand, so nothing but `flush_sinks` runs.
+        for i in 0..3 {
+            let rule = Rule {
+                rule_id: format!("rule-{i}"),
+                ..threshold_rule()
+            };
+            let record = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+            let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+            ev.enqueue_if_absent(alert_id, AlertNotification::new(record, None, &rule.labels));
+        }
+        assert_eq!(ev.undelivered.len(), 3);
+
+        let tick_start = NOW_NS - 2 * sink_delivery_budget_ns();
+        let mut report = AlertEvalReport::default();
+        ev.flush_sinks(tick_start, &mut report).await;
+
+        assert_eq!(
+            report.notifications_delivered, 1,
+            "the first attempt of a pass is unconditional, so a tick whose rule \
+             evaluation alone spent the budget still makes progress"
+        );
+        assert_eq!(
+            report.notifications_deferred, 2,
+            "the deadline is tick start plus one budget, already in the past, so \
+             every attempt after the first is deferred"
+        );
+        assert_eq!(report.notifications_failed, 0, "the sink is healthy");
+        assert_eq!(
+            ev.undelivered.len(),
+            2,
+            "the two deferred notifications are still queued"
+        );
+        assert_eq!(
+            clock.now_ns(),
+            NOW_NS,
+            "the healthy sink costs no injected time, so the deferrals are the \
+             deadline's doing and not the pass's own cost"
+        );
+    }
+
+    /// A pass costs the notifications it attempts, not the queue it walks.
+    /// Behind a sink that never drains it, the undelivered queue grows without
+    /// bound, and a tick that is already past its deadline when delivery begins
+    /// attempts exactly one entry of it: exactly one request reaches the sink
+    /// and the other `QUEUED - 1` entries are deferred without being touched
+    /// beyond their queue positions.
+    #[tokio::test]
+    async fn a_deferred_pass_attempts_one_notification_out_of_a_long_queue() {
+        const QUEUED: usize = 32;
+
+        let clock = TestClock::at(NOW_NS);
+        // Costs no injected time per delivery, so the single attempt is the
+        // deadline's doing and not a cost this pass ran up itself.
+        let sink = recording_sink(Arc::clone(&clock), 0, "200 OK").await;
+        let mut ev = evaluator_with(
+            Arc::new(MemoryStore::new()),
+            Arc::clone(&clock),
+            vec![AlertSink::webhook(sink.url.clone())],
+            Arc::new(AlertMetrics::default()),
+        );
+
+        for i in 0..QUEUED {
+            let rule = Rule {
+                rule_id: format!("rule-{i:04}"),
+                ..threshold_rule()
+            };
+            let record = build_transition_record(&rule, AlertState::Firing, 0, NOW_NS);
+            let alert_id = compute_alert_id(&rule.rule_id, &rule.labels);
+            ev.enqueue_if_absent(alert_id, AlertNotification::new(record, None, &rule.labels));
+        }
+        assert_eq!(ev.undelivered.len(), QUEUED);
+
+        let tick_start = NOW_NS - 2 * sink_delivery_budget_ns();
+        let mut report = AlertEvalReport::default();
+        ev.flush_sinks(tick_start, &mut report).await;
+
+        assert_eq!(
+            sink.seen().len(),
+            1,
+            "the pass makes one attempt, not one per queued notification; seen: {:?}",
+            sink.seen()
+        );
+        assert_eq!(
+            report.notifications_delivered, 1,
+            "the unconditional first attempt is the whole of this pass's delivery"
+        );
+        assert_eq!(
+            report.notifications_deferred,
+            QUEUED as u32 - 1,
+            "everything the pass did not attempt is deferred and counted"
+        );
+        assert_eq!(
+            ev.undelivered.len(),
+            QUEUED - 1,
+            "the deferred notifications are still queued, at their own places"
+        );
+        assert_eq!(
+            clock.now_ns(),
+            NOW_NS,
+            "no injected time passes, so the one attempt is not a timing artefact"
+        );
+    }
+
+    /// ADR-0117's amended per-tick publish bound, reached in a single tick
+    /// (issue #2064): `2 x MAX_ALERTS_PER_RULE` records, not
+    /// `MAX_ALERTS_PER_RULE`.
+    ///
+    /// Set A of exactly `MAX_ALERTS_PER_RULE` series is hot on tick one. Ten
+    /// minutes on, set A's samples have fallen out of the PromQL lookback and a
+    /// disjoint set B of the same size is hot instead, so the second tick
+    /// writes one Firing record per series of B and one Resolved record per
+    /// alert of A in the same pass. That is the worst case the amendment
+    /// states, and it happens in one tick rather than being split across two.
+    #[tokio::test]
+    async fn one_tick_writes_twice_the_cap_when_a_disjoint_set_replaces_it() {
+        let cap = ravel_alerting::MAX_ALERTS_PER_RULE;
+        let later = NOW_NS + 10 * 60 * NS_PER_SEC;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = TenantId::new(TENANT);
+        let tenant_hash = tenant.hash();
+        let hot_at = |prefix: &'static str, ts_ns: i64| -> Vec<(LabelSet, Vec<(i64, f64)>)> {
+            (0..cap)
+                .map(|i| {
+                    (
+                        instance_label_set(&format!("{prefix}-{i:04}")),
+                        vec![(ts_ns, 1.0)],
+                    )
+                })
+                .collect()
+        };
+        publish_series(
+            store.as_ref(),
+            &tenant,
+            hot_at("a", NOW_NS - 30 * NS_PER_SEC),
+        )
+        .await;
+        publish_series_at_seq(
+            store.as_ref(),
+            &tenant,
+            hot_at("b", later - 30 * NS_PER_SEC),
+            2,
+        )
+        .await;
+
+        let clock = TestClock::at(NOW_NS);
+        let mut evaluator = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        let first = evaluator.run_tick().await;
+        assert_eq!(first.rules_failed, 0, "the cap itself is not over the cap");
+        assert_eq!(
+            first.records_written, cap as u32,
+            "the matched-set term of the bound: set A fires"
+        );
+
+        clock.set(later);
+        let second = evaluator.run_tick().await;
+        assert_eq!(
+            second.rules_failed, 0,
+            "set B is exactly the cap, so the rule does not fail with TooManyAlerts"
+        );
+        assert_eq!(
+            second.records_written,
+            2 * cap as u32,
+            "one tick reaching the whole amended bound: the cap in new firings \
+             plus the cap in resolutions of alerts that were open at the end of \
+             the previous tick and are now absent"
+        );
+
+        let records = read_alert_records(store.as_ref(), tenant_hash).await;
+        assert_eq!(
+            records.len(),
+            3 * cap,
+            "cap on tick one, 2 x cap on tick two"
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|r| r.state == AlertState::Resolved)
+                .count(),
+            cap,
+            "every alert of set A resolved exactly once"
+        );
+
+        // Nothing is resolved twice, and set B is already firing.
+        assert_eq!(evaluator.run_tick().await.records_written, 0);
+    }
+
+    /// The liveness gauge is the only figure that separates a dead loop from a
+    /// healthy idle one, so it must advance on a tick that reached its end and
+    /// stay put on one that did not. The failing tick runs an hour later on a
+    /// store whose alert-history listing always fails, which is the
+    /// `history_unavailable` path; both evaluators fold into one handle,
+    /// exactly as every tenant's evaluator does in a real process.
+    #[tokio::test]
+    async fn the_liveness_gauge_advances_only_on_a_completed_tick() {
+        let metrics = Arc::new(AlertMetrics::default());
+
+        let healthy = seeded_store().await;
+        let mut ok = evaluator_with(
+            healthy,
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+        assert!(!ok.run_tick().await.history_unavailable);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a completed tick stamps the gauge with the clock it ran at"
+        );
+
+        let tenant = TenantId::new(TENANT).hash();
+        let commit_prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::List,
+                ScriptedFault::Transient("alert history listing unavailable".into()),
+            )
+            .with_key_contains(commit_prefix)
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(seeded_store().await, plan));
+        let broken: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let later = NOW_NS + 3_600 * NS_PER_SEC;
+        let mut dead = evaluator_with(
+            broken,
+            TestClock::at(later),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+
+        let report = dead.run_tick().await;
+        assert!(
+            report.history_unavailable,
+            "the listing fault makes the history unreadable"
+        );
+        assert!(
+            fault.fault_count(Op::List, FaultKind::Transient) >= 1,
+            "the injected listing fault actually fired"
+        );
+        assert_eq!(
+            metrics.ticks(AlertTickOutcome::HistoryUnavailable),
+            1,
+            "the failed tick is still counted, under its own outcome"
+        );
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a tick that could not read history must NOT advance the gauge, or a \
+             permanently broken loop would look alive"
+        );
+    }
+
+    /// A replica that loses the lease is healthy, not failing. It must count as
+    /// its own tick outcome and keep stamping the liveness gauge: folding it
+    /// into a failure counter, or withholding the gauge, turns the expected
+    /// multi-replica steady state into a permanent alarm.
+    #[tokio::test]
+    async fn a_lease_not_held_tick_records_the_state_without_a_failure() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let holder_metrics = Arc::new(AlertMetrics::default());
+        let standby_metrics = Arc::new(AlertMetrics::default());
+
+        let mut holder = evaluator_with(
+            Arc::clone(&store),
+            Arc::clone(&clock),
+            Vec::new(),
+            Arc::clone(&holder_metrics),
+        );
+        let mut standby = evaluator_with(store, clock, Vec::new(), Arc::clone(&standby_metrics));
+
+        assert_eq!(
+            holder.run_tick().await.records_written,
+            1,
+            "the holder fires"
+        );
+        let report = standby.run_tick().await;
+        assert!(report.lease_not_held, "the peer holds the lease");
+        assert!(!report.lease_unavailable, "the store is healthy");
+
+        assert_eq!(standby_metrics.ticks(AlertTickOutcome::LeaseNotHeld), 1);
+        assert_eq!(standby_metrics.ticks(AlertTickOutcome::Evaluated), 0);
+        assert_eq!(
+            standby_metrics.ticks(AlertTickOutcome::LeaseUnavailable),
+            0,
+            "a peer holding the lease is not a store failure"
+        );
+        assert_eq!(
+            standby_metrics.rules_failed(),
+            0,
+            "skipping evaluation is not a rule failure"
+        );
+        assert_eq!(standby_metrics.rules_evaluated(), 0);
+        assert_eq!(standby_metrics.records_written(), 0);
+        assert_eq!(
+            standby_metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "a standby replica is alive; its liveness gauge must keep advancing"
+        );
+    }
+
+    /// A store that fails the lease write is a failure, not the healthy standby
+    /// state the test above pins: it must count under its own outcome and leave
+    /// the liveness gauge where the last completed tick left it, because the
+    /// recommended operator alert keys on exactly this series. The fault is
+    /// `Transient`, which reaches `acquire_lease`'s catch-all `Err` arm and is
+    /// the error class a stuck backend produces; the lease-not-held path needs
+    /// a live peer lease to read back, which this store never holds. Both ticks
+    /// fold into one handle, as every tenant's evaluator does in a real process.
+    #[tokio::test]
+    async fn a_lease_unavailable_tick_records_the_store_failure() {
+        let metrics = Arc::new(AlertMetrics::default());
+        let tenant = TenantId::new(TENANT).hash();
+
+        let mut healthy = evaluator_with(
+            seeded_store().await,
+            TestClock::at(NOW_NS),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+        assert!(
+            !healthy.run_tick().await.lease_unavailable,
+            "the first tick holds the lease on a healthy store"
+        );
+
+        // Scoped to the lease key. On this tick the lease create is the only
+        // put that runs (the memo and rule writes sit behind the held lease),
+        // so the scoping documents intent rather than changing the outcome.
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert lease write unavailable".into()),
+            )
+            .with_key_contains(alert_lease_key(&tenant))
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(seeded_store().await, plan));
+        let broken: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let mut dead = evaluator_with(
+            broken,
+            TestClock::at(NOW_NS + 3_600 * NS_PER_SEC),
+            Vec::new(),
+            Arc::clone(&metrics),
+        );
+
+        let report = dead.run_tick().await;
+        // Whole-struct, not an `assert!` on the flag: `outcome` tests
+        // `lease_unavailable` before `lease_not_held`, so a build that set both
+        // would still count `LeaseUnavailable` and only this compare catches it.
+        assert_eq!(
+            report,
+            AlertEvalReport {
+                lease_unavailable: true,
+                ..Default::default()
+            },
+            "a failed lease write is a store failure and nothing else: no rule \
+             ran, and the tick is not the healthy lease-not-held state"
+        );
+
+        assert!(
+            fault.fault_count(Op::Put, FaultKind::Transient) >= 1,
+            "the injected lease-write fault actually fired"
+        );
+        assert_eq!(metrics.ticks(AlertTickOutcome::LeaseUnavailable), 1);
+        assert_eq!(metrics.ticks(AlertTickOutcome::Evaluated), 1);
+        assert_eq!(
+            metrics.ticks(AlertTickOutcome::LeaseNotHeld),
+            0,
+            "a store failure is not a peer holding the lease"
+        );
+        assert_eq!(metrics.ticks(AlertTickOutcome::HistoryUnavailable), 0);
+        assert_eq!(
+            metrics.last_tick_completed_unix_ns(),
+            NOW_NS,
+            "the gauge still carries the first tick's reading: a tick that could \
+             not reach the store must not look alive"
+        );
+    }
+
+    /// [`spawn`] refuses an enabled config with a zero `interval` directly at
+    /// its spawn site with [`SpawnError::ZeroEvalInterval`], before any
+    /// evaluator is spawned. `alerting` is a `pub` module, so an outside caller
+    /// reaches this function without passing through `validate_loop_intervals`;
+    /// `check_spawnable` runs ahead of the empty-rules short circuit, so an
+    /// empty rule set still exercises the guard.
+    ///
+    /// Flip to watch it fail: delete the `config.check_spawnable()?` call at the
+    /// top of [`spawn`]. With no rules the function then returns
+    /// `Ok(AlertEvalTasks::none())` on a zero interval.
+    #[tokio::test]
+    async fn spawn_refuses_a_zero_eval_interval() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
+        let engines = AlertQueryEngines {
+            promql: Arc::new(engine),
+            #[cfg(feature = "sql")]
+            sql: None,
+        };
+        let config = AlertEvalConfig {
+            enabled: true,
+            interval: Duration::ZERO,
+            ..AlertEvalConfig::default()
+        };
+        let err = spawn(store, engines, TestClock::at(NOW_NS), config)
+            .err()
+            .expect("a zero eval interval must be refused at spawn");
+        assert!(
+            matches!(
+                err.downcast_ref::<SpawnError>(),
+                Some(SpawnError::ZeroEvalInterval)
+            ),
+            "expected ZeroEvalInterval, got: {err:#}"
+        );
+    }
+
+    /// A distributed-fetch double for the per-rule entry-clock test: records
+    /// the query deadline each slice carries (what the coordinator mints every
+    /// fragment capability's expiry from), then moves the evaluator's clock
+    /// forward by `takes_ns`, as a slow rule query does, and answers with an
+    /// empty slice.
+    struct SlowSliceRecorder {
+        clock: Arc<TestClock>,
+        takes_ns: i64,
+        deadlines: parking_lot::Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl ravel_query::distrib::client::SliceFetcher for SlowSliceRecorder {
+        async fn fetch(
+            &self,
+            request: ravel_proto::queryfrag::v1::FetchRequest,
+        ) -> Result<
+            ravel_query::distrib::client::SliceResponse,
+            ravel_query::distrib::client::DistribError,
+        > {
+            self.deadlines.lock().push(request.deadline_unix_ns);
+            self.clock.advance(self.takes_ns);
+            Ok(ravel_query::distrib::client::SliceResponse {
+                scalar: Vec::new(),
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: ravel_types::accounting::QueryAccountingSnapshot::default(),
+                stats: ravel_query::FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: ravel_proto::queryfrag::v1::status::Code::Ok,
+                status_message: String::new(),
+            })
+        }
+    }
+
+    /// Issue #2385: rules run one after another in a tick, so each rule's
+    /// query deadline, and every fragment capability minted from it, counts
+    /// from that rule's own engine entry, not from the tick's start. The first
+    /// rule's query takes 7 s of the injected clock; the second rule's slice
+    /// carries its own entry (tick start plus 7 s) plus the query deadline.
+    ///
+    /// Mutation proof: passing the tick's `now_ns` to the engine again in
+    /// `run_query` records the tick start plus the deadline for both rules.
+    #[tokio::test]
+    async fn each_rules_query_deadline_counts_from_its_own_engine_entry() {
+        const TAKES_NS: i64 = 7 * NS_PER_SEC;
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let recorder = Arc::new(SlowSliceRecorder {
+            clock: clock.clone(),
+            takes_ns: TAKES_NS,
+            deadlines: parking_lot::Mutex::new(Vec::new()),
+        });
+        let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+            recorder.clone(),
+            // Zero thresholds put the one-segment snapshot on the distributed
+            // path for every rule.
+            ravel_query::distrib::partition::DistribThresholds {
+                min_store_bytes: 0,
+                min_segments: 0,
+                max_parallel_slices: 1,
+            },
+        ));
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default())
+            .with_distributed(distributed);
+        let config = AlertEvalConfig {
+            enabled: true,
+            ..AlertEvalConfig::default()
+        };
+        let second = Rule {
+            rule_id: "high-cpu-second".to_string(),
+            ..threshold_rule()
+        };
+        let mut evaluator = AlertEvaluator::new(
+            store,
+            AlertQueryEngines {
+                promql: Arc::new(engine),
+                #[cfg(feature = "sql")]
+                sql: None,
+            },
+            clock.clone(),
+            TenantId::new(TENANT).hash(),
+            vec![threshold_rule(), second],
+            &config,
+        )
+        .expect("build evaluator")
+        .with_metrics(Arc::new(AlertMetrics::default()));
+
+        let report = evaluator.run_tick().await;
+
+        assert_eq!(report.rules_evaluated, 2, "{report:?}");
+        let deadline_ns =
+            i64::try_from(DEFAULT_QUERY_DEADLINE.as_nanos()).expect("deadline fits in i64");
+        assert_eq!(
+            *recorder.deadlines.lock(),
+            vec![NOW_NS + deadline_ns, NOW_NS + TAKES_NS + deadline_ns],
+            "each rule's slice carries its own entry plus the query deadline"
+        );
+    }
+}

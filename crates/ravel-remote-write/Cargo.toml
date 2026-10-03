@@ -1,0 +1,32 @@
+[package]
+name = "ravel-remote-write"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Prometheus Remote Write ingest: RW1 protobuf decode, snappy block decompression, and normalization to Ravel canonical points (ADR-0015)."
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-otlp = { workspace = true }
+ravel-segment = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+hex = { workspace = true }
+snap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# Test-only: the two-surface acceptance test for issue #1858 drives the OTLP
+# ingest path with the same histogram shapes as this crate's, which needs the
+# OTLP data-point types to build a request.
+opentelemetry-proto = { workspace = true }
+
+[lints]
+workspace = true

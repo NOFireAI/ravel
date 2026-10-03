@@ -1,0 +1,50 @@
+//! Parquet tables as DataFusion tables (ADR-2040 decision D3).
+//!
+//! This crate is the only one that needs DataFusion's Parquet support;
+//! `ravel-query` stays free of it. It provides:
+//!
+//! - [`PinnedParquetReader`], an `AsyncFileReader` for one manifest file that
+//!   reads through the process-wide `GetLimiter` and `ReadCache`, pins every
+//!   read to the manifest's ETag and version, and charges the footer read to
+//!   the Probe phase and every other read to the Scan phase; it does not use
+//!   the file's page index. Every range it returns is reserved against the
+//!   process memory budget for as long as the bytes live, and every GET is
+//!   admitted against the query's request and byte budgets before it is
+//!   issued ([`ReadLimits`]);
+//!   [`PinnedReaderFactory`] builds one per file DataFusion opens;
+//! - [`MetadataCache`], a decoded-footer cache owned by Ravel, bounded in
+//!   bytes, keyed by tenant hash and pinned identity, held outside any
+//!   per-query session;
+//! - [`TenantParquetStore`] (the `object_store` 0.13 trait) that serves `head`
+//!   from the manifest's sizes and refuses every other path, every read,
+//!   every write and every list, and [`SingleStoreRegistry`], which answers
+//!   only that store's URL;
+//! - [`ParquetTableProvider`], which builds its scan from a manifest resolved
+//!   by `ravel-pqtable` before the session is built, and never lists the
+//!   store while planning;
+//! - [`snapshot::snapshot_location`], which turns a granted location into
+//!   the files a manifest pins and the schema they share, reading each
+//!   footer with the reader's checks.
+//!
+//! `ravel-sql`'s executor builds one [`ParquetTableProvider`] per Parquet
+//! table a statement names, after resolving its manifest, and a session over
+//! them whose registry is a [`SingleStoreRegistry`].
+
+mod boundary;
+mod error;
+mod limits;
+mod metadata_cache;
+mod provider;
+mod reader;
+pub mod snapshot;
+mod store;
+
+#[cfg(test)]
+mod test_support;
+
+pub use error::{ParquetReadError, ParquetTableError};
+pub use limits::ReadLimits;
+pub use metadata_cache::{MetadataCache, MetadataKey};
+pub use provider::{Cast, ParquetTableProvider, TableOptions};
+pub use reader::{PinnedFile, PinnedParquetReader, PinnedReaderFactory, ReadServices};
+pub use store::{SingleStoreRegistry, TenantParquetStore, file_path, store_url};

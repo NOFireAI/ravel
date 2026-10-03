@@ -1,0 +1,45 @@
+# Pre-registration for the ClickBench Parquet lane (ADR-2040 D7, issue #2055).
+#
+# clickbench_parquet_bench loads this file before it runs anything and judges
+# its report against it. Every key is required; none has a default.
+#
+# The three keys below ship as a placeholder string. The loader refuses the
+# file while any of them still holds it, naming each one, so no figure can be
+# judged against a bar that was never set. Fill them in on the reference
+# machine, before the first Ravel run, and commit the filled file with the
+# stamped report.
+
+# The per-query memory cap the failures below are registered against, in
+# bytes. The run's server log must show `sql_max_query_bytes` equal to this
+# (D7: every figure is stamped with the per-query memory cap).
+memory_cap_bytes = "FILL-IN-ON-REFERENCE-MACHINE"
+
+# Arm B's hot and cold sums in seconds, as predicted before any run. D7: hot
+# within 1.25x of arm B, cold within 1.25x of arm B. Every report, arm B's own
+# included, is judged against 1.25x these predictions; the measured arm B
+# report is compared with arm A's by hand (docs/internal/clickbench.md,
+# "ClickBench Parquet lane").
+arm_b_hot_s = "FILL-IN-ON-REFERENCE-MACHINE"
+arm_b_cold_s = "FILL-IN-ON-REFERENCE-MACHINE"
+
+# D7's starting point: the statements that exhaust the pool on the RLOG entry
+# or failed under K4. No statement outside this set may fail, in the timed
+# tries or in the concurrency phase.
+failures = ["q19", "q29", "q33", "q34", "q35"]
+
+# D7: hot must also be under the RLOG entry's 101.7 s.
+rlog_hot_ceiling_s = 101.7
+
+# D7's concurrency phase is pre-registered against ADR-2023's figures on the
+# RLOG entry: at least 0.400 queries per second, at most 0.101 error ratio.
+#
+# The report carries two error ratios. `error_ratio` is every error over every
+# run, the figure comparable with the RLOG entry. `unregistered_error_ratio`
+# leaves out the statements listed in `failures`: errors from every other
+# statement over the runs of those statements, completed plus errored. The
+# ceiling is judged on the second (issue #2055).
+# The phase cycles all 43 statements, so the five registered failures failing
+# exactly as predicted put the raw ratio at 5/43, about 0.116, over 0.101 on
+# every run however the rest behave.
+concurrency_qps_floor = 0.400
+concurrency_error_ratio_ceiling = 0.101

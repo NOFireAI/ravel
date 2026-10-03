@@ -1,0 +1,17 @@
+[package]
+name = "ravel-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Prost-generated types for Ravel on-object metadata (segment footers, commit records)."
+
+[dependencies]
+prost = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+protox = { workspace = true }
+
+[lints]
+workspace = true

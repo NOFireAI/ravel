@@ -1,0 +1,442 @@
+#!/usr/bin/env bash
+# One-line status for a Ravel PR under the wait-for-the-review-then-merge-
+# by-hand rule: mergeStateStatus, the CI check rollup, and the state of the
+# fleet review, in one call instead of the three or four `gh` invocations
+# every session was hand-rolling.
+#
+# The review is requested by commenting `@claude-fleet review` on the PR and
+# arrives as a review from `claude-fleet[bot]` (ADR-1586). That bot posts one
+# review object per task and pins it to the commit it read, so freshness here
+# is `review.commit_id == headRefOid` and nothing looser.
+#
+# The bot never approves and never requests changes, by design: a person
+# decides that. So COMMENTED is the success state, and "not approved" must
+# never be read as "not clean".
+#
+# Usage: pr-review-status.sh <pr-number> [--confirm-addressed]
+#
+# --confirm-addressed: the operator's explicit statement that every finding on
+# the PR has been read and each one fixed or answered, both the inline
+# comments and the outside-diff findings in the review body. The REST API has
+# no resolved/unresolved field (see below), so once a PR has ever had a
+# finding its comment count never returns to zero and the clean branch below
+# could otherwise never fire again (issue #764: PR #754 had 13 addressed
+# comments across 4 fix rounds and no way to get the SHA-pinned merge
+# command). The flag skips ONLY the finding-count conjuncts; CI, the
+# current-head review, and the mergeState checks still gate exactly as
+# without it.
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The review bot's GitHub login. One place, because three checks below key on
+# it and a typo in one of them reads as "no review yet" -- a false block, but
+# an indefinite one.
+bot="claude-fleet[bot]"
+
+# Runs the merge-base guard and keeps both halves of its answer. It is a
+# function so the exit code survives: `$?` read after an `if`/`elif` reports the
+# test, not the command. The guard asks git about whatever repository the cwd
+# belongs to while every other check here is pinned to ${repo} by `gh --repo`,
+# so it runs with the cwd pinned to this script's own checkout; otherwise the
+# two halves of the verdict can be about different repositories.
+#
+# The `cd` failing is its own outcome, not a stale base: left bare in the `&&`
+# it would exit 1, which is the code reserved for "behind", and the operator
+# would be told to rebase over a guard that never ran.
+guard_rc=0
+guard_out=""
+merge_base_guard() {
+  guard_rc=0
+  guard_out="$( { { cd "${script_dir}/.." || exit 2; } && \
+    "${script_dir}/guards/assert-fresh-merge-base.sh" "${pr}" origin "${base_ref}"; } 2>&1)" || guard_rc=$?
+  return "${guard_rc}"
+}
+
+# Is a merge queue enforced on the pull request's base branch?
+#
+# A queue rebases each entry onto current main and runs full CI on the combined
+# result before landing, so ordinary base movement is not a reason to send the
+# author back for a rebase and another CI cycle (CLAUDE.md, issue #1758). One
+# call: /rules/branches/<branch> returns the rules in effect for that branch,
+# merge_queue among them, without walking every ruleset.
+#
+# Fails CLOSED. A call that errors, or returns something jq cannot read, is
+# "could not ask", which is not "there is a queue": it returns non-zero, the
+# stale base keeps blocking, and the cost is a rebase rather than a merge onto
+# an unverified base.
+merge_queue_active() {
+  local branch="${1:-main}" body count
+  # A branch name can contain `/` (release/1.2); the API wants that segment
+  # encoded, and an unencoded one 404s, which would read as "no queue".
+  branch="${branch//\//%2F}"
+  # --paginate: the endpoint pages at 30 rules, and a merge_queue rule landing
+  # on page 2 would otherwise read as absent.
+  body="$(gh api --paginate "repos/${repo}/rules/branches/${branch}" 2>/dev/null)" || return 2
+  count="$(printf '%s' "${body}" \
+    | jq -s '[.[][] | select(.type == "merge_queue")] | length' 2>/dev/null)" || return 2
+  [[ "${count}" =~ ^[1-9][0-9]*$ ]] || return 1
+  return 0
+}
+
+pr="${1:?usage: pr-review-status.sh <pr-number> [--confirm-addressed]}"
+repo="NOFireAI/ravel"
+confirm_addressed=0
+if [[ "${2:-}" == "--confirm-addressed" ]]; then
+  confirm_addressed=1
+elif [[ -n "${2:-}" ]]; then
+  echo "usage: pr-review-status.sh <pr-number> [--confirm-addressed]" >&2
+  exit 2
+fi
+
+pr_json="$(gh pr view "${pr}" --repo "${repo}" \
+  --json state,mergeStateStatus,statusCheckRollup,headRefOid,baseRefName)"
+state="$(echo "${pr_json}" | jq -r '.state')"
+merge_state="$(echo "${pr_json}" | jq -r '.mergeStateStatus')"
+head_sha="$(echo "${pr_json}" | jq -r '.headRefOid')"
+# Empty when the field is absent; the repository's default branch is the right
+# fallback, and keeps a fixture that predates this field working.
+base_ref="$(echo "${pr_json}" | jq -r '.baseRefName // empty')"
+[[ -n "${base_ref}" ]] || base_ref="main"
+
+# One classifier, shared with scripts/guards/assert-green-head.sh: two
+# scripts that can disagree about whether a pull request is green are worse
+# than one. The shapes it has to tell apart, and why a skipped check is its
+# own bucket, are documented in the filter itself.
+normalized="$(echo "${pr_json}" | jq -f "${script_dir}/lib/check-rollup-classify.jq")"
+pending=$(echo "${normalized}" | jq '[.[] | select(.class=="pending")] | length')
+success=$(echo "${normalized}" | jq '[.[] | select(.class=="success")] | length')
+failing=$(echo "${normalized}" | jq '[.[] | select(.class=="failing")] | length')
+failing_names=$(echo "${normalized}" | jq -r '[.[] | select(.class=="failing") | .name] | join(",")')
+# A skipped check is not a failure and does not block a merge -- GitHub's own
+# ruleset treats a path-filtered required check as satisfied -- but it is not
+# a pass either, and folding it into the pass count reports "19 pass" for a
+# pull request on which nothing ran at all. Counted on its own so the line
+# says which it was.
+skipped=$(echo "${normalized}" | jq '[.[] | select(.class=="skipped")] | length')
+# Every check must land in success/skipped/pending/failing above (an ACTION_REQUIRED
+# or STALE conclusion, an unrecognized state value, or a shape this script
+# has never seen) before CI counts as settled; this catches whatever falls
+# through all three.
+other=$(echo "${normalized}" | jq '[.[] | select(.class=="other")] | length')
+
+# `--paginate` on an array-returning endpoint writes one JSON array per page,
+# back to back, not one combined array -- `jq -s add` slurps every page into
+# a single flat array regardless of how many pages came back. No `|| echo
+# '[]'` fallback: a real gh api failure (auth, rate limit, network) must
+# abort the script (set -e), not be reported as "zero reviews found", which
+# would read as "not reviewed yet, don't merge" instead of "the check itself
+# didn't run".
+reviews_json="$(gh api "repos/${repo}/pulls/${pr}/reviews" --paginate | jq -s 'add')"
+# Only a review against the PR's CURRENT head commit counts: a stale review
+# from before the last push covers code that no longer exists on the branch.
+# The bot sets commit_id once, when it posts, so this is a real freshness
+# test rather than the count-the-objects guess it replaces.
+reviews_at_head=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" --arg bot "${bot}" \
+  '[.[] | select(.user.login==$bot and .commit_id==$sha)] | length')
+# The last review state at head from ANY author, not just the bot: a human's
+# CHANGES_REQUESTED at head has to block, and `protect-main` requires zero
+# approvals, so mergeStateStatus stays CLEAN and nothing else here would catch
+# it. The bot's own presence gate above stays bot-scoped, because a human
+# review is not the agent review the gate asks for.
+reviews_at_head_any=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" \
+  '[.[] | select(.commit_id==$sha)] | length')
+review_last_state=$(echo "${reviews_json}" | jq -r --arg sha "${head_sha}" \
+  '[.[] | select(.commit_id==$sha)] | last | .state // "none"')
+# Reviews the bot posted for some OTHER commit. Reported, never gating: it is
+# the difference between "nobody has reviewed this branch" and "the head moved
+# after the last review", and the operator's next action differs.
+reviews_stale=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" --arg bot "${bot}" \
+  '[.[] | select(.user.login==$bot and .commit_id!=$sha)] | length')
+
+issue_comments_json="$(gh api "repos/${repo}/issues/${pr}/comments" --paginate | jq -s 'add')"
+# The bot's task comment for the head commit, as one word: none, running,
+# done, dead, or unknown. Without it, "no review at head" collapses five
+# different situations into one, and two of them need opposite actions: a
+# queued task needs waiting, a failed one needs re-triggering and will
+# otherwise never arrive.
+task_state=$(echo "${issue_comments_json}" | jq -r --arg sha "${head_sha}" --arg bot "${bot}" \
+  -f "${script_dir}/lib/fleet-review-task-state.jq")
+# Did anyone ask? Counted from non-bot comments so the bot quoting the trigger
+# cannot pass for someone asking for a review. The word boundary after `review`
+# matters: without it "@claude-fleet reviews are useful here" counts as a
+# request.
+#
+# A review is NEVER started by a push or by opening a PR -- only by this
+# comment -- so a trigger posted before the current head exists cannot have
+# started a task for it. That is why the count alone cannot diagnose anything:
+# see task_comments_anywhere below.
+triggers=$(echo "${issue_comments_json}" | jq --arg bot "${bot}" \
+  '[.[] | select(.user.login!=$bot) | select((.body // "") | test("@claude-fleet[[:space:]]+review($|[^[:alnum:]])"))] | length')
+# Task comments for ANY commit. This is the discriminator the diagnosis needs:
+# one bot task comment anywhere proves the app is installed here, that its
+# deliveries arrive, and that the trigger parses. So a head with no task
+# comment beside a task comment at an older commit is "the head moved after the
+# last request, ask again", never "the mention did not take" -- which is what
+# this said before, on the single most common state the script runs in, since
+# fleet-result-merge.sh posts a trigger at open and every later push then
+# lands here.
+task_comments_anywhere=$(echo "${issue_comments_json}" | jq --arg bot "${bot}" \
+  '[.[] | select(.user.login==$bot) | select((.body // "") | test("^Review task queued\\."))] | length')
+
+# The REST review-comments endpoint carries no resolved/unresolved field
+# (resolution is a review-THREAD concept, GraphQL-only) -- this reports the
+# raw inline-comment count. A nonzero count needs a human/session read of
+# `gh api repos/${repo}/pulls/${pr}/comments` to judge whether each finding
+# was already fixed or answered; this script cannot tell that for you. A
+# comment's own count never drops to zero just because the code it flagged
+# changed, so "clean" below means CI green plus a current-head review, not
+# zero comments -- see the merge-fleet-result skill and issue #1579.
+# Every author's inline comments, for the same reason as the review state: a
+# human reviewer's findings sit on this endpoint too, and counting only the
+# bot's left them invisible to both the summary line and the blocking branch.
+comments_json="$(gh api "repos/${repo}/pulls/${pr}/comments" --paginate | jq -s 'add')"
+inline_comments=$(echo "${comments_json}" | jq 'length')
+
+# A finding whose line GitHub will not accept an inline comment on goes into
+# the review BODY instead, under a "Findings outside the diff:" heading. It
+# leaves no entry on the review-comments endpoint above, so nothing read so
+# far can see it. On #908 the two inline comments were pinned to a superseded
+# commit and had already been fixed, so `inline_comments=2` read as "two stale
+# findings, nothing new" while an unaddressed body finding sat at the current
+# head -- the exact shape this script exists to prevent.
+outside_diff=$(echo "${reviews_json}" | jq --arg sha "${head_sha}" --arg bot "${bot}" \
+  -f "${script_dir}/lib/fleet-review-outside-diff.jq")
+
+# "CI green" is a claim about checks that RAN, so a rollup of nothing but
+# skips should not make it. This branch is DEFENSIVE, not a case this
+# repository currently reaches: no workflow here carries an `on.*.paths`
+# filter, and ci.yml's `changes` job has neither `needs:` nor `if:`, so it and
+# the other ungated lanes run and pass on every pull request. A docs-only PR
+# therefore reads 4 pass / 15 skipped, not 0 / 19, and "CI green" is honest on
+# it. What was wrong there was only the COUNT, which said 19 pass. Keep this
+# branch anyway: it costs three lines and it is what stops the phrase lying if
+# a path filter is ever added, which is the change that would make it
+# reachable.
+ci_phrase="CI green"
+if [[ "${success}" == "0" && "${skipped}" != "0" ]]; then
+  ci_phrase="every check skipped, nothing ran"
+fi
+summary="PR #${pr} @ ${head_sha}: state=${state} mergeState=${merge_state} CI=${success} pass/${pending} pending/${failing} fail"
+if [[ "${skipped}" != "0" ]]; then
+  summary="${summary}/${skipped} skipped"
+fi
+if [[ "${other}" != "0" ]]; then
+  summary="${summary}/${other} unrecognized"
+fi
+if [[ "${failing}" != "0" ]]; then
+  summary="${summary} (${failing_names})"
+fi
+summary="${summary} | review: task@head=${task_state} reviews@head=${reviews_at_head} last=${review_last_state} inline_comments=${inline_comments}"
+if [[ "${reviews_at_head_any}" != "${reviews_at_head}" ]]; then
+  summary="${summary} reviews@head_all_authors=${reviews_at_head_any}"
+fi
+if [[ "${reviews_stale}" != "0" ]]; then
+  summary="${summary} reviews_at_older_commits=${reviews_stale}"
+fi
+# Appended only when nonzero, so a PR with no body findings prints exactly the
+# line it printed before this field existed. The name says body_findings rather
+# than anything with "comment" in it: these are not inline comments and are not
+# fetched from the comments endpoint, and an operator who reads the two counts
+# as one number is back to the #908 failure.
+if [[ "${outside_diff}" != "0" ]]; then
+  summary="${summary} outside_diff_body_findings@head=${outside_diff}"
+fi
+echo "${summary}"
+
+# Does a base behind its own branch block the merge?
+#
+# Not when a merge queue is enforced on the base branch: the queue rebases the
+# entry onto current main and runs full CI on the combined result before
+# landing, so a hand rebase buys nothing and costs a CI cycle (issue #1758).
+#
+# The behind-ness is still reported. That is the half of the old refusal worth
+# keeping: the unseen commits are printed so a base the author does not
+# recognise stays visible, which is the landing-loop revert detector CLAUDE.md
+# names. Only the refusal is dropped, not the information.
+#
+# A guard exit other than 1 means the check did not run, not that the base is
+# fresh, so it blocks regardless of any queue.
+#
+# Called from the verdict chain rather than computed ahead of it, so a closed,
+# DIRTY or DRAFT pull request -- which an earlier branch answers -- still costs
+# no fetch and no API call, exactly as before this function existed.
+base_behind_note=""
+queue_merges=0
+queue_lookup_failed=0
+# Memoised so the two callers below share one lookup, and still lazy: a pull
+# request answered by an earlier branch of the verdict chain reaches neither
+# caller and pays for no API call.
+_queue_rc=""
+queue_is_active() {
+  [[ -n "${_queue_rc}" ]] || { merge_queue_active "${base_ref}"; _queue_rc=$?; }
+  return "${_queue_rc}"
+}
+base_stale_blocks() {
+  merge_base_guard && return 1
+  [[ "${guard_rc}" == "1" ]] || return 0
+  local qrc=0
+  queue_is_active || qrc=$?
+  if [[ "${qrc}" == "2" ]]; then
+    # Could not ask is not an answer. Block, but say why, so the operator is
+    # not handed the pre-#1758 advice with no hint it came from a failed
+    # lookup and cannot tell it from the ordinary no-queue path.
+    queue_lookup_failed=1
+    return 0
+  fi
+  [[ "${qrc}" == "0" ]] || return 0
+  queue_merges=1
+  # The guard's own closing line is "rebase onto <remote>/<branch> and let CI
+  # re-run before merging", which is exactly the advice this path exists to
+  # stop giving. Keep the behind count and the unseen commits, which are the
+  # landing-loop revert detector, and drop that one line.
+  # Anchored: the advisory is the only line starting `guard: rebase`, while a
+  # commit line is `guard:   <hash> <subject>`. An unanchored match would drop
+  # any commit whose SUBJECT says `rebase onto`, hiding exactly the commit an
+  # operator most needs to see while the header still counts it.
+  base_behind_note="$(printf '%s\n' "${guard_out}" | grep -v '^guard: rebase onto')"
+  return 1
+}
+
+if [[ "${state}" != "OPEN" ]]; then
+  echo "  -> PR is ${state}, not open; nothing to merge"
+elif [[ "${merge_state}" == "DIRTY" || "${merge_state}" == "DRAFT" || "${merge_state}" == "BEHIND" ]]; then
+  echo "  -> mergeState is ${merge_state}; not mergeable regardless of CI/review state below"
+elif [[ "${reviews_at_head}" == "0" ]]; then # PROVE-FLIP
+  # Flipping this one condition off clears a PR whose head has no review at
+  # all; the test file sed-flips it and asserts the flipped script clears the
+  # unreviewed fixture, which is what proves the condition carries the gate.
+  #
+  # Five states, and they are not variations on "wait": a dead task never
+  # arrives, a missing trigger means nobody asked, and an unknown status means
+  # this script cannot say. Collapsing them is the failure mode this branch
+  # exists to prevent, in both directions -- an indefinite wait, or a merge
+  # with nothing reviewed.
+  case "${task_state}" in
+    none)
+      if [[ "${task_comments_anywhere}" != "0" ]]; then
+        echo "  -> the head moved after the last review request (${task_comments_anywhere} task comment(s) at earlier commits, none for ${head_sha}): comment \`@claude-fleet review\` again, since a push never starts a review"
+      elif [[ "${triggers}" == "0" ]]; then
+        echo "  -> no review at head and nobody asked for one: comment \`@claude-fleet review\` on the PR (that exact body, arguments after \`review\` are parsed and an unrecognized word gets a confused reaction and no review)"
+      else
+        echo "  -> ${triggers} \`@claude-fleet review\` comment(s) and no task comment anywhere on this PR: if the last one is seconds old, the task comment lands within seconds, so re-run this; otherwise the mention was malformed (check for a confused reaction on it), the app is not installed here, or the bot is not receiving deliveries"
+      fi
+      ;;
+    running)
+      echo "  -> review task for ${head_sha} is queued or running; wait (the bot edits its task comment in place, and posts the review when the task finishes)"
+      ;;
+    dead)
+      echo "  -> review task for ${head_sha} went terminal with NO review posted; nothing will arrive, so re-trigger with \`@claude-fleet review\` (read the task comment for the failure class: \`gh api repos/${repo}/issues/${pr}/comments --jq '.[] | select(.user.login==\"${bot}\") | .body'\`)"
+      ;;
+    done)
+      echo "  -> the task comment for ${head_sha} says the review was posted, but no review object at that commit is visible; check by hand before merging"
+      ;;
+    *)
+      echo "  -> review task for ${head_sha} is in an unrecognized state (${task_state}); read its task comment by hand before merging"
+      ;;
+  esac
+  if [[ "${reviews_stale}" != "0" ]]; then
+    echo "     (${reviews_stale} review(s) exist at older commits; the head moved after them, so they do not cover it)"
+  fi
+# Block-only, and the `reviews_at_head_any` conjunct is what keeps it that way: the
+# branch above owns "no review at head" and prints which of the five states the
+# PR is in, so this one refuses only a review that EXISTS and carries a state
+# neither APPROVED nor COMMENTED. Without the conjunct it also fires on
+# `last=none`, which reads as a wrong diagnosis (a review in a bad state rather
+# than no review) and, worse, masks the branch above from the test that proves
+# it carries the gate.
+#
+# COMMENTED is the bot's own success state -- it never approves and never
+# requests changes -- so this catches a DISMISSED review or a human's
+# CHANGES_REQUESTED, whoever left it.
+elif [[ "${reviews_at_head_any}" != "0" && "${review_last_state}" != "APPROVED" && "${review_last_state}" != "COMMENTED" ]]; then
+  echo "  -> the current-head review state is ${review_last_state} (need APPROVED or COMMENTED); not clean"
+elif [[ "${failing}" != "0" ]]; then
+  echo "  -> CI has failing/cancelled checks; not clean to merge"
+elif [[ "${other}" != "0" ]]; then
+  echo "  -> CI has ${other} check(s) in an unrecognized state; verify by hand before merging"
+elif [[ "${pending}" != "0" ]]; then
+  echo "  -> CI still running; wait"
+elif [[ "${inline_comments}" != "0" && "${confirm_addressed}" != "1" ]]; then
+  echo "  -> ${inline_comments} inline review comment(s); read them, then re-run with --confirm-addressed once each is fixed or answered (the API cannot tell; see the header comment)"
+elif [[ "${outside_diff}" != "0" && "${confirm_addressed}" != "1" ]]; then
+  echo "  -> ${outside_diff} outside-diff finding(s) in the review BODY at head, not inline; read the body with \`ALLOW_LITERAL_SHA=1 gh api repos/${repo}/pulls/${pr}/reviews --jq '.[] | select(.commit_id==\"${head_sha}\") | .body'\`, then re-run with --confirm-addressed once each is fixed or answered"
+# Ahead of the mergeState check on purpose. A stale base is always actionable
+# and the fix is always the same; mergeState UNKNOWN is often just GitHub still
+# computing. Green CI on a stale base says nothing about the merge: a PR that
+# passed against an older base can still break `main`, and a gate added to
+# `main` after the PR went green has never run against the PR at all. Main's
+# own push CI catches the first of those after the merge has landed, which is
+# detection rather than prevention, and it never catches a landing loop that
+# silently reverts a concurrent change. Costs one fetch.
+elif base_stale_blocks; then
+  if [[ "${guard_rc}" == "1" ]]; then
+    echo "  -> merge base is behind origin/${base_ref}; rebase and let CI re-run before merging"
+  else
+    echo "  -> could not check merge-base freshness (guard exit ${guard_rc}); check by hand before merging"
+  fi
+  echo "${guard_out//guard: /     }"
+  if [[ "${queue_lookup_failed}" == "1" ]]; then
+    echo "  -> NOTE: could not read the base branch's rules, so this refusal does not know whether a merge queue would have re-validated it"
+  fi
+elif [[ "${merge_state}" != "CLEAN" && "${merge_state}" != "UNSTABLE" ]]; then
+  echo "  -> every check and review looks clean, but mergeState is ${merge_state} (not CLEAN/UNSTABLE); verify by hand before merging"
+  if [[ "${queue_merges}" == "1" ]]; then
+    # Verifying by hand without the unseen-commit list means verifying without
+    # the one signal that catches a silently reverted concurrent landing. The
+    # note was computed above; print it here too rather than drop it.
+    echo "  -> the base is also behind; these are the commits it has not seen:"
+    echo "${base_behind_note//guard: /     }"
+  fi
+else
+  if [[ "${inline_comments}" != "0" && "${outside_diff}" != "0" ]]; then
+    echo "  -> clean (operator confirmed all ${inline_comments} inline comment(s) and ${outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, review at the current head"
+  elif [[ "${inline_comments}" != "0" ]]; then
+    echo "  -> clean (operator confirmed all ${inline_comments} inline comment(s) addressed): ${ci_phrase}, review at the current head"
+  elif [[ "${outside_diff}" != "0" ]]; then
+    echo "  -> clean (operator confirmed all ${outside_diff} outside-diff body finding(s) addressed): ${ci_phrase}, review at the current head"
+  else
+    echo "  -> clean: ${ci_phrase}, review at the current head with zero findings"
+  fi
+  # The freshness check above proved the base current at the moment it ran, not
+  # for however long the operator takes to run this line; `--match-head-commit`
+  # pins the PR head, not `main`. So the printed command re-runs the guard and
+  # merges only if it still passes.
+  #
+  # No `--delete-branch`: gh refuses it outright once a merge queue is enabled
+  # ("Cannot use `-d` or `--delete-branch` when merge queue enabled"), so the
+  # printed command would fail before merging anything. Nothing is lost; the
+  # repository sets `delete_branch_on_merge`, which removes the head branch
+  # when the merge lands.
+  if [[ "${queue_merges}" == "1" ]]; then
+    # Reachable despite the BEHIND branch above: on a queue repository GitHub
+    # reports mergeStateStatus CLEAN for a pull request behind in git, so the
+    # merge-base guard is the only detector. See f1c63bc.
+    # Reported, not refused. The queue rebases this entry onto current main and
+    # runs full CI on the result, so the behind-ness below is context for
+    # spotting a base you do not recognise, not a reason to rebase by hand.
+    echo "  -> base is behind origin/${base_ref}; the merge queue re-validates the entry against current ${base_ref} before landing, so this is information, not a blocker:"
+    echo "${base_behind_note//guard: /     }"
+    echo "  -> if any commit above is one you do not recognise, stop and check for a landing loop before merging"
+    # No assert-fresh-merge-base prefix: it would refuse on exactly the
+    # behind-ness the queue exists to handle, which is issue #1758.
+    #
+    # --rebase is redundant once the queue owns the strategy, but gh accepts
+    # it here with an informational warning, and keeping it means the command
+    # stays correct if the queue is ever removed. See 6a66e04 for the check.
+    echo "  -> ALLOW_LITERAL_SHA=1 gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+  elif queue_is_active; then
+    # Base is fresh right now, but a queue is enforced, so the prefix would
+    # refuse the moment main moves between this check and the operator running
+    # the line -- the pre-#1758 refusal reached by the fresh path instead of
+    # the stale one. The queue re-validates the entry either way.
+    echo "  -> ALLOW_LITERAL_SHA=1 gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+  else
+    if [[ "${_queue_rc}" == "2" ]]; then
+      # Same distinction the stale path makes: blocking is right, but the
+      # operator must not read a failed lookup as an ordinary no-queue repo.
+      echo "  -> NOTE: could not read the base branch's rules, so this command carries the freshness guard without knowing whether a merge queue would have re-validated it"
+    fi
+    echo "  -> scripts/guards/assert-fresh-merge-base.sh ${pr} origin ${base_ref} && ALLOW_LITERAL_SHA=1 gh pr merge ${pr} --rebase --match-head-commit ${head_sha}"
+  fi
+fi

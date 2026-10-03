@@ -1,0 +1,374 @@
+# floci as the fake-S3 backend for the kind development environment
+# (ADR-0034 decision 6, and decision 8's default after the floci_contract
+# capability gate went green: crates/ravel-object-store/tests/contract.rs).
+#
+# This is a development backend only. It stores everything in the container's
+# ephemeral filesystem, has no persistent volume, and accepts any credentials
+# without verifying request signatures. Nothing here is suitable for a real
+# deployment; production points `spec.storage.s3.endpoint` at real S3 or a real
+# S3-compatible store and supplies real credentials.
+#
+# The `ravel-system` Namespace is not defined here on purpose. It is created by
+# deploy/k8s/operator/operator.yaml (and by scripts/kind-up.sh before either
+# manifest is applied), and defining it twice with different labels would make
+# two `kubectl apply` invocations fight over the same object.
+#
+# Apply with:
+#   kubectl apply -f deploy/k8s/floci.yaml
+#   kubectl wait --for=condition=Complete --timeout=180s \
+#     -n ravel-system job/floci-create-bucket
+#
+# Waiting on the Job rather than on the Deployment is deliberate: the Job's
+# retry loop is what actually proves the S3 handler answers and the bucket
+# Ravel needs exists (see its script below).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: floci
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: floci
+    app.kubernetes.io/component: fake-s3
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: the store is the container's own filesystem,
+  # so two overlapping replicas would serve two different, diverging buckets.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: floci
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: floci
+        app.kubernetes.io/component: fake-s3
+    spec:
+      # Kubernetes injects a legacy Docker-link environment variable per
+      # Service in the namespace, so the Service named `floci` below produces
+      # FLOCI_PORT=tcp://<clusterIP>:4566 in this pod. floci reads its own
+      # `floci.port` config property, and SmallRye maps that property from
+      # exactly that variable name, so the injected value wins and the
+      # container dies at startup:
+      #
+      #   The config property floci.port with the config value
+      #   "tcp://10.96.237.141:4566" threw an Exception whilst being converted
+      #   SRCFG00029: Expected an integer value
+      #
+      # Service links are only injected for Services that already exist when
+      # the pod is created, so leaving this on makes startup depend on whether
+      # the Deployment or the Service won the race inside a single
+      # `kubectl apply -f` -- it comes up on one run and crash-loops on the
+      # next. Nothing in this pod consumes service-link variables, so turn
+      # them off and let floci read its own defaults.
+      enableServiceLinks: false
+      containers:
+        - name: floci
+          # Same digest the object-store-contract CI job pins for its own
+          # `docker run` (issue #1720 residual round), so the backend this
+          # environment runs is the exact build the contract suite proved
+          # satisfies Capabilities::mandatory() and multipart. Left on Docker
+          # Hub deliberately: only the pin form changed, not the registry.
+          image: floci/floci@sha256:f5aa8c18302cedb4f2385f5c4e455b3efc77fee6bf7b6e5d1712b2817ba102db
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: s3
+              containerPort: 4566
+          # No env vars. floci needs none for the S3 path, and it ignores
+          # LocalStack's `SERVICES` allowlist (measured: `SERVICES=s3` still
+          # reports its whole service catalogue as running), so setting it
+          # would only be a comment that lies about what the pod does.
+          #
+          # /_floci/health answers before every service handler is running, so
+          # a plain 200 here is a liveness signal, not a readiness one. The
+          # readiness probe checks for the S3 handler specifically. The pinned
+          # image (RHEL 9) ships bash as /bin/sh but no curl, wget, nc or grep,
+          # so the probe uses bash builtins only: it sends the request over
+          # /dev/tcp, reads the response with read (which returns non-zero at
+          # EOF but fills the variable, hence the ;), and requires a 200
+          # status line and the S3 handler reported running.
+          livenessProbe:
+            httpGet:
+              path: /_floci/health
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'exec 3<>/dev/tcp/127.0.0.1/4566 && printf "GET /_floci/health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n" >&3 && { IFS= read -r -d "" r <&3; [[ $r == "HTTP/1."?" 200 "* && $r == *"\"s3\":\"running\""* ]]; }'
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 40
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: floci
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: floci
+    app.kubernetes.io/component: fake-s3
+spec:
+  selector:
+    app.kubernetes.io/name: floci
+  ports:
+    - name: s3
+      port: 4566
+      targetPort: s3
+---
+# Bucket creation, mirroring the `createbucket` sidecar in
+# deploy/docker-compose/rustfs.yml. floci needs no S3 client and no SigV4
+# signing (it accepts any credentials and does not verify signatures), so plain
+# PUTs with curl are enough -- the same approach the object-store-contract CI
+# job uses.
+#
+# The operator passes --require-bucket-protection to every RavelCluster, so the
+# bucket must pass the startup check (docs/object-store-contract.md "Required
+# bucket configuration"): Object Lock enabled at creation, versioning on, and
+# one whole-bucket lifecycle rule carrying the sanctioned actions. The lifecycle
+# document below is the same rule set deploy/k8s/rustfs.yaml and the compose
+# files send, and crates/ravel-object-store's
+# `launcher_lifecycle_documents_pass_every_in_process_condition` test reads it
+# from this file.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: floci-create-bucket
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: floci
+    app.kubernetes.io/component: fake-s3
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: floci
+        app.kubernetes.io/component: fake-s3
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: create-bucket
+          # Left on Docker Hub deliberately: no ghcr.io or quay.io mirror of
+          # curlimages/curl was found, and this Job runs once per cluster
+          # bring-up rather than per CI run, so it does not share the
+          # per-runner pull pressure the quickstart job hits.
+          #
+          # Digest resolved from the registry rather than mirrored from a
+          # sibling pin, since no other reference to this image exists in the
+          # repo. Category 6 of the pin scanner holds it here.
+          image: curlimages/curl:8.11.1@sha256:c1fe1679c34d9784c1b0d1e5f62ac0a79fca01fb6377cdd33e90473c6f9f9a69
+          imagePullPolicy: IfNotPresent
+          env:
+            # Must match spec.storage.s3.bucket of the RavelCluster that uses
+            # this backend (deploy/k8s/examples/ravelcluster-dev.yaml).
+            - name: BUCKET
+              value: ravel
+            - name: ENDPOINT
+              value: http://floci.ravel-system.svc:4566
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # Wait for the S3 handler specifically. The Service can route to
+              # a pod whose HTTP listener is up before S3 is running, and a
+              # CreateBucket against that loses.
+              i=0
+              while [ "$i" -lt 60 ]; do
+                if curl -fsS "${ENDPOINT}/_floci/health" | grep -q '"s3":"running"'; then
+                  echo "floci S3 is running"
+                  break
+                fi
+                i=$((i + 1))
+                sleep 2
+              done
+              if [ "$i" -ge 60 ]; then
+                echo "floci S3 did not start in time" >&2
+                exit 1
+              fi
+              # NoncurrentDays 1 keeps a dev bucket's noncurrent versions
+              # briefly; a production bucket sets its own E_v
+              # (docs/guides/disaster-recovery.md).
+              LIFECYCLE='<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule><ID>ravel</ID><Filter><Prefix></Prefix></Filter><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration><AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>'
+              VERSIONING='<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>'
+              # The bucket is created only when HEAD says it is absent, and
+              # versioning and the lifecycle rule are each read first and put
+              # only when the read does not already match, then read back, so
+              # a rerun of this Job against a bucket that is already set up
+              # issues no put. Object Lock can only be enabled when the bucket
+              # is created.
+              status="$(curl -sS -o /dev/null -w '%{http_code}' -I "${ENDPOINT}/${BUCKET}")"
+              if [ "$status" != "200" ] && [ "$status" != "404" ]; then
+                echo "could not read bucket ${BUCKET} (HEAD ${status})" >&2
+                exit 1
+              fi
+              if [ "$status" = "404" ]; then
+                curl -fsS -o /dev/null -X PUT -H 'x-amz-bucket-object-lock-enabled: true' \
+                  "${ENDPOINT}/${BUCKET}"
+                # Verify rather than trust: HEAD on a missing bucket is 404, so
+                # a 200 here proves the bucket Ravel needs actually exists.
+                status="$(curl -sS -o /dev/null -w '%{http_code}' -I "${ENDPOINT}/${BUCKET}")"
+                if [ "$status" != "200" ]; then
+                  echo "bucket ${BUCKET} missing after create (HEAD ${status})" >&2
+                  exit 1
+                fi
+              fi
+              # Object Lock is read before anything else is put. A bucket
+              # created by an older manifest without Object Lock fails here;
+              # delete the floci pod to start from an empty store.
+              if ! curl -fsS "${ENDPOINT}/${BUCKET}?object-lock" |
+                grep -q '<ObjectLockEnabled>Enabled</ObjectLockEnabled>'; then
+                echo "bucket ${BUCKET} does not have Object Lock enabled" >&2
+                exit 1
+              fi
+              enabled() {
+                case "$1" in
+                  *'<Status>Enabled</Status>'*) return 0 ;;
+                esac
+                return 1
+              }
+              # A failed read puts versioning; the read-back below is the gate.
+              versioning="$(curl -fsS "${ENDPOINT}/${BUCKET}?versioning")" || {
+                echo "could not read the versioning of bucket ${BUCKET}; putting it" >&2
+                versioning=
+              }
+              if enabled "$versioning"; then
+                echo "bucket ${BUCKET} already has versioning Enabled; not putting it"
+              else
+                curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/xml' \
+                  --data-binary "$VERSIONING" "${ENDPOINT}/${BUCKET}?versioning"
+                versioning="$(curl -fsS "${ENDPOINT}/${BUCKET}?versioning")" || versioning=
+                if ! enabled "$versioning"; then
+                  echo "bucket ${BUCKET} does not have versioning enabled" >&2
+                  exit 1
+                fi
+              fi
+              # lifecycle_ok reads the lifecycle document once and checks it
+              # whole: exactly one rule, enabled, scoped to the whole bucket,
+              # carrying each action. It returns 1 with the mismatch in $why,
+              # including when the read fails because the bucket has no
+              # configuration. flat is the document on one line with every
+              # whitespace character turned into a space, tagged the same with
+              # the spaces inside each tag removed, and doc the same with no
+              # spaces at all.
+              count() { printf '%s\n' "$1" | grep -o "$2" | wc -l | tr -d ' '; }
+              lifecycle_ok() {
+                if ! got="$(curl -sS -w '\n%{http_code}' "${ENDPOINT}/${BUCKET}?lifecycle")"; then
+                  why="could not read the lifecycle configuration of bucket ${BUCKET}"
+                  return 1
+                fi
+                code="${got##*[!0-9]}"
+                lifecycle="$(printf '%s' "${got%"$code"}")"
+                if [ "$code" != "200" ]; then
+                  why="bucket ${BUCKET} lifecycle read answered HTTP ${code:-none} (read ${lifecycle})"
+                  return 1
+                fi
+                flat="$(printf '%s' "$lifecycle" | tr '\r\n\t' '   ')"
+                tagged="$(printf '%s\n' "$flat" | sed -e ':a' -e 's/\(<[^>]*\) /\1/' -e 'ta')"
+                doc="$(printf '%s' "$tagged" | tr -d ' ')"
+                rules="$(count "$flat" '<Rule[ />]')"
+                if [ "$rules" != "1" ]; then
+                  why="bucket ${BUCKET} carries ${rules} lifecycle rules, not exactly one"
+                  return 1
+                fi
+                if [ "$(printf '%s\n' "$lifecycle" | grep -o '<Status>[^<]*</Status>')" != \
+                  '<Status>Enabled</Status>' ]; then
+                  why="bucket ${BUCKET} lifecycle rule is not enabled"
+                  return 1
+                fi
+                # The rule's filter must be exactly one spelling the server's
+                # rule parser reads as the whole bucket: a Filter holding only
+                # an empty Prefix (directly or inside And), an empty Filter, or
+                # a rule-level empty Prefix with no Filter. The spelling must be
+                # a direct child of Rule (as many tags opened as closed before
+                # it), and nothing else in the rule may name a filter element.
+                # The server keeps a Prefix's text as it is, so whitespace there
+                # is a prefix of spaces: any Prefix holding text is refused,
+                # read from tagged, where only the whitespace inside tags is
+                # gone. The match below keys on unprefixed tag names, so a
+                # Filter, Prefix or And written with a namespace prefix
+                # (s3:Filter) would be invisible to it; any such tag is refused
+                # instead, read from flat, where the space before an attribute
+                # still ends the tag name, and the canonical rule is put.
+                rule="${doc#*<Rule>}"
+                rule="${rule%%</Rule>*}"
+                whole=
+                case "$doc" in
+                  *'<Rule>'*'</Rule>'*) ;;
+                  *) rule= ;;
+                esac
+                case "$tagged" in
+                  *'<Prefix>'[!\<]*) rule= ;;
+                esac
+                if printf '%s\n' "$flat" | grep -qE '</?[^ />]*:(Filter|Prefix|And)[ />]'; then
+                  rule=
+                fi
+                for spelling in '<Filter><Prefix></Prefix></Filter>' '<Filter><Prefix/></Filter>' \
+                  '<Filter><And><Prefix></Prefix></And></Filter>' '<Filter><And><Prefix/></And></Filter>' \
+                  '<Filter></Filter>' '<Filter/>' '<Prefix></Prefix>' '<Prefix/>'; do
+                  case "$rule" in
+                    *"$spelling"*) ;;
+                    *) continue ;;
+                  esac
+                  before="${rule%%"$spelling"*}"
+                  case "${before}${rule#*"$spelling"}" in
+                    *'<Filter'* | *'<Prefix'* | *'<And'* | *'<Tag'* | *'<ObjectSize'*) continue ;;
+                  esac
+                  opened="$(count "$before" '<[^/!?]')"
+                  closed="$(( $(count "$before" '</') + $(count "$before" '/>') ))"
+                  if [ "$opened" -eq "$closed" ]; then
+                    whole="$spelling"
+                  fi
+                done
+                if [ -z "$whole" ]; then
+                  why="bucket ${BUCKET} lifecycle rule is not scoped to the whole bucket (read ${flat})"
+                  return 1
+                fi
+                if ! printf '%s\n' "$lifecycle" |
+                  grep -q '<DaysAfterInitiation>7</DaysAfterInitiation>'; then
+                  why="bucket ${BUCKET} does not carry the multipart-abort rule"
+                  return 1
+                fi
+                if ! printf '%s\n' "$lifecycle" | grep -q '<NoncurrentDays>1</NoncurrentDays>'; then
+                  why="bucket ${BUCKET} does not carry the noncurrent-expiration rule"
+                  return 1
+                fi
+                if ! printf '%s\n' "$lifecycle" |
+                  grep -q '<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>'; then
+                  why="bucket ${BUCKET} does not carry the expired-delete-marker rule"
+                  return 1
+                fi
+              }
+              why=
+              if lifecycle_ok; then
+                echo "bucket ${BUCKET} already carries the lifecycle rule; not putting it"
+              else
+                echo "putting the lifecycle rule: ${why}"
+                curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/xml' \
+                  --data-binary "$LIFECYCLE" "${ENDPOINT}/${BUCKET}?lifecycle"
+                if ! lifecycle_ok; then
+                  echo "$why" >&2
+                  exit 1
+                fi
+              fi
+              echo "bucket ${BUCKET} ready: Object Lock, versioning and lifecycle rules set"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi

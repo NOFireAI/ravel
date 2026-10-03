@@ -1,0 +1,9143 @@
+//! Metric index fold: catalog snapshot construction from commit records
+//! (ADR-0020).
+//!
+//! Never runs on the ingest or query path. A fold reads the current HEAD,
+//! computes the newly sealed watermark, folds previous parts plus newly
+//! sealed (shard, hour) buckets into one new content-addressed snapshot
+//! part, and CAS-swaps HEAD to name it. Any number of folders may race:
+//! parts are content-addressed so a losing PUT is a no-op, and HEAD's CAS
+//! precondition serializes the pointer swap. Every failure mode (absent or
+//! corrupt HEAD, unreadable previous part, exhausted CAS retries) either
+//! falls back to full rebuild from the commit layout or returns a typed
+//! error; it never corrupts HEAD or leaves a torn snapshot visible.
+
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use futures::stream::{self, StreamExt};
+use ravel_commit::keys::{self, BucketEntry, KeyError};
+use ravel_commit::signal;
+use ravel_object_store::{
+    GetRange, ObjectMeta, ObjectStoreBackend, PutMode, PutOptions, StoreError, UploadChecksum,
+    Version, list_all,
+};
+use ravel_proto::catalog::v1::{
+    ColumnStatsSegment, SnapshotColumnStatsPartRef, SnapshotEntry, SnapshotHead, SnapshotPartRef,
+    SnapshotPostingsRef,
+};
+use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord, RewriteRecord};
+use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::{METRIC_NAME_LABEL, Signal, TenantHash};
+use uuid::Uuid;
+
+use crate::catalog::Catalog;
+use crate::column_stats_build;
+use crate::config::CatalogConfig;
+use crate::declared_stats;
+use crate::error::CatalogError;
+use crate::provisioning::{DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, scan_count};
+use crate::snapshot_format::{
+    self, HEAD_FORMAT_VERSION, NamePostings, PartLimits, SnapshotFormatError,
+    column_stats_segments_concat,
+};
+use crate::tenant_config::DeclaredTypedColumn;
+
+/// RSEG section kinds needed to decode a segment's catalog
+/// (docs/segment-format.md `SectionKind`). Kinds 1/2 are v1
+/// (LABEL_DICT/SERIES_TABLE); 5/6 are v2 (SERIES_IDS/SERIES_META).
+/// A failure while building the name-postings index for a fold. Every
+/// variant is caught by [`Catalog::build_postings`], logged, and turned into
+/// "fold succeeds without a postings ref" ("Postings build failures leave the fold successful without a postings
+/// ref") -- never surfaced as a [`CatalogError`], and never a partial or
+/// approximate postings object (ravel CLAUDE.md: "Exact semantics by
+/// default").
+#[derive(Debug, thiserror::Error)]
+pub enum PostingsBuildError {
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+    #[error("key error: {0}")]
+    Key(#[from] KeyError),
+    #[error("segment error: {0}")]
+    Segment(#[from] SegmentError),
+    #[error("snapshot format error: {0}")]
+    Format(#[from] snapshot_format::SnapshotFormatError),
+    #[error("entry content_hash must be 32 bytes, got {0}")]
+    BadContentHashLen(usize),
+    #[error("entry writer_id must be 16 bytes, got {0}")]
+    BadWriterIdLen(usize),
+    #[error("L1 entry writer_id (input_set_hash) must be 32 bytes, got {0}")]
+    BadInputSetHashLen(usize),
+    #[error("L1 entry writer_epoch (part_index) does not fit u32: {0}")]
+    BadPartIndex(u64),
+    #[error("segment series entry has no {METRIC_NAME_LABEL} label")]
+    MissingMetricName,
+    #[error("unsupported segment format version {0}")]
+    UnsupportedSegmentVersion(u16),
+}
+
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+/// Bounded retry budget for HEAD's CAS loop: a folder that keeps losing to concurrent folders
+/// gives up with [`CatalogError::FoldCasRetriesExhausted`] rather than
+/// retrying forever.
+const MAX_HEAD_CAS_ATTEMPTS: u32 = 8;
+
+/// Placeholder for future compaction/retention transactions.
+/// `fold`'s entry point accepts a
+/// `&[Transaction]` today so a later phase can apply compaction/retention
+/// records without a signature change, but this phase never constructs one:
+/// no public constructor exists, so callers can only ever pass an empty
+/// slice.
+#[derive(Debug, Clone)]
+pub struct Transaction {
+    _private: (),
+}
+
+/// The ingest hours a caller wants this fold to re-list and reconcile, on top
+/// of the fold's own fixed reconcile window and retention-frontier band
+/// (ADR-0063 section 4). The receiving end of issue #526's re-fold half.
+///
+/// The fold cannot derive this set itself. An hour that received a late
+/// compaction or rewrite record is indistinguishable, from the snapshot
+/// entries alone, from an hour that did not: proving the difference needs a
+/// LIST of that hour's commit buckets, and the hours that could have received
+/// one are every hour the snapshot names, so a self-derived version would cost
+/// a full-history LIST fan-out on every fold. The fixed window bounds that by
+/// recency and the frontier band bounds it by the retention frontier; neither
+/// reaches a late record in the middle of a tenant's history, which is exactly
+/// the hour that leaks (the sweep's HEAD-reachability gate holds the
+/// pre-rewrite inputs because the snapshot still names them).
+///
+/// The maintain tier's superseded-input sweep already pays for those LISTs and
+/// already computes the answer: a bucket it holds on
+/// `SnapshotBlock::Named` is an hour whose snapshot entries still name inputs a
+/// published compaction or rewrite record superseded. Those hours are what
+/// belongs here.
+///
+/// Requesting an hour is a hint, never a durability dependency: an unrequested
+/// or dropped hour degrades to today's behavior (the hour keeps naming its
+/// pre-rewrite inputs until retention drops it), and the sweep's gate remains
+/// the delete blocker either way.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefoldRequest {
+    /// Ascending and deduplicated, so a fold spends its cap oldest-first (the
+    /// hours whose held inputs have occupied storage longest).
+    hours: BTreeSet<u32>,
+}
+
+impl RefoldRequest {
+    /// An empty request: the fold behaves exactly as [`Catalog::fold`] does.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request a re-fold of one ingest hour.
+    pub fn insert(&mut self, ingest_hour_bucket: u32) {
+        self.hours.insert(ingest_hour_bucket);
+    }
+
+    /// Build a request from an hour iterator; duplicates collapse.
+    pub fn from_hours(hours: impl IntoIterator<Item = u32>) -> Self {
+        Self {
+            hours: hours.into_iter().collect(),
+        }
+    }
+
+    /// The requested hours, ascending.
+    pub fn hours(&self) -> impl Iterator<Item = u32> + '_ {
+        self.hours.iter().copied()
+    }
+
+    /// Number of distinct hours requested.
+    pub fn len(&self) -> usize {
+        self.hours.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hours.is_empty()
+    }
+}
+
+/// Outcome of one [`Catalog::fold`] call.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FoldReport {
+    /// HEAD's watermark_hour after this call. `None` only when no hour has
+    /// ever been sealed for this (tenant, signal) yet.
+    pub watermark_hour: Option<u32>,
+    /// HEAD's watermark_hour before this call.
+    pub previous_watermark_hour: Option<u32>,
+    /// `true` if nothing was sealed beyond `previous_watermark_hour`: HEAD
+    /// was left untouched, no part was written.
+    pub no_op: bool,
+    /// `true` if this fold discovered entries by listing every commit
+    /// prefix up to the watermark (HEAD absent, corrupt, or its parts
+    /// unreadable) rather than folding incrementally from a trusted HEAD.
+    pub rebuilt: bool,
+    /// Number of (shard, hour) commit buckets listed by this fold.
+    pub buckets_folded: u64,
+    /// Total entries across every part of the new HEAD (previous entries
+    /// plus newly folded ones).
+    pub entry_count: u64,
+    /// Total encoded size across every part named by the new HEAD, in bytes
+    /// (sealed, carried-by-reference, and the fresh tail).
+    pub part_bytes: u64,
+    /// Number of parts named by the new HEAD (ADR-0063: sealed + carried +
+    /// tail). `1` for a single-part fold that never crossed
+    /// `snapshot_part_max_entries`.
+    pub parts_total: u64,
+    /// Of `parts_total`, how many were carried forward from the previous
+    /// HEAD by reference (same key, same blake3) rather than re-encoded and
+    /// re-PUT (ADR-0063 section 3, "Only changed parts are encoded and PUT").
+    /// A fold that touches only recent hours reuses every unchanged sealed
+    /// part, so no PUT is issued for it.
+    pub parts_reused: u64,
+    pub list_requests: u64,
+    pub get_requests: u64,
+    /// Number of PUT requests this fold issued to the object store, counted
+    /// unconditionally at the point each request is issued -- an
+    /// `AlreadyExists` or another store-side error still counts, since the
+    /// store received the request and, on an ambiguous error, may have
+    /// durably written the object despite the client-visible failure (#1598).
+    /// This is a request-issued counter, not a request-succeeded one: a
+    /// build/PUT failure that leaves a `*_built` field `false` still counted
+    /// its attempt here.
+    pub put_requests: u64,
+    /// `true` if this fold successfully built and attached a name-postings
+    /// index. `false` covers both "no
+    /// postings work was needed" (a no-op fold) and "the build failed and
+    /// the fold proceeded without a postings ref".
+    pub postings_built: bool,
+    /// Encoded size of the postings object, in bytes. `0` when
+    /// `postings_built` is `false`.
+    pub postings_bytes: u64,
+    /// Number of per-part (v3, ADR-1413) column-statistics objects this fold
+    /// built and PUT, one per newly written or rewritten part (never for a
+    /// part carried forward by reference: its existing
+    /// `SnapshotPartRef.column_stats` ref, if any, is forwarded unchanged).
+    /// `0` on a no-op fold or when the tenant has no configured typed
+    /// columns. A part whose statistics exceed the ceiling still gets an
+    /// object here (ADR-1413 decision 4, amended): the fold degrades it by
+    /// dropping dictionaries (see [`Self::column_stats_dictionaries_dropped`])
+    /// rather than skipping it, and only fails the whole fold when no
+    /// dictionary is left and it is still over ceiling.
+    pub column_stats_part_objects_built: u64,
+    /// Total (segment, column) dictionaries this fold dropped (largest
+    /// encoded size first, `dictionary_present` set to `false`) across every
+    /// per-part column-statistics object, to bring an over-ceiling part's
+    /// body under [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]
+    /// (ADR-1413 decision 4, amended). `0` when every part's statistics
+    /// already fit the ceiling with every dictionary intact. min/max/count/sum
+    /// are never affected: only the dictionary is dropped, never truncated
+    /// (ADR-0850 decision 3's omit-never-truncate rule).
+    pub column_stats_dictionaries_dropped: u64,
+    /// Number of commit-bucket entries this fold skipped rather than
+    /// aborting on: an unrecognized bucket-key shape, or a commit record
+    /// whose identity duplicates one already folded. Both are layout drift
+    /// (docs/catalog-and-mvcc.md key-layout section: "layout drift must be
+    /// visible, not swallowed"), logged at `warn!` with the offending
+    /// key/identity -- satisfied by the log plus this counter, never by
+    /// aborting the fold, since either condition is a permanent property of
+    /// the sealed layout and aborting would block the watermark forever.
+    pub layout_drift_count: u64,
+    /// Retention-frontier hours this fold re-listed (ADR-0020 delete-blocker,
+    /// the retirement-frontier half). In addition to the fixed
+    /// [`CatalogConfig::fold_reconcile_window_hours`](crate::CatalogConfig::fold_reconcile_window_hours)
+    /// window behind the watermark, the reconcile pass covers snapshot-named
+    /// hours at or approaching the tenant's retention frontier so a tombstone
+    /// written `R` days behind the watermark is applied before the retention
+    /// sweep's horizon lets it delete the objects that hour's snapshot entries
+    /// still name. Zero when the tenant has no durable retention window, on a
+    /// first fold, and on a rebuild (which re-derives every hour anyway).
+    pub frontier_hours_reconciled: u64,
+    /// Retention-frontier hours that were at or approaching the frontier this
+    /// fold but exceeded
+    /// [`CatalogConfig::frontier_reconcile_max_hours`](crate::CatalogConfig::frontier_reconcile_max_hours)
+    /// and were carried to the next fold rather than reconciled now (a jump:
+    /// a shortened retention window, or a folder that was stopped for a long
+    /// time). Never a silent skip: the deferred hours are still named by the
+    /// snapshot, so the next fold recomputes them as frontier candidates and
+    /// drains the backlog oldest-first. Nonzero here is the signal that the
+    /// frontier is behind; steady state is always zero.
+    pub frontier_hours_deferred: u64,
+    /// Ingest hours the targeted re-fold pass reconciled this fold, from a
+    /// caller-supplied [`RefoldRequest`] (issue #526, ADR-0063 amendment).
+    /// Bounded by the same `frontier_reconcile_max_hours` cap the frontier
+    /// band uses; a request naming more hours than the cap allows carries the
+    /// remainder to whichever later fold the requester asks again, and this
+    /// field counts only the hours this call actually re-listed. `0` on a
+    /// [`Catalog::fold`] call (an empty [`RefoldRequest`]) and on a request
+    /// submitted to a fold call that turns out to be a no-op: the pass sits
+    /// inside the same reconcile branch as the fixed window and the frontier
+    /// band, which never runs when nothing new is sealed, so a request
+    /// against an unchanged watermark reconciles nothing regardless of what
+    /// it names (docs/adrs/0064-selective-subject-erasure.md, the no-op
+    /// carve-out).
+    pub refold_hours_reconciled: usize,
+    /// Stamped carriers this fold read: L0 commit records whose
+    /// `declared_column_stats` (field 20) was non-empty, plus L1 compaction
+    /// parts whose own stamps (field 12) were non-empty. The read half of the
+    /// ADR-0873 stamp-coverage pair. Counted off the wire before the
+    /// statistics validity predicate runs, so a carrier whose every entry is
+    /// defective still counts here. Rewrite output parts are excluded: they
+    /// carry no stamps by decision 3, so counting them would report a
+    /// permanent shortfall. An exact count for this fold, not a running total.
+    pub stamped_records: u64,
+    /// Snapshot entries this fold built carrying at least one declared-column
+    /// stamp, from either carrier: the carry half of the same pair. Tallied
+    /// where the entry is built, so it counts what the fold carried forward
+    /// rather than what a later step wrote: a bucket the reconcile pass
+    /// re-reads and leaves unchanged, and an entry dropped as a duplicate
+    /// identity, are both counted here and on the records side alike. Never
+    /// above `stamped_records` in this report, since only a stamped carrier
+    /// can produce a stamped entry. Below it means every entry of some stamped carrier was
+    /// dropped on the way through, which is the coverage shortfall ADR-0873's
+    /// deployment gate is read against.
+    pub stamped_entries: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RequestCounters {
+    list_requests: u64,
+    get_requests: u64,
+    put_requests: u64,
+}
+
+/// HEAD as read at the top of one fold attempt.
+enum HeadState {
+    Absent,
+    /// `head` is boxed so this large variant does not inflate every
+    /// `HeadState` value (`clippy::large_enum_variant`): `SnapshotHead` grew
+    /// past 300 bytes when ADR-0850 added `column_stats`, while the other
+    /// variants are tiny.
+    Valid {
+        head: Box<SnapshotHead>,
+        version: Version,
+    },
+    /// HEAD object exists but failed to decode: logged loudly by
+    /// [`Catalog::get_head`] and treated as absent for fold purposes.
+    Corrupt {
+        version: Version,
+    },
+    /// HEAD decoded far enough to see a `format_version` above
+    /// [`HEAD_FORMAT_VERSION`] (ADR-0066 decision 2, "fail-closed-on-newer");
+    /// a version below it is [`HeadState::Corrupt`]. Unlike
+    /// [`HeadState::Corrupt`], this HEAD is NOT rebuildable: a newer-format
+    /// HEAD (e.g. an EH multi-part HEAD written by an already-upgraded peer)
+    /// carries state this older process cannot see, so rebuilding a
+    /// single-part HEAD and CAS-overwriting it would silently discard that
+    /// state. The fold fails loudly instead
+    /// ([`CatalogError::UnsupportedHeadVersion`]). Carries only
+    /// `format_version`: unlike [`HeadState::Corrupt`], this state never CAS-
+    /// writes, so it has no use for the store `Version`.
+    UnsupportedVersion {
+        format_version: u32,
+    },
+}
+
+impl HeadState {
+    fn watermark_hour(&self) -> Option<u32> {
+        match self {
+            HeadState::Valid { head, .. } => Some(head.watermark_hour),
+            HeadState::Absent
+            | HeadState::Corrupt { .. }
+            | HeadState::UnsupportedVersion { .. } => None,
+        }
+    }
+}
+
+/// Orders per-part (v3) column-statistics records by their join key (the
+/// covered part's content hash, carried in `writer_id`) and collapses
+/// repeats.
+///
+/// `encode_column_stats_v3` rejects a repeated key outright, and the fold
+/// treats that error as "no field 7 ref for this part", so one repeat would
+/// strip the part's statistics. A repeated key means two entries cover a
+/// byte-identical part, so their records carry the same statistics and
+/// keeping one is exact rather than a narrowing.
+fn sort_and_dedup_part_segments(segments: &mut Vec<ColumnStatsSegment>) {
+    segments.sort_by(|a, b| a.writer_id.cmp(&b.writer_id));
+    segments.dedup_by(|a, b| a.writer_id == b.writer_id);
+}
+
+/// Greatest ingest-hour bucket sealed at `now_ns` (docs/catalog-and-mvcc.md,
+/// ADR-0020 "Sealed-hour watermark"): the greatest `H` such that
+/// `now_ns >= end(H) + max_flush_lifetime + clock_skew_allowance +
+/// fold_safety_margin`, where `end(H) = (H + 1) * 1 hour`. `None` if no
+/// hour is sealed yet.
+fn sealed_watermark_hour(now_ns: i64, config: &CatalogConfig) -> Option<u32> {
+    let margin_ns = config.max_flush_lifetime_ns
+        + config.clock_skew_allowance_ns
+        + config.fold_safety_margin_ns;
+    let threshold_ns = now_ns.saturating_sub(margin_ns);
+    if threshold_ns < 0 {
+        return None;
+    }
+    let floor_hours = threshold_ns.div_euclid(NS_PER_HOUR);
+    if floor_hours < 1 {
+        return None;
+    }
+    u32::try_from(floor_hours - 1).ok()
+}
+
+pub(crate) fn head_object_key(tenant: &TenantHash, signal: Signal) -> String {
+    format!("t/{}/catalog/{}/HEAD", tenant.to_hex(), signal.key_prefix())
+}
+
+fn part_object_key(
+    tenant: &TenantHash,
+    signal: Signal,
+    watermark_hour: u32,
+    hash16: &str,
+) -> String {
+    format!(
+        "t/{}/catalog/{}/snap/{}.{}.csnap",
+        tenant.to_hex(),
+        signal.key_prefix(),
+        keys::ingest_hour_string(watermark_hour),
+        hash16
+    )
+}
+
+fn postings_object_key(
+    tenant: &TenantHash,
+    signal: Signal,
+    watermark_hour: u32,
+    hash16: &str,
+) -> String {
+    format!(
+        "t/{}/catalog/{}/idx/{}.{}.npost",
+        tenant.to_hex(),
+        signal.key_prefix(),
+        keys::ingest_hour_string(watermark_hour),
+        hash16
+    )
+}
+
+fn column_stats_object_key(
+    tenant: &TenantHash,
+    signal: Signal,
+    watermark_hour: u32,
+    hash16: &str,
+) -> String {
+    format!(
+        "t/{}/catalog/{}/idx/{}.{}.cstat",
+        tenant.to_hex(),
+        signal.key_prefix(),
+        keys::ingest_hour_string(watermark_hour),
+        hash16
+    )
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn writer_id_display(bytes: &[u8]) -> String {
+    match <[u8; 16]>::try_from(bytes) {
+        Ok(arr) => Uuid::from_bytes(arr).to_string(),
+        Err(_) => hex_encode(bytes),
+    }
+}
+
+/// (ingest_hour_bucket, shard, writer_id, writer_epoch, writer_seq): the
+/// identity a commit record must be unique under (docs/catalog-and-mvcc.md).
+type EntryIdentity = (u32, u32, Vec<u8>, u64, u64);
+
+/// One shard's delimited-listing result during a rebuild's parallel bucket
+/// discovery: `(shard, shard_prefix, common_prefixes)` (ADR-0063 section 3).
+type ShardListing = (u32, String, Vec<String>);
+
+/// One `(shard, hour)` bucket's discovered keys during the parallel bucket
+/// discovery: `(shard, hour, keys)` (ADR-0063 section 3).
+type BucketListing = (u32, u32, Vec<ObjectMeta>);
+
+fn entry_identity(entry: &SnapshotEntry) -> EntryIdentity {
+    (
+        entry.ingest_hour_bucket,
+        entry.shard,
+        entry.writer_id.clone(),
+        entry.writer_epoch,
+        entry.writer_seq,
+    )
+}
+
+fn build_snapshot_entry(
+    key: &str,
+    record: &CommitRecord,
+    coverage: &mut declared_stats::StampCoverage,
+) -> Result<SnapshotEntry, CatalogError> {
+    let writer_id =
+        Uuid::parse_str(&record.writer_id).map_err(|_| CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "writer_id",
+            expected: "uuid".to_string(),
+            actual: record.writer_id.clone(),
+        })?;
+    Ok(SnapshotEntry {
+        level: 0,
+        shard: record.shard,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        writer_id: writer_id.into_bytes().to_vec(),
+        writer_epoch: record.writer_epoch,
+        writer_seq: record.writer_seq,
+        content_hash: record.content_hash.clone(),
+        object_size: record.object_size,
+        min_event_ts_ns: record.min_event_ts_ns,
+        max_event_ts_ns: record.max_event_ts_ns,
+        sample_count: record.sample_count,
+        series_count: record.series_count,
+        segment_format_version: record.segment_format_version,
+        created_unix_ns: record.created_unix_ns,
+        // ADR-0873 decision 4: the stamps are copied from the record the fold
+        // is already reading, through the gated read that binds the row-count
+        // clauses against this record's own sample_count. A defective entry is
+        // dropped here rather than sealed into a part that outlives the record
+        // proving it wrong.
+        declared_column_stats: declared_stats::carry_commit_record(record, coverage),
+    })
+}
+
+/// Build a level-1 [`SnapshotEntry`] for one part of a compaction record. The proto's frozen entry
+/// shape has no dedicated field for an L1 part's identity, so the writer_*
+/// slots -- which an L1 part has no native use for -- carry it: `writer_id`
+/// holds the 32-byte `input_set_hash` and `writer_epoch` holds the
+/// `part_index`. A resolve reads them back verbatim
+/// (`build_segment_ref_from_entry`) to reconstruct the exact same
+/// `SegmentRef` a live listing builds from the record and part directly
+/// (`build_l1_segment_ref`), keyed by `reconstruct_l1_part_key`. `level` is
+/// pinned to 1: the resolver treats every compaction record as an L1 part
+/// regardless of its declared level, and the fold matches that.
+fn build_l1_snapshot_entry(
+    key: &str,
+    record: &CompactionRecord,
+    part: &CompactionPart,
+    coverage: &mut declared_stats::StampCoverage,
+) -> Result<SnapshotEntry, CatalogError> {
+    if record.input_set_hash.len() != 32 {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "input_set_hash",
+            expected: "32 bytes".to_string(),
+            actual: format!("{} bytes", record.input_set_hash.len()),
+        });
+    }
+    if part.content_hash.len() != 32 {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "part content_hash",
+            expected: "32 bytes".to_string(),
+            actual: format!("{} bytes", part.content_hash.len()),
+        });
+    }
+    Ok(SnapshotEntry {
+        level: 1,
+        shard: record.shard,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        writer_id: record.input_set_hash.clone(),
+        writer_epoch: u64::from(part.part_index),
+        writer_seq: 0,
+        content_hash: part.content_hash.clone(),
+        object_size: part.object_size,
+        min_event_ts_ns: part.min_event_ts_ns,
+        max_event_ts_ns: part.max_event_ts_ns,
+        sample_count: part.sample_count,
+        series_count: part.series_count,
+        segment_format_version: part.segment_format_version,
+        created_unix_ns: record.created_unix_ns,
+        // The part's own stamps (CompactionPart field 12), gated against the
+        // part's own row count exactly as the L0 path gates a commit record's
+        // (ADR-0873 decision 4), and tallied into the same coverage pair: a
+        // stamped entry built here counts as much as one built from an L0
+        // record.
+        declared_column_stats: declared_stats::carry_compaction_part(part, coverage),
+    })
+}
+
+/// Build a level-1 [`SnapshotEntry`] for one part of a [`RewriteRecord`]
+/// (ADR-0064 decision 3 point 5: rewrite outputs fold in exactly as compaction
+/// parts do). Identical entry shape to [`build_l1_snapshot_entry`]: the frozen
+/// entry has no dedicated L1-identity field, so `writer_id` carries the
+/// rewrite's 32-byte `input_set_hash` and `writer_epoch` carries the
+/// `part_index`. A resolve reconstructs the part key from these via
+/// `reconstruct_rewrite_part_key`, matching what a live listing builds
+/// (`build_rewrite_l1_segment_ref`).
+fn build_rewrite_l1_snapshot_entry(
+    key: &str,
+    record: &RewriteRecord,
+    part: &CompactionPart,
+) -> Result<SnapshotEntry, CatalogError> {
+    if record.input_set_hash.len() != 32 {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "input_set_hash",
+            expected: "32 bytes".to_string(),
+            actual: format!("{} bytes", record.input_set_hash.len()),
+        });
+    }
+    if part.content_hash.len() != 32 {
+        return Err(CatalogError::FieldMismatch {
+            key: key.to_string(),
+            field: "part content_hash",
+            expected: "32 bytes".to_string(),
+            actual: format!("{} bytes", part.content_hash.len()),
+        });
+    }
+    Ok(SnapshotEntry {
+        level: 1,
+        shard: record.shard,
+        ingest_hour_bucket: record.ingest_hour_bucket,
+        writer_id: record.input_set_hash.clone(),
+        writer_epoch: u64::from(part.part_index),
+        writer_seq: 0,
+        content_hash: part.content_hash.clone(),
+        object_size: part.object_size,
+        min_event_ts_ns: part.min_event_ts_ns,
+        max_event_ts_ns: part.max_event_ts_ns,
+        sample_count: part.sample_count,
+        series_count: part.series_count,
+        segment_format_version: part.segment_format_version,
+        created_unix_ns: record.created_unix_ns,
+        // NEVER carried for a rewrite output (ADR-0873 decision 3): the
+        // rewrite dropped rows, so a stamp computed before the drop is stale
+        // for the surviving rows. Every rewrite writer emits empty stamps
+        // today; forcing empty here also refuses a stamped rewrite part from
+        // a buggy or future writer until the recompute path lands with its
+        // own tests and flips this line deliberately. Counted on neither side
+        // of the stamp-coverage pair for the same reason: a carrier that can
+        // never carry would report a permanent shortfall.
+        declared_column_stats: Vec::new(),
+    })
+}
+
+/// Fold one entry into the running set, deduping by commit/part identity.
+/// `is_canonical` marks whether this occurrence sits under the hour directory
+/// its own embedded `ingest_hour_bucket` names. On a duplicate identity the
+/// canonical occurrence is preferred and the collision is counted as layout
+/// drift (docs/catalog-and-mvcc.md key layout: "layout drift must be visible,
+/// not swallowed"), never fatal, since a duplicate identity is a permanent
+/// property of the sealed layout and aborting would block the watermark
+/// forever.
+fn fold_in_entry(
+    entries: &mut Vec<SnapshotEntry>,
+    seen: &mut HashMap<EntryIdentity, (usize, bool)>,
+    layout_drift_count: &mut u64,
+    entry: SnapshotEntry,
+    is_canonical: bool,
+) {
+    match seen.entry(entry_identity(&entry)) {
+        Entry::Vacant(slot) => {
+            slot.insert((entries.len(), is_canonical));
+            entries.push(entry);
+        }
+        Entry::Occupied(mut slot) => {
+            *layout_drift_count += 1;
+            tracing::warn!(
+                level = entry.level,
+                shard = entry.shard,
+                ingest_hour_bucket = entry.ingest_hour_bucket,
+                writer_id = %writer_id_display(&entry.writer_id),
+                writer_epoch = entry.writer_epoch,
+                writer_seq = entry.writer_seq,
+                "duplicate entry identity while folding, preferring the entry in its correct hour directory"
+            );
+            let &(existing_index, existing_canonical) = slot.get();
+            if !existing_canonical && is_canonical {
+                entries[existing_index] = entry;
+                slot.insert((existing_index, true));
+            }
+        }
+    }
+}
+
+/// (shard, hour) pairs newly sealed since `watermark_hour_old`, exclusive of
+/// the old watermark and inclusive of the new one. Each hour's shard fan-out
+/// is its own `scan_count(h)` derived from the generation history (ADR-0052
+/// section 4), not one static count for the whole range, so a fold enumerates
+/// exactly the shard set a live resolve would list for the same hours.
+fn incremental_buckets(
+    generations: &[ShardGeneration],
+    watermark_hour_old: u32,
+    watermark_hour_new: u32,
+) -> Vec<(u32, u32)> {
+    hour_range_buckets(generations, watermark_hour_old + 1, watermark_hour_new)
+}
+
+/// The fan-out ceiling at fold time (ADR-0052 section 5). Delegates to the one
+/// shared [`crate::provisioning::shard_ceiling`] that the reader's head
+/// validation (`snapshot_resolve::head_generations_acceptable`) also calls, so
+/// the value a fold stamps into `SnapshotHead.shard_count` and the value a
+/// reader recomputes to validate that head can never diverge (a decrease
+/// followed by a fold past the slack window used to have the two disagree and
+/// hard-fail every query permanently).
+fn fold_shard_ceiling(generations: &[ShardGeneration], watermark_hour: u32) -> u32 {
+    crate::provisioning::shard_ceiling(generations, watermark_hour)
+}
+
+/// The number of bytes a protobuf varint encodes `v` in: 7 payload bits per
+/// byte, continuation bit set on every byte but the last. Used by the
+/// per-part column-stats degrade loop to track, without re-encoding, how a
+/// message's own length-delimiter width changes when its content shrinks.
+fn varint_len(v: u64) -> u64 {
+    let mut len = 1u64;
+    let mut rest = v >> 7;
+    while rest > 0 {
+        len += 1;
+        rest >>= 7;
+    }
+    len
+}
+
+// Test-only instrumentation for #1482: counts calls to
+// `column_stats_segments_concat` made by the per-part column-stats degrade
+// loop, so a regression test can pin the loop at measuring the body a
+// bounded number of times rather than once per dictionary dropped.
+#[cfg(test)]
+thread_local! {
+    static COLUMN_STATS_CONCAT_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_column_stats_concat_call_for_test() {
+    COLUMN_STATS_CONCAT_CALLS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(test)]
+fn column_stats_concat_calls_for_test() -> u64 {
+    COLUMN_STATS_CONCAT_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_column_stats_concat_calls_for_test() {
+    COLUMN_STATS_CONCAT_CALLS.with(|c| c.set(0));
+}
+
+/// One part's span in the fully-sorted entry set: the `[start, end)` index
+/// range into `entries` and the `[min_hour, watermark_hour]` ingest-hour range
+/// those entries occupy (ADR-0063 section 1). Ranges are disjoint and
+/// ascending across the returned spans because every whole hour lands in
+/// exactly one part and parts are cut only at hour boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PartSpan {
+    start: usize,
+    end: usize,
+    min_hour: u32,
+    watermark_hour: u32,
+}
+
+/// One span's part encoding, computed once and reused by both the
+/// `reused_old_part_hashes` baseline pass and the main per-span build loop,
+/// so a span is encoded and hashed once per fold. `min_hour`/`watermark` are
+/// this span's already-resolved
+/// part bounds (single-part/tail overrides applied), not the raw `PartSpan`
+/// values.
+struct SpanEncoding {
+    min_hour: u32,
+    watermark: u32,
+    bytes: Vec<u8>,
+    hash: blake3::Hash,
+}
+
+/// Partition the fully hour-major-sorted `entries` into hour-range parts under
+/// the sealing policy (ADR-0063 section 1): whole hours accumulate into the
+/// current part until adding the next hour's run would push the part's entry
+/// count past `max_entries`, at which point the part seals at that hour
+/// boundary and a fresh part starts. Splits are always at hour boundaries, so
+/// a single hour larger than `max_entries` produces one oversized part (the
+/// decode cap still bounds it) rather than being split across parts -- which
+/// would break the free per-part duplicate-freedom proof, since the dedup
+/// identity leads with the hour.
+///
+/// Always returns at least one span. An empty entry set yields a single empty
+/// `[0, 0)` span with `min_hour`/`watermark_hour` 0, so an empty fold still
+/// writes one (empty) part exactly as the single-part path always has. Each
+/// span's `watermark_hour` here is the last ingest hour it actually contains;
+/// the caller overrides the tail span's watermark with the fold watermark.
+fn partition_parts(entries: &[SnapshotEntry], max_entries: usize) -> Vec<PartSpan> {
+    if entries.is_empty() {
+        return vec![PartSpan {
+            start: 0,
+            end: 0,
+            min_hour: 0,
+            watermark_hour: 0,
+        }];
+    }
+    // `max_entries == 0` would seal after every hour and never make progress;
+    // clamp to 1 so a part always holds at least one whole hour.
+    let cap = max_entries.max(1);
+    let mut spans = Vec::new();
+    let mut cur_start = 0usize;
+    let mut cur_count = 0usize;
+    let mut cur_min_hour = entries[0].ingest_hour_bucket;
+    let mut i = 0usize;
+    while i < entries.len() {
+        // The contiguous run of entries sharing this ingest hour (entries are
+        // hour-major sorted, so equal hours are adjacent).
+        let hour = entries[i].ingest_hour_bucket;
+        let run_start = i;
+        while i < entries.len() && entries[i].ingest_hour_bucket == hour {
+            i += 1;
+        }
+        let run_len = i - run_start;
+        // Seal the current part at this hour boundary if it already holds
+        // entries and admitting this whole hour would exceed the cap.
+        if cur_count > 0 && cur_count + run_len > cap {
+            spans.push(PartSpan {
+                start: cur_start,
+                end: run_start,
+                min_hour: cur_min_hour,
+                watermark_hour: entries[run_start - 1].ingest_hour_bucket,
+            });
+            cur_start = run_start;
+            cur_count = 0;
+            cur_min_hour = hour;
+        }
+        cur_count += run_len;
+    }
+    spans.push(PartSpan {
+        start: cur_start,
+        end: entries.len(),
+        min_hour: cur_min_hour,
+        watermark_hour: entries[entries.len() - 1].ingest_hour_bucket,
+    });
+    spans
+}
+
+/// One `(shard, hour)` commit bucket's contribution to the fold: each entry it
+/// should fold in paired with that entry's `is_canonical` flag (whether the
+/// occurrence sits under the hour directory its own embedded
+/// `ingest_hour_bucket` names). Compaction L1 parts first, then unsuperseded L0
+/// commit records; empty when the bucket is tombstoned or holds nothing
+/// foldable. Produced by the shared [`Catalog::classify_bucket`] so both the
+/// incremental fold loop and the reconcile pass (ADR-0063 section 4) derive a
+/// bucket's state one way only, never two subtly different ways.
+type BucketContribution = Vec<(SnapshotEntry, bool)>;
+
+/// The reconcile pass only needs to touch a window bucket whose commit-record
+/// set could differ from what a past fold folded. The seal lemma
+/// (docs/catalog-and-mvcc.md "Sealed hours") makes the L0 set of a sealed
+/// bucket immutable, so a bucket holding only L0 records is guaranteed
+/// unchanged and can be skipped without a GET. A compaction record, a
+/// retention tombstone, or a selective-erasure rewrite record (ADR-0064
+/// decision 3) can all land after an hour was sealed and folded, so those
+/// three shapes are the reconcile triggers.
+///
+/// A rewrite record is load-bearing here, not an incidental addition: the
+/// rewrite pass targets already-sealed (already-folded) buckets by
+/// construction (ADR-0064 §3.1 scopes it to sealed buckets), so without this
+/// trigger a rewrite would never be picked up by the incremental fold path at
+/// all -- the folded snapshot would keep serving the rewrite's pre-erasure
+/// inputs indefinitely for any hour outside `incremental_buckets`' range,
+/// since those objects stay physically present (GET-able) until the
+/// horizon-gated sweep runs, so there is no NotFound-driven re-resolve to
+/// force a refresh either. This is the mechanism ADR-0064 §4's "the next
+/// fold rebuilds snapshots over the rewrite outputs" claim depends on; that
+/// claim is honest only within `fold_reconcile_window_hours` of the fold
+/// that observes it -- see the amendment note in
+/// docs/adrs/0064-selective-subject-erasure.md §4.
+fn bucket_needs_reconcile(listing: &[ObjectMeta]) -> bool {
+    listing.iter().any(|meta| {
+        matches!(
+            keys::partition_bucket_entry(&meta.key),
+            Ok(BucketEntry::CompactionRecord(_))
+                | Ok(BucketEntry::Tombstone(_))
+                | Ok(BucketEntry::RewriteRecord(_))
+        )
+    })
+}
+
+/// Dedup one bucket's classified contribution by entry identity, preferring
+/// the canonical occurrence, reusing [`fold_in_entry`]'s exact rule so the
+/// reconcile pass and the incremental path resolve a within-bucket duplicate
+/// identically. Within a single bucket a duplicate identity is near-impossible
+/// (it would take two records with the same identity in one directory), so the
+/// throwaway drift counter here is expected to stay zero.
+fn dedup_contribution(items: Vec<(SnapshotEntry, bool)>) -> Vec<SnapshotEntry> {
+    let mut out: Vec<SnapshotEntry> = Vec::new();
+    let mut seen: HashMap<EntryIdentity, (usize, bool)> = HashMap::new();
+    let mut drift = 0u64;
+    for (entry, is_canonical) in items {
+        fold_in_entry(&mut out, &mut seen, &mut drift, entry, is_canonical);
+    }
+    out
+}
+
+/// Whether two entry sets for one bucket are identical ignoring order: same
+/// identities and, for each, byte-identical [`SnapshotEntry`] content. Used by
+/// the reconcile pass to decide whether a re-listed bucket's current
+/// contribution differs from what the in-progress `entries` already reflect.
+/// Sorting by identity is safe: identity is unique within a deduped
+/// contribution, so the sort is total and the elementwise compare is exact.
+fn same_entry_set(a: &mut [SnapshotEntry], b: &mut [SnapshotEntry]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.sort_by_key(entry_identity);
+    b.sort_by_key(entry_identity);
+    a == b
+}
+
+/// `(shard, hour)` pairs for every hour in the inclusive range `[lo, hi]`, one
+/// per shard in that hour's own `scan_count(h)` fan-out (ADR-0052 section 4).
+/// `lo > hi` yields no buckets. Shared by the incremental range
+/// ([`incremental_buckets`]) and the reconcile window (ADR-0063 section 4) so
+/// both enumerate exactly the shard set a live resolve would list.
+fn hour_range_buckets(generations: &[ShardGeneration], lo: u32, hi: u32) -> Vec<(u32, u32)> {
+    let mut buckets = Vec::new();
+    for hour in lo..=hi {
+        let scan = scan_count(generations, hour, DEFAULT_SCAN_SLACK_HOURS);
+        for shard in 0..scan {
+            buckets.push((shard, hour));
+        }
+    }
+    buckets
+}
+
+/// The newest ingest hour at or approaching the retention frontier for a
+/// tenant with retention window `R` (`retention_window_ns`) and protection
+/// horizon `protection_horizon_ns` at fold time `now_ns` (ADR-0020
+/// delete-blocker, retirement-frontier half). Retention (ADR-0019) tombstones
+/// a bucket once its newest event is older than `R`; conservatively every hour
+/// whose end is at or before `now - R` may already be tombstoned, so `now - R`
+/// is the frontier. The `+ protection_horizon` look-ahead extends it so hours
+/// approaching the frontier are pre-listed and an appearing tombstone is caught
+/// the fold it lands, a full horizon before the sweep may delete the objects
+/// that hour still names. `None` when the cutoff predates the epoch (no hour is
+/// near the frontier yet).
+fn retirement_frontier_hour(
+    now_ns: i64,
+    retention_window_ns: i64,
+    protection_horizon_ns: i64,
+) -> Option<u32> {
+    let cutoff_ns = now_ns
+        .saturating_sub(retention_window_ns)
+        .saturating_add(protection_horizon_ns);
+    if cutoff_ns < 0 {
+        return None;
+    }
+    u32::try_from(cutoff_ns.div_euclid(NS_PER_HOUR)).ok()
+}
+
+/// `(shard, hour)` pairs for an explicit, arbitrary set of ingest hours, one
+/// per shard in each hour's own `scan_count(h)` fan-out (ADR-0052 section 4).
+/// Both sparse reconcile passes need this shape, which
+/// [`hour_range_buckets`]' contiguous `[lo, hi]` range cannot express: the
+/// retention-frontier reconcile (ADR-0020) over the snapshot-named hours at or
+/// below the frontier, and the targeted re-fold pass (issue #526) over the
+/// hours a [`RefoldRequest`] names.
+fn hour_set_buckets(generations: &[ShardGeneration], hours: &[u32]) -> Vec<(u32, u32)> {
+    let mut buckets = Vec::new();
+    for &hour in hours {
+        let scan = scan_count(generations, hour, DEFAULT_SCAN_SLACK_HOURS);
+        for shard in 0..scan {
+            buckets.push((shard, hour));
+        }
+    }
+    buckets
+}
+
+/// Whether a previous HEAD's part covers any dirty reconcile hour, so it must
+/// NOT be carried forward by reference this fold (ADR-0063 section 4). A dirty
+/// part is always re-encoded and re-PUT through the normal path: fail toward
+/// re-PUTting fresh content, never toward silently keeping a stale part, even
+/// in the (impossible-by-content-addressing) case where the recomputed hash
+/// still coincided with the old ref.
+fn part_covers_dirty_hour(part: &SnapshotPartRef, dirty_hours: &HashSet<u32>) -> bool {
+    dirty_hours
+        .iter()
+        .any(|&h| part.min_hour <= h && h <= part.watermark_hour)
+}
+
+impl Catalog {
+    /// Fold previous snapshot parts plus newly sealed commit buckets into a
+    /// new snapshot part and CAS-swap HEAD to name it.
+    /// Never runs on the ingest or
+    /// query path.
+    ///
+    /// `now_ns` and `folder_id` are always caller-supplied: this crate never
+    /// reads a clock or generates randomness. `folder_id` should be a fresh
+    /// UUIDv4 per folder process start (proto/ravel/catalog.proto,
+    /// `SnapshotHead.folder_id`).
+    ///
+    /// Compaction and retention are folded in from the same per-bucket
+    /// listing this fold already performs: a bucket's `CompactionRecord`s contribute their parts as
+    /// level-1 entries and supersede their named L0 inputs, and a bucket
+    /// holding a `RetentionTombstone` contributes nothing. No separate
+    /// discovery mechanism is needed, so `transactions` stays an unused
+    /// extension point ([`Transaction`] has no public constructor).
+    ///
+    /// Returns `Ok` with `no_op: true` if no hour has newly sealed since the
+    /// last fold. Every other failure mode that the metric index is allowed
+    /// to degrade from (absent/corrupt HEAD, an unreadable previous part)
+    /// falls back to a full rebuild from the commit layout rather than
+    /// erroring. An unrecognized bucket-key shape or a duplicate commit
+    /// identity is a permanent property of the sealed layout, not a
+    /// transient fault: rather than failing every subsequent fold
+    /// identically forever, these are counted in
+    /// [`FoldReport::layout_drift_count`], logged at `warn!` with the
+    /// offending key/identity, and skipped (see the bucket-processing loop
+    /// below). Only a malformed commit record or exhausted HEAD CAS retries
+    /// surface as [`CatalogError`].
+    ///
+    /// `default_retention_ns` is the caller-resolved deployment-level default
+    /// retention window for this tenant (from the CLI-derived `RetentionConfig`
+    /// in ravel-maintain, resolved by the caller via `window_for`), or `None`
+    /// if no deployment default is configured. `ravel-catalog` never sees
+    /// `RetentionConfig` itself: the dependency runs the other way (see
+    /// [`crate::config::DEFAULT_PROTECTION_HORIZON_NS`] for the same
+    /// one-directional mirroring precedent). The frontier reconcile below
+    /// overlays the durable per-tenant `TenantConfig.retention_ns` on top of
+    /// this default.
+    pub async fn fold(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
+        transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+    ) -> Result<FoldReport, CatalogError> {
+        self.fold_with_refold_request(
+            tenant,
+            signal,
+            folder_id,
+            now_ns,
+            transactions,
+            default_retention_ns,
+            &RefoldRequest::new(),
+        )
+        .await
+    }
+
+    /// [`Catalog::fold`], plus a targeted re-fold of the ingest hours
+    /// `refold_request` names (issue #526).
+    ///
+    /// The fixed reconcile window reaches only
+    /// `fold_reconcile_window_hours` behind the previous watermark and the
+    /// retention-frontier band reaches only the hours near the tenant's
+    /// retirement frontier. A compaction or rewrite record that lands in an
+    /// already-folded hour between those two bands is never observed by any
+    /// later fold, so the snapshot keeps naming that hour's pre-rewrite
+    /// inputs, the maintain tier's superseded-input sweep holds those objects
+    /// on its HEAD-reachability gate (ADR-0020), and they occupy storage until
+    /// retention drops the hour. This entry point is how the holder tells the
+    /// fold which hours to re-list; see [`RefoldRequest`] for why the fold
+    /// cannot derive that set itself.
+    ///
+    /// The requested hours are reconciled through exactly the same per-bucket
+    /// path as the other two passes, so a re-fold can only ever make the
+    /// snapshot agree with the commit layout. The pass is bounded by
+    /// `frontier_reconcile_max_hours`, skips hours the other two passes already
+    /// list, and skips hours the snapshot does not name (a re-fold of an hour
+    /// no part covers would be pure cost). It also inherits ADR-0063 section
+    /// 4's carve-outs: a first fold and a rebuild do no reconcile work at all,
+    /// so a request made against either is ignored rather than adding LISTs to
+    /// a fold that already derives every hour from the commit layout.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fold_with_refold_request(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
+        transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+        refold_request: &RefoldRequest,
+    ) -> Result<FoldReport, CatalogError> {
+        let result = self
+            .fold_inner(
+                tenant,
+                signal,
+                folder_id,
+                now_ns,
+                transactions,
+                default_retention_ns,
+                refold_request,
+            )
+            .await;
+        self.record_fold_outcome(signal, now_ns, result.is_ok());
+        result
+    }
+
+    /// The fold body. Wrapped by [`Catalog::fold`] rather than instrumented
+    /// in place because the body returns from a dozen points and through `?`,
+    /// and a counter maintained at each of those is a counter that a later
+    /// early return silently stops feeding.
+    #[allow(clippy::too_many_arguments)]
+    async fn fold_inner(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        folder_id: Uuid,
+        now_ns: i64,
+        _transactions: &[Transaction],
+        default_retention_ns: Option<i64>,
+        refold_request: &RefoldRequest,
+    ) -> Result<FoldReport, CatalogError> {
+        let head_key = head_object_key(tenant, signal);
+        // Fold never runs on the query path (module docs above) and keeps
+        // its own `RequestCounters`; this handle exists only to satisfy the
+        // shared cache/load API's `QueryAccounting` parameter and is discarded.
+        // Declared before the generation read so that read's own GET (issue
+        // #729: it now funnels through `guarded_get`) has a handle to charge,
+        // discarded like every other fold-path GET.
+        let accounting = QueryAccounting::new();
+        // The generation history for the read-side scan rule (ADR-0052 section
+        // 4/5), read fresh (see `Catalog::read_scan_generations`). A fold must
+        // enumerate the same per-hour shard set a resolve would, and records
+        // the fan-out ceiling and generation count into the HEAD it writes.
+        let generations = self
+            .read_scan_generations(tenant, signal, &accounting)
+            .await?;
+        let shard_generation_count = generations.len() as u32;
+        let mut counters = RequestCounters::default();
+        // Fold the generation-history read's GET(s) into the fold's own
+        // counters. Under provisioning enforcement `read_scan_generations`
+        // funnels one provisioning-record GET through `guarded_get` (issue
+        // #729), charged only to the `accounting` handle this fold otherwise
+        // discards; without counting it here `FoldReport.get_requests`
+        // under-reports the store's real GETs by exactly one whenever
+        // enforcement is on (issue #770). The snapshot is taken before the
+        // retry loop reuses `accounting`, so it captures only this pre-loop
+        // read; every in-loop guarded GET is counted explicitly at its call
+        // site. With enforcement off the read issues no store request and this
+        // adds zero.
+        counters.get_requests += accounting.snapshot().s3_requests(AccountedOp::Get);
+        let mut attempt: u32 = 0;
+
+        // The tenant's effective retention window, read once per fold
+        // (loop-invariant). Bounds the retention-frontier reconcile pass below
+        // (ADR-0020 delete-blocker). Resolution mirrors the admission-limit
+        // overlay in crates/ravel-ingest/src/lifecycle.rs (ADR-0078): the
+        // durable per-tenant `TenantConfig.retention_ns` override wins when the
+        // record exists and carries `Some`; otherwise the effective window is
+        // `default_retention_ns`, the caller-resolved deployment-wide default.
+        // A `TenantConfig` read failure or absent record is NOT "skip the
+        // frontier reconcile": it means "fall back to the deployment default,"
+        // which does not depend on that read at all. Only a tenant with neither
+        // a per-tenant override nor a deployment default gets no frontier
+        // reconcile (nothing is being retired). The fold's index role is a pure
+        // optimization and the sweep's HEAD-reachability gate is the durable
+        // delete blocker, so a config-read fault never fails the fold.
+        let tenant_config = match crate::tenant_config::read_config_values(self.store(), tenant)
+            .await
+        {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    tenant = %tenant.to_hex(),
+                    "tenant config read failed; falling back to deployment-default retention and no typed attribute columns"
+                );
+                None
+            }
+        };
+        let tenant_retention_ns: Option<i64> = crate::tenant_config::resolve_retention_window(
+            tenant_config.as_ref(),
+            default_retention_ns,
+        );
+        // ADR-0850: the tenant's configured typed logs attribute columns, if
+        // any. `None`/absent config/a read failure all mean "no configured
+        // columns" -- unlike `retention_ns`, `typed_attr_columns` has no
+        // deployment-wide default threaded through `fold` (ravel-bench's own
+        // consumer of this field treats absence the same way), so a fold
+        // simply builds no column-stats artifact for that tenant.
+        let typed_attr_columns: Vec<DeclaredTypedColumn> = tenant_config
+            .and_then(|cfg| cfg.typed_attr_columns)
+            .unwrap_or_default();
+        // Count the tenant-config record GET. `read_config_values` issues one
+        // raw `store.get` per fold on every outcome (hit, absent, or error) and
+        // takes neither a counters nor an accounting handle, so it is otherwise
+        // invisible to the report. Read once before the retry loop, so it is one
+        // GET per fold regardless of how many CAS attempts the loop makes.
+        counters.get_requests += 1;
+
+        // One tally cache for the WHOLE fold, CAS retries included: a lost
+        // HEAD CAS restarts the loop, and a cache constructed inside it would
+        // discard every successful tally and refetch the same objects on the
+        // next attempt. The declared columns, tenant, and signal are fixed for
+        // the fold, and a failed tally is never cached, so reuse across
+        // attempts is safe by the cache's own contract.
+        let mut column_stats_cache =
+            column_stats_build::SegmentColumnStatsCache::new(&typed_attr_columns);
+
+        loop {
+            let head_state = self.get_head(&head_key, &mut counters).await?;
+
+            let Some(watermark_hour) = sealed_watermark_hour(now_ns, self.config()) else {
+                return Ok(no_op_report(head_state.watermark_hour(), counters));
+            };
+            if let Some(watermark_hour_old) = head_state.watermark_hour()
+                && watermark_hour_old >= watermark_hour
+            {
+                return Ok(no_op_report(Some(watermark_hour_old), counters));
+            }
+
+            let (mut entries, buckets, rebuilt, previous_entries_len) = match &head_state {
+                HeadState::Valid { head, .. } => match self
+                    .load_previous_entries(head, &mut counters)
+                    .await
+                {
+                    Ok(entries) => {
+                        let buckets =
+                            incremental_buckets(&generations, head.watermark_hour, watermark_hour);
+                        let previous_entries_len = entries.len();
+                        (entries, buckets, false, previous_entries_len)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            tenant = %tenant.to_hex(),
+                            "previous snapshot part unreadable, rebuilding from commit layout"
+                        );
+                        let buckets = self
+                            .discover_buckets(
+                                tenant,
+                                signal,
+                                &generations,
+                                watermark_hour,
+                                &mut counters,
+                            )
+                            .await?;
+                        (Vec::new(), buckets, true, 0)
+                    }
+                },
+                HeadState::Absent | HeadState::Corrupt { .. } => {
+                    let buckets = self
+                        .discover_buckets(
+                            tenant,
+                            signal,
+                            &generations,
+                            watermark_hour,
+                            &mut counters,
+                        )
+                        .await?;
+                    (Vec::new(), buckets, true, 0)
+                }
+                // A newer-format HEAD is not rebuildable (ADR-0066 decision
+                // 2): rebuilding a single-part HEAD here would CAS-overwrite
+                // whatever the newer format carries. Fail loudly so the
+                // operator sees this process is too old for this HEAD, rather
+                // than falling into the `Corrupt`/`Absent` rebuild path.
+                HeadState::UnsupportedVersion { format_version, .. } => {
+                    return Err(CatalogError::UnsupportedHeadVersion {
+                        format_version: *format_version,
+                    });
+                }
+            };
+
+            // The old watermark the reconcile pass anchors its window to,
+            // present ONLY for an incremental fold from a trusted HEAD. Absent
+            // (`None`) on the first fold (no previous watermark) and on any
+            // rebuild (the rebuild already re-derived every hour), which
+            // together skip the reconcile pass entirely (ADR-0063 section 4).
+            let reconcile_watermark: Option<u32> = match &head_state {
+                HeadState::Valid { head, .. } if !rebuilt => Some(head.watermark_hour),
+                _ => None,
+            };
+
+            // Identity -> (index in `entries`, whether that occurrence sits
+            // under the hour directory its own embedded ingest_hour_bucket
+            // names). Entries loaded from a previous part already survived
+            // this same check in an earlier fold, so they seed the map as
+            // trivially canonical.
+            let mut seen: HashMap<EntryIdentity, (usize, bool)> = entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry_identity(entry), (index, true)))
+                .collect();
+            let mut layout_drift_count: u64 = 0;
+            // ADR-0873 stamp coverage for this fold attempt. Threaded through
+            // the classifier like `layout_drift_count` rather than kept in a
+            // thread-local: the fold is an async fn that can migrate threads
+            // across any of its awaits, and a retried attempt must start from
+            // zero rather than double-count the records the abandoned attempt
+            // already read.
+            let mut coverage = declared_stats::StampCoverage::default();
+
+            // Discover each (shard, hour) bucket's keys concurrently, bounded
+            // by `fold_bucket_concurrency` (ADR-0063 section 3), mirroring the
+            // resolve path's `buffered` fan-out. `buffered`
+            // preserves input order, so the discovered buckets are merged in
+            // the same deterministic bucket order the serial loop used, keeping
+            // the fold byte-for-byte reproducible (content addressing depends
+            // on it). Only the LIST discovery is parallel; per-record GETs and
+            // the dedup merge below stay serial in bucket order.
+            let bucket_listings = self
+                .discover_bucket_listings(tenant, signal, &buckets)
+                .await?;
+            counters.list_requests += buckets.len() as u64;
+
+            for (shard, hour, listing) in &bucket_listings {
+                // Classify the bucket into its contribution via the shared
+                // classifier the reconcile pass also uses (ADR-0063 section 4,
+                // ADR-0064 decision 3), then fold each contributed entry into
+                // the running set. A tombstoned bucket classifies to an empty
+                // contribution, so it folds nothing in (ADR-0019 section 3).
+                let contribution = self
+                    .classify_bucket(
+                        tenant,
+                        signal,
+                        *shard,
+                        *hour,
+                        listing,
+                        &accounting,
+                        &mut counters,
+                        &mut layout_drift_count,
+                        &mut coverage,
+                    )
+                    .await?;
+                for (entry, is_canonical) in contribution {
+                    fold_in_entry(
+                        &mut entries,
+                        &mut seen,
+                        &mut layout_drift_count,
+                        entry,
+                        is_canonical,
+                    );
+                }
+            }
+
+            // ---- Reconcile pass (ADR-0063 section 4) ----
+            //
+            // `incremental_buckets` only lists hours STRICTLY AFTER the
+            // previous fold's watermark, so a compaction record or retention
+            // tombstone published into an hour that was already sealed and
+            // folded into a PAST fold's output is never rediscovered by any
+            // later incremental fold. Re-list a bounded window of already-
+            // sealed hours and diff each bucket's current contribution against
+            // what the in-progress `entries` (seeded from the previous fold's
+            // own output for every hour outside the incremental range) already
+            // reflect. A bucket whose contribution changed updates `entries`
+            // and marks its covering part dirty so it is re-encoded and re-PUT
+            // rather than carried forward by reference. The findings fold into
+            // THIS fold attempt's single HEAD CAS below, never a second CAS.
+            //
+            // Skipped on the first fold for a tenant (`Absent`: no previous
+            // watermark exists) and on a rebuilt fold (`rebuilt`: the rebuild
+            // already re-derives every hour from the commit layout, so a
+            // reconcile pass would redo the same work over the same buckets).
+            let mut dirty_hours: HashSet<u32> = HashSet::new();
+            let mut frontier_hours_reconciled: u64 = 0;
+            let mut frontier_hours_deferred: u64 = 0;
+            // Hours the retention-frontier pass listed this fold, so the
+            // targeted re-fold pass below does not list any of them a second
+            // time (issue #526).
+            let mut frontier_listed_hours: HashSet<u32> = HashSet::new();
+            let mut refold_hours_reconciled: u64 = 0;
+            if let Some(watermark_hour_old) = reconcile_watermark {
+                let window = self.config().fold_reconcile_window_hours;
+                let lo = watermark_hour_old.saturating_sub(window);
+                // Inclusive at both ends: `watermark_hour_old` is the boundary
+                // `incremental_buckets` already excludes, so the reconcile
+                // window and the incremental range are adjacent, not
+                // overlapping.
+                let reconcile_buckets = hour_range_buckets(&generations, lo, watermark_hour_old);
+                let reconcile_listings = self
+                    .discover_bucket_listings(tenant, signal, &reconcile_buckets)
+                    .await?;
+                counters.list_requests += reconcile_buckets.len() as u64;
+
+                for (shard, hour, listing) in &reconcile_listings {
+                    self.reconcile_one_bucket(
+                        tenant,
+                        signal,
+                        *shard,
+                        *hour,
+                        listing,
+                        &accounting,
+                        &mut entries,
+                        &mut seen,
+                        &mut dirty_hours,
+                        &mut counters,
+                        &mut layout_drift_count,
+                        &mut coverage,
+                    )
+                    .await?;
+                }
+
+                // ---- Retention-frontier reconcile (ADR-0020 delete-blocker) ----
+                //
+                // The fixed window above reaches only `fold_reconcile_window_hours`
+                // behind the watermark. A retention tombstone (ADR-0019) is
+                // written at its own bucket's ingest-hour key, which is `R` (the
+                // tenant's retention window) behind the watermark -- far outside
+                // that window for any realistic `R`. Left unobserved, the snapshot
+                // keeps naming the retired bucket's segments forever, and the
+                // horizon-gated physical sweep would (absent its own HEAD gate)
+                // delete objects a HEAD-referenced snapshot still names. So the
+                // fold ALSO reconciles the bounded set of snapshot-named hours at
+                // or approaching the tenant's retirement frontier. This is the
+                // fold half of ADR-0020's "GC must treat reachability from
+                // HEAD-referenced snapshots (within the protection horizon) as a
+                // delete blocker": it makes the sweep's block clear on its own by
+                // dropping a tombstoned bucket from the snapshot promptly, rather
+                // than leaving the sweep permanently blocked on a bucket no fold
+                // ever drops.
+                //
+                // Frontier derivation (docs/catalog-and-mvcc.md): a bucket whose
+                // end is at or before `now - R` may already be tombstoned;
+                // `frontier_hi` pushes that forward by the protection horizon so
+                // hours *approaching* the frontier are pre-listed and an appearing
+                // tombstone is caught the fold it lands, a full horizon before the
+                // sweep may delete. Candidates are the snapshot-named hours at or
+                // below `frontier_hi` and below the fixed window (which already
+                // covers the near-watermark region), reconciled oldest-first (an
+                // object is deletable `protection_horizon` after its tombstone, so
+                // the oldest still-named hours are closest to deletion) and capped
+                // at `frontier_reconcile_max_hours`; the remainder is carried to
+                // the next fold via `frontier_hours_deferred` (the snapshot still
+                // names those hours, so the next fold recomputes them), never
+                // dropped. `tenant_retention_ns` is the tenant's effective
+                // retention window: the durable `TenantConfig.retention_ns`
+                // override when present, else the deployment-wide default
+                // (ADR-0078). A tenant with neither gets no frontier reconcile
+                // (nothing is being retired).
+                if let Some(retention_window_ns) = tenant_retention_ns
+                    && let Some(frontier_hi_raw) = retirement_frontier_hour(
+                        now_ns,
+                        retention_window_ns,
+                        self.config().protection_horizon_ns,
+                    )
+                {
+                    // Cap the band's top strictly below the fixed window so no
+                    // bucket is listed by both passes.
+                    let frontier_hi = frontier_hi_raw.min(lo.saturating_sub(1));
+                    let mut candidate_hours: Vec<u32> = {
+                        let mut hs: HashSet<u32> = HashSet::new();
+                        for entry in entries.iter() {
+                            if entry.ingest_hour_bucket <= frontier_hi {
+                                hs.insert(entry.ingest_hour_bucket);
+                            }
+                        }
+                        hs.into_iter().collect()
+                    };
+                    // Oldest-first: the hours closest to physical deletion are
+                    // reconciled before the cap is spent.
+                    candidate_hours.sort_unstable();
+                    let cap = self.config().frontier_reconcile_max_hours as usize;
+                    let take = candidate_hours.len().min(cap);
+                    frontier_hours_deferred = (candidate_hours.len() - take) as u64;
+                    let frontier_hours = &candidate_hours[..take];
+                    if !frontier_hours.is_empty() {
+                        let frontier_buckets = hour_set_buckets(&generations, frontier_hours);
+                        let frontier_listings = self
+                            .discover_bucket_listings(tenant, signal, &frontier_buckets)
+                            .await?;
+                        counters.list_requests += frontier_buckets.len() as u64;
+                        frontier_hours_reconciled = frontier_hours.len() as u64;
+                        frontier_listed_hours.extend(frontier_hours.iter().copied());
+                        for (shard, hour, listing) in &frontier_listings {
+                            self.reconcile_one_bucket(
+                                tenant,
+                                signal,
+                                *shard,
+                                *hour,
+                                listing,
+                                &accounting,
+                                &mut entries,
+                                &mut seen,
+                                &mut dirty_hours,
+                                &mut counters,
+                                &mut layout_drift_count,
+                                &mut coverage,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+
+                // ---- Targeted re-fold pass (issue #526) ----
+                //
+                // The two passes above are bounded by recency and by the
+                // retention frontier. A compaction or rewrite record that
+                // lands in an already-folded hour between those bands is
+                // reached by neither, so the snapshot keeps naming that hour's
+                // pre-rewrite inputs; the superseded-input sweep's
+                // HEAD-reachability gate (ADR-0020) then holds those objects
+                // instead of deleting them, and they occupy storage until
+                // retention drops the hour. `refold_request` is how the holder
+                // names those hours (see `RefoldRequest` for why the fold
+                // cannot derive them itself), and this pass re-lists them
+                // through the same per-bucket reconcile the other two use.
+                //
+                // Three filters keep the pass targeted, and together they are
+                // what bounds its work to the hours that can actually be
+                // leaking:
+                //
+                // - `< lo` drops anything the fixed window already lists,
+                //   which also drops every hour at or above the old watermark
+                //   (the incremental range folds those fresh this cycle).
+                // - `!frontier_listed_hours` drops what the frontier pass just
+                //   listed, so no bucket is listed twice in one fold.
+                // - `named_hours` drops hours no snapshot entry covers. Such an
+                //   hour cannot be blocking a delete on HEAD reachability, so
+                //   listing it is pure cost.
+                //
+                // Whatever survives is capped oldest-first, so one caller
+                // reporting a large blocked set cannot turn a fold into an
+                // unbounded LIST fan-out.
+                //
+                // The cap is `frontier_reconcile_max_hours`, read from the
+                // runtime config rather than from its default, which is what
+                // makes "the two sparse passes share one cap" true for an
+                // operator who lowers it and not only for one who leaves it
+                // alone. The bound suits both for the same reason: it sits far
+                // above the steady-state set, so it only ever bounds a recovery
+                // case.
+                //
+                // The remainder is not tracked in the snapshot: the requester
+                // re-derives its blocked set each pass, so a still-blocked hour
+                // comes back on the next request.
+                if !refold_request.is_empty() {
+                    let named_hours: HashSet<u32> =
+                        entries.iter().map(|e| e.ingest_hour_bucket).collect();
+                    // `RefoldRequest` iterates ascending, so this is
+                    // oldest-first without a sort: the hours whose held inputs
+                    // have occupied storage longest are reconciled before the
+                    // cap is spent.
+                    let candidates: Vec<u32> = refold_request
+                        .hours()
+                        .filter(|hour| {
+                            *hour < lo
+                                && !frontier_listed_hours.contains(hour)
+                                && named_hours.contains(hour)
+                        })
+                        .collect();
+                    let cap = self.config().frontier_reconcile_max_hours as usize;
+                    let take = candidates.len().min(cap);
+                    if take < candidates.len() {
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            requested = candidates.len(),
+                            reconciled = take,
+                            "targeted re-fold request exceeds the per-fold cap; the remainder is \
+                             carried to whichever later fold the requester asks for it again"
+                        );
+                    }
+                    let refold_hours = &candidates[..take];
+                    if !refold_hours.is_empty() {
+                        let refold_buckets = hour_set_buckets(&generations, refold_hours);
+                        let refold_listings = self
+                            .discover_bucket_listings(tenant, signal, &refold_buckets)
+                            .await?;
+                        counters.list_requests += refold_buckets.len() as u64;
+                        refold_hours_reconciled = refold_hours.len() as u64;
+                        for (shard, hour, listing) in &refold_listings {
+                            self.reconcile_one_bucket(
+                                tenant,
+                                signal,
+                                *shard,
+                                *hour,
+                                listing,
+                                &accounting,
+                                &mut entries,
+                                &mut seen,
+                                &mut dirty_hours,
+                                &mut counters,
+                                &mut layout_drift_count,
+                                &mut coverage,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            if refold_hours_reconciled > 0 {
+                tracing::debug!(
+                    tenant = %tenant.to_hex(),
+                    hours = refold_hours_reconciled,
+                    "fold reconciled the ingest hours a re-fold request named"
+                );
+            }
+            // A reconcile that changed any hour invalidates the append-only,
+            // stable-ordinal assumption the forward postings merge relies on
+            // (a superseded or removed entry shifts every later ordinal), so
+            // postings must be rebuilt from scratch this fold, exactly as on
+            // the rebuild path.
+            let reconciled = !dirty_hours.is_empty();
+
+            entries.sort_by(|a, b| {
+                (
+                    a.ingest_hour_bucket,
+                    a.shard,
+                    a.writer_id.as_slice(),
+                    a.writer_epoch,
+                    a.writer_seq,
+                )
+                    .cmp(&(
+                        b.ingest_hour_bucket,
+                        b.shard,
+                        b.writer_id.as_slice(),
+                        b.writer_epoch,
+                        b.writer_seq,
+                    ))
+            });
+
+            let signal_num = signal::to_proto(signal) as u32;
+            // The part/HEAD `shard_count` is the fan-out ceiling at fold time
+            // (ADR-0052 section 5), not this process's static config value.
+            let shard_ceiling = fold_shard_ceiling(&generations, watermark_hour);
+
+            // Partition the fully-sorted entry set into hour-range parts under
+            // the sealing policy (ADR-0063 section 1): whole hours accumulate
+            // into the current part until adding the next hour would cross
+            // `snapshot_part_max_entries`, then the part seals at that hour
+            // boundary and a fresh tail starts. The concatenation of
+            // range-ordered parts is exactly the globally sorted entry set, so
+            // postings ordinals still index that concatenation and global
+            // duplicate-freedom follows from per-part validation plus range
+            // disjointness (no cross-part entry pass is needed).
+            let spans = partition_parts(&entries, self.config().snapshot_part_max_entries);
+
+            // Sealed parts unchanged since the previous HEAD are carried by
+            // reference, never re-encoded or re-PUT (ADR-0063 section 3). The
+            // "unchanged" signal is content addressing: a part recomputed from
+            // the same entries over the same [min_hour, watermark] range
+            // encodes to byte-identical output and therefore the same blake3,
+            // so a hash already present in the previous HEAD names an object
+            // already in the store under the same content-addressed key. Only
+            // a part whose covering hours actually changed produces a new hash
+            // and is PUT.
+            //
+            // `!rebuilt` is load-bearing: when `load_previous_entries` failed
+            // above and this fold rebuilt from the commit layout instead
+            // (missing or corrupt sealed part object), reusing the old HEAD's
+            // refs here would recompute a byte-identical hash for a part that
+            // does NOT exist in the store, skip its PUT, and leave the new
+            // HEAD permanently naming a dead object -- defeating the
+            // PUT-and-get-AlreadyExists self-heal ADR-0063 section 5
+            // describes, which only works if the object actually exists.
+            //
+            // A part the reconcile pass marked dirty (its covering hours'
+            // contribution changed) is excluded from this reuse map, so it can
+            // never be carried forward even if its recomputed hash somehow
+            // still matched the old ref: a dirty part always takes the normal
+            // re-encode-and-PUT path (ADR-0063 section 4). In practice the
+            // changed content already yields a different hash, so this is a
+            // fail-safe, not the primary mechanism.
+            let existing_by_blake3: HashMap<Vec<u8>, SnapshotPartRef> = match &head_state {
+                HeadState::Valid { head, .. } if !rebuilt => head
+                    .parts
+                    .iter()
+                    .filter(|p| !part_covers_dirty_hour(p, &dirty_hours))
+                    .map(|p| (p.blake3.clone(), p.clone()))
+                    .collect(),
+                _ => HashMap::new(),
+            };
+
+            // An old part carried forward by reference below
+            // (`existing_by_blake3`) never touches `v3_content_baseline`: the
+            // per-span loop skips the v3 block for it. Only an old part this
+            // fold re-derives can use its prior per-segment statistics as a
+            // baseline, so precompute which old part hashes the spans
+            // reproduce byte-for-byte and fetch baselines for the rest only.
+            //
+            // Encoded once per span (kept in `span_encodings`, not discarded):
+            // the per-span build loop below consumes the same bytes and hash
+            // rather than re-running `encode_part_ranged` and `blake3::hash`
+            // a second time over identical input.
+            let single_part = spans.len() == 1;
+            let span_encodings: Vec<Result<SpanEncoding, SnapshotFormatError>> = spans
+                .iter()
+                .enumerate()
+                .map(|(span_index, span)| {
+                    let is_tail = span_index + 1 == spans.len();
+                    let (min_hour, watermark) = if single_part {
+                        (0, watermark_hour)
+                    } else if is_tail {
+                        (span.min_hour, watermark_hour)
+                    } else {
+                        (span.min_hour, span.watermark_hour)
+                    };
+                    let part_entries = &entries[span.start..span.end];
+                    let bytes = snapshot_format::encode_part_ranged(
+                        tenant.0,
+                        signal_num,
+                        shard_ceiling,
+                        min_hour,
+                        watermark,
+                        part_entries,
+                    )?;
+                    let hash = blake3::hash(&bytes);
+                    Ok(SpanEncoding {
+                        min_hour,
+                        watermark,
+                        bytes,
+                        hash,
+                    })
+                })
+                .collect();
+            let reused_old_part_hashes: HashSet<[u8; 32]> = span_encodings
+                .iter()
+                .filter_map(|encoding| encoding.as_ref().ok())
+                .filter_map(|encoding| {
+                    let hash = *encoding.hash.as_bytes();
+                    existing_by_blake3
+                        .contains_key(hash.as_slice())
+                        .then_some(hash)
+                })
+                .collect();
+
+            // ADR-1413 decision 1 (v2 semantics): reuse the previous fold's
+            // per-part v3 column-stats objects the same way the field-13 (v2)
+            // baseline below reuses its own predecessor, so a part that grows
+            // (e.g. an appended hour) does not re-derive every entry it
+            // already covered. Keyed by content hash, exactly as the v2
+            // baseline is (both key on `entry.content_hash`, the same join
+            // key); merged across every old part still valid for reuse
+            // (excluded: a part covering a dirty hour, whose old statistics
+            // cannot be trusted forward, mirroring `existing_by_blake3`
+            // above; also excluded: a part this fold's spans reproduce
+            // byte-for-byte and will carry forward by reference, whose
+            // baseline would never be consulted).
+            let v3_content_baseline: HashMap<Vec<u8>, ColumnStatsSegment> = if typed_attr_columns
+                .is_empty()
+                || rebuilt
+            {
+                HashMap::new()
+            } else if let HeadState::Valid { head, .. } = &head_state {
+                let mut baseline = HashMap::new();
+                for old_part in head
+                    .parts
+                    .iter()
+                    .filter(|p| !part_covers_dirty_hour(p, &dirty_hours))
+                {
+                    let Some(stats_ref) = &old_part.column_stats else {
+                        continue;
+                    };
+                    let Ok(old_part_hash) = <[u8; 32]>::try_from(old_part.blake3.as_slice()) else {
+                        continue;
+                    };
+                    if reused_old_part_hashes.contains(&old_part_hash) {
+                        continue;
+                    }
+                    match self.store().get(&stats_ref.key, GetRange::Full).await {
+                        Ok(got) => {
+                            counters.get_requests += 1;
+                            match column_stats_build::decode_previous_column_stats(
+                                &got.data,
+                                &[old_part_hash],
+                                &crate::snapshot_format::ColumnStatsLimits::default(),
+                            ) {
+                                Ok(segments) => {
+                                    for segment in segments {
+                                        baseline.insert(segment.writer_id.clone(), segment);
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        error = %err,
+                                        tenant = %tenant.to_hex(),
+                                        "previous per-part column-stats object failed to decode or bind to its owning part; rebuilding every segment's statistics for parts that reuse it"
+                                    );
+                                }
+                            }
+                        }
+                        // `NotFound` is reachable: a sealed part can be
+                        // deleted out from under a ref a previous fold wrote,
+                        // which `rebuild_restores_a_deleted_sealed_part_instead_of_reusing_its_ref`
+                        // pins. It stays the quiet "nothing to reuse" case
+                        // rather than being promoted, because only
+                        // a non-NotFound failure (issue #1964, most commonly
+                        // AccessDenied on a missing idx/* read grant) is an
+                        // outage worth an operator's attention, since it
+                        // recurs on every fold and silently turns reuse into
+                        // a permanent full rebuild.
+                        Err(StoreError::NotFound) => {
+                            tracing::warn!(
+                                key = %stats_ref.key,
+                                tenant = %tenant.to_hex(),
+                                "previous per-part column-stats object not found; rebuilding every segment's statistics for parts that reuse it"
+                            );
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                error = %err,
+                                key = %stats_ref.key,
+                                tenant = %tenant.to_hex(),
+                                "previous per-part column-stats object GET failed; rebuilding every segment's statistics for parts that reuse it"
+                            );
+                        }
+                    }
+                }
+                baseline
+            } else {
+                HashMap::new()
+            };
+
+            let mut part_refs: Vec<SnapshotPartRef> = Vec::with_capacity(spans.len());
+            let mut part_hashes: Vec<[u8; 32]> = Vec::with_capacity(spans.len());
+            let mut total_part_bytes: u64 = 0;
+            let mut parts_reused: u64 = 0;
+            let mut column_stats_part_objects_built: u64 = 0;
+            let mut column_stats_dictionaries_dropped: u64 = 0;
+            for (span, encoding) in spans.iter().zip(span_encodings) {
+                // Single-part fold keeps exact v1 semantics: min_hour 0 (the
+                // epoch floor) and the fold watermark, byte-identical to the
+                // legacy encode so existing single-part objects and their
+                // content addresses never change. Multi-part: each part carries
+                // its real first hour as min_hour; sealed parts end at their
+                // last contained hour, and only the tail carries the fold
+                // watermark, so HEAD.watermark == max part watermark == fold
+                // watermark (the `validate_head` contract). Both already
+                // resolved into `encoding` above.
+                let SpanEncoding {
+                    min_hour: part_min_hour,
+                    watermark: part_watermark,
+                    bytes: part_bytes,
+                    hash: part_hash,
+                } = encoding?;
+                let part_entries = &entries[span.start..span.end];
+                if let Some(existing) = existing_by_blake3.get(part_hash.as_bytes().as_slice()) {
+                    // Carried by reference: the previous HEAD already names an
+                    // object with these exact bytes, so no PUT is issued and
+                    // the existing ref (same key/size/entry_count/range) is
+                    // forwarded unchanged.
+                    total_part_bytes += existing.size;
+                    part_hashes.push(*part_hash.as_bytes());
+                    part_refs.push(existing.clone());
+                    parts_reused += 1;
+                    continue;
+                }
+                let part_bytes_len = part_bytes.len() as u64;
+                let part_crc = crc32c::crc32c(&part_bytes);
+                let hash16 = &part_hash.to_hex()[..16];
+                let part_key = part_object_key(tenant, signal, part_watermark, hash16);
+
+                // ADR-1413: build (degrading dictionaries as needed to fit
+                // the ceiling) the per-part (v3) column-statistics object
+                // BEFORE writing the part's own `.csnap` object below. Unlike
+                // the v1/v2 builds below, a failure here (no dictionary left
+                // and still over ceiling) is never graceful: it must fail the
+                // whole fold rather than publish a truncated object or
+                // silently carry on without one (decision 4, amended).
+                // Deriving it first means that refusal happens before the
+                // part object is ever written, so a refused fold leaves no
+                // orphaned `.csnap` behind for a part that will never gain a
+                // HEAD entry.
+                let column_stats = if typed_attr_columns.is_empty() {
+                    None
+                } else {
+                    let mut v3_segments: Vec<ColumnStatsSegment> = Vec::new();
+                    for entry in part_entries.iter() {
+                        if let Some(existing) = v3_content_baseline.get(&entry.content_hash) {
+                            v3_segments.push(existing.clone());
+                            continue;
+                        }
+                        match column_stats_cache
+                            .segment_column_stats(self.store(), tenant, signal, entry)
+                            .await
+                        {
+                            Ok((mut segment, fetch)) => {
+                                if fetch == column_stats_build::StatsFetch::Issued {
+                                    counters.get_requests += 1;
+                                }
+                                // v2 semantics (ADR-1413): bind the record to
+                                // this part's content hash, uniform for L0 and
+                                // L1.
+                                segment.writer_id = entry.content_hash.clone();
+                                v3_segments.push(segment);
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant = %tenant.to_hex(),
+                                    ingest_hour_bucket = entry.ingest_hour_bucket,
+                                    shard = entry.shard,
+                                    level = entry.level,
+                                    "per-part column-stats build failed for one segment; it has no stats entry and queries over it fall back to scanning"
+                                );
+                            }
+                        }
+                    }
+                    sort_and_dedup_part_segments(&mut v3_segments);
+
+                    // ADR-1413 decision 4 (amended): degrade before refusing.
+                    // While the segments' uncompressed body -- measured
+                    // exactly as the encoder will measure it -- exceeds the
+                    // ceiling, drop the largest remaining dictionary (by its
+                    // own encoded size). min/max/count/sum are never touched:
+                    // only `dictionary_present`/`dictionary` are cleared, the
+                    // same omitted-dictionary shape ADR-0850 decision 3
+                    // already uses for the cardinality ceiling. Only once no
+                    // dictionary is left does `encode_column_stats_v3` below
+                    // refuse.
+                    //
+                    // The body is never re-concatenated per drop: a part can
+                    // need tens of thousands of drops against a
+                    // multi-gigabyte body. Every (segment, column) pair's
+                    // exact contribution to the body is measured once, kept
+                    // in a max-heap, and a running total is adjusted by
+                    // exactly the bytes each drop removes: the
+                    // `DictEntry` bytes and the `dictionary_present` flag,
+                    // plus any varint length-delimiter shrink on the
+                    // enclosing `ColumnStat` and on the segment's own
+                    // length-delimited framing (`encode_length_delimited_to_vec`,
+                    // per `column_stats_segments_concat`). Popping by
+                    // `(dict_size, seg_idx, col_idx)`'s natural tuple max
+                    // orders the drops: largest size first, then the highest
+                    // (seg_idx, col_idx).
+                    let ceiling = self.column_stats_part_ceiling();
+                    let mut segment_len: Vec<u64> = v3_segments
+                        .iter()
+                        .map(|seg| prost::Message::encoded_len(seg) as u64)
+                        .collect();
+                    #[cfg(test)]
+                    record_column_stats_concat_call_for_test();
+                    let mut running_total: u64 =
+                        column_stats_segments_concat(&v3_segments).len() as u64;
+                    let mut heap: BinaryHeap<(u64, usize, usize, u64)> = BinaryHeap::new();
+                    for (seg_idx, seg) in v3_segments.iter().enumerate() {
+                        for (col_idx, col) in seg.columns.iter().enumerate() {
+                            if !col.dictionary_present {
+                                continue;
+                            }
+                            let dict_size: u64 = col
+                                .dictionary
+                                .iter()
+                                .map(|e| prost::Message::encoded_len(e) as u64)
+                                .sum();
+                            // Bytes the `ColumnStat`'s own body shrinks by:
+                            // the `dictionary_present` flag (proto3 omits a
+                            // false bool, so tag + varint(true) = 2 bytes
+                            // recovered) plus each `DictEntry`'s own
+                            // tag + length-varint + content.
+                            let dict_content_shrink: u64 = 2 + col
+                                .dictionary
+                                .iter()
+                                .map(|e| {
+                                    let entry_len = prost::Message::encoded_len(e) as u64;
+                                    1 + varint_len(entry_len) + entry_len
+                                })
+                                .sum::<u64>();
+                            let col_len_before = prost::Message::encoded_len(col) as u64;
+                            let col_len_after = col_len_before.saturating_sub(dict_content_shrink);
+                            // The column's own embedding in `segment.columns`
+                            // (tag + length-varint + content): the content
+                            // shrink plus any varint-width drop in its own
+                            // length prefix.
+                            let seg_reduction = dict_content_shrink
+                                + (varint_len(col_len_before) - varint_len(col_len_after));
+                            heap.push((dict_size, seg_idx, col_idx, seg_reduction));
+                        }
+                    }
+
+                    let mut dropped_this_part: u64 = 0;
+                    while running_total > ceiling {
+                        let Some((_, seg_idx, col_idx, seg_reduction)) = heap.pop() else {
+                            break;
+                        };
+                        let seg_len_before = segment_len[seg_idx];
+                        let seg_len_after = seg_len_before.saturating_sub(seg_reduction);
+                        // Any varint-width drop in the segment's own
+                        // length-delimited framing shrinks the body by that
+                        // much more than the column's own contribution.
+                        let body_reduction = seg_reduction
+                            + (varint_len(seg_len_before) - varint_len(seg_len_after));
+                        // Saturating, like the two subtractions above: the
+                        // invariant makes these non-negative, and a broken
+                        // invariant must reach the drift check as a typed
+                        // error rather than wrap first.
+                        running_total = running_total.saturating_sub(body_reduction);
+                        segment_len[seg_idx] = seg_len_after;
+                        let col = &mut v3_segments[seg_idx].columns[col_idx];
+                        col.dictionary_present = false;
+                        col.dictionary.clear();
+                        dropped_this_part += 1;
+                    }
+                    if dropped_this_part > 0 {
+                        tracing::info!(
+                            tenant = %tenant.to_hex(),
+                            part_key = %part_key,
+                            dropped = dropped_this_part,
+                            ceiling,
+                            "per-part column-stats degrade dropped dictionaries to fit the ceiling"
+                        );
+                        column_stats_dictionaries_dropped += dropped_this_part;
+                    }
+                    // The incremental accounting above must agree exactly
+                    // with what the encoder measures. Re-measuring once here
+                    // (not on every drop) turns a drift between the two into
+                    // an explicit refusal carrying both figures, rather than
+                    // either stopping early on a still-over-ceiling body or
+                    // silently publishing one.
+                    #[cfg(test)]
+                    record_column_stats_concat_call_for_test();
+                    let measured_total = column_stats_segments_concat(&v3_segments).len() as u64;
+                    if measured_total != running_total {
+                        return Err(CatalogError::FieldMismatch {
+                            key: part_key.clone(),
+                            field: "column_stats_degrade_running_total",
+                            expected: running_total.to_string(),
+                            actual: measured_total.to_string(),
+                        });
+                    }
+                    let stats_bytes = snapshot_format::encode_column_stats_v3(
+                        tenant.0,
+                        signal_num,
+                        *part_hash.as_bytes(),
+                        &v3_segments,
+                        ceiling,
+                    )
+                    .map_err(|err| match err {
+                        SnapshotFormatError::ColumnStatsPartOverBound { declared, ceiling } => {
+                            CatalogError::ColumnStatsPartOverBound {
+                                part_key: part_key.clone(),
+                                declared,
+                                ceiling,
+                            }
+                        }
+                        other => CatalogError::SnapshotFormat(other),
+                    })?;
+
+                    let stats_crc = crc32c::crc32c(&stats_bytes);
+                    let stats_hash = blake3::hash(&stats_bytes);
+                    // Keyed by the hash of the object's OWN bytes
+                    // (`stats_hash16`), the same derivation the field-13 (v2)
+                    // object uses, NOT by the part's hash (`hash16`): the
+                    // per-segment build has a warn-and-omit path
+                    // (column_stats_cache above), so two folds over the same
+                    // part can produce different statistics bytes. Keying by
+                    // the part's hash would let a second fold's PUT collide
+                    // with the first's under `AlreadyExists`, which this
+                    // code (like the part PUT above) treats as "bytes are
+                    // identical by construction" -- false here, leaving a
+                    // field-7 ref whose blake3 describes bytes that were
+                    // never stored. Content-addressing on the object's own
+                    // bytes makes that assumption true again: identical
+                    // bytes always collapse onto the same key, and differing
+                    // bytes always land on a different one.
+                    let stats_hash16 = &stats_hash.to_hex()[..16];
+                    let stats_key =
+                        column_stats_object_key(tenant, signal, part_watermark, stats_hash16);
+                    let size = stats_bytes.len() as u64;
+                    let segment_count = v3_segments.len() as u32;
+                    let put_result = self
+                        .store()
+                        .put(
+                            &stats_key,
+                            Bytes::from(stats_bytes),
+                            PutOptions::create_if_absent()
+                                .with_checksum(UploadChecksum::Crc32c(stats_crc)),
+                        )
+                        .await;
+                    // Counted unconditionally, before matching the outcome:
+                    // this is a request-issued counter, not a
+                    // request-succeeded one (#1598).
+                    counters.put_requests += 1;
+                    match put_result {
+                        Ok(_) => {}
+                        // Content-addressed under the object's own hash:
+                        // bytes really are identical by construction here.
+                        Err(StoreError::AlreadyExists) => {}
+                        Err(e) => return Err(CatalogError::Store(e)),
+                    }
+                    column_stats_part_objects_built += 1;
+                    Some(SnapshotColumnStatsPartRef {
+                        key: stats_key,
+                        blake3: stats_hash.as_bytes().to_vec(),
+                        size,
+                        segment_count,
+                        part_blake3: vec![part_hash.as_bytes().to_vec()],
+                    })
+                };
+
+                let put_result = self
+                    .store()
+                    .put(
+                        &part_key,
+                        Bytes::from(part_bytes),
+                        PutOptions::create_if_absent()
+                            .with_checksum(UploadChecksum::Crc32c(part_crc)),
+                    )
+                    .await;
+                // Counted unconditionally, before matching the outcome: this
+                // is a request-issued counter, not a request-succeeded one
+                // (#1598).
+                counters.put_requests += 1;
+                match put_result {
+                    Ok(_) => {}
+                    // Content-addressed key: bytes are identical by
+                    // construction, so a losing folder's part is as good as
+                    // its own (mirrors `publish::put_data_object`).
+                    Err(StoreError::AlreadyExists) => {}
+                    Err(e) => return Err(CatalogError::Store(e)),
+                }
+                total_part_bytes += part_bytes_len;
+                part_hashes.push(*part_hash.as_bytes());
+
+                part_refs.push(SnapshotPartRef {
+                    key: part_key,
+                    blake3: part_hash.as_bytes().to_vec(),
+                    size: part_bytes_len,
+                    entry_count: part_entries.len() as u64,
+                    watermark_hour: part_watermark,
+                    min_hour: part_min_hour,
+                    column_stats,
+                });
+            }
+
+            // Postings are merged forward from the previous fold's postings
+            // object rather than re-decoded from every historical segment:
+            // entries only ever gain a strictly greater ingest_hour_bucket
+            // than the entries a valid HEAD already covers
+            // (`incremental_buckets` only lists hours past the old
+            // watermark), so the sort above always keeps previously-covered
+            // entries at their same ordinal prefix and `decode_start` below
+            // never needs to re-fetch them. On the rebuilt path (corrupt
+            // HEAD, unreadable previous part), or when no usable previous
+            // postings baseline exists (no postings ref on HEAD, or it fails
+            // to load), decoding starts at 0 and every current entry is
+            // fetched once -- a one-time full build, not a partial merge. A
+            // build failure at any entry from `decode_start` onward aborts
+            // the whole index, never publishes a partial one.
+            //
+            // Level is not gated here: `fetch_segment_names` derives an L1
+            // entry's key and identity the same way `build_segment_ref_from_entry`
+            // does for a query read, so a compacted bucket's `__name__` set
+            // is decoded exactly like an L0 one. The forward-merge ordinal
+            // assumption a compaction rewrite breaks is guarded by
+            // `reconciled` above, not by level: a bucket whose content
+            // changed under an already-recorded ordinal (an L0 run superseded
+            // by its L1 compaction) always lands in `dirty_hours` and forces
+            // `decode_start = 0` here, while a bucket that arrives
+            // already-compacted on its first fold is a plain hour-major
+            // append and never disturbs a previously-recorded ordinal.
+            let postings_names = {
+                let (postings_baseline, postings_decode_start): (Vec<NamePostings>, usize) =
+                    if rebuilt || reconciled {
+                        (Vec::new(), 0)
+                    } else if let HeadState::Valid { head, .. } = &head_state {
+                        match self
+                            .load_previous_postings(
+                                tenant,
+                                head,
+                                previous_entries_len as u64,
+                                &mut counters,
+                                &accounting,
+                            )
+                            .await?
+                        {
+                            Some(names) => (names, previous_entries_len),
+                            None => (Vec::new(), 0),
+                        }
+                    } else {
+                        (Vec::new(), 0)
+                    };
+                self.build_postings(
+                    tenant,
+                    signal,
+                    &entries,
+                    postings_decode_start,
+                    postings_baseline,
+                    &mut counters,
+                )
+                .await
+            };
+            let mut postings_built = false;
+            let mut postings_size = 0u64;
+            let postings_ref = match postings_names {
+                Some(names) => match snapshot_format::encode_postings(
+                    tenant.0,
+                    signal_num,
+                    &part_hashes,
+                    entries.len() as u64,
+                    &names,
+                ) {
+                    Ok(postings_bytes) => {
+                        let postings_crc = crc32c::crc32c(&postings_bytes);
+                        let postings_hash = blake3::hash(&postings_bytes);
+                        let postings_hash16 = &postings_hash.to_hex()[..16];
+                        let postings_key =
+                            postings_object_key(tenant, signal, watermark_hour, postings_hash16);
+                        let size = postings_bytes.len() as u64;
+                        let name_count = names.len() as u32;
+                        let put_result = self
+                            .store()
+                            .put(
+                                &postings_key,
+                                Bytes::from(postings_bytes),
+                                PutOptions::create_if_absent()
+                                    .with_checksum(UploadChecksum::Crc32c(postings_crc)),
+                            )
+                            .await;
+                        // Counted unconditionally: a real (non-AlreadyExists)
+                        // Err here still means the store received a PUT
+                        // request, and may have durably written the object
+                        // despite the client-visible error (#1598).
+                        counters.put_requests += 1;
+                        match put_result {
+                            Ok(_) | Err(StoreError::AlreadyExists) => {
+                                postings_built = true;
+                                postings_size = size;
+                                Some(SnapshotPostingsRef {
+                                    key: postings_key,
+                                    blake3: postings_hash.as_bytes().to_vec(),
+                                    size,
+                                    name_count,
+                                    part_blake3: part_hashes.iter().map(|h| h.to_vec()).collect(),
+                                })
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    error = %err,
+                                    tenant = %tenant.to_hex(),
+                                    "postings PUT failed, folding without a postings ref"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            tenant = %tenant.to_hex(),
+                            "postings encode failed, folding without a postings ref"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            let new_head = SnapshotHead {
+                format_version: HEAD_FORMAT_VERSION,
+                tenant_hash: tenant.0.to_vec(),
+                signal: signal_num,
+                shard_count: shard_ceiling,
+                watermark_hour,
+                // Sealed parts (ascending, disjoint by construction), any
+                // carried-by-reference sealed parts, and the fresh tail, in
+                // range order (ADR-0063 section 1). `partition_parts` builds
+                // them min_hour-ascending with disjoint ranges, exactly what
+                // `validate_head` enforces for a multi-part head.
+                parts: part_refs.clone(),
+                postings: postings_ref,
+                folder_id: folder_id.into_bytes().to_vec(),
+                created_unix_ns: now_ns,
+                shard_generation_count,
+            };
+            let head_bytes = snapshot_format::encode_head(&new_head)?;
+            let head_crc = crc32c::crc32c(&head_bytes);
+            let put_mode = match &head_state {
+                HeadState::Valid { version, .. } | HeadState::Corrupt { version } => {
+                    PutMode::CasVersion(version.clone())
+                }
+                HeadState::Absent => PutMode::CreateIfAbsent,
+                // Unreachable in practice: the rebuild-decision match above
+                // returns before we build a HEAD to PUT. Handled explicitly
+                // (never a CAS write) so a future refactor cannot let a
+                // newer-format HEAD reach a clobbering PUT (ADR-0066
+                // decision 2).
+                HeadState::UnsupportedVersion { format_version, .. } => {
+                    return Err(CatalogError::UnsupportedHeadVersion {
+                        format_version: *format_version,
+                    });
+                }
+            };
+
+            let head_put_result = self
+                .store()
+                .put(
+                    &head_key,
+                    Bytes::from(head_bytes),
+                    PutOptions {
+                        mode: put_mode,
+                        checksum: Some(UploadChecksum::Crc32c(head_crc)),
+                    },
+                )
+                .await;
+            // Counted unconditionally, before matching the outcome: this is
+            // a request-issued counter, not a request-succeeded one (#1598).
+            counters.put_requests += 1;
+            match head_put_result {
+                Ok(_) => {
+                    // Only a fold that reached its committed HEAD contributes
+                    // to the process-global coverage totals, so an attempt
+                    // abandoned to a CAS loss and retried from zero above is
+                    // counted exactly once, by whichever attempt won.
+                    declared_stats::observe_fold_stamp_coverage(coverage);
+                    return Ok(FoldReport {
+                        watermark_hour: Some(watermark_hour),
+                        previous_watermark_hour: head_state.watermark_hour(),
+                        no_op: false,
+                        rebuilt,
+                        buckets_folded: buckets.len() as u64,
+                        entry_count: entries.len() as u64,
+                        part_bytes: total_part_bytes,
+                        parts_total: part_refs.len() as u64,
+                        parts_reused,
+                        list_requests: counters.list_requests,
+                        get_requests: counters.get_requests,
+                        put_requests: counters.put_requests,
+                        postings_built,
+                        postings_bytes: postings_size,
+                        column_stats_part_objects_built,
+                        column_stats_dictionaries_dropped,
+                        layout_drift_count,
+                        frontier_hours_reconciled,
+                        frontier_hours_deferred,
+                        refold_hours_reconciled: refold_hours_reconciled as usize,
+                        stamped_records: coverage.records(),
+                        stamped_entries: coverage.entries(),
+                    });
+                }
+                // Another folder's HEAD CAS won first. Re-GET HEAD next
+                // iteration: if the winner's watermark already covers ours,
+                // the top-of-loop no-op check stops cleanly; otherwise we
+                // rebase onto the winner's parts and retry.
+                Err(StoreError::PreconditionFailed) | Err(StoreError::AlreadyExists) => {
+                    attempt += 1;
+                    if attempt >= MAX_HEAD_CAS_ATTEMPTS {
+                        return Err(CatalogError::FoldCasRetriesExhausted {
+                            attempts: attempt,
+                            watermark_hour,
+                        });
+                    }
+                }
+                Err(e) => return Err(CatalogError::Store(e)),
+            }
+        }
+    }
+
+    async fn get_head(
+        &self,
+        head_key: &str,
+        counters: &mut RequestCounters,
+    ) -> Result<HeadState, CatalogError> {
+        match self.store().get(head_key, GetRange::Full).await {
+            Ok(got) => {
+                counters.get_requests += 1;
+                match snapshot_format::decode_head(&got.data) {
+                    Ok(head) => Ok(HeadState::Valid {
+                        head: Box::new(head),
+                        version: got.version,
+                    }),
+                    // A HEAD newer than this process understands is NOT
+                    // corruption and must NOT be rebuilt (ADR-0066 decision 2,
+                    // "fail-closed-on-newer"): rebuilding would CAS-clobber a
+                    // newer HEAD written by an upgraded peer. Keep it a
+                    // distinct state so the fold fails loudly.
+                    Err(SnapshotFormatError::UnsupportedHeadVersion(format_version))
+                        if format_version > HEAD_FORMAT_VERSION =>
+                    {
+                        tracing::error!(
+                            key = %head_key,
+                            format_version,
+                            "HEAD is a newer format than this process understands; refusing to rebuild"
+                        );
+                        Ok(HeadState::UnsupportedVersion { format_version })
+                    }
+                    // Below the supported floor (`decode_head` accepts only
+                    // `HEAD_FORMAT_VERSION`, so the floor is that constant
+                    // today): corrupt, or written by an older peer during a
+                    // rolling upgrade. Either way it is rebuilt like any
+                    // undecodable HEAD: the CAS on `got.version` only moves
+                    // a HEAD forward, and an older peer refuses the result.
+                    Err(SnapshotFormatError::UnsupportedHeadVersion(format_version)) => {
+                        tracing::warn!(
+                            key = %head_key,
+                            format_version,
+                            supported = HEAD_FORMAT_VERSION,
+                            "HEAD format_version is below the supported version, rebuilding"
+                        );
+                        Ok(HeadState::Corrupt {
+                            version: got.version,
+                        })
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, key = %head_key, "HEAD failed to decode, treating as absent");
+                        Ok(HeadState::Corrupt {
+                            version: got.version,
+                        })
+                    }
+                }
+            }
+            Err(StoreError::NotFound) => {
+                counters.get_requests += 1;
+                Ok(HeadState::Absent)
+            }
+            Err(e) => Err(CatalogError::Store(e)),
+        }
+    }
+
+    /// Load and validate every part HEAD names, verifying each part's bytes
+    /// against its recorded blake3 before trusting its entries. Any
+    /// failure (GET error, hash mismatch, decode error) is returned to the
+    /// caller, which falls back to a full rebuild.
+    async fn load_previous_entries(
+        &self,
+        head: &SnapshotHead,
+        counters: &mut RequestCounters,
+    ) -> Result<Vec<SnapshotEntry>, CatalogError> {
+        let mut entries = Vec::new();
+        for part_ref in &head.parts {
+            let got = self.store().get(&part_ref.key, GetRange::Full).await?;
+            counters.get_requests += 1;
+            let digest = blake3::hash(&got.data);
+            if digest.as_bytes().as_slice() != part_ref.blake3.as_slice() {
+                return Err(CatalogError::FieldMismatch {
+                    key: part_ref.key.clone(),
+                    field: "blake3",
+                    expected: hex_encode(&part_ref.blake3),
+                    actual: digest.to_hex().to_string(),
+                });
+            }
+            let decoded = snapshot_format::decode_part(&got.data, &PartLimits::default())?;
+            entries.extend(decoded.entries);
+        }
+        Ok(entries)
+    }
+
+    /// Load and verify the previous fold's postings object before trusting
+    /// it as a merge baseline: same
+    /// hash/tenant/part-binding/decode checks `snapshot_resolve`'s
+    /// `load_snapshot_postings` applies at query time, plus an
+    /// `entry_count` check against `previous_entry_count` -- the ordinal
+    /// boundary this fold's merge carries forward, not the post-fold total.
+    /// Most failures (no postings ref, cache miss, a `NotFound` GET, hash
+    /// mismatch, decode error, entry_count mismatch) return `Ok(None)`, so the
+    /// caller decodes every current entry from scratch instead of merging.
+    /// A GET failure other than `NotFound` (issue #1964, most commonly
+    /// AccessDenied on a missing idx/* read grant) also returns `Ok(None)` --
+    /// merging is an optimization, never a correctness gate -- but is logged
+    /// at `error!`, not `warn!`, since it recurs on every fold and silently
+    /// turns postings reuse into a permanent full rebuild.
+    ///
+    /// Two failures are errors instead, both for the same reason the resolve
+    /// path treats them as errors (ADR-0050 §2, ADR-1702 decision 6 and the
+    /// decode-refusal amendment): a postings object whose header names another
+    /// tenant is an isolation breach, which a silent rebuild would leave
+    /// unreported; and a refused decode reservation is memory pressure, which
+    /// the rebuild would answer by fetching and decoding every segment's names
+    /// instead of one postings object, holding more memory rather than less.
+    async fn load_previous_postings(
+        &self,
+        tenant: &TenantHash,
+        head: &SnapshotHead,
+        previous_entry_count: u64,
+        counters: &mut RequestCounters,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<Vec<NamePostings>>, CatalogError> {
+        let Some(postings_ref) = head.postings.as_ref() else {
+            return Ok(None);
+        };
+        let expected_part_blake3: Vec<[u8; 32]> = match head
+            .parts
+            .iter()
+            .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()))
+            .collect::<Result<_, _>>()
+        {
+            Ok(hashes) => hashes,
+            Err(_) => return Ok(None),
+        };
+
+        if let Some(cached) = self
+            .postings_cache()
+            .get(tenant, &postings_ref.key, accounting)
+        {
+            if cached.header.entry_count == previous_entry_count {
+                return Ok(Some(cached.names.clone()));
+            }
+            tracing::warn!(
+                key = %postings_ref.key,
+                "cached previous postings entry_count mismatch, rebuilding postings from scratch"
+            );
+            return Ok(None);
+        }
+
+        let got = match self.store().get(&postings_ref.key, GetRange::Full).await {
+            Ok(got) => got,
+            // `NotFound` is reachable here too: a sealed part can be deleted
+            // out from under a ref a previous fold wrote. It stays quiet for
+            // the same reason as the `.cstat` read above; only a non-NotFound
+            // failure (issue #1964, most commonly AccessDenied on a missing
+            // idx/* read grant) is an outage worth an operator's attention,
+            // since it recurs on every fold and silently turns reuse into a
+            // permanent full rebuild.
+            Err(StoreError::NotFound) => {
+                tracing::warn!(
+                    key = %postings_ref.key,
+                    tenant = %tenant.to_hex(),
+                    "previous postings not found, rebuilding postings from scratch"
+                );
+                return Ok(None);
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    key = %postings_ref.key,
+                    tenant = %tenant.to_hex(),
+                    "previous postings GET failed, rebuilding postings from scratch"
+                );
+                return Ok(None);
+            }
+        };
+        counters.get_requests += 1;
+        let digest = blake3::hash(&got.data);
+        if digest.as_bytes().as_slice() != postings_ref.blake3.as_slice() {
+            tracing::warn!(
+                key = %postings_ref.key,
+                "previous postings hash mismatch, rebuilding postings from scratch"
+            );
+            return Ok(None);
+        }
+        let limits = snapshot_format::PostingsLimits {
+            max_postings_bytes: self.config().max_postings_bytes,
+        };
+        // The decoded postings go into the same postings cache the resolve
+        // path reads, so they carry a decode reservation the same way
+        // (ADR-1702 decision 6).
+        let header = match snapshot_format::decode_postings_header(&got.data) {
+            Ok(header) => header,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    key = %postings_ref.key,
+                    "previous postings header unreadable, rebuilding postings from scratch"
+                );
+                return Ok(None);
+            }
+        };
+        // ADR-0050 §2, read off the already hash-verified bytes and before the
+        // reservation below, exactly as `load_snapshot_postings` does it on the
+        // resolve path. `decode_postings` only binds the object to this HEAD's
+        // part hashes, and that mismatch degrades to a rebuild, so a foreign
+        // tenant_hash checked any later would be masked by the degrade; and a
+        // budget with no room would otherwise refuse first, reporting memory
+        // pressure where a cross-tenant object was.
+        match <[u8; 16]>::try_from(header.tenant_hash.as_slice()) {
+            Ok(declared) if declared != tenant.0 => {
+                self.record_isolation_breach();
+                return Err(CatalogError::FieldMismatch {
+                    key: postings_ref.key.clone(),
+                    field: "tenant_hash",
+                    expected: tenant.to_hex(),
+                    actual: hex::encode(declared),
+                });
+            }
+            Ok(_) => {}
+            Err(_) => {
+                tracing::warn!(
+                    key = %postings_ref.key,
+                    "previous postings header tenant_hash malformed, rebuilding postings from scratch"
+                );
+                return Ok(None);
+            }
+        }
+        // A refusal fails the fold rather than rebuilding: the rebuild fetches
+        // and decodes every segment's names, holding more memory than the one
+        // postings decode just refused. The resolve path answers the same
+        // refusal the same way (ADR-1702, the decode-refusal amendment). A
+        // refusal the eviction pass cannot clear (see
+        // `Catalog::reserve_decoded`) recurs on every fold while it holds, so
+        // that tenant's fold stays failed.
+        let reservation =
+            self.reserve_decoded(header.body_uncompressed_len, limits.max_postings_bytes)?;
+        let decoded =
+            match snapshot_format::decode_postings(&got.data, &limits, &expected_part_blake3) {
+                Ok(decoded) => crate::charged::Charged::new(decoded, reservation),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        key = %postings_ref.key,
+                        "previous postings failed to decode, rebuilding postings from scratch"
+                    );
+                    return Ok(None);
+                }
+            };
+        if decoded.header.entry_count != previous_entry_count {
+            tracing::warn!(
+                key = %postings_ref.key,
+                expected = previous_entry_count,
+                actual = decoded.header.entry_count,
+                "previous postings entry_count mismatch, rebuilding postings from scratch"
+            );
+            return Ok(None);
+        }
+
+        let decoded = Arc::new(decoded);
+        self.postings_cache().insert(
+            *tenant,
+            postings_ref.key.clone(),
+            decoded.clone(),
+            got.data.len() as u64,
+            self.config().postings_cache_entries,
+        );
+        Ok(Some(decoded.names.clone()))
+    }
+
+    /// Build the name-postings index for `entries`, merging forward from `baseline` rather than re-decoding every
+    /// historical segment on every fold: entries before `decode_start` keep
+    /// exactly the ordinals `baseline` already recorded for them, and only
+    /// entries at or past `decode_start` are fetched and decoded. Returns
+    /// `None` on any failure (a segment fetch, identity check, or decode
+    /// error, or a series missing `__name__`), logging the cause: a
+    /// postings build is all-or-nothing over the entries it decodes, never
+    /// partial.
+    async fn build_postings(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        entries: &[SnapshotEntry],
+        decode_start: usize,
+        baseline: Vec<NamePostings>,
+        counters: &mut RequestCounters,
+    ) -> Option<Vec<NamePostings>> {
+        let mut by_name: BTreeMap<String, Vec<u64>> = baseline
+            .into_iter()
+            .map(|np| (np.name, np.ordinals))
+            .collect();
+        for (ordinal, entry) in entries.iter().enumerate().skip(decode_start) {
+            let names = match fetch_segment_names(self.store(), tenant, signal, entry).await {
+                Ok(names) => {
+                    counters.get_requests += 1;
+                    names
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        tenant = %tenant.to_hex(),
+                        shard = entry.shard,
+                        ingest_hour_bucket = entry.ingest_hour_bucket,
+                        "postings build aborted: segment fetch/decode failed"
+                    );
+                    return None;
+                }
+            };
+            let ordinal = ordinal as u64;
+            for name in names {
+                by_name.entry(name).or_default().push(ordinal);
+            }
+        }
+        Some(
+            by_name
+                .into_iter()
+                .map(|(name, ordinals)| NamePostings { name, ordinals })
+                .collect(),
+        )
+    }
+
+    // The per-entry `__name__` derivation the postings build consumes is the
+    // free `fetch_segment_names` function (after this impl block), extracted so
+    // `ravel-maintain`'s scrubber re-derives names exactly the way the fold
+    // that wrote the postings did (ADR-0059 decision 3).
+
+    /// Enumerate every (shard, hour) commit bucket at or before
+    /// `watermark_hour` by listing the commit-hour directories directly,
+    /// rather than trusting a previous snapshot (HEAD absent, corrupt, or
+    /// unreadable). The shard range is the fold-time fan-out ceiling
+    /// (ADR-0052 section 5), i.e. the union of every generation activated by
+    /// the watermark, so a rebuild lists every shard any generation ever
+    /// wrote (a shard a generation never used lists empty, which is cheap and
+    /// which `list_shard_hours`-style listing already tolerates). Data only
+    /// ever lands in hours `<= watermark` under a generation active at or
+    /// before those hours, so this ceiling is complete; listing is the ground
+    /// truth here, so a discovered (shard, hour) is always kept.
+    async fn discover_buckets(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        generations: &[ShardGeneration],
+        watermark_hour: u32,
+        counters: &mut RequestCounters,
+    ) -> Result<Vec<(u32, u32)>, CatalogError> {
+        let scan_shards = fold_shard_ceiling(generations, watermark_hour);
+        let tenant_c = *tenant;
+        let concurrency = self.config().fold_bucket_concurrency.max(1);
+        // Fan out the per-shard delimited LISTs concurrently under
+        // `fold_bucket_concurrency` (ADR-0063 section 3); parse and filter
+        // serially afterwards so the result stays deterministic.
+        let per_shard: Vec<Result<ShardListing, CatalogError>> = stream::iter(0..scan_shards)
+            .map(|shard| async move {
+                let prefix = keys::commit_shard_prefix(&tenant_c, signal, shard)?;
+                let listing = self.store().list_delimited(&prefix).await?;
+                Ok::<_, CatalogError>((shard, prefix, listing.common_prefixes))
+            })
+            .buffered(concurrency)
+            .collect()
+            .await;
+        counters.list_requests += u64::from(scan_shards);
+        let mut buckets = Vec::new();
+        for res in per_shard {
+            let (shard, prefix, common_prefixes) = res?;
+            for common_prefix in &common_prefixes {
+                let hour_text = common_prefix
+                    .strip_prefix(prefix.as_str())
+                    .and_then(|s| s.strip_suffix('/'))
+                    .ok_or_else(|| {
+                        CatalogError::Key(KeyError::Malformed {
+                            key: common_prefix.clone(),
+                            reason: "common prefix outside the expected shard prefix".to_string(),
+                        })
+                    })?;
+                let hour = keys::parse_ingest_hour_string(hour_text)?;
+                if hour <= watermark_hour {
+                    buckets.push((shard, hour));
+                }
+            }
+        }
+        buckets.sort_unstable();
+        Ok(buckets)
+    }
+
+    /// Reconcile one already-sealed, already-folded bucket against its current
+    /// on-store state, replacing exactly this bucket's entries in the
+    /// in-progress `entries` set when its contribution changed and marking the
+    /// hour dirty. Shared by the fixed reconcile window and the
+    /// retention-frontier reconcile (ADR-0063 section 4, ADR-0020
+    /// delete-blocker) so both derive a re-listed bucket's state one way only.
+    #[allow(clippy::too_many_arguments)]
+    async fn reconcile_one_bucket(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour: u32,
+        listing: &[ObjectMeta],
+        accounting: &QueryAccounting,
+        entries: &mut Vec<SnapshotEntry>,
+        seen: &mut HashMap<EntryIdentity, (usize, bool)>,
+        dirty_hours: &mut HashSet<u32>,
+        counters: &mut RequestCounters,
+        layout_drift_count: &mut u64,
+        coverage: &mut declared_stats::StampCoverage,
+    ) -> Result<(), CatalogError> {
+        // A bucket with only immutable L0 records cannot have changed since it
+        // was folded (seal lemma). Skip it with no GET; only a late compaction
+        // record, rewrite record, or retention tombstone triggers real
+        // reconcile work.
+        if !bucket_needs_reconcile(listing) {
+            return Ok(());
+        }
+        let contribution = self
+            .classify_bucket(
+                tenant,
+                signal,
+                shard,
+                hour,
+                listing,
+                accounting,
+                counters,
+                layout_drift_count,
+                coverage,
+            )
+            .await?;
+        let mut desired = dedup_contribution(contribution);
+        // What `entries` currently reflects for this (shard, hour): found by
+        // each entry's own shard and ingest_hour_bucket.
+        let mut current: Vec<SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.shard == shard && e.ingest_hour_bucket == hour)
+            .cloned()
+            .collect();
+        if same_entry_set(&mut current, &mut desired) {
+            return Ok(());
+        }
+        // The bucket's contribution changed (a late compaction superseded L0
+        // inputs previously folded in directly, or a late tombstone means the
+        // hour now contributes nothing): replace exactly this bucket's entries,
+        // leave every other entry untouched, and mark the hour dirty.
+        entries.retain(|e| !(e.shard == shard && e.ingest_hour_bucket == hour));
+        // `seen`'s cached indices go stale the instant `entries` is mutated by
+        // anything other than `fold_in_entry` (the `retain` above shifts every
+        // later index); rebuild it from the post-retain entries, seeded as
+        // trivially canonical, so the fold-in below can detect a `desired`
+        // identity that already exists elsewhere in `entries` (a drift-relocated
+        // commit record present under its true home bucket) instead of a blind
+        // `extend` that would insert a duplicate identity and break every later
+        // fold with `SnapshotFormat(DuplicateEntry)`. `fold_in_entry` resolves
+        // the collision exactly as the incremental loop does: the resident
+        // occurrence wins, the duplicate is dropped and counted as layout drift.
+        *seen = entries
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry_identity(entry), (index, true)))
+            .collect();
+        for entry in desired {
+            let is_canonical = entry.ingest_hour_bucket == hour;
+            fold_in_entry(entries, seen, layout_drift_count, entry, is_canonical);
+        }
+        dirty_hours.insert(hour);
+        Ok(())
+    }
+
+    /// Classify one `(shard, hour)` commit bucket's listing into the entries
+    /// it should contribute to the snapshot, the single shared classifier for both the incremental fold loop and
+    /// the reconcile pass (ADR-0063 section 4). Partitioning the bucket's keys
+    /// by shape mirrors the resolve-time listing (`Catalog::process_bucket`,
+    /// docs/catalog-and-mvcc.md step 2) so a fold and a live resolve derive
+    /// identical bucket state.
+    ///
+    /// A retention tombstone makes the bucket contribute nothing: neither its
+    /// L1 parts nor its L0 records are folded in (ADR-0019 section 3). Each
+    /// compaction record contributes its parts as level-1 entries and
+    /// supersedes its named L0 inputs; two records with DISJOINT input sets in
+    /// one bucket both contribute (a harmless overlap the resolver alarms on
+    /// but still serves), while two whose input sets OVERLAP resolve to one
+    /// authoritative record through
+    /// [`crate::catalog::select_authoritative_compaction_records`] (issue
+    /// #1070), the loser's parts skipped and its uncovered inputs folded in as
+    /// raw L0. The same selector skips a record a present version 2 record
+    /// supersedes, and a version 2 record a live rewrite dominates is dropped
+    /// before it runs
+    /// ([`crate::catalog::erasure_dominated_compaction_records`]). A
+    /// selective-erasure rewrite record (ADR-0064
+    /// decision 3, amended) contributes its own output parts as level-1
+    /// entries and supersedes either its named L0 inputs directly, or -- when
+    /// it names a `superseded_record_key` instead -- whatever that
+    /// compaction/rewrite predecessor's own inputs are, chased recursively via
+    /// [`crate::catalog::resolve_rewrite_supersession`] (the same helper
+    /// snapshot resolution uses, so a fold and a live resolve can never
+    /// disagree on which records an erasure has superseded). A rewrite itself
+    /// superseded by a later one (a bucket erased twice) contributes nothing.
+    /// Every L0 not named by a compaction or rewrite input list is contributed
+    /// exactly as the resolver includes it. Unrecognized key shapes are
+    /// counted as layout drift and skipped, never fatal.
+    #[allow(clippy::too_many_arguments)]
+    async fn classify_bucket(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        hour: u32,
+        listing: &[ObjectMeta],
+        accounting: &QueryAccounting,
+        counters: &mut RequestCounters,
+        layout_drift_count: &mut u64,
+        coverage: &mut declared_stats::StampCoverage,
+    ) -> Result<BucketContribution, CatalogError> {
+        let mut l0_keys: Vec<&str> = Vec::new();
+        let mut compaction_keys: Vec<&str> = Vec::new();
+        let mut rewrite_keys: Vec<&str> = Vec::new();
+        let mut has_tombstone = false;
+        for meta in listing {
+            match keys::partition_bucket_entry(&meta.key) {
+                Ok(BucketEntry::CommitRecord(_)) => l0_keys.push(meta.key.as_str()),
+                Ok(BucketEntry::CompactionRecord(_)) => compaction_keys.push(meta.key.as_str()),
+                // Selective-erasure rewrite record (ADR-0064 decision 3).
+                // Recognized here rather than warn-skipped: a silently
+                // skipped rewrite record's supersession would be ignored by
+                // the fold and could resurrect an erased subject's
+                // pre-rewrite records into a folded snapshot.
+                Ok(BucketEntry::RewriteRecord(_)) => rewrite_keys.push(meta.key.as_str()),
+                Ok(BucketEntry::Tombstone(_)) => has_tombstone = true,
+                Err(err) => {
+                    *layout_drift_count += 1;
+                    tracing::warn!(
+                        error = %err,
+                        key = %meta.key,
+                        "unrecognized bucket-key shape, skipping key"
+                    );
+                }
+            }
+        }
+
+        if has_tombstone {
+            return Ok(Vec::new());
+        }
+
+        let mut contributed: BucketContribution = Vec::new();
+        let mut excluded: HashSet<(String, u64, u64)> = HashSet::new();
+        let mut compaction_records: Vec<(String, Arc<CompactionRecord>)> = Vec::new();
+        for ckey in &compaction_keys {
+            let record = self
+                .load_and_validate_compaction(tenant, signal, shard, ckey, accounting)
+                .await?;
+            counters.get_requests += 1;
+            compaction_records.push(((*ckey).to_string(), record));
+        }
+
+        // Load rewrite records (ADR-0064 decision 3), verified against their
+        // own identity inside `load_and_validate_rewrite`.
+        let mut rewrite_records: Vec<(String, Arc<RewriteRecord>)> = Vec::new();
+        for rkey in &rewrite_keys {
+            let record = self
+                .load_and_validate_rewrite(tenant, signal, shard, rkey, accounting)
+                .await?;
+            counters.get_requests += 1;
+            rewrite_records.push(((*rkey).to_string(), record));
+        }
+
+        // Resolve every rewrite's supersession into the SAME `excluded` set
+        // (its effective L0 inputs) and a `superseded_records` set (keys of
+        // compaction/rewrite records superseded as a whole, whose parts must
+        // therefore be skipped). This is what stops an erased subject's
+        // pre-rewrite records from resurfacing in the fold. Identical
+        // mechanism to snapshot resolution (`process_bucket`), sharing one
+        // chase helper.
+        let mut superseded_records: HashSet<String> = HashSet::new();
+        let bucket_label = keys::commit_shard_hour_prefix(tenant, signal, shard, hour)?;
+        if !rewrite_records.is_empty() {
+            let compaction_by_key: HashMap<&str, &CompactionRecord> = compaction_records
+                .iter()
+                .map(|(k, r)| (k.as_str(), r.as_ref()))
+                .collect();
+            let rewrite_by_key: HashMap<&str, &RewriteRecord> = rewrite_records
+                .iter()
+                .map(|(k, r)| (k.as_str(), r.as_ref()))
+                .collect();
+            for (rkey, record) in &rewrite_records {
+                crate::catalog::resolve_rewrite_supersession(
+                    rkey,
+                    record,
+                    &bucket_label,
+                    &compaction_by_key,
+                    &rewrite_by_key,
+                    &mut excluded,
+                    &mut superseded_records,
+                )?;
+            }
+        }
+
+        // Overlapping input sets in one bucket (issue #1070): pick one
+        // authoritative record per overlap component through the SAME helpers
+        // snapshot resolution uses, so a folded snapshot and a live resolve
+        // never disagree on which record wins: a version 2 record a live
+        // rewrite dominates is dropped first, and the selector excludes every
+        // record a present version 2 record supersedes. An excluded record's
+        // parts are skipped below and only AUTHORITATIVE records' inputs join
+        // `excluded`, so a loser input no winner names is folded in as a raw
+        // L0. Disjoint records are not in conflict and both contribute.
+        let dominated = crate::catalog::erasure_dominated_compaction_records(
+            &compaction_records,
+            &rewrite_records,
+            &bucket_label,
+        )?;
+        let candidates: Vec<(&str, &CompactionRecord)> = compaction_records
+            .iter()
+            .map(|(k, r)| (k.as_str(), r.as_ref()))
+            .filter(|(k, _)| !dominated.contains(k))
+            .collect();
+        let selection = crate::catalog::select_authoritative_compaction_records(&candidates)?;
+        for (ckey, record) in &candidates {
+            if selection.is_excluded(ckey) {
+                continue;
+            }
+            for input in &record.inputs {
+                excluded.insert((
+                    input.writer_id.clone(),
+                    input.writer_epoch,
+                    input.writer_seq,
+                ));
+            }
+        }
+
+        // Sibling-rewrite alarm, raised through the same helper snapshot
+        // resolution uses. The fold is the path that matters most here: a
+        // rewrite always lands in an already-sealed bucket (ADR-0064 §3.1),
+        // and once that hour is folded, a query is served from the snapshot
+        // without ever calling `process_bucket`, so this is the only place the
+        // conflict would ever be observed for the ordinary case.
+        self.check_rewrite_siblings(shard, hour, &rewrite_records, &superseded_records);
+
+        // Compaction parts: contribute each non-superseded, authoritative
+        // record's parts as level-1 entries. Records whose input sets overlap
+        // resolve to one winner per overlap component, exactly as the live
+        // resolver picks it; a loser's parts are skipped and any input only
+        // the loser names stays a raw level-0 entry.
+        for (ckey, record) in &compaction_records {
+            if superseded_records.contains(ckey.as_str())
+                || dominated.contains(ckey.as_str())
+                || selection.is_excluded(ckey)
+            {
+                continue;
+            }
+            for part in &record.parts {
+                let entry = build_l1_snapshot_entry(ckey, record, part, coverage)?;
+                contributed.push((entry, true));
+            }
+        }
+
+        // Rewrite output parts: contributed as level-1 entries exactly as
+        // compaction parts, unless this rewrite is itself superseded by a
+        // newer one (ADR-0064 amendment).
+        for (rkey, record) in &rewrite_records {
+            if superseded_records.contains(rkey.as_str()) {
+                continue;
+            }
+            for part in &record.parts {
+                let entry = build_rewrite_l1_snapshot_entry(rkey, record, part)?;
+                contributed.push((entry, true));
+            }
+        }
+
+        // L0 commit records: contribute every one not named by a compaction
+        // or rewrite input list above. An unlisted L0 is included exactly as the resolver
+        // includes it.
+        for key in &l0_keys {
+            let record = self
+                .load_and_validate(tenant, signal, shard, key, accounting)
+                .await?;
+            counters.get_requests += 1;
+            if excluded.contains(&(
+                record.writer_id.clone(),
+                record.writer_epoch,
+                record.writer_seq,
+            )) {
+                continue;
+            }
+            let entry = build_snapshot_entry(key, &record, coverage)?;
+            let is_canonical = hour == entry.ingest_hour_bucket;
+            contributed.push((entry, is_canonical));
+        }
+
+        Ok(contributed)
+    }
+
+    /// Discover each `(shard, hour)` bucket's raw keys concurrently, bounded by
+    /// `fold_bucket_concurrency` (ADR-0063 section 3). Returns one
+    /// `(shard, hour, keys)` per input bucket in the SAME order as `buckets`
+    /// (`buffered` preserves input order), so the caller's serial merge stays
+    /// deterministic and the fold's output stays byte-for-byte reproducible.
+    /// Only the LIST discovery is parallel here; the caller loads per-record
+    /// GETs and merges entries serially in this order.
+    async fn discover_bucket_listings(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        buckets: &[(u32, u32)],
+    ) -> Result<Vec<BucketListing>, CatalogError> {
+        let tenant = *tenant;
+        let concurrency = self.config().fold_bucket_concurrency.max(1);
+        let results: Vec<Result<BucketListing, CatalogError>> =
+            stream::iter(buckets.iter().copied())
+                .map(|(shard, hour)| async move {
+                    let prefix = keys::commit_shard_hour_prefix(&tenant, signal, shard, hour)?;
+                    let listing = list_all(self.store(), &prefix).await?;
+                    Ok((shard, hour, listing))
+                })
+                .buffered(concurrency)
+                .collect()
+                .await;
+        results.into_iter().collect()
+    }
+}
+
+/// Fetch one entry's segment and return the distinct `__name__` values among
+/// its series. The segment is fetched in full (rather than the
+/// footer-suffix-then-range-chase protocol `ravel-query`'s fetcher uses for
+/// query-time page reads): a fold reads every newly-covered entry's catalog
+/// exactly once and needs no page data, so the extra bytes of a single full
+/// GET are cheaper than the extra round trips a suffix chase would add here.
+///
+/// This is the one authoritative derivation of a segment's true `__name__`
+/// set from a [`SnapshotEntry`]: [`Catalog::build_postings`] uses it to build
+/// the name-postings index, and `ravel-maintain`'s content-tier scrubber
+/// (ADR-0059 decision 1) uses it to re-derive the same set at rest and diff it
+/// against what a covering postings object claims for the object. Keeping a
+/// single implementation is deliberate: two copies that must always agree
+/// would be a maintenance hazard, since a scrub is only meaningful if it
+/// derives names exactly the way the fold that wrote the postings did.
+///
+/// Level-aware key and identity derivation, matching
+/// `build_segment_ref_from_entry` (`snapshot_resolve.rs`) exactly: an L0
+/// entry's `writer_id`/`writer_epoch`/`writer_seq` are the flush's real
+/// writer identity, addressed with `keys::data_key`. An L1 entry has no
+/// writer identity of its own; the fold packs its `input_set_hash` into
+/// `writer_id` and its `part_index` into `writer_epoch`
+/// (`build_l1_snapshot_entry`), addressed with `keys::l1_part_key`, and its
+/// footer carries the nil/0 sentinel identity `ravel-query`'s fetcher checks
+/// L1 segments against (`expected_identity` in `ravel-query/src/fetcher.rs`).
+pub async fn fetch_segment_names(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    entry: &SnapshotEntry,
+) -> Result<HashSet<String>, PostingsBuildError> {
+    let content_hash: [u8; 32] = entry
+        .content_hash
+        .as_slice()
+        .try_into()
+        .map_err(|_| PostingsBuildError::BadContentHashLen(entry.content_hash.len()))?;
+
+    let (data_key, expected) = if entry.level == 0 {
+        let writer_id_bytes: [u8; 16] = entry
+            .writer_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| PostingsBuildError::BadWriterIdLen(entry.writer_id.len()))?;
+        let writer_id = Uuid::from_bytes(writer_id_bytes);
+        let data_key = keys::data_key(
+            tenant,
+            signal,
+            entry.shard,
+            writer_id,
+            entry.writer_epoch,
+            entry.writer_seq,
+            &content_hash,
+        )?;
+        let expected = ExpectedIdentity {
+            tenant_hash: tenant.0,
+            shard: entry.shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: entry.writer_epoch,
+            writer_seq: entry.writer_seq,
+        };
+        (data_key, expected)
+    } else {
+        let input_set_hash: [u8; 32] = entry
+            .writer_id
+            .as_slice()
+            .try_into()
+            .map_err(|_| PostingsBuildError::BadInputSetHashLen(entry.writer_id.len()))?;
+        let part_index = u32::try_from(entry.writer_epoch)
+            .map_err(|_| PostingsBuildError::BadPartIndex(entry.writer_epoch))?;
+        let data_key = keys::l1_part_key(
+            tenant,
+            signal,
+            entry.shard,
+            entry.ingest_hour_bucket,
+            &hex::encode(&input_set_hash[..8]),
+            part_index,
+            &hex::encode(&content_hash[..8]),
+        )?;
+        let expected = ExpectedIdentity {
+            tenant_hash: tenant.0,
+            shard: entry.shard,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        (data_key, expected)
+    };
+    let got = store.get(&data_key, GetRange::Full).await?;
+
+    let limits = ReaderLimits::default();
+    let location = ravel_segment::open_from_full(&got.data, limits)?;
+    ravel_segment::check_identity(&location.footer, &expected)?;
+
+    // ADR-0027: v7 is the only supported version (`open_from_full` above has
+    // already rejected anything else, including the retired v6). The chunked
+    // v5-shaped catalog (unchanged by the v6 EXEMPLARS addition and the v7
+    // per-sample provenance extension, which the postings build ignores) spans
+    // sections, so it is decoded over the whole object -- already in hand here
+    // via the `GetRange::Full` GET -- and folded to the per-series
+    // `SeriesEntry` view the postings build consumes.
+    let series: Vec<ravel_segment::SeriesEntry> = match location.version {
+        ravel_segment::VERSION_V7 => {
+            ravel_segment::decode_catalog_v5(&location.footer, &got.data, limits)?
+                .into_iter()
+                .map(|e| e.entry)
+                .collect()
+        }
+        other => return Err(PostingsBuildError::UnsupportedSegmentVersion(other)),
+    };
+
+    let mut names = HashSet::new();
+    for s in &series {
+        let name = s
+            .labels
+            .get(METRIC_NAME_LABEL)
+            .ok_or(PostingsBuildError::MissingMetricName)?;
+        names.insert(name.to_string());
+    }
+    Ok(names)
+}
+
+fn no_op_report(watermark_hour: Option<u32>, counters: RequestCounters) -> FoldReport {
+    FoldReport {
+        watermark_hour,
+        previous_watermark_hour: watermark_hour,
+        no_op: true,
+        rebuilt: false,
+        buckets_folded: 0,
+        entry_count: 0,
+        part_bytes: 0,
+        parts_total: 0,
+        parts_reused: 0,
+        list_requests: counters.list_requests,
+        get_requests: counters.get_requests,
+        put_requests: counters.put_requests,
+        postings_built: false,
+        postings_bytes: 0,
+        column_stats_part_objects_built: 0,
+        column_stats_dictionaries_dropped: 0,
+        layout_drift_count: 0,
+        frontier_hours_reconciled: 0,
+        frontier_hours_deferred: 0,
+        // The carve-out this field documents: a no-op fold never reaches the
+        // reconcile branch that runs the targeted re-fold pass, so a request
+        // against it reconciles zero hours regardless of what it names.
+        refold_hours_reconciled: 0,
+        // A no-op fold reads no commit record and writes no entry, so it has
+        // no coverage to report and contributes nothing to the process-global
+        // totals either.
+        stamped_records: 0,
+        stamped_entries: 0,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use prost::Message;
+    use ravel_commit::erasure;
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault, Sequence,
+    };
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{InstrumentedStore, ObjectStoreBackend, PutOptions};
+    use ravel_proto::commit::v1::{CompactionInputIdentity, RetentionTombstone, RewriteDrop};
+    use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+    use ravel_types::{Label, LabelSet, Sample, SeriesId, TenantId};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::*;
+    use crate::config::{
+        DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
+        DEFAULT_MAX_FLUSH_LIFETIME_NS,
+    };
+
+    const DEFAULT_MARGIN_NS: i64 = DEFAULT_MAX_FLUSH_LIFETIME_NS
+        + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+        + DEFAULT_FOLD_SAFETY_MARGIN_NS;
+
+    fn tenant() -> TenantHash {
+        TenantHash([0xcd; 16])
+    }
+
+    fn config(shard_count: u32) -> CatalogConfig {
+        CatalogConfig {
+            shard_count,
+            ..Default::default()
+        }
+    }
+
+    /// `now_ns` at which ingest hour `hour` has just sealed under default
+    /// margins: the exact boundary of `sealed_watermark_hour`.
+    fn now_at_seal(hour: u32) -> i64 {
+        (i64::from(hour) + 1) * NS_PER_HOUR + DEFAULT_MARGIN_NS
+    }
+
+    async fn publish_segment(
+        store: &MemoryStore,
+        shard: u32,
+        writer_id: Uuid,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+    ) -> CommitRecord {
+        let payload = format!("seg-{shard}-{writer_id}-{seq}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    fn stamp_stat(
+        name: &str,
+        min: i64,
+        max: i64,
+        null_count: u64,
+    ) -> ravel_types::declared_stats::DeclaredColumnStat {
+        ravel_types::declared_stats::DeclaredColumnStat::new(
+            name,
+            ravel_types::declared_stats::DeclaredStatType::I64,
+            Some(ravel_types::declared_stats::DeclaredStatValue::I64(min)),
+            Some(ravel_types::declared_stats::DeclaredStatValue::I64(max)),
+            null_count,
+        )
+        .expect("valid i64 stat")
+    }
+
+    /// `publish_segment` with an ADR-0873 declared-column stamp: the published
+    /// record carries `stats` in `declared_column_stats` (field 20) exactly as
+    /// the writer that computed them would have written it.
+    async fn publish_stamped_segment(
+        store: &MemoryStore,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        stats: &[ravel_types::declared_stats::DeclaredColumnStat],
+    ) -> CommitRecord {
+        let payload = format!("stamped-seg-{seq}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let mut record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id: Uuid::from_u128(u128::from(seq) + 1),
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 8,
+            series_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        ravel_commit::declared_stats::stamp_commit_record(&mut record, stats);
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// Like `publish_segment`, but writes a real RSEG v1 segment (not a fake
+    /// payload) so that `Catalog::build_postings` has something genuine to
+    /// decode. Needed for tests that must observe postings-build behavior,
+    /// since a fake payload makes `build_postings` fail unconditionally
+    /// regardless of any fault injection under test.
+    async fn publish_real_segment(
+        store: &MemoryStore,
+        shard: u32,
+        writer_id: Uuid,
+        seq: u64,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        metrics: &[&str],
+    ) -> CommitRecord {
+        let tenant_id = TenantId::new("fold-postings-fault-test");
+        let series: Vec<SeriesInput> = metrics
+            .iter()
+            .map(|metric| {
+                let labels = LabelSet::new(vec![Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: (*metric).to_string(),
+                }])
+                .expect("valid labels");
+                let series_id = SeriesId::compute(&tenant_id, metric, &labels).expect("series id");
+                SeriesInput {
+                    series_id,
+                    labels,
+                    samples: vec![Sample {
+                        ts_ns: created_unix_ns,
+                        value: 1.0,
+                    }],
+                }
+            })
+            .collect();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant().0,
+            shard,
+            writer_id: writer_id.to_string(),
+            writer_epoch: 1,
+            writer_seq: seq,
+        };
+        let min_ingest_ts_ns = created_unix_ns - 1_000;
+        let max_ingest_ts_ns = created_unix_ns;
+        let bounds = IngestBounds {
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// A MemoryStore wrapper that records the key of every `get`, so a test can
+    /// assert exactly which objects a fold read.
+    struct RecordingStore {
+        inner: MemoryStore,
+        get_keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingStore {
+        fn new() -> Self {
+            RecordingStore {
+                inner: MemoryStore::new(),
+                get_keys: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn clear_gets(&self) {
+            self.get_keys.lock().expect("lock").clear();
+        }
+
+        fn count_gets_of(&self, key: &str) -> usize {
+            self.get_keys
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|k| k.as_str() == key)
+                .count()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RecordingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.get_keys.lock().expect("lock").push(key.to_string());
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Publish one real L0 RLOG logs segment carrying an I64 `status` attribute
+    /// on every row, plus its commit record, exactly as ingest would. Returns
+    /// the record so the caller can reconstruct its data-object key.
+    async fn publish_logs_segment(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        statuses: &[i64],
+    ) -> CommitRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        );
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for (i, status) in statuses.iter().enumerate() {
+            let ts = base_ts + i as i64;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![("status".to_string(), AttrValue::I64(*status))],
+            })
+            .expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: statuses.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: max_ts,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// ADR-0873 stamp coverage, the acceptance test for both halves of the
+    /// pair and for the shortfall between them.
+    ///
+    /// A fold over a known mix of stamped and unstamped commit records reports
+    /// exactly how many stamped records it read and exactly how many stamped
+    /// entries it wrote from them. The second half folds the same stamped
+    /// records with the test-only strip hook installed, which is the only way
+    /// to produce the state a mixed-version fleet produces in the field: new
+    /// records carrying stamps, a fold of an older shape not carrying them
+    /// through. The counts must then diverge, entries below records, which is
+    /// what the alert in docs/guides/observability.md fires on.
+    #[tokio::test]
+    async fn fold_report_counts_stamped_records_and_stamped_entries_and_flags_shortfall() {
+        const HOUR: u32 = 10;
+        let created = i64::from(HOUR) * NS_PER_HOUR + 60_000_000_000;
+        let stats = vec![stamp_stat("EventDate", -5, 19_000, 2)];
+
+        let records_before = crate::declared_stats::fold_stamped_records_total();
+        let entries_before = crate::declared_stats::fold_stamped_entries_total();
+
+        // Three stamped records and two unstamped ones, one hour, one shard.
+        let store = Arc::new(MemoryStore::new());
+        for seq in 1..=3u64 {
+            publish_stamped_segment(&store, seq, HOUR, created, &stats).await;
+        }
+        for seq in 4..=5u64 {
+            publish_segment(
+                &store,
+                0,
+                Uuid::from_u128(u128::from(seq) + 1),
+                seq,
+                HOUR,
+                created,
+            )
+            .await;
+        }
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(HOUR),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+
+        assert_eq!(
+            report.entry_count, 5,
+            "all five records fold in; only three of them are stamped"
+        );
+        assert_eq!(
+            report.stamped_records, 3,
+            "exactly the three records published with a stamp are counted as read with one"
+        );
+        assert_eq!(
+            report.stamped_entries, 3,
+            "each of those three carried its stamp onto its snapshot entry"
+        );
+
+        // The shortfall. Same three stamped records, a fold whose carriage does
+        // not survive.
+        let store = Arc::new(MemoryStore::new());
+        for seq in 1..=3u64 {
+            publish_stamped_segment(&store, seq, HOUR, created, &stats).await;
+        }
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let stripped = {
+            let _strip = crate::declared_stats::StripCarriedStampsGuard::install();
+            catalog
+                .fold(
+                    &tenant(),
+                    Signal::Metrics,
+                    Uuid::new_v4(),
+                    now_at_seal(HOUR),
+                    &[],
+                    None,
+                )
+                .await
+                .expect("fold")
+        };
+
+        assert_eq!(
+            stripped.stamped_records, 3,
+            "the records are still read with their stamps on the wire"
+        );
+        assert_eq!(
+            stripped.stamped_entries, 0,
+            "none of the stamps reached an entry, which is the shortfall itself"
+        );
+        assert!(
+            stripped.stamped_entries < stripped.stamped_records,
+            "entries below records is the state the coverage alert fires on"
+        );
+
+        // The two per-fold reports also reach the process-global totals the
+        // /metrics families render. A lower bound, not an equality: the totals
+        // are process-global and other fold tests in this binary add to them
+        // concurrently, so only this test's own contribution is pinned.
+        assert!(
+            crate::declared_stats::fold_stamped_records_total() >= records_before + 6,
+            "both folds' six stamped records must reach the process-global total"
+        );
+        assert!(
+            crate::declared_stats::fold_stamped_entries_total() >= entries_before + 3,
+            "only the first fold's three stamped entries may reach the process-global total"
+        );
+    }
+
+    /// The coverage pair counts the compaction-part carriage path, not only the
+    /// L0 one.
+    ///
+    /// A fold whose entries come entirely from compaction parts reports exactly
+    /// the stamped parts it read and exactly the stamped entries it built from
+    /// them, and both reach the process-global totals the /metrics families
+    /// render. Without the tally at `carry_compaction_part`, this fold reports
+    /// zero on both halves while writing two stamped L1 entries, which is the
+    /// state that makes the rendered entries counter mean less than it says.
+    #[tokio::test]
+    async fn fold_counts_stamp_coverage_carried_from_compaction_parts() {
+        const HOUR: u32 = 10;
+
+        let records_before = crate::declared_stats::fold_stamped_records_total();
+        let entries_before = crate::declared_stats::fold_stamped_entries_total();
+
+        // Three L1 parts of one compaction record; the first two are stamped.
+        let store = Arc::new(MemoryStore::new());
+        publish_logs_l1(
+            store.as_ref(),
+            0,
+            HOUR,
+            "stamped-compaction-parts",
+            &[
+                (&[200, 404, 200, 500], true),
+                (&[500, 500, 200], true),
+                (&[200, 200], false),
+            ],
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(HOUR),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+
+        assert_eq!(
+            report.entry_count, 3,
+            "one L1 entry per part, and no L0 record in this fixture"
+        );
+        assert_eq!(
+            report.stamped_records, 2,
+            "exactly the two parts published with a stamp are counted as read with one"
+        );
+        assert_eq!(
+            report.stamped_entries, 2,
+            "each of those two carried its stamp onto its L1 snapshot entry"
+        );
+
+        // A lower bound on the process-global totals, as above: other fold
+        // tests in this binary add to them concurrently, so only this fold's
+        // own contribution is pinned.
+        assert!(
+            crate::declared_stats::fold_stamped_records_total() >= records_before + 2,
+            "the fold's two stamped parts must reach the process-global total"
+        );
+        assert!(
+            crate::declared_stats::fold_stamped_entries_total() >= entries_before + 2,
+            "the fold's two stamped L1 entries must reach the process-global total"
+        );
+    }
+
+    /// Issue #850, Finding 3: an incremental fold that appends entries must
+    /// REUSE the previous fold's column-statistics baseline for the segments it
+    /// already covered, re-fetching only the genuinely new segment. The reuse
+    /// binding is checked against the parts the baseline was actually built with
+    /// (the previous HEAD's parts), not the parts this fold just encoded.
+    ///
+    /// Asserted by a count of OBJECTS READ: after the second fold, the two
+    /// first-fold segment data objects are never GET again (reuse), while the
+    /// new segment is. Against the pre-fix code (`expected_part_blake3 =
+    /// part_hashes`), the append changes the tail part's hash, the baseline is
+    /// rejected, and both old segments are re-fetched, so `count_gets_of` for
+    /// each old data key is 1 and this test fails.
+    #[tokio::test]
+    async fn incremental_fold_reuses_column_stats_baseline() {
+        let store = Arc::new(RecordingStore::new());
+
+        // Declare `status` as an I64 typed logs column so the fold builds
+        // column statistics.
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(vec![crate::tenant_config::DeclaredTypedColumn {
+                key: "status".to_string(),
+                ty: crate::tenant_config::DeclaredColumnType::I64,
+            }]),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+
+        // Two segments in hour 10.
+        let rec_a = publish_logs_segment(store.as_ref(), 1, 10, &[200, 404, 200]).await;
+        let rec_b = publish_logs_segment(store.as_ref(), 2, 10, &[500, 200]).await;
+        let key_a = keys::reconstruct_data_key(&rec_a).expect("key a");
+        let key_b = keys::reconstruct_data_key(&rec_b).expect("key b");
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        assert!(
+            first.column_stats_part_objects_built > 0,
+            "the first fold builds per-part column statistics over the hour-10 segments"
+        );
+
+        // A new segment in a later hour, then an incremental second fold.
+        let rec_c = publish_logs_segment(store.as_ref(), 3, 11, &[200, 200]).await;
+        let key_c = keys::reconstruct_data_key(&rec_c).expect("key c");
+
+        store.clear_gets();
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "the second fold is incremental");
+        assert!(
+            second.column_stats_part_objects_built > 0,
+            "the second fold builds a per-part statistics object for the new part"
+        );
+
+        // The reuse assertion, by objects read. Segment B is the clean
+        // discriminator: on the second fold it is fetched ONLY if the
+        // column-stats baseline was rejected and B recomputed. With reuse it is
+        // never read; with the pre-fix `part_hashes` binding it is read once.
+        //
+        // Segment A is read exactly once, by the name-postings pass, which
+        // aborts on the first L0 entry because a logs RLOG object is not a
+        // metrics RSEG. The v3 (content-hash-keyed, per part) baseline
+        // covers it without a second read.
+        assert_eq!(
+            store.count_gets_of(&key_a),
+            1,
+            "only the postings pass reads A; the v3 publish reuses its baseline record"
+        );
+        assert_eq!(
+            store.count_gets_of(&key_b),
+            0,
+            "segment B's stats were reused, not recomputed"
+        );
+        // Issue #964: the one genuinely new segment is read ONCE.
+        assert_eq!(
+            store.count_gets_of(&key_c),
+            1,
+            "the new hour-11 segment is fetched once"
+        );
+
+        // Reuse still produced a complete artifact covering all three
+        // segments. Since ADR-1413 the per-part v3 object answers this load
+        // and its records are content-hash keyed, so they land in
+        // `by_content_hash`, not the always-empty `segments` map.
+        store.clear_gets();
+        let acc = QueryAccounting::new();
+        let loaded = catalog
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                ravel_types::TimeRange {
+                    start_ns: 0,
+                    end_ns: 50 * NS_PER_HOUR,
+                },
+                50 * NS_PER_HOUR,
+                &acc,
+            )
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        assert_eq!(
+            loaded.by_content_hash.len(),
+            3,
+            "the reused baseline plus the new segment cover all three"
+        );
+    }
+
+    /// Captures WARN and ERROR events with their message and fields flattened
+    /// to one line each, so a test can assert which level a log line landed
+    /// at without depending on `tracing`'s own formatting.
+    #[derive(Clone, Default)]
+    struct LevelCapture {
+        lines: Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>,
+    }
+
+    impl LevelCapture {
+        fn lines(&self) -> Vec<(tracing::Level, String)> {
+            self.lines.lock().expect("lock").clone()
+        }
+
+        fn count_at(&self, level: tracing::Level, needle: &str) -> usize {
+            self.lines
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(l, line)| *l == level && line.contains(needle))
+                .count()
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LevelCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let level = *event.metadata().level();
+            if level != tracing::Level::WARN && level != tracing::Level::ERROR {
+                return;
+            }
+            let mut visitor = LevelCaptureVisitor::default();
+            event.record(&mut visitor);
+            self.lines
+                .lock()
+                .expect("lock")
+                .push((level, visitor.finish()));
+        }
+    }
+
+    #[derive(Default)]
+    struct LevelCaptureVisitor {
+        message: String,
+        fields: Vec<String>,
+    }
+
+    impl LevelCaptureVisitor {
+        fn finish(self) -> String {
+            let mut line = self.message;
+            for field in self.fields {
+                line.push(' ');
+                line.push_str(&field);
+            }
+            line
+        }
+    }
+
+    impl tracing::field::Visit for LevelCaptureVisitor {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields.push(format!("{}={}", field.name(), value));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = value.to_string();
+            } else {
+                self.fields.push(format!("{}={}", field.name(), value));
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else {
+                self.fields.push(format!("{}={:?}", field.name(), value));
+            }
+        }
+    }
+
+    /// Issue #1964: a GET failure on the previous fold's per-part
+    /// column-stats object (`.cstat`), other than `NotFound`, must surface at
+    /// `error!`, naming the key, rather than the quiet `warn!` a genuine
+    /// absence gets. Either way the fold still falls back to rebuilding the
+    /// part's statistics from scratch: the reuse baseline is an optimization,
+    /// never a correctness gate. `ScriptedFault` has no `AccessDenied` kind (a
+    /// `ravel-object-store` testing gap, out of scope here), so `Permanent`
+    /// stands in as a structurally equivalent non-`NotFound` GET failure: the
+    /// fixed code branches on `Err(StoreError::NotFound)` versus every other
+    /// `Err`, not on which variant the "other" arm carries.
+    #[tokio::test]
+    async fn cstat_baseline_permanent_failure_logs_at_error() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(".cstat"),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        set_status_column_config(store.inner()).await;
+
+        publish_logs_segment(store.inner(), 1, 10, &[200, 404, 200]).await;
+        publish_logs_segment(store.inner(), 2, 10, &[500, 200]).await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(
+            first.column_stats_part_objects_built > 0,
+            "the first fold must build a column-stats baseline for the second fold to reuse"
+        );
+
+        publish_logs_segment(store.inner(), 3, 11, &[200, 200]).await;
+
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold succeeds despite the faulted baseline read");
+        assert!(!second.rebuilt);
+
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+        assert!(
+            capture.count_at(
+                tracing::Level::ERROR,
+                "previous per-part column-stats object GET failed"
+            ) >= 1,
+            "a non-NotFound GET failure on the .cstat baseline must log at error!, not warn!: {:?}",
+            capture.lines()
+        );
+    }
+
+    /// Counterpart to `cstat_baseline_permanent_failure_logs_at_error`: a
+    /// genuine `NotFound` on the `.cstat` baseline (modeled with
+    /// `NotFoundBlip`, an eventual-consistency blip rather than a permission
+    /// fault) must still degrade quietly to a `warn!`, exactly as before this
+    /// fix, never an `error!`.
+    #[tokio::test]
+    async fn cstat_baseline_not_found_blip_still_warns_quietly() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(".cstat"));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        set_status_column_config(store.inner()).await;
+
+        publish_logs_segment(store.inner(), 1, 10, &[200, 404, 200]).await;
+        publish_logs_segment(store.inner(), 2, 10, &[500, 200]).await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.column_stats_part_objects_built > 0);
+
+        publish_logs_segment(store.inner(), 3, 11, &[200, 200]).await;
+
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold succeeds");
+        assert!(!second.rebuilt);
+
+        assert!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
+        assert!(
+            capture.count_at(
+                tracing::Level::WARN,
+                "previous per-part column-stats object not found"
+            ) >= 1,
+            "a NotFound on the .cstat baseline must still log at warn!: {:?}",
+            capture.lines()
+        );
+        assert_eq!(
+            capture.count_at(
+                tracing::Level::ERROR,
+                "previous per-part column-stats object GET failed"
+            ),
+            0,
+            "a genuine absence must never log at error!"
+        );
+    }
+
+    /// Issue #1964: a GET failure on the previous fold's postings object
+    /// (`.npost`), other than `NotFound`, must surface at `error!`, naming
+    /// the key, rather than the quiet `warn!` a genuine absence gets. Either
+    /// way the fold still falls back to rebuilding postings from scratch:
+    /// reuse is an optimization, never a correctness gate. Uses real metrics
+    /// segments (`publish_real_segment`), not logs: a logs RLOG object never
+    /// decodes as an RSEG, so `build_postings` returns `None` before a
+    /// `.npost` object is ever written, and the reuse path this test targets
+    /// would never be reached.
+    #[tokio::test]
+    async fn npost_baseline_permanent_failure_logs_at_error() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("simulated AccessDenied on idx/*".into()),
+            )
+            .with_key_contains(".npost"),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_1 = now_at_seal(10);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - NS_PER_HOUR,
+            &["cpu", "mem"],
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(
+            first.postings_built,
+            "the first fold must build a postings ref for the second fold's reuse baseline to exist"
+        );
+
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold succeeds despite the faulted baseline read");
+        assert!(!second.rebuilt);
+
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the injected fault must actually have fired"
+        );
+        assert!(
+            capture.count_at(tracing::Level::ERROR, "previous postings GET failed") >= 1,
+            "a non-NotFound GET failure on the .npost baseline must log at error!, not warn!: {:?}",
+            capture.lines()
+        );
+    }
+
+    /// Counterpart to `npost_baseline_permanent_failure_logs_at_error`: a
+    /// genuine `NotFound` on the `.npost` baseline (modeled with
+    /// `NotFoundBlip`) must still degrade quietly to a `warn!`, exactly as
+    /// before this fix, never an `error!`.
+    #[tokio::test]
+    async fn npost_baseline_not_found_blip_still_warns_quietly() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(".npost"));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_1 = now_at_seal(10);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - NS_PER_HOUR,
+            &["cpu", "mem"],
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(first.postings_built);
+
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+
+        let capture = LevelCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold succeeds");
+        assert!(!second.rebuilt);
+
+        assert!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip) >= 1,
+            "the injected fault must actually have fired"
+        );
+        assert!(
+            capture.count_at(tracing::Level::WARN, "previous postings not found") >= 1,
+            "a NotFound on the .npost baseline must still log at warn!: {:?}",
+            capture.lines()
+        );
+        assert_eq!(
+            capture.count_at(tracing::Level::ERROR, "previous postings GET failed"),
+            0,
+            "a genuine absence must never log at error!"
+        );
+    }
+
+    /// One fold over hour 10, then the HEAD and the `.npost` object it wrote,
+    /// for the reuse-path tests below. Returns the catalog, the HEAD, and the
+    /// postings object's bytes.
+    async fn folded_postings_baseline(store: &Arc<MemoryStore>) -> (Catalog, SnapshotHead, Bytes) {
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_real_segment(
+            store,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - NS_PER_HOUR,
+            &["cpu", "mem"],
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(
+            first.postings_built,
+            "the second fold's reuse baseline is what these tests exercise"
+        );
+
+        let head_bytes = store
+            .get(&head_object_key(&tenant(), Signal::Metrics), GetRange::Full)
+            .await
+            .expect("HEAD present")
+            .data;
+        let head = snapshot_format::decode_head(&head_bytes).expect("HEAD decodes");
+        let postings_key = head
+            .postings
+            .as_ref()
+            .expect("the first fold wrote a postings ref")
+            .key
+            .clone();
+        let postings = store
+            .get(&postings_key, GetRange::Full)
+            .await
+            .expect("postings present")
+            .data;
+        (catalog, head, postings)
+    }
+
+    /// Rewrite the postings object `head` already points at, re-stamping the
+    /// ref's blake3 and size, and PUT both. The blake3 gate runs before every
+    /// header check, so this is what lets a reader reach the header checks at
+    /// all.
+    async fn repoint_head_at_postings(
+        store: &Arc<MemoryStore>,
+        head: &mut SnapshotHead,
+        postings: Vec<u8>,
+    ) {
+        let key = head
+            .postings
+            .as_ref()
+            .expect("a postings ref to re-point")
+            .key
+            .clone();
+        let postings_ref = head.postings.as_mut().expect("a postings ref to re-point");
+        postings_ref.blake3 = blake3::hash(&postings).as_bytes().to_vec();
+        postings_ref.size = postings.len() as u64;
+        store
+            .put(&key, Bytes::from(postings), PutOptions::default())
+            .await
+            .expect("put the rewritten postings");
+        let head_bytes = snapshot_format::encode_head(head).expect("encode head");
+        store
+            .put(
+                &head_object_key(&tenant(), Signal::Metrics),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put the re-pointed HEAD");
+    }
+
+    /// Issue #2081 item 1, ADR-0050 §2: the fold's previous-postings reuse path
+    /// checks the object's declared `tenant_hash` before it reuses it, exactly
+    /// as `snapshot_resolve::load_snapshot_postings` does at query time, and a
+    /// foreign one is an isolation breach that fails the fold rather than a
+    /// quiet rebuild. The re-encoded object still binds to this HEAD's part
+    /// hashes, so nothing but the tenant check can reject it.
+    ///
+    /// FLIP: drop the `tenant_hash` match in `load_previous_postings` and the
+    /// second fold succeeds, so `expect_err` panics with "a previous postings
+    /// object naming another tenant must fail the fold: FoldReport { ... }"
+    /// and `isolation_breaches()` reads 0.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_on_the_previous_postings_fails_the_fold() {
+        assert_foreign_previous_postings_fail_the_fold(None, true).await;
+    }
+
+    /// The tenant check runs before the decode reservation: under a budget
+    /// with no room at all the fold still reports the breach, not memory
+    /// pressure.
+    ///
+    /// FLIP: move the `tenant_hash` match below the `reserve_decoded` call in
+    /// `load_previous_postings` and the fold fails with `MemoryExhausted`
+    /// instead.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_is_reported_before_the_postings_reservation() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(0));
+        assert_foreign_previous_postings_fail_the_fold(Some(budget), true).await;
+    }
+
+    /// The tenant check runs before the part-binding check: a foreign object
+    /// that is also bound to other part hashes still fails the fold instead of
+    /// degrading to a rebuild.
+    ///
+    /// FLIP: move the `tenant_hash` match below the `decode_postings` call in
+    /// `load_previous_postings` and the fold rebuilds and succeeds, so
+    /// `expect_err` panics.
+    #[tokio::test]
+    async fn a_foreign_tenant_hash_is_reported_before_the_part_binding_degrade() {
+        assert_foreign_previous_postings_fail_the_fold(None, false).await;
+    }
+
+    /// Re-point the fixture HEAD at a copy of its postings naming another
+    /// tenant, bound to the HEAD's own part hashes or to hashes it does not
+    /// carry, then fold again under `budget` (unlimited when `None`) and assert
+    /// the fold fails with the `tenant_hash` mismatch and one counted breach.
+    async fn assert_foreign_previous_postings_fail_the_fold(
+        budget: Option<Arc<ravel_memory::MemoryBudget>>,
+        bind_to_head_parts: bool,
+    ) {
+        let store = Arc::new(MemoryStore::new());
+        let (catalog, mut head, postings) = folded_postings_baseline(&store).await;
+        let catalog = match budget {
+            Some(budget) => catalog.with_memory_budget(budget),
+            None => catalog,
+        };
+        let part_blake3: Vec<[u8; 32]> = head
+            .parts
+            .iter()
+            .map(|p| <[u8; 32]>::try_from(p.blake3.as_slice()).expect("32-byte part hash"))
+            .collect();
+        let decoded = snapshot_format::decode_postings(
+            &postings,
+            &snapshot_format::PostingsLimits::default(),
+            &part_blake3,
+        )
+        .expect("the fixture postings decode");
+        let bound_parts = if bind_to_head_parts {
+            part_blake3.clone()
+        } else {
+            vec![[0xee; 32]; part_blake3.len()]
+        };
+        assert_eq!(
+            bound_parts == part_blake3,
+            bind_to_head_parts,
+            "the fixture binds the foreign object as the case asks"
+        );
+        let foreign = snapshot_format::encode_postings(
+            [0xff; 16],
+            decoded.header.signal,
+            &bound_parts,
+            decoded.header.entry_count,
+            &decoded.names,
+        )
+        .expect("re-encode the fixture postings for a foreign tenant");
+        let postings_key = head.postings.as_ref().expect("a postings ref").key.clone();
+        repoint_head_at_postings(&store, &mut head, foreign).await;
+
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect_err("a previous postings object naming another tenant must fail the fold");
+        match err {
+            CatalogError::FieldMismatch { field, key, .. } => {
+                assert_eq!(field, "tenant_hash");
+                assert_eq!(key, postings_key);
+            }
+            other => panic!("expected a tenant_hash FieldMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            catalog.isolation_breaches(),
+            1,
+            "the breach is counted, not swallowed by a rebuild"
+        );
+    }
+
+    /// Issue #2081 item 4: a refused decode reservation on the previous
+    /// postings object fails the fold, the same answer
+    /// `snapshot_resolve::load_snapshot_postings` gives the same refusal
+    /// (pinned by `catalog::tests::postings_decode_reserves_its_output`).
+    /// Rebuilding instead answers memory pressure by fetching and decoding
+    /// every segment's names, which holds more memory than the one postings
+    /// decode that was just refused.
+    ///
+    /// FLIP: restore the `Err(err) => { warn!(...); return Ok(None) }` arm
+    /// around `reserve_decoded` in `load_previous_postings` and the second fold
+    /// succeeds, so `expect_err` panics.
+    #[tokio::test]
+    async fn a_refused_postings_reservation_fails_the_fold() {
+        let store = Arc::new(MemoryStore::new());
+        let (catalog, head, postings) = folded_postings_baseline(&store).await;
+        let declared = snapshot_format::decode_postings_header(&postings)
+            .expect("postings header decodes")
+            .body_uncompressed_len;
+        assert!(declared > 0, "the fixture postings have a body to charge");
+        assert!(
+            declared <= config(1).max_postings_bytes,
+            "the decoder would admit this body, so only the budget can refuse it"
+        );
+        drop(head);
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(declared - 1));
+        let catalog = catalog.with_memory_budget(budget.clone());
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            2,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["disk"],
+        )
+        .await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect_err("a refused postings reservation must fail the fold");
+        match err {
+            CatalogError::MemoryExhausted(exhausted) => {
+                assert_eq!(exhausted.requested, declared);
+                assert_eq!(exhausted.reserved, 0);
+                assert_eq!(exhausted.limit, declared - 1);
+            }
+            other => panic!("expected CatalogError::MemoryExhausted, got {other:?}"),
+        }
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "a refused reservation charges nothing"
+        );
+    }
+
+    /// Issue #1482 finding 4: `v3_content_baseline` must fetch a previous
+    /// per-part stats object only for an old part this fold is actually about
+    /// to re-derive, never for one about to be carried forward by reference.
+    /// `snapshot_part_max_entries = 1` seals every hour into its own part, so
+    /// the first fold over hours 10-12 produces three parts: two sealed
+    /// (hour 10, hour 11) whose `(min_hour, watermark_hour)` come from their
+    /// own entries and never change again, and one tail (hour 12) whose
+    /// watermark is overridden to the fold's overall watermark. The first
+    /// fold seals at hour 15 (`now_at_seal(15)`) even though entries only
+    /// reach hour 12, so that override tuple is `(12, 15)` -- deliberately
+    /// different from what hour 12 encodes to once it seals for real, so the
+    /// second fold's reseal is a genuine content change, not a coincidental
+    /// hash match.
+    ///
+    /// The second fold appends an hour-13 entry: hours 10 and 11 stay
+    /// byte-identical and are carried by reference (untouched), while hour
+    /// 12 seals from tail to non-tail -- its tuple becomes `(12, 12)`, so it
+    /// genuinely re-derives even though its one entry's content is
+    /// unchanged, and reuses that entry's segment statistics from the first
+    /// fold's baseline. Pre-fix, all three non-dirty old parts get their
+    /// stats object GET regardless of reuse; post-fix, only hour 12's does.
+    #[tokio::test]
+    async fn incremental_fold_bounds_baseline_gets_to_parts_actually_rederived() {
+        let store = Arc::new(RecordingStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        publish_logs_segment(store.as_ref(), 1, 10, &[200]).await;
+        publish_logs_segment(store.as_ref(), 2, 11, &[404]).await;
+        publish_logs_segment(store.as_ref(), 3, 12, &[500]).await;
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(15),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        assert_eq!(first.parts_total, 3, "one part per hour under a cap of 1");
+
+        let head_1 = read_logs_head(store.as_ref()).await;
+        let stats_key_of = |hour: u32| {
+            head_1
+                .parts
+                .iter()
+                .find(|p| p.min_hour == hour)
+                .unwrap_or_else(|| panic!("part for hour {hour}"))
+                .column_stats
+                .clone()
+                .unwrap_or_else(|| panic!("v3 object for hour {hour}"))
+                .key
+        };
+        let stats_key_10 = stats_key_of(10);
+        let stats_key_11 = stats_key_of(11);
+        let stats_key_12 = stats_key_of(12);
+
+        publish_logs_segment(store.as_ref(), 4, 13, &[200]).await;
+
+        store.clear_gets();
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(16),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "the second fold is incremental");
+
+        let head_2 = read_logs_head(store.as_ref()).await;
+        let part_10 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 10)
+            .expect("hour 10 part survives");
+        let part_11 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 11)
+            .expect("hour 11 part survives");
+        let part_12 = head_2
+            .parts
+            .iter()
+            .find(|p| p.min_hour == 12)
+            .expect("hour 12 part survives, now sealed");
+        assert_eq!(
+            part_10.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_10),
+            "hour 10's v3 object is carried forward at its same key"
+        );
+        assert_eq!(
+            part_11.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_11),
+            "hour 11's v3 object is carried forward at its same key"
+        );
+        assert_ne!(
+            part_12.column_stats.as_ref().map(|r| &r.key),
+            Some(&stats_key_12),
+            "hour 12 reseals from tail to non-tail and gets a new v3 object"
+        );
+
+        // The bound this finding fixes: an untouched, carried-forward part's
+        // previous stats object must never be fetched as a baseline. Against
+        // the pre-fix code (baseline built from every non-dirty old part
+        // unconditionally) these are each 1.
+        assert_eq!(
+            store.count_gets_of(&stats_key_10),
+            0,
+            "hour 10 is carried by reference; its old stats object must not be fetched"
+        );
+        assert_eq!(
+            store.count_gets_of(&stats_key_11),
+            0,
+            "hour 11 is carried by reference; its old stats object must not be fetched"
+        );
+        // Hour 12 is genuinely re-derived (tail -> sealed), so its baseline
+        // fetch is legitimate work, not the bug: exactly one GET reuses its
+        // one entry's segment statistics instead of re-fetching the segment
+        // itself.
+        assert_eq!(
+            store.count_gets_of(&stats_key_12),
+            1,
+            "hour 12 is re-derived and its prior stats object is fetched once as a baseline"
+        );
+    }
+
+    /// Declare three I64 typed logs columns (`col_a`, `col_b`, `col_c`) so a
+    /// fold builds column statistics with three distinct-size dictionaries per
+    /// part, for the degrade-loop tests.
+    async fn set_three_column_config(store: &dyn ObjectStoreBackend) {
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(vec![
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_a".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_b".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+                crate::tenant_config::DeclaredTypedColumn {
+                    key: "col_c".to_string(),
+                    ty: crate::tenant_config::DeclaredColumnType::I64,
+                },
+            ]),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    /// Publish one L0 segment of `rows` entries, each carrying all three
+    /// `col_a`/`col_b`/`col_c` declared columns with deliberately distinct
+    /// cardinality (`col_a` all-distinct, `col_b` 30 distinct, `col_c` 3
+    /// distinct), so their per-column dictionaries encode to distinct sizes.
+    async fn publish_logs_segment_wide(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        rows: usize,
+    ) -> CommitRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        );
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for i in 0..rows {
+            let ts = base_ts + i as i64;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![
+                    ("col_a".to_string(), AttrValue::I64(i as i64)),
+                    ("col_b".to_string(), AttrValue::I64((i % 30) as i64)),
+                    ("col_c".to_string(), AttrValue::I64((i % 3) as i64)),
+                ],
+            })
+            .expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: rows as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: max_ts,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// Declare `n_columns` I64 typed columns (`c00`, `c01`, ...), all names
+    /// the same byte length so every column's `ColumnStat.name` field costs
+    /// the same number of bytes regardless of index.
+    async fn set_many_column_config(store: &dyn ObjectStoreBackend, n_columns: usize) {
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(
+                (0..n_columns)
+                    .map(|i| crate::tenant_config::DeclaredTypedColumn {
+                        key: format!("c{i:02}"),
+                        ty: crate::tenant_config::DeclaredColumnType::I64,
+                    })
+                    .collect(),
+            ),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    /// Publish one L0 segment carrying all `n_columns` declared columns
+    /// (`c00`..`c{n_columns-1}`), every column given the same two distinct
+    /// values across `rows` entries, so every (segment, column) dictionary
+    /// encodes to the exact same size -- the fixture
+    /// `degrade_completes_a_part_needing_many_drops_with_one_concatenation`
+    /// needs a large, size-tied pair set so the drop order is decided purely
+    /// by the heap's `(seg_idx, col_idx)` tie-break, not by planted size
+    /// differences.
+    async fn publish_logs_segment_many_columns(
+        store: &dyn ObjectStoreBackend,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        n_columns: usize,
+        rows: usize,
+    ) -> CommitRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        );
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+        let mut min_ts = i64::MAX;
+        let mut max_ts = i64::MIN;
+        for i in 0..rows {
+            let ts = base_ts + i as i64;
+            min_ts = min_ts.min(ts);
+            max_ts = max_ts.max(ts);
+            let attrs = (0..n_columns)
+                .map(|c| (format!("c{c:02}"), AttrValue::I64((i % 2) as i64)))
+                .collect();
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs,
+            })
+            .expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: rows as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: min_ts,
+            max_ingest_ts_ns: max_ts,
+            segment_format_version: 1,
+            created_unix_ns: max_ts,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(bytes))
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        record
+    }
+
+    /// Declare `status` as an I64 typed logs column so the fold builds column
+    /// statistics for a (tenant, Logs) pair.
+    async fn set_status_column_config(store: &dyn ObjectStoreBackend) {
+        let cfg = crate::tenant_config::TenantConfig {
+            typed_attr_columns: Some(vec![crate::tenant_config::DeclaredTypedColumn {
+                key: "status".to_string(),
+                ty: crate::tenant_config::DeclaredColumnType::I64,
+            }]),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
+    async fn read_logs_head(store: &dyn ObjectStoreBackend) -> SnapshotHead {
+        let got = store
+            .get(&head_object_key(&tenant(), Signal::Logs), GetRange::Full)
+            .await
+            .expect("head present");
+        snapshot_format::decode_head(&got.data).expect("head decodes")
+    }
+
+    /// Publish a compaction record for `(shard, ingest_hour_bucket)` whose parts
+    /// are REAL L1 RLOG objects, each carrying the `status` I64 column. `parts`
+    /// gives, per part, its status values and whether the part carries an
+    /// ADR-0873 declared stamp over them (`status` min/max, no NULLs); part `i`
+    /// becomes CompactionPart `part_index = i`. Both the part objects (at their
+    /// reconstructed L1 keys) and the compaction record are written, so a fold
+    /// over the hour produces one L1 `SnapshotEntry` per part and ADR-0942
+    /// builds part-bound stats for each. Returns the record (its
+    /// `parts[i].content_hash` is the v2 join key for part `i`).
+    async fn publish_logs_l1(
+        store: &dyn ObjectStoreBackend,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        input_set_seed: &str,
+        parts: &[(&[i64], bool)],
+    ) -> CompactionRecord {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let input_set_hash = *blake3::hash(input_set_seed.as_bytes()).as_bytes();
+        let base_ts = i64::from(ingest_hour_bucket) * NS_PER_HOUR + 60_000_000_000;
+
+        let mut compaction_parts: Vec<CompactionPart> = Vec::new();
+        let mut part_bytes: Vec<Vec<u8>> = Vec::new();
+        let mut max_ts_all = i64::MIN;
+        for (part_index, (statuses, stamped)) in parts.iter().enumerate() {
+            let mut w = RlogWriter::new(
+                RlogConfig::default(),
+                ObjectIdentity {
+                    tenant_hash: tenant().0,
+                    shard,
+                    writer_id: *Uuid::nil().as_bytes(),
+                    writer_epoch: 0,
+                    writer_seq: 0,
+                },
+            );
+            let mut min_ts = i64::MAX;
+            let mut max_ts = i64::MIN;
+            for (i, status) in statuses.iter().enumerate() {
+                let ts = base_ts + (part_index as i64) * 1_000_000 + i as i64;
+                min_ts = min_ts.min(ts);
+                max_ts = max_ts.max(ts);
+                w.push(LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("row {part_index}-{i}"),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: vec![("status".to_string(), AttrValue::I64(*status))],
+                })
+                .expect("push");
+            }
+            let bytes = w.finish().expect("finish");
+            let content_hash = *blake3::hash(&bytes).as_bytes();
+            max_ts_all = max_ts_all.max(max_ts);
+            let mut compaction_part = CompactionPart {
+                part_index: part_index as u32,
+                first_series_id: vec![0u8; 16],
+                last_series_id: vec![0xffu8; 16],
+                content_hash: content_hash.to_vec(),
+                object_size: bytes.len() as u64,
+                sample_count: statuses.len() as u64,
+                series_count: 1,
+                run_count: 1,
+                min_event_ts_ns: min_ts,
+                max_event_ts_ns: max_ts,
+                segment_format_version: 2,
+                declared_column_stats: Vec::new(),
+            };
+            if *stamped {
+                let min = *statuses.iter().min().expect("a part has rows");
+                let max = *statuses.iter().max().expect("a part has rows");
+                ravel_commit::declared_stats::stamp_compaction_part(
+                    &mut compaction_part,
+                    &[stamp_stat("status", min, max, 0)],
+                );
+            }
+            compaction_parts.push(compaction_part);
+            part_bytes.push(bytes);
+        }
+
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Logs).into(),
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: Vec::new(),
+            input_set_hash: input_set_hash.to_vec(),
+            parts: compaction_parts,
+            created_unix_ns: max_ts_all,
+            superseded_record_key: String::new(),
+        };
+        for (part, bytes) in record.parts.iter().zip(part_bytes) {
+            let key = keys::reconstruct_l1_part_key(&record, part).expect("l1 part key");
+            publish::put_data_object(store, &key, Bytes::from(bytes))
+                .await
+                .expect("put l1 part object");
+        }
+        let ckey = keys::compaction_record_key_for(&record).expect("compaction key");
+        store
+            .put(
+                &ckey,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        record
+    }
+
+    /// Assert the single declared `status` I64 column of a decoded segment has
+    /// exactly the given statistics.
+    fn assert_status_column(
+        seg: &ColumnStatsSegment,
+        non_null: u64,
+        null: u64,
+        min: i64,
+        max: i64,
+        dict: &[(i64, u64)],
+        sum: i64,
+    ) {
+        use ravel_proto::catalog::v1::ColumnValue;
+        use ravel_proto::catalog::v1::column_value::Kind;
+        let unwrap_i64 = |v: &ColumnValue| match &v.kind {
+            Some(Kind::I64(x)) => *x,
+            other => panic!("expected I64 column value, got {other:?}"),
+        };
+        assert_eq!(seg.columns.len(), 1, "only status is declared");
+        let col = &seg.columns[0];
+        assert_eq!(col.name, "status");
+        assert_eq!(col.declared_type, 2, "I64 stats tag");
+        assert_eq!(col.non_null_count, non_null);
+        assert_eq!(col.null_count, null);
+        assert_eq!(unwrap_i64(col.min.as_ref().expect("min")), min);
+        assert_eq!(unwrap_i64(col.max.as_ref().expect("max")), max);
+        assert!(col.dictionary_present, "cardinality under the ceiling");
+        let got: Vec<(i64, u64)> = col
+            .dictionary
+            .iter()
+            .map(|e| (unwrap_i64(e.value.as_ref().expect("value")), e.count))
+            .collect();
+        assert_eq!(got, dict, "exact per-value counts, ascending");
+        assert_eq!(col.sum, Some(sum));
+    }
+
+    /// ADR-1413: a fold over an L1-COMPACTED fixture builds the per-part (v3,
+    /// field 7) object over the L1 entries, with EXACT expected values, and
+    /// two L1 parts of one (shard, hour) bucket -- the collision the old
+    /// five-field tuple key could not represent, because a reconstructed L1
+    /// SegmentRef carries writer_id nil / epoch 0 / seq 0 -- produce two
+    /// DISTINCT records keyed by their distinct content hashes within that
+    /// one part's object, neither overwriting the other.
+    #[tokio::test]
+    async fn l1_compacted_fold_builds_part_bound_records_with_exact_values() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        // One compaction record, two L1 parts, both in (shard 0, hour 10).
+        let record = publish_logs_l1(
+            store.as_ref(),
+            0,
+            10,
+            "input-set-seed",
+            &[(&[200, 404, 200, 500], false), (&[500, 500, 200], false)],
+        )
+        .await;
+
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert!(report.rebuilt, "first fold rebuilds from the commit layout");
+        assert_eq!(report.entry_count, 2, "two L1 parts folded");
+        assert_eq!(
+            report.column_stats_part_objects_built, 1,
+            "both L1 entries seal into one output part, so one v3 object is built"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        // Both L1 entries really are level 1 in the folded snapshot.
+        let entries = collect_head_entries(store.as_ref(), &head).await;
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.level == 1), "genuinely L1 fixture");
+        assert_eq!(
+            head.parts.len(),
+            1,
+            "one output part covers both L1 entries"
+        );
+
+        let stats_ref = head.parts[0]
+            .column_stats
+            .clone()
+            .expect("field 7 present after folding L1 parts");
+        let got = store
+            .get(&stats_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let decoded = snapshot_format::decode_column_stats(
+            &got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v3 decodes");
+        assert_eq!(
+            decoded.header.format_version, 3,
+            "per-part object is envelope v3"
+        );
+        assert_eq!(
+            decoded.segments.len(),
+            2,
+            "two L1 parts of one bucket -> two records"
+        );
+
+        let ch0 = record.parts[0].content_hash.clone();
+        let ch1 = record.parts[1].content_hash.clone();
+        assert_ne!(ch0, ch1, "distinct parts have distinct content hashes");
+        // A v2 record is keyed by the part content hash carried in writer_id.
+        let rec0 = decoded
+            .segments
+            .iter()
+            .find(|s| s.writer_id == ch0)
+            .expect("part 0's record is present, keyed by its content hash");
+        let rec1 = decoded
+            .segments
+            .iter()
+            .find(|s| s.writer_id == ch1)
+            .expect("part 1's record is present, keyed by its content hash");
+        // Neither collapsed onto the other: exact, per-part values.
+        assert_status_column(rec0, 4, 0, 200, 500, &[(200, 2), (404, 1), (500, 1)], 1304);
+        assert_status_column(rec1, 3, 0, 200, 500, &[(200, 1), (500, 2)], 1200);
+    }
+
+    async fn list_all_keys(store: &dyn ObjectStoreBackend, prefix: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut page_token = None;
+        loop {
+            let page = store.list(prefix, page_token).await.expect("list");
+            out.extend(page.objects.into_iter().map(|m| m.key));
+            match page.next {
+                Some(t) => page_token = Some(t),
+                None => break,
+            }
+        }
+        out
+    }
+
+    /// ADR-1413 decision 6 (#1600): a fold whose entry count crosses
+    /// `snapshot_part_max_entries` produces a multi-part HEAD, and EACH newly
+    /// written part gets its OWN v3 (field 7) column-statistics object, not
+    /// one shared whole-tenant object -- and no whole-tenant v1/v2 object is
+    /// published at all: the store holds EXACTLY one `.cstat` object per
+    /// part, never a whole-tenant one, at any size.
+    #[tokio::test]
+    async fn fold_over_two_parts_writes_exactly_two_cstat_objects_and_no_whole_object() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Two L0 segments in two distinct sealed hours: cap 1 seals hour 10
+        // into its own part and starts a fresh tail at hour 11.
+        publish_logs_segment(store.as_ref(), 0, 10, &[200, 404]).await;
+        publish_logs_segment(store.as_ref(), 1, 11, &[500, 500, 200]).await;
+
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            report.parts_total, 2,
+            "crossing the cap splits into two parts"
+        );
+        assert_eq!(
+            report.column_stats_part_objects_built, 2,
+            "one v3 object per newly written part"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        assert_eq!(head.parts.len(), 2);
+        assert!(
+            head.parts.iter().all(|p| p.column_stats.is_some()),
+            "field 7 set on both parts"
+        );
+
+        let all_keys = list_all_keys(store.as_ref(), "").await;
+        let cstat_keys: Vec<&String> = all_keys.iter().filter(|k| k.ends_with(".cstat")).collect();
+        assert_eq!(
+            cstat_keys.len(),
+            2,
+            "exactly two .cstat objects in the store, one per part: {cstat_keys:?}"
+        );
+
+        for part in &head.parts {
+            let part_stats = part
+                .column_stats
+                .clone()
+                .expect("every newly written part carries its own field 7 ref");
+            assert_eq!(
+                part_stats.part_blake3,
+                vec![part.blake3.clone()],
+                "the v3 object's own part_blake3 names exactly this part"
+            );
+            assert_eq!(
+                part_stats.segment_count, 1,
+                "one entry per part in this fixture"
+            );
+
+            let got = store
+                .get(&part_stats.key, GetRange::Full)
+                .await
+                .expect("v3 object present at its declared key");
+            assert_eq!(got.data.len() as u64, part_stats.size);
+            assert_eq!(
+                blake3::hash(&got.data).as_bytes().to_vec(),
+                part_stats.blake3
+            );
+            let decoded = snapshot_format::decode_column_stats(
+                &got.data,
+                &crate::snapshot_format::ColumnStatsLimits::default(),
+            )
+            .expect("v3 decodes");
+            assert_eq!(
+                decoded.header.format_version, 3,
+                "per-part object is envelope v3"
+            );
+            assert_eq!(decoded.segments.len(), 1);
+            assert_eq!(
+                decoded.header.part_blake3,
+                vec![part.blake3.clone()],
+                "decoded header's part_blake3 matches the ref"
+            );
+        }
+    }
+
+    /// ADR-1413 decision 4 (amended): a part whose per-part column-statistics
+    /// body exceeds the ceiling degrades rather than refuses -- the fold
+    /// drops the largest remaining dictionary (by its own encoded size),
+    /// re-measures, and repeats until the part fits. Three declared columns
+    /// with deliberately distinct dictionary sizes (`col_a` all-distinct
+    /// across `rows` entries, `col_b` 30 distinct, `col_c` 3 distinct) let a
+    /// small injected ceiling force exactly the two largest (`col_a`,
+    /// `col_b`) to drop while `col_c`'s dictionary survives; min/max/count/sum
+    /// stay exact for all three regardless.
+    #[tokio::test]
+    async fn fold_drops_the_largest_dictionaries_until_a_part_fits_the_ceiling() {
+        let rows = 300;
+
+        // Reference fold at the real (unbounded-for-this-fixture) ceiling:
+        // every dictionary intact. Used only to measure, via the same
+        // `column_stats_segments_concat` the fold itself measures with, the
+        // exact post-drop body size -- so the injected ceiling below is
+        // derived from the encoder's own accounting rather than a guessed
+        // constant.
+        let reference_store = Arc::new(MemoryStore::new());
+        set_three_column_config(reference_store.as_ref()).await;
+        publish_logs_segment_wide(reference_store.as_ref(), 0, 10, rows).await;
+        let reference_catalog = Catalog::new(reference_store.clone(), config(1)).expect("catalog");
+        let reference_report = reference_catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("reference fold at the real ceiling never degrades");
+        assert_eq!(
+            reference_report.column_stats_dictionaries_dropped, 0,
+            "the real ceiling admits this small fixture with every dictionary intact"
+        );
+        let reference_head = read_logs_head(reference_store.as_ref()).await;
+        let reference_ref = reference_head.parts[0]
+            .column_stats
+            .clone()
+            .expect("v3 ref");
+        let reference_got = reference_store
+            .get(&reference_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let reference_decoded = snapshot_format::decode_column_stats(
+            &reference_got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v3 decodes");
+        assert_eq!(reference_decoded.segments.len(), 1);
+        let reference_columns = reference_decoded.segments[0].columns.clone();
+
+        let mut sizes: Vec<(usize, usize)> = reference_columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let size: usize = c.dictionary.iter().map(|e| e.encoded_len()).sum();
+                (i, size)
+            })
+            .collect();
+        sizes.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
+        let largest_idx = sizes[0].0;
+        let second_idx = sizes[1].0;
+        let kept_idx = sizes[2].0;
+        assert_eq!(
+            reference_columns[largest_idx].name, "col_a",
+            "col_a has the most distinct values, so the largest dictionary"
+        );
+        assert_eq!(
+            reference_columns[second_idx].name, "col_b",
+            "col_b is the second-most distinct"
+        );
+        assert_eq!(
+            reference_columns[kept_idx].name, "col_c",
+            "col_c has the fewest distinct values, so the smallest dictionary"
+        );
+
+        let mut post_drop_segments = reference_decoded.segments.clone();
+        post_drop_segments[0].columns[largest_idx].dictionary_present = false;
+        post_drop_segments[0].columns[largest_idx]
+            .dictionary
+            .clear();
+        post_drop_segments[0].columns[second_idx].dictionary_present = false;
+        post_drop_segments[0].columns[second_idx].dictionary.clear();
+        let ceiling =
+            snapshot_format::column_stats_segments_concat(&post_drop_segments).len() as u64;
+
+        // Fresh store, byte-identical fixture, ceiling injected: dropping only
+        // the single largest dictionary still leaves `col_b`'s dictionary in
+        // the body, which is strictly larger than `ceiling` (built from
+        // dropping both), so the degrade loop must continue to a second drop.
+        let store = Arc::new(MemoryStore::new());
+        set_three_column_config(store.as_ref()).await;
+        publish_logs_segment_wide(store.as_ref(), 0, 10, rows).await;
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(ceiling);
+
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("an over-ceiling part degrades rather than refusing");
+        assert_eq!(
+            report.column_stats_dictionaries_dropped, 2,
+            "exactly the two largest dictionaries are dropped"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        let stats_ref = head.parts[0].column_stats.clone().expect("v3 ref");
+        let got = store
+            .get(&stats_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let limits = crate::snapshot_format::ColumnStatsLimits {
+            max_column_stats_bytes: ceiling,
+        };
+        let decoded = snapshot_format::decode_column_stats(&got.data, &limits)
+            .expect("the degraded object decodes under the injected ceiling");
+        let columns = &decoded.segments[0].columns;
+        assert!(
+            !columns[largest_idx].dictionary_present,
+            "col_a's dictionary (largest) was dropped"
+        );
+        assert!(
+            columns[largest_idx].dictionary.is_empty(),
+            "a dropped dictionary is empty, not truncated"
+        );
+        assert!(
+            !columns[second_idx].dictionary_present,
+            "col_b's dictionary (second-largest) was dropped"
+        );
+        assert!(columns[second_idx].dictionary.is_empty());
+        assert!(
+            columns[kept_idx].dictionary_present,
+            "col_c's dictionary (smallest) survives"
+        );
+        assert_eq!(
+            columns[kept_idx].dictionary, reference_columns[kept_idx].dictionary,
+            "the surviving dictionary is unchanged"
+        );
+        for i in 0..3 {
+            assert_eq!(
+                columns[i].non_null_count, reference_columns[i].non_null_count,
+                "column {i} non_null_count stays exact regardless of dictionary drop"
+            );
+            assert_eq!(
+                columns[i].min, reference_columns[i].min,
+                "column {i} min stays exact"
+            );
+            assert_eq!(
+                columns[i].max, reference_columns[i].max,
+                "column {i} max stays exact"
+            );
+            assert_eq!(
+                columns[i].sum, reference_columns[i].sum,
+                "column {i} sum stays exact"
+            );
+        }
+    }
+
+    /// ADR-1413 decision 4 (amended): the fold refuses a part ONLY once no
+    /// dictionary is left to drop and the dictionary-free body (fixed
+    /// fields: name, declared_type, non_null_count, null_count, min, max,
+    /// sum, plus the segment/header framing) is still over the ceiling. A
+    /// ceiling of 1 byte is below that fixed-field floor for any declared
+    /// column, so this never depends on dictionary cardinality at all.
+    #[tokio::test]
+    async fn fold_refuses_only_a_part_whose_dictionary_free_stats_exceed_the_ceiling() {
+        let store = Arc::new(MemoryStore::new());
+        set_status_column_config(store.as_ref()).await;
+        publish_logs_segment(store.as_ref(), 0, 10, &[200, 404, 200]).await;
+
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(1);
+
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect_err("dictionary-free stats alone still exceed a 1-byte ceiling");
+        match err {
+            CatalogError::ColumnStatsPartOverBound {
+                part_key,
+                declared,
+                ceiling,
+            } => {
+                assert!(
+                    part_key.contains(".csnap"),
+                    "error names the part object's own key, got {part_key}"
+                );
+                assert_eq!(ceiling, 1);
+                assert!(
+                    declared > ceiling,
+                    "declared {declared} must exceed ceiling {ceiling} for this to be the refusal path"
+                );
+            }
+            other => panic!("expected ColumnStatsPartOverBound, got {other:?}"),
+        }
+
+        // No column-stats object of any version was ever published: the
+        // fold bailed out of the per-part loop before it could reach the
+        // whole-tenant v1/v2 builds that run after it.
+        let keys = list_all_keys(store.as_ref(), &format!("t/{}/", tenant().to_hex())).await;
+        assert!(
+            keys.iter().all(|k| !k.ends_with(".cstat")),
+            "no column-stats object of any version was written, got {keys:?}"
+        );
+        // The ceiling check runs before the part's own `.csnap` PUT, so a
+        // refused part never leaves an orphan part object behind either.
+        assert!(
+            keys.iter().all(|k| !k.ends_with(".csnap")),
+            "no part object was written for the refused part, got {keys:?}"
+        );
+        // HEAD was never written either: a failed fold must not publish any
+        // catalog state.
+        assert!(
+            store
+                .get(&head_object_key(&tenant(), Signal::Logs), GetRange::Full)
+                .await
+                .is_err(),
+            "HEAD must not exist after a fold that failed before publishing"
+        );
+    }
+
+    /// #1482: the pre-fix loop re-measured the WHOLE part's uncompressed
+    /// body (`column_stats_segments_concat`, a fresh multi-gigabyte `Vec`)
+    /// and re-summed every dictionary's `encoded_len` on every single drop,
+    /// so a part needing many drops never finished. This fixture forces
+    /// 1,500 drops across 2,000 (segment, column) pairs (100 segments x 20
+    /// columns each, every dictionary the same size so the drop order is
+    /// decided purely by the heap's `(seg_idx, col_idx)` tie-break) and
+    /// pins the fix at measuring the body exactly twice regardless of how
+    /// many drops it takes: once before the drop loop, once after.
+    ///
+    /// Reverting the fix's initial `running_total` computation in
+    /// `fold.rs` back to a per-iteration `column_stats_segments_concat`
+    /// call inside the `while running_total > ceiling` loop (the shape
+    /// `#1482` reports) flips this test's concatenation-count assertion
+    /// back to failing, since the counter would then read 1,501 instead of
+    /// 2 (1 before the loop that is no longer needed, plus 1500 in-loop,
+    /// plus the 1 after).
+    #[tokio::test]
+    async fn degrade_completes_a_part_needing_many_drops_with_one_concatenation() {
+        let n_columns = 20;
+        let n_segments = 100;
+        let rows = 4;
+
+        // Reference fold at the real (unbounded-for-this-fixture) ceiling:
+        // every dictionary intact. Used only to measure, via the same
+        // `column_stats_segments_concat` the fold itself measures with,
+        // the exact post-drop body size for an injected ceiling that
+        // forces exactly 1500 drops.
+        let reference_store = Arc::new(MemoryStore::new());
+        set_many_column_config(reference_store.as_ref(), n_columns).await;
+        for seq in 0..n_segments {
+            publish_logs_segment_many_columns(
+                reference_store.as_ref(),
+                seq as u64,
+                10,
+                n_columns,
+                rows,
+            )
+            .await;
+        }
+        let reference_catalog = Catalog::new(reference_store.clone(), config(1)).expect("catalog");
+        let reference_report = reference_catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("reference fold at the real ceiling never degrades");
+        assert_eq!(
+            reference_report.column_stats_dictionaries_dropped, 0,
+            "the real ceiling admits this fixture with every dictionary intact"
+        );
+        let reference_head = read_logs_head(reference_store.as_ref()).await;
+        let reference_ref = reference_head.parts[0]
+            .column_stats
+            .clone()
+            .expect("v3 ref");
+        let reference_got = reference_store
+            .get(&reference_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let reference_decoded = snapshot_format::decode_column_stats(
+            &reference_got.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("v3 decodes");
+        assert_eq!(reference_decoded.segments.len(), n_segments);
+        for seg in &reference_decoded.segments {
+            assert_eq!(seg.columns.len(), n_columns);
+        }
+
+        // Drop every dictionary in the LAST 75 segments (all 20 columns
+        // each = 1500 pairs). Every pair's dictionary is the same size, so
+        // this is exactly what the degrade loop's heap picks: with the
+        // primary (size) key tied across all 2000 pairs, the heap's
+        // `(size, seg_idx, col_idx, ...)` tuple order pops the highest
+        // seg_idx first, then within it the highest col_idx, reproducing
+        // the same "last maximum wins" tie-break the pre-fix
+        // `max_by_key`-based loop used.
+        let mut post_drop_segments = reference_decoded.segments.clone();
+        let dropped_seg_start = n_segments - 75;
+        for seg in &mut post_drop_segments[dropped_seg_start..] {
+            for col in &mut seg.columns {
+                col.dictionary_present = false;
+                col.dictionary.clear();
+            }
+        }
+        let ceiling =
+            snapshot_format::column_stats_segments_concat(&post_drop_segments).len() as u64;
+
+        // Fresh store, byte-identical fixture, ceiling injected.
+        let store = Arc::new(MemoryStore::new());
+        set_many_column_config(store.as_ref(), n_columns).await;
+        for seq in 0..n_segments {
+            publish_logs_segment_many_columns(store.as_ref(), seq as u64, 10, n_columns, rows)
+                .await;
+        }
+        let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        catalog.set_column_stats_part_ceiling_for_test(ceiling);
+
+        reset_column_stats_concat_calls_for_test();
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(10),
+                &[],
+                None,
+            )
+            .await
+            .expect("an over-ceiling part degrades rather than refusing");
+        assert_eq!(
+            report.column_stats_dictionaries_dropped, 1500,
+            "exactly the 1500 pairs in the last 75 segments are dropped"
+        );
+        assert_eq!(
+            column_stats_concat_calls_for_test(),
+            2,
+            "the degrade loop itself concatenates the part's body exactly twice \
+             (once before the drop loop, once after) no matter how many \
+             drops it takes -- not once per drop; the encoder's own passes \
+             are outside this count"
+        );
+
+        let head = read_logs_head(store.as_ref()).await;
+        let stats_ref = head.parts[0].column_stats.clone().expect("v3 ref");
+        let got = store
+            .get(&stats_ref.key, GetRange::Full)
+            .await
+            .expect("v3 object present");
+        let limits = crate::snapshot_format::ColumnStatsLimits {
+            max_column_stats_bytes: ceiling,
+        };
+        snapshot_format::decode_column_stats(&got.data, &limits)
+            .expect("the degraded object decodes under the injected ceiling");
+    }
+
+    /// Issue #1482 finding 2: a v3 object keyed by the PART's own hash
+    /// (`hash16`, the pre-fix code) rather than the hash of its OWN bytes
+    /// collides across two folds that recompute the same byte-identical part
+    /// but derive different statistics for it. Here `snapshot_part_max_entries
+    /// = 2` seals hour 10's two segments (A, B) into a non-tail part on the
+    /// very first fold, alongside a separate tail part for hour 11's segment
+    /// (C); a non-tail part's `(min_hour, watermark_hour)` come from its own
+    /// entries, not the fold's overall watermark, so this part's `.csnap`
+    /// bytes -- and therefore its part hash -- never change no matter how far
+    /// later folds advance. A permanent fault on every `/snap/` GET forces the
+    /// second fold to rebuild from the commit layout (ADR-0063 section 4)
+    /// rather than forward the byte-identical part by reference, so it
+    /// genuinely re-derives that part's v3 statistics from the two segments a
+    /// second time. A `Sequence` scripted onto segment A's own data key lets
+    /// its first two reads (the first fold's v3 build, then the first fold's
+    /// name-postings pass, which aborts immediately because a logs RLOG
+    /// object is not a metrics RSEG) succeed normally, then fails the third
+    /// read -- the second fold's v3 build -- permanently. That is the
+    /// warn-and-omit path (fold.rs's per-entry v3 loop only logs and
+    /// continues on a fetch failure), and it drops A from the second fold's
+    /// v3 segments while B (a distinct key, never faulted) still succeeds:
+    /// the second fold's stats object for this part covers only B, genuinely
+    /// different bytes than the first fold's two-segment object for the exact
+    /// same part.
+    ///
+    /// Reverting the fix (`stats_hash16` back to the part's own `hash16`)
+    /// turns this from two objects at two keys into one: the second fold's
+    /// PUT collides under `AlreadyExists` with the first fold's object
+    /// already sitting at that part-hash-derived key, and the code (like the
+    /// legitimate content-addressed case) treats that as "bytes are
+    /// identical" and skips writing anything. The HEAD's field-7 ref still
+    /// gets the SECOND fold's `blake3` (computed directly off the just-built,
+    /// one-segment bytes, independent of where they landed), so the ref names
+    /// a hash that the object actually stored at its key does not have --
+    /// exactly the corruption this test's final assertion below would catch.
+    #[tokio::test]
+    async fn fold_keys_v3_object_by_its_own_content_hash_not_the_parts_hash() {
+        let inner = MemoryStore::new();
+        set_status_column_config(&inner).await;
+
+        let rec_a = publish_logs_segment(&inner, 1, 10, &[200, 404]).await;
+        let rec_b = publish_logs_segment(&inner, 2, 10, &[500]).await;
+        publish_logs_segment(&inner, 3, 11, &[200]).await;
+        let key_a = keys::reconstruct_data_key(&rec_a).expect("key a");
+
+        let plan = FaultPlan::empty()
+            .with_rule(
+                Rule::new(Op::Get, ScriptedFault::Permanent("part unreadable".into()))
+                    .with_key_contains("/snap/"),
+            )
+            .with_sequence(
+                Sequence::new(Op::Get)
+                    .with_key_contains(key_a.clone())
+                    .then_passthrough() // first fold's v3 build reads A
+                    .then_passthrough() // first fold's postings pass reads A, aborts (RLOG vs RSEG)
+                    .then_fault(ScriptedFault::Permanent(
+                        "segment A unreadable on rebuild".into(),
+                    )), // second fold's v3 build: warn-and-omit
+            );
+        let store = Arc::new(FaultStore::new(inner, plan));
+
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 2,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(11),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        assert_eq!(
+            first.parts_total, 2,
+            "hour 10 seals off from hour 11's tail"
+        );
+
+        let head_1 = read_logs_head(store.as_ref()).await;
+        let part_1 = head_1
+            .parts
+            .iter()
+            .find(|p| p.entry_count == 2)
+            .expect("the sealed two-entry part")
+            .clone();
+        let stats_ref_1 = part_1
+            .column_stats
+            .clone()
+            .expect("first fold's v3 object for the sealed part");
+        let stored_1 = store
+            .get(&stats_ref_1.key, GetRange::Full)
+            .await
+            .expect("first fold's v3 object present");
+        let decoded_1 = snapshot_format::decode_column_stats(
+            &stored_1.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("first fold's v3 object decodes");
+        assert_eq!(
+            decoded_1.segments.len(),
+            2,
+            "first fold covers both A and B"
+        );
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Logs,
+                Uuid::new_v4(),
+                now_at_seal(12),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(
+            second.rebuilt,
+            "the /snap/ fault forces a rebuild from the commit layout"
+        );
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "at least one Permanent Get fault fired; this counter is aggregate \
+             across the /snap/ rule and the sequence, so it does not alone prove \
+             the sequence's third-read fault hit A -- decoded_2.segments below \
+             (len 1, surviving segment is B) is what proves that"
+        );
+
+        let head_2 = read_logs_head(store.as_ref()).await;
+        let part_2 = head_2
+            .parts
+            .iter()
+            .find(|p| p.entry_count == 2)
+            .expect("the same sealed two-entry part, rebuilt")
+            .clone();
+        assert_eq!(
+            part_2.blake3, part_1.blake3,
+            "byte-identical part: same entries, same non-tail (min_hour, watermark_hour)"
+        );
+        let stats_ref_2 = part_2
+            .column_stats
+            .clone()
+            .expect("second fold's v3 object for the same part");
+
+        // The bug this guards against: two different keys, not one collided
+        // key. With the fix, content-addressing guarantees this on its own;
+        // asserting it is what would catch a regression back to part-hash
+        // keying, since fold1 and fold2 share the same part hash.
+        assert_ne!(
+            stats_ref_2.key, stats_ref_1.key,
+            "different statistics bytes must land at different keys, even though \
+             both folds computed this from the exact same part"
+        );
+
+        // First fold's object at its own key is untouched.
+        let restored_1 = store
+            .get(&stats_ref_1.key, GetRange::Full)
+            .await
+            .expect("first fold's object still present, unmodified");
+        assert_eq!(
+            restored_1.data, stored_1.data,
+            "the first fold's v3 object must not be overwritten by the second"
+        );
+
+        // The core correctness property (issue #1482 finding 2): the field-7
+        // ref's blake3 must match what is actually stored at its key. Under
+        // the pre-fix part-hash keying this fails, because the second PUT is
+        // skipped on a false `AlreadyExists` against the first fold's bytes.
+        let stored_2 = store
+            .get(&stats_ref_2.key, GetRange::Full)
+            .await
+            .expect("second fold's v3 object present at its declared key");
+        assert_eq!(
+            blake3::hash(&stored_2.data).as_bytes().to_vec(),
+            stats_ref_2.blake3,
+            "the ref's blake3 must describe the bytes actually stored at its key"
+        );
+        let decoded_2 = snapshot_format::decode_column_stats(
+            &stored_2.data,
+            &crate::snapshot_format::ColumnStatsLimits::default(),
+        )
+        .expect("second fold's v3 object decodes");
+        assert_eq!(
+            decoded_2.segments.len(),
+            1,
+            "A was dropped by the warn-and-omit path; only B survived"
+        );
+        assert_eq!(
+            decoded_2.segments[0].writer_id, rec_b.content_hash,
+            "the surviving segment is B's (entry.content_hash), not A's"
+        );
+    }
+
+    /// ADR-0942: one bucket can hold two entries that cover a byte-identical
+    /// output part, so they carry the same content hash under different
+    /// identity tuples (compaction records with different input sets, plus a
+    /// rewrite record's own parts). `encode_column_stats_v2` rejects a repeated
+    /// key for the WHOLE artifact, and the fold's error arm only logs, so a
+    /// single repeat would strip field 13 for that tenant on this and every
+    /// later fold. Sorting alone does not prevent it; the repeat is collapsed.
+    #[test]
+    fn duplicate_part_content_hashes_are_collapsed_before_encoding() {
+        let shared = vec![7u8; 32];
+        let other = vec![9u8; 32];
+        let seg = |hash: &Vec<u8>| ColumnStatsSegment {
+            writer_id: hash.clone(),
+            ..Default::default()
+        };
+
+        // What the pre-fix code produced: sorted, but still carrying the repeat.
+        let mut sorted_only = vec![seg(&other), seg(&shared), seg(&shared)];
+        sorted_only.sort_by(|a, b| a.writer_id.cmp(&b.writer_id));
+        let err = snapshot_format::encode_column_stats_v2(
+            [0u8; 16],
+            signal::to_proto(Signal::Logs) as u32,
+            Vec::new(),
+            &sorted_only,
+        )
+        .expect_err("a repeated key is rejected for the whole artifact");
+        assert!(
+            matches!(
+                err,
+                crate::snapshot_format::SnapshotFormatError::ColumnStatsDuplicateSegment
+            ),
+            "expected ColumnStatsDuplicateSegment, got {err:?}"
+        );
+
+        // With the collapse the artifact encodes, and the distinct part survives.
+        let mut segments = vec![seg(&other), seg(&shared), seg(&shared)];
+        sort_and_dedup_part_segments(&mut segments);
+        assert_eq!(
+            segments.len(),
+            2,
+            "the repeat collapsed to one, the distinct part kept"
+        );
+        assert_eq!(segments[0].writer_id, shared, "sorted by content hash");
+        assert_eq!(segments[1].writer_id, other);
+        snapshot_format::encode_column_stats_v2(
+            [0u8; 16],
+            signal::to_proto(Signal::Logs) as u32,
+            Vec::new(),
+            &segments,
+        )
+        .expect("encodes once the repeat is collapsed");
+    }
+
+    #[test]
+    fn seal_boundary_is_inclusive_and_hour_by_hour() {
+        let cfg = config(1);
+        assert_eq!(sealed_watermark_hour(now_at_seal(10), &cfg), Some(10));
+        assert_eq!(sealed_watermark_hour(now_at_seal(10) - 1, &cfg), Some(9));
+        assert_eq!(sealed_watermark_hour(now_at_seal(0), &cfg), Some(0));
+        assert_eq!(sealed_watermark_hour(now_at_seal(0) - 1, &cfg), None);
+    }
+
+    #[tokio::test]
+    async fn no_hour_sealed_yet_is_a_no_op() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, config(1)).expect("catalog");
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), 0, &[], None)
+            .await
+            .expect("fold");
+        assert!(report.no_op);
+        assert_eq!(report.watermark_hour, None);
+        assert_eq!(report.put_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn empty_tenant_still_produces_a_valid_empty_fold() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, config(2)).expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(5),
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert!(!report.no_op);
+        assert!(report.rebuilt);
+        assert_eq!(report.watermark_hour, Some(5));
+        assert_eq!(report.entry_count, 0);
+    }
+
+    #[tokio::test]
+    async fn first_fold_rebuilds_from_commit_layout_and_second_call_is_idempotent() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 2, 10, now - NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt);
+        assert!(!first.no_op);
+        assert_eq!(first.watermark_hour, Some(10));
+        assert_eq!(first.previous_watermark_hour, None);
+        assert_eq!(first.entry_count, 2);
+
+        // Same now_ns: nothing new sealed, so this must be a clean no-op
+        // that touches neither the part nor HEAD.
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("second fold");
+        assert!(second.no_op);
+        assert_eq!(second.watermark_hour, Some(10));
+        assert_eq!(second.put_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn incremental_fold_preserves_previous_entries_and_folds_only_new_hours() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 1);
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "a valid HEAD must fold incrementally");
+        assert!(!second.no_op);
+        assert_eq!(second.previous_watermark_hour, Some(10));
+        assert_eq!(second.watermark_hour, Some(12));
+        // Hours 11 and 12 across the single shard: two new buckets listed,
+        // only one of which has data.
+        assert_eq!(second.buckets_folded, 2);
+        assert_eq!(second.entry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn corrupt_head_falls_back_to_rebuild_and_recovers_all_entries() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+
+        // Corrupt HEAD in place: same key, garbage bytes.
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        store
+            .put(
+                &head_key,
+                Bytes::from_static(b"not a head"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite head with garbage");
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("fold after corruption");
+        assert!(report.rebuilt);
+        assert!(!report.no_op);
+        assert_eq!(report.watermark_hour, Some(12));
+        assert_eq!(report.entry_count, 2);
+    }
+
+    /// A HEAD whose `format_version` is newer than this process understands
+    /// (ADR-0066 decision 2) must fail the fold loudly and, critically, never
+    /// attempt a CAS write: an older process racing a rolling upgrade must not
+    /// rebuild a single-part HEAD over a newer multi-part one written by an
+    /// upgraded peer (the single-part-over-multipart clobber bug).
+    #[tokio::test]
+    async fn newer_format_head_fails_loudly_and_never_clobbers() {
+        let inner = MemoryStore::new();
+        // Fault EVERY put. The fold must return before writing anything, so
+        // this fault must never fire. Setup writes go through `inner()` and
+        // bypass this counter, so a non-zero count can only mean the fold
+        // itself attempted a PUT.
+        let plan = FaultPlan::empty().with_rule(Rule::new(
+            Op::Put,
+            ScriptedFault::Permanent("no write expected on newer-format head".into()),
+        ));
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // Seed a HEAD one format version ahead of this build, written
+        // directly so it bypasses `encode_head`'s own version validation. It
+        // decodes as protobuf, so `decode_head` reaches the version check
+        // first and returns `UnsupportedHeadVersion`.
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let newer_head = SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION + 1,
+            ..Default::default()
+        };
+        let newer_bytes = newer_head.encode_to_vec();
+        store
+            .inner()
+            .put(
+                &head_key,
+                Bytes::from(newer_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed newer-format head");
+
+        let now = now_at_seal(12);
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect_err("fold must fail on a newer-format HEAD");
+        assert!(
+            matches!(
+                err,
+                CatalogError::UnsupportedHeadVersion { format_version }
+                    if format_version == HEAD_FORMAT_VERSION + 1
+            ),
+            "expected UnsupportedHeadVersion, got {err:?}"
+        );
+
+        // The core safety property: the old process never attempted a PUT, so
+        // it could not have clobbered the newer HEAD.
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Permanent),
+            0,
+            "fold must not attempt any PUT against a newer-format HEAD"
+        );
+
+        // And the newer HEAD is byte-for-byte intact in the store.
+        let got = store
+            .inner()
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("newer head still present");
+        assert_eq!(got.data.as_ref(), newer_bytes.as_slice());
+    }
+
+    /// The mirror image of the test above: a HEAD that decodes as protobuf and
+    /// carries the CURRENT format version but fails a LATER structural check
+    /// (tenant_hash length) is genuine corruption, not a newer format, and
+    /// must still take the self-healing rebuild-and-CAS-overwrite path. Proves
+    /// the single-part/multipart split is precise and did not block legitimate
+    /// self-healing.
+    #[tokio::test]
+    async fn head_failing_late_validation_still_rebuilds_via_corrupt_path() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_at_seal(10) - NS_PER_HOUR,
+        )
+        .await;
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let corrupt_head = SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION,
+            tenant_hash: vec![0u8; 4],
+            ..Default::default()
+        };
+        store
+            .put(
+                &head_key,
+                Bytes::from(corrupt_head.encode_to_vec()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed corrupt head");
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("corrupt head self-heals via rebuild");
+        assert!(report.rebuilt);
+        assert!(
+            report.put_requests >= 1,
+            "rebuild must CAS-overwrite the corrupt head"
+        );
+        assert_eq!(report.watermark_hour, Some(12));
+        assert_eq!(report.entry_count, 2);
+    }
+
+    /// A HEAD below the supported format version (0: a writer that never set
+    /// the field) is corrupt, not newer, so ADR-0066 decision 2 does not
+    /// apply: the fold rebuilds it exactly as it rebuilds a HEAD of garbage
+    /// bytes (`corrupt_head_falls_back_to_rebuild_and_recovers_all_entries`).
+    #[tokio::test]
+    async fn below_floor_head_version_rebuilds_like_corrupt_head() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let below_floor = SnapshotHead {
+            format_version: 0,
+            watermark_hour: 10,
+            ..Default::default()
+        };
+        store
+            .put(
+                &head_key,
+                Bytes::from(below_floor.encode_to_vec()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite head with a version-0 head");
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("a below-floor HEAD is rebuilt, not refused as newer");
+        assert!(report.rebuilt);
+        assert!(!report.no_op);
+        assert_eq!(report.watermark_hour, Some(12));
+        assert_eq!(report.entry_count, 2);
+
+        let got = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("rebuilt head present");
+        let head = snapshot_format::decode_head(&got.data).expect("rebuilt head decodes");
+        assert_eq!(head.format_version, HEAD_FORMAT_VERSION);
+        assert_eq!(head.watermark_hour, 12);
+    }
+
+    /// A HEAD one version above this build is still refused (ADR-0066
+    /// decision 2) on a plain store, and its bytes are left untouched.
+    #[tokio::test]
+    async fn above_max_head_version_is_refused_and_not_overwritten() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now_1 = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let newer_bytes = SnapshotHead {
+            format_version: HEAD_FORMAT_VERSION + 1,
+            watermark_hour: 10,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        store
+            .put(
+                &head_key,
+                Bytes::from(newer_bytes.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite head with a newer-format head");
+
+        let now_2 = now_at_seal(12);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect_err("a newer-format HEAD must be refused");
+        assert!(
+            matches!(
+                err,
+                CatalogError::UnsupportedHeadVersion { format_version }
+                    if format_version == HEAD_FORMAT_VERSION + 1
+            ),
+            "expected UnsupportedHeadVersion, got {err:?}"
+        );
+
+        let got = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("newer head still present");
+        assert_eq!(got.data.as_ref(), newer_bytes.as_slice());
+    }
+
+    /// Every snapshot part key contains `/snap/`; a HEAD key never does, so
+    /// this rule fails exactly the previous-part reads a later incremental
+    /// fold performs, and nothing else. Simulates a part that has become
+    /// unreadable (e.g. GC raced with a stalled fold) without needing to
+    /// know its content-addressed key ahead of time.
+    #[tokio::test]
+    async fn unreadable_previous_part_falls_back_to_rebuild() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("part unreadable".into()))
+                .with_key_contains("/snap/"),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_1 = now_at_seal(10);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 1);
+
+        let now_2 = now_at_seal(12);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("fold falls back to rebuild");
+        assert!(second.rebuilt);
+        assert_eq!(second.entry_count, 2);
+        assert!(store.fault_count(Op::Get, FaultKind::Permanent) >= 1);
+    }
+
+    /// Every data-object key contains `/l0/`
+    /// (crates/ravel-commit/src/keys.rs `data_key`); no HEAD, part, postings,
+    /// or commit-record key does. This rule fails exactly the segment fetch
+    /// `Catalog::build_postings` performs mid-fold, and nothing else, so the
+    /// part and HEAD writes still succeed while the postings build is the
+    /// one thing interrupted.
+    #[tokio::test]
+    async fn segment_fetch_fault_mid_postings_build_leaves_fold_successful_without_postings() {
+        let inner = MemoryStore::new();
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Permanent("segment unreadable".into()),
+            )
+            .with_key_contains("/l0/"),
+        );
+        let store = Arc::new(FaultStore::new(inner, plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now = now_at_seal(10);
+        publish_real_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now - NS_PER_HOUR,
+            &["cpu", "mem"],
+        )
+        .await;
+
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("fold succeeds despite postings-build fault");
+
+        assert!(!report.no_op);
+        assert_eq!(report.entry_count, 1);
+        assert!(!report.postings_built);
+        assert_eq!(report.postings_bytes, 0);
+        assert!(store.fault_count(Op::Get, FaultKind::Permanent) >= 1);
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let got = store
+            .inner()
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head readable");
+        let head = snapshot_format::decode_head(&got.data).expect("head decodes");
+        assert!(head.postings.is_none());
+        assert_eq!(head.parts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_first_folds_race_head_cas_and_only_one_advances() {
+        let store = Arc::new(MemoryStore::new());
+        let now = now_at_seal(10);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now - NS_PER_HOUR).await;
+
+        let catalog_a = Catalog::new(store.clone(), config(1)).expect("catalog a");
+        let catalog_b = Catalog::new(store.clone(), config(1)).expect("catalog b");
+        let tenant = tenant();
+        let (result_a, result_b) = tokio::join!(
+            catalog_a.fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[], None),
+            catalog_b.fold(&tenant, Signal::Metrics, Uuid::new_v4(), now, &[], None),
+        );
+        let report_a = result_a.expect("fold a");
+        let report_b = result_b.expect("fold b");
+
+        let no_op_count = [&report_a, &report_b].iter().filter(|r| r.no_op).count();
+        assert_eq!(
+            no_op_count, 1,
+            "exactly one racer must rebase onto the other's HEAD"
+        );
+        for report in [&report_a, &report_b] {
+            assert_eq!(report.watermark_hour, Some(10));
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_commit_identity_across_buckets_skips_and_advances() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_at_seal(11);
+        let writer_id = Uuid::new_v4();
+
+        // A well-formed record naturally placed in hour 10's directory.
+        let record_a = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: 5,
+            content_hash: *blake3::hash(b"a").as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1,
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 1,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+            ingest_hour_bucket: 10,
+        })
+        .expect("valid record a");
+        let key_a =
+            keys::commit_key(&tenant(), Signal::Metrics, 0, 10, writer_id, 1, 1).expect("key a");
+        store
+            .put(
+                &key_a,
+                record::encode(&record_a),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put a");
+
+        // Same shard/writer_id/epoch/seq/ingest_hour_bucket identity, but
+        // physically misplaced under hour 9's directory (a buggy or
+        // misbehaving writer). validate_expected_fields never checks the
+        // embedded ingest_hour_bucket against the physical directory, so
+        // both entries decode and validate cleanly; fold's own identity
+        // dedup must be what catches the collision.
+        let key_b =
+            keys::commit_key(&tenant(), Signal::Metrics, 0, 9, writer_id, 1, 1).expect("key b");
+        store
+            .put(
+                &key_b,
+                record::encode(&record_a),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put b");
+
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("duplicate identity must not be fold-fatal");
+        assert!(!report.no_op);
+        assert_eq!(report.watermark_hour, Some(11));
+        assert_eq!(
+            report.entry_count, 1,
+            "the misplaced duplicate collapses into the one entry kept in its correct hour directory"
+        );
+        assert_eq!(report.layout_drift_count, 1);
+    }
+
+    #[tokio::test]
+    async fn unrecognized_bucket_key_shape_skips_and_advances() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let now = now_at_seal(5);
+
+        // A key sitting in a well-formed commit hour directory, but whose
+        // filename matches none of the three recognized shapes (commit
+        // record, compaction record, retention tombstone).
+        let prefix = keys::commit_shard_hour_prefix(&tenant(), Signal::Metrics, 0, 5)
+            .expect("bucket prefix");
+        store
+            .put(
+                &format!("{prefix}not-a-recognized-shape"),
+                Bytes::from_static(b"layout drift"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put unrecognized key");
+
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("unrecognized key shape must not be fold-fatal");
+        assert!(!report.no_op);
+        assert!(report.rebuilt);
+        assert_eq!(report.watermark_hour, Some(5));
+        assert_eq!(report.entry_count, 0);
+        assert_eq!(report.layout_drift_count, 1);
+    }
+
+    /// A fold must decode only the entries newly folded since
+    /// the last successful fold, carrying forward the previous postings
+    /// object as a merge baseline rather than re-fetching every
+    /// historically-covered entry's segment. `get_requests` is the proof:
+    /// each fold's total is bookkeeping gets (HEAD, plus on the second
+    /// fold the previous part and previous postings) plus exactly one
+    /// commit-record load and one segment fetch per *newly* folded entry.
+    /// A fold that still rebuilt postings from every historical segment
+    /// would add one extra segment fetch on the second run (re-decoding
+    /// the first fold's entry), landing on 6 instead of 5.
+    #[tokio::test]
+    async fn incremental_fold_decodes_only_newly_folded_entries_for_postings() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_1 = now_at_seal(10);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - NS_PER_HOUR,
+            &["cpu"],
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(!first.no_op);
+        assert_eq!(first.entry_count, 1);
+        assert!(first.postings_built);
+        // HEAD get (absent) + 1 tenant-config read + 1 commit-record load +
+        // 1 segment fetch to decode the sole entry's names.
+        assert_eq!(first.get_requests, 4);
+
+        let now_2 = now_at_seal(12);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            12,
+            now_2 - NS_PER_HOUR,
+            &["mem"],
+        )
+        .await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "a valid HEAD must fold incrementally");
+        assert!(!second.no_op);
+        assert_eq!(second.entry_count, 2);
+        assert!(second.postings_built);
+        // HEAD get + tenant-config read + previous-part load + previous-postings
+        // load + 1 new commit-record load + 1 new segment fetch = 6: the first
+        // fold's "cpu" entry is neither re-loaded from the part nor re-decoded
+        // from its segment.
+        assert_eq!(second.get_requests, 6);
+    }
+
+    /// `FoldReport.get_requests` must equal the store's real observed GET count
+    /// on every path (issue #770). Two fold GETs were charged to the discarded
+    /// `QueryAccounting` handle or a bare `store.get` and never folded into the
+    /// report: the tenant-config read (every fold) and, under provisioning
+    /// enforcement, the generation-history read. The report is measured against
+    /// an `InstrumentedStore`'s own GET counter rather than a hand-written
+    /// constant, so the assertion tracks the code it checks.
+    ///
+    /// FLIP (pre-fix demonstration, either line reverted in `Catalog::fold`):
+    /// dropping `counters.get_requests += accounting.snapshot()...` leaves the
+    /// enforcement path reporting 4 against 5 observed; dropping
+    /// `counters.get_requests += 1` after the tenant-config read leaves both
+    /// paths reporting one below observed. Each makes an `assert_eq!` of report
+    /// against observed fail.
+    #[tokio::test]
+    async fn fold_report_get_requests_equals_observed_store_gets() {
+        // One rebuild fold over a fresh instrumented store holding a single
+        // sealed segment. Returns (FoldReport.get_requests, the store's real GET
+        // calls issued during the fold only). Publishing happens on the inner
+        // store before it is wrapped, so only the fold's own requests are
+        // measured.
+        async fn measured(enforce: bool) -> (u64, u64) {
+            let inner = MemoryStore::new();
+            let now = now_at_seal(10);
+            publish_real_segment(
+                &inner,
+                0,
+                Uuid::new_v4(),
+                1,
+                10,
+                now - NS_PER_HOUR,
+                &["cpu"],
+            )
+            .await;
+            let store = Arc::new(InstrumentedStore::new(inner));
+            let catalog = {
+                let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+                if enforce {
+                    catalog.with_provisioning_enforcement()
+                } else {
+                    catalog
+                }
+            };
+
+            let before = store.metrics().snapshot();
+            let report = catalog
+                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+                .await
+                .expect("fold");
+            let after = store.metrics().snapshot();
+
+            assert!(!report.no_op);
+            assert!(report.rebuilt);
+            (report.get_requests, after.get.calls - before.get.calls)
+        }
+
+        // Enforcement off: the report must equal the store's real GET count.
+        // The scan set is a single shard 0 either way (implicit generation 0 at
+        // shard_count 1), so the GETs are HEAD (absent) + tenant-config +
+        // commit-record load + segment fetch = 4.
+        let (off_report, off_observed) = measured(false).await;
+        assert_eq!(
+            off_report, off_observed,
+            "with enforcement off the report must equal the store's observed GETs"
+        );
+        assert_eq!(off_observed, 4);
+
+        // Enforcement on: `read_scan_generations` funnels exactly one extra GET
+        // (the provisioning-record read, NotFound here but still one request)
+        // through `guarded_get`. That is the GET issue #770 dropped; the report
+        // must now equal the store's real count on this path too.
+        let (on_report, on_observed) = measured(true).await;
+        assert_eq!(
+            on_report, on_observed,
+            "with enforcement on the report must equal the store's observed GETs"
+        );
+        assert_eq!(on_observed, 5);
+        assert_eq!(
+            on_observed,
+            off_observed + 1,
+            "enforcement issues exactly one extra GET, the provisioning read"
+        );
+    }
+
+    // ---- ADR-0063 T2: hour-partitioned sealed/tail parts ----
+
+    /// `partition_parts` seals only at hour boundaries: whole hours accumulate
+    /// until admitting the next hour would cross the cap, and a single hour
+    /// larger than the cap becomes one oversized part rather than being split.
+    #[test]
+    fn partition_parts_seals_at_hour_boundaries() {
+        let entry = |hour: u32| SnapshotEntry {
+            ingest_hour_bucket: hour,
+            ..SnapshotEntry::default()
+        };
+        // Empty input still yields one (empty) span.
+        let empty = partition_parts(&[], 100);
+        assert_eq!(empty.len(), 1);
+        assert_eq!((empty[0].start, empty[0].end), (0, 0));
+
+        // One entry per hour, cap 1: every hour becomes its own part.
+        let one_per_hour = vec![entry(10), entry(11), entry(12)];
+        let spans = partition_parts(&one_per_hour, 1);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.min_hour, s.watermark_hour))
+                .collect::<Vec<_>>(),
+            vec![(10, 10), (11, 11), (12, 12)],
+        );
+
+        // A single hour of 3 entries with cap 2 is NOT split: one oversized
+        // part, because splits are only at hour boundaries.
+        let dense = vec![entry(5), entry(5), entry(5)];
+        let spans = partition_parts(&dense, 2);
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].start, spans[0].end), (0, 3));
+
+        // Two entries in hour 7 then one in hour 8, cap 2: hour 7 fills the
+        // first part, hour 8 seals it and starts the tail.
+        let mixed = vec![entry(7), entry(7), entry(8)];
+        let spans = partition_parts(&mixed, 2);
+        assert_eq!(spans.len(), 2);
+        assert_eq!((spans[0].min_hour, spans[0].watermark_hour), (7, 7));
+        assert_eq!((spans[1].min_hour, spans[1].watermark_hour), (8, 8));
+    }
+
+    /// A fold whose entry count crosses
+    /// `snapshot_part_max_entries` mid-run produces a multi-part HEAD that is
+    /// sorted, disjoint, and self-consistent (`validate_head`); a later fold
+    /// that adds no new data carries the sealed part forward by reference, so
+    /// no PUT is issued for it.
+    #[tokio::test]
+    async fn ceiling_crossing_produces_multiple_parts() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Two segments in two distinct sealed hours: with a cap of 1 entry the
+        // fold seals hour 10 into its own part and starts a fresh tail at 11.
+        let now_1 = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(!first.no_op);
+        assert_eq!(first.entry_count, 2);
+        assert_eq!(
+            first.parts_total, 2,
+            "crossing the cap splits into two parts"
+        );
+        assert_eq!(first.parts_reused, 0, "first fold writes every part fresh");
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let head = snapshot_format::decode_head(
+            &store
+                .get(&head_key, GetRange::Full)
+                .await
+                .expect("get head")
+                .data,
+        )
+        .expect("head decodes");
+        assert_eq!(head.parts.len(), 2);
+        // Re-encoding re-runs validate_head: sorted, disjoint, self-consistent.
+        snapshot_format::encode_head(&head).expect("multi-part head is self-consistent");
+        assert!(head.parts[0].min_hour <= head.parts[0].watermark_hour);
+        assert!(
+            head.parts[0].watermark_hour < head.parts[1].min_hour,
+            "ranges ascending and disjoint"
+        );
+        assert_eq!(
+            head.parts[1].watermark_hour, head.watermark_hour,
+            "the tail carries the fold watermark"
+        );
+        assert_eq!(head.watermark_hour, 11);
+
+        let sealed_key = head.parts[0].key.clone();
+        let sealed_bytes = store
+            .get(&sealed_key, GetRange::Full)
+            .await
+            .expect("sealed part present")
+            .data;
+
+        // A second fold advances the watermark but adds no new data: the sealed
+        // part is carried by reference, no PUT for it.
+        let now_2 = now_at_seal(13);
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt, "a valid HEAD folds incrementally");
+        assert_eq!(second.parts_total, 2);
+        assert!(
+            second.parts_reused >= 1,
+            "the unchanged sealed part is carried by reference (no PUT)"
+        );
+
+        let head2 = snapshot_format::decode_head(
+            &store
+                .get(&head_key, GetRange::Full)
+                .await
+                .expect("get head 2")
+                .data,
+        )
+        .expect("head2 decodes");
+        assert!(
+            head2.parts.iter().any(|p| p.key == sealed_key),
+            "sealed part still referenced by its original key"
+        );
+        let sealed_bytes_2 = store
+            .get(&sealed_key, GetRange::Full)
+            .await
+            .expect("sealed part still present")
+            .data;
+        assert_eq!(
+            sealed_bytes, sealed_bytes_2,
+            "the sealed part object was not rewritten"
+        );
+    }
+
+    /// Stage 4 checkpoint regression: when a sealed part object is missing
+    /// and the fold falls back to a full rebuild from the commit layout
+    /// (`rebuilt = true`), the rebuild recomputes byte-identical content for
+    /// that span, so its blake3 matches the stale ref in the (still `Valid`)
+    /// previous HEAD. Carrying that ref forward by reference -- as if the
+    /// object still existed -- would skip the PUT and leave the new HEAD
+    /// permanently naming a dead object. The rebuild path must always
+    /// restore the sealed part, never reuse a reference across a rebuild.
+    #[tokio::test]
+    async fn rebuild_restores_a_deleted_sealed_part_instead_of_reusing_its_ref() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert_eq!(
+            first.parts_total, 2,
+            "crossing the cap splits into two parts"
+        );
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let head = snapshot_format::decode_head(
+            &store
+                .get(&head_key, GetRange::Full)
+                .await
+                .expect("get head")
+                .data,
+        )
+        .expect("head decodes");
+        let sealed_key = head.parts[0].key.clone();
+
+        // Delete the sealed part object out from under the HEAD, simulating
+        // an unreadable/missing part (e.g. a GC race). Any live tenant read
+        // of it now fails with `NotFound`.
+        store.delete(&sealed_key).await.expect("delete sealed part");
+
+        let now_2 = now_at_seal(13);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("fold falls back to rebuild and restores the missing part");
+        assert!(
+            second.rebuilt,
+            "the missing sealed part must trigger a rebuild, not an incremental fold"
+        );
+
+        // The sealed part object must have been restored: a live GET must
+        // succeed now, not still return NotFound.
+        let restored = store.get(&sealed_key, GetRange::Full).await;
+        assert!(
+            restored.is_ok(),
+            "the rebuild must have re-PUT the deleted sealed part, got {restored:?}"
+        );
+
+        let head2 = snapshot_format::decode_head(
+            &store
+                .get(&head_key, GetRange::Full)
+                .await
+                .expect("get head 2")
+                .data,
+        )
+        .expect("head2 decodes");
+        for part in &head2.parts {
+            let got = store.get(&part.key, GetRange::Full).await;
+            assert!(
+                got.is_ok(),
+                "every part the rebuilt HEAD references must actually exist: {} -> {got:?}",
+                part.key
+            );
+        }
+    }
+
+    /// Failing the crashing fold's HEAD CAS (after some
+    /// new part objects have already been PUT) must leave the previous HEAD
+    /// exactly intact -- never half-updated. The orphaned new part objects are
+    /// allowed garbage.
+    #[tokio::test]
+    async fn crash_after_partial_part_puts_leaves_old_head_intact() {
+        // Fail only the SECOND HEAD PUT (the crashing fold's CAS). The first
+        // fold's HEAD PUT (the 1st matching call) passes, establishing a valid
+        // old head; no other PUT key contains "HEAD".
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("head cas crash".into()))
+                .with_key_contains("HEAD")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now_1 - 2 * NS_PER_HOUR,
+        )
+        .await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert_eq!(first.parts_total, 2);
+
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let old_head_bytes = store
+            .inner()
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("old head")
+            .data;
+
+        // A second fold adds new data (so new parts get PUT), then its HEAD CAS
+        // is failed by the fault.
+        let now_2 = now_at_seal(13);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 13, now_2 - NS_PER_HOUR).await;
+        let err = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect_err("HEAD CAS crash must surface as an error");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+
+        // The fault fired exactly once: the crashing fold's single HEAD PUT
+        // attempt (a Permanent error is not retried).
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+
+        // HEAD is byte-for-byte the old head: never half-updated.
+        let head_now = store
+            .inner()
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head still present")
+            .data;
+        assert_eq!(
+            head_now.as_ref(),
+            old_head_bytes.as_ref(),
+            "HEAD unchanged after the crashing fold"
+        );
+        // And it still decodes to the pre-crash multi-part snapshot.
+        let head = snapshot_format::decode_head(&head_now).expect("old head still valid");
+        assert_eq!(head.watermark_hour, 11);
+        assert_eq!(head.parts.len(), 2);
+    }
+
+    /// A resolve over a narrow hour window fetches only
+    /// the parts whose range intersects it, not every part in HEAD. Proven by a
+    /// GET fault on the low part's object (its `/snap/` key embeds hour 10's
+    /// watermark string): a narrow window must not fire it, a wide window must.
+    #[tokio::test]
+    async fn range_scoped_resolve_fetches_only_intersecting_parts() {
+        let low_marker = format!("snap/{}", keys::ingest_hour_string(10));
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("low part fetched".into()))
+                .with_key_contains(low_marker),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Two far-apart hours: hour 10 seals into its own part, hour 20 is the
+        // tail.
+        let now = now_at_seal(20);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            10,
+            now - 11 * NS_PER_HOUR,
+        )
+        .await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 20, now - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("fold");
+        assert_eq!(report.parts_total, 2);
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "the rebuild fold GETs no /snap/ object"
+        );
+
+        // Narrow window near hour 20: the low part (hours 10..10) does not
+        // intersect, so it is not fetched.
+        let narrow = ravel_types::TimeRange {
+            start_ns: 20 * NS_PER_HOUR,
+            end_ns: 21 * NS_PER_HOUR,
+        };
+        catalog
+            .resolve(&tenant(), Signal::Metrics, narrow, &[], now)
+            .await
+            .expect("narrow resolve");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Permanent),
+            0,
+            "range filter must skip the non-intersecting low part"
+        );
+
+        // A window reaching hour 10 intersects the low part, so a fetch is
+        // attempted (fault fires); the resolve still succeeds via listing.
+        let wide = ravel_types::TimeRange {
+            start_ns: 0,
+            end_ns: 21 * NS_PER_HOUR,
+        };
+        catalog
+            .resolve(&tenant(), Signal::Metrics, wide, &[], now)
+            .await
+            .expect("wide resolve");
+        assert!(
+            store.fault_count(Op::Get, FaultKind::Permanent) >= 1,
+            "the intersecting low part is fetched"
+        );
+    }
+
+    // ---- ADR-0063: fold reconcile pass ----
+
+    /// Publish a compaction record into `(shard, ingest_hour_bucket)` that
+    /// supersedes the given L0 `inputs` and contributes one L1 part. Only the
+    /// record object is written (at its own reconstructed key): the fold's
+    /// reconcile and incremental paths read the record, not the part object, so
+    /// no L1 part object is needed for these tests.
+    async fn publish_compaction(
+        store: &MemoryStore,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        inputs: &[&CommitRecord],
+        created_unix_ns: i64,
+    ) -> CompactionRecord {
+        let input_ids: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|r| CompactionInputIdentity {
+                writer_id: r.writer_id.clone(),
+                writer_epoch: r.writer_epoch,
+                writer_seq: r.writer_seq,
+            })
+            .collect();
+        let mut hasher = blake3::Hasher::new();
+        for id in &input_ids {
+            hasher.update(id.writer_id.as_bytes());
+            hasher.update(&id.writer_epoch.to_le_bytes());
+            hasher.update(&id.writer_seq.to_le_bytes());
+        }
+        let input_set_hash = *hasher.finalize().as_bytes();
+        let part_payload = format!("l1-{shard}-{ingest_hour_bucket}").into_bytes();
+        let part_content_hash = *blake3::hash(&part_payload).as_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: part_content_hash.to_vec(),
+            object_size: part_payload.len() as u64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            segment_format_version: 3,
+            declared_column_stats: Vec::new(),
+        };
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: input_ids,
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        let key = keys::compaction_record_key_for(&record).expect("compaction key");
+        store
+            .put(
+                &key,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        record
+    }
+
+    /// Like `publish_real_segment`, but writes the real RSEG part as an L1
+    /// compaction output (`keys::l1_part_key`, footer identity nil/0/0 per
+    /// `build_l1_snapshot_entry`) with a `CompactionRecord` pointing at it,
+    /// instead of a `CommitRecord`-addressed L0 object. Needed so a test can
+    /// observe `Catalog::build_postings` actually GET and decode an L1
+    /// entry, the same way it already does for L0 via
+    /// `publish_real_segment`.
+    async fn publish_real_compaction(
+        store: &MemoryStore,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        created_unix_ns: i64,
+        metrics: &[&str],
+    ) -> CompactionRecord {
+        let tenant_id = TenantId::new("fold-postings-fault-test");
+        let series: Vec<SeriesInput> = metrics
+            .iter()
+            .map(|metric| {
+                let labels = LabelSet::new(vec![Label {
+                    name: METRIC_NAME_LABEL.to_string(),
+                    value: (*metric).to_string(),
+                }])
+                .expect("valid labels");
+                let series_id = SeriesId::compute(&tenant_id, metric, &labels).expect("series id");
+                SeriesInput {
+                    series_id,
+                    labels,
+                    samples: vec![Sample {
+                        ts_ns: created_unix_ns,
+                        value: 1.0,
+                    }],
+                }
+            })
+            .collect();
+        let identity = SegmentIdentity {
+            tenant_hash: tenant().0,
+            shard,
+            writer_id: Uuid::nil().to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        };
+        let min_ingest_ts_ns = created_unix_ns - 1_000;
+        let max_ingest_ts_ns = created_unix_ns;
+        let bounds = IngestBounds {
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        };
+        let written = SegmentWriter::write(series, identity, bounds).expect("write segment");
+        let input_set_hash =
+            *blake3::hash(format!("l1-inputs-{shard}-{ingest_hour_bucket}").as_bytes()).as_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: written.summary.blake3.to_vec(),
+            object_size: written.bytes.len() as u64,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            run_count: 1,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 3,
+            declared_column_stats: Vec::new(),
+        };
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard,
+            ingest_hour_bucket,
+            level: 1,
+            inputs: Vec::new(),
+            input_set_hash: input_set_hash.to_vec(),
+            parts: vec![part],
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        let data_key =
+            keys::reconstruct_l1_part_key(&record, &record.parts[0]).expect("l1 part key");
+        publish::put_data_object(store, &data_key, written.bytes)
+            .await
+            .expect("put l1 part object");
+        let ckey = keys::compaction_record_key_for(&record).expect("compaction key");
+        store
+            .put(
+                &ckey,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        record
+    }
+
+    /// Publish a retention tombstone for `(shard, ingest_hour_bucket)`. The
+    /// fold classifies a bucket as tombstoned from the key shape alone and
+    /// never reads the body, so a minimal valid record suffices.
+    async fn publish_tombstone(store: &MemoryStore, shard: u32, ingest_hour_bucket: u32) {
+        let record = RetentionTombstone {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics).into(),
+            shard,
+            ingest_hour_bucket,
+            retired_at_ns: 0,
+            retention_window_ns: 0,
+            record_count_observed: 0,
+        };
+        let key = keys::retention_tombstone_key_for(&record).expect("tombstone key");
+        store
+            .put(
+                &key,
+                Bytes::from(record.encode_to_vec()),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put tombstone");
+    }
+
+    /// Load and concatenate every entry across all parts a HEAD names, in part
+    /// order (the globally sorted entry set).
+    async fn collect_head_entries(
+        store: &dyn ObjectStoreBackend,
+        head: &SnapshotHead,
+    ) -> Vec<SnapshotEntry> {
+        let mut out = Vec::new();
+        for part in &head.parts {
+            let got = store
+                .get(&part.key, GetRange::Full)
+                .await
+                .expect("part present");
+            let decoded = snapshot_format::decode_part(&got.data, &PartLimits::default())
+                .expect("decode part");
+            out.extend(decoded.entries);
+        }
+        out
+    }
+
+    async fn read_head(store: &dyn ObjectStoreBackend) -> SnapshotHead {
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        let got = store
+            .get(&head_key, GetRange::Full)
+            .await
+            .expect("head present");
+        snapshot_format::decode_head(&got.data).expect("head decodes")
+    }
+
+    /// A compaction record published into an hour that a
+    /// PREVIOUS fold already sealed and folded is discovered and applied by the
+    /// reconcile pass of a later fold, and the sealed part covering that hour is
+    /// actually re-PUT (its content changed) rather than carried forward by
+    /// reference.
+    #[tokio::test]
+    async fn reconcile_applies_late_compaction_before_horizon() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Hour 10 seals into its own part; hour 11 is the tail.
+        let now_1 = now_at_seal(11);
+        let writer_a = Uuid::new_v4();
+        let seg_a = publish_segment(&store, 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert_eq!(first.parts_total, 2);
+        assert_eq!(first.entry_count, 2);
+
+        let head1 = read_head(store.as_ref()).await;
+        let hour10_part = head1
+            .parts
+            .iter()
+            .find(|p| p.min_hour <= 10 && 10 <= p.watermark_hour)
+            .expect("a part covers hour 10")
+            .clone();
+        let old_blake3 = hour10_part.blake3.clone();
+
+        // A compaction lands in the already-sealed, already-folded hour 10,
+        // superseding seg_a's L0 with one L1 part.
+        publish_compaction(&store, 0, 10, &[&seg_a], now_1).await;
+
+        // A later fold: the reconcile window covers hour 10 and applies it.
+        let now_2 = now_at_seal(13);
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let head2 = read_head(store.as_ref()).await;
+        let entries = collect_head_entries(store.as_ref(), &head2).await;
+        let hour10: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 10)
+            .collect();
+        assert_eq!(hour10.len(), 1, "hour 10 now has exactly the L1 part");
+        assert_eq!(hour10[0].level, 1, "hour 10's entry is the compaction L1");
+        assert!(
+            !entries.iter().any(|e| e.content_hash == seg_a.content_hash),
+            "the superseded L0 must be gone from the snapshot"
+        );
+
+        // The sealed part covering hour 10 was re-PUT: no part in the new HEAD
+        // carries the old hour-10 part's blake3, so it was not carried forward.
+        assert!(
+            !head2.parts.iter().any(|p| p.blake3 == old_blake3),
+            "the sealed hour-10 part must be re-PUT with new content, not reused"
+        );
+        assert!(
+            head2
+                .parts
+                .iter()
+                .any(|p| p.min_hour <= 10 && 10 <= p.watermark_hour),
+            "a part still covers hour 10"
+        );
+    }
+
+    /// Test debt (formal/tla/TRACEABILITY.md, catalog row 1, `DoFoldCas`
+    /// fold-lifetime bound / `DoFoldRebase`): a fold that LISTs a bucket
+    /// before a compaction supersedes one of its L0 inputs, and whose own
+    /// publishing CAS lands only after that input's superseded-sweep horizon
+    /// has passed (so a real deployment's maintenance process would already
+    /// have physically deleted it), must never publish a snapshot that names
+    /// the swept input. Nothing inside `Catalog::fold` samples a clock or
+    /// times its own duration (module docs above: "this crate never reads a
+    /// clock"); the guarantee comes from `DoFoldRebase`, the HEAD CAS retry
+    /// loop's `PreconditionFailed`/`AlreadyExists` branch: a delayed fold's
+    /// CAS loses to whichever fold's fresher listing published first, and the
+    /// loser re-reads HEAD and takes the no-op path instead of ever
+    /// publishing its own stale listing. A `FaultStore` hold on the delayed
+    /// fold's HEAD PUT freezes it after its LIST and before its CAS so a
+    /// second, unheld fold can win the race while the compaction and the
+    /// sweep both land in between.
+    #[tokio::test]
+    async fn fold_that_lists_before_a_compaction_and_cas_after_the_sweep_horizon_does_not_name_a_swept_input()
+     {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Arc::new(Catalog::new(store.clone(), cfg).expect("catalog"));
+
+        // Hour 10 seals into its own part; hour 11 is the tail. Fold A's LIST
+        // of hour 10 sees only the raw L0 segment: no compaction exists yet.
+        let now_1 = now_at_seal(11);
+        let writer_a = Uuid::new_v4();
+        let seg_a =
+            publish_segment(store.inner(), 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+
+        // Hold fold A's HEAD PUT: HEAD is absent, so this is the very first
+        // (and only, until released) call that matches. Fold A's LIST has
+        // already completed by the time its PUT is attempted, so the hold
+        // freezes it exactly after LIST and before CAS.
+        let gate = store.hold(Op::Put, Some("HEAD".to_string()), Occurrence::Nth(1));
+        let cat_a = catalog.clone();
+        let fold_a = tokio::spawn(async move {
+            cat_a
+                .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+                .await
+        });
+        gate.wait_until_held(1).await;
+        assert_eq!(gate.held_count(), 1, "fold A is blocked on its HEAD CAS");
+
+        // A compaction lands while fold A is paused, superseding seg_a's L0
+        // with one L1 part.
+        publish_compaction(store.inner(), 0, 10, &[&seg_a], now_1).await;
+
+        // Simulate the superseded-input sweep: once `protection_horizon_ns`
+        // has elapsed past the compaction's own `created_unix_ns`, a real
+        // maintenance process would physically delete seg_a's commit record
+        // and data object (docs/deletion-and-gc.md's superseded-input sweep
+        // row; the delete blocker there is vacuous while HEAD is still
+        // absent, which is exactly fold A's paused state). Do that directly
+        // here (ravel-maintain is out of this task's scope) so fold B below
+        // runs, and fold A resumes, against a store where the swept input is
+        // already gone, not merely superseded.
+        let commit_key = keys::commit_key_for_record(&seg_a).expect("commit key");
+        let data_key = keys::reconstruct_data_key(&seg_a).expect("data key");
+        store
+            .inner()
+            .delete(&commit_key)
+            .await
+            .expect("delete swept commit record");
+        store
+            .inner()
+            .delete(&data_key)
+            .await
+            .expect("delete swept data object");
+
+        // Fold B: its own LIST of hour 10 sees the compaction directly (no
+        // reconcile pass needed, this is also a first/rebuild fold since HEAD
+        // is still absent while fold A is paused). Its CAS is not gated by
+        // the hold (`Occurrence::Nth(1)` matched only fold A's attempt), so
+        // it wins the race and publishes HEAD naming the L1 part, well past
+        // the sweep horizon.
+        let now_2 = now_1 + cfg.protection_horizon_ns + NS_PER_HOUR;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("fold B must not fail even though the swept input is already gone");
+        assert!(!second.no_op);
+        assert!(second.rebuilt, "HEAD was still absent when fold B listed");
+
+        // Release fold A: its own HEAD PUT now loses (`AlreadyExists`, HEAD
+        // was created by fold B while fold A was held), so it must rebase
+        // onto fold B's HEAD and take the no-op path rather than publish its
+        // own stale listing that still names seg_a.
+        for id in gate.held() {
+            gate.release(id);
+        }
+        let first = fold_a
+            .await
+            .expect("join fold A")
+            .expect("fold A must rebase, not error");
+        assert!(
+            first.no_op,
+            "fold A must rebase onto fold B's HEAD, never publish its stale listing"
+        );
+
+        let head = read_head(store.inner()).await;
+        let entries = collect_head_entries(store.inner(), &head).await;
+        let hour10: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 10)
+            .collect();
+        assert_eq!(hour10.len(), 1, "hour 10 now has exactly the L1 part");
+        assert_eq!(hour10[0].level, 1, "hour 10's entry is the compaction L1");
+        assert!(
+            !entries.iter().any(|e| e.content_hash == seg_a.content_hash),
+            "the published fold must not name the swept input"
+        );
+    }
+
+    /// Regression for issue #587: a fold used to skip postings entirely the
+    /// moment any L1 (compacted) entry was present, because
+    /// `fetch_segment_names` could only key and identity-check an L0 object.
+    /// A bucket set mixing one real L0 segment and one real L1 compaction
+    /// part must still build postings and cover both entries.
+    #[tokio::test]
+    async fn mixed_l0_l1_entries_still_build_postings() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now = now_at_seal(10);
+        publish_real_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            5,
+            now - 5 * NS_PER_HOUR,
+            &["cpu"],
+        )
+        .await;
+        publish_real_compaction(&store, 0, 8, now - 2 * NS_PER_HOUR, &["disk"]).await;
+
+        let report = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now, &[], None)
+            .await
+            .expect("fold");
+
+        assert!(!report.no_op);
+        assert!(report.rebuilt);
+        assert_eq!(report.entry_count, 2);
+        assert!(
+            report.postings_built,
+            "postings must be built over a mixed L0/L1 entry set, not skipped"
+        );
+
+        let head = read_head(store.as_ref()).await;
+        assert!(head.postings.is_some());
+        let entries = collect_head_entries(store.as_ref(), &head).await;
+        let mut levels: Vec<u32> = entries.iter().map(|e| e.level).collect();
+        levels.sort_unstable();
+        assert_eq!(levels, vec![0, 1], "entry set is genuinely mixed L0/L1");
+    }
+
+    /// The reconcile pass must never reintroduce a duplicate entry identity.
+    /// A record physically stored under one hour's directory but whose own
+    /// embedded `ingest_hour_bucket` names a different hour
+    /// (`classify_bucket`'s drift tolerance, exercised for the incremental
+    /// path by `duplicate_commit_identity_across_buckets_skips_and_advances`)
+    /// is already resident in `entries` from a past fold with no colliding
+    /// copy anywhere. When a LATER compaction lands in that drifted record's
+    /// own physical (not embedded) bucket, the reconcile pass re-classifies
+    /// that bucket and must not blindly re-append the drifted record's
+    /// identity a second time -- doing so used to permanently break every
+    /// later fold with `SnapshotFormat(DuplicateEntry)`.
+    #[tokio::test]
+    async fn reconcile_never_reintroduces_a_drifted_duplicate() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+
+        // S: a genuine record properly placed in hour 9's directory.
+        let seg_s = publish_segment(&store, 0, Uuid::new_v4(), 1, 9, now_1 - 2 * NS_PER_HOUR).await;
+
+        // R: physically stored under hour 9's directory, but its own
+        // embedded ingest_hour_bucket names hour 10 -- a drifted record with
+        // no other physical copy anywhere. classify_bucket tolerates this
+        // shape (validate_expected_fields never checks the embedded hour
+        // against the physical directory).
+        let writer_r = Uuid::new_v4();
+        let record_r = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id: writer_r,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: 5,
+            content_hash: *blake3::hash(b"r").as_bytes(),
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 1,
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 1,
+            segment_format_version: 1,
+            created_unix_ns: 0,
+            ingest_hour_bucket: 10,
+        })
+        .expect("valid record r");
+        let key_r =
+            keys::commit_key(&tenant(), Signal::Metrics, 0, 9, writer_r, 1, 1).expect("key r");
+        store
+            .put(
+                &key_r,
+                record::encode(&record_r),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put r");
+
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert_eq!(
+            first.entry_count, 3,
+            "S, the drifted R, and hour 11's segment all fold in with no collision"
+        );
+        assert_eq!(first.layout_drift_count, 0, "R has no colliding copy yet");
+
+        // A late compaction lands in hour 9's directory, covering S but not
+        // the drifted R (a different writer identity entirely).
+        publish_compaction(&store, 0, 9, &[&seg_s], now_1).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+                None,
+            )
+            .await
+            .expect("reconcile must not fail with DuplicateEntry");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        let r_bytes = writer_r.into_bytes().to_vec();
+        assert_eq!(
+            entries.iter().filter(|e| e.writer_id == r_bytes).count(),
+            1,
+            "the drifted record R must appear exactly once, never duplicated"
+        );
+        let hour9: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 9)
+            .collect();
+        assert_eq!(
+            hour9.len(),
+            1,
+            "hour 9 now holds exactly the compacted L1 part"
+        );
+        assert_eq!(hour9[0].level, 1);
+
+        // A third fold must also succeed cleanly: the bug reproduced
+        // deterministically on every subsequent fold, not just the first.
+        let third = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(14),
+                &[],
+                None,
+            )
+            .await
+            .expect("a third fold must also succeed, not fail forever");
+        assert!(!third.no_op);
+    }
+
+    /// A late record landing OUTSIDE the reconcile window (older than
+    /// `watermark_hour_old - fold_reconcile_window_hours`) is still NOT picked
+    /// up by a fold that was not asked to look there.
+    ///
+    /// This is no longer an unconditional invariant, and the distinction is
+    /// the whole point of issue #526's re-fold half. What the window bounds is
+    /// what the fold discovers ON ITS OWN: it cannot tell which old hour
+    /// received a late record without listing that hour's buckets, and the
+    /// hours that could have received one are every hour the snapshot names,
+    /// so a self-derived pass would cost a full-history LIST fan-out per fold.
+    /// The bounded staleness this test pins is therefore the staleness of the
+    /// UNREQUESTED fold, and it is the reason a caller that DOES know (the
+    /// superseded-input sweep, which lists those buckets anyway and holds the
+    /// hour's pre-rewrite inputs on its HEAD-reachability gate) has
+    /// [`Catalog::fold_with_refold_request`] to say so.
+    ///
+    /// Held deliberately, not by omission: `refold_request_applies_out_of_
+    /// window_compaction` below is this exact scenario plus the request, and
+    /// it asserts the opposite outcome.
+    #[tokio::test]
+    async fn reconcile_ignores_late_record_outside_window() {
+        let store = Arc::new(MemoryStore::new());
+        // Default window is 26 hours.
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let writer_x = Uuid::new_v4();
+        let seg_x = publish_segment(&store, 0, writer_x, 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 2);
+
+        // A compaction lands in hour 5, far older than watermark 40 minus the
+        // 26-hour window (floor 14).
+        publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.no_op, "the watermark advanced 40 -> 41");
+        assert_eq!(
+            second.entry_count, 2,
+            "the out-of-window compaction is not applied"
+        );
+
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        let hour5: Vec<&SnapshotEntry> = entries
+            .iter()
+            .filter(|e| e.ingest_hour_bucket == 5)
+            .collect();
+        assert_eq!(hour5.len(), 1);
+        assert_eq!(hour5[0].level, 0, "hour 5 still holds the original L0");
+        assert_eq!(hour5[0].content_hash, seg_x.content_hash);
+    }
+
+    // ---- issue #526: targeted re-fold of hours that received a late record ----
+
+    /// The object key a snapshot entry names, derived level-aware exactly as
+    /// [`fetch_segment_names`] derives it for a fetch. Lets a test assert the
+    /// exact set of objects a folded snapshot still names, rather than a count.
+    fn entry_object_key(entry: &SnapshotEntry) -> String {
+        if entry.level == 0 {
+            let writer_id: [u8; 16] = entry
+                .writer_id
+                .as_slice()
+                .try_into()
+                .expect("a level-0 entry carries a 16-byte writer id");
+            let content_hash: [u8; 32] = entry
+                .content_hash
+                .as_slice()
+                .try_into()
+                .expect("an entry carries a 32-byte content hash");
+            keys::data_key(
+                &tenant(),
+                Signal::Metrics,
+                entry.shard,
+                Uuid::from_bytes(writer_id),
+                entry.writer_epoch,
+                entry.writer_seq,
+                &content_hash,
+            )
+            .expect("data key")
+        } else {
+            keys::l1_part_key(
+                &tenant(),
+                Signal::Metrics,
+                entry.shard,
+                entry.ingest_hour_bucket,
+                &hex::encode(&entry.writer_id[..8]),
+                u32::try_from(entry.writer_epoch).expect("part index fits u32"),
+                &hex::encode(&entry.content_hash[..8]),
+            )
+            .expect("l1 part key")
+        }
+    }
+
+    /// Every object key the current HEAD's snapshot names, as a set.
+    async fn head_object_keys(store: &dyn ObjectStoreBackend) -> BTreeSet<String> {
+        collect_head_entries(store, &read_head(store).await)
+            .await
+            .iter()
+            .map(entry_object_key)
+            .collect()
+    }
+
+    /// Publish a selective-erasure rewrite record (ADR-0064 decision 3) into
+    /// `(shard, ingest_hour_bucket)` that supersedes the given L0 `inputs` and
+    /// contributes one L1 output part. Like `publish_compaction`, only the
+    /// record object is written: the fold reads the record, not the part.
+    async fn publish_rewrite(
+        store: &MemoryStore,
+        shard: u32,
+        ingest_hour_bucket: u32,
+        inputs: &[&CommitRecord],
+        created_unix_ns: i64,
+    ) -> RewriteRecord {
+        let mut input_ids: Vec<CompactionInputIdentity> = inputs
+            .iter()
+            .map(|r| CompactionInputIdentity {
+                writer_id: r.writer_id.clone(),
+                writer_epoch: r.writer_epoch,
+                writer_seq: r.writer_seq,
+            })
+            .collect();
+        // `validate_rewrite` requires the inputs in this order and recomputes
+        // the input-set hash over them.
+        input_ids.sort_by(|a, b| {
+            (a.writer_id.as_str(), a.writer_epoch, a.writer_seq).cmp(&(
+                b.writer_id.as_str(),
+                b.writer_epoch,
+                b.writer_seq,
+            ))
+        });
+        let request_ids = vec![Uuid::new_v4().to_string()];
+        let input_set_hash =
+            erasure::compute_rewrite_input_set_hash(&input_ids, None, &request_ids).to_vec();
+        let part_payload = format!("rw-{shard}-{ingest_hour_bucket}").into_bytes();
+        let part = CompactionPart {
+            part_index: 0,
+            first_series_id: vec![0u8; 16],
+            last_series_id: vec![0xffu8; 16],
+            content_hash: blake3::hash(&part_payload).as_bytes().to_vec(),
+            object_size: part_payload.len() as u64,
+            sample_count: 1,
+            series_count: 1,
+            run_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            segment_format_version: 3,
+            declared_column_stats: Vec::new(),
+        };
+        let record = RewriteRecord {
+            format_version: 1,
+            tenant_hash: tenant().0.to_vec(),
+            signal: signal::to_proto(Signal::Metrics) as i32,
+            shard,
+            ingest_hour_bucket,
+            inputs: input_ids,
+            input_set_hash,
+            parts: vec![part],
+            drops: request_ids
+                .iter()
+                .map(|request_id| RewriteDrop {
+                    request_id: request_id.clone(),
+                    dropped_count: 1,
+                })
+                .collect(),
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        let key = keys::rewrite_record_key_for(&record).expect("rewrite key");
+        store
+            .put(
+                &key,
+                erasure::encode_rewrite(&record),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put rewrite record");
+        record
+    }
+
+    /// Deliverable 1: an hour that received a late COMPACTION record outside
+    /// the fixed reconcile window is re-folded when a request names it, and
+    /// the resulting snapshot stops naming that hour's pre-rewrite inputs.
+    /// Same setup as `reconcile_ignores_late_record_outside_window`, whose
+    /// unrequested fold leaves hour 5 naming the superseded L0.
+    ///
+    /// To watch this FAIL against the pre-fix behaviour, empty the targeted
+    /// pass's slice in `fold_inner`: `let refold_hours = &candidates[..0];`.
+    /// The pass then lists nothing, hour 5 keeps naming `seg_x`, and the exact
+    /// key-set assertion below fails. (`&candidates[..take]` is the shipped
+    /// line itself, so quoting that changes nothing and the test still
+    /// passes.)
+    #[tokio::test]
+    async fn refold_request_applies_out_of_window_compaction() {
+        let store = Arc::new(MemoryStore::new());
+        // Default window is 26 hours, so the fixed pass covers [14, 40] only.
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let seg_x = publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        let seg_recent = publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 2);
+
+        let compaction = publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.no_op, "the watermark advanced 40 -> 41");
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let expected: BTreeSet<String> = [
+            keys::reconstruct_l1_part_key(&compaction, &compaction.parts[0]).expect("l1 part key"),
+            keys::reconstruct_data_key(&seg_recent).expect("data key"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            head_object_keys(store.as_ref()).await,
+            expected,
+            "hour 5 must now name the compaction output, and no longer its superseded L0 input"
+        );
+        assert_eq!(second.refold_hours_reconciled, 1);
+    }
+
+    /// Deliverable 1, the rewrite half: the same for a late selective-erasure
+    /// REWRITE record (ADR-0064 decision 3). This is the shape issue #526
+    /// names, because a rewrite always lands in an already-sealed bucket, so a
+    /// rewrite outside the window is never picked up by any later fold at all.
+    ///
+    /// Flip the same line as `refold_request_applies_out_of_window_compaction`
+    /// (`let refold_hours = &candidates[..0];`) to watch it fail: the snapshot
+    /// keeps naming the pre-erasure L0.
+    #[tokio::test]
+    async fn refold_request_applies_out_of_window_rewrite() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let seg_x = publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        let seg_recent = publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        let rewrite = publish_rewrite(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt, "an incremental fold, not a rebuild");
+
+        let expected: BTreeSet<String> = [
+            keys::reconstruct_rewrite_part_key(&rewrite, &rewrite.parts[0])
+                .expect("rewrite part key"),
+            keys::reconstruct_data_key(&seg_recent).expect("data key"),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            head_object_keys(store.as_ref()).await,
+            expected,
+            "hour 5 must now name the rewrite output, and no longer its pre-erasure L0 input"
+        );
+        assert_eq!(second.refold_hours_reconciled, 1);
+    }
+
+    /// ADR-0063 section 4 carve-out 1: a FIRST fold skips the reconcile pass
+    /// entirely (no previous watermark exists to anchor a window to). A
+    /// re-fold request must not make it do reconcile work anyway. The
+    /// requested hour is not even sealed-and-folded yet, so listing it would
+    /// be work the rebuild-shaped first fold already does.
+    #[tokio::test]
+    async fn refold_request_is_ignored_on_a_first_fold() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let seg_x = publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        let first = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("first fold");
+        assert!(!first.no_op);
+        assert_eq!(
+            first.refold_hours_reconciled, 0,
+            "a first fold does no reconcile work, requested or not"
+        );
+        assert_eq!(
+            first.frontier_hours_reconciled, 0,
+            "and no frontier work either, which the carve-out also covers"
+        );
+        // The first fold derives hour 5 from the commit layout, compaction
+        // record included, so the request had nothing to add.
+        assert_eq!(first.entry_count, 2);
+    }
+
+    /// #1763 part (a), the #1781 review item: a [`RefoldRequest`] submitted
+    /// to a fold call that turns out to be a no-op (nothing newly sealed
+    /// beyond the previous watermark) reconciles zero hours, not the count
+    /// of hours the request named. The targeted pass sits inside the same
+    /// reconcile branch as the fixed window and the frontier band, and that
+    /// branch never runs once the top-of-loop watermark check has already
+    /// returned a no-op report -- the request is never denied, it is never
+    /// reached.
+    ///
+    /// Prove-the-test: hardcode `no_op_report`'s `refold_hours_reconciled` to
+    /// `1` and the final assertion below fails.
+    #[tokio::test]
+    async fn refold_request_to_a_no_op_fold_reconciles_zero_hours_and_reports_it() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        // Same `now_ns` as the first fold: the watermark cannot advance, so
+        // this call is a no-op regardless of what the request names. Hour 5
+        // is a real, snapshot-named hour a reachable targeted pass would
+        // happily reconcile.
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("second fold");
+        assert!(second.no_op, "the watermark did not advance");
+        assert_eq!(
+            second.refold_hours_reconciled, 0,
+            "a request against a no-op fold reconciles nothing, however many hours it names"
+        );
+    }
+
+    /// ADR-0063 section 4 carve-out 2: a REBUILD skips the reconcile pass (it
+    /// re-derives every hour from the commit layout already). A re-fold
+    /// request must not add a second listing of hours the rebuild just read.
+    #[tokio::test]
+    async fn refold_request_is_ignored_on_a_rebuild() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let seg_x = publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        // Corrupt HEAD in place so the next fold rebuilds.
+        store
+            .put(
+                &head_object_key(&tenant(), Signal::Metrics),
+                Bytes::from_static(b"not a head"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite head with garbage");
+        publish_compaction(&store, 0, 5, &[&seg_x], 6 * NS_PER_HOUR).await;
+
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([5]),
+            )
+            .await
+            .expect("fold after corruption");
+        assert!(second.rebuilt, "a rebuild, not an incremental fold");
+        assert_eq!(
+            second.refold_hours_reconciled, 0,
+            "a rebuild does no reconcile work, requested or not"
+        );
+        // The rebuild picks the late compaction up on its own, from the same
+        // listing it performs for every hour.
+        let hour5: Vec<SnapshotEntry> =
+            collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await)
+                .await
+                .into_iter()
+                .filter(|e| e.ingest_hour_bucket == 5)
+                .collect();
+        assert_eq!(hour5.len(), 1);
+        assert_eq!(hour5[0].level, 1);
+    }
+
+    /// Bounded work: one late record means exactly ONE hour is re-folded, not
+    /// every hour the snapshot names, and not every hour on every later tick.
+    ///
+    /// The LIST arithmetic is asserted exactly, because the hour count alone
+    /// would not catch a pass that re-listed the whole history and then
+    /// reported only the hours it changed. For the second fold below
+    /// (`watermark_hour_old` 40, new watermark 41, one shard, no tenant
+    /// retention window so the frontier pass does not run): 1 incremental
+    /// bucket for hour 41, 27 for the fixed window `[14, 40]`, and 1 for the
+    /// requested hour 3.
+    /// The cap truncates oldest-first and carries the remainder, rather than
+    /// dropping it or deferring it into the snapshot. The requester re-derives
+    /// its blocked set each pass, so an hour the cap cut out comes back on the
+    /// next request.
+    ///
+    /// The cap is read from the runtime config, so this case sets it to 2 and
+    /// requests 4 hours rather than needing 169 of them. That is also what
+    /// makes the config read testable at all: with the previous hardcoded
+    /// const, reaching the branch meant building a 169-hour snapshot.
+    ///
+    /// Flip to watch it fail: drop the `.min(cap)` from `take`. All four
+    /// requested hours are then re-folded and the count below reads 4.
+    #[tokio::test]
+    async fn refold_request_is_capped_oldest_first_and_carries_the_remainder() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                shard_count: 1,
+                frontier_reconcile_max_hours: 2,
+                ..Default::default()
+            },
+        )
+        .expect("catalog");
+
+        let mut old_segments = Vec::new();
+        for hour in [1u32, 2, 3, 5] {
+            old_segments.push(
+                publish_segment(
+                    &store,
+                    0,
+                    Uuid::new_v4(),
+                    1,
+                    hour,
+                    (i64::from(hour) + 1) * NS_PER_HOUR,
+                )
+                .await,
+            );
+        }
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        // Every one of the four old hours receives a late record, so all four
+        // are genuine candidates and the cap is what limits the pass.
+        for (i, hour) in [1u32, 2, 3, 5].iter().enumerate() {
+            publish_compaction(
+                &store,
+                0,
+                *hour,
+                &[&old_segments[i]],
+                (i64::from(*hour) + 1) * NS_PER_HOUR,
+            )
+            .await;
+        }
+
+        let capped = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([1, 2, 3, 5]),
+            )
+            .await
+            .expect("capped fold");
+        assert_eq!(
+            capped.refold_hours_reconciled, 2,
+            "the cap of 2 bounds the pass, not the four requested hours"
+        );
+
+        // The remainder is not lost: requesting it again re-folds it, which is
+        // the property that lets the pass defer nothing into the snapshot.
+        let remainder = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(42),
+                &[],
+                None,
+                &RefoldRequest::from_hours([3, 5]),
+            )
+            .await
+            .expect("remainder fold");
+        assert_eq!(
+            remainder.refold_hours_reconciled, 2,
+            "the hours the cap cut out are re-foldable on the next request"
+        );
+    }
+
+    #[tokio::test]
+    async fn refold_request_re_lists_only_the_requested_hours() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // Five snapshot-named hours, all but hour 40 far outside the window.
+        let mut old_segments = Vec::new();
+        for hour in [1u32, 2, 3, 5] {
+            old_segments.push(
+                publish_segment(
+                    &store,
+                    0,
+                    Uuid::new_v4(),
+                    1,
+                    hour,
+                    (i64::from(hour) + 1) * NS_PER_HOUR,
+                )
+                .await,
+            );
+        }
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        let first = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 5);
+
+        // Exactly one hour receives a late record.
+        publish_compaction(&store, 0, 3, &[&old_segments[2]], 4 * NS_PER_HOUR).await;
+
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                &RefoldRequest::from_hours([3]),
+            )
+            .await
+            .expect("second fold");
+        assert_eq!(
+            second.refold_hours_reconciled, 1,
+            "exactly the one requested hour is re-folded"
+        );
+        assert_eq!(
+            second.list_requests,
+            1 + 27 + 1,
+            "hour 41 incrementally, the 27-hour fixed window [14, 40], and hour 3"
+        );
+
+        // A later tick with nothing to request re-lists no extra hour at all:
+        // the pass is driven by the request, never by the snapshot's size.
+        let third = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(42),
+                &[],
+                None,
+            )
+            .await
+            .expect("third fold");
+        assert_eq!(third.refold_hours_reconciled, 0);
+        assert_eq!(
+            third.list_requests,
+            1 + 27,
+            "hour 42 incrementally plus the fixed window [15, 41]; no re-fold LISTs"
+        );
+    }
+
+    /// The pass declines the hours it cannot usefully re-fold: one inside the
+    /// fixed window (which lists it anyway), one above the old watermark
+    /// (which the incremental range folds fresh), and one no snapshot entry
+    /// names (which cannot be blocking a delete on HEAD reachability). A
+    /// request of only such hours costs no LIST at all.
+    #[tokio::test]
+    async fn refold_request_skips_hours_the_other_passes_cover() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 5, 6 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 20, 21 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 40, 41 * NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(40),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        let second = catalog
+            .fold_with_refold_request(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(41),
+                &[],
+                None,
+                // 20: inside the fixed window [14, 40]. 41: the incremental
+                // range. 4: no snapshot entry names it.
+                &RefoldRequest::from_hours([4, 20, 41]),
+            )
+            .await
+            .expect("second fold");
+        assert_eq!(second.refold_hours_reconciled, 0);
+        assert_eq!(
+            second.list_requests,
+            1 + 27,
+            "hour 41 incrementally plus the fixed window [14, 40], and nothing more"
+        );
+    }
+
+    /// A late retention tombstone in an already-folded, in-window hour drops
+    /// that hour's entries on the next fold.
+    #[tokio::test]
+    async fn reconcile_applies_late_tombstone() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert_eq!(first.entry_count, 2);
+
+        // Retire hour 10 after it was folded.
+        publish_tombstone(&store, 0, 10).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.no_op);
+        assert!(!second.rebuilt);
+
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        assert!(
+            !entries.iter().any(|e| e.ingest_hour_bucket == 10),
+            "the tombstoned hour contributes nothing after reconcile"
+        );
+        assert!(
+            entries.iter().any(|e| e.ingest_hour_bucket == 11),
+            "the untouched hour 11 is preserved"
+        );
+    }
+
+    /// Write a per-tenant durable retention window (TenantConfig.retention_ns)
+    /// so the fold's retention-frontier reconcile has a frontier to derive.
+    async fn write_retention_config(store: &dyn ObjectStoreBackend, retention_ns: i64) {
+        let cfg = crate::tenant_config::TenantConfig {
+            retention_ns: Some(retention_ns),
+            ..crate::tenant_config::TenantConfig::new(
+                crate::tenant_config::TenantLifecycleState::Active,
+            )
+        };
+        crate::tenant_config::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant retention config");
+    }
+
+    /// A retention tombstone written into an hour FAR behind the watermark
+    /// (well outside `fold_reconcile_window_hours`) is applied by the next
+    /// fold's retention-frontier reconcile, and the resulting snapshot no
+    /// longer names that bucket's segments (deliverable 2, fold side; ADR-0020
+    /// delete-blocker, retirement-frontier half). To watch this FAIL against
+    /// pre-fix code, set `frontier_reconcile_max_hours: 0` in the config below
+    /// (or `retention_ns: None`): the frontier pass then never runs, hour 5's
+    /// tombstone stays outside the fixed 26h window forever, and the snapshot
+    /// keeps naming hour 5.
+    #[tokio::test]
+    async fn frontier_reconcile_applies_out_of_window_tombstone() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            frontier_reconcile_max_hours: 168,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // Retention window 200h: with the ~25h protection-horizon look-ahead,
+        // the retirement frontier at fold time sits near hour 28 -- well above
+        // the retired hour 5, and well below the fixed reconcile window behind
+        // the hour-200 watermark ([174, 200]). So only the frontier pass can
+        // reach hour 5's tombstone.
+        write_retention_config(store.as_ref(), 200 * NS_PER_HOUR).await;
+
+        let now_1 = now_at_seal(200);
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            5,
+            5 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            200,
+            200 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt, "first fold rebuilds from the commit layout");
+        let entries0 = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        assert!(
+            entries0.iter().any(|e| e.ingest_hour_bucket == 5),
+            "the first fold's snapshot names hour 5"
+        );
+
+        // Retire hour 5 long after it was folded: the tombstone lands at hour
+        // 5's key, ~195 hours behind the watermark -- far outside [174, 200].
+        publish_tombstone(&store, 0, 5).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(202),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(
+            !second.rebuilt,
+            "the second fold is incremental, not a rebuild"
+        );
+        assert!(
+            second.frontier_hours_reconciled >= 1,
+            "the frontier pass re-listed hour 5's bucket (got {})",
+            second.frontier_hours_reconciled
+        );
+        assert_eq!(
+            second.frontier_hours_deferred, 0,
+            "the single frontier hour is well under the cap"
+        );
+
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        assert!(
+            !entries.iter().any(|e| e.ingest_hour_bucket == 5),
+            "the out-of-window tombstoned hour 5 contributes nothing after the frontier reconcile"
+        );
+        assert!(
+            entries.iter().any(|e| e.ingest_hour_bucket == 200),
+            "the untouched recent hour 200 is preserved"
+        );
+    }
+
+    /// A frontier jump -- the retention window is short, so many already-sealed
+    /// hours sit below the frontier at once -- does NOT make one fold re-list an
+    /// unbounded number of buckets: the frontier pass reconciles at most
+    /// `frontier_reconcile_max_hours` per fold and carries the remainder to the
+    /// next fold (deliverable 5). The carried hours are never silently dropped:
+    /// they are still named by the snapshot and counted on
+    /// `frontier_hours_deferred`. To watch this FAIL, remove the cap in the
+    /// fold (`let take = candidate_hours.len()`): `frontier_hours_reconciled`
+    /// then jumps to the full candidate count and `frontier_hours_deferred`
+    /// collapses to 0.
+    #[tokio::test]
+    async fn frontier_reconcile_is_bounded_and_carries_remainder() {
+        let store = Arc::new(MemoryStore::new());
+        let cap: u32 = 3;
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            frontier_reconcile_max_hours: cap,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        // A dramatically short window: every sealed hour below ~28 is at or
+        // past the frontier at once. Hours 5..=15 (eleven hours) all sit below
+        // both the frontier and the fixed window behind the hour-200 watermark.
+        write_retention_config(store.as_ref(), 200 * NS_PER_HOUR).await;
+
+        let old_hours: Vec<u32> = (5..=15).collect();
+        for &h in &old_hours {
+            publish_segment(
+                &store,
+                0,
+                Uuid::new_v4(),
+                1,
+                h,
+                i64::from(h) * NS_PER_HOUR + 60_000_000_000,
+            )
+            .await;
+        }
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            200,
+            200 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(200),
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold");
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(202),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert_eq!(
+            second.frontier_hours_reconciled,
+            u64::from(cap),
+            "the frontier pass re-lists at most the cap per fold"
+        );
+        assert_eq!(
+            second.frontier_hours_deferred,
+            old_hours.len() as u64 - u64::from(cap),
+            "every frontier hour beyond the cap is carried, not dropped"
+        );
+
+        // Carried, not dropped: no tombstones exist yet, so every old hour is
+        // still named by the snapshot after the capped fold -- none was
+        // silently skipped out of the snapshot.
+        let entries = collect_head_entries(store.as_ref(), &read_head(store.as_ref()).await).await;
+        for &h in &old_hours {
+            assert!(
+                entries.iter().any(|e| e.ingest_hour_bucket == h),
+                "hour {h} is still named (carried, never dropped without a tombstone)"
+            );
+        }
+    }
+
+    /// Run the out-of-window frontier scenario (hour 5 retired far behind an
+    /// hour-200 watermark) with a chosen `TenantConfig.retention_ns` state and a
+    /// chosen deployment default, and return the second fold's
+    /// `frontier_hours_reconciled`. `tenant_config` is `None` to write no config
+    /// record at all, `Some(inner)` to write a record whose `retention_ns` is
+    /// `inner`. `default_retention_ns` is the value the caller (the production
+    /// fold loop) resolves from `RetentionConfig::window_for` and passes into
+    /// `Catalog::fold`; it is passed to both folds, as a real tick would.
+    async fn frontier_reconciled_with(
+        tenant_config: Option<Option<i64>>,
+        default_retention_ns: Option<i64>,
+    ) -> u64 {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            frontier_reconcile_max_hours: 168,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        if let Some(inner) = tenant_config {
+            let tc = crate::tenant_config::TenantConfig {
+                retention_ns: inner,
+                ..crate::tenant_config::TenantConfig::new(
+                    crate::tenant_config::TenantLifecycleState::Active,
+                )
+            };
+            crate::tenant_config::set_tenant_config(store.as_ref(), &tenant(), &tc, 1)
+                .await
+                .expect("write tenant config");
+        }
+
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            5,
+            5 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        publish_segment(
+            &store,
+            0,
+            Uuid::new_v4(),
+            1,
+            200,
+            200 * NS_PER_HOUR + 60_000_000_000,
+        )
+        .await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(200),
+                &[],
+                default_retention_ns,
+            )
+            .await
+            .expect("first fold");
+
+        publish_tombstone(&store, 0, 5).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(202),
+                &[],
+                default_retention_ns,
+            )
+            .await
+            .expect("second fold");
+        second.frontier_hours_reconciled
+    }
+
+    /// The retention-window overlay (ADR-0078, deliverable 2): the frontier
+    /// reconcile resolves its window as the durable `TenantConfig.retention_ns`
+    /// override when present, else the caller-supplied deployment default. A
+    /// window of 200h retires hour 5 (frontier ~hour 28); a window of 100_000h
+    /// pushes the frontier before the epoch, so `retirement_frontier_hour`
+    /// returns `None` and no frontier reconcile runs. That gap makes each
+    /// precedence branch observable through `frontier_hours_reconciled`.
+    ///
+    /// To watch this FAIL against pre-fix code, restore the old resolution
+    /// (`Ok(None) => None`, `Err(..) => None`, and `Ok(Some(cfg)) =>
+    /// cfg.retention_ns` without `.or(default_retention_ns)`): the two
+    /// deployment-default-only cases below then report 0 reconciled hours.
+    #[tokio::test]
+    async fn retention_overlay_precedence() {
+        const RETIRES: i64 = 200 * NS_PER_HOUR;
+        // A window so large the retirement frontier predates the epoch, so no
+        // frontier pass runs even though a window is set.
+        const NO_FRONTIER: i64 = 100_000 * NS_PER_HOUR;
+
+        // 1. TenantConfig override present wins over the deployment default:
+        //    override retires (200h) while the default would not (NO_FRONTIER).
+        assert!(
+            frontier_reconciled_with(Some(Some(RETIRES)), Some(NO_FRONTIER)).await >= 1,
+            "the TenantConfig override must win over the deployment default"
+        );
+
+        // 2. No TenantConfig record at all: the deployment default applies.
+        assert!(
+            frontier_reconciled_with(None, Some(RETIRES)).await >= 1,
+            "the deployment default must apply when no TenantConfig record exists"
+        );
+
+        // 3. TenantConfig record present but retention_ns is None: the
+        //    deployment default applies (the record does not veto the default).
+        assert!(
+            frontier_reconciled_with(Some(None), Some(RETIRES)).await >= 1,
+            "the deployment default must apply when TenantConfig.retention_ns is None"
+        );
+
+        // 4. Neither a per-tenant override nor a deployment default: no frontier
+        //    reconcile, identical to pre-ADR-0078 behavior.
+        assert_eq!(
+            frontier_reconciled_with(None, None).await,
+            0,
+            "no override and no default means no frontier reconcile"
+        );
+        assert_eq!(
+            frontier_reconciled_with(Some(None), None).await,
+            0,
+            "a None-valued TenantConfig record with no default still means no reconcile"
+        );
+    }
+
+    /// A fold whose reconcile window finds nothing changed carries every
+    /// untouched sealed part forward by reference: no spurious PUT; the
+    /// carry-forward optimization is not regressed by the reconcile pass.
+    #[tokio::test]
+    async fn reconcile_no_change_carries_sealed_parts_forward() {
+        let store = Arc::new(MemoryStore::new());
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+
+        let head1 = read_head(store.as_ref()).await;
+        let sealed = head1
+            .parts
+            .iter()
+            .find(|p| p.min_hour <= 10 && 10 <= p.watermark_hour)
+            .expect("hour-10 part")
+            .clone();
+        let sealed_bytes = store
+            .get(&sealed.key, GetRange::Full)
+            .await
+            .expect("sealed part")
+            .data;
+
+        // No late record: a later fold's reconcile pass finds nothing changed.
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold");
+        assert!(!second.rebuilt);
+        assert!(
+            second.parts_reused >= 1,
+            "the unchanged sealed part is carried by reference"
+        );
+
+        let head2 = read_head(store.as_ref()).await;
+        assert!(
+            head2.parts.iter().any(|p| p.key == sealed.key),
+            "sealed part still referenced by its original key"
+        );
+        let sealed_bytes_2 = store
+            .get(&sealed.key, GetRange::Full)
+            .await
+            .expect("sealed part still present")
+            .data;
+        assert_eq!(
+            sealed_bytes, sealed_bytes_2,
+            "the sealed part object was not rewritten"
+        );
+    }
+
+    /// Both the very first fold (`HeadState::Absent`) and a rebuilt fold
+    /// (corrupt HEAD) skip the reconcile pass entirely: no in-window empty
+    /// bucket is ever listed. Proven by a LIST fault on hour 5's bucket prefix
+    /// (an hour that holds no data, so `discover_buckets` never lists it, but
+    /// the reconcile window WOULD): the fault must never fire.
+    #[tokio::test]
+    async fn first_and_rebuilt_folds_skip_reconcile() {
+        let hour5_prefix =
+            keys::commit_shard_hour_prefix(&tenant(), Signal::Metrics, 0, 5).expect("prefix");
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Permanent("reconcile listed an in-window empty hour".into()),
+            )
+            .with_key_contains(hour5_prefix),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // First fold: HEAD absent -> rebuilt, reconcile skipped.
+        let now_1 = now_at_seal(10);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 10, now_1 - NS_PER_HOUR).await;
+        let first = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+        assert!(first.rebuilt);
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Permanent),
+            0,
+            "first fold must not run the reconcile pass"
+        );
+
+        // Corrupt HEAD, then fold again: rebuilt, reconcile skipped.
+        let head_key = head_object_key(&tenant(), Signal::Metrics);
+        store
+            .inner()
+            .put(
+                &head_key,
+                Bytes::from_static(b"not a head"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("corrupt head");
+        let now_2 = now_at_seal(12);
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 12, now_2 - NS_PER_HOUR).await;
+        let second = catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_2, &[], None)
+            .await
+            .expect("second fold");
+        assert!(second.rebuilt);
+        assert_eq!(
+            store.fault_count(Op::List, FaultKind::Permanent),
+            0,
+            "a rebuilt fold must not run the reconcile pass"
+        );
+    }
+
+    /// The single HEAD CAS invariant holds even when the reconcile pass finds
+    /// and applies a change: exactly one HEAD PUT per fold attempt. Fault the
+    /// THIRD HEAD PUT (fold 1 is the 1st, the reconcile-applying fold 2 is the
+    /// 2nd); a spurious second HEAD PUT inside fold 2 would be the 3rd and fire
+    /// the fault. It must not.
+    #[tokio::test]
+    async fn reconcile_preserves_single_head_cas() {
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("second HEAD PUT within one fold".into()),
+            )
+            .with_key_contains("HEAD")
+            .with_occurrence(Occurrence::Nth(3)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let cfg = CatalogConfig {
+            shard_count: 1,
+            snapshot_part_max_entries: 1,
+            ..Default::default()
+        };
+        let catalog = Catalog::new(store.clone(), cfg).expect("catalog");
+
+        let now_1 = now_at_seal(11);
+        let writer_a = Uuid::new_v4();
+        let seg_a =
+            publish_segment(store.inner(), 0, writer_a, 1, 10, now_1 - 2 * NS_PER_HOUR).await;
+        publish_segment(store.inner(), 0, Uuid::new_v4(), 1, 11, now_1 - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Metrics, Uuid::new_v4(), now_1, &[], None)
+            .await
+            .expect("first fold");
+
+        publish_compaction(store.inner(), 0, 10, &[&seg_a], now_1).await;
+
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_at_seal(13),
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold applies reconcile under one HEAD CAS");
+        assert!(!second.no_op);
+
+        // The reconcile change actually landed (proving the test exercised the
+        // apply path, not a no-op).
+        let entries = collect_head_entries(store.inner(), &read_head(store.inner()).await).await;
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.ingest_hour_bucket == 10 && e.level == 1),
+            "the late compaction was applied"
+        );
+        assert!(
+            !entries.iter().any(|e| e.content_hash == seg_a.content_hash),
+            "the superseded L0 is gone"
+        );
+
+        // No fold attempt issued a second HEAD PUT.
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Permanent),
+            0,
+            "each fold attempt performs exactly one HEAD CAS write"
+        );
+    }
+
+    /// The fold-liveness gauge and cycle counter (issue #1306). A successful
+    /// fold stamps the caller's `now_ns` into `fold_last_success_unix_ns`
+    /// exactly, and counts exactly one cycle. Exact equality, not a band: the
+    /// value IS the injected clock reading the caller passed in, since this
+    /// crate reads no clock of its own.
+    #[tokio::test]
+    async fn successful_fold_stamps_last_success_and_counts_one_cycle() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 0);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            0,
+            "no fold has succeeded yet, so the gauge is the zero sentinel"
+        );
+
+        let now_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_ns - NS_PER_HOUR).await;
+        let report = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold succeeds");
+        assert!(!report.no_op, "the fold folded the sealed hour");
+
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 1);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            now_ns,
+            "the gauge is exactly the now_ns the caller folded at"
+        );
+
+        // A second successful fold at a later clock reading advances the gauge
+        // to that reading and counts a second cycle. This one is a no-op fold
+        // (nothing new has sealed), which is the healthy steady state: the
+        // gauge must move for it, or a quiet tenant reads as a stopped fold.
+        let later_ns = now_ns + 7_000_000_000;
+        let second = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                later_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("second fold succeeds");
+        assert!(second.no_op, "nothing newly sealed between the two folds");
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 2);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 0);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), later_ns);
+    }
+
+    /// The other half of the same claim (issue #1306): a fold that returns
+    /// `Err` counts exactly one failure and leaves the liveness gauge where
+    /// the last SUCCESS left it. Without this half, a gauge that advanced on
+    /// every call regardless of outcome would pass the success test above and
+    /// still report a fold failing every cycle as healthy.
+    #[tokio::test]
+    async fn failing_fold_counts_a_failure_and_leaves_the_gauge_where_it_was() {
+        // Fail the second HEAD PUT: the first fold establishes a real HEAD and
+        // a real gauge value, the second fold's CAS write fails. No other PUT
+        // key contains "HEAD".
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("head cas failure".into()))
+                .with_key_contains("HEAD")
+                .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let first_ns = now_at_seal(11);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            11,
+            first_ns - NS_PER_HOUR,
+        )
+        .await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                first_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("first fold succeeds");
+        assert_eq!(catalog.fold_cycles(Signal::Metrics), 1);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), first_ns);
+
+        let failing_ns = now_at_seal(13);
+        publish_segment(
+            store.inner(),
+            0,
+            Uuid::new_v4(),
+            1,
+            13,
+            failing_ns - NS_PER_HOUR,
+        )
+        .await;
+        let err = catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                failing_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect_err("the HEAD CAS fault must surface as an error");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+
+        // The fault fired exactly once, so exactly one fold failed.
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+        assert_eq!(catalog.fold_failures(Signal::Metrics), 1);
+        assert_eq!(
+            catalog.fold_cycles(Signal::Metrics),
+            1,
+            "the failing fold is not a cycle: the cycle count is still the one successful fold"
+        );
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            first_ns,
+            "a failing fold must not advance the liveness gauge, even though its now_ns is later"
+        );
+    }
+
+    /// A plain `store`, not `fetch_max`: the liveness gauge holds the stamp of
+    /// the last fold to FINISH, even when that stamp is older than the one the
+    /// slot already carried. This pins the semantics deliberately.
+    ///
+    /// The two calls below model out-of-order completion, which is the way one
+    /// signal's slot goes backwards with no clock anomaly at all. Each stamp
+    /// is the `now_ns` read before its fold began, and folds of one signal
+    /// overlap in the server (the scheduled loop for that signal re-reads the
+    /// clock per tenant while an on-demand fold for another tenant of the same
+    /// signal runs against the same `Catalog`), so a fold that started later
+    /// and finished sooner is overwritten by the slower one completing behind
+    /// it. Calling `fold(ahead)` then `fold(behind)` is that completion order.
+    /// An NTP step back produces the same store.
+    ///
+    /// Under `fetch_max` the second store would be dropped and the gauge would
+    /// stay at `ahead_ns`, which is the assertion that fails below. That is
+    /// the failure mode being rejected: `fetch_max` latches a forward step and
+    /// masks a later genuine stall with no bound on how long.
+    #[tokio::test]
+    async fn an_out_of_order_fold_completion_lowers_the_last_success_gauge() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let ahead_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, ahead_ns - NS_PER_HOUR).await;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                ahead_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold stamped at the later reading");
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Metrics), ahead_ns);
+
+        let behind_ns = ahead_ns - 60_000_000_000;
+        catalog
+            .fold(
+                &tenant(),
+                Signal::Metrics,
+                Uuid::new_v4(),
+                behind_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold stamped at the earlier reading finishes second");
+        assert_eq!(
+            catalog.fold_last_success_unix_ns(Signal::Metrics),
+            behind_ns,
+            "the gauge holds the stamp of the last fold to finish, even an older one"
+        );
+        assert_eq!(
+            catalog.fold_cycles(Signal::Metrics),
+            2,
+            "both folds are still cycles"
+        );
+    }
+
+    /// Per-signal keying (issue #1306): folding one signal moves that signal's
+    /// counters and gauge and leaves every other signal's exactly where they
+    /// were. Without this, the three families are process-global and one dead
+    /// fold loop out of three stays invisible behind the two that still run.
+    ///
+    /// `Signal::Profiles` is asserted alongside the two other folded signals
+    /// because the slot table covers every `Signal` variant, not just the
+    /// three the server folds, and an off-by-one there would alias two of them
+    /// onto one slot.
+    #[tokio::test]
+    async fn folding_one_signal_leaves_the_other_signals_untouched() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        let now_ns = now_at_seal(11);
+        publish_segment(&store, 0, Uuid::new_v4(), 1, 11, now_ns - NS_PER_HOUR).await;
+        catalog
+            .fold(&tenant(), Signal::Logs, Uuid::new_v4(), now_ns, &[], None)
+            .await
+            .expect("the logs fold succeeds");
+
+        assert_eq!(catalog.fold_cycles(Signal::Logs), 1);
+        assert_eq!(catalog.fold_failures(Signal::Logs), 0);
+        assert_eq!(catalog.fold_last_success_unix_ns(Signal::Logs), now_ns);
+
+        for untouched in [Signal::Metrics, Signal::Spans, Signal::Profiles] {
+            assert_eq!(
+                catalog.fold_cycles(untouched),
+                0,
+                "{untouched:?} was never folded, so its cycle count is still 0"
+            );
+            assert_eq!(
+                catalog.fold_failures(untouched),
+                0,
+                "{untouched:?} was never folded, so its failure count is still 0"
+            );
+            assert_eq!(
+                catalog.fold_last_success_unix_ns(untouched),
+                0,
+                "{untouched:?} was never folded, so its gauge is still the zero sentinel"
+            );
+        }
+    }
+
+    /// The failure half of the per-signal claim: a fold that fails for one
+    /// signal leaves every other signal's failure counter at zero, so the
+    /// `RavelCatalogFoldFailing` rule attributes the failure to the signal
+    /// that produced it rather than to the process.
+    #[tokio::test]
+    async fn a_failing_fold_charges_only_its_own_signal() {
+        // Fail the first HEAD PUT. No other PUT key contains "HEAD".
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("head cas failure".into()))
+                .with_key_contains("HEAD")
+                .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+
+        // No segment is published: a fold over an empty prefix still advances
+        // its watermark over the hours that held nothing and writes a first
+        // HEAD, which is the PUT the fault below intercepts.
+        let now_ns = now_at_seal(11);
+        let err = catalog
+            .fold(&tenant(), Signal::Spans, Uuid::new_v4(), now_ns, &[], None)
+            .await
+            .expect_err("the HEAD CAS fault must surface as an error");
+        assert!(matches!(err, CatalogError::Store(_)), "got {err:?}");
+
+        assert_eq!(store.fault_count(Op::Put, FaultKind::Permanent), 1);
+        assert_eq!(catalog.fold_failures(Signal::Spans), 1);
+        for untouched in [Signal::Metrics, Signal::Logs] {
+            assert_eq!(
+                catalog.fold_failures(untouched),
+                0,
+                "{untouched:?} did not fail: only the folded signal is charged"
+            );
+            assert_eq!(catalog.fold_cycles(untouched), 0);
+        }
+    }
+}

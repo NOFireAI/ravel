@@ -1,0 +1,80 @@
+name: bench-compare
+
+# DISABLED. This job does not run: not on a schedule, not on pull_request (it
+# has no such trigger), and not on a manual workflow_dispatch either, because
+# the job's own `if: false` condition (below) skips it before any step runs.
+# There is no measurement host for it to run on: the repository gets no
+# self-hosted GitHub Actions runner (owner decision, 2026-09-19, ADR-0070
+# amendment). It is public, and a self-hosted runner executes workflow code
+# from forked pull requests unless every entry point is gated; the
+# `ravel-reference` label this job was written against will not be
+# registered, and an unregistered label does not skip a job, it queues it for
+# about 24 hours and then fails it. A GitHub-hosted runner is not a drop-in
+# replacement either: ADR-0070 decision 3 treats a criterion timing number as
+# only comparable to a baseline taken on the same, non-noisy hardware, which a
+# shared hosted runner is not.
+#
+# The comparison logic itself (scripts/bench-tier-b.sh, scripts/bench-compare.py)
+# is unchanged and still runnable by hand against a chosen host. A baseline
+# recorded that way is only meaningful if it is stamped with the host,
+# the binary's commit, the corpus, the sampling knobs, and the flush cadence
+# it was measured under; see bench/baselines/README.md.
+#
+# Re-enabling this workflow is an owner's decision on where it runs (a
+# re-registered self-hosted reference runner, or a GitHub-hosted runner
+# against infrastructure -- e.g. an object store -- the workflow provisions
+# itself), not a mechanical edit. Restoring it needs, at minimum: removing
+# the `if: false` below, pointing `runs-on` at the chosen host, and deciding
+# whether a `pull_request` trigger and an `enforce` input come back with it
+# (see ADR-0070's 2026-09-19 amendment for the probation-window condition
+# that gates ever wiring `--enforce` onto pull_request).
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-compare-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench-compare:
+    # Hard-disabled regardless of trigger; see the header for why. This `if`
+    # is deliberately not just `false`: the rest of it is the pre-existing
+    # same-repository guard (this repository is public, so a fork can open a
+    # pull request, and this job would check out the head and run cargo bench
+    # from it with a token that has pull-requests: write; running fork code is
+    # arbitrary code execution on whatever runs this job). It stays in place,
+    # dead code under `false &&`, so it does not need re-deriving whenever
+    # this job is re-enabled and a pull_request trigger returns.
+    if: >-
+      false &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository)
+    # Placeholder only: the job never reaches a runner while `if: false`
+    # holds above. Not a decision to run the comparison on a GitHub-hosted
+    # runner -- see the header comment for what restoring this needs.
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - name: Run the tier B compare
+        id: compare
+        env:
+          # Pinned, not left to the script defaults. RAVEL_BENCH_MAX_SERIES is
+          # part of the segment_encode bench id, so a compare run at a different
+          # cardinality than the baseline was recorded at produces a bench id
+          # that matches nothing: the arm reads as MISSING on one side and as an
+          # ignored extra on the other, and drops out of the comparison without
+          # failing anything. These must equal the values in the baseline's
+          # _meta.knobs.
+          BENCH_SAMPLE_SIZE: "10"
+          BENCH_WARMUP: "1"
+          BENCH_MEASURE: "3"
+          RAVEL_BENCH_MAX_SERIES: "2000"
+        run: scripts/bench-tier-b.sh compare bench/baselines/tier-b.json
