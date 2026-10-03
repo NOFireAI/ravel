@@ -656,7 +656,8 @@ The disk tier is disposable by design. The directory is created lazily on first
 admission and is never required to exist. A missing, full or corrupt cache
 directory degrades to a store read, never to a query error, so a node whose
 cache directory is deleted while it is running answers every query correctly and
-only more slowly.
+only more slowly. SQL spill under the same directory is the exception: it is
+checked at startup, as described in "SQL spill" below.
 
 **Cache bytes are not encrypted by SSE-KMS.** Server-side encryption protects
 object bytes at rest in the store, not the bytes this process writes to
@@ -668,6 +669,81 @@ Once a disk tier is configured, each cache's counters gain a tier label
 alongside the existing cache label, so RAM and disk hit rates are reported
 separately. With no `--cache-dir` no tier label appears at all. See
 [the caching guide](../caching.md) for the full metric list and sizing advice.
+
+## SQL spill
+
+In a build with SQL, a query whose memory pool fills can spill its working
+state to local disk and finish, instead of failing with a resources-exhausted
+error, when its plan qualifies: an aggregation built only from `COUNT`, `SUM`
+over integers and `AVG` over integers, with no float `GROUP BY` key, optionally
+under an `ORDER BY`. Any other aggregate (`MIN`, `MAX`, or `SUM` or `AVG` over
+floats) keeps the query on the existing refusal. Spilled files belong to one
+query and are removed when it ends. Nothing reads them afterwards.
+
+The server takes the spill settings from the first of these sources that is
+configured:
+
+1. `--sql-spill off` disables spill whatever the other two sources say. Use
+   it on a node with no safe local scratch storage. The other value, `auto`,
+   is the default.
+2. `RAVEL_SQL_SPILL_DIR` and `RAVEL_SQL_SPILL_MAX_BYTES`, both set: spill goes
+   under that directory, and each query may hold at most that many bytes of
+   spill at once. The directory must already exist; the server does not
+   create it.
+3. `--cache-dir` set and `RAVEL_SQL_SPILL_DIR` unset: spill goes under
+   `<cache-dir>/sql-spill/<instance-id>`, with a derived per-query ceiling.
+   `RAVEL_SQL_SPILL_MAX_BYTES` set on its own replaces the derived ceiling.
+4. None of the above: spill is off and a query that outgrows its pool fails
+   as it always has.
+
+`RAVEL_SQL_SPILL_DIR` without `RAVEL_SQL_SPILL_MAX_BYTES`, or
+`RAVEL_SQL_SPILL_MAX_BYTES` alone with no `--cache-dir`, refuses startup with
+an error naming the missing variable.
+
+The derived ceiling is half the free bytes on the volume backing
+`<cache-dir>/sql-spill`, measured once at startup, capped at four times the
+process memory budget (`memory_budget_bytes` in the startup log), and never
+below 1 GiB. On a volume with 200 GiB free and the 30,064,771,072-byte budget
+of a 30 GiB host, that is 107,374,182,400 bytes: half the free space, below
+the 120,259,084,288-byte cap. The ceiling applies to each query on its own.
+There is no per-tenant or per-node spill quota, so several queries spilling
+at once, or several processes sharing one cache volume, can together use more
+than one ceiling.
+
+Startup logs the result on two `performance default resolved` lines, in the
+same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
+
+| `setting` | `value` | `source` |
+|---|---|---|
+| `sql_spill_dir` | the spill directory, or `none` | `env`, `cache-dir`, `flag-off` or `unset` |
+| `sql_spill_max_bytes` | the per-query ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `flag-off` or `unset` |
+
+Under `--cache-dir` the layout is:
+
+```text
+<cache-dir>/sql-spill/<instance-id>/.owner.lock
+<cache-dir>/sql-spill/<instance-id>/ravel-spill-<pid>-<nonce>-<n>/   one per spilling query
+```
+
+`<instance-id>` is the process's maintenance worker id, a UUID drawn at each
+start, so every process and every restart gets its own directory. Before it serves a query, the process creates its
+directory and holds an exclusive lock on `.owner.lock` until it shuts down;
+the operating system releases the lock however the process exits. It then
+sweeps once: another directory under `<cache-dir>/sql-spill` is deleted only
+when this process can take that directory's lock itself, which means its owner
+is gone. A directory whose lock is held, or that has no `.owner.lock`, is left
+in place and logged at INFO with its path. The sweep touches nothing outside
+`<cache-dir>/sql-spill`, and a process whose spill is off or set by the
+environment does not sweep at all.
+
+Unlike the read cache, the spill directory is checked at startup: with
+`--cache-dir` set and spill resolving there, the server refuses to start if it
+cannot create `<cache-dir>/sql-spill`, measure its free space, or take its own
+directory's lock. `--sql-spill off` starts without touching it.
+
+With spill on, a qualifying query with an `ORDER BY` also breaks ties on its
+`GROUP BY` columns (ascending, nulls last), so it returns rows in the same
+order whether or not it spills.
 
 ## Retention and garbage-collection configuration
 

@@ -1284,7 +1284,8 @@ pub struct Cli {
     /// replaces that ceiling); else no spill. `off` disables spill whatever the
     /// environment or `--cache-dir` says. The startup log's
     /// `sql_spill_dir` and `sql_spill_max_bytes` lines report the outcome.
-    /// Meaningful only in a build with the `sql` feature; inert otherwise.
+    /// Meaningful only in a build with the `sql` feature and in a mode that
+    /// serves queries; inert otherwise.
     #[arg(long = "sql-spill", value_enum, default_value = "auto")]
     pub sql_spill: SqlSpillArg,
 
@@ -1953,7 +1954,9 @@ pub struct Cli {
     /// share (there is no separate disk-tier capacity flag). The
     /// directory is created lazily on first admission and is never
     /// required to exist; a missing, full, or corrupt cache directory degrades
-    /// to a store read, never a query error.
+    /// to a store read, never a query error. SQL spill is the exception: when
+    /// it resolves under this directory (see `--sql-spill`), startup creates
+    /// `<cache-dir>/sql-spill` and refuses to start if it cannot.
     ///
     /// Encryption posture (ADR-0046 decision 7): bytes this process writes to
     /// this directory are NOT encrypted by the SSE-KMS object-storage path.
