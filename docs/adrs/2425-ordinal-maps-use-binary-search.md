@@ -86,7 +86,8 @@ them. The map bytes stand.
 Both sets of figures were pre-registered on #2425 before their runs. Every
 median landed inside its band. The 1-stream time share was marginal: its band
 was under 0.5%, its median 0.49%, and one of its five runs read 0.55%. The
-memory figures were inside their bands with margin.
+memory figures were inside their bands with margin (those figures are
+withdrawn; see the correction below for the one that stands and its band).
 
 The map is therefore neither a time nor a memory bottleneck of RLOG encode. A
 table that cost nothing would move row-path encode time by about 1% and encode
@@ -236,8 +237,9 @@ reading of the heap at its global maximum (issue #2485, result branch
 | 1,000 | 43,024 | 30,296,064 | 0.14% |
 | 20,000 | 688,144 | 41,444,889 | 1.66% |
 
-The profiler's per-site figures sum exactly to its own total in every run, and
-the peak is identical across four runs of the same arm.
+The profiler's per-site figures sum exactly to its own total in every run. The
+1,000-stream peak is identical across four runs of that arm; the other two
+rows are single runs.
 
 The two peak columns are not the same quantity, so this table replaces the
 earlier one and is not a delta against it. The earlier column was the largest
@@ -250,7 +252,17 @@ two are smaller.
 
 In the Context, the sentence on what a table that cost nothing would move
 gives the memory figure as a bound of 1.55%. The figure is 1.66%, and it is a
-measured share, not an upper bound. The pre-registered bar for this figure was
-10% at 20,000 streams, so the conclusion drawn from it, that the map is not a
-memory bottleneck, is unchanged, and so is every decision above. The time
-measurement (Stage 0) did not use the formula and is unaffected.
+measured share, not an upper bound.
+
+Against what was pre-registered. The original memory pre-registration (the
+second pre-registration comment on #2425) expected a share under 5% at 20,000
+streams and named 10% or more as the result that would have justified a
+purpose-built index. The replacement measurement pre-registered its own band
+on #2467, 2% to 6%, and 1.66% came in below it: the map is a smaller part of
+the peak than predicted there. So the Context's statement that the memory
+figures were inside their bands with margin describes the withdrawn figures;
+the figure that stands is under the original 5% expectation, under the 10%
+threshold, and below the band predicted for it. The conclusion drawn from it,
+that the map is not a memory bottleneck, is unchanged, and so is every
+decision above. The time measurement (Stage 0) did not use the formula and is
+unaffected.
