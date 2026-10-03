@@ -2393,9 +2393,12 @@ decode and is sized by `--cpu-gate-read-permits` (default
 decode and is sized by `--cpu-gate-write-permits` (default
 `max(1, cores / 2)`). A job below the gate's inline floor, 256 KiB of
 uncompressed bytes or 100,000 samples for a PromQL evaluation, runs on the
-calling thread instead and takes no permit. No call site submits work to the
-gates yet, so the job, inline, wait and run figures stay at 0 until decode
-and encode move onto them.
+calling thread instead and takes no permit. The catalog's snapshot part,
+postings and column-statistics decodes are the only work submitted to the
+gates so far, on the read gate's `catalog_part`, `catalog_postings` and
+`catalog_column_stats` sites. Every other site's job and inline figures, and
+all of the write gate's figures, stay at 0 until that decode or encode moves
+onto a gate.
 
 | Metric | Meaning |
 |---|---|

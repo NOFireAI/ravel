@@ -2488,11 +2488,19 @@ pub async fn start_with_heartbeat(
                 .merge(remote_write::router(mtls_rw_state));
         }
     }
-    let catalog =
-        query::build_catalog_for_server(store.clone(), &config, ingest_lag.catalog_window_ns)?;
     // Durable shard_count enforcement on the read path (ADR-0050 section 5).
     // The two cache flags reach the catalog byte cache here, not only the
     // fetcher cache.
+    let catalog =
+        query::build_catalog_for_server(store.clone(), &config, ingest_lag.catalog_window_ns)?;
+    // ADR-1702 decision 3: the catalog's resolve-path snapshot part, postings
+    // and column-statistics decodes run on the read gate, not on the
+    // resolving task. The memory budget stays unlimited here.
+    let catalog = Arc::new(
+        Arc::into_inner(catalog)
+            .ok_or_else(|| anyhow::anyhow!("the freshly built catalog is already shared"))?
+            .with_read_gate(cpu_gates.read.clone()),
+    );
 
     // Built in every mode, `Some` only in Mode::Maintain (the one mode that
     // spawns `maintain::spawn` below and therefore has discovery counters to
