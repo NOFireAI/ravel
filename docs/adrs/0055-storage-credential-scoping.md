@@ -1504,15 +1504,21 @@ whose credential issues them:
   `ravel-cli provision reshard` (`append_generation`, `CasVersion`).
 
 Query is not a caller. A `query` process runs the startup check with
-`AbsentPolicy::CheckOnly` (`static_absent_policy` in
-`services/ravel-server/src/provisioning.rs`): a present record is validated
-as in every other mode, and one it cannot read refuses startup, while an
-absent record passes with no listing and no write. This is least privilege:
-the read role holds no provisioning write, and needs no `l0/` listing for
-the check. Before this, Query ran the adopt path, whose first call lists
-`t/<hash>/<sig>/l0/`, a prefix `QueryList` does not admit, so a Query
-process with a statically known tenant that had data and no record was
-refused at startup before it reached any write. ADR-0050 section 5 already
+`AbsentPolicy::RefuseIfCommittedDataHidden` (`static_absent_policy` in
+`services/ravel-server/src/provisioning.rs`) and never adopts: a present
+record is validated as in every other mode, and one it cannot read refuses
+startup. For an absent record it lists only the commit prefix
+`t/<hash>/<sig>/c/`, which `QueryList` already admits through `t/*/*/c/*`,
+and refuses with `AdoptionWouldHideData` when a committed shard index is at
+or above its configured shard count, since it would read that tenant through
+the implicit generation 0 of that count and leave those shards out. Otherwise
+it passes with no write. It never lists `l0/`: Query serves committed data
+only. ADR-0050 section 5 therefore holds in every mode, and the read role
+holds no provisioning write and no `l0/` listing. Before this, Query ran the
+adopt path, whose first call lists `t/<hash>/<sig>/l0/`, a prefix
+`QueryList` does not admit, so a Query process with a statically known
+tenant that had data and no record was refused at startup with
+`AccessDenied` before it reached any write. ADR-0050 section 5 already
 assigns adoption to ingest, maintenance and the CLI and keeps the read path
 write-free.
 
@@ -1524,8 +1530,8 @@ floor. `gateway.json` and `admin.json` granted an unconditioned `PutObject`
 on the record.
 
 The S3 backend sends `CreateIfAbsent` as `If-None-Match: *` and
-`CasVersion` as `If-Match: <etag>`. Checked against AWS on 2026-10-03, IAM
-evaluates both keys on `PutObject`: a statement conditioned on
+`CasVersion` as `If-Match: <etag>`. AWS documents both `s3:if-none-match`
+and `s3:if-match` as condition keys IAM evaluates on `PutObject`: a statement conditioned on
 `StringEquals` `s3:if-none-match` `*` admits a PUT that sends
 `If-None-Match: *`, and a statement conditioned on `Null` `s3:if-match`
 `false` admits a PUT that sends `If-Match`. Neither admits an unconditional
@@ -1564,9 +1570,11 @@ gap. The operator's `append_generation` runs under the shared credential,
 not a template. `crates/ravel-commit/tests/iam_templates.rs` pins the
 condition and the three resources of every `prov` statement per role,
 refuses an unconditioned `PutObject` reaching the record, refuses a `prov`
-grant reaching a nested `/prov` key or an unprovisioned signal's key,
-asserts `query.json` reaches no record, and matches each caller above to a
-grant of its own kind.
+grant reaching a nested `/prov` key, an unprovisioned signal's key, or a key
+whose tenant segment is 31 or 33 characters wide, asserts `query.json`
+reaches no record and admits the commit-prefix listing of the Query startup
+check but not an `l0/` one, and matches each caller above to a grant of its
+own kind.
 
 Net effect on §1: the Maintain write column gains the `prov` writes above,
 the Gateway and Admin entries are conditioned and narrowed to the three

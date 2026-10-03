@@ -1142,6 +1142,10 @@ pub enum ProvisioningCheck {
     /// written (the caller passed [`AbsentPolicy::AdoptIfData`]); the record is
     /// created on the tenant's first actual write. This is the fresh-tenant,
     /// fresh-deployment case that must never refuse (ADR-0050 section 5).
+    /// Also the no-write outcome for an absent record under
+    /// [`AbsentPolicy::CheckOnly`] and
+    /// [`AbsentPolicy::RefuseIfCommittedDataHidden`], whether or not shard data
+    /// exists.
     FreshNoData,
     /// No record existed; the record was written from config. Covers both a
     /// genuine first write ([`AbsentPolicy::CreateFromConfig`] on empty data)
@@ -1175,6 +1179,17 @@ pub enum AbsentPolicy {
     /// may run with write-restricted credentials, and adoption belongs to the
     /// ingest/maintenance/CLI paths, not to a read.
     CheckOnly,
+    /// Never write anything: validate a present record, and when the record is
+    /// absent list only the commit prefix (`t/<hash>/<sig>/c/`, delimited) and
+    /// refuse with [`ProvisioningError::AdoptionWouldHideData`] when any
+    /// committed shard index is at or above the configured `shard_count`;
+    /// otherwise return [`ProvisioningCheck::FreshNoData`]. Used by the startup
+    /// static-tenant check of a `query` process, which reads an unprovisioned
+    /// tenant through the implicit generation 0 of its configured count, so
+    /// committed data on a higher shard would be left out of every read
+    /// (ADR-0050 section 5). `l0/` is not listed: Query serves committed data
+    /// only.
+    RefuseIfCommittedDataHidden,
 }
 
 /// Decode provisioning-record bytes, mapping a decode failure to a typed
@@ -1370,6 +1385,24 @@ fn shard_index_from_common_prefix(common_prefix: &str, listed_prefix: &str) -> O
     segment.parse::<u32>().ok()
 }
 
+/// The highest shard index with a shard directory directly under `prefix`, or
+/// `None` when it holds none. One delimited listing, which returns the shard
+/// directories as common prefixes.
+async fn max_shard_under(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+) -> Result<Option<u32>, ProvisioningError> {
+    let list = store
+        .list_delimited(prefix)
+        .await
+        .map_err(|err| ProvisioningError::store(prefix, err))?;
+    Ok(list
+        .common_prefixes
+        .iter()
+        .filter_map(|common| shard_index_from_common_prefix(common, prefix))
+        .max())
+}
+
 /// The highest shard index with data present under `l0/` or `c/` for this
 /// (tenant, signal), or `None` when neither prefix holds any shard directory.
 /// Delimiter listing costs one request per prefix and returns the shard
@@ -1384,14 +1417,8 @@ async fn max_observed_shard(
         l0_prefix(tenant_hash, signal),
         commit_prefix(tenant_hash, signal),
     ] {
-        let list = store
-            .list_delimited(&prefix)
-            .await
-            .map_err(|err| ProvisioningError::store(&prefix, err))?;
-        for common in &list.common_prefixes {
-            if let Some(idx) = shard_index_from_common_prefix(common, &prefix) {
-                max = Some(max.map_or(idx, |m| m.max(idx)));
-            }
+        if let Some(idx) = max_shard_under(store, &prefix).await? {
+            max = Some(max.map_or(idx, |m| m.max(idx)));
         }
     }
     Ok(max)
@@ -1481,6 +1508,9 @@ async fn write_record_race_safe(
 ///    `< shard_count`, write the record from config. If any is `>= shard_count`,
 ///    the configured value hides data:
 ///    [`ProvisioningError::AdoptionWouldHideData`], writing nothing.
+///    [`AbsentPolicy::RefuseIfCommittedDataHidden`] never writes either: it
+///    lists only `c/`, refuses the same way when a committed shard index is
+///    `>= shard_count`, and otherwise returns [`ProvisioningCheck::FreshNoData`].
 /// 3. Record present: accept it. The record's generation-0 `shard_count` is
 ///    returned in [`ProvisioningCheck::RecordPresent`]; it is no longer required
 ///    to equal the configured value (ADR-0082). A difference is drift, logged
@@ -1504,10 +1534,26 @@ pub async fn validate_or_adopt(
         });
     }
 
-    // No record. The read path never writes and never needs to list: pass
-    // through without adopting (adoption belongs to ingest/maintain/CLI).
-    if matches!(absent_policy, AbsentPolicy::CheckOnly) {
-        return Ok(ProvisioningCheck::FreshNoData);
+    // No record. The non-adopting policies never write (adoption belongs to
+    // ingest/maintain/CLI); the startup check of a read-only process still
+    // refuses when its configured count would hide committed data.
+    match absent_policy {
+        AbsentPolicy::CheckOnly => return Ok(ProvisioningCheck::FreshNoData),
+        AbsentPolicy::RefuseIfCommittedDataHidden => {
+            let prefix = commit_prefix(tenant_hash, signal);
+            return match max_shard_under(store, &prefix).await? {
+                Some(observed) if observed >= shard_count => {
+                    Err(ProvisioningError::AdoptionWouldHideData {
+                        tenant_hash: tenant_hash.to_hex(),
+                        signal: signal.key_prefix(),
+                        configured: shard_count,
+                        observed_shard: observed,
+                    })
+                }
+                Some(_) | None => Ok(ProvisioningCheck::FreshNoData),
+            };
+        }
+        AbsentPolicy::AdoptIfData | AbsentPolicy::CreateFromConfig => {}
     }
 
     // Decide fresh (scenario 1) vs pre-ADR data (scenario 2) from the shard
@@ -1516,13 +1562,14 @@ pub async fn validate_or_adopt(
     match max_observed_shard(store, tenant_hash, signal).await? {
         None => match absent_policy {
             // No record and no data is the fresh case: adopt-if-data and the
-            // read-only check both pass through without writing. CheckOnly
-            // returns earlier (line above) so it does not reach here today, but
-            // handling it explicitly keeps this arm correct if that early return
-            // is ever moved, rather than leaving a panic a refactor could trip.
-            AbsentPolicy::AdoptIfData | AbsentPolicy::CheckOnly => {
-                Ok(ProvisioningCheck::FreshNoData)
-            }
+            // read-only checks all pass through without writing. CheckOnly and
+            // RefuseIfCommittedDataHidden return earlier (above) so they do not
+            // reach here today, but handling them explicitly keeps this arm
+            // correct if that early return is ever moved, rather than leaving a
+            // panic a refactor could trip.
+            AbsentPolicy::AdoptIfData
+            | AbsentPolicy::CheckOnly
+            | AbsentPolicy::RefuseIfCommittedDataHidden => Ok(ProvisioningCheck::FreshNoData),
             AbsentPolicy::CreateFromConfig => {
                 write_record_race_safe(store, &key, tenant_hash, signal, shard_count, now_ns).await
             }
@@ -2210,6 +2257,299 @@ pub(crate) mod tests {
                 "sys and commit Signal enums disagree for {signal:?}"
             );
         }
+    }
+
+    /// One store call that names a key or prefix, as [`RecordingStore`] logs it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum StoreCall {
+        Get(String),
+        Head(String),
+        Put(String),
+        Delete(String),
+        List(String),
+        ListDelimited(String),
+    }
+
+    /// A [`MemoryStore`] that logs every call by operation and key or prefix, so
+    /// a test can assert exactly which prefixes a check listed and that it
+    /// wrote nothing.
+    struct RecordingStore {
+        inner: MemoryStore,
+        calls: Mutex<Vec<StoreCall>>,
+    }
+
+    impl RecordingStore {
+        fn new(inner: MemoryStore) -> Self {
+            RecordingStore {
+                inner,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn record(&self, call: StoreCall) {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(call);
+        }
+
+        fn calls(&self) -> Vec<StoreCall> {
+            self.calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        /// Every call except record reads, which each check issues once.
+        fn non_get_calls(&self) -> Vec<StoreCall> {
+            self.calls()
+                .into_iter()
+                .filter(|call| !matches!(call, StoreCall::Get(_)))
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for RecordingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.record(StoreCall::Put(key.to_string()));
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.record(StoreCall::Get(key.to_string()));
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.record(StoreCall::Head(key.to_string()));
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.record(StoreCall::List(prefix.to_string()));
+            self.inner.list(prefix, page).await
+        }
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.record(StoreCall::List(prefix.to_string()));
+            self.inner.list_after(prefix, start_after, page).await
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.record(StoreCall::ListDelimited(prefix.to_string()));
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.record(StoreCall::Delete(key.to_string()));
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// Seed a committed shard directory: a commit record under `c/<shard>/`.
+    async fn seed_commit_shard(
+        store: &dyn ObjectStoreBackend,
+        th: &TenantHash,
+        signal: Signal,
+        shard: u32,
+    ) {
+        let key = format!(
+            "t/{}/{}/c/{:04}/100/writer.0.cmt",
+            th.to_hex(),
+            signal.key_prefix(),
+            shard
+        );
+        store
+            .put(&key, vec![1].into(), PutOptions::default())
+            .await
+            .expect("seed commit record");
+    }
+
+    /// The only store calls an absent-record check under
+    /// [`AbsentPolicy::RefuseIfCommittedDataHidden`] may make besides the record
+    /// read: one delimited listing of the commit prefix. No `l0/` listing and no
+    /// write.
+    fn expected_committed_only_calls(th: &TenantHash, signal: Signal) -> Vec<StoreCall> {
+        let expected_prefix = format!("t/{}/{}/c/", th.to_hex(), signal.key_prefix());
+        assert_eq!(commit_prefix(th, signal), expected_prefix);
+        vec![StoreCall::ListDelimited(expected_prefix)]
+    }
+
+    /// Committed data on a shard index at or above the configured count would be
+    /// left out of every read through the implicit generation 0, so the
+    /// read-only startup check refuses, listing only the commit prefix and
+    /// writing nothing. Fails under `CheckOnly`, which returns before listing.
+    #[tokio::test]
+    async fn refuse_if_committed_data_hidden_refuses_a_committed_shard_at_the_count() {
+        let th = tenant();
+        let inner = MemoryStore::new();
+        seed_commit_shard(&inner, &th, Signal::Metrics, 1).await;
+        seed_commit_shard(&inner, &th, Signal::Metrics, 4).await;
+        let store = RecordingStore::new(inner);
+        let err = validate_or_adopt(
+            &store,
+            &th,
+            Signal::Metrics,
+            4,
+            1_000,
+            AbsentPolicy::RefuseIfCommittedDataHidden,
+        )
+        .await
+        .expect_err("committed data on shard 4 is hidden by a shard count of 4");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::AdoptionWouldHideData {
+                    configured: 4,
+                    observed_shard: 4,
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        assert_eq!(
+            store.non_get_calls(),
+            expected_committed_only_calls(&th, Signal::Metrics)
+        );
+    }
+
+    /// Committed data all below the configured count is fully served by the
+    /// implicit generation 0: the check passes, lists only the commit prefix,
+    /// and writes no record.
+    #[tokio::test]
+    async fn refuse_if_committed_data_hidden_passes_in_range_committed_data_without_writing() {
+        let th = tenant();
+        let inner = MemoryStore::new();
+        seed_commit_shard(&inner, &th, Signal::Metrics, 0).await;
+        seed_commit_shard(&inner, &th, Signal::Metrics, 3).await;
+        let store = RecordingStore::new(inner);
+        let out = validate_or_adopt(
+            &store,
+            &th,
+            Signal::Metrics,
+            4,
+            1_000,
+            AbsentPolicy::RefuseIfCommittedDataHidden,
+        )
+        .await
+        .expect("committed shards 0 and 3 are in range for a shard count of 4");
+        assert_eq!(out, ProvisioningCheck::FreshNoData);
+        assert_eq!(
+            store.non_get_calls(),
+            expected_committed_only_calls(&th, Signal::Metrics)
+        );
+        assert!(matches!(
+            store
+                .inner
+                .get(&provisioning_key(&th, Signal::Metrics), GetRange::Full)
+                .await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    /// Uncommitted `l0/` data on a high shard does not refuse: a `query` process
+    /// serves committed data only, so `l0/` data is never read there and nothing
+    /// is hidden from it. The check does not list `l0/` at all.
+    #[tokio::test]
+    async fn refuse_if_committed_data_hidden_ignores_uncommitted_l0_data() {
+        let th = tenant();
+        let inner = MemoryStore::new();
+        seed_l0_shard(&inner, &th, Signal::Metrics, 9).await;
+        let store = RecordingStore::new(inner);
+        let out = validate_or_adopt(
+            &store,
+            &th,
+            Signal::Metrics,
+            4,
+            1_000,
+            AbsentPolicy::RefuseIfCommittedDataHidden,
+        )
+        .await
+        .expect("l0-only data is not served by a query process");
+        assert_eq!(out, ProvisioningCheck::FreshNoData);
+        assert_eq!(
+            store.non_get_calls(),
+            expected_committed_only_calls(&th, Signal::Metrics)
+        );
+    }
+
+    /// A present record is validated exactly as under every other policy: a
+    /// valid one is accepted (its count, not the configured one, governs reads,
+    /// so committed data above the configured count is not hidden) with no
+    /// listing, and one naming another tenant fails closed.
+    #[tokio::test]
+    async fn refuse_if_committed_data_hidden_validates_a_present_record() {
+        let _guard = SHARD_COUNT_DRIFT_TEST_LOCK.lock().await;
+        let th = tenant();
+        let inner = MemoryStore::new();
+        seed_record(&inner, &th, Signal::Metrics, 8).await;
+        seed_commit_shard(&inner, &th, Signal::Metrics, 6).await;
+        let store = RecordingStore::new(inner);
+        let out = validate_or_adopt(
+            &store,
+            &th,
+            Signal::Metrics,
+            4,
+            1_000,
+            AbsentPolicy::RefuseIfCommittedDataHidden,
+        )
+        .await
+        .expect("a valid present record is accepted");
+        assert_eq!(
+            out,
+            ProvisioningCheck::RecordPresent {
+                recorded_shard_count: 8
+            }
+        );
+        assert_eq!(store.non_get_calls(), Vec::new());
+
+        let other = TenantHash([0xCDu8; 16]);
+        let misfiled = build_record(&other, Signal::Logs, 4, 1_000);
+        store
+            .inner
+            .put(
+                &provisioning_key(&th, Signal::Logs),
+                misfiled.encode_to_vec().into(),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed misfiled record");
+        let err = validate_or_adopt(
+            &store,
+            &th,
+            Signal::Logs,
+            4,
+            1_000,
+            AbsentPolicy::RefuseIfCommittedDataHidden,
+        )
+        .await
+        .expect_err("a record naming another tenant fails closed");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::CorruptRecord {
+                    field: "tenant_hash",
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        assert_eq!(store.non_get_calls(), Vec::new());
     }
 
     #[tokio::test]

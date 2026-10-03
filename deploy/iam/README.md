@@ -546,9 +546,12 @@ floor after a clean re-audit. The delete falls under `MaintainDelete`
 `t/*/*/maint/*`, since IAM's `*` matches `/`. The floor raise is
 `MaintainProvCas`, a CAS-only grant (see "Provisioning records: conditioned
 writes" below). `maintain_template_covers_every_maintain_migrate_call` in
-`crates/ravel-commit/tests/iam_templates.rs` checks every call the command
-issues against this template. Issue #2359 changes the migrate cursor; the grants here are
-for the cursor as it is today.
+`crates/ravel-commit/tests/iam_templates.rs` checks a list of the command's
+calls against this template. That list is written by hand from the code, not
+derived from it, so a new call in `migrate.rs` needs a new entry there; the
+cursor key in it is a format string mirroring `migrate_cursor_key`, which is
+private to `ravel-maintain`. Issue #2359 changes the migrate cursor; the
+grants here are for the cursor as it is today.
 
 ### Parquet table DDL
 
@@ -617,8 +620,9 @@ functions: `write_record_race_safe` with `CreateIfAbsent` (reached from
 `validate_or_adopt` under `CreateFromConfig` or `AdoptIfData`), and
 `append_generation` and `raise_format_floor` with `CasVersion`. The S3 backend
 sends `CreateIfAbsent` as `If-None-Match: *` and `CasVersion` as
-`If-Match: <etag>`, and IAM evaluates both keys on `PutObject` (checked
-against AWS on 2026-10-03), so every template grants the record through
+`If-Match: <etag>`, and AWS documents both `s3:if-none-match` and
+`s3:if-match` as condition keys IAM evaluates on `PutObject`, so every
+template grants the record through
 conditioned statements only (ADR-0055, prov write conditions amendment):
 
 | Call | Role | Put mode | Grant |
@@ -630,14 +634,20 @@ conditioned statements only (ADR-0055, prov write conditions amendment):
 | `ravel-cli provision adopt`, `validate_or_adopt` with `AdoptIfData` | Admin | `CreateIfAbsent` | `AdminProvCreate` |
 | `ravel-cli provision reshard`, `append_generation` | Admin | `CasVersion` | `AdminProvCas` |
 
-A `query` process runs the same startup check with `CheckOnly`
-(`static_absent_policy` in `services/ravel-server/src/provisioning.rs`): it
-validates a present record and refuses startup on one it cannot read, and it
-passes an absent record without listing the tenant's shards or writing
-anything. Adoption belongs to ingest, maintenance and the CLI. The read role
-therefore holds no provisioning write, and needs no `l0/` listing for this
-check: `QueryList` does not admit `t/*/*/l0/*`, so an adopting Query startup
-would be refused at that listing before it reached the write.
+A `query` process runs the startup check with `RefuseIfCommittedDataHidden`
+(`static_absent_policy` in `services/ravel-server/src/provisioning.rs`) and
+never adopts: it validates a present record and refuses startup on one it
+cannot read. For an absent record it lists only the commit prefix
+`t/<tenant_hash>/<signal>/c/`, which `QueryList` already admits through
+`t/*/*/c/*`, and refuses startup with `AdoptionWouldHideData` when committed
+data sits on a shard index at or above its `--shards`, because it reads such
+a tenant through that shard count and would leave those shards out (ADR-0050
+section 5). Otherwise it passes without writing anything. It never lists
+`l0/`, since Query serves committed data only. Adoption belongs to ingest,
+maintenance and the CLI. The read role therefore holds no provisioning write
+and no `l0/` listing: `QueryList` does not admit `t/*/*/l0/*`, so an
+adopting Query startup would be refused at that listing before it reached the
+write.
 
 Each create-only statement is `s3:PutObject` conditioned on `StringEquals`
 `s3:if-none-match` `*`, the form `QueryManifestCreate` uses. Each CAS-only
@@ -656,8 +666,12 @@ IAM's `*` matches `/`, so `t/*/*/prov` would also reach nested keys that end
 in `/prov` (for example `t/<tenant_hash>/m/c/<shard>/<hour>/prov` or
 `t/<tenant_hash>/m/del/prov`) and the `prov` key of the alerts, audit and
 profiles signals, none of which has a provisioning record. The tenant hash is
-spelled as 32 `?`, the way `QueryManifestCreate` spells it, so the grant
-reaches only `t/<tenant_hash>/<signal>/prov` for metrics, logs and spans.
+spelled as 32 `?`, the way `QueryManifestCreate` spells it, so the statements
+name the record keys of metrics, logs and spans. An IAM `?` also matches `/`,
+so the patterns are not a proof that no other string matches, but no real key
+of another shape does: a tenant segment of 31 or 33 characters, a nested key
+ending in `/prov` and an unprovisioned signal's `prov` key all fall outside
+them.
 `DenyDeleteProtected` keeps the broader `t/*/*/prov`, since a broad deny is
 the safe direction.
 
