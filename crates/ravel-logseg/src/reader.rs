@@ -940,6 +940,23 @@ impl BlockScan {
         self.blocks.len().saturating_sub(self.next)
     }
 
+    /// The object's decoded PAGE_DIR, shared via the same [`Arc`] every
+    /// reader opened from one [`SegmentDirectories`] holds (ADR-2414
+    /// decision A1). A caller sizing the read gate's job from this scan's
+    /// segment reads the directory here instead of decoding PAGE_DIR again.
+    pub fn page_dir(&self) -> &Arc<PageDir> {
+        &self.page_dir
+    }
+
+    /// The whole-object block index of every surviving block, in the order
+    /// [`Self::next_block`] drains them. A caller grouping survivors into
+    /// row groups (PAGE_DIR's `groups[i].block_count` boundaries, ADR-2414
+    /// decision A1) needs the real block index, not the ordinal position
+    /// [`RlogReader::scan_blocks_subset`]'s `indices` addresses.
+    pub fn survivor_block_indices(&self) -> Vec<usize> {
+        self.blocks.iter().map(|b| b.block_index as usize).collect()
+    }
+
     /// Decode the next surviving block and return the rows of it that match the
     /// exact filter, or `None` once every surviving block has been decoded.
     ///
