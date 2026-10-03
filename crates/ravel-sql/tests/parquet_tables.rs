@@ -495,6 +495,154 @@ async fn clickbench_q19_plans_and_groups_by_extracted_minute() {
     );
 }
 
+/// Two rows of one column per Arrow type the JSON encoder had no arm for
+/// before issue #2390, written to Parquet with the Arrow schema embedded so
+/// the reader restores each type. The reader hands both `Binary` and
+/// `LargeBinary` back as `BinaryView`, so one binary column covers both.
+fn typed_bytes() -> Bytes {
+    use datafusion::arrow::array::{
+        BinaryArray, Date32Array, Date64Array, Decimal128Array, Int8Array, Int16Array,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray, UInt16Array,
+    };
+    use datafusion::arrow::datatypes::TimeUnit;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("i8", DataType::Int8, false),
+        Field::new("i16", DataType::Int16, false),
+        Field::new("u16", DataType::UInt16, false),
+        Field::new("d32", DataType::Date32, false),
+        Field::new("d64", DataType::Date64, false),
+        Field::new("ts_s", DataType::Timestamp(TimeUnit::Second, None), false),
+        Field::new(
+            "ts_ms",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            false,
+        ),
+        Field::new(
+            "ts_us",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("dec", DataType::Decimal128(10, 2), false),
+        Field::new("bin", DataType::Binary, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int8Array::from(vec![-8, 8])) as ArrayRef,
+            Arc::new(Int16Array::from(vec![-1_600, 1_600])),
+            Arc::new(UInt16Array::from(vec![0, 65_535])),
+            Arc::new(Date32Array::from(vec![-1, 19_675])),
+            Arc::new(Date64Array::from(vec![-86_400_000, 11_016 * 86_400_000])),
+            Arc::new(TimestampSecondArray::from(vec![-1, CLICKBENCH_T0])),
+            Arc::new(TimestampMillisecondArray::from(vec![
+                -1,
+                CLICKBENCH_T0 * 1_000 + 123,
+            ])),
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                -1,
+                CLICKBENCH_T0 * 1_000_000 + 123_456,
+            ])),
+            Arc::new(
+                Decimal128Array::from(vec![-5, 12_345])
+                    .with_precision_and_scale(10, 2)
+                    .expect("decimal"),
+            ),
+            Arc::new(BinaryArray::from(vec![&[0xbe_u8][..], &[0xef][..]])),
+        ],
+    )
+    .expect("batch");
+    let mut out = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut out, schema, None).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    Bytes::from(out)
+}
+
+/// Issue #2390: a Parquet table's Int8, Int16, UInt16, Date32, Date64,
+/// second/millisecond/microsecond timestamp, Decimal128 and binary columns
+/// encode through the JSON output path the SQL endpoint serves, instead of
+/// failing with "no JSON encoding for arrow type".
+#[tokio::test]
+async fn parquet_column_types_encode_as_json() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    let file = lake.put_file("t/typed/0.parquet", typed_bytes()).await;
+    lake.grant(&acme).await;
+    lake.create(&acme, "typed", vec![file]).await;
+
+    let outcome = lake
+        .execute(&acme, "SELECT * FROM typed ORDER BY i16")
+        .await
+        .expect("the statement runs");
+    let json = outcome
+        .output
+        .to_json()
+        .expect("every column encodes as JSON");
+
+    let types: Vec<(String, String)> = json["columns"]
+        .as_array()
+        .expect("columns")
+        .iter()
+        .map(|c| {
+            (
+                c["name"].as_str().expect("name").to_string(),
+                c["type"].as_str().expect("type").to_string(),
+            )
+        })
+        .collect();
+    let expected_types = [
+        ("i8", "Int8"),
+        ("i16", "Int16"),
+        ("u16", "UInt16"),
+        ("d32", "Date32"),
+        ("d64", "Date64"),
+        ("ts_s", "Timestamp(s)"),
+        ("ts_ms", "Timestamp(ms)"),
+        ("ts_us", "Timestamp(µs)"),
+        ("dec", "Decimal128(10, 2)"),
+        ("bin", "BinaryView"),
+    ];
+    assert_eq!(
+        types,
+        expected_types
+            .iter()
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+            .collect::<Vec<_>>(),
+        "the Parquet round trip keeps each type the rows below exercise"
+    );
+
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([
+            [
+                -8,
+                -1_600,
+                0,
+                "1969-12-31",
+                "1969-12-31",
+                -1_000_000_000,
+                -1_000_000,
+                -1_000,
+                "-0.05",
+                "be"
+            ],
+            [
+                8,
+                1_600,
+                65_535,
+                "2023-11-14",
+                "2000-02-29",
+                1_700_000_000_000_000_000_i64,
+                1_700_000_000_123_000_000_i64,
+                1_700_000_000_123_456_000_i64,
+                "123.45",
+                "ef"
+            ]
+        ])
+    );
+}
+
 /// The unknown-table failure of `sql` for `tenant`, which every name that is
 /// no table of that tenant must reproduce.
 async fn unknown_table_error(lake: &Lake, tenant: &TenantHash, sql: &str) -> SqlError {
