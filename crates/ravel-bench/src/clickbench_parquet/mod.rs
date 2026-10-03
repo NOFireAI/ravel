@@ -1,7 +1,8 @@
-//! ClickBench Parquet lane (ADR-2040, issue #2055 task T5b): the suite
-//! definition, result comparator, and synthetic fixture a later task's
-//! engines and acceptance test consume. Each module here is unit-tested on
-//! its own; nothing in this module wires an engine to a live object store.
+//! ClickBench Parquet lane (ADR-2040 D7, issue #2055): the upstream suite
+//! definition, the result comparator, the synthetic fixture, and the engines
+//! that run the suite (in-process Ravel, an in-process DataFusion reference,
+//! and a running server over HTTP). The end-to-end check is
+//! `tests/clickbench_corpus.rs`'s `parquet_lane_runs_the_upstream_suite_verbatim`.
 
 pub mod comparator;
 pub mod engine;
