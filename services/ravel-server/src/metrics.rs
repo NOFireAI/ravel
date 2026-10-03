@@ -2192,7 +2192,7 @@ fn render_idempotency_lookup_family(
     write_header(
         out,
         NAME,
-        "Keyed log and span writes refused with a retryable 503 / UNAVAILABLE because a GET of an idempotency marker key failed with a store error other than not-found, by signal. Each refusal also logs a WARN line naming the key and the store error.",
+        "Keyed log and span writes refused with a retryable 503 / UNAVAILABLE because their idempotency marker lookup failed, by signal: a GET of a marker key failed with a store error other than not-found, or the lookup was still running at the request's ack deadline. Each refusal also logs a WARN line naming the key and the store error, or the deadline.",
         "counter",
     );
     for signal in signals {

@@ -785,24 +785,32 @@ ingest hour from `now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS` down to
 tolerance hours, `now` and `now - 1`, GET together, where a retry's marker
 almost always sits; only if none of them holds an object does the second
 batch GET every remaining hour of the window, at most
-`IDEM_MARKER_PROBE_CONCURRENCY` (8) in flight. Within a batch the newest
-object found wins, so the outcome for a given store state is the one a
-sequential newest-first scan stopping at the first object would return. A
-`NotFound` means no marker at that hour. Any other store error on any probe
-of a batch fails the lookup, even when another probe of that batch found a
-marker, and the keyed write is not acknowledged: it fails with a retryable
-503 / gRPC `UNAVAILABLE` before the request's own data is written, so the
-retry is safe. At the default 24-hour window and one hour of forward
+`IDEM_MARKER_PROBE_CONCURRENCY` (8) in flight. A batch is decided once all
+of its GETs answered, walking the answers from the newest hour down: the
+first object found is the outcome, and the first store error fails the
+lookup, whichever comes first. So the outcome for a given store state is the
+one a sequential newest-first scan stopping at the first object or the first
+store error would return. A `NotFound` means no marker at that hour. Any
+other store error fails the lookup when it sits at a newer hour than every
+object the batch found; one at an older hour than an object found is ignored,
+since the scan stops at that object. A failed lookup is not acknowledged: the
+keyed write fails with a retryable 503 / gRPC `UNAVAILABLE` before the
+request's own data is written, so the retry is safe. At the default 24-hour window and one hour of forward
 tolerance a hit at `now + 1`, `now` or `now - 1` costs 3 GETs and one round
 trip; any other hit, or a miss, costs 26 GETs in about four round trips.
 
-The lookup is bounded by the same `ack_deadline` the router write gets: the
-gateway wraps it in a timeout of that length (`lookup_marker_within` in
-`services/ravel-server/src/logs_ingest.rs`), so under S3 throttling a lookup
-cannot run past the budget of the write it gates. A lookup still running at
-the deadline is refused exactly like a failed probe (the same retryable
-error, client message and `ravel_ingest_idempotency_lookup_failures_total`
-count), with a WARN line that names the deadline rather than a key.
+The lookup and the router write it gates share one `ack_deadline` budget per
+request. The deadline starts before the lookup, the gateway wraps the lookup
+in a timeout of that length (`lookup_marker_within` in
+`services/ravel-server/src/logs_ingest.rs`), and the router write gets only
+what is left of it when the write starts as its acknowledgement deadline, so under S3 throttling
+the lookup's time comes out of that deadline instead of adding a second full
+one to the request. A lookup still
+running at the deadline is refused exactly like a failed probe (the same
+retryable error, client message and
+`ravel_ingest_idempotency_lookup_failures_total` count), with a WARN line
+that names the deadline rather than a key. A strict write left no budget at
+all fails with the router's own ack timeout, which is retryable too.
 
 Why exact-key GETs and not a segment-aligned listing:
 
@@ -823,8 +831,8 @@ Why exact-key GETs and not a segment-aligned listing:
 Section 5's honest residuals are unchanged.
 
 Net effect on section 5: "one prefix LIST" becomes one GET per hour of the
-window, the hours nearest `now` first, bounded by the write's `ack_deadline`,
-and "one LIST plus one PUT" becomes up to
+window, the hours nearest `now` first, inside the one `ack_deadline` budget
+the request's write also draws on, and "one LIST plus one PUT" becomes up to
 `dedup_window + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS + 1` GETs plus one
 PUT. Recorded as an appended amendment, with an inline pointer added to
 section 5.

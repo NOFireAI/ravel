@@ -163,6 +163,9 @@ pub async fn handle_export_traces(
     .map_err(|e| SpanIngestRequestError::Provisioning(e.to_string()))?;
     // One hour-bucket computation shared by the lookup and the marker write.
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
+    // One `ack_deadline` budget per request, started before the lookup: the
+    // router write gets what the lookup leaves of it.
+    let deadline = tokio::time::Instant::now() + state.ack_deadline;
 
     // Replay (ADR-0051 section 5): a keyed retry whose marker is still inside
     // the dedup window skips normalize and the router write and returns the
@@ -231,7 +234,12 @@ pub async fn handle_export_traces(
 
     let receipt = state
         .router
-        .write(tenant.clone(), normalized.spans, mode, state.ack_deadline)
+        .write(
+            tenant.clone(),
+            normalized.spans,
+            mode,
+            crate::logs_ingest::remaining_budget(deadline),
+        )
         .await
         .map_err(|err| {
             // A PartialWrite's durable siblings are real, durably committed
@@ -383,7 +391,7 @@ mod tests {
     use crate::logs_ingest::marker_lookup_test_support::{
         FIRST_BATCH_PROBES, LOOKUP_DEADLINE_WARNING, LOOKUP_FAILED_WARNING, LOOKUP_FAILURE_COUNTER,
         LookupFailureWarning, LookupFailureWarnings, PAUSED_CLOCK_SLACK, STORE_ERROR_TEXT,
-        marker_get_refusals, marker_probe_store, put_count,
+        SlowLookupStalledWriteStore, marker_get_refusals, marker_probe_store, put_count,
     };
     use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
@@ -1031,6 +1039,58 @@ mod tests {
             crate::logs_ingest::idempotency_lookup_failures(Signal::Spans) - failures_before,
             1,
             "the deadline refusal must be counted exactly once"
+        );
+    }
+
+    /// Issue #2462: the spans twin of the logs test of the same name. A lookup
+    /// that takes four of the five seconds of `ack_deadline` leaves the strict
+    /// write one, so a write whose data PUT never answers fails with the
+    /// router's retryable ack timeout five seconds after the request started,
+    /// not nine. The clock is paused.
+    ///
+    /// Non-vacuity: passing `state.ack_deadline` to `router.write` instead of
+    /// `remaining_budget(deadline)` refuses the write after nine seconds.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_write_gets_only_the_budget_its_lookup_left() {
+        let lookup_takes = Duration::from_secs(4);
+        let store = Arc::new(SlowLookupStalledWriteStore::new(lookup_takes));
+        let state = state_with_store(store.clone());
+        assert!(lookup_takes < state.ack_deadline);
+
+        let started = tokio::time::Instant::now();
+        let Err(err) = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![span("GET /x", Vec::new())]),
+            MARKER_TEST_INGEST_TS_NS,
+            Some(b"idem-2462-budget".to_vec()),
+        )
+        .await
+        else {
+            panic!("a write whose data PUT never answers must time out");
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(
+                err,
+                SpanIngestRequestError::Write(SpanWriteError::AckTimeout)
+            ),
+            "expected the router's ack timeout, got {err:?}"
+        );
+        assert!(err.is_retryable(), "{err:?} must be retryable");
+        // The lookup ran to a miss over the whole default window.
+        assert_eq!(
+            store.marker_gets(),
+            u64::from(DEFAULT_IDEM_DEDUP_WINDOW_HOURS) + FIRST_BATCH_PROBES - 1
+        );
+        // hygiene-allow: wall-clock -- `started` is a tokio Instant under a
+        // paused clock, so `elapsed` is the timer's deadline, not the machine's.
+        assert!(
+            elapsed >= state.ack_deadline && elapsed <= state.ack_deadline + PAUSED_CLOCK_SLACK,
+            "refused after {elapsed:?}, one budget is {:?}",
+            state.ack_deadline
         );
     }
 

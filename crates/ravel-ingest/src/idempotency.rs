@@ -344,9 +344,10 @@ pub async fn write_marker(
 /// [`IDEM_MARKER_PROBE_CONCURRENCY`] GETs in flight: first the forward skew
 /// hours, the current hour and the hour before it, where a retry's marker
 /// almost always sits; then, only if that batch found nothing, every remaining
-/// hour of the window. Within a batch the newest object found wins, so the
-/// result for a given store state is the one a sequential newest-first scan
-/// stopping at the first object would return.
+/// hour of the window. A batch is decided once all of its probes answered,
+/// and decided the way a sequential newest-first scan stopping at the first
+/// object or the first store error would decide it, so the result for a given
+/// store state is the one that scan returns.
 ///
 /// The probes are GETs, not a listing of the key's `<keyhash32>.` prefix: the
 /// S3 adapter appends `/` to every list prefix, so that listing finds no
@@ -354,10 +355,11 @@ pub async fn write_marker(
 ///
 /// Returns [`LookupOutcome::Miss`] when every probe answers `NotFound`, and
 /// [`LookupOutcome::Corrupt`] when the newest marker found fails to decode.
-/// Any other store error on any probe of a batch fails the whole lookup, even
-/// when another probe of that batch found a marker, since the lookup cannot
-/// tell a marker it could not read from none. This function sets no deadline
-/// of its own; the caller bounds it.
+/// A store error other than `NotFound` fails the lookup when it sits at a
+/// newer hour than every marker found, since the lookup cannot tell a marker
+/// it could not read there from none. A store error at an hour older than a
+/// marker found is ignored: the scan stops at that marker and never reaches
+/// it. This function sets no deadline of its own; the caller bounds it.
 pub async fn read_marker(
     store: &dyn ObjectStoreBackend,
     tenant_id: &TenantId,
@@ -382,9 +384,11 @@ pub async fn read_marker(
 }
 
 /// Probe every hour of `hours` (newest first), at most
-/// [`IDEM_MARKER_PROBE_CONCURRENCY`] at a time, and decide only once all of
-/// them answered: a store error anywhere fails the batch, otherwise the newest
-/// object found is the outcome.
+/// [`IDEM_MARKER_PROBE_CONCURRENCY`] at a time, then decide the batch the way
+/// a sequential newest-first scan would: walking the answers from the newest
+/// hour down, the first object found is the outcome and the first store error
+/// fails the batch, whichever comes first. Anything older than that hour is
+/// ignored, store errors included.
 async fn probe_batch(
     store: &dyn ObjectStoreBackend,
     tenant_id: &TenantId,
@@ -402,17 +406,15 @@ async fn probe_batch(
         .buffered(IDEM_MARKER_PROBE_CONCURRENCY)
         .collect()
         .await;
-    let mut newest_found = None;
+    // `buffered` yields in input order, so `results` runs newest hour first.
     for (key, result) in results {
         match result {
             Err(source) => return Err(MarkerLookupError { key, source }),
             Ok(LookupOutcome::Miss) => {}
-            Ok(found) => {
-                newest_found.get_or_insert(found);
-            }
+            Ok(found) => return Ok(found),
         }
     }
-    Ok(newest_found.unwrap_or(LookupOutcome::Miss))
+    Ok(LookupOutcome::Miss)
 }
 
 async fn probe_key(
@@ -712,40 +714,64 @@ mod tests {
     }
 
     /// The batched lookup returns, for every store state tried, exactly what
-    /// a sequential newest-first scan stopping at the first object returns:
-    /// markers at several hours, some of them corrupt, read from reader hours
+    /// a sequential newest-first scan stopping at the first object or the
+    /// first store error returns: markers at several hours, some of them
+    /// corrupt, some hours whose GET the store refuses, read from reader hours
     /// on both sides of each.
     #[tokio::test]
     async fn batched_lookup_matches_a_sequential_newest_first_scan() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+
+        /// `Err` carries the key of the refused GET.
         async fn sequential(
             store: &dyn ObjectStoreBackend,
             tenant: &TenantId,
             now: u32,
             window: u32,
-        ) -> LookupOutcome {
+        ) -> Result<LookupOutcome, String> {
             let newest = now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS;
             for hour in (now.saturating_sub(window)..=newest).rev() {
                 let key = marker_key(tenant, Signal::Logs, b"same", hour);
-                match read_marker_at(store, &key).await.expect("probe") {
-                    LookupOutcome::Miss => {}
-                    found => return found,
+                match read_marker_at(store, &key).await {
+                    Err(_) => return Err(key),
+                    Ok(LookupOutcome::Miss) => {}
+                    Ok(found) => return Ok(found),
                 }
             }
-            LookupOutcome::Miss
+            Ok(LookupOutcome::Miss)
         }
 
         let tenant = tenant("acme");
         let base = 495_972u32;
-        // (marker hour offsets from base, offsets whose marker is corrupt)
-        let states: [(&[u32], &[u32]); 5] = [
-            (&[0], &[]),
-            (&[0, 1, 2, 5, 11, 23], &[]),
-            (&[3, 9, 17], &[9]),
-            (&[2, 7, 30], &[2]),
-            (&[], &[]),
+        // (marker hour offsets from base, offsets whose marker is corrupt,
+        // offsets whose GET the store refuses)
+        let states: [(&[u32], &[u32], &[u32]); 10] = [
+            (&[0], &[], &[]),
+            (&[0, 1, 2, 5, 11, 23], &[], &[]),
+            (&[3, 9, 17], &[9], &[]),
+            (&[2, 7, 30], &[2], &[]),
+            (&[], &[], &[]),
+            (&[], &[], &[4]),
+            (&[10], &[], &[9, 11]),
+            (&[3, 20], &[3], &[2, 4, 19]),
+            (&[0, 6, 12, 18, 24], &[], &[1, 7, 13, 25, 30]),
+            (&[15], &[], &[14, 15, 16]),
         ];
-        for (markers, corrupt) in states {
-            let store = MemoryStore::new();
+        let mut refused = 0usize;
+        let mut found_over_an_older_fault = 0usize;
+        for (markers, corrupt, faulted) in states {
+            let plan = faulted.iter().fold(FaultPlan::empty(), |plan, &offset| {
+                plan.with_rule(
+                    Rule::new(Op::Get, ScriptedFault::Permanent("AccessDenied".into()))
+                        .with_key_contains(marker_key(
+                            &tenant,
+                            Signal::Logs,
+                            b"same",
+                            base + offset,
+                        )),
+                )
+            });
+            let store = FaultStore::new(MemoryStore::new(), plan);
             for &offset in markers {
                 let hour = base + offset;
                 let key = marker_key(&tenant, Signal::Logs, b"same", hour);
@@ -764,15 +790,38 @@ mod tests {
                 for now in base..=base + 40 {
                     let batched = read_marker(&store, &tenant, Signal::Logs, b"same", now, window)
                         .await
-                        .expect("lookup");
+                        .map_err(|err| err.key);
                     let expected = sequential(&store, &tenant, now, window).await;
                     assert_eq!(
                         batched, expected,
-                        "markers {markers:?}, corrupt {corrupt:?}, reader {now}, window {window}"
+                        "markers {markers:?}, corrupt {corrupt:?}, faulted {faulted:?}, \
+                         reader {now}, window {window}"
                     );
+                    let oldest = now.saturating_sub(window);
+                    let found_at = markers
+                        .iter()
+                        .map(|&offset| base + offset)
+                        .filter(|&hour| {
+                            hour >= oldest && hour <= now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS
+                        })
+                        .max();
+                    match (&expected, found_at) {
+                        (Err(_), _) => refused += 1,
+                        (Ok(_), Some(found_at))
+                            if faulted
+                                .iter()
+                                .any(|&offset| (oldest..found_at).contains(&(base + offset))) =>
+                        {
+                            found_over_an_older_fault += 1;
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
+        // Both sides of the decision rule were exercised, not only fault-free states.
+        assert!(refused > 0);
+        assert!(found_over_an_older_fault > 0);
     }
 
     /// A store whose GET records how many GETs are in flight, then yields a
@@ -935,12 +984,14 @@ mod tests {
         assert!(gets.contains(&below));
     }
 
-    /// An error in the first batch fails the lookup even when a newer probe
-    /// of that same batch found a marker: the batch is collected before it is
-    /// decided, so a hit at `now + 1` does not mask a refused GET at `now`.
+    /// An error in the first batch at an hour newer than the batch's marker
+    /// fails the lookup: a refused GET at `now` is not masked by a marker at
+    /// `now - 1`, since the newest-first scan would have stopped at `now`.
     #[tokio::test]
-    async fn a_hit_does_not_mask_an_error_in_the_same_batch() {
-        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    async fn an_error_newer_than_a_hit_in_the_same_batch_fails_the_lookup() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
 
         let tenant = tenant("acme");
         let now = 495_972u32;
@@ -955,17 +1006,52 @@ mod tests {
             &tenant,
             Signal::Logs,
             b"masked",
-            now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS,
-            &receipt(1, "v2:token-ahead"),
+            now - 1,
+            &receipt(1, "v2:token-behind"),
         )
         .await
         .expect("write");
 
         let err = read_marker(&store, &tenant, Signal::Logs, b"masked", now, 24)
             .await
-            .expect_err("an error beside a hit in one batch must fail the lookup");
+            .expect_err("an error newer than a hit must fail the lookup");
 
         assert_eq!(err.key, failing);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+        let gets = store.inner().take_gets();
+        assert_eq!(gets.len(), 2);
+        assert!(gets.contains(&marker_key(&tenant, Signal::Logs, b"masked", now - 1)));
+    }
+
+    /// A marker at `now` wins over a refused GET at `now - 1` in the same
+    /// batch: the newest-first scan stops at the marker and never reaches the
+    /// older hour, so the error there does not turn a replay into a refusal.
+    #[tokio::test]
+    async fn a_newer_hit_wins_over_an_older_error_in_the_same_batch() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let tenant = tenant("acme");
+        let now = 495_972u32;
+        let failing = marker_key(&tenant, Signal::Logs, b"replay", now - 1);
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("AccessDenied".into()))
+                .with_key_contains(failing),
+        );
+        let store = FaultStore::new(SegmentAlignedStore::new(), plan);
+        let stored = receipt(4, "v2:token-now");
+        write_marker(&store, &tenant, Signal::Logs, b"replay", now, &stored)
+            .await
+            .expect("write");
+
+        let looked_up = read_marker(&store, &tenant, Signal::Logs, b"replay", now, 24)
+            .await
+            .expect("an older error must not fail a lookup a newer marker decides");
+
+        assert_eq!(looked_up, LookupOutcome::Hit(stored));
+        // The faulted probe ran: the batch still issued it.
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
         assert_eq!(store.inner().take_gets().len(), 2);
     }
 

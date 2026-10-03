@@ -946,9 +946,15 @@ for each ingest hour of the dedup window, from one hour ahead of the request's
 hour back 24 hours. It first GETs the hour ahead, the request's hour and the
 hour before it together and stops there if any holds a marker (3 GETs, one
 round trip); otherwise it GETs the other 23 hours, at most 8 at a time
-(`IDEM_MARKER_PROBE_CONCURRENCY`). The newest marker found wins, and a miss
-costs 26 GETs. The whole lookup is bounded by the request's `ack_deadline`,
-the same budget the write gets. It does not list the key's `<keyhash32>.` prefix, because
+(`IDEM_MARKER_PROBE_CONCURRENCY`). Each batch is decided the way a sequential
+scan from the newest hour down would decide it: the first marker or store
+error in that order wins, so a marker found at a newer hour than a failed GET
+is replayed, and a failed GET at a newer hour than every marker found fails
+the lookup. A miss costs 26 GETs. The request has one `ack_deadline` budget,
+started before the lookup: the lookup may use all of it, and the write's
+acknowledgement deadline is whatever remains of it when the write starts
+(zero if nothing does, and a strict write then fails with the router's
+retryable ack timeout). It does not list the key's `<keyhash32>.` prefix, because
 the S3 adapter appends `/` to every list prefix and that listing would find
 nothing. A hit replays the stored receipt; a miss, or a corrupt marker,
 proceeds to the normal write, and the marker is written after the commit and

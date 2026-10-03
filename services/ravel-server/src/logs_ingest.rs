@@ -194,9 +194,10 @@ pub(crate) fn marker_lookup_deadline(signal: Signal, deadline: Duration) -> Stri
 }
 
 /// The marker lookup of a keyed write (ADR-0051 section 5), bounded by
-/// `deadline`, the same `ack_deadline` the router write gets. A lookup that
-/// fails or runs past it returns the client-facing refusal message, already
-/// logged and counted; the caller refuses the write with it.
+/// `deadline`, the request's whole `ack_deadline`; the caller gives the router
+/// write only what the lookup leaves of it ([`remaining_budget`]). A lookup
+/// that fails or runs past it returns the client-facing refusal message,
+/// already logged and counted; the caller refuses the write with it.
 pub(crate) async fn lookup_marker_within(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
@@ -218,6 +219,13 @@ pub(crate) async fn lookup_marker_within(
         Ok(Err(err)) => Err(marker_lookup_failure(signal, &err)),
         Err(_elapsed) => Err(marker_lookup_deadline(signal, deadline)),
     }
+}
+
+/// What is left at this instant of a request's `ack_deadline` budget that
+/// ends at `deadline`, zero once it has passed. The router write gets this,
+/// so a keyed request's marker lookup and its write share one budget.
+pub(crate) fn remaining_budget(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
 }
 
 /// Upper bound on the assembled `error_message` byte length, the same cap and
@@ -270,6 +278,9 @@ pub async fn handle_export_logs(
     // One hour-bucket computation, shared by the lookup and the marker write
     // so they cannot drift within a request (see `request_ingest_hour_bucket`).
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
+    // One `ack_deadline` budget per request, started before the lookup: the
+    // router write gets what the lookup leaves of it.
+    let deadline = tokio::time::Instant::now() + state.ack_deadline;
 
     // Replay (ADR-0051 section 5): a keyed retry whose marker is still inside
     // the dedup window skips admission, normalize, and the router write, and
@@ -365,7 +376,7 @@ pub async fn handle_export_logs(
 
     let receipt = state
         .router
-        .write(tenant.clone(), records, mode, state.ack_deadline)
+        .write(tenant.clone(), records, mode, remaining_budget(deadline))
         .await
         .map_err(|err| {
             // A PartialWrite's durable siblings are real, durably committed
@@ -535,7 +546,7 @@ mod tests {
     use crate::logs_ingest::marker_lookup_test_support::{
         FIRST_BATCH_PROBES, LOOKUP_DEADLINE_WARNING, LOOKUP_FAILED_WARNING, LOOKUP_FAILURE_COUNTER,
         LookupFailureWarning, LookupFailureWarnings, PAUSED_CLOCK_SLACK, STORE_ERROR_TEXT,
-        marker_get_refusals, marker_probe_store, put_count,
+        SlowLookupStalledWriteStore, marker_get_refusals, marker_probe_store, put_count,
     };
     use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
@@ -1461,6 +1472,55 @@ mod tests {
         );
     }
 
+    /// Issue #2462: a keyed request's lookup and its router write share one
+    /// `ack_deadline`. A lookup that takes four of the five seconds leaves the
+    /// strict write one second to be acknowledged, so a write whose data PUT
+    /// never answers fails with the router's retryable ack timeout five
+    /// seconds after the request started, not nine. The clock is paused, so
+    /// the elapsed time is the timer's, not the machine's.
+    ///
+    /// Non-vacuity: passing `state.ack_deadline` to `router.write` instead of
+    /// `remaining_budget(deadline)` refuses the write after nine seconds.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_write_gets_only_the_budget_its_lookup_left() {
+        let lookup_takes = Duration::from_secs(4);
+        let store = Arc::new(SlowLookupStalledWriteStore::new(lookup_takes));
+        let state = state_with_store(1, store.clone());
+        assert!(lookup_takes < state.ack_deadline);
+
+        let started = tokio::time::Instant::now();
+        let err = handle_export_logs(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![record("hello", Vec::new())]),
+            BASE_TS_NS,
+            Some(b"idem-2462-budget".to_vec()),
+        )
+        .await
+        .expect_err("a write whose data PUT never answers must time out");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, LogIngestRequestError::Write(LogWriteError::AckTimeout)),
+            "expected the router's ack timeout, got {err:?}"
+        );
+        assert!(err.is_retryable(), "{err:?} must be retryable");
+        // The lookup ran to a miss: every hour of the default window, the
+        // forward skew hour included, was probed once.
+        assert_eq!(
+            store.marker_gets(),
+            u64::from(DEFAULT_IDEM_DEDUP_WINDOW_HOURS) + FIRST_BATCH_PROBES - 1
+        );
+        // hygiene-allow: wall-clock -- `started` is a tokio Instant under a
+        // paused clock, so `elapsed` is the timer's deadline, not the machine's.
+        assert!(
+            elapsed >= state.ack_deadline && elapsed <= state.ack_deadline + PAUSED_CLOCK_SLACK,
+            "refused after {elapsed:?}, one budget is {:?}",
+            state.ack_deadline
+        );
+    }
+
     /// A hanging marker GET does not touch a request without a key: it never
     /// looks a marker up, so it writes as before.
     #[tokio::test]
@@ -1619,6 +1679,102 @@ pub(crate) mod marker_lookup_test_support {
 
     pub(crate) fn marker_get_refusals(store: &FaultStore<MemoryStore>) -> u64 {
         store.fault_count(Op::Get, FaultKind::Permanent)
+    }
+
+    /// A store whose first marker GET answers only after `lookup_delay` on the
+    /// tokio clock, so a keyed write's lookup takes exactly that long, and
+    /// whose PUTs outside `idem/` never answer, so a strict write waits for its
+    /// acknowledgement until its own deadline.
+    pub(crate) struct SlowLookupStalledWriteStore {
+        inner: MemoryStore,
+        lookup_delay: std::time::Duration,
+        marker_gets: std::sync::atomic::AtomicU64,
+    }
+
+    impl SlowLookupStalledWriteStore {
+        pub(crate) fn new(lookup_delay: std::time::Duration) -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                lookup_delay,
+                marker_gets: std::sync::atomic::AtomicU64::new(0),
+            }
+        }
+
+        pub(crate) fn marker_gets(&self) -> u64 {
+            self.marker_gets.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ravel_object_store::ObjectStoreBackend for SlowLookupStalledWriteStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: ravel_object_store::PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            if !key.contains("/idem/") {
+                return std::future::pending().await;
+            }
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            if key.contains("/idem/")
+                && self
+                    .marker_gets
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    == 0
+            {
+                tokio::time::sleep(self.lookup_delay).await;
+            }
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            if !key.contains("/idem/") {
+                return std::future::pending().await;
+            }
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
     }
 
     /// The WARN message `marker_lookup_failure` writes.
