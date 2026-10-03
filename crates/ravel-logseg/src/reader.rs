@@ -736,7 +736,9 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// lists are expected to be equal. When they are not, `wanted` was dealt
     /// from a list this scan does not have, and a row-ref position derived from
     /// it would address the wrong block, so the call refuses with a typed
-    /// [`LogSegError::Corrupted`] instead of keeping the intersection.
+    /// [`LogSegError::Corrupted`] instead of keeping the intersection. A
+    /// `wanted` index that is not among the survivors is refused the same way,
+    /// where [`RlogReader::scan_blocks_subset`] refuses an ordinal past the end.
     pub fn scan_blocks_raw_subset(
         &self,
         content: &Predicate,
@@ -755,6 +757,12 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             )));
         }
         let wanted: std::collections::HashSet<usize> = wanted.iter().copied().collect();
+        let survivors: std::collections::HashSet<usize> = actual.iter().copied().collect();
+        if let Some(stray) = wanted.iter().find(|w| !survivors.contains(w)) {
+            return Err(LogSegError::Corrupted(format!(
+                "raw block subset: block {stray} is not among the surviving blocks"
+            )));
+        }
         scan.blocks
             .retain(|b| wanted.contains(&(b.block_index as usize)));
         scan.next = 0;
@@ -5426,9 +5434,8 @@ mod tests {
         );
     }
 
-    /// `scan_blocks_raw_subset` names whole-object block indices. A wanted
-    /// index pruning removed is absent, not an error, and the drain follows the
-    /// scan's own block order.
+    /// `scan_blocks_raw_subset` names whole-object block indices, and the drain
+    /// follows the scan's own block order.
     ///
     /// Fails against the ordinal reading of `wanted` (`scan_blocks_subset`
     /// positions): with blocks 0 and 1 pruned, positions 0 and 1 are blocks 2
@@ -5452,11 +5459,11 @@ mod tests {
                 &from_block_two,
                 &[],
                 &ColumnSelection::all(),
-                &[0, 1, 6, 5],
+                &[6, 5],
                 &expected_survivors,
             )
             .expect("raw subset");
-        assert_eq!(scan.survivor_block_indices(), expected_survivors);
+        assert_eq!(scan.survivor_block_indices(), vec![5, 6]);
         let mut want = block_ts(5);
         want.extend(block_ts(6));
         assert_eq!(drain_ts(&mut scan, &object), want);
@@ -5466,10 +5473,10 @@ mod tests {
                 &from_block_two,
                 &[],
                 &ColumnSelection::all(),
-                &[0, 1],
+                &[],
                 &expected_survivors,
             )
-            .expect("raw subset of pruned blocks");
+            .expect("an empty share");
         assert_eq!(none.remaining_blocks(), 0);
         assert!(drain_ts(&mut none, &object).is_empty());
     }
@@ -5484,7 +5491,10 @@ mod tests {
     /// blocks) would pass a length check but must still be refused here.
     /// Also fails against a wrong implementation that ignores
     /// `expected_survivors` entirely and just applies `wanted`: that version
-    /// returns `Ok` with the two requested blocks instead of `Err`.
+    /// returns `Ok` with the two requested blocks instead of `Err`. A share
+    /// naming a block the survivor lists do not hold (here block 0, which the
+    /// window prunes) is refused too, where a plain `retain` returns it as
+    /// absent.
     #[test]
     fn a_raw_subset_refuses_on_survivor_mismatch() {
         let (_records, object) = dict_fixture::two_group_object();
@@ -5507,7 +5517,21 @@ mod tests {
             Err(other) => panic!("expected a typed Corrupted error, got {other:?}"),
             Ok(_) => panic!("mismatched survivor list must refuse, not silently subset"),
         }
+
+        let stray = reader.scan_blocks_raw_subset(
+            &from_block_two,
+            &[],
+            &ColumnSelection::all(),
+            &[0, 5],
+            &[2, 3, 4, 5, 6, 7],
+        );
+        match stray {
+            Err(LogSegError::Corrupted(msg)) => assert!(msg.contains("block 0"), "{msg}"),
+            Err(other) => panic!("expected a typed Corrupted error, got {other:?}"),
+            Ok(_) => panic!("a pruned block in the share must refuse, not drop"),
+        }
     }
+
     /// Readers built from one decoded [`SegmentDirectories`] share its STREAM_DIR,
     /// FIELD_DIR and SKIP_IDX by reference rather than copying them, and report
     /// the decoded length of all four sections.
