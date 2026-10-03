@@ -1413,10 +1413,20 @@ impl RlogWriter {
         let mut blk_indexed_ends: Vec<u32> = Vec::new();
         let mut blk_stat: Vec<(u32, ColumnValue)> = Vec::new();
         let mut blk_stat_ends: Vec<u32> = Vec::new();
+        let block_sample = stage0::block_sample_enabled();
 
         for (blk_idx, span) in spans.iter().enumerate() {
             let block_rows = &perm[span.clone()];
             let blk_idx_u32 = blk_idx as u32;
+            // Stage 0d (#2477) sample points: [0]=iteration start, [1]=after
+            // materialize+dirs, [2]=after block value pages, [3]=after encode,
+            // [4]=after postings, [5]=after bloom, [6]=after stats, [7]=after
+            // `blocks.push`. Indices 1..7 double as the transient high-water
+            // candidate set.
+            let mut bsamp: [Option<(i64, u64)>; 8] = [None; 8];
+            if block_sample {
+                bsamp[0] = Some(stage0::sample());
+            }
 
             // Materialize only this block's rows from source: each row's
             // in-budget columnar occurrences (cid-sorted) and its merged-view
@@ -1503,6 +1513,10 @@ impl RlogWriter {
                 .enumerate()
                 .map(|(i, p)| (p.column_id, i))
                 .collect();
+            if block_sample {
+                bsamp[1] = Some(stage0::sample());
+                stage0::record_block_materialize(bsamp[0].unwrap(), bsamp[1].unwrap());
+            }
 
             // Column-major fixed inputs, gathered by the sort permutation.
             let ts_v: Vec<i64> = block_rows.iter().map(|&g| g_ts[g]).collect();
@@ -1588,6 +1602,10 @@ impl RlogWriter {
                     })
                 })
                 .collect();
+            if block_sample {
+                bsamp[2] = Some(stage0::sample());
+                stage0::record_block_vecs(bsamp[1].unwrap(), bsamp[2].unwrap());
+            }
 
             let input = ColumnarBlockInput {
                 n: block_rows.len(),
@@ -1610,6 +1628,10 @@ impl RlogWriter {
                 str_dicts: &str_dicts_v,
             };
             let out = write_block_columnar(&input, self.cfg.zstd_level)?;
+            if block_sample {
+                bsamp[3] = Some(stage0::sample());
+                stage0::record_block_encode(bsamp[2].unwrap(), bsamp[3].unwrap());
+            }
 
             // POSTINGS over each row's merged-view indexed terms, in its own
             // pass ahead of the timed bloom region below and never inside it,
@@ -1638,6 +1660,10 @@ impl RlogWriter {
                         postings_capped.insert(*cid);
                     }
                 }
+            }
+            if block_sample {
+                bsamp[4] = Some(stage0::sample());
+                stage0::record_block_postings(bsamp[3].unwrap(), bsamp[4].unwrap());
             }
 
             // Bloom over body, severity_text, and string columns.
@@ -1695,6 +1721,10 @@ impl RlogWriter {
                     u64::try_from(bloom_start.elapsed().as_nanos()).unwrap_or(u64::MAX);
                 bloom_blocks += 1;
             }
+            if block_sample {
+                bsamp[5] = Some(stage0::sample());
+                stage0::record_block_bloom(bsamp[4].unwrap(), bsamp[5].unwrap());
+            }
 
             for &g in block_rows {
                 min_ts = min_ts.min(g_ts[g]);
@@ -1707,10 +1737,51 @@ impl RlogWriter {
             for cid in &present_cols {
                 *col_blocks.entry(*cid).or_insert(0) += 1;
             }
+            if block_sample {
+                bsamp[6] = Some(stage0::sample());
+                stage0::record_block_dirs_stats(bsamp[5].unwrap(), bsamp[6].unwrap());
+            }
 
             blocks.push(out);
+            if block_sample {
+                bsamp[7] = Some(stage0::sample());
+                stage0::note_block_transient_high_water(
+                    bsamp[0].unwrap(),
+                    &[
+                        bsamp[1].unwrap(),
+                        bsamp[2].unwrap(),
+                        bsamp[3].unwrap(),
+                        bsamp[4].unwrap(),
+                        bsamp[5].unwrap(),
+                        bsamp[6].unwrap(),
+                        bsamp[7].unwrap(),
+                    ],
+                );
+            }
         }
         stage0::fire(stage0_mode, "after_blocks");
+
+        // Stage 0d (#2477) trailing-section sample points, in source-execution
+        // order (not section push order: pushes happen later, grouped by
+        // kind). `tsamp[0]` is this stage's start; each later index closes the
+        // bracket opened by the previous one.
+        let section_sample = stage0::block_sample_enabled();
+        let mut tsamp: [Option<(i64, u64)>; 9] = [None; 9];
+        if section_sample {
+            tsamp[0] = Some(stage0::sample());
+            // Deliverable 2: len/cap of the block-stage structures still
+            // alive at `after_blocks` (bloom input sets, postings
+            // accumulator, directory-input maps, the unflushed block group).
+            let (pending_len, pending_cap) = blocks.pending_len_cap();
+            stage0::note_capacity("blocks.pending", pending_len, pending_cap);
+            stage0::note_capacity("bloom_entries", bloom_entries.len(), bloom_entries.capacity());
+            stage0::note_capacity("bloom_covered", bloom_covered.len(), 0);
+            stage0::note_capacity("postings_terms", postings_terms.len(), 0);
+            stage0::note_capacity("col_present", col_present.len(), col_present.capacity());
+            stage0::note_capacity("col_blocks", col_blocks.len(), col_blocks.capacity());
+            stage0::note_capacity("first_blk", first_blk.len(), first_blk.capacity());
+            stage0::note_capacity("last_blk", last_blk.len(), last_blk.capacity());
+        }
 
         // STREAM_DIR.
         let total_blocks = spans.len() as u32;
@@ -1731,6 +1802,10 @@ impl RlogWriter {
             })
             .collect();
         let stream_dir = StreamDir::new(stream_entries);
+        if section_sample {
+            tsamp[1] = Some(stage0::sample());
+            stage0::record_section_stream_dir_build(tsamp[0].unwrap(), tsamp[1].unwrap());
+        }
 
         // FIELD_DIR.
         let field_entries: Vec<FieldEntry> = columns
@@ -1748,9 +1823,17 @@ impl RlogWriter {
             })
             .collect();
         let field_dir = FieldDir::new(field_entries);
+        if section_sample {
+            tsamp[2] = Some(stage0::sample());
+            stage0::record_section_field_dir_build(tsamp[1].unwrap(), tsamp[2].unwrap());
+        }
 
         let (blocks_bytes, l0, page_dir) = blocks.finish_checked()?;
         let skip = SkipIndex::build(l0);
+        if section_sample {
+            tsamp[3] = Some(stage0::sample());
+            stage0::record_section_blocks_skip_build(tsamp[2].unwrap(), tsamp[3].unwrap());
+        }
 
         let postings_capped_fields = postings_capped.len() as u32;
         let mut postings_fields: BTreeMap<u32, FieldTerms> = BTreeMap::new();
@@ -1769,6 +1852,10 @@ impl RlogWriter {
                 postings_fields.insert(cid, FieldTerms::Terms(map));
             }
         }
+        if section_sample {
+            tsamp[4] = Some(stage0::sample());
+            stage0::record_section_postings_fields_build(tsamp[3].unwrap(), tsamp[4].unwrap());
+        }
 
         // Assemble sections in kind order.
         let mut object = Vec::new();
@@ -1779,6 +1866,10 @@ impl RlogWriter {
             kind::STREAM_DIR,
             &compress(&stream_dir.encode(), self.cfg.zstd_level)?,
         );
+        if section_sample {
+            tsamp[5] = Some(stage0::sample());
+            stage0::record_section_stream_dir_encode(tsamp[4].unwrap(), tsamp[5].unwrap());
+        }
         push_section(
             &mut object,
             &mut sections,
@@ -1806,12 +1897,20 @@ impl RlogWriter {
             kind::PAGE_DIR,
             &compress(&page_dir.encode(), self.cfg.zstd_level)?,
         );
+        if section_sample {
+            tsamp[6] = Some(stage0::sample());
+            stage0::record_section_remaining_dirs_encode(tsamp[5].unwrap(), tsamp[6].unwrap());
+        }
         push_section(
             &mut object,
             &mut sections,
             kind::BLOOM,
             &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
         );
+        if section_sample {
+            tsamp[7] = Some(stage0::sample());
+            stage0::record_section_bloom_encode(tsamp[6].unwrap(), tsamp[7].unwrap());
+        }
         let mut postings_bytes_len: u64 = 0;
         if !indexed_column_ids.is_empty() {
             let postings_bytes = encode_postings_section(
@@ -1826,6 +1925,15 @@ impl RlogWriter {
                 kind::POSTINGS,
                 &Stored::raw(postings_bytes),
             );
+        }
+        if section_sample {
+            tsamp[8] = Some(stage0::sample());
+            stage0::record_section_postings_encode(tsamp[7].unwrap(), tsamp[8].unwrap());
+            // Deliverable 2: len/cap of the structures alive at the end of
+            // the trailing sections (before the footer is appended).
+            stage0::note_capacity("object", object.len(), object.capacity());
+            stage0::note_capacity("sections", sections.len(), sections.capacity());
+            stage0::note_capacity("postings_fields", postings_fields.len(), 0);
         }
         stage0::fire(stage0_mode, "after_sections");
 
@@ -3147,6 +3255,13 @@ impl BlocksBuilder {
         BlocksBuilder::new(Layout::with_group(group_target_blocks))
     }
 
+    /// Stage 0d (#2477): len/capacity of the not-yet-flushed group buffer, for
+    /// `stage0::note_capacity` call sites outside this module. Not otherwise
+    /// needed by callers, since `pending` is drained by `push`/`finish_checked`.
+    pub fn pending_len_cap(&self) -> (usize, usize) {
+        (self.pending.len(), self.pending.capacity())
+    }
+
     fn new(layout: Layout) -> Self {
         BlocksBuilder {
             layout,
@@ -3163,15 +3278,30 @@ impl BlocksBuilder {
     /// Adds one encoded block. The block is buffered and placed when its row
     /// group fills.
     pub fn push(&mut self, mut out: BlockWriteOut) {
+        // Stage 0d (#2477): `intern` (the row-group dictionary builder) and a
+        // periodic `flush_group` (the group's encoded bytes, net of the
+        // dictionary-builder state `flush_group` itself drops via
+        // `mem::take`) are bracketed separately so the two pre-registered
+        // buckets stay distinguishable; see stage0::BLOCK_DICT_BUILDER_BYTES
+        // and stage0::BLOCK_ASSEMBLY_ENCODED_BYTES.
+        let block_sample = stage0::block_sample_enabled();
+        let dict_before = block_sample.then(stage0::sample);
         let block = self.pending.len();
         for values in std::mem::take(&mut out.str_values) {
             if let Err(e) = self.intern(block, values) {
                 self.fault.get_or_insert(e);
             }
         }
+        if let Some(before) = dict_before {
+            stage0::record_block_dict_builder(before, stage0::sample());
+        }
         self.pending.push(out);
         if self.pending.len() >= self.layout.group_target_blocks.max(1) {
+            let flush_before = block_sample.then(stage0::sample);
             self.flush_group();
+            if let Some(before) = flush_before {
+                stage0::record_block_assembly_encoded(before, stage0::sample());
+            }
         }
     }
 
@@ -3462,7 +3592,15 @@ impl BlocksBuilder {
     /// [`BlocksBuilder::finish`], or the first internal inconsistency the
     /// row-group dictionary decision met, as `Corrupted`.
     pub fn finish_checked(mut self) -> Result<(Vec<u8>, Vec<Level0Entry>, PageDir), LogSegError> {
+        // Stage 0d (#2477): this remainder flush lands in the trailing
+        // sections stage, not the block loop, since it runs after
+        // `after_blocks` fires; see stage0::SECTION_FINAL_FLUSH_BYTES.
+        let block_sample = stage0::block_sample_enabled();
+        let before = block_sample.then(stage0::sample);
         self.flush_group();
+        if let Some(before) = before {
+            stage0::record_section_final_flush(before, stage0::sample());
+        }
         match self.fault {
             Some(e) => Err(e),
             None => Ok((self.bytes, self.l0, self.dir)),
@@ -6081,7 +6219,7 @@ mod row_order_tests {
 /// Stage 0 measurement scaffolding (issue #2426, #2428, #2469); never merged.
 #[doc(hidden)]
 pub mod stage0 {
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
     use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering::Relaxed};
     pub static MODE: AtomicU8 = AtomicU8::new(0);
     pub static BUILD_NS: AtomicU64 = AtomicU64::new(0);
@@ -6253,5 +6391,283 @@ pub mod stage0 {
         ROW_ORDER_ALLOCS.store(0, Relaxed);
         ROW_SETUP_BYTES.store(0, Relaxed);
         ROW_SETUP_ALLOCS.store(0, Relaxed);
+    }
+
+    /// Stage 0d block-stage memory sampling (issue #2477): gates a second,
+    /// independent set of buckets around `build_object_columnar`'s block
+    /// loop and trailing sections, reusing `STATS_SAMPLER` above. Same
+    /// before/after `record_*` pattern as the row buckets.
+    pub static BLOCK_SAMPLE: AtomicBool = AtomicBool::new(false);
+
+    pub fn block_sample_enabled() -> bool {
+        BLOCK_SAMPLE.load(Relaxed)
+    }
+
+    // --- Block loop (between `after_resolve_rows` and `after_blocks`) ---
+
+    /// Per-row materialized columnar occurrences (`blk_cols`), the per-row
+    /// stamp output, and this block's present-column/plan bookkeeping
+    /// (`col_present`, `col_blocks` growth, `plan_pos`): all touched in the
+    /// same per-row pass and not separable without restructuring, so they
+    /// share one bucket.
+    pub static BLOCK_MATERIALIZE_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_MATERIALIZE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// The block's column-major value pages (`ts_v` through `raw_vals_v`,
+    /// `values_v`, `stat_v`, `str_dict_ids_v`, `str_dicts_v`): declared with
+    /// `let` inside the loop body, dropped when the iteration ends.
+    pub static BLOCK_VECS_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_VECS_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `write_block_columnar`'s output (`BlockWriteOut`): the block's
+    /// compressed pages, held until `BlocksBuilder::push` consumes it.
+    pub static BLOCK_ENCODE_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_ENCODE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `postings_terms`/`postings_capped` growth from this block's indexed
+    /// terms.
+    pub static BLOCK_POSTINGS_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_POSTINGS_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// The per-block `BloomBuilder` (re-exported from `ravel_codec`, out of
+    /// this crate's scope to instrument further) plus `bloom_entries.push`.
+    pub static BLOCK_BLOOM_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_BLOOM_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `first_blk`/`last_blk`/`col_blocks` growth after the block is placed.
+    pub static BLOCK_DIRS_STATS_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_DIRS_STATS_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `BlocksBuilder::push`'s row-group dictionary interning (`intern`),
+    /// summed over every push in the block loop. A detail of the
+    /// `BLOCK_ASSEMBLY` outer bracket (`BLOCK_DIRS_STATS` end to the next
+    /// iteration start); excludes the final remainder flush in
+    /// `finish_checked`, counted under `SECTION_FINAL_FLUSH_BYTES` instead.
+    pub static BLOCK_DICT_BUILDER_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_DICT_BUILDER_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `BlocksBuilder::flush_group`'s own growth when a full row group
+    /// flushes during the block loop: a NET figure, since `flush_group`
+    /// also drops (via `mem::take`) the row-group dictionary interner state
+    /// that `BLOCK_DICT_BUILDER_BYTES` counted growing over the preceding
+    /// pushes, so this bucket can be small or negative even when real
+    /// encoded bytes were added. The other detail of `BLOCK_ASSEMBLY`;
+    /// excludes the final remainder flush (see `BLOCK_DICT_BUILDER_BYTES`).
+    pub static BLOCK_ASSEMBLY_ENCODED_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_ASSEMBLY_ENCODED_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// The largest live-bytes value seen at any sample point inside one
+    /// block iteration, minus the value at that iteration's start, as a
+    /// running max over every iteration: the per-block transient high-water
+    /// that label samples alone cannot see.
+    pub static BLOCK_TRANSIENT_HIGH_WATER: AtomicI64 = AtomicI64::new(0);
+
+    pub fn record_block_materialize(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_MATERIALIZE_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_MATERIALIZE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_block_vecs(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_VECS_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_VECS_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_block_encode(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_ENCODE_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_ENCODE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_block_postings(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_POSTINGS_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_POSTINGS_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_block_bloom(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_BLOOM_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_BLOOM_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_block_dirs_stats(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_DIRS_STATS_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_DIRS_STATS_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_block_dict_builder(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_DICT_BUILDER_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_DICT_BUILDER_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_block_assembly_encoded(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_ASSEMBLY_ENCODED_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_ASSEMBLY_ENCODED_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    /// `start` is the iteration's own first sample; `samples` is every later
+    /// sample taken inside that same iteration.
+    pub fn note_block_transient_high_water(start: (i64, u64), samples: &[(i64, u64)]) {
+        let Some(peak) = samples.iter().map(|s| s.0).max() else {
+            return;
+        };
+        BLOCK_TRANSIENT_HIGH_WATER.fetch_max(peak - start.0, Relaxed);
+    }
+
+    // --- Trailing sections (between `after_blocks` and `after_sections`) ---
+
+    /// `stream_entries`/`StreamDir::new` construction (each stream's
+    /// attribute blob cloned via `blob.to_vec()`), before `encode`.
+    pub static SECTION_STREAM_DIR_BUILD_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_STREAM_DIR_BUILD_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `field_entries`/`FieldDir::new` construction, before `encode`.
+    pub static SECTION_FIELD_DIR_BUILD_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_FIELD_DIR_BUILD_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `blocks.finish_checked()` (the final, possibly-partial row-group
+    /// flush) plus `SkipIndex::build(l0)`. Detail: `SECTION_FINAL_FLUSH_BYTES`
+    /// isolates the `finish_checked` portion alone.
+    pub static SECTION_BLOCKS_SKIP_BUILD_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_BLOCKS_SKIP_BUILD_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `BlocksBuilder::finish_checked`'s own flush, a subset of
+    /// `SECTION_BLOCKS_SKIP_BUILD_BYTES` (which also includes
+    /// `SkipIndex::build`'s own small allocation).
+    pub static SECTION_FINAL_FLUSH_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_FINAL_FLUSH_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// `postings_fields` assembled from `postings_terms`/`postings_capped`:
+    /// mostly a move of already-allocated maps into a new `BTreeMap`.
+    pub static SECTION_POSTINGS_FIELDS_BUILD_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_POSTINGS_FIELDS_BUILD_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// STREAM_DIR section: `stream_dir.encode()` plus `compress` plus
+    /// `push_section`'s copy into `object`.
+    pub static SECTION_STREAM_DIR_ENCODE_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_STREAM_DIR_ENCODE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// FIELD_DIR, BLOCKS, SKIP_IDX, and PAGE_DIR sections combined (encode,
+    /// compress, and `push_section`'s copy for each): none of these are
+    /// expected to scale with stream count, so they are bundled rather than
+    /// split four ways.
+    pub static SECTION_REMAINING_DIRS_ENCODE_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_REMAINING_DIRS_ENCODE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// BLOOM section: `encode_rlog_bloom_section` plus `push_section`.
+    pub static SECTION_BLOOM_ENCODE_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_BLOOM_ENCODE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// POSTINGS section: `encode_postings_section` plus `push_section` (or
+    /// nothing, when `indexed_column_ids` is empty).
+    pub static SECTION_POSTINGS_ENCODE_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static SECTION_POSTINGS_ENCODE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn record_section_stream_dir_build(before: (i64, u64), after: (i64, u64)) {
+        SECTION_STREAM_DIR_BUILD_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_STREAM_DIR_BUILD_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_section_field_dir_build(before: (i64, u64), after: (i64, u64)) {
+        SECTION_FIELD_DIR_BUILD_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_FIELD_DIR_BUILD_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_section_blocks_skip_build(before: (i64, u64), after: (i64, u64)) {
+        SECTION_BLOCKS_SKIP_BUILD_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_BLOCKS_SKIP_BUILD_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_section_final_flush(before: (i64, u64), after: (i64, u64)) {
+        SECTION_FINAL_FLUSH_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_FINAL_FLUSH_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_section_postings_fields_build(before: (i64, u64), after: (i64, u64)) {
+        SECTION_POSTINGS_FIELDS_BUILD_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_POSTINGS_FIELDS_BUILD_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_section_stream_dir_encode(before: (i64, u64), after: (i64, u64)) {
+        SECTION_STREAM_DIR_ENCODE_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_STREAM_DIR_ENCODE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_section_remaining_dirs_encode(before: (i64, u64), after: (i64, u64)) {
+        SECTION_REMAINING_DIRS_ENCODE_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_REMAINING_DIRS_ENCODE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_section_bloom_encode(before: (i64, u64), after: (i64, u64)) {
+        SECTION_BLOOM_ENCODE_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_BLOOM_ENCODE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_section_postings_encode(before: (i64, u64), after: (i64, u64)) {
+        SECTION_POSTINGS_ENCODE_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        SECTION_POSTINGS_ENCODE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    /// Zeroes every block/section-sample accumulator; called before each
+    /// sampled encode so results never carry over from a prior one.
+    pub fn reset_block_samples() {
+        BLOCK_MATERIALIZE_BYTES.store(0, Relaxed);
+        BLOCK_MATERIALIZE_ALLOCS.store(0, Relaxed);
+        BLOCK_VECS_BYTES.store(0, Relaxed);
+        BLOCK_VECS_ALLOCS.store(0, Relaxed);
+        BLOCK_ENCODE_BYTES.store(0, Relaxed);
+        BLOCK_ENCODE_ALLOCS.store(0, Relaxed);
+        BLOCK_POSTINGS_BYTES.store(0, Relaxed);
+        BLOCK_POSTINGS_ALLOCS.store(0, Relaxed);
+        BLOCK_BLOOM_BYTES.store(0, Relaxed);
+        BLOCK_BLOOM_ALLOCS.store(0, Relaxed);
+        BLOCK_DIRS_STATS_BYTES.store(0, Relaxed);
+        BLOCK_DIRS_STATS_ALLOCS.store(0, Relaxed);
+        BLOCK_DICT_BUILDER_BYTES.store(0, Relaxed);
+        BLOCK_DICT_BUILDER_ALLOCS.store(0, Relaxed);
+        BLOCK_ASSEMBLY_ENCODED_BYTES.store(0, Relaxed);
+        BLOCK_ASSEMBLY_ENCODED_ALLOCS.store(0, Relaxed);
+        BLOCK_TRANSIENT_HIGH_WATER.store(0, Relaxed);
+        SECTION_STREAM_DIR_BUILD_BYTES.store(0, Relaxed);
+        SECTION_STREAM_DIR_BUILD_ALLOCS.store(0, Relaxed);
+        SECTION_FIELD_DIR_BUILD_BYTES.store(0, Relaxed);
+        SECTION_FIELD_DIR_BUILD_ALLOCS.store(0, Relaxed);
+        SECTION_BLOCKS_SKIP_BUILD_BYTES.store(0, Relaxed);
+        SECTION_BLOCKS_SKIP_BUILD_ALLOCS.store(0, Relaxed);
+        SECTION_FINAL_FLUSH_BYTES.store(0, Relaxed);
+        SECTION_FINAL_FLUSH_ALLOCS.store(0, Relaxed);
+        SECTION_POSTINGS_FIELDS_BUILD_BYTES.store(0, Relaxed);
+        SECTION_POSTINGS_FIELDS_BUILD_ALLOCS.store(0, Relaxed);
+        SECTION_STREAM_DIR_ENCODE_BYTES.store(0, Relaxed);
+        SECTION_STREAM_DIR_ENCODE_ALLOCS.store(0, Relaxed);
+        SECTION_REMAINING_DIRS_ENCODE_BYTES.store(0, Relaxed);
+        SECTION_REMAINING_DIRS_ENCODE_ALLOCS.store(0, Relaxed);
+        SECTION_BLOOM_ENCODE_BYTES.store(0, Relaxed);
+        SECTION_BLOOM_ENCODE_ALLOCS.store(0, Relaxed);
+        SECTION_POSTINGS_ENCODE_BYTES.store(0, Relaxed);
+        SECTION_POSTINGS_ENCODE_ALLOCS.store(0, Relaxed);
+        CAPACITY_NOTES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Stage 0d (#2477) len/capacity notes for structures on deliverable 1's
+    /// list that are a `Vec`, `String`, or map: byte-delta sampling alone
+    /// cannot show over-allocation. `cap` is 0 for a map (no capacity
+    /// concept); a caller distinguishes "map, len only" from "Vec/String,
+    /// len and cap" by the name it registered.
+    #[allow(clippy::type_complexity)]
+    pub static CAPACITY_NOTES: Mutex<Vec<(&'static str, usize, usize)>> = Mutex::new(Vec::new());
+
+    /// Records one structure's len/capacity, gated the same as the block/
+    /// section byte buckets so an unsampled run pays nothing but the gate
+    /// check.
+    pub fn note_capacity(name: &'static str, len: usize, cap: usize) {
+        if block_sample_enabled() {
+            CAPACITY_NOTES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((name, len, cap));
+        }
+    }
+
+    /// Drains the notes recorded since the last reset or take.
+    pub fn take_capacity_notes() -> Vec<(&'static str, usize, usize)> {
+        std::mem::take(&mut *CAPACITY_NOTES.lock().unwrap_or_else(|e| e.into_inner()))
     }
 }
