@@ -227,9 +227,12 @@ pub enum LogsFetchPolicyArg {
     /// more bytes than a request costs. The setting for an egress-billed or
     /// network-constrained deployment.
     ByteMinimal,
-    /// Derive the request cost from the active store cost profile. At the
-    /// reference (intra-region) profile this resolves to request-minimal
-    /// behaviour; at egress prices it resolves to a small byte cost.
+    /// Derive the request cost from the active store cost profile: the larger
+    /// of its price term and its time term. At the reference (intra-region)
+    /// profile the rate is the time term, 6.3 MB per request, so a narrow
+    /// projection of an object above the projection break-even (five request
+    /// costs, 31.5 MB) reads ranged and an object at or below it reads whole;
+    /// at egress prices it resolves to a small byte cost.
     #[default]
     CostBased,
     /// Resolves the byte quantities exactly as `byte-minimal` does (issue
@@ -1364,8 +1367,13 @@ pub struct Cli {
     /// cost-preferring shape where transfer is free and the bill is requests);
     /// `byte-minimal` is ADR-0904's behaviour, ranged reads wherever they save
     /// more bytes than a request costs; `cost-based` derives the rate from
-    /// `--store-cost-profile`, which at the reference intra-region profile
-    /// means request-minimal behaviour; `latency-first` (issue #1196) resolves
+    /// `--store-cost-profile` as the larger of its price term and its time
+    /// term (request latency times per-connection throughput), which at the
+    /// reference intra-region profile is the time term, 6.3 MB per request:
+    /// a narrow projection of an object above the projection break-even
+    /// (the larger of the routing threshold and five request costs, 31.5 MB
+    /// by default) reads ranged, and an object at or below it reads whole;
+    /// `latency-first` (issue #1196) resolves
     /// the byte quantities exactly as `byte-minimal` does. Read at startup
     /// only: the running engine never changes its own policy, so the stamped
     /// effective policy describes the whole process lifetime.
@@ -1401,18 +1409,24 @@ pub struct Cli {
 
     /// Path to a TOML `StoreCostProfile` (ADR-0996 decision 1): this
     /// deployment's object-store prices, in integer nanodollars per request
-    /// class and per GiB. Omitted, the reference profile
-    /// (`s3-intra-region-2026`: PUT-class $5.00/M, GET-class $0.40/M, transfer
-    /// and retrieval free) is used.
+    /// class and per GiB, and optionally its measured request latency and
+    /// per-connection throughput (both or neither). Omitted, the reference
+    /// profile (`s3-intra-region-2026`: PUT-class $5.00/M, GET-class $0.40/M,
+    /// transfer and retrieval free, 70 ms per request at 90 MB/s per
+    /// connection) is used.
     ///
     /// The only consumer at startup is `--logs-fetch-policy cost-based`, which
-    /// derives the byte-denominated request cost from the profile's ratio; no
-    /// price ever reaches the fetch layer (ADR-0904's layering, preserved). A
-    /// file that is unreadable, is not valid TOML, carries an unknown key, or
-    /// names no profile fails startup with the typed error rather than falling
-    /// back to the reference profile: a silent fallback would make every
-    /// figure the deployment reports irreconcilable with the prices its
-    /// operator believes are in force.
+    /// derives the byte-denominated request cost as the larger of the price
+    /// term and the time term (latency times throughput: 6.3 MB on the
+    /// reference profile), so a narrow projection of an object above the
+    /// projection break-even (the larger of the routing threshold and five
+    /// request costs) reads ranged and an object at or below it reads whole;
+    /// no price ever reaches the fetch layer (ADR-0904's layering, preserved).
+    /// A file that is unreadable, is not valid TOML, carries an unknown key,
+    /// sets one timing without the other, or names no profile fails startup
+    /// with the typed error rather than falling back to the reference profile:
+    /// a silent fallback would make every figure the deployment reports
+    /// irreconcilable with the prices its operator believes are in force.
     #[arg(long = "store-cost-profile", value_name = "PATH")]
     pub store_cost_profile: Option<PathBuf>,
 
@@ -2666,7 +2680,9 @@ impl QueryBudgets {
                 Some(_) => REQUEST_COST_SOURCE_EXPLICIT_FLAG,
                 None => REQUEST_COST_SOURCE_POLICY,
             },
+            rate_term: resolved.rate_term_label(self.logs_request_cost_bytes.is_some()),
             block_range_threshold: resolved.block_range_threshold,
+            projection_break_even_bytes: resolved.projection_break_even_bytes,
             overridden_block_range_threshold: resolved.overridden_block_range_threshold,
             saturated_profile: resolved.saturated_profile,
             max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
@@ -2712,6 +2728,7 @@ impl QueryBudgets {
             max_segments: self.max_segments,
             logs_block_range_threshold: resolved.block_range_threshold,
             logs_request_cost_bytes: resolved.request_cost_bytes,
+            logs_projection_break_even_bytes: resolved.projection_break_even_bytes,
             logs_fetch_policy: self.logs_fetch_policy,
             logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
             ..base
@@ -2763,8 +2780,18 @@ pub struct LogsFetchStamp {
     /// from the policy: [`REQUEST_COST_SOURCE_EXPLICIT_FLAG`] or
     /// [`REQUEST_COST_SOURCE_POLICY`].
     pub request_cost_source: &'static str,
+    /// Which term produced [`Self::request_cost_bytes`]
+    /// (`ravel_query::ResolvedLogsFetch::rate_term_label`): `price`, `time` or
+    /// `saturated` for a cost-based derivation (ADR-2414 decision A3), `flag`
+    /// when the explicit byte flag set it, `none` when the policy set it
+    /// without a derivation.
+    pub rate_term: &'static str,
     /// The resolved logs routing threshold.
     pub block_range_threshold: u64,
+    /// The projection break-even in force (ADR-2414 decision A3): `Some` only
+    /// under `cost-based` with a finite rate. `None` means the routing
+    /// threshold serves as the break-even, and [`Self::emit`] prints it as 0.
+    pub projection_break_even_bytes: Option<u64>,
     /// The operator's `--logs-block-range-threshold` when the resolution
     /// overrode it (a saturated rate routes every object whole-object
     /// regardless of the flag), for the override log line. `None` when the flag
@@ -2821,7 +2848,9 @@ impl LogsFetchStamp {
             profile = %self.profile,
             request_cost_bytes = self.request_cost_bytes,
             request_cost_source = self.request_cost_source,
+            rate_term = self.rate_term,
             block_range_threshold = self.block_range_threshold,
+            projection_break_even_bytes = self.projection_break_even_bytes.unwrap_or(0),
             max_fetch_run_bytes = self.max_fetch_run_bytes,
             saturated_profile = self.saturated_profile.as_deref().unwrap_or(""),
             "logs fetch policy resolved"
@@ -9866,17 +9895,19 @@ mod tests {
         // Everything the derivation does NOT govern must still be untouched.
         // The two logs fetch quantities are the exception ADR-0996 decision 2
         // ships: `cost-based` is the default policy, and at the reference
-        // profile (transfer and retrieval free) it resolves to request-minimal
-        // behaviour. That is the ADR's argued default, not an accident, so it
-        // is pinned to the exact resolved values here.
+        // profile it resolves the time term's request cost with the routing
+        // threshold at its compiled-in value and a five-request-cost
+        // break-even (ADR-2414 decision A3). That is the ADR's argued default,
+        // not an accident, so it is pinned to the exact resolved values here.
         let engine = budgets
             .apply_to_engine(EngineConfig::default())
             .expect("the default configuration resolves");
         assert_eq!(
             engine,
             EngineConfig {
-                logs_request_cost_bytes: u64::MAX,
-                logs_block_range_threshold: u64::MAX,
+                logs_request_cost_bytes: 6_300_000,
+                logs_block_range_threshold: 524_288,
+                logs_projection_break_even_bytes: Some(31_500_000),
                 fetch_concurrency: REFERENCE_FETCH_CONCURRENCY,
                 max_segments: DERIVED_MAX_SEGMENTS,
                 // ADR-1195: `apply_to_engine` always sets the three unbundled
@@ -11667,11 +11698,15 @@ mod tests {
         );
 
         // cost-based at the reference profile (the shipped default, with no
-        // flags at all) resolves to the same two quantities.
+        // flags at all) resolves the time term (ADR-2414 decision A3): a
+        // finite rate, the routing threshold at its compiled-in value, and
+        // the break-even handed to the engine config the fetcher is built
+        // from.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         let engine = engine_from(&cli);
-        assert_eq!(engine.logs_request_cost_bytes, u64::MAX);
-        assert_eq!(engine.logs_block_range_threshold, u64::MAX);
+        assert_eq!(engine.logs_request_cost_bytes, 6_300_000);
+        assert_eq!(engine.logs_block_range_threshold, 524_288);
+        assert_eq!(engine.logs_projection_break_even_bytes, Some(31_500_000));
         assert_eq!(
             engine.logs_fetch_policy,
             ravel_query::LogsFetchPolicy::CostBased,
@@ -11702,6 +11737,7 @@ mod tests {
         let engine = engine_from(&cli);
         assert_eq!(engine.logs_request_cost_bytes, 1_887_437);
         assert_eq!(engine.logs_block_range_threshold, 524_288);
+        assert_eq!(engine.logs_projection_break_even_bytes, None);
         assert_eq!(
             engine.logs_fetch_policy,
             ravel_query::LogsFetchPolicy::LatencyFirst
@@ -11892,13 +11928,54 @@ mod tests {
         // the policy rather than to a flag nobody passed.
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         let stamp = stamp_from(&cli);
-        assert_eq!(stamp.request_cost_bytes, u64::MAX);
+        assert_eq!(stamp.request_cost_bytes, 6_300_000);
         assert_eq!(stamp.request_cost_source, REQUEST_COST_SOURCE_POLICY);
+        assert_eq!(stamp.rate_term, "time");
         assert_eq!(
-            stamp.saturated_profile.as_deref(),
-            Some("s3-intra-region-2026"),
-            "the saturated-override log names the profile that saturated the rate"
+            stamp.saturated_profile, None,
+            "the reference profile's time term is finite, so nothing saturates"
         );
+    }
+
+    /// ADR-2414 decision A3 reachability: with no fetch flags the stamp the
+    /// operator reads names the time term and the break-even, and the
+    /// engine config the server builds carries that same break-even, which
+    /// is what `build_sql_state` hands the logs fetcher. Under
+    /// `byte-minimal` there is no break-even and the stamp prints 0.
+    ///
+    /// Prove-the-test: drop `logs_projection_break_even_bytes` from
+    /// `apply_to_engine` (leaving `..base`'s `None`) and the engine assertion
+    /// reads `None` against `Some(31500000)`; drop the cost-based-only
+    /// condition from `resolve_logs_fetch` and the byte-minimal stamp reads
+    /// `Some(9437185)` against `None`.
+    #[test]
+    fn the_default_stamp_carries_the_time_term_and_the_break_even() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.policy, "cost-based");
+        assert_eq!(stamp.rate_term, "time");
+        assert_eq!(stamp.request_cost_bytes, 6_300_000);
+        assert_eq!(stamp.block_range_threshold, 524_288);
+        assert_eq!(stamp.projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(stamp.overridden_block_range_threshold, None);
+        assert_eq!(stamp.saturated_profile, None);
+        assert_eq!(
+            engine_from(&cli).logs_projection_break_even_bytes,
+            Some(31_500_000),
+            "the break-even reaches the engine config the fetcher is built from"
+        );
+
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "byte-minimal"])
+            .expect("flag parses");
+        let stamp = stamp_from(&cli);
+        assert_eq!(stamp.rate_term, "none");
+        assert_eq!(stamp.request_cost_bytes, 1_887_437);
+        assert_eq!(stamp.projection_break_even_bytes, None);
+        assert_eq!(engine_from(&cli).logs_projection_break_even_bytes, None);
+
+        let cli = Cli::try_parse_from(["ravel-server", "--logs-request-cost-bytes", "123456"])
+            .expect("flag parses");
+        assert_eq!(stamp_from(&cli).rate_term, "flag");
     }
 
     /// ADR-2023 decision 1: `--logs-fetch-policy` unset resolves `cost-based`
