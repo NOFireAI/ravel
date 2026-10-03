@@ -51,11 +51,12 @@ use crate::reconcile::{
     RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY, STORE_QUALIFIED_FAILED_REASON,
     STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON, STORE_QUALIFIED_SUCCEEDED_REASON,
     STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
-    audit_token_key_missing, desired_objects, desired_qualify_job, grpcroute_api_resource,
-    httproute_api_resource, plan_qualify_gate, possible_gateway_route_names,
-    possible_ingest_ingress_names, possible_network_policy_names,
-    possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
-    qualify_job_input_hash, qualify_job_phase, s3_allow_http,
+    audit_token_key_missing, deployment_rollout_complete, desired_objects, desired_qualify_job,
+    distributed_query_secret_refs, grpcroute_api_resource, httproute_api_resource,
+    plan_qualify_gate, possible_gateway_route_names, possible_ingest_ingress_names,
+    possible_network_policy_names, possible_pod_disruption_budget_names,
+    possible_router_object_names, qualification_decision, qualify_job_input_hash,
+    qualify_job_phase, query_network_policy_during_rollout, s3_allow_http,
 };
 
 /// Server-side-apply field manager name.
@@ -298,6 +299,24 @@ async fn secret_resource_version(
         .await
         .map_err(|err| secret_error(err, name, namespace, field))?;
     Ok(secret.resource_version())
+}
+
+/// Read the `resourceVersion` of each distributed-query Secret the query pods
+/// mount, in [`distributed_query_secret_refs`] order, for the query tier's
+/// pod-template checksum. Empty when distributed query does not render. A
+/// missing Secret surfaces as [`Error::SecretNotFound`], as the deployment key
+/// does.
+async fn resolve_distributed_query_resource_versions(
+    client: &Client,
+    namespace: &str,
+    spec: &RavelClusterSpec,
+) -> Result<Vec<String>, Error> {
+    let mut versions = Vec::new();
+    for (name, field) in distributed_query_secret_refs(spec) {
+        let rv = secret_resource_version(client, namespace, name, field).await?;
+        versions.push(rv.unwrap_or_default());
+    }
+    Ok(versions)
 }
 
 /// Read the `resourceVersion` of every credential Secret the spec references,
@@ -1146,35 +1165,51 @@ where
 /// Converge the fragment-port NetworkPolicy around the Deployment applies.
 ///
 /// A rendered `policy` is applied before `apply_deployments` runs, so a query
-/// pod never opens the fragment port without the policy covering it. Every
-/// other name in `possible_names` is deleted only after `apply_deployments`
-/// reports that it applied the query Deployment, so a pass that holds the
-/// query apply back (a missing audit-token key, or the bootstrap order
-/// waiting on maintain) keeps the policy. The apply does not wait for the
-/// rollout: pods of the old ReplicaSet can still listen on the port for the
-/// rest of the rolling update after the delete, guarded then only by the
-/// fragment listener's mutual TLS. The callbacks are injected so tests can
-/// record the order.
+/// pod never opens the fragment port without the policy covering it. Until
+/// the query Deployment's rollout completes, that apply holds the policy
+/// widened to every port the pods of `live_query` (the query Deployment as
+/// read before this pass's apply) can still listen on
+/// ([`query_network_policy_during_rollout`]).
+///
+/// The exact `policy` replaces the widened one, and every other name in
+/// `possible_names` is deleted, only once `apply_deployments` returns the
+/// applied query Deployment with no pods left on an older spec
+/// ([`deployment_rollout_complete`]). A pass that holds the query apply back
+/// (a missing audit-token key, or the bootstrap order waiting on maintain),
+/// or that finds the rollout still in progress, keeps the policy as it is;
+/// the owned-Deployment watch re-runs the reconcile as the rollout's status
+/// moves. The callbacks are injected so tests can record the order.
 async fn converge_query_network_policy<A, AF, D, DF>(
     policy: Option<NetworkPolicy>,
+    live_query: Option<Deployment>,
     possible_names: Vec<String>,
-    apply_policy: A,
+    mut apply_policy: A,
     mut delete_policy: D,
-    apply_deployments: impl Future<Output = Result<bool, Error>>,
+    apply_deployments: impl Future<Output = Result<Option<Deployment>, Error>>,
 ) -> Result<(), Error>
 where
-    A: FnOnce(String, NetworkPolicy) -> AF,
+    A: FnMut(String, NetworkPolicy) -> AF,
     AF: Future<Output = Result<(), Error>>,
     D: FnMut(String) -> DF,
     DF: Future<Output = Result<(), Error>>,
 {
     let desired_name = policy.as_ref().map(ResourceExt::name_any);
-    if let (Some(name), Some(policy)) = (desired_name.clone(), policy) {
-        apply_policy(name, policy).await?;
+    let held = policy
+        .as_ref()
+        .map(|policy| query_network_policy_during_rollout(policy, live_query.as_ref()));
+    if let (Some(name), Some(held)) = (desired_name.clone(), held.clone()) {
+        apply_policy(name, held).await?;
     }
-    let query_applied = apply_deployments.await?;
-    if !query_applied {
+    let Some(applied_query) = apply_deployments.await? else {
         return Ok(());
+    };
+    if !deployment_rollout_complete(&applied_query) {
+        return Ok(());
+    }
+    if let (Some(name), Some(policy)) = (desired_name.clone(), policy)
+        && held.as_ref() != Some(&policy)
+    {
+        apply_policy(name, policy).await?;
     }
     for name in possible_names {
         if desired_name.as_deref() == Some(name.as_str()) {
@@ -1731,6 +1766,10 @@ async fn reconcile_inner(
         credential_resource_versions,
         deployment_key_resource_version: deployment_key_secret.resource_version,
         audit_token_key_resource_version,
+        distributed_query_resource_versions: resolve_distributed_query_resource_versions(
+            client, namespace, &obj.spec,
+        )
+        .await?,
     };
 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -1976,9 +2015,14 @@ async fn reconcile_inner(
         policy.metadata.owner_references = owner.clone();
         policy
     });
+    let live_query = match &query_policy {
+        Some(_) => live_deployment(&deployments, &child(instance, "query")).await?,
+        None => None,
+    };
     let network_policies = &network_policies;
     converge_query_network_policy(
         query_policy,
+        live_query,
         possible_network_policy_names(instance),
         |name, policy| async move {
             apply(network_policies, &name, &policy).await?;
@@ -1991,7 +2035,7 @@ async fn reconcile_inner(
                     .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
                     .await?;
             }
-            Ok(tiers.applied(DeploymentTier::Query).is_some())
+            Ok(tiers.applied(DeploymentTier::Query).cloned())
         },
     )
     .await?;
@@ -2198,6 +2242,15 @@ async fn live_replica_counts(
             unavailable_replicas(&deployment),
         )),
         Err(err) if is_not_found(&err) => Ok((None, None)),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// The live Deployment `name`, or `None` when it does not exist.
+async fn live_deployment(api: &Api<Deployment>, name: &str) -> Result<Option<Deployment>, Error> {
+    match api.get(name).await {
+        Ok(deployment) => Ok(Some(deployment)),
+        Err(err) if is_not_found(&err) => Ok(None),
         Err(err) => Err(err.into()),
     }
 }
@@ -4227,26 +4280,102 @@ mod tests {
         }
     }
 
+    /// A query Deployment at `generation` whose status reports
+    /// `observed_generation`, `updated` of `replicas` updated and `unavailable`
+    /// unavailable, declaring `ports` on its container.
+    fn query_rollout(
+        generation: i64,
+        observed_generation: Option<i64>,
+        replicas: i32,
+        updated: i32,
+        unavailable: Option<i32>,
+        ports: &[i32],
+    ) -> Deployment {
+        use k8s_openapi::api::apps::v1::{DeploymentSpec, DeploymentStatus};
+        use k8s_openapi::api::core::v1::{Container, ContainerPort, PodSpec, PodTemplateSpec};
+        Deployment {
+            metadata: kube::api::ObjectMeta {
+                name: Some("rc-query".to_string()),
+                generation: Some(generation),
+                ..Default::default()
+            },
+            spec: Some(DeploymentSpec {
+                template: PodTemplateSpec {
+                    spec: Some(PodSpec {
+                        containers: vec![Container {
+                            name: "ravel".to_string(),
+                            ports: Some(
+                                ports
+                                    .iter()
+                                    .map(|port| ContainerPort {
+                                        container_port: *port,
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                            ),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            status: Some(DeploymentStatus {
+                observed_generation,
+                replicas: Some(replicas),
+                updated_replicas: Some(updated),
+                unavailable_replicas: unavailable,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// A query Deployment whose rollout is complete.
+    fn rolled_out() -> Deployment {
+        use crate::reconcile::{FRAGMENT_PORT, HTTP_PORT};
+        query_rollout(2, Some(2), 3, 3, None, &[HTTP_PORT, FRAGMENT_PORT])
+    }
+
     /// Run `converge_query_network_policy` with recording callbacks and return
-    /// the calls in the order they ran. `query_applied` is what the Deployment
-    /// step reports: whether it applied the query Deployment this pass.
-    async fn converge_events(policy: Option<NetworkPolicy>, query_applied: bool) -> Vec<String> {
+    /// the calls in the order they ran. `applied_query` is what the Deployment
+    /// step returns: the query Deployment it applied this pass, if any.
+    async fn converge_events(
+        policy: Option<NetworkPolicy>,
+        applied_query: Option<Deployment>,
+    ) -> Vec<String> {
+        converge_with_live(policy, None, applied_query)
+            .await
+            .into_iter()
+            .map(|(event, _)| event)
+            .collect()
+    }
+
+    /// [`converge_events`] with the pre-apply live query Deployment, also
+    /// returning the policy each apply wrote.
+    async fn converge_with_live(
+        policy: Option<NetworkPolicy>,
+        live_query: Option<Deployment>,
+        applied_query: Option<Deployment>,
+    ) -> Vec<(String, Option<NetworkPolicy>)> {
         let events = std::cell::RefCell::new(Vec::new());
         let log = &events;
         converge_query_network_policy(
             policy,
+            live_query,
             vec!["rc-query-fragment".to_string()],
-            |name, _policy| async move {
-                log.borrow_mut().push(format!("apply {name}"));
+            |name, policy| async move {
+                log.borrow_mut()
+                    .push((format!("apply {name}"), Some(policy)));
                 Ok(())
             },
             |name| async move {
-                log.borrow_mut().push(format!("delete {name}"));
+                log.borrow_mut().push((format!("delete {name}"), None));
                 Ok(())
             },
             async move {
-                log.borrow_mut().push("deployments".to_string());
-                Ok(query_applied)
+                log.borrow_mut().push(("deployments".to_string(), None));
+                Ok(applied_query)
             },
         )
         .await
@@ -4259,7 +4388,11 @@ mod tests {
     #[tokio::test]
     async fn fragment_policy_is_applied_before_the_query_deployment() {
         assert_eq!(
-            converge_events(Some(fragment_policy("rc-query-fragment")), true).await,
+            converge_events(
+                Some(fragment_policy("rc-query-fragment")),
+                Some(rolled_out())
+            )
+            .await,
             vec!["apply rc-query-fragment", "deployments"]
         );
     }
@@ -4269,7 +4402,7 @@ mod tests {
     #[tokio::test]
     async fn fragment_policy_is_deleted_after_the_query_deployment_is_applied() {
         assert_eq!(
-            converge_events(None, true).await,
+            converge_events(None, Some(rolled_out())).await,
             vec!["deployments", "delete rc-query-fragment"]
         );
     }
@@ -4278,7 +4411,167 @@ mod tests {
     /// open the fragment port, so the policy stays.
     #[tokio::test]
     async fn fragment_policy_is_kept_while_the_query_apply_is_held_back() {
-        assert_eq!(converge_events(None, false).await, vec!["deployments"]);
+        assert_eq!(converge_events(None, None).await, vec!["deployments"]);
+    }
+
+    /// Disabling while the applied query Deployment still runs pods on the old
+    /// spec: the policy stays, under each of the three status conditions that
+    /// mark the rollout incomplete.
+    #[tokio::test]
+    async fn fragment_policy_is_kept_until_the_query_rollout_completes() {
+        use crate::reconcile::{FRAGMENT_PORT, HTTP_PORT};
+        let ports = [HTTP_PORT, FRAGMENT_PORT];
+        let incomplete = [
+            (
+                "controller has not observed the new generation",
+                query_rollout(3, Some(2), 3, 3, None, &ports),
+            ),
+            (
+                "status not reported yet",
+                Deployment {
+                    status: None,
+                    ..query_rollout(3, None, 0, 0, None, &ports)
+                },
+            ),
+            (
+                "an old-spec replica is still running",
+                query_rollout(3, Some(3), 4, 3, None, &ports),
+            ),
+            (
+                "a replica is unavailable",
+                query_rollout(3, Some(3), 3, 3, Some(1), &ports),
+            ),
+        ];
+        for (why, applied) in incomplete {
+            assert_eq!(
+                converge_events(None, Some(applied)).await,
+                vec!["deployments"],
+                "{why}: the policy must outlive the old pods"
+            );
+        }
+        // Unavailable reported as zero, rather than absent, is complete.
+        assert_eq!(
+            converge_events(None, Some(query_rollout(3, Some(3), 3, 3, Some(0), &ports))).await,
+            vec!["deployments", "delete rc-query-fragment"]
+        );
+    }
+
+    /// A policy with the fragment rule and an open rule admitting `open`.
+    fn policy_open_on(open: &[i32]) -> NetworkPolicy {
+        use crate::reconcile::FRAGMENT_PORT;
+        use k8s_openapi::api::networking::v1::{
+            NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
+        };
+        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+        let tcp = |port: i32| NetworkPolicyPort {
+            port: Some(IntOrString::Int(port)),
+            protocol: Some("TCP".to_string()),
+            end_port: None,
+        };
+        NetworkPolicy {
+            spec: Some(NetworkPolicySpec {
+                ingress: Some(vec![
+                    NetworkPolicyIngressRule {
+                        from: Some(vec![NetworkPolicyPeer::default()]),
+                        ports: Some(vec![tcp(FRAGMENT_PORT)]),
+                    },
+                    NetworkPolicyIngressRule {
+                        from: None,
+                        ports: Some(open.iter().copied().map(tcp).collect()),
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..fragment_policy("rc-query-fragment")
+        }
+    }
+
+    /// The ports a policy's open rule admits, sorted.
+    fn open_ports(policy: &NetworkPolicy) -> Vec<i32> {
+        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+        let mut ports: Vec<i32> = policy
+            .spec
+            .iter()
+            .flat_map(|spec| spec.ingress.iter().flatten())
+            .filter(|rule| rule.from.is_none())
+            .flat_map(|rule| rule.ports.iter().flatten())
+            .filter_map(|port| match port.port {
+                Some(IntOrString::Int(port)) => Some(port),
+                _ => None,
+            })
+            .collect();
+        ports.sort_unstable();
+        ports
+    }
+
+    /// The (event, open ports) trace of a converge pass.
+    async fn narrowing_trace(
+        live_query: Option<Deployment>,
+        applied_query: Option<Deployment>,
+    ) -> Vec<(String, Option<Vec<i32>>)> {
+        use crate::reconcile::HTTP_PORT;
+        converge_with_live(
+            Some(policy_open_on(&[HTTP_PORT])),
+            live_query,
+            applied_query,
+        )
+        .await
+        .into_iter()
+        .map(|(event, policy)| (event, policy.as_ref().map(open_ports)))
+        .collect()
+    }
+
+    /// Narrowing while distributed query stays on (the dedicated health port
+    /// turned off): the wider policy is held until the rollout of the query
+    /// Deployment completes, then the exact one replaces it.
+    #[tokio::test]
+    async fn wider_fragment_policy_is_held_through_a_narrowing_rollout() {
+        use crate::reconcile::{FRAGMENT_PORT, HEALTH_PORT, HTTP_PORT};
+        let old_spec = [HTTP_PORT, HEALTH_PORT, FRAGMENT_PORT];
+        let new_spec = [HTTP_PORT, FRAGMENT_PORT];
+        let mut wide = vec![HTTP_PORT, HEALTH_PORT];
+        wide.sort_unstable();
+        let held = |event: &str| (event.to_string(), Some(wide.clone()));
+        let exact = |event: &str| (event.to_string(), Some(vec![HTTP_PORT]));
+        let deployments = ("deployments".to_string(), None);
+
+        // The pass that starts the rollout: the live Deployment is the old,
+        // fully rolled-out spec, and the apply bumps its generation.
+        assert_eq!(
+            narrowing_trace(
+                Some(query_rollout(2, Some(2), 3, 3, None, &old_spec)),
+                Some(query_rollout(3, Some(2), 3, 3, None, &new_spec)),
+            )
+            .await,
+            vec![held("apply rc-query-fragment"), deployments.clone()],
+        );
+        // A later pass mid-rollout: the live template is already the new
+        // spec, but old pods remain, so the policy stays wide.
+        let mid = query_rollout(3, Some(3), 4, 2, Some(1), &new_spec);
+        assert_eq!(
+            narrowing_trace(Some(mid.clone()), Some(mid)).await,
+            vec![held("apply rc-query-fragment"), deployments.clone()],
+        );
+        // The rollout completed between the read and the apply: narrow once
+        // the applied object says so.
+        assert_eq!(
+            narrowing_trace(
+                Some(query_rollout(3, Some(3), 3, 2, None, &new_spec)),
+                Some(query_rollout(3, Some(3), 3, 3, None, &new_spec)),
+            )
+            .await,
+            vec![
+                held("apply rc-query-fragment"),
+                deployments.clone(),
+                exact("apply rc-query-fragment"),
+            ],
+        );
+        // Steady state after the rollout: one apply, already exact.
+        let done = query_rollout(3, Some(3), 3, 3, None, &new_spec);
+        assert_eq!(
+            narrowing_trace(Some(done.clone()), Some(done)).await,
+            vec![exact("apply rc-query-fragment"), deployments],
+        );
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and
