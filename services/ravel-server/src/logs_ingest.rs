@@ -1248,8 +1248,8 @@ mod tests {
     ///
     /// Non-vacuity: restoring a log-and-write arm for `Err(err)` in
     /// `handle_export_logs` makes the write succeed, so `expect_err` fails;
-    /// passing the store error into the message fails the
-    /// `STORE_ERROR_TEXT` check; dropping the `tracing::warn!` or the
+    /// appending the store error to the message fails the
+    /// message equality check; dropping the `tracing::warn!` or the
     /// `fetch_add` in `marker_lookup_failure` fails the capture or the counter
     /// check.
     #[tokio::test]

@@ -855,18 +855,18 @@ mod tests {
     /// `corrupt_marker_falls_through_to_a_normal_write_not_an_error`.
     const MARKER_TEST_INGEST_TS_NS: i64 = BASE_TS_NS + 2_000;
 
-    /// Issue #2462: a keyed span write whose marker probe the store refuses fails
-    /// with the retryable `Abandoned` error before any of its data is written.
-    /// The client-facing message names no key, tenant hash, LIST or store
-    /// error; the failed GET, its key and the store error go to one WARN line
-    /// and one count of `ravel_ingest_idempotency_lookup_failures_total`.
+    /// Issue #2462: a keyed span write whose marker probe the store refuses
+    /// fails with the retryable `Abandoned` error before any of its data is
+    /// written. The client-facing message names no key, tenant hash, LIST or
+    /// store error; the failed GET, its key and the store error go to one WARN
+    /// line and one count of `ravel_ingest_idempotency_lookup_failures_total`.
     ///
     /// Non-vacuity: restoring a log-and-write arm for `Err(err)` in
-    /// `handle_export_traces` makes the write succeed, so the `let Err` pattern panics;
-    /// passing the store error into the message fails the
-    /// `STORE_ERROR_TEXT` check; dropping the `tracing::warn!` or the
-    /// `fetch_add` in `crate::logs_ingest::marker_lookup_failure` fails the capture or the counter
-    /// check.
+    /// `handle_export_traces` makes the write succeed, so the `let Err`
+    /// pattern panics; appending the store error to the message fails the
+    /// message equality check; dropping the `tracing::warn!` or the
+    /// `fetch_add` in `crate::logs_ingest::marker_lookup_failure` fails the
+    /// capture or the counter check.
     #[tokio::test]
     async fn keyed_write_whose_marker_lookup_is_refused_fails_retryable_and_writes_nothing() {
         use tracing_subscriber::layer::SubscriberExt as _;
