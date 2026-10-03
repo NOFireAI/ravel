@@ -654,8 +654,7 @@ timings_measured = "2026-10-03, the 32 GB reference box of the reference suite, 
             "the error names the missing field: {err}"
         );
 
-        let throughput_only =
-            format!("{prices}per_connection_throughput_bytes_per_s = 90000000\n");
+        let throughput_only = format!("{prices}per_connection_throughput_bytes_per_s = 90000000\n");
         let err = StoreCostProfile::from_toml_str(&throughput_only)
             .expect_err("a throughput without a latency must be refused");
         assert!(
@@ -668,7 +667,8 @@ timings_measured = "2026-10-03, the 32 GB reference box of the reference suite, 
             "got {err:?}"
         );
         assert!(
-            err.to_string().contains("request_latency_micros is missing"),
+            err.to_string()
+                .contains("request_latency_micros is missing"),
             "the error names the missing field: {err}"
         );
 

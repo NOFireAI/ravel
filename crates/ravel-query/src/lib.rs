@@ -34,7 +34,7 @@ pub use config::{
     LogsFetchPolicy, MAX_REQUESTS_PER_UNSEALED_FLUSH, REFERENCE_CLOCK_SKEW_ALLOWANCE,
     REFERENCE_FOLD_INTERVAL, REFERENCE_FOLD_SAFETY_MARGIN, REFERENCE_HEAD_CACHE_TTL,
     REFERENCE_MAX_FLUSH_LIFETIME, REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH,
-    RequestBudgetParts, RequestLimit, ResolvedLogsFetch, SealMargin, covered_span,
+    RateTerm, RequestBudgetParts, RequestLimit, ResolvedLogsFetch, SealMargin, covered_span,
     derive_max_s3_requests, derive_max_s3_requests_for, fold_lag_tail_threshold, healthy_tail_max,
     request_budget_parts, resolve_logs_fetch,
 };

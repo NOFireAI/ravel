@@ -497,6 +497,7 @@ impl QueryEngine {
             .with_get_limiter(get_limiter.clone())
             .with_memory_budget(memory_budget.clone())
             .with_request_cost_bytes(config.logs_request_cost_bytes)
+            .with_projection_break_even_bytes(config.logs_projection_break_even_bytes)
             .with_max_fetch_run_bytes(fetch_run_bytes)
             .unwrap_or_else(|err| {
                 tracing::warn!(
@@ -509,6 +510,7 @@ impl QueryEngine {
                     .with_get_limiter(get_limiter.clone())
                     .with_memory_budget(memory_budget.clone())
                     .with_request_cost_bytes(config.logs_request_cost_bytes)
+                    .with_projection_break_even_bytes(config.logs_projection_break_even_bytes)
             });
         QueryEngine {
             catalog,

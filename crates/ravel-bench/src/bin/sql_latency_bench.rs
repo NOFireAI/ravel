@@ -687,6 +687,18 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
         }
     ));
     out.push_str(&format!(
+        "  rate term  : effective={}  break-even: effective={}\n",
+        match &p.logs_rate_term_effective {
+            Some(term) => term.clone(),
+            None => unresolved_effective_label(&p.source).to_string(),
+        },
+        match p.logs_projection_break_even_bytes_effective {
+            Some(0) => "none (routing threshold)".to_string(),
+            Some(v) => format!("{v} bytes"),
+            None => unresolved_effective_label(&p.source).to_string(),
+        }
+    ));
+    out.push_str(&format!(
         "  query max  : requested={} bytes  effective={}\n",
         p.sql_max_query_bytes_requested,
         match p.sql_max_query_bytes_effective {
@@ -1118,6 +1130,8 @@ mod tests {
             logs_block_range_threshold_effective: Some(
                 ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             ),
+            logs_rate_term_effective: Some("flag".to_string()),
+            logs_projection_break_even_bytes_effective: Some(0),
             sql_max_query_bytes_requested: DEFAULT_MAX_QUERY_BYTES,
             sql_max_query_bytes_effective: Some(DEFAULT_MAX_QUERY_BYTES),
             tenant_max_bytes: 1 << 30,
@@ -1221,28 +1235,58 @@ mod tests {
 
     /// At default flags against the reference (intra-region) profile, the bench
     /// resolves the same shape a stock server resolves, loopback endpoint or
-    /// not (ADR-2023 decision 1): a saturated request cost AND a saturated
-    /// routing threshold, so every object is read whole in one covering GET.
-    /// Before the policy was reachable the threshold stayed at 512 KiB whatever
-    /// the request cost said, so a full-scan statement range-read every larger
-    /// object per block while a stock server read it whole (issue #1139).
+    /// not (ADR-2023 decision 1): the time term's request cost, the configured
+    /// routing threshold, and a projection break-even of five request costs
+    /// (ADR-2414 decision A3), so a narrow projection of an object above
+    /// 31,500,000 bytes reads ranged and every smaller object reads whole.
     #[test]
-    fn default_flags_resolve_whole_object_routing_at_the_reference_profile() {
+    fn default_flags_resolve_the_time_term_at_the_reference_profile() {
         let resolved = resolution_from(&["sql_latency_bench", "--generate"]);
+        assert_eq!(resolved.request_cost_bytes, 6_300_000);
+        assert_eq!(resolved.rate_term, Some(ravel_query::RateTerm::Time));
+        assert_eq!(resolved.rate_term_label(false), "time");
         assert_eq!(
             resolved.block_range_threshold,
-            u64::MAX,
-            "the default policy must saturate the routing threshold"
+            ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            "a finite rate leaves the routing threshold at its configured value"
         );
-        assert_eq!(
-            resolved.request_cost_bytes,
-            u64::MAX,
-            "the reference profile prices bytes at zero, so the rate saturates"
+        assert_eq!(resolved.projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(resolved.saturated_profile, None);
+    }
+
+    /// The header names the rate term and the break-even beside the request
+    /// cost, so two passes whose rates came from different terms cannot read
+    /// as one configuration.
+    #[test]
+    fn header_stamps_the_rate_term_and_break_even() {
+        let d = dataset("pre-compaction", None);
+        let mut p = provenance_with_cost(6_300_000);
+        p.logs_rate_term_effective = Some("time".to_string());
+        p.logs_projection_break_even_bytes_effective = Some(31_500_000);
+        let header = provenance_header(&p, &d);
+        assert!(
+            header
+                .contains("  rate term  : effective=time  break-even: effective=31500000 bytes\n"),
+            "got:\n{header}"
         );
-        assert_eq!(
-            resolved.saturated_profile.as_deref(),
-            Some("s3-intra-region-2026"),
-            "the saturation is attributed to the profile that produced it"
+
+        p.logs_projection_break_even_bytes_effective = Some(0);
+        let header = provenance_header(&p, &d);
+        assert!(
+            header.contains("break-even: effective=none (routing threshold)\n"),
+            "a policy with no break-even says the routing threshold serves; got:\n{header}"
+        );
+
+        p.source = "flight".to_string();
+        p.logs_rate_term_effective = None;
+        p.logs_projection_break_even_bytes_effective = None;
+        let header = provenance_header(&p, &d);
+        assert!(
+            header.contains(
+                "  rate term  : effective=unknown (server config)  \
+                 break-even: effective=unknown (server config)\n"
+            ),
+            "a Flight run names neither; got:\n{header}"
         );
     }
 
@@ -1272,10 +1316,10 @@ mod tests {
     }
 
     /// An explicit `--logs-block-range-threshold` is in force under
-    /// `byte-minimal` and overridden (and recorded as overridden) under the
-    /// default policy, exactly as on the server.
+    /// `byte-minimal` and under the default policy too, whose rate is finite at
+    /// the reference profile (ADR-2414 decision A3), exactly as on the server.
     #[test]
-    fn explicit_threshold_is_honoured_by_byte_minimal_and_overridden_by_default() {
+    fn explicit_threshold_is_honoured_by_byte_minimal_and_by_default() {
         let honoured = resolution_from(&[
             "sql_latency_bench",
             "--generate",
@@ -1287,14 +1331,19 @@ mod tests {
         assert_eq!(honoured.block_range_threshold, 65_536);
         assert_eq!(honoured.overridden_block_range_threshold, None);
 
-        let overridden = resolution_from(&[
+        let default_policy = resolution_from(&[
             "sql_latency_bench",
             "--generate",
             "--logs-block-range-threshold",
             "65536",
         ]);
-        assert_eq!(overridden.block_range_threshold, u64::MAX);
-        assert_eq!(overridden.overridden_block_range_threshold, Some(65_536));
+        assert_eq!(default_policy.block_range_threshold, 65_536);
+        assert_eq!(default_policy.overridden_block_range_threshold, None);
+        assert_eq!(
+            default_policy.projection_break_even_bytes,
+            Some(31_500_000),
+            "the break-even is five request costs above a smaller threshold"
+        );
     }
 
     /// The two new provenance fields round-trip through JSON at their exact

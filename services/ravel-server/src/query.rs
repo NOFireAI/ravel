@@ -756,9 +756,12 @@ fn build_sql_state_inner(
     // ADR-0996 decision 2: the two quantities above are the RESOLVED ones.
     // `QueryBudgets::apply_to_engine` runs `--logs-fetch-policy` through
     // `ravel_query::resolve_logs_fetch` before this config exists, so
-    // `request-minimal` (and `cost-based` at a free-byte profile) arrives here
-    // as a saturated request cost AND a saturated routing threshold, which is
-    // what makes the policy select the read shape instead of being inert.
+    // `request-minimal` (and `cost-based` at a profile with neither byte
+    // prices nor timings) arrives here as a saturated request cost AND a
+    // saturated routing threshold, which is what makes the policy select the
+    // read shape instead of being inert. `cost-based` with a finite rate also
+    // resolves the projection break-even (ADR-2414 decision A3), which has to
+    // reach the fetcher the same way.
     // `--logs-max-fetch-run-bytes` is the fetch bound: it caps one covering
     // GET's length on every policy, so it has to be handed to the fetcher here
     // like the other three or the fetcher keeps its compiled-in 64 MiB.
@@ -766,6 +769,7 @@ fn build_sql_state_inner(
         .with_block_range_threshold(config.engine.logs_block_range_threshold)
         .with_get_limiter(get_limiter.clone())
         .with_request_cost_bytes(config.engine.logs_request_cost_bytes)
+        .with_projection_break_even_bytes(config.engine.logs_projection_break_even_bytes)
         .with_max_fetch_run_bytes(config.engine.logs_max_fetch_run_bytes)
         .map_err(|err| anyhow::anyhow!("invalid logs fetch bound: {err}"))?
         .with_memory_budget(process_memory_budget.clone());
