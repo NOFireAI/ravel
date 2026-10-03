@@ -12,8 +12,8 @@
 // allowed; an additive change bumps `format_version` under the
 // readers-before-writers sequence, because manifest version N+1 is built from
 // version N and a reader that dropped an unknown field would write N+1
-// without it. Nothing has shipped yet, so the numbering below is still free to
-// move; from the first release it is not.
+// without it. v0.20.0 shipped this schema, so the numbering below is frozen:
+// only the additive changes above are allowed from here on.
 syntax = "proto3";
 
 package ravel.parquet_table.v1;

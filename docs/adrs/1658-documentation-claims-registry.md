@@ -95,6 +95,8 @@ capability.
    The script is stdlib only, exits 0 clean, 1 on findings, 2 when it
    cannot run (missing registry, unreadable doc, empty marker match set
    across all normative docs, which would mean the scan is broken).
+   (The gate deviates from BIND and STATUS for `not-implemented` entries:
+   see the gate-deviations amendment below.)
 
 4. **Seed from the review's claim matrix.** Each matrix row whose source
    sentence still exists on `main` becomes an entry: the claim's source
@@ -105,6 +107,8 @@ capability.
    contradictions above are the first `contradicted` entries; the MCP and
    PROGRESS.md corrections land in their own change and flip those entries
    to `verified`.
+   (The registry was not seeded from the matrix: see the narrower-seed
+   amendment below.)
 
 5. **Wiring: the doc-scripts job beside `check_docs.py`, `make
    check-docs`, and `scripts/test_check_doc_claims.py` under `make
@@ -171,5 +175,46 @@ flowchart LR
      PROGRESS.md audit paragraph, corrected against the shipped code.
   2. `scripts/check-doc-claims.py`, its unittest module, the registry
      seeded from the matrix, and the CI and Makefile wiring, in one
-     change, cases first.
+     change, cases first (the seed is narrower: see the narrower-seed
+     amendment below).
   3. The query-engine.md stamp-writer sentence corrected, with its entry.
+
+## Amendment (2026-10-03): the narrower-seed amendment, decision 4 accepts the registry as seeded
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="narrower-seed amendment" -->
+
+Decision 4 is replaced. The registry is seeded with the 22 entries
+`docs/review/claims.yaml` carried when it landed, not from the review's
+claim matrix (the diagram's "seed once" edge does not happen), and
+that narrower seed is accepted as the registry's starting state.
+
+The matrix cannot be seeded mechanically. It is not in the repository, so no
+change here can read it, and its rows cite line ranges and `file:line`
+evidence rather than the verbatim quote QUOTE needs and the
+`path.rs::Symbol` references BIND resolves. Turning a row into an entry means
+finding the sentence again, choosing the fragment and naming the defining
+symbol, which is the per-claim review decision 4 assumed could be skipped.
+Further entries are added the way any entry is: by an author who edits or
+adds a registered sentence, or by NEGATIVE refusing an unregistered marker
+line.
+
+## Amendment (2026-10-03): the gate-deviations amendment, decision 3 as the gate implements it
+
+<!-- amendment-applies: sections="Decision" pointer="gate-deviations amendment" -->
+
+Decision 3's BIND and STATUS rules hold for every status except
+`not-implemented`, where `scripts/check-doc-claims.py` applies two
+deliberate deviations. Both are accepted as the rules.
+
+- **BIND tolerates a missing final symbol on a `not-implemented` entry.** Such
+  an entry binds the symbol whose arrival would make its sentence false, so
+  that symbol is expected to be absent. The gate reports a bind failure only
+  when the reason is something other than "no definition of" the reference's
+  last segment: a missing file, a malformed reference or a missing leading
+  segment is still a BIND finding, so the STATUS trip cannot be disarmed by
+  a reference that would never resolve.
+- **STATUS exempts a `not-implemented` entry with empty `binds`.** The STATUS
+  finding fires only when the entry has at least one bind and every bind
+  resolves. An entry with `binds: []` records an absence with no would-be
+  symbol to name yet (the registry header says so), and it never trips
+  STATUS; it goes stale only through QUOTE, when its sentence is edited.

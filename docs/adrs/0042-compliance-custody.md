@@ -35,6 +35,8 @@ and one real gap the pinned `object_store` version cannot close:
   Ravel cannot enforce S3-level, credential-proof WORM through this
   client. This is a real, load-bearing constraint on this ADR's scope,
   not a detail to gloss over.
+  (What bucket-level Object Lock does deliver is narrower than "true
+  WORM": see the Object Lock recoverability amendment below.)
 - **Custody verification**: `services/ravel-cli/src/maintain.rs:226`'s
   `audit_versions` (a tenant/shard-scoped per-object walk with anomaly
   counting) is the template a `verify-custody` command extends, not a
@@ -71,7 +73,9 @@ and one real gap the pinned `object_store` version cannot close:
    proof WORM (immutability that survives a compromised or malicious
    holder of the object-store credentials) - `object_store` 0.14 cannot
    set S3's own Object Lock retention on a PUT. Real WORM requires the
-   operator to *additionally* enable S3 Object Lock at the bucket level
+   operator (Object Lock recoverability amendment below: what this layer
+   gives is recoverable locked versions, not a frozen current version)
+   to *additionally* enable S3 Object Lock at the bucket level
    (compliance mode, a default retention period) as an out-of-band,
    documented deployment step; docs/guides/operations.md gets a new
    "Compliance mode" section spelling out both layers and which
@@ -180,3 +184,30 @@ per-tenant `S3Config` field versus a routing decorator over per-tenant
 `S3Store` instances keyed by prefix — was wrong in the original text, and
 is corrected here rather than left to mislead a future reader of decision
 1 in isolation.
+
+## Amendment (2026-10-03, #2258): the Object Lock recoverability amendment
+
+<!-- amendment-applies: sections="Context|Decision" pointer="Object Lock recoverability amendment" -->
+<!-- amendment-supersedes: phrase="Real WORM requires the" pointer="Object Lock recoverability amendment" -->
+
+Decision 3 and the Context present bucket-level S3 Object Lock as the layer
+that supplies credential-proof WORM, immutability that survives a
+compromised or malicious holder of the object-store credentials. That
+overstates it. Object Lock protects object *versions*, not a key's current
+version. In compliance mode it refuses, for the retention period and for
+every principal including the bucket owner, any request that would destroy
+or alter a locked version: a delete naming its version id, or a lifecycle
+expiration. It does not refuse a PUT to the same key, which adds a new
+current version, or a delete with no version id, which inserts a delete
+marker; Object Lock requires a versioned bucket, and both of those are
+ordinary versioned-bucket writes. Every Ravel delete is the second kind.
+
+So against a compromised credential, the guarantee the second layer adds is
+that every locked object version stays recoverable for its retention period,
+not that the key keeps reading the version it held. Recovering one means
+restoring the locked prior version as the current one; the disaster-recovery
+guide carries that procedure ("Restore one overwritten key from its locked
+prior version"). `docs/object-store-contract.md`, "Required bucket
+configuration", states the same model normatively. The two-layer framing,
+the out-of-band bucket step, and decision 2's Ravel-enforced legal hold are
+unchanged.

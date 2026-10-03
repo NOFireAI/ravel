@@ -277,9 +277,10 @@ is one knob controlling two windows.**
 
 - It is the **disaster-detection budget**: after an accidental or malicious
   mass delete, the operator has `E_v` to notice and restore the noncurrent
-  versions on the primary. At level 1 the replica has its own window,
-  replication lag plus `E_v_r`; the two windows run side by side and do not
-  add up.
+  versions on the primary. For a single key, see
+  [restoring one overwritten key](#restore-one-overwritten-key-from-its-locked-prior-version).
+  At level 1 the replica has its own window, replication lag plus `E_v_r`;
+  the two windows run side by side and do not add up.
 - It is simultaneously the **erasure-residue window**: erased bytes persist as
   noncurrent versions for `E_v`.
 
@@ -553,6 +554,114 @@ verified operation.
 7. **Replicate and close out.** Re-establish replication to a new replica,
    with the replica's own versioning and lifecycle rules, before declaring
    the incident closed. Until that is done the deployment is level 0.
+
+## Restore one overwritten key from its locked prior version
+
+Object Lock protects object versions, not a key's current version (see
+"Required bucket configuration" in
+[the object store contract](../object-store-contract.md)). A credential with
+write access can PUT a new body to a protected key such as `sys/tenancy` or
+a `t/<tenant-hash>/<signal>/prov` record, or delete it with no version id,
+which inserts a delete marker. Object Lock refuses neither request. The
+shipped role templates in `deploy/iam/` deny the delete on these keys, so a
+leaked role credential can overwrite one but not delete it; a credential
+outside those templates can do both. Every reader then sees the new current
+version or no object at all. The version the key held before stays in the
+bucket: for its retention period where compliance-mode retention covers it
+(at level 2, or once your retention mechanism has locked that version), and
+otherwise only until the noncurrent-version expiration rule removes it, `E_v`
+after it stopped being current. `t/<tenant-hash>/enc` is not under Object
+Lock at all, so only that rule bounds it. Recovery is restoring that version
+as the current one, within whichever of those windows applies.
+This is a primary-bucket operation, not the replica restore above.
+
+Restoring a version discards every write that landed after it, not only the
+bad one, and Ravel rewrites some of these keys itself in normal operation:
+a `prov` record gains an entry when a shard generation or a format floor is
+appended, `t/<tenant-hash>/enc` gains one at each key-epoch change, and
+`t/<tenant-hash>/catalog/<signal>/HEAD` moves on every fold. Use this
+procedure on such a key only when the bad write is the only write after the
+version you restore. If a legitimate write landed after it, do not restore:
+a writer may already have acted on the entry the restore would drop, so
+escalate instead. Readers can act on the rolled-back version too, without
+writing the key: ingest routers re-read a `prov` record within a minute and
+route new records on the shard history they read, and restoring the record
+moves none of those records back. If ingest, a fold or a maintenance pass
+ran while the bad version was current, escalate rather than restore. A
+catalog HEAD carries one more condition: the
+maintenance sweep deletes the snapshot and index objects the current HEAD
+does not name once they pass the protection horizon, so after the bad write
+the objects the good version names may already be gone. A restored HEAD
+naming a deleted object fails reads even though step 5's byte comparison
+passes, so escalate a rolled-back HEAD rather than restore it with this
+procedure.
+
+1. **Stop the writes.** Revoke or rotate the credential that made the bad
+   write, and stop any process that would write the key again, before you
+   restore anything; a restore under a live credential can be overwritten
+   the same way.
+2. **List the key's versions.** `--prefix` also matches longer keys, so read
+   only the rows whose `Key` is exactly the one you are restoring:
+
+   ```sh
+   aws s3api list-object-versions --bucket <bucket> --prefix <exact-key> \
+     --query '{versions: Versions[?Key==`"<exact-key>"`].[VersionId,IsLatest,LastModified,Size], markers: DeleteMarkers[?Key==`"<exact-key>"`].[VersionId,IsLatest,LastModified]}'
+   ```
+
+   The bad write is the row with `IsLatest` true: a version for an
+   overwrite, a delete marker for a delete.
+3. **Pick the version to restore.** It is the newest version written before
+   the bad write. Confirm it is still locked, and fetch it to inspect:
+
+   ```sh
+   aws s3api get-object-retention --bucket <bucket> --key <exact-key> --version-id <good-version-id>
+   aws s3api get-object --bucket <bucket> --key <exact-key> --version-id <good-version-id> restore-good.bin
+   ```
+
+   If more than one write came after it, check each candidate the same way
+   and pick the last one you can show predates the compromise.
+4. **Copy it back as the current version.** A copy of a version onto its own
+   key adds a new current version with the same bytes; it works the same
+   whether the current entry is a bad version or a delete marker. The locked
+   versions, good and bad, are left in place, and the bad one ages out with
+   the noncurrent-version rule once any retention it carries lapses.
+
+   ```sh
+   aws s3api copy-object --bucket <bucket> --key <exact-key> \
+     --copy-source '<bucket>/<exact-key>?versionId=<good-version-id>' \
+     --checksum-algorithm CRC64NVME
+   ```
+
+   `--checksum-algorithm CRC64NVME` stores a checksum the S3 store can
+   recompute when it reads the key with `--s3-request-stored-checksum` on
+   (the default). AWS keeps the source version's checksum algorithm on a
+   copy without the flag; an endpoint that stores no checksum leaves reads
+   of the key counted as unverified. Omit the flag on an endpoint that
+   rejects checksum headers, which runs with `--s3-upload-integrity off`. A
+   copy does not carry the source version's SSE-KMS key over: if the good
+   version was written under a KMS key (`--s3-kms-key`, or a tenant's key
+   from `--tenant-kms-config`), read it from the `SSEKMSKeyId` that
+   `aws s3api head-object --bucket <bucket> --key <exact-key> --version-id
+   <good-version-id>` prints and add `--server-side-encryption aws:kms
+   --ssekms-key-id <key-id>` with it. The credential running the copy needs
+   `kms:Decrypt` and `kms:GenerateDataKey` on that key.
+5. **Verify.** List the versions again: the newest row is your copy, with
+   `IsLatest` true, and the good version and the bad one are both still
+   listed. Fetch the current version and compare it byte for byte with the
+   good one, then confirm the new current version carries retention under
+   your retention posture (the bucket default at level 2, or your retention
+   mechanism's next run otherwise), with the commands in the platform-CLI
+   verification checklist:
+
+   ```sh
+   aws s3api get-object --bucket <bucket> --key <exact-key> restore-current.bin
+   cmp restore-good.bin restore-current.bin
+   aws s3api get-object-retention --bucket <bucket> --key <exact-key> --version-id <new-current-version-id>
+   ```
+
+   A running Ravel process can hold the rolled-back state in memory, so
+   restart the processes that read the key; processes carry no local state,
+   and a restart re-reads the current version.
 
 ## RPO and RTO: defined here, published only from a rehearsal
 
