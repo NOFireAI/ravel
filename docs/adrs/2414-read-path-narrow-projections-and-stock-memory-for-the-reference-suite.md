@@ -93,22 +93,29 @@ S3 reads ranged.** A request's cost in bytes is the bytes one connection
 transfers during one request's latency, `request_latency *
 per_connection_throughput`, from the store cost profile beside its prices
 (the reference profile records the figures measured from the reference box:
-about 70 ms and about 90 MB/s, so about 6.3 MB per request), and the
-resolved rate is the larger of the price-derived rate and the time-derived
-one. `resolve_cost_based_rate` therefore returns a finite rate on the
-intra-region profile and the routing threshold stays at its configured
-value (512 KiB by default). The projection break-even is NOT that
-threshold: today the engine always sets `logs_block_range_threshold`, and
-`effective_whole_object_threshold` returns the configured value verbatim,
-so a finite rate alone would make `ranged_projection_pays` compare the
-saved bytes against 512 KiB and read a 3 MB L0 object ranged, the shape
-ADR-2023 measured as a threefold concurrent throughput loss. So
-`ranged_projection_pays` takes the larger of the configured routing
-threshold and five request costs as its break-even whenever the rate is
-finite: a 35 MB object at a 3% projection saves 34 MB against a 31 MB
+about 70 ms and about 90 MB/s, so about 6.3 MB per request). The resolved
+rate under `cost-based` is the time-derived rate whenever the price-derived
+one saturates (a profile with zero byte prices, which is where
+`resolve_cost_based_rate` short-circuits to `u64::MAX` today), and the
+larger of the two when both are finite; a saturated rate is therefore only
+possible on a profile that records neither prices nor timings.
+`resolve_cost_based_rate` thus returns a finite rate on the intra-region
+profile, `saturates_routing` is false, and the routing threshold stays at
+its configured value (512 KiB by default). The projection break-even is NOT
+that threshold: today the engine always sets `logs_block_range_threshold`,
+and `effective_whole_object_threshold` returns the configured value
+verbatim, so a finite rate alone would make `ranged_projection_pays`
+compare the saved bytes against 512 KiB and read a 3 MB L0 object ranged,
+the shape ADR-2023 measured as a threefold concurrent throughput loss. So
+under `cost-based`, and only there, `ranged_projection_pays` takes the
+larger of the configured routing threshold and five request costs as its
+break-even: a 35 MB object at a 3% projection saves 34 MB against a 31 MB
 break-even and reads ranged; a 3 MB L0 object saves under 3 MB and reads
 whole; an explicit `--logs-block-range-threshold` still bounds the
-block-range routing it was written for. The rate drives a third decision
+block-range routing it was written for. `byte-minimal` and `latency-first`
+keep today's break-even (the configured threshold) and today's rate: they
+exist to read ranged wherever bytes are saved, and this decision does not
+touch them. The rate drives a third decision
 too: the coalescing gap, `max(request_cost_bytes, DEFAULT_LOG_COALESCE_GAP)`,
 which no caller pins, so on the reference profile it becomes about 6.3 MB
 instead of the byte-minimal rate's 1.9 MB. That is the same trade stated
@@ -124,14 +131,18 @@ is enough.
 
 Expected on the reference box after A1 to A3 (pre-registered on #1248
 before A3's run): the one-column statement under 2 s cold at 32 partitions,
-the stock cold suite under 200 s over 42 statements (241.4 s measured), and
+the stock cold suite under 200 s over the same 42 statements the 241.4 s
+baseline covers, with q33 reported beside it under its own band (B3), and
 the tuned arm re-registered for 35 MB objects with partitions at most the
 segment count.
 
 ### Track B: q33 in the stock configuration
 
 B1. **The derived per-query SQL pool is the tenant's share.**
-`SQL_QUERY_MEMORY_PERCENT` becomes 50, equal to `SQL_TENANT_MEMORY_PERCENT`,
+`SQL_QUERY_MEMORY_PERCENT` becomes 50, equal to `SQL_TENANT_MEMORY_PERCENT`
+(whose doc comment, "twice the per-query share so the per-tenant ceiling
+admits concurrent queries without the per-query clamp binding", is rewritten
+in the same change, since it would then be false),
 so a lone statement may reserve the tenant's whole SQL share. The tenant
 total is unchanged and the per-statement cap is removed: the per-query pool
 nests inside the per-tenant pool, which refuses the byte that would exceed
@@ -158,7 +169,14 @@ after this ADR; the reference box is covered by B1.
 
 B3. **q33 is a measured statement.** The reference-suite registration on
 #1248 carries q33 in the stock arm with a pre-registered band (about 11 s
-cold, 10 s warm from Stage 0); a null for it is a miss.
+cold, 10 s warm from Stage 0); a null for it is a miss. The acceptance
+script in `docs/internal/clickbench-aws-runbook.md` asserts the statement
+set by identity before it reads any band (`EXPECTED_MEASURED = 42` and
+`EXPECTED_FAILED_Q = {"q33"}`, written
+for the budget B1 removes), so the measurement wave changes those to 43
+measured and no expected failure in the same change that records the
+figures, and the 42-statement bands keep their baseline for comparability
+while q33 is reported as a 43rd row.
 
 ## Rejected alternatives
 
