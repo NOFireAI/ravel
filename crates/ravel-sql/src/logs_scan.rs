@@ -3232,7 +3232,7 @@ fn row_groups(indices: &[usize], page_dir: &PageDir) -> Vec<Vec<usize>> {
         let block = u32::try_from(idx).unwrap_or(u32::MAX);
         let first_block = page_dir.locate_block(block).map(|(g, _)| g.first_block);
         match groups.last_mut() {
-            Some((cur, items)) if *cur == first_block => items.push(idx),
+            Some((cur, items)) if cur.is_some() && *cur == first_block => items.push(idx),
             _ => groups.push((first_block, vec![idx])),
         }
     }
@@ -8329,6 +8329,21 @@ mod owned_work_tests {
             row_groups(&[], dirs.page_dir()),
             Vec::<Vec<usize>>::new(),
             "no survivors, no groups"
+        );
+    }
+
+    /// Blocks PAGE_DIR cannot place each keep a singleton group, adjacent ones
+    /// included: they share no group, so nothing makes them one unit.
+    ///
+    /// Fails against matching on the `Option` key alone, which merges 100 and
+    /// 101 into one group keyed `None`.
+    #[test]
+    fn unplaceable_blocks_keep_singleton_groups() {
+        let dirs = dirs();
+        assert!(dirs.page_dir().locate_block(100).is_none());
+        assert_eq!(
+            row_groups(&[9, 100, 101], dirs.page_dir()),
+            vec![vec![9], vec![100], vec![101]]
         );
     }
 
