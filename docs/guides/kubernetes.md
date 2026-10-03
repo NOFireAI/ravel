@@ -286,7 +286,7 @@ A minimal example is in
 | `spec.query.replicas` | integer | `1` | |
 | `spec.query.resources` | object | `requests: {cpu: 200m, memory: 512Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
 | `spec.query.distributedQuery` | object | none | Distributed PromQL fan-out across the query replicas, on the dedicated TLS fragment listener. Omit and nothing is rendered. See "Distributed query" below. |
-| `spec.query.distributedQuery.enabled` | boolean | `false` | `true` renders the distributed-query flags, the fragment port, the four Secret mounts, and the fragment NetworkPolicy. `false` renders none of them and deletes the NetworkPolicy once the query Deployment without them is applied. |
+| `spec.query.distributedQuery.enabled` | boolean | `false` | `true` renders the distributed-query flags, the fragment port, the four Secret mounts, and the fragment NetworkPolicy. `false` renders none of them and deletes the NetworkPolicy once the query Deployment without them has finished rolling out. |
 | `spec.query.distributedQuery.fragmentTlsSecretRef.name` | string | none | Secret with keys `tls.crt` and `tls.key`: the fragment listener's certificate and private key. Required when `enabled`. |
 | `spec.query.distributedQuery.fragmentCaSecretRef.name` | string | none | Secret with key `ca.crt`: the CA that signed every query pod's fragment certificate. May name the same Secret as `fragmentTlsSecretRef`. Required when `enabled`. |
 | `spec.query.distributedQuery.fragmentKeySecretRef.name` | string | none | Secret with key `keys`: the fragment key file. Required when `enabled`. |
@@ -418,7 +418,13 @@ spec:
 ```
 
 The block expects four Secrets in the `RavelCluster`'s namespace. The
-operator only mounts them; it never reads, creates, or rotates them.
+operator mounts them and reads only their `resourceVersion` (a metadata-only
+read) to detect a rotation; it never loads their values, and never creates
+or rotates them. A referenced Secret missing from the namespace holds back
+only the query Deployment (its running pods keep serving on their current
+spec): the operator keeps the fragment NetworkPolicy in place, records a
+`Degraded` condition naming the Secret, and reconciles the gateway and
+maintain Deployments as usual.
 
 | Reference | Secret keys | Mounted at | Flag |
 |---|---|---|---|
@@ -486,26 +492,75 @@ message naming each unset field, such as
 `spec.query.distributedQuery.fragmentCaSecretRef`. Setting `enabled: false`,
 or removing the block, renders the same local-only query Deployment. Either
 way, a block that was enabled and complete rolls the query Deployment back to
-local-only arguments. The operator deletes the NetworkPolicy only after it
-has applied that query Deployment. It does not wait for the rollout, so
-while the old pods are being replaced they can still accept connections on
-port 4319 from any pod in the namespace; the fragment listener's mutual TLS
-still refuses a peer without a certificate from the fragment CA. A pass that
-holds the query Deployment back, such as one reporting
+local-only arguments. The operator deletes the NetworkPolicy only once that
+query Deployment's rollout has completed: its `status.observedGeneration`
+equals its `metadata.generation`, `status.updatedReplicas` equals
+`status.replicas`, and `status.unavailableReplicas` is zero or absent. Until
+then the old pods, which still listen on port 4319, stay behind the policy,
+and every reconcile the Deployment's status changes trigger checks again. A
+pass that holds the query Deployment back, such as one reporting
 `AuditTokenKeyMissing`, deletes no NetworkPolicy. When enabling, the policy
 is applied even in such a pass, before the held-back Deployment.
 
+A change that narrows the policy while the block stays enabled, such as
+turning `spec.probes.dedicatedHealthPort` off, waits for the same rollout
+condition. While query pods of an older spec may still be running, the
+policy's second rule also admits every port those pods can listen on (4318
+and 4316), and the operator narrows it to the new spec's ports once the
+rollout completes. Disabling the block holds that wider policy too, from the
+first disabling pass, whenever the live query Deployment's pod template still
+opens port 4319 (so a port the new pods open, such as a dedicated health port
+turned on in the same change, is not blocked under the old policy), and the
+operator deletes the policy only once the rollout completes.
+
+"Rollout completes" means the query Deployment has no pod left on an older
+spec, including terminating ones: the operator also waits for
+`status.terminatingReplicas` to reach zero when the cluster reports it, so it
+does not delete or narrow the policy while an old pod is still shutting down
+on the fragment port. When the cluster does not report that field (before
+Kubernetes 1.33, or with the feature gate off) the operator cannot see
+terminating pods, so the policy can be removed while one lingers for up to
+that pod's termination grace period (45s, or 51s with the dedicated health
+port). The window is not closed, only narrowed: the fragment listener's own
+mutual TLS still refuses any peer that presents no certificate from the
+fragment CA.
+
 Upgrading the operator to a version with this block: apply
 `deploy/k8s/operator/rbac.yaml` before rolling out the new operator image.
-The operator deletes the fragment NetworkPolicy on every reconcile of a
-cluster without the block, and without the `networkpolicies` grant that
-delete fails and stops reconciliation of every `RavelCluster`.
+On a cluster without the block, a reconcile whose query rollout is complete
+issues a delete for any fragment NetworkPolicy, and without the
+`networkpolicies` grant that delete fails the reconcile. A cluster with the
+block already enabled sees one query rollout on the upgrade: the four
+Secrets' `resourceVersion`s now feed the query pod template's checksum (see
+below), which moves it once. If one of those four Secrets is missing, that
+upgrade pass holds the query Deployment back and reports `Degraded` naming
+the Secret, while the gateway and maintain Deployments still reconcile.
 
-`ravel-server` reads all four files once at startup, and their Secrets do
-not feed the pod-template secrets checksum, so editing one does not roll the
-query pods. After rotating a certificate or a key file, run
-`kubectl rollout restart deployment/<cluster>-query`, following the key
-rotation order in the deployment guide.
+`ravel-server` reads all four files once at startup, so the four Secrets'
+`resourceVersion`s feed the query pod template's secrets checksum, the same
+way the deployment key Secret's does: editing any one of them rolls the
+query pods, and leaves the gateway and maintain pods alone. The operator
+does not watch Secrets: it notices an edited Secret at its next reconcile of
+the `RavelCluster`, which can be up to 5 minutes (its resync interval) after
+the edit. A missing Secret that is created later is picked up within the same
+interval.
+
+Follow the key rotation order in the deployment guide: each edit in that
+sequence must be its own roll. Running `kubectl rollout status` right after an
+edit can report the previous, finished rollout, and an edit made then can
+coalesce into the same roll, which breaks the add, roll, remove order. After
+each edit, wait until the query Deployment shows a new rollout, either a
+changed `ravel.nofire.ai/secrets-checksum` annotation on its pod template or
+a new ReplicaSet:
+
+```sh
+kubectl get deployment <cluster>-query \
+  -o jsonpath='{.spec.template.metadata.annotations.ravel\.nofire\.ai/secrets-checksum}'
+kubectl get replicaset -l app.kubernetes.io/instance=<cluster>,app.kubernetes.io/component=query
+```
+
+Then wait for that rollout to finish with
+`kubectl rollout status deployment/<cluster>-query` before the next edit.
 
 ### Managed objects
 
