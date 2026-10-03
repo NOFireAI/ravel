@@ -1021,6 +1021,12 @@ impl RlogWriter {
         if total_rows == 0 {
             return Err(LogSegError::LimitExceeded("empty object".into()));
         }
+        // Stage 0c row-vs-columnar memory measurement (issue #2475): the same
+        // whole-encode hook build_object fires, at the columnar path's
+        // analogous points, reusing build_object's label names where the
+        // structure lines up. Unset cost is one `OnceLock::get` load.
+        let stage0_mode = stage0::MODE.load(std::sync::atomic::Ordering::Relaxed);
+        stage0::fire(stage0_mode, "before_index");
         let mut bases = Vec::with_capacity(batches.len());
         {
             let mut acc = 0usize;
@@ -1058,6 +1064,7 @@ impl RlogWriter {
         for (i, id) in sorted_ids.iter().enumerate() {
             ref_of.insert(*id, i as u32);
         }
+        stage0::fire(stage0_mode, "after_index");
 
         // Each clustering key's value per global row, read from the same
         // first per-record occurrence the row path reads.
@@ -1144,6 +1151,7 @@ impl RlogWriter {
                 stream_seeds.insert(*id, seed);
             }
         }
+        stage0::fire(stage0_mode, "after_columns");
 
         // Per-global-row fixed columns and derived data, built column by column
         // (no per-row struct, no per-attribute column_of probe).
@@ -1339,6 +1347,7 @@ impl RlogWriter {
                 perm
             }
         };
+        stage0::fire(stage0_mode, "after_resolve_rows");
 
         // Chunk into blocks, reproducing chunk_blocks/row_estimate. The dynamic
         // part is precomputed in `g_est_dyn`; the rest is byte-identical.
@@ -1701,6 +1710,7 @@ impl RlogWriter {
 
             blocks.push(out);
         }
+        stage0::fire(stage0_mode, "after_blocks");
 
         // STREAM_DIR.
         let total_blocks = spans.len() as u32;
@@ -1817,6 +1827,7 @@ impl RlogWriter {
                 &Stored::raw(postings_bytes),
             );
         }
+        stage0::fire(stage0_mode, "after_sections");
 
         let footer = LogFooter {
             tenant_hash: self.identity.tenant_hash,
@@ -1839,6 +1850,7 @@ impl RlogWriter {
             clustering_generation: self.clustering_generation,
         };
         write_footer_and_trailer(&mut object, &footer);
+        stage0::fire(stage0_mode, "before_return");
         Ok((
             object,
             WriteStats {
