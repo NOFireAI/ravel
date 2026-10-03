@@ -577,6 +577,14 @@ same bytes back. It applies to `Overwrite` only; a `CreateIfAbsent` or
 `CasVersion` put stays on the single-PUT path at every size (bounded by S3's
 5 GiB single-request limit) rather than silently dropping its precondition.
 `MemoryStore::put` has no threshold: there is no transport to chunk.
+Through a scheduled `ClassedStore` handle (`--store-scheduling`), one permit
+stands for one request in flight, so the handle's `put` takes one permit plus
+whatever free permits of its class it can take without waiting, up to the
+store's fan-out for the payload (`s3::put_fan_out`: up to 4 for an `Overwrite`
+above the threshold, otherwise 1), and the multipart path keeps no more parts
+in flight than the permits held. A class with no spare permit uploads the
+parts one at a time
+(`s3_http_faults::scheduled_large_put_keeps_requests_within_its_permits`).
 
 **Checksum coverage.** `put_part`'s optional `UploadChecksum` is verified
 per part, before the part is sent, with exactly the reach `PutOptions::checksum`
