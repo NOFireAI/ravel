@@ -105,10 +105,10 @@ fn current_version(signal: Signal) -> u32 {
     }
 }
 
-/// Two metrics inputs that share the series `keep`, so compaction merges its
-/// runs into one run carrying the per-sample provenance column, plus a
-/// `victim` series an erasure test can drop. The duplicate `(keep, 2000)`
-/// timestamp is the case the provenance column exists for.
+/// Two metrics inputs that both carry the series `keep` and `victim`, so
+/// compaction merges each series' runs into one run carrying the per-sample
+/// provenance column. An erasure test drops `victim`. The duplicate
+/// `(keep, 2000)` timestamp is the case the provenance column exists for.
 async fn seed_metrics(store: &dyn ObjectStoreBackend) -> ravel_maintain::Bucket {
     for spec in [
         InputSpec::new(
@@ -382,7 +382,7 @@ fn assert_current_successor(
 /// The fixture's predecessor carries a provenance column (asserted), so the
 /// comparison covers it. Removing the `provenance:` line in
 /// `reencode_rseg_part` (so every run is written with `None`) fails the
-/// row equality: the merged `keep` run loses its four provenance entries.
+/// row equality: all six samples lose their provenance entries.
 #[tokio::test]
 async fn metrics_reencode_serves_the_predecessors_exact_rows() {
     let store = MemoryStore::new();
