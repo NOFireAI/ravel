@@ -477,7 +477,9 @@ partition:
   taken from that list. The open prunes again over the same immutable object; if
   its survivor list differs from the plan's, the open fails with a typed
   `Corrupted` error naming a survivor mismatch instead of reading the
-  intersection (`an_open_that_prunes_differently_from_the_plan_fails_closed`).
+  intersection (`an_open_that_prunes_differently_from_the_plan_fails_closed`),
+  and a share naming a block that is not among the survivors fails the same way
+  (`a_raw_subset_refuses_on_survivor_mismatch`).
 - **Row groups are dealt whole.** With a read cache wired, `owned_work` numbers
   every surviving row group in segment-then-group order across the whole scan,
   where a row group is the PAGE_DIR group (`group_target_blocks` consecutive
