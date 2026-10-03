@@ -687,11 +687,11 @@ configured:
    it on a node with no safe local scratch storage. The other value, `auto`,
    is the default.
 2. `RAVEL_SQL_SPILL_DIR` and `RAVEL_SQL_SPILL_MAX_BYTES`, both set: spill goes
-   under that directory, and each query may hold at most that many bytes of
-   spill at once. The directory must already exist; the server does not
-   create it.
+   under that directory, and the process's queries together may hold at most
+   that many bytes of spill at once. The directory must already exist; the
+   server does not create it.
 3. `--cache-dir` set and `RAVEL_SQL_SPILL_DIR` unset: spill goes under
-   `<cache-dir>/sql-spill/<instance-id>`, with a derived per-query ceiling.
+   `<cache-dir>/sql-spill/<instance-id>`, with a derived ceiling.
    `RAVEL_SQL_SPILL_MAX_BYTES` set on its own replaces the derived ceiling.
 4. None of the above: spill is off and a query that outgrows its pool fails
    as it always has.
@@ -705,10 +705,18 @@ The derived ceiling is half the free bytes on the volume backing
 process memory budget (`memory_budget_bytes` in the startup log), and never
 below 1 GiB. On a volume with 200 GiB free and the 30,064,771,072-byte budget
 of a 30 GiB host, that is 107,374,182,400 bytes: half the free space, below
-the 120,259,084,288-byte cap. The ceiling applies to each query on its own.
-There is no per-tenant or per-node spill quota, so several queries spilling
-at once, or several processes sharing one cache volume, can together use more
-than one ceiling.
+the 120,259,084,288-byte cap.
+
+The ceiling is one budget for the whole process. A qualifying query reserves
+its own spill limit out of it before it starts: the ceiling, or whatever is
+left of it if that is less. When less than 64 MiB is left (or, under a
+ceiling smaller than 64 MiB, less than the whole ceiling), the query runs
+with spill off and a WARN line says why. The reservation is returned when
+the query ends. A query that starts while no other holds a reservation takes
+the whole ceiling, so a second qualifying query that starts while it runs
+gets no spill. There is no per-tenant spill quota, and nothing adds up the
+ceilings of several processes sharing one cache volume, so give each spilling
+process its own volume.
 
 Startup logs the result on two `performance default resolved` lines, in the
 same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
@@ -716,7 +724,7 @@ same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
 | `setting` | `value` | `source` |
 |---|---|---|
 | `sql_spill_dir` | the spill directory, or `none` | `env`, `cache-dir`, `flag-off` or `unset` |
-| `sql_spill_max_bytes` | the per-query ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `flag-off` or `unset` |
+| `sql_spill_max_bytes` | the process spill ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `flag-off` or `unset` |
 
 Under `--cache-dir` the layout is:
 

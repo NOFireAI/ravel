@@ -215,8 +215,12 @@ pub struct SpillConfig {
     /// otherwise fails with [`crate::SqlError::SpillUnavailable`] rather than
     /// creating anything outside it.
     pub dir: PathBuf,
-    /// Ceiling, in bytes, on the scratch this one query may hold on disk at
-    /// once. Enforced by DataFusion's disk manager
+    /// Ceiling, in bytes, on the scratch all of one executor's queries may
+    /// hold on disk at once. Each query granted spill reserves its own cap
+    /// out of it, `max_bytes` or whatever remains if that is less, and runs
+    /// with spill disabled when less than
+    /// [`MIN_SPILL_RESERVATION_BYTES`](crate::spill::MIN_SPILL_RESERVATION_BYTES)
+    /// remains. The cap is enforced by DataFusion's disk manager
     /// (`max_temp_directory_size`), which counts bytes written to spill files,
     /// not bytes decoded from them. Exceeding it is
     /// [`crate::SqlError::SpillBudgetExhausted`], never a partial result.

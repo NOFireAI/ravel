@@ -1281,7 +1281,8 @@ pub struct Cli {
     /// `--cache-dir` set, `<cache-dir>/sql-spill/<instance-id>` under a ceiling
     /// of half the volume's free bytes at startup, capped at four times the
     /// memory budget and floored at 1 GiB (`RAVEL_SQL_SPILL_MAX_BYTES` alone
-    /// replaces that ceiling); else no spill. `off` disables spill whatever the
+    /// replaces that ceiling); else no spill. The ceiling bounds all of the
+    /// process's queries together. `off` disables spill whatever the
     /// environment or `--cache-dir` says. The startup log's
     /// `sql_spill_dir` and `sql_spill_max_bytes` lines report the outcome.
     /// Meaningful only in a build with the `sql` feature and in a mode that
