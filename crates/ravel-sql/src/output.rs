@@ -23,7 +23,8 @@
 //!
 //! Integers of every width are JSON numbers. A timestamp of any unit is an
 //! integer count of nanoseconds since the epoch, its time zone dropped; one
-//! with no i64 nanosecond count is an error. `Date32` and `Date64` are
+//! with no i64 nanosecond count is an error. Such a count is usually past
+//! 2^53, so a client must parse JSON integers exactly to keep it. `Date32` and `Date64` are
 //! `YYYY-MM-DD` strings, and a value with no such form (a year outside 0000
 //! to 9999, or a `Date64` that is not a whole day) is an error. `Decimal128`
 //! is a string of its exact decimal text. Binary types are lowercase hex
