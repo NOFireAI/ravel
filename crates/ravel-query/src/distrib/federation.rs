@@ -1397,13 +1397,16 @@ mod tests {
     }
 
     /// Issue #2385: the Resolve request carries the deadline the caller
-    /// passed, and a remote that stopped at it fails the query with
-    /// `DeadlineExceeded` naming the request's own deadline even under
-    /// `skip_unavailable`, after its spend is folded into the query's handle.
+    /// passed, and a remote that stopped at it, once this coordinator's own
+    /// deadline has passed too, fails the query with `DeadlineExceeded`
+    /// naming the request's own deadline even under `skip_unavailable`, after
+    /// its spend is folded into the query's handle.
     ///
     /// Mutation proof: `deadline_unix_ns: 0` on the request records 0;
     /// deleting the `Timeout` arm fails the query with `Federation` instead;
-    /// a `Duration::ZERO` in `slice_deadline_exceeded` names zero.
+    /// a `Duration::ZERO` in `slice_deadline_exceeded` names zero; routing
+    /// every `TIMEOUT` through `handle_unavailable` skips the remote and the
+    /// `expect_err` fails.
     #[tokio::test]
     async fn a_remote_stopped_at_the_deadline_fails_the_query_and_reports_its_spend() {
         const DEADLINE_NS: i64 = 1_700_000_005_000_000_000;
@@ -1450,5 +1453,105 @@ mod tests {
         let folded = accounting.snapshot();
         assert_eq!(folded.total_s3_requests(), 1);
         assert_eq!(folded.total_s3_bytes(), 8_192);
+    }
+
+    /// A remote that answers `status` at once: one series for `Ok`, nothing
+    /// otherwise. `Timeout` is a peer whose wall clock runs ahead of the
+    /// coordinator's, refusing every request on arrival.
+    struct AnsweringFetcher(pb::status::Code);
+
+    const HEALTHY_SERIES: SeriesId = SeriesId([3u8; 16]);
+
+    #[async_trait]
+    impl SliceFetcher for AnsweringFetcher {
+        async fn fetch(&self, _r: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            let scalar = if self.0 == pb::status::Code::Ok {
+                vec![FetchedSeriesSoa {
+                    series_id: HEALTHY_SERIES,
+                    labels: ravel_types::LabelSet::default(),
+                    timestamps: vec![500],
+                    values: vec![1.0],
+                    created_unix_ns: 0,
+                    writer_epoch: 0,
+                    writer_seq: 0,
+                    per_sample_priorities: None,
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(SliceResponse {
+                scalar,
+                histogram: Vec::new(),
+                partials: Vec::new(),
+                accounting: QueryAccountingSnapshot::default(),
+                stats: FetchStats::default(),
+                series_returned: 0,
+                samples_returned: 0,
+                status: self.0,
+                status_message: "refused: the query's deadline has passed".to_string(),
+            })
+        }
+    }
+
+    /// A peer whose clock runs ahead (`skip` as given) beside a healthy one.
+    fn ahead_and_healthy(skip: bool) -> Federation {
+        Federation::new(vec![
+            RemoteCluster {
+                name: "ahead".to_string(),
+                fetcher: Arc::new(AnsweringFetcher(pb::status::Code::Timeout)),
+                tenant: None,
+                skip_unavailable: skip,
+                soft_timeout: Duration::from_secs(5),
+            },
+            RemoteCluster {
+                name: "healthy".to_string(),
+                fetcher: Arc::new(AnsweringFetcher(pb::status::Code::Ok)),
+                tenant: None,
+                skip_unavailable: false,
+                soft_timeout: Duration::from_secs(5),
+            },
+        ])
+    }
+
+    /// A peer that answers `TIMEOUT` while this coordinator's own deadline is
+    /// a year away compared the deadline on a clock running ahead: under
+    /// `skip_unavailable` it is skipped and the query answers from the other
+    /// cluster.
+    ///
+    /// Mutation proof: returning `DeadlineExceeded` for every `TIMEOUT`, as
+    /// before the coordinator carried its monotonic deadline, fails the
+    /// `expect`.
+    #[tokio::test]
+    async fn a_peer_whose_clock_runs_ahead_is_skipped_under_skip_unavailable() {
+        let outcome = run(&ahead_and_healthy(true))
+            .await
+            .expect("a TIMEOUT before the coordinator's deadline is skippable");
+
+        assert_eq!(outcome.skipped, vec!["ahead".to_string()]);
+        assert!(outcome.partial);
+        assert_eq!(
+            outcome.warnings,
+            vec!["remote cluster ahead unavailable; results are partial".to_string()]
+        );
+        assert_eq!(outcome.series.len(), 1, "one healthy cluster answered");
+        assert_eq!(outcome.series[0].len(), 1);
+        assert_eq!(outcome.series[0][0].series_id, HEALTHY_SERIES);
+    }
+
+    /// The same peer without `skip_unavailable` fails the query as an
+    /// unavailable cluster, not as a deadline the query never reached.
+    ///
+    /// Mutation proof: returning `DeadlineExceeded` for every `TIMEOUT` fails
+    /// the `Federation` match.
+    #[tokio::test]
+    async fn an_unskippable_peer_whose_clock_runs_ahead_fails_as_unavailable() {
+        let err = run(&ahead_and_healthy(false))
+            .await
+            .expect_err("an unskippable remote that did not answer fails the query");
+
+        assert!(
+            matches!(&err, QueryError::Federation { cluster, .. } if cluster == "ahead"),
+            "{err:?}"
+        );
     }
 }

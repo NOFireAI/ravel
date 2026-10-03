@@ -6311,6 +6311,10 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         /// `SliceStreamDecoder::finish` rather than out of `push`, after the
         /// summary's accounting was already accepted.
         UnknownStatusSummary,
+        /// The call is refused `Unauthenticated` before any frame: how a
+        /// worker that predates the in-band `TIMEOUT` refuses an expired
+        /// capability.
+        RefuseUnauthenticated,
     }
 
     /// The per-slice wire cap the two scripted flood endings are refused under,
@@ -6343,6 +6347,11 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             _request: tonic::Request<pb::FetchRequest>,
         ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
             self.attempts.fetch_add(1, Ordering::Relaxed);
+            if self.ending == Ending::RefuseUnauthenticated {
+                return Err(tonic::Status::unauthenticated(
+                    "fragment capability rejected: expired",
+                ));
+            }
             let summary = || Ok(self.spend.summary(self.code));
             let broke = || Err(tonic::Status::unavailable("worker went away mid-stream"));
             let flood = || (0..FLOOD_FRAMES).map(|i| Ok(flood_series_frame(i)));
@@ -6358,6 +6367,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 Ending::UnknownStatusSummary => {
                     vec![Ok(self.spend.summary_with_raw_status(UNKNOWN_STATUS_CODE))]
                 }
+                Ending::RefuseUnauthenticated => Vec::new(),
             };
             Ok(tonic::Response::new(Box::pin(futures::stream::iter(items))))
         }
@@ -7866,23 +7876,24 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         assert_eq!(outcome.series.len(), 1, "the peer's one series");
     }
 
-    /// Issue #2385, the coordinator half: a remote worker that ends a slice
-    /// `TIMEOUT` (it stopped at the query's deadline) ends the query.
+    /// Issue #2385, the coordinator half: a remote worker that answers a slice
+    /// `TIMEOUT` while the coordinator's own deadline is still ahead compared
+    /// the query's wall-clock deadline on a clock running ahead. That does not
+    /// end the query: the worker is not quarantined, and the slice is
+    /// re-dispatched and then read locally, bounded by the coordinator's own
+    /// deadline.
     ///
     /// Both live workers answer the same way, so the total attempt count is
     /// the re-dispatch check whichever of them ranks first. The coordinator's
-    /// local fragment service reads through its own call counter, so zero
-    /// there means no local read of the slice; the quarantine map and the
-    /// re-dispatch and fallback counters say the worker was not treated as
-    /// dead. The fragment stats entry carries the stopped attempt's spend, and
-    /// the query fails `DeadlineExceeded` with its own request deadline.
+    /// local fragment service reads through its own call counter, so a
+    /// nonzero count there is the local read of the slice. The fragment stats
+    /// entry carries both stopped attempts' spend plus the local read's.
     ///
-    /// Mutation proof: classifying a `TIMEOUT` summary as `Attempt::Retry` in
-    /// `try_remote`, which is how a transport loss is handled, sends the slice
-    /// down the re-dispatch ladder to a local read that answers the query, so
-    /// the `expect_err` below fails.
+    /// Mutation proof: keeping every `TIMEOUT` summary `Attempt::Keep` in
+    /// `try_remote`, whatever the coordinator's deadline, ends the query with
+    /// `DeadlineExceeded` and the `unwrap_or_else` below panics.
     #[tokio::test]
-    async fn a_worker_stopped_at_the_deadline_ends_the_query_without_a_retry() {
+    async fn a_worker_timeout_before_the_coordinators_deadline_is_rerouted_without_quarantine() {
         const PAID: Spend = Spend {
             get_requests: 2,
             get_bytes: 6_144,
@@ -7944,33 +7955,222 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         )
         .await;
 
-        let err = outcome.expect_err("a slice stopped at the deadline ends the query");
+        let outcome = outcome.unwrap_or_else(|err| panic!("the slice is read elsewhere: {err:?}"));
         assert!(
-            matches!(err, ravel_query::QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
-            "{err:?}"
+            matches!(&outcome.0, ravel_promql::Value::Vector(samples) if samples.len() == 1),
+            "the local read answers the one series: {:?}",
+            outcome.0
         );
         assert_eq!(
             tries_a.load(Ordering::Relaxed) + tries_b.load(Ordering::Relaxed),
-            1,
-            "dispatched once and never re-dispatched"
+            2,
+            "dispatched, then re-dispatched once"
         );
-        assert_eq!(
-            local_store.issued(),
-            0,
-            "the coordinator issued no local read for the slice"
+        assert!(
+            local_store.issued() > 0,
+            "the coordinator read the slice itself"
         );
         assert!(
             routing.quarantine.lock().is_empty(),
-            "a worker that stopped at the deadline is healthy, not quarantined"
+            "a worker whose clock runs ahead is alive, not quarantined"
         );
-        assert_eq!(metrics.quarantine_current(), 0);
-        assert_eq!(metrics.slices_redispatched_total(), 0);
-        assert_eq!(metrics.slices_fallback_total(), 0);
+        assert_eq!(metrics.quarantine_marks_total(), 0);
+        assert_eq!(metrics.slices_redispatched_total(), 1);
+        assert_eq!(metrics.slices_fallback_total(), 1);
         let recorded = sink.take();
         assert_eq!(recorded.len(), 1, "one slice, one entry: {recorded:?}");
-        assert_eq!(
-            recorded[0].bytes_reported, PAID.get_bytes,
-            "the stopped attempt's spend is reported"
+        assert_eq!(recorded[0].status, "fallback");
+        assert!(
+            recorded[0].bytes_reported > 2 * PAID.get_bytes,
+            "both stopped attempts' spend rides on the local answer, plus its own: {}",
+            recorded[0].bytes_reported
         );
+    }
+
+    /// A routing coordinator over `store` whose live worker set holds
+    /// `endpoints` (and not itself), so every slice routes to them and a
+    /// quarantine mark has a heartbeat stamp to record.
+    fn coordinator_with_live(
+        store: Arc<dyn ObjectStoreBackend>,
+        now_ns: i64,
+        endpoints: &[&str],
+    ) -> RoutingSliceFetcher {
+        let live = endpoints
+            .iter()
+            .enumerate()
+            .map(|(i, endpoint)| QueryWorkerRecord {
+                process_id: uuid::Uuid::from_u128(100 + i as u128).to_string(),
+                fragment_endpoint: endpoint.to_string(),
+                flight_sql_endpoint: endpoint.to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 0,
+            })
+            .collect();
+        RoutingSliceFetcher::new(
+            Arc::new(OnceLock::new()),
+            Arc::new(RwLock::new(Arc::new(live))),
+            test_keys(),
+            pinned_service(store, now_ns),
+            Arc::new(FragmentMetrics::new()),
+        )
+    }
+
+    /// A deadline on the coordinator's monotonic clock a year away.
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600)
+    }
+
+    /// Issue #2385: once the coordinator's own deadline has passed, a
+    /// worker's `TIMEOUT` ends the slice. It is not re-dispatched, not read
+    /// locally, and the worker is not quarantined; the slice's `fragments[]`
+    /// entry says `timeout` and carries what the worker spent.
+    ///
+    /// Mutation proof: treating the deadline as never passed in `try_remote`
+    /// re-dispatches the slice, so the attempt and fallback assertions fail;
+    /// recording `"ok"` for a `TIMEOUT` response in `record_fragment_stat`
+    /// fails the status assertion.
+    #[tokio::test]
+    async fn a_worker_timeout_after_the_coordinators_deadline_ends_the_slice() {
+        const PAID: Spend = Spend {
+            get_requests: 2,
+            get_bytes: 6_144,
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        };
+        let (store, now, request, _local_only) = one_slice_corpus("timeout-after-deadline").await;
+        let (endpoint, tries, _keep) =
+            spawn_scripted(PAID, pb::status::Code::Timeout, Ending::Summary).await;
+        let routing = coordinator_with_live(store, now, &[&endpoint]);
+
+        let sink = FragmentStatsSink::new();
+        let result = with_fragment_stats(
+            sink.clone(),
+            routing.fetch_within(request, tokio::time::Instant::now()),
+        )
+        .await;
+
+        let response = result.expect("the worker's TIMEOUT summary is the slice's answer");
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(tries.load(Ordering::Relaxed), 1);
+        assert!(routing.quarantine.lock().is_empty());
+        assert_eq!(routing.metrics.slices_redispatched_total(), 0);
+        assert_eq!(routing.metrics.slices_fallback_total(), 0);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].status, "timeout");
+        assert_eq!(recorded[0].bytes_reported, PAID.get_bytes);
+    }
+
+    /// Issue #2385, mixed versions: a worker that predates the in-band
+    /// `TIMEOUT` refuses a capability that has expired on the coordinator's
+    /// clock with `Unauthenticated`. That says nothing about the worker's
+    /// health, so it is never quarantined for it. Before the coordinator's
+    /// own deadline the slice falls back to a local read; after it, the slice
+    /// ends `TIMEOUT`.
+    ///
+    /// Mutation proof: deleting the expired-capability arm in `try_remote`
+    /// classifies the refusal as a transport loss, which quarantines the
+    /// worker in both halves.
+    #[tokio::test]
+    async fn an_older_workers_expired_capability_refusal_does_not_quarantine_it() {
+        const NOTHING: Spend = Spend {
+            get_requests: 0,
+            get_bytes: 0,
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        };
+
+        // Before the coordinator's deadline: read locally.
+        let (store, now, mut request, _local_only) = one_slice_corpus("expired-cap-early").await;
+        request.deadline_unix_ns = now;
+        let (endpoint, tries, _keep) =
+            spawn_scripted(NOTHING, pb::status::Code::Ok, Ending::RefuseUnauthenticated).await;
+        let routing = coordinator_with_live(store, now, &[&endpoint]);
+        let wire_bytes = AtomicU64::new(0);
+        let (result, _endpoint, fell_back) = routing
+            .dispatch(
+                vec![Owner::Remote(endpoint)],
+                request,
+                &wire_bytes,
+                Some(far_deadline()),
+            )
+            .await;
+        let response = result.expect("the local read answers");
+        assert_eq!(response.status, pb::status::Code::Ok);
+        assert!(fell_back);
+        assert_eq!(tries.load(Ordering::Relaxed), 1);
+        assert!(
+            routing.quarantine.lock().is_empty(),
+            "an expired capability is not a dead worker"
+        );
+        assert_eq!(routing.metrics.quarantine_marks_total(), 0);
+
+        // After it: the slice ends TIMEOUT, so the query fails as a deadline.
+        let (store, now, mut request, _local_only) = one_slice_corpus("expired-cap-late").await;
+        request.deadline_unix_ns = now;
+        let (endpoint, tries, _keep) =
+            spawn_scripted(NOTHING, pb::status::Code::Ok, Ending::RefuseUnauthenticated).await;
+        let routing = coordinator_with_live(store, now, &[&endpoint]);
+        let wire_bytes = AtomicU64::new(0);
+        let (result, _endpoint, fell_back) = routing
+            .dispatch(
+                vec![Owner::Remote(endpoint)],
+                request,
+                &wire_bytes,
+                Some(tokio::time::Instant::now()),
+            )
+            .await;
+        let response = result.expect("the refusal ends the slice in-band");
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert!(!fell_back);
+        assert_eq!(tries.load(Ordering::Relaxed), 1);
+        assert!(routing.quarantine.lock().is_empty());
+        assert_eq!(routing.metrics.quarantine_marks_total(), 0);
+    }
+
+    /// The control for the test above: a worker that fails a slice whose
+    /// deadline has not passed on the coordinator's clock is still
+    /// quarantined, whether it refused the call `Unauthenticated` or the
+    /// stream broke.
+    ///
+    /// Mutation proof: dropping the wall-clock check from the expired-
+    /// capability arm in `try_remote` stops quarantining the `Unauthenticated`
+    /// worker, and the first half fails.
+    #[tokio::test]
+    async fn a_failing_worker_before_the_wall_deadline_is_still_quarantined() {
+        const NOTHING: Spend = Spend {
+            get_requests: 0,
+            get_bytes: 0,
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        };
+        for (name, ending) in [
+            ("refused-live-cap", Ending::RefuseUnauthenticated),
+            ("broken-stream", Ending::BreakOnly),
+        ] {
+            let (store, now, mut request, _local_only) = one_slice_corpus(name).await;
+            request.deadline_unix_ns = now + HOUR_NS;
+            let (endpoint, tries, _keep) =
+                spawn_scripted(NOTHING, pb::status::Code::Ok, ending).await;
+            let routing = coordinator_with_live(store, now, &[&endpoint]);
+            let wire_bytes = AtomicU64::new(0);
+            let (result, _endpoint, fell_back) = routing
+                .dispatch(
+                    vec![Owner::Remote(endpoint.clone())],
+                    request,
+                    &wire_bytes,
+                    Some(far_deadline()),
+                )
+                .await;
+            result.unwrap_or_else(|err| panic!("{name}: the local read answers: {err:?}"));
+            assert!(fell_back, "{name}");
+            assert_eq!(tries.load(Ordering::Relaxed), 1, "{name}");
+            assert_eq!(
+                routing.quarantine.lock().get(&endpoint).copied(),
+                Some(0),
+                "{name}: the failing worker is quarantined at its stamp"
+            );
+            assert_eq!(routing.metrics.quarantine_marks_total(), 1, "{name}");
+        }
     }
 }
