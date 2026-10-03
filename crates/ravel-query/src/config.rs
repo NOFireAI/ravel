@@ -477,14 +477,16 @@ pub struct ResolvedLogsFetch {
     /// object is ever routed to the ranged path, overriding an explicit
     /// `--logs-block-range-threshold`.
     pub block_range_threshold: u64,
-    /// The projection break-even under cost-based with a finite rate
-    /// (ADR-2414 decision A3): `max(block_range_threshold,
+    /// The projection break-even when a cost-based derivation produced a
+    /// finite rate ([`Self::rate_term`] is `Price` or `Time`, ADR-2414
+    /// decision A3): `max(block_range_threshold,
     /// WHOLE_OBJECT_REQUEST_MULTIPLE * request_cost_bytes)`, the bytes a
     /// narrow projection must save before the fast path reads it ranged and
-    /// before the ranged fetch skips its whole-object size crossover
-    /// ([`EngineConfig::logs_projection_break_even_bytes`]). `None` under every
-    /// other policy and under a saturated rate, where the break-even stays the
-    /// routing threshold verbatim.
+    /// the object size at or below which the ranged fetch reads the object
+    /// whole ([`EngineConfig::logs_projection_break_even_bytes`]). `None`
+    /// under every other policy, under a saturated rate, and under an explicit
+    /// `--logs-request-cost-bytes`, where the break-even stays the routing
+    /// threshold verbatim.
     pub projection_break_even_bytes: Option<u64>,
     /// Set to the operator's explicit `--logs-block-range-threshold` when the
     /// resolution overrode it, so the startup path can log the overridden flag
@@ -553,13 +555,14 @@ impl ResolvedLogsFetch {
 /// request-minimal policy); the 64 KiB gap and 512 KiB crossover floors are
 /// applied downstream in the fetch layer.
 ///
-/// Under cost-based with a finite rate the projection break-even is
-/// `max(block_range_threshold, WHOLE_OBJECT_REQUEST_MULTIPLE *
-/// request_cost_bytes)`, which an explicit `--logs-request-cost-bytes` feeds
-/// too: the routing threshold bounds which objects take the block-range path
-/// at all, and the break-even bounds which narrow projections are worth a
-/// ranged read. The other policies keep the routing threshold as the
-/// break-even.
+/// When the cost-based derivation produces a finite rate, the projection
+/// break-even is `max(block_range_threshold, WHOLE_OBJECT_REQUEST_MULTIPLE *
+/// request_cost_bytes)`: the routing threshold bounds which objects take the
+/// block-range path at all, and the break-even bounds which narrow
+/// projections are worth a ranged read. Every other resolution keeps the
+/// routing threshold as the break-even, including an explicit
+/// `--logs-request-cost-bytes` under cost-based, which keeps a deployment
+/// that sets it on exactly ADR-0904's routing.
 pub fn resolve_logs_fetch(
     policy: LogsFetchPolicy,
     profile: &StoreCostProfile,
@@ -602,7 +605,10 @@ pub fn resolve_logs_fetch(
         (configured_block_range_threshold, None)
     };
 
-    let projection_break_even_bytes = (policy == LogsFetchPolicy::CostBased && !saturates_routing)
+    // The break-even pairs with a rate the cost-based derivation produced: an
+    // explicit byte flag keeps the deployment on ADR-0904's routing, where the
+    // routing threshold is the break-even.
+    let projection_break_even_bytes = matches!(rate_term, Some(RateTerm::Price | RateTerm::Time))
         .then(|| {
             block_range_threshold
                 .max(request_cost_bytes.saturating_mul(crate::WHOLE_OBJECT_REQUEST_MULTIPLE))
@@ -1407,8 +1413,8 @@ mod tests {
 
         // The same escape hatch under cost-based: an explicit finite rate
         // replaces the profile's derived one, the configured routing threshold
-        // stays in force, and the break-even is derived from the explicit
-        // rate: max(524,288, 5 * 123,456 = 617,280).
+        // stays in force, and no break-even is resolved, so the deployment
+        // keeps ADR-0904's routing (the threshold is the break-even).
         let cb = resolve_logs_fetch(
             LogsFetchPolicy::CostBased,
             &profile,
@@ -1423,7 +1429,7 @@ mod tests {
             cb.block_range_threshold,
             crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
         );
-        assert_eq!(cb.projection_break_even_bytes, Some(617_280));
+        assert_eq!(cb.projection_break_even_bytes, None);
         assert_eq!(cb.saturated_profile, None);
     }
 
