@@ -60,8 +60,9 @@
 //! amendment): a bucket whose one compaction record has parts below the
 //! current segment format version gets those parts re-encoded at the current
 //! version and a version 2 compaction record that supersedes the old one. It
-//! sits behind [`CompactorConfig::reencode_writer_enabled`], off by default,
-//! and has no production caller yet.
+//! sits behind [`CompactorConfig::reencode_writer_enabled`], off by default.
+//! Its caller is the `migrate` walk ([`crate::migrate::migrate_family`]); no
+//! operator surface turns the switch on yet.
 
 use std::collections::BTreeMap;
 
@@ -525,6 +526,14 @@ pub enum MigrateOutcome {
     /// The migration took the bucket's claim and lost it before its record PUT,
     /// and cancelled at `at` with nothing published.
     Cancelled { at: Checkpoint },
+    /// The pre-publish re-list found a record set other than the one this run
+    /// planned from, and the new listing holds no tombstone, compaction record
+    /// or rewrite record (an L0 commit record came or went), so the run
+    /// published nothing (ADR-1029, the 2026-10-03 amendment). A later run
+    /// plans again. A new listing that holds one of those is reported as
+    /// [`Self::Tombstoned`], [`Self::AlreadyCompacted`] or
+    /// [`Self::RewritePresent`].
+    RecordSetChanged,
 }
 
 /// EM's compaction-variant caller of the shared primitive: migrate a sealed
@@ -685,10 +694,7 @@ async fn migrate_bucket_format_scoped(
         // from, so it published nothing: report the gate the new listing
         // fails, an erasure rewrite record above all.
         FencedRewrite::RecordSetChanged(now) => {
-            migrate_listing_gate(&now).unwrap_or(MigrateOutcome::Rewritten {
-                parts: 0,
-                publish: PublishOutcome::Abandoned,
-            })
+            migrate_listing_gate(&now).unwrap_or(MigrateOutcome::RecordSetChanged)
         }
     })
 }
@@ -837,7 +843,7 @@ pub enum ReencodeOutcome {
 
 /// The segment format version the current writer emits for `signal`'s
 /// compaction parts.
-fn current_part_version(signal: Signal) -> Result<u32> {
+pub(crate) fn current_part_version(signal: Signal) -> Result<u32> {
     match signal {
         Signal::Metrics => Ok(crate::build::OUTPUT_FORMAT_VERSION),
         Signal::Logs => Ok(crate::rlog::OUTPUT_FORMAT_VERSION),
@@ -882,8 +888,9 @@ fn current_part_version(signal: Signal) -> Result<u32> {
 /// publishes nothing if the record set changed (ADR-1029, the 2026-10-03
 /// amendment), the same fence compaction and the erasure rewrite use.
 ///
-/// Nothing in production calls this yet: `migrate` wiring is ADR-0066 force 2
-/// task T6.
+/// The `migrate` walk calls this for a bucket held below its target only by
+/// its one compaction record's parts (ADR-0066 force 2 task T6,
+/// [`crate::migrate::migrate_family`]).
 pub async fn reencode_compaction_parts(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
