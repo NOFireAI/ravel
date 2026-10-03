@@ -191,7 +191,9 @@ while q33 is reported as a 43rd row.
   ceiling the server has no derivation for, and the statement fits in memory
   on the reference box once the per-query share is right. Spill stays the
   operator's lever for smaller hosts, and the `Sort` admission it needs for
-  this statement is decided with it on issue #2416.
+  this statement is decided with it on issue #2416. (Superseded: see the
+  issue #2416 spill amendment below, which turns spill on by default under
+  `--cache-dir`.)
 - **A streaming top-k for q33.** The running `COUNT` is a lower bound on a
   group's final count and not monotone with the final order, so no exact
   short-cut exists over an unsorted scan (noted on #837).
@@ -223,7 +225,9 @@ while q33 is reported as a 43rd row.
   wants the old split sets `--sql-max-query-bytes` to half the tenant
   ceiling, 25% of memory.
 - Spill eligibility is unchanged; a `Sort` over an aggregate still refuses
-  spill until the tie-order question is answered on issue #2416.
+  spill until the tie-order question is answered on issue #2416. (Superseded:
+  see the issue #2416 spill amendment below, which admits that `Sort` once
+  its key is made total.)
 - The store cost profile gains two measured constants per profile (request
   latency, per-connection throughput) with the date and host they were
   measured on; a profile without them keeps the price-only rate.
@@ -241,3 +245,26 @@ flowchart LR
     W --> X
     D --> X
 ```
+
+## Amendment (2026-10-03): spill on by default under --cache-dir, and the Sort admitted (issue #2416)
+
+<!-- amendment-applies: sections="Rejected alternatives|Consequences" pointer="issue #2416 spill amendment" -->
+
+This is the issue #2416 spill amendment. Two statements above no longer
+hold; both now carry a pointer here, and the rest of this ADR stands.
+
+- The rejected alternative "Enable spill by default" is superseded. The
+  server now derives both things that alternative lacked: with `--cache-dir`
+  set and no spill environment, spill goes under
+  `<cache-dir>/sql-spill/<instance-id>` with a ceiling derived from the
+  volume's free bytes and the memory budget, and `--sql-spill off` turns it
+  off. ADR-0954's cache-dir spill default amendment records the rules.
+- The consequence "a `Sort` over an aggregate still refuses spill" is
+  superseded. A `Sort` directly over a spill-exact aggregate, or over a
+  projection directly over one, now has the aggregate's group keys appended
+  as trailing tiebreak terms, which makes its key total, and is then
+  spill-eligible. That is the tie-order proof decision B2 asked for. The
+  terms are appended whatever the spill setting, so q33 returns the same top
+  ten with spill forced and with spill off.
+
+Decision B2 itself stands as a record of what this ADR did not change.
