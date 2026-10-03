@@ -1237,4 +1237,25 @@ mod tests {
         assert!(swept);
         assert_usable(&owner, root.path(), "inst-dead");
     }
+
+    /// A root swept away under `acquire` on both attempts is an error naming
+    /// the root, not a third attempt and not an owner of a removed root.
+    #[test]
+    fn an_acquire_that_loses_its_root_twice_refuses() {
+        let root = tempfile::tempdir().expect("temp root");
+        let sweeper = SpillRootOwner::acquire(root.path(), "inst-1").expect("sweeper");
+        let mut sweeps = 0;
+        let err = match SpillRootOwner::acquire_with(root.path(), "inst-dead", &mut || {
+            sweeps += 1;
+            sweeper.sweep_orphaned_spill_roots();
+        }) {
+            Ok(_) => panic!("a root lost on both attempts must not be owned"),
+            Err(err) => err,
+        };
+        assert_eq!(sweeps, 2, "exactly two attempts");
+        assert!(
+            err.to_string().contains("inst-dead") && err.to_string().contains("twice"),
+            "the error names the root and the cause: {err}"
+        );
+    }
 }
