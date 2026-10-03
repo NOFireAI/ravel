@@ -2066,20 +2066,13 @@ async fn reconcile_inner(
             (None, None, false)
         };
 
-    let mut tiers = TierDeployments {
-        gateway: Some(desired.gateway_deployment),
-        // Withheld (`None`) when the audit-token-key is missing (#1487 rework)
-        // or a referenced distributed-query Secret does not exist (#2403): any
-        // existing query Deployment is left exactly as it is rather than rolled
-        // to a spec whose pods could not start.
-        query: query_tier_apply_target(
-            &obj.spec,
-            distributed_query_secret_missing,
-            desired.query_deployment,
-        ),
-        maintain: desired.maintain_deployment,
-        applied: BTreeMap::new(),
-    };
+    let mut tiers = TierDeployments::new(
+        &obj.spec,
+        distributed_query_secret_missing,
+        desired.gateway_deployment,
+        desired.query_deployment,
+        desired.maintain_deployment,
+    );
     // Maintain disabled: converge its Deployment away.
     if tiers.maintain.is_none() {
         delete_if_present(&deployments, &maintain_name).await?;
@@ -2289,6 +2282,27 @@ struct TierDeployments {
 }
 
 impl TierDeployments {
+    /// The tiers to apply this pass. The query Deployment is withheld
+    /// (`None`) when the audit-token-key is missing (#1487 rework) or a
+    /// referenced distributed-query Secret does not exist (#2403): any existing
+    /// query Deployment is left exactly as it is rather than rolled to a spec
+    /// whose pods could not start. Neither case touches the gateway or maintain
+    /// Deployment.
+    fn new(
+        spec: &RavelClusterSpec,
+        distributed_query_secret_missing: bool,
+        gateway: Deployment,
+        query: Deployment,
+        maintain: Option<Deployment>,
+    ) -> Self {
+        Self {
+            gateway: Some(gateway),
+            query: query_tier_apply_target(spec, distributed_query_secret_missing, query),
+            maintain,
+            applied: BTreeMap::new(),
+        }
+    }
+
     /// Apply one tier's Deployment, stamping namespace and owner references.
     /// A tier the render withheld (or one already applied this pass) is a
     /// no-op.
@@ -4814,6 +4828,50 @@ mod tests {
         assert!(
             query_tier_apply_target(&keyed, false, Deployment::default()).is_some(),
             "with the Secret present the query tier applies normally"
+        );
+    }
+
+    /// A missing distributed-query Secret holds back the query Deployment only:
+    /// the gateway and maintain Deployments are still applied this pass.
+    /// Guarding lines: `gateway: Some(gateway)` and `maintain` in
+    /// `TierDeployments::new`; gate either on `distributed_query_secret_missing`
+    /// and the matching assertion fails.
+    #[test]
+    fn missing_distributed_query_secret_still_applies_gateway_and_maintain() {
+        let mut keyed = spec_with_affinity(None);
+        keyed.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "dk".to_string(),
+        });
+        let named = |name: &str| Deployment {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tiers = TierDeployments::new(
+            &keyed,
+            true,
+            named("rc-gateway"),
+            named("rc-query"),
+            Some(named("rc-maintain")),
+        );
+        assert!(tiers.query.is_none(), "the query Deployment is held back");
+        assert_eq!(
+            tiers
+                .gateway
+                .as_ref()
+                .and_then(|d| d.metadata.name.as_deref()),
+            Some("rc-gateway"),
+            "the gateway Deployment still applies"
+        );
+        assert_eq!(
+            tiers
+                .maintain
+                .as_ref()
+                .and_then(|d| d.metadata.name.as_deref()),
+            Some("rc-maintain"),
+            "the maintain Deployment still applies"
         );
     }
 
