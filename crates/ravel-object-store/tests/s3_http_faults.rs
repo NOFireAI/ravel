@@ -516,9 +516,7 @@ impl FakeS3 {
 
     /// Wait until at least `target` requests are in flight.
     async fn wait_in_flight(&self, target: usize) {
-        self.state
-            .wait_for(&self.state.in_flight, target)
-            .await;
+        self.state.wait_for(&self.state.in_flight, target).await;
     }
 
     /// The most requests of any kind the endpoint has served at once.
