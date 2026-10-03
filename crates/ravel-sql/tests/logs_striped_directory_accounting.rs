@@ -743,8 +743,9 @@ fn section_len(obj: &[u8], k: u32) -> u64 {
 /// one-block group. Each partition's crossover weighs its own span, so the
 /// first issues one covering range of exactly its group and the second one
 /// range of its group: wire bytes are the two spans plus the BLOOM range both
-/// ask for, within the object's length. One partition owns every block and
-/// takes the one whole-object GET.
+/// ask for, within the object's length. One partition, routed through the
+/// striped path by a predicate every block passes, owns every block and takes
+/// the one whole-object GET.
 ///
 /// Fails against the whole-object crossover on a partial share (the first
 /// partition moves the object, and the sum passes its length) and against a
@@ -791,15 +792,24 @@ async fn a_partial_share_crossover_moves_its_own_span() {
     );
     assert!(run.phases.scan.s3_bytes[get] <= obj.len() as u64);
 
+    // One partition with a predicate every block passes: the fast path
+    // refuses the predicate, so the striped route runs with one share owning
+    // every row group, the full-share crossover this half pins.
+    let keep_all = vec![col(attr_name(0)).lt(lit(C0_BELOW))];
     let whole = run_scan(
         &snapshot,
         1,
         short_probe_fetcher(Arc::clone(&store), None),
         None,
-        &[],
+        &keep_all,
     )
     .await;
     assert_eq!(whole.rows, SHORT_BLOCKS);
+    assert_eq!(
+        sum_metric(&whole.plan, "fast_path_rejected_block_predicate"),
+        1,
+        "the striped route"
+    );
     assert_eq!(
         (
             whole.phases.scan.s3_requests[get],
