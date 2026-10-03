@@ -2523,6 +2523,7 @@ impl LogSegmentFetcher {
         // that must never restrict the object-level candidate set below.
         let owned_blocks = raw.then(|| OwnedBlocks {
             blocks: indices,
+            survivors: expected_survivors,
             dirs: dirs.map(|d| &**d),
         });
         let Some((bytes, _blocks_read)) = self
@@ -3890,10 +3891,13 @@ pub struct CarriedFooter<'a> {
 ///
 /// `blocks` is ascending. With `dirs` the ranged read fetches and decodes none
 /// of STREAM_DIR, FIELD_DIR, SKIP_IDX or PAGE_DIR: the reader built over the
-/// result takes them from `dirs`.
+/// result takes them from `dirs`. `survivors` is the segment's whole
+/// surviving-block list, of which `blocks` is this partition's share: the
+/// row groups it touches are the ones some partition owns.
 #[derive(Clone, Copy)]
 struct OwnedBlocks<'a> {
     blocks: &'a [usize],
+    survivors: &'a [usize],
     dirs: Option<&'a SegmentDirectories>,
 }
 
@@ -6092,7 +6096,6 @@ impl BlockRangeFetcher {
         let key = seg_ref.data_object_key.as_str();
         let total_size = seg_ref.object_size;
         let dirs = owned_blocks.and_then(|o| o.dirs);
-        let owned_blocks = owned_blocks.map(|o| o.blocks);
         let blocks_desc = *footer
             .section(kind::BLOCKS)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing BLOCKS".into())))?;
@@ -6246,19 +6249,29 @@ impl BlockRangeFetcher {
         // fetch for one object stay disjoint and their wire bytes sum to at
         // most the object's size.
         let mut fences: Vec<(u64, u64)> = Vec::new();
-        // Whether another partition owns a row group of this object: only then
-        // is a whole-object read someone else's bytes as well as this share's.
+        // Whether another partition owns one of the row groups this segment's
+        // surviving blocks sit in: only then is a whole-object read someone
+        // else's bytes as well as this share's. A row group whose blocks were
+        // all pruned is owned by no partition, so it is weighed from the
+        // segment's survivor list, not from every group PAGE_DIR lists.
         let mut partial_share = false;
-        if let Some(owned) = owned_blocks {
-            let owned_groups: HashSet<u32> = owned
+        if let Some(OwnedBlocks {
+            blocks: owned,
+            survivors,
+            ..
+        }) = owned_blocks
+        {
+            let group_of = |b: usize| {
+                u32::try_from(b)
+                    .ok()
+                    .and_then(|b| page_dir.locate_block(b))
+                    .map(|(g, _)| g.first_block)
+            };
+            let owned_groups: HashSet<u32> = owned.iter().filter_map(|&b| group_of(b)).collect();
+            partial_share = survivors
                 .iter()
-                .filter_map(|&b| u32::try_from(b).ok())
-                .filter_map(|b| page_dir.locate_block(b).map(|(g, _)| g.first_block))
-                .collect();
-            partial_share = page_dir
-                .groups
-                .iter()
-                .any(|g| !owned_groups.contains(&g.first_block));
+                .filter_map(|&b| group_of(b))
+                .any(|g| !owned_groups.contains(&g));
             let foreign: Vec<usize> = candidates
                 .iter()
                 .copied()
@@ -6308,8 +6321,9 @@ impl BlockRangeFetcher {
         // or an all-columns read of such an object would skip `covering_read`
         // and its whole-object cache admission entirely.
         //
-        // A partial share (another partition owns a row group of this object)
-        // never reads the whole object: that would move the other shares' bytes
+        // A partial share (another partition owns a row group holding some of
+        // this object's surviving blocks) never reads the whole object: that
+        // would move the other shares' bytes
         // again. It weighs its runs against its own span instead, from its first
         // wanted page to its last with any fence inside it counted, and on
         // crossing joins every gap between its runs that holds no fence. A share
@@ -13033,6 +13047,9 @@ mod owned_block_plan_tests {
     const KEY: &str = "t/owned.rlog";
     const GROUP_BLOCKS: usize = 4;
     const BLOCKS: usize = 3 * GROUP_BLOCKS;
+    /// Every block of a [`BLOCKS`]-block fixture: the survivor list of a
+    /// query that prunes nothing.
+    const EVERY_BLOCK: [usize; BLOCKS] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
     /// With `two_streams`, even timestamps belong to one stream and odd ones to
     /// another, so a stream-attribute filter has something to select; the
@@ -13230,6 +13247,7 @@ mod owned_block_plan_tests {
             i64::MIN,
             Some(OwnedBlocks {
                 blocks: &owned,
+                survivors: &EVERY_BLOCK,
                 dirs: None,
             }),
         )
@@ -13267,6 +13285,7 @@ mod owned_block_plan_tests {
             2,
             Some(OwnedBlocks {
                 blocks: &owned,
+                survivors: &EVERY_BLOCK,
                 dirs: None,
             }),
         )
@@ -13300,6 +13319,7 @@ mod owned_block_plan_tests {
             i64::MIN,
             Some(OwnedBlocks {
                 blocks: &owned,
+                survivors: &EVERY_BLOCK,
                 dirs: Some(&dirs),
             }),
         )
@@ -13312,6 +13332,7 @@ mod owned_block_plan_tests {
             i64::MIN,
             Some(OwnedBlocks {
                 blocks: &owned,
+                survivors: &EVERY_BLOCK,
                 dirs: None,
             }),
         )
@@ -13396,6 +13417,7 @@ mod owned_block_plan_tests {
         let own = |blocks| {
             Some(OwnedBlocks {
                 blocks,
+                survivors: &EVERY_BLOCK,
                 dirs: Some(&dirs),
             })
         };
@@ -13527,6 +13549,7 @@ mod owned_block_plan_tests {
         let own = |blocks| {
             Some(OwnedBlocks {
                 blocks,
+                survivors: &EVERY_BLOCK[..=GROUP_BLOCKS],
                 dirs: Some(&dirs),
             })
         };
@@ -13596,6 +13619,7 @@ mod owned_block_plan_tests {
         let own = || {
             Some(OwnedBlocks {
                 blocks: &owned,
+                survivors: &EVERY_BLOCK,
                 dirs: Some(&dirs),
             })
         };
@@ -13646,6 +13670,7 @@ mod owned_block_plan_tests {
         let own = |blocks| {
             Some(OwnedBlocks {
                 blocks,
+                survivors: &EVERY_BLOCK,
                 dirs: Some(&dirs),
             })
         };
@@ -13668,5 +13693,90 @@ mod owned_block_plan_tests {
         assert_eq!(stats_b.block_range_gets, 1);
         assert_eq!(stats_b.block_bytes_fetched, span_len(1));
         assert!(stats_a.block_bytes_fetched + stats_b.block_bytes_fetched <= blocks_len);
+    }
+
+    async fn plan_with_survivors(
+        fetcher: &LogSegmentFetcher,
+        fx: &Fixture,
+        owned: &[usize],
+        survivors: &[usize],
+    ) -> (LogObjectBytes, BlockRangeStats) {
+        fetcher
+            .block_range
+            .fetch_object_with_footer_subset(
+                &fx.seg,
+                TENANT,
+                i64::MIN,
+                i64::MAX,
+                &[],
+                &ColumnSelection::fixed_only(),
+                None,
+                ReadPhases::SCAN,
+                Some(OwnedBlocks {
+                    blocks: owned,
+                    survivors,
+                    dirs: None,
+                }),
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("fetch")
+    }
+
+    /// A row group whose blocks were all pruned is owned by no partition (issue
+    /// #2473), so with the middle group pruned a partition owning the first and
+    /// last groups is the object's only reader: at a coverage threshold of 0
+    /// it takes the one whole-object GET and admits the object to the read
+    /// cache, so a second open moves no block byte. Dealt to two partitions,
+    /// the same survivors keep the partial-share read of each one's own span.
+    ///
+    /// Fails against weighing ownership on every group PAGE_DIR lists (the
+    /// sole reader reads as a partial share: two span ranges, never the
+    /// object) and against a flag that is always false (each of the two
+    /// partitions reads the whole object).
+    #[tokio::test]
+    async fn a_wholly_pruned_row_group_leaves_a_sole_reader_a_full_share() {
+        let fx = fixture_shaped(false, Some(0), BLOCKS, Some(0.0)).await;
+        let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+            16 * 1024 * 1024,
+            100,
+            16 * 1024 * 1024,
+        )));
+        let fetcher = fx.fetcher.clone().with_cache(cache);
+        let survivors: Vec<usize> = (0..GROUP_BLOCKS).chain(2 * GROUP_BLOCKS..BLOCKS).collect();
+
+        let (bytes, sole) = plan_with_survivors(&fetcher, &fx, &survivors, &survivors).await;
+        assert!(sole.whole_object, "the sole reader reads the object whole");
+        assert_eq!(sole.block_range_gets, 1);
+        assert_eq!(sole.block_bytes_fetched, fx.object.len() as u64);
+        assert_eq!(placed_blocks(&fx, &bytes), (0..BLOCKS).collect::<Vec<_>>());
+        let (_, again) = plan_with_survivors(&fetcher, &fx, &survivors, &survivors).await;
+        assert!(again.whole_object);
+        assert_eq!(
+            (again.block_range_gets, again.block_bytes_fetched),
+            (0, 0),
+            "the whole object was admitted to the cache and is served from it"
+        );
+
+        let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
+            .expect("directories");
+        let selected = ColumnSelection::fixed_only()
+            .resolve(dirs.field_dir())
+            .expect("a narrow projection resolves to a column set");
+        let shares: [Vec<usize>; 2] = [
+            (0..GROUP_BLOCKS).collect(),
+            (2 * GROUP_BLOCKS..BLOCKS).collect(),
+        ];
+        for (share, group) in shares.iter().zip([0, 2]) {
+            let (bytes, stats) = plan_with_survivors(&fx.fetcher, &fx, share, &survivors).await;
+            let (start, end) = group_span(&fx, group, Some(&selected));
+            assert!(
+                !stats.whole_object,
+                "group {group}'s owner is a partial share"
+            );
+            assert_eq!(stats.block_range_gets, 1);
+            assert_eq!(stats.block_bytes_fetched, end - start);
+            assert_eq!(placed_blocks(&fx, &bytes), *share);
+        }
     }
 }
