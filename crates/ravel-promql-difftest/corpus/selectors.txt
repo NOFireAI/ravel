@@ -1,0 +1,238 @@
+# Selector corpus (ticket P3, docs/promql-evaluator-plan.md section 5.3):
+# matcher types, offsets, @, parens, lookback boundaries, and stale
+# markers, all against crates/ravel-promql-difftest/src/generator.rs's
+# fixed dataset. Every offset is relative to the dataset's base_ts_ms.
+# `mode: unordered` is correct for every entry here: nothing in this file
+# uses sort()/sort_desc()/topk()/bottomk(), so result order is never
+# semantically significant (ADR-0021 decision 3).
+
+name: instant_bare_metric_name
+query: diff_gauge_walk
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_equality_matcher
+query: diff_histogram_bucket{variant="wellformed",le="0.5"}
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_negative_equality_matcher
+query: diff_match_left{instance!="1"}
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_regex_matcher
+query: diff_match_left{job=~"a.*"}
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_negative_regex_matcher
+query: diff_histogram_bucket{le!~"0\\..*"}
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_multiple_matchers
+query: diff_histogram_bucket{variant="wellformed",le="+Inf"}
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_curly_brace_only_selector
+query: {__name__="diff_gauge_walk"}
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_parens_around_selector
+query: (diff_gauge_walk)
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_double_parens
+query: ((diff_group_right))
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_offset_modifier
+query: diff_gauge_walk offset 1m
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_negative_offset_modifier
+query: diff_counter_total{shape="reset"} offset -1m
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_at_modifier_fixed_timestamp
+query: diff_gauge_walk @ 1700000060.000
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_at_modifier_start
+query: diff_gauge_walk @ start()
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_at_modifier_end
+query: diff_gauge_walk @ end()
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_at_and_offset_combined
+query: diff_gauge_walk @ 1700000300.000 offset 30s
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_no_match_returns_empty_vector
+query: diff_metric_that_does_not_exist
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: instant_special_values_plus_inf
+query: diff_special_values
+kind: instant
+time: +30s
+mode: unordered
+
+name: instant_special_values_minus_inf
+query: diff_special_values
+kind: instant
+time: +90s
+mode: unordered
+
+name: instant_special_values_nan
+query: diff_special_values
+kind: instant
+time: +120s
+mode: unordered
+
+# -0.0 is deliberately excluded from this corpus, not merely untested: the
+# pinned Prometheus binary renders this dataset's -0.0 sample as "0"
+# (verified against v3.13.1), so it does not preserve the sign of zero
+# through its own storage/query path, while Ravel's comparator treats
+# -0.0 as bit-significant by design (src/comparator.rs's own header
+# comment; CLAUDE.md's float-comparison testing pattern). Matching
+# Prometheus here
+# would mean Ravel deliberately discarding a bit it currently preserves
+# correctly. This is a real, accepted engine-behavior divergence, not a
+# corpus mistake.
+
+name: instant_stale_marker_is_absent
+query: diff_stale
+kind: instant
+time: +30s
+mode: unordered
+expect: empty
+
+name: instant_stale_marker_recovers
+query: diff_stale
+kind: instant
+time: +60s
+mode: unordered
+
+name: instant_lookback_just_inside_5m
+query: diff_boundary
+kind: instant
+time: +299s
+mode: unordered
+
+name: instant_lookback_exactly_5m_boundary
+query: diff_boundary
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_lookback_past_5m_falls_back_to_next_sample
+query: diff_boundary
+kind: instant
+time: +601s
+mode: unordered
+
+# A bare matrix selector is not a valid top-level query for
+# /api/v1/query_range on either engine: the endpoint requires the query
+# to evaluate to an instant value at each grid step, and a matrix
+# selector only does that nested inside a function like rate(). Both
+# Prometheus and Ravel reject these identically (bad_data), so this is
+# `mode: error`, not a value comparison.
+name: range_matrix_selector_basic_window
+query: diff_gauge_walk[5m]
+kind: range
+start: +0s
+end: +600s
+step: 30s
+mode: error
+
+name: range_matrix_selector_with_offset
+query: diff_counter_total{shape="reset"}[5m] offset 1m
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: error
+
+name: range_matrix_selector_across_reset_boundary
+query: diff_counter_total{shape="reset_at_boundary"}[10m]
+kind: range
+start: +0s
+end: +1170s
+step: 30s
+mode: error
+
+name: range_matrix_selector_no_match
+query: diff_metric_that_does_not_exist[5m]
+kind: range
+start: +0s
+end: +300s
+step: 30s
+mode: error
+
+name: range_query_over_sparse_jittered_series
+query: diff_sparse_jitter
+kind: range
+start: +0s
+end: +900s
+step: 30s
+mode: unordered
+
+name: range_query_over_histogram_bucket_family
+query: diff_histogram_bucket{variant="wellformed"}
+kind: range
+start: +0s
+end: +1170s
+step: 60s
+mode: unordered
+
+name: range_query_over_group_left_shape
+query: diff_group_left
+kind: range
+start: +0s
+end: +300s
+step: 30s
+mode: unordered
+
+# Moved from errors.txt: a trailing comma in a matcher list is no longer a
+# parse error on the pinned Prometheus binary (v3.13.1 tolerates it), so
+# this belongs among semantic-gap-shaped cases, not errors.txt's fixed
+# syntax-error set (see that file's own header comment on why it must
+# stay a fixed regression set). Both engines return an empty vector.
+name: stray_comma_in_matchers_is_accepted_and_matches_nothing
+query: diff_gauge_walk{job="api",}
+kind: instant
+time: +0s
+mode: unordered
+expect: empty

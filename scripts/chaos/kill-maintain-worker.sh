@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# scripts/chaos/kill-maintain-worker.sh -- ADR-0077 section 4, scenario 2:
+# "Kill a maintain worker mid-compaction, with a sibling running."
+#
+# Two maintain-role workers under leased maintenance (ADR-0065), SIGKILL one
+# mid-compaction, and assert the pinned oracle for this scenario:
+#
+#   * sibling-takeover-within-3H-plus-tick: the sibling takes over the dead
+#     worker's units within `3 * H` (ADR-0065's liveness bound) plus one
+#     maintenance tick;
+#   * no-orphaned-lease: no unit stays orphaned;
+#   * conservation-holds: the interrupted compaction completes under the
+#     conservation gate;
+#   * no-partial-output-leak: the dead worker's abandoned partial outputs age
+#     out under the existing unreferenced-part rule with no leak past the
+#     horizon;
+#   * custody-and-catalog verification clean.
+#
+# RELEASE-BLOCKING: per ADR-0077 section 4, a failure of THIS scenario is a
+# release-blocking bug, not a flaky test. On any oracle failure this script
+# names the specific failed assertion(s) and exits 2 (distinct from 1, an
+# ordinary failure, and from >2 setup/usage errors) so the distinction is
+# legible to the ADR-0077 section 3 rehearsal record.
+#
+# MID-COMPACTION TRIGGER (named explicitly): the compaction lifecycle. A
+# compaction is observed in flight when a worker owns units
+# (ravel_maintain_units_owned >= 1) and its log has NOT yet emitted the
+# "compaction record published" line
+# (crates/ravel-maintain/src/publish.rs:200) for the current run. The SIGKILL
+# fires in that window, so the compaction is genuinely interrupted before its
+# record is published.
+#
+# --check / --dry-run validates structure and dependencies WITHOUT starting
+# RustFS, spawning workers, or issuing a real kill. That is the only proof
+# available with no object store; a real run is the orchestrator's job.
+#
+# Gate-shell discipline: see scripts/chaos/lib.sh header.
+set -eEuo pipefail
+# -E carries the ERR trap below into functions, so a setup command that fails
+# inside a helper exits 3 like one at top level rather than with its own
+# status, which could be the 2 reserved for a release-blocking oracle failure.
+# The oracle calls below carry `|| true` and never reach it, and the summary
+# passes `blocking`, so the oracle path itself exits only 0 or 2.
+trap 'exit 3' ERR
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT_DIR"
+# shellcheck source=scripts/chaos/lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+
+# Two maintain workers expose metrics on separate addresses. Worker A is the
+# one we SIGKILL; worker B is the survivor whose takeover we assert.
+WORKER_A_HTTP="${CHAOS_WORKER_A_HTTP:-127.0.0.1:14328}"
+WORKER_A_GRPC="${CHAOS_WORKER_A_GRPC:-127.0.0.1:14327}"
+WORKER_B_HTTP="${CHAOS_WORKER_B_HTTP:-127.0.0.1:14338}"
+WORKER_B_GRPC="${CHAOS_WORKER_B_GRPC:-127.0.0.1:14337}"
+WORKER_B_URL="http://${WORKER_B_HTTP}"
+
+# An ingest server drives the load that creates compactable buckets before the
+# maintain workers start. Its own address, distinct from either worker's.
+INGEST_HTTP="${CHAOS_INGEST_HTTP:-127.0.0.1:14318}"
+INGEST_GRPC="${CHAOS_INGEST_GRPC:-127.0.0.1:14317}"
+
+# Number of strict-ack exports to drive into the ingest server so the bucket
+# carries real, compactable data for the maintain workers to own and compact.
+EXPORT_COUNT="${CHAOS_EXPORT_COUNT:-20}"
+
+# Total ownable units across the world under test; the survivor must own all
+# of them after takeover. Sized by the load the setup drives (tenants x
+# signals x shards). Overridable so the orchestrator can match its fixture.
+EXPECTED_TOTAL_UNITS="${CHAOS_EXPECTED_TOTAL_UNITS:-4}"
+
+usage() {
+  cat <<'EOF'
+Usage: kill-maintain-worker.sh [--check|--dry-run] [--help]
+
+  --check, --dry-run   Validate structure and dependencies only. Does NOT
+                       start RustFS, spawn workers, or issue a real kill -9.
+  --help               Show this help.
+
+With no flag, runs the full scenario against a real RustFS with two maintain
+workers (orchestrator-only; executors have no object store and must use
+--check).
+
+A failure of this scenario is RELEASE-BLOCKING (ADR-0077 section 4); the
+script exits 2 and names the failed pinned oracle assertion(s).
+EOF
+}
+
+MODE="run"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check|--dry-run) MODE="check"; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "kill-maintain-worker.sh: unknown argument: $1" >&2; usage >&2; exit 64 ;;
+  esac
+done
+
+if [[ "$MODE" == "check" ]]; then
+  echo "== kill-maintain-worker.sh --check (scenario 2: kill maintain worker mid-compaction) =="
+  echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
+    "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
+  echo "mid-compaction trigger marker: units_owned>=1 before '${CHAOS_COMPACTION_PUBLISH_MARKER}'"
+  echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
+  rc=0
+  check_dependencies || rc=$?
+  exit "$rc"
+fi
+
+# ---------------------------------------------------------------------------
+# Real run (orchestrator, with RustFS). Executors must not reach here.
+# ---------------------------------------------------------------------------
+
+WORKER_A_PID=""
+WORKER_B_PID=""
+INGEST_PID=""
+WORKER_A_LOG="$(mktemp)"
+WORKER_B_LOG="$(mktemp)"
+INGEST_LOG="$(mktemp)"
+FIXTURE_PATH="$(mktemp --suffix=.pb)"
+
+cleanup() {
+  # A failure in here must not replace a pending exit 2, with 3 through the
+  # ERR trap or with its own status through set -e.
+  trap - ERR
+  set +e
+  local pid
+  for pid in "$WORKER_A_PID" "$WORKER_B_PID" "$INGEST_PID"; do
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  rm -f "$WORKER_A_LOG" "$WORKER_B_LOG" "$INGEST_LOG" "$FIXTURE_PATH"
+  rustfs_down
+}
+trap cleanup EXIT
+
+# Start a maintain-role worker. $1=http $2=grpc $3=logfile; echoes the PID via
+# the named global set by the caller. We set the PID through a nameref so the
+# trap can reap both workers.
+start_worker() {
+  local http_addr="$1" grpc_addr="$2" log_file="$3"
+  local -n pid_ref="$4"
+  local argv=()
+  mapfile -d '' -t argv < <(ravel_server_cmd \
+    --store s3 \
+    --mode maintain \
+    --listen-http "$http_addr" \
+    --listen-grpc "$grpc_addr" \
+    --tenant-token "${CHAOS_TENANT_TOKEN}=${CHAOS_TENANT_NAME}")
+  "${argv[@]}" >"$log_file" 2>&1 &
+  pid_ref=$!
+}
+
+worker_reachable() {
+  curl --silent --fail --max-time 2 "http://$1/metrics" >/dev/null 2>&1
+}
+
+# Start an ingest-role server (default mode) in the background, capturing its
+# PID so the trap can reap it. This is the server the load below is POSTed to.
+start_ingest_bg() {
+  local argv=()
+  mapfile -d '' -t argv < <(ravel_server_cmd \
+    --store s3 \
+    --listen-http "$INGEST_HTTP" \
+    --listen-grpc "$INGEST_GRPC" \
+    --tenant-token "${CHAOS_TENANT_TOKEN}=${CHAOS_TENANT_NAME}")
+  "${argv[@]}" >"$INGEST_LOG" 2>&1 &
+  INGEST_PID=$!
+}
+
+ingest_reachable() {
+  curl --silent --fail --max-time 2 \
+    -H "Authorization: Bearer ${CHAOS_TENANT_TOKEN}" \
+    "http://${INGEST_HTTP}/api/v1/query?query=up" >/dev/null 2>&1
+}
+
+log "bringing up RustFS and qualifying the store"
+rustfs_up
+
+log "generating OTLP fixture"
+chaos_gen_fixture > "$FIXTURE_PATH"
+
+# Actually drive the generated load: start an ingest server and POST the
+# fixture through it so the bucket carries real, compactable data. A prior
+# version generated the fixture and never sent it, then commented that it
+# "assumes the bucket already carries compactable data" -- so the maintain
+# workers below owned nothing, no compaction ever ran, and every oracle was
+# vacuous. The maintain workers read the sealed inputs this load produces.
+log "starting ingest server (${INGEST_HTTP}) and driving ${EXPORT_COUNT} exports"
+start_ingest_bg
+chaos_wait_for "ingest server to accept connections" 60 ingest_reachable
+SENT=0
+for _ in $(seq 1 "$EXPORT_COUNT"); do
+  if drive_one_export "$INGEST_HTTP" "$FIXTURE_PATH" >/dev/null; then
+    SENT=$(( SENT + 1 ))
+  fi
+done
+if [[ "$SENT" -eq 0 ]]; then
+  log "no exports were accepted; the maintain workers would own nothing"
+  exit 3
+fi
+log "sent ${SENT}/${EXPORT_COUNT} strict-ack exports into the ingest server"
+
+log "starting two maintain workers (A=${WORKER_A_HTTP}, B=${WORKER_B_HTTP})"
+start_worker "$WORKER_A_HTTP" "$WORKER_A_GRPC" "$WORKER_A_LOG" WORKER_A_PID
+start_worker "$WORKER_B_HTTP" "$WORKER_B_GRPC" "$WORKER_B_LOG" WORKER_B_PID
+chaos_wait_for "worker A metrics" 60 worker_reachable "$WORKER_A_HTTP"
+chaos_wait_for "worker B metrics" 60 worker_reachable "$WORKER_B_HTTP"
+
+# Baselines for delta-based oracles, read from the survivor (worker B).
+CONS_BASELINE="$(metric_value "$WORKER_B_URL" ravel_maintain_conservation_aborts_total)" \
+  || CONS_BASELINE=0
+[[ "${CONS_BASELINE%.*}" =~ ^[0-9]+$ ]] || CONS_BASELINE=0
+BREAKER_BASELINE="$(metric_value "$WORKER_B_URL" ravel_maintain_orphan_breaker_tripped_total)" \
+  || BREAKER_BASELINE=0
+[[ "${BREAKER_BASELINE%.*}" =~ ^[0-9]+$ ]] || BREAKER_BASELINE=0
+
+log "waiting for worker A to be mid-compaction"
+if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$WORKER_A_LOG" 120; then
+  log "worker A observed mid-compaction -- issuing SIGKILL"
+else
+  log "did not observe worker A mid-compaction within budget; killing anyway"
+  echo "::warning::chaos scenario 2 killed worker A without observing it mid-compaction; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
+fi
+
+# The >= comparison in the two takeover oracles below only discriminates while
+# the store holds this scenario's tenant alone. See
+# `assert_single_tenant_universe` in lib.sh for why. Checked before the kill,
+# because a violated precondition otherwise reports PASS.
+assert_single_tenant_universe || true
+
+# Timestamp the kill so the takeover oracle can measure wall-clock against the
+# 3*H + tick bound. `date +%s` is the real clock ADR-0077 section 4 requires.
+KILL_EPOCH="$(date +%s)"
+sigkill_pid "$WORKER_A_PID"
+WORKER_A_PID=""
+
+# ---- Oracle (each pinned assertion independently, survivor = worker B) ----
+oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
+oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
+oracle_conservation_holds "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" || true
+oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true
+oracle_custody_and_catalog_verify_clean "$CHAOS_TENANT_NAME" 4 || true
+
+# Release-blocking: pass `blocking` so a failure exits 2 and prints the
+# RELEASE-BLOCKING severity line.
+summary_rc=0
+print_oracle_summary "scenario 2: kill maintain worker mid-compaction" blocking || summary_rc=$?
+exit "$summary_rc"

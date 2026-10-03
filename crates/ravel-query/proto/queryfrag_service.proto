@@ -1,0 +1,25 @@
+// The ADR-0071 fragment RPC service. The message contract is frozen in
+// proto/ravel/queryfrag.proto (ravel.queryfrag.v1); this file adds only the
+// gRPC service that carries those messages, in a separate package so the
+// frozen message file needs no service block. The message types are reused
+// verbatim from ravel-proto via a build-time extern_path mapping, never
+// regenerated here.
+//
+// Like the messages it carries, this is a TRANSIENT wire contract between query
+// processes, not a persistent stored format: no byte defined here is written to
+// object storage.
+syntax = "proto3";
+
+package ravel.queryfrag.svc.v1;
+
+import "ravel/queryfrag.proto";
+
+// The PromQL-lane fragment service (ADR-0071). A coordinator dispatches one
+// slice of a query as a FetchRequest; the worker executes the existing fetch
+// path over the listed segments and streams series frames back, ending with
+// exactly one Summary frame (slice atomicity: the slice contributes to the
+// merge only after its terminal Summary arrives).
+service SeriesFetch {
+  rpc Fetch(ravel.queryfrag.v1.FetchRequest)
+      returns (stream ravel.queryfrag.v1.FetchResponse);
+}

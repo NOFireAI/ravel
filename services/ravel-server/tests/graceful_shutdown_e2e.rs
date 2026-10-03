@@ -1,0 +1,1164 @@
+//! Graceful shutdown drains buffered ingest, marks the process not-ready before
+//! listeners close, and overwrites the distributed-query heartbeat record with
+//! the drained stamp on the way out (issue #1291, server half; issue #1828).
+//! The query role never deletes that record: the maintain role reaps it.
+//!
+//! These drive a real in-process server over real sockets. Automatic
+//! time-based flushes are disabled (a very long `max_flush_delay`) so the only
+//! thing that can flush a buffered record is the shutdown drain itself: an
+//! object appearing under the tenant's metrics prefix after `shutdown()` proves
+//! the drain ran, not a background timer.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+use opentelemetry_proto::tonic::metrics::v1::{
+    Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use prost::Message;
+use ravel_fleet::query_workers::{
+    DRAINED_STAMP_NS, QUERY_WORKERS_PREFIX, QueryWorkerRecord, QueryWorkers,
+};
+use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
+use ravel_query::distrib::partition::DistribThresholds;
+use ravel_server::config::DistribSettings;
+use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
+use ravel_types::TenantId;
+
+const TOKEN: &str = "testtoken";
+const TENANT: &str = "acme";
+
+/// Serializes every test in this file that can drive `Running::shutdown` past
+/// the outer `--shutdown-timeout` (issue #1742). Those tests move
+/// `ravel_server::drain_overrun_total()`, the process-global
+/// `DRAIN_OVERRUN_TOTAL` static in `services/ravel-server/src/lib.rs`; two of
+/// them racing inside the same before/after window would land both
+/// increments in one test's delta. Under `cargo-nextest` (what
+/// `scripts/affected-tests.sh` runs) every test already gets its own process,
+/// so this lock is a no-op there; under plain `cargo test`'s default
+/// multi-threaded runner, which shares one process across this whole file, it
+/// is load-bearing. Held for the full duration of the `shutdown()` call, not
+/// just around the counter reads, so a genuinely concurrent overrun from
+/// another locked test cannot land mid-drain either.
+static DRAIN_OVERRUN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The cluster fragment key the distributed test mints capabilities under.
+const FRAGMENT_KEY: [u8; 32] = [0x5au8; 32];
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos() as i64
+}
+
+fn string_kv(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(AnyValueVariant::StringValue(value.to_string())),
+        }),
+        ..Default::default()
+    }
+}
+
+fn export_request(
+    metric_name: &str,
+    job: &str,
+    value: f64,
+    ts_ns: i64,
+) -> ExportMetricsServiceRequest {
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![string_kv("service.name", job)],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    data: Some(MetricData::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: ts_ns as u64,
+                            value: Some(NumberValue::AsDouble(value)),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+/// Build a server config with automatic flushes disabled, so only the shutdown
+/// drain flushes buffered records. `distrib` gates the ADR-0071 heartbeat. The
+/// settle interval defaults to zero (no dead time per shutdown); tests that need
+/// the pre-close 503 window set it via [`start_server_configured`].
+async fn start_server(
+    store: Arc<dyn ObjectStoreBackend>,
+    mode: Mode,
+    distrib: Option<DistribSettings>,
+) -> ravel_server::Running {
+    start_server_configured(store, mode, distrib, |_| {}).await
+}
+
+/// [`start_server`] with a hook to tweak the `ServerConfig` before the server
+/// starts, for the tests that need a non-default settle interval or a shorter
+/// shutdown timeout.
+async fn start_server_configured(
+    store: Arc<dyn ObjectStoreBackend>,
+    mode: Mode,
+    distrib: Option<DistribSettings>,
+    tweak: impl FnOnce(&mut ServerConfig),
+) -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let mut config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
+        query_budgets: Default::default(),
+        max_inflight_flushes: 1,
+        max_queued_flushes: 8,
+        adaptive_flush_delay: false,
+        // Long enough that no time-based flush ever fires during a test: the
+        // shutdown drain is the only thing that can flush the buffered record.
+        max_flush_delay: Duration::from_secs(3600),
+        max_flush_delay_idle: Duration::from_secs(3600),
+        min_flush_bytes: 1024 * 1024 * 1024,
+        idle_flush_byte_floor: 0,
+        mode,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        metrics_tenant_labels: false,
+        limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: Duration::from_secs(3600),
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
+        scrub_period: Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
+        parquet_profiles: None,
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
+        cache_dir: None,
+        catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: Duration::from_secs(3600),
+        distrib,
+        remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        // Zero by default so a suite that shuts a server down on every case does
+        // not pay the settle delay each time; the 503-window test overrides it.
+        drain_settle_interval: Duration::ZERO,
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
+    };
+    tweak(&mut config);
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
+}
+
+fn always_distribute_settings() -> DistribSettings {
+    DistribSettings {
+        fragment_keys: vec![FRAGMENT_KEY],
+        sql_ticket_keys: None,
+        max_inflight_fragments: 32,
+        max_inflight_federated_resolves: 8,
+        thresholds: DistribThresholds {
+            min_store_bytes: 0,
+            min_segments: 0,
+            max_parallel_slices: 8,
+        },
+        fragment_listener: None,
+        advertise_endpoint: None,
+    }
+}
+
+/// The tenant's level-0 metrics data prefix; an object here means a segment was
+/// flushed durably.
+fn metrics_l0_prefix() -> String {
+    format!("t/{}/m/l0/", TenantId::new(TENANT).hash().to_hex())
+}
+
+/// Park until the heartbeat loop's first `sys/query/workers/<uuid>` write has
+/// landed. It writes before its first sleep, so this converges in well under a
+/// second; a shutdown assertion is only meaningful once the record it must
+/// overwrite with the drained stamp exists.
+async fn await_heartbeat_record(store: &dyn ObjectStoreBackend) {
+    for _ in 0..200 {
+        if !list_all(store, QUERY_WORKERS_PREFIX)
+            .await
+            .expect("list worker records")
+            .is_empty()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("a distributed-query process must publish a heartbeat record before shutdown");
+}
+
+/// Decode every record under `sys/query/workers/`, in key order.
+async fn worker_records(store: &dyn ObjectStoreBackend) -> Vec<QueryWorkerRecord> {
+    let mut records = Vec::new();
+    for meta in list_all(store, QUERY_WORKERS_PREFIX)
+        .await
+        .expect("list worker records")
+    {
+        let got = store
+            .get(&meta.key, GetRange::Full)
+            .await
+            .expect("get worker record");
+        records.push(QueryWorkerRecord::decode(got.data.as_ref()).expect("decode worker record"));
+    }
+    records
+}
+
+/// A reader that is not the server under test, as a sibling coordinator is.
+fn sibling_reader() -> QueryWorkers {
+    QueryWorkers::with_defaults("127.0.0.1:1", "127.0.0.1:2", 1)
+}
+
+/// A buffered-mode ingest ack is written to the shard buffer and acked before
+/// any object hits the store. With time-based flushes disabled, the record is
+/// still buffered at shutdown, and the shutdown drain must flush it durably: an
+/// l0 metrics object exists after `shutdown()` and did not before.
+#[tokio::test]
+async fn sigterm_drains_buffered_records_in_gateway_mode() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone(), Mode::Gateway, None).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let request = export_request("drained_metric", "demo", 7.0, now_ns());
+    let body = request.encode_to_vec();
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        // Buffered mode: ack at enqueue, before any durable write.
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(body)
+        .send()
+        .await
+        .expect("buffered export request succeeds");
+    assert_eq!(response.status(), 200, "buffered export should be accepted");
+
+    // Nothing durable yet: the record is buffered, and time-based flushes are
+    // disabled, so the store holds no l0 metrics object.
+    let prefix = metrics_l0_prefix();
+    let before = list_all(store.as_ref(), &prefix)
+        .await
+        .expect("list before shutdown");
+    assert!(
+        before.is_empty(),
+        "the buffered record must not be durable before shutdown, found: {before:?}"
+    );
+
+    // The drain must flush it.
+    running.shutdown().await.expect("graceful shutdown");
+
+    let after = list_all(store.as_ref(), &prefix)
+        .await
+        .expect("list after shutdown");
+    assert_eq!(
+        after.len(),
+        1,
+        "the shutdown drain must flush the buffered record to exactly one l0 object, found: {after:?}"
+    );
+}
+
+/// When the outer `--shutdown-timeout` fires DURING the ingest flush (an
+/// unreachable store, whose per-shard flush deadline dwarfs the drain budget),
+/// nothing is durable, and the overrun error must say so rather than claim the
+/// records were flushed. The three `flush_all` calls are the FIRST steps of the
+/// drain, so the timeout can land on either side of them; before this fix the
+/// message was unconditional and told an operator the records were flushed on
+/// exactly the failure this ticket exists to detect.
+///
+/// A `FaultStore` hold on the metrics l0 PUT is what holds the flush open with
+/// no wall-clock wait: the shard actor issues the PUT, the gate parks it, and
+/// `flush_all` never returns, so the outer timeout is the only thing that can
+/// fire. `MemoryStore` cannot reproduce this: its PUT answers immediately and
+/// the flush completes, which is the other branch
+/// (`audit_drain_is_bounded_by_the_overall_shutdown_timeout`, where the flush
+/// finished and the overrun says the flush COMPLETED).
+#[tokio::test]
+async fn shutdown_timeout_during_ingest_flush_warns_records_may_not_be_durable() {
+    // This drain overruns the outer `--shutdown-timeout`; see
+    // `DRAIN_OVERRUN_TEST_LOCK`'s own doc comment for why.
+    let _overrun_guard = DRAIN_OVERRUN_TEST_LOCK.lock().await;
+
+    /// Small so the test does not idle: the held flush cannot complete, so the
+    /// whole budget elapses before `shutdown` returns.
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+    let running = start_server_configured(store.clone(), Mode::Gateway, None, |config| {
+        config.shutdown_timeout = SHUTDOWN_TIMEOUT;
+    })
+    .await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let request = export_request("held_metric", "demo", 3.0, now_ns());
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(request.encode_to_vec())
+        .send()
+        .await
+        .expect("buffered export request succeeds");
+    assert_eq!(response.status(), 200, "buffered export should be accepted");
+
+    // Armed only now: nothing writes an l0 metrics object before shutdown (time
+    // based flushes are disabled), so this gate holds exactly the drain's flush
+    // PUT and no earlier call.
+    let gate = faults.hold(Op::Put, Some(metrics_l0_prefix()), Occurrence::Always);
+
+    let err = running
+        .shutdown()
+        .await
+        .expect_err("a drain cut off during the flush is an error, not a swallowed Ok");
+
+    // The plain `Display` form, which is what `main.rs` logs with `%err`.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeded --shutdown-timeout"),
+        "the overrun must name the budget that cut it off, got: {msg}"
+    );
+    assert!(
+        msg.contains("before the ingest flush completed") && msg.contains("may not be durable"),
+        "an overrun during the flush must warn the records may not be durable, got: {msg}"
+    );
+    assert!(
+        !msg.contains("buffered records were flushed"),
+        "an overrun during the flush must NOT claim the records were flushed, got: {msg}"
+    );
+
+    // The PUT is still held: the outer timeout dropped the drain future rather
+    // than cancelling the in-flight call. Release it so the detached flush can
+    // unwind.
+    assert_eq!(
+        gate.held_count(),
+        1,
+        "the abandoned flush PUT must still be in flight, not cancelled"
+    );
+    for id in gate.held() {
+        assert!(gate.release(id), "releasing a held call must succeed");
+    }
+}
+
+/// Issue #1742: `ravel_shutdown_drain_overrun_total`
+/// (`ravel_server::drain_overrun_total()`) increments by exactly 1 on the
+/// branch where `--shutdown-timeout` actually elapsed, not 0 (missed) and not
+/// more than 1 (a bug that increments per drain step rather than once per
+/// `shutdown()` call). Reuses the same `FaultStore` hold as
+/// `shutdown_timeout_during_ingest_flush_warns_records_may_not_be_durable` to
+/// force the overrun deterministically rather than by racing a sleep against
+/// a drain: the gate parks the flush PUT forever, so the outer
+/// `--shutdown-timeout` is the only thing that can resolve `shutdown()`, and
+/// the branch under test is reached on every run rather than when the drain
+/// happens to be slow. The test body issues no sleep of its own, but this is
+/// not a paused-clock test: `#[tokio::test]` here runs the real timer, so the
+/// run does spend the 2-second `SHUTDOWN_TIMEOUT` below waiting for that
+/// bound to elapse. That wait is the behavior under test, not a settling
+/// delay, and it cannot be shortened away without removing what the
+/// assertion rests on.
+///
+/// `DRAIN_OVERRUN_TOTAL` is a process-global static
+/// (`services/ravel-server/src/lib.rs`'s `store_probe`-style counter), so
+/// this delta is only exact when this test does not share a process with
+/// another test that also drives a real overrun; `scripts/affected-tests.sh`
+/// runs this crate under `cargo-nextest`, which gives every test its own
+/// process, so no other test's overrun can land inside this window.
+///
+/// Prove-the-test: flip `if timed_out { record_drain_overrun(); }` in
+/// `Running::shutdown` (`services/ravel-server/src/lib.rs`) to an
+/// unconditional `record_drain_overrun();` call after the timeout, and this
+/// assertion still passes (a false negative for THIS test alone) but
+/// `drain_overrun_counter_stays_zero_on_a_clean_drain` below then observes 1
+/// instead of 0, which is how that mutation is actually caught.
+#[tokio::test]
+async fn drain_overrun_counter_increments_exactly_once_on_a_real_overrun() {
+    let _overrun_guard = DRAIN_OVERRUN_TEST_LOCK.lock().await;
+
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+    let running = start_server_configured(store.clone(), Mode::Gateway, None, |config| {
+        config.shutdown_timeout = SHUTDOWN_TIMEOUT;
+    })
+    .await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let request = export_request("held_metric", "demo", 3.0, now_ns());
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(request.encode_to_vec())
+        .send()
+        .await
+        .expect("buffered export request succeeds");
+    assert_eq!(response.status(), 200, "buffered export should be accepted");
+
+    let gate = faults.hold(Op::Put, Some(metrics_l0_prefix()), Occurrence::Always);
+
+    let before = ravel_server::drain_overrun_total();
+    let err = running
+        .shutdown()
+        .await
+        .expect_err("a drain cut off by the timeout is an error");
+    assert!(
+        err.to_string().contains("exceeded --shutdown-timeout"),
+        "sanity: this must be the overrun branch, got: {err}"
+    );
+    let after = ravel_server::drain_overrun_total();
+    assert_eq!(
+        after - before,
+        1,
+        "a real overrun must increment the counter by exactly 1, before={before} after={after}"
+    );
+
+    for id in gate.held() {
+        assert!(gate.release(id), "releasing a held call must succeed");
+    }
+}
+
+/// The counterpart to `drain_overrun_counter_increments_exactly_once_on_a_real_overrun`:
+/// a clean drain (nothing held, well within `--shutdown-timeout`) must leave
+/// `ravel_server::drain_overrun_total()` unchanged. Pinned separately, and at
+/// exactly 0 rather than merely "less than the overrun case", because the
+/// WRONG-2 mutation this pair exists to catch (`record_drain_overrun()`
+/// called unconditionally instead of only inside `if timed_out`) increments
+/// on every drain, this clean one included; a test that only checked the
+/// overrun case at 1 would pass against that mutation too, since 1 - 0 = 1
+/// either way if this test did not also assert 0 here.
+#[tokio::test]
+async fn drain_overrun_counter_stays_zero_on_a_clean_drain() {
+    let _overrun_guard = DRAIN_OVERRUN_TEST_LOCK.lock().await;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone(), Mode::Gateway, None).await;
+
+    let before = ravel_server::drain_overrun_total();
+    running.shutdown().await.expect("graceful shutdown");
+    let after = ravel_server::drain_overrun_total();
+
+    assert_eq!(
+        after - before,
+        0,
+        "a clean drain must not increment the overrun counter, before={before} after={after}"
+    );
+}
+
+/// Readiness flips to 503 before the first listener closes: a probe issued
+/// concurrently with `shutdown()` observes an HTTP 503 response (the listener
+/// was still open and routing) rather than only 200s followed by a connection
+/// error. This is what lets Kubernetes stop routing new traffic to the pod
+/// before the sockets actually close.
+#[tokio::test]
+async fn readyz_is_503_before_the_first_listener_closes() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    // This test relies on the pre-close settle window to observe 503 over a
+    // still-open listener, so it sets the interval to 500ms explicitly; the
+    // other tests keep the zero default.
+    let running = start_server_configured(store.clone(), Mode::All, None, |config| {
+        config.drain_settle_interval = Duration::from_millis(500);
+    })
+    .await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    // Ready before shutdown begins.
+    let ready = client
+        .get(format!("{base}/readyz"))
+        .send()
+        .await
+        .expect("readyz request completes")
+        .status();
+    assert_eq!(ready.as_u16(), 200, "must be ready before shutdown");
+
+    // A prober hammering /readyz concurrently with shutdown. It records whether
+    // it ever received an actual 503 HTTP response (server open, but draining),
+    // as opposed to a post-close connection error.
+    let stop = Arc::new(AtomicBool::new(false));
+    let saw_503_response = Arc::new(AtomicBool::new(false));
+    let prober = {
+        let stop = stop.clone();
+        let saw_503 = saw_503_response.clone();
+        let base = base.clone();
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            while !stop.load(Ordering::SeqCst) {
+                if let Ok(resp) = client.get(format!("{base}/readyz")).send().await
+                    && resp.status().as_u16() == 503
+                {
+                    saw_503.store(true, Ordering::SeqCst);
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    };
+
+    // Shutdown flips readiness to draining and waits the settle interval before
+    // any listener closes, so the prober has a window to observe 503 over an
+    // open listener.
+    running.shutdown().await.expect("graceful shutdown");
+    stop.store(true, Ordering::SeqCst);
+    prober.await.expect("prober joins");
+
+    assert!(
+        saw_503_response.load(Ordering::SeqCst),
+        "a probe concurrent with shutdown must observe a 503 response before the listener closes"
+    );
+}
+
+/// A distributed-query process writes its `sys/query/workers/<uuid>` heartbeat
+/// record; graceful shutdown must overwrite it with [`DRAINED_STAMP_NS`] so
+/// sibling coordinators drop it from their live set immediately rather than
+/// dialing a stopped worker until its stamp ages out. The record itself stays:
+/// the query role holds no delete grant (ADR-0055 section 1), and the maintain
+/// role reaps it later.
+#[tokio::test]
+async fn heartbeat_worker_record_is_stamped_drained_on_shutdown() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server(store.clone(), Mode::All, Some(always_distribute_settings())).await;
+
+    await_heartbeat_record(store.as_ref()).await;
+
+    running.shutdown().await.expect("graceful shutdown");
+
+    let after = worker_records(store.as_ref()).await;
+    assert_eq!(
+        after.len(),
+        1,
+        "shutdown must leave exactly this process's record in place, found: {after:?}"
+    );
+    assert_eq!(
+        after[0].started_unix_ns, DRAINED_STAMP_NS,
+        "shutdown must overwrite the record with the drained stamp, found: {after:?}"
+    );
+
+    let reader = sibling_reader();
+    let live = reader
+        .live_set(store.as_ref(), now_ns())
+        .await
+        .expect("sibling live_set");
+    assert!(
+        live.iter().all(|r| r.process_id != after[0].process_id),
+        "a sibling's live set must leave the drained record out, got: {live:?}"
+    );
+    assert_eq!(
+        live.len(),
+        1,
+        "a sibling's live set must hold only the sibling itself, got: {live:?}"
+    );
+}
+
+/// The listener join is bounded by its own sub-budget, so a connection held
+/// open past that sub-budget cannot cost buffered records: the join is
+/// abandoned, the drain proceeds, and the record is durable when shutdown
+/// returns. A record is buffered, then a second request is left in-flight on a
+/// raw socket so the HTTP listener cannot close; with a short shutdown timeout
+/// the listener join is abandoned at its sub-budget, yet the record is durable
+/// and shutdown still returns.
+///
+/// This pins the SUB-BUDGET half of the drain's ordering guarantee, not the
+/// flush-before-join half. On a `MemoryStore` the flush is instant, so it fits
+/// in the one-fifth reserve whether it runs before the join or after it: moving
+/// the bounded join ahead of the three `flush_all` calls leaves this test green.
+/// Only removing the join's sub-budget (an unbounded join ahead of the flush)
+/// loses the record here. The ordering itself is discriminated by
+/// [`ingest_flush_is_attempted_before_the_listener_join`].
+#[tokio::test]
+async fn buffered_record_is_flushed_before_a_stuck_listener_join() {
+    use tokio::io::AsyncWriteExt;
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server_configured(store.clone(), Mode::Gateway, None, |config| {
+        // Short enough that the abandoned listener join is quick; the stuck
+        // connection below outlives it, so the join can never complete.
+        config.shutdown_timeout = Duration::from_secs(2);
+    })
+    .await;
+    let http_addr = running.http_addr;
+    let base = format!("http://{http_addr}");
+    let client = reqwest::Client::new();
+
+    // Buffer a record (acked at enqueue, nothing durable yet).
+    let request = export_request("drained_metric", "demo", 7.0, now_ns());
+    let body = request.encode_to_vec();
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(body)
+        .send()
+        .await
+        .expect("buffered export request succeeds");
+    assert_eq!(response.status(), 200, "buffered export should be accepted");
+
+    let prefix = metrics_l0_prefix();
+    assert!(
+        list_all(store.as_ref(), &prefix)
+            .await
+            .expect("list before shutdown")
+            .is_empty(),
+        "the buffered record must not be durable before shutdown"
+    );
+
+    // Open a raw connection and send a request whose body never completes, so
+    // the HTTP listener has an in-flight request and cannot close during the
+    // graceful drain.
+    let mut stuck = tokio::net::TcpStream::connect(http_addr)
+        .await
+        .expect("connect a raw socket to the http listener");
+    let partial = format!(
+        "POST /v1/metrics HTTP/1.1\r\nHost: {http_addr}\r\nauthorization: Bearer {TOKEN}\r\n\
+         content-type: application/x-protobuf\r\nx-ravel-ingest-mode: buffered\r\n\
+         content-length: 100000\r\n\r\n"
+    );
+    stuck
+        .write_all(partial.as_bytes())
+        .await
+        .expect("send request headers");
+    // A few body bytes, far short of the declared content-length, so the
+    // handler stays parked awaiting the rest.
+    stuck
+        .write_all(&[0u8; 8])
+        .await
+        .expect("send a partial body");
+    stuck.flush().await.expect("flush the partial request");
+
+    // The flush must persist the buffered record before the listener join is
+    // abandoned at its sub-budget, and shutdown must still return.
+    running.shutdown().await.expect("graceful shutdown returns");
+
+    let after = list_all(store.as_ref(), &prefix)
+        .await
+        .expect("list after shutdown");
+    assert_eq!(
+        after.len(),
+        1,
+        "the drain must flush the buffered record even with a listener held open past the join \
+         budget, found: {after:?}"
+    );
+
+    // Hold the stuck socket open until after the assertions.
+    drop(stuck);
+}
+
+/// The three `flush_all` calls run BEFORE the listener join, not merely within
+/// the same overall `--shutdown-timeout`. Moving the bounded join ahead of the
+/// flush (keeping its four-fifths sub-budget) is caught by nothing else in this
+/// suite, because on a `MemoryStore` the post-join flush still fits in the
+/// one-fifth reserve; a real multi-shard flush against S3 need not, so a future
+/// refactor that reorders them would silently give the flush only the reserve
+/// and lose records under load while the suite stayed green.
+///
+/// This pins the order directly. A `FaultStore` hold on the metrics l0 PUT
+/// makes the flush's arrival observable through `wait_until_held`, and a stuck
+/// in-flight request makes the listener join block for its whole sub-budget.
+/// With the flush first (shipped), its PUT is issued and held at once, so the
+/// wait below returns promptly. With the join moved ahead of the flush, the PUT
+/// is not issued until the join abandons at four-fifths of a deliberately large
+/// `--shutdown-timeout` (80s), far past the small ceiling below, so the wait
+/// expires and the test fails. The margin is 80s against the sub-second cost of
+/// issuing one PUT, so the outcome does not depend on which future a loaded
+/// machine polls first.
+#[tokio::test]
+async fn ingest_flush_is_attempted_before_the_listener_join() {
+    use tokio::io::AsyncWriteExt;
+
+    /// Large, so the listener-join sub-budget (four-fifths, 80s) dwarfs the
+    /// sub-second cost of issuing one PUT: "the PUT was held promptly"
+    /// discriminates the order by an enormous margin, not a fine one.
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(100);
+    /// A generous ceiling on issuing one held PUT, far below the 80s the
+    /// reordered code would make this wait on, so no machine load closes the gap.
+    const FLUSH_OBSERVE_BUDGET: Duration = Duration::from_secs(10);
+
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+    let running = start_server_configured(store.clone(), Mode::Gateway, None, |config| {
+        config.shutdown_timeout = SHUTDOWN_TIMEOUT;
+    })
+    .await;
+    let http_addr = running.http_addr;
+    let base = format!("http://{http_addr}");
+    let client = reqwest::Client::new();
+
+    // Buffer a record (acked at enqueue, nothing durable yet).
+    let request = export_request("drained_metric", "demo", 7.0, now_ns());
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(request.encode_to_vec())
+        .send()
+        .await
+        .expect("buffered export request succeeds");
+    assert_eq!(response.status(), 200, "buffered export should be accepted");
+
+    // A raw request whose body never completes, so the HTTP listener has an
+    // in-flight request and its join blocks for the whole sub-budget.
+    let mut stuck = tokio::net::TcpStream::connect(http_addr)
+        .await
+        .expect("connect a raw socket to the http listener");
+    let partial = format!(
+        "POST /v1/metrics HTTP/1.1\r\nHost: {http_addr}\r\nauthorization: Bearer {TOKEN}\r\n\
+         content-type: application/x-protobuf\r\nx-ravel-ingest-mode: buffered\r\n\
+         content-length: 100000\r\n\r\n"
+    );
+    stuck
+        .write_all(partial.as_bytes())
+        .await
+        .expect("send request headers");
+    stuck
+        .write_all(&[0u8; 8])
+        .await
+        .expect("send a partial body");
+    stuck.flush().await.expect("flush the partial request");
+
+    // Armed only now: no l0 metrics object is written before shutdown, so this
+    // gate holds exactly the drain's first flush PUT and no earlier call.
+    let gate = faults.hold(Op::Put, Some(metrics_l0_prefix()), Occurrence::Always);
+
+    let shutdown = tokio::spawn(async move { running.shutdown().await });
+
+    // The flush is the FIRST drain step, so its metrics PUT is issued and held
+    // at once. Reordered behind the stuck-listener join, it would not be issued
+    // until the join abandons at four-fifths of SHUTDOWN_TIMEOUT (80s), far past
+    // this ceiling, and this wait would expire.
+    tokio::time::timeout(FLUSH_OBSERVE_BUDGET, gate.wait_until_held(1))
+        .await
+        .expect(
+            "the ingest flush PUT must be issued before the listener join; a wait that expires \
+             here means the join was moved ahead of the flush and consumed the budget first",
+        );
+    assert_eq!(
+        gate.held_count(),
+        1,
+        "exactly the drain's metrics flush PUT must be held"
+    );
+
+    // Release the held PUT so the detached flush can unwind, then abandon the
+    // shutdown task rather than wait out the 80s stuck-listener join for a
+    // result already asserted.
+    for id in gate.held() {
+        assert!(gate.release(id), "releasing a held call must succeed");
+    }
+    drop(stuck);
+    shutdown.abort();
+}
+
+/// The ADR-0071 heartbeat record must be stamped drained BEFORE the listeners
+/// close, so a sibling coordinator drops this worker from its live set while the
+/// fragment listener is still up, instead of routing a fragment to a socket
+/// about to disappear mid-join. With a non-zero settle interval the drain write
+/// (run concurrently with the settle wait) lands while the listeners are still
+/// open: a probe issued mid-shutdown observes the drained stamp AND a listener
+/// still serving.
+#[tokio::test]
+async fn heartbeat_record_is_stamped_drained_while_a_listener_still_serves() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server_configured(
+        store.clone(),
+        Mode::All,
+        Some(always_distribute_settings()),
+        |config| config.drain_settle_interval = Duration::from_millis(500),
+    )
+    .await;
+    let base = format!("http://{}", running.http_addr);
+
+    await_heartbeat_record(store.as_ref()).await;
+
+    // Drive shutdown from a background task so the assertion can run mid-drain.
+    let shutdown = tokio::spawn(async move { running.shutdown().await });
+
+    // During the settle window observe the drained stamp while a listener
+    // (`/healthz` liveness, independent of drain) still accepts. Only shutdown
+    // writes that stamp; every heartbeat tick writes a clock reading.
+    let probe = reqwest::Client::new();
+    let reader = sibling_reader();
+    let mut observed = false;
+    for _ in 0..200 {
+        let records = worker_records(store.as_ref()).await;
+        let drained = records.len() == 1 && records[0].started_unix_ns == DRAINED_STAMP_NS;
+        let left_live_set = drained
+            && reader
+                .live_set(store.as_ref(), now_ns())
+                .await
+                .expect("sibling live_set mid-shutdown")
+                .iter()
+                .all(|r| r.process_id != records[0].process_id);
+        if left_live_set
+            && let Ok(resp) = probe.get(format!("{base}/healthz")).send().await
+            && resp.status().as_u16() == 200
+        {
+            observed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    shutdown
+        .await
+        .expect("shutdown task joins")
+        .expect("graceful shutdown returns");
+
+    assert!(
+        observed,
+        "the heartbeat record must be stamped drained, and out of a sibling's live set, while \
+         a listener is still serving"
+    );
+}
+
+/// The heartbeat stop is BOUNDED, so an object store that never answers the
+/// worker-record drain PUT cannot hold the process past its grace period with
+/// the ingest buffers still unflushed.
+///
+/// That stop sits ahead of the `--shutdown-timeout`-bounded drain block by
+/// necessity: the drain write has to land while the listeners still serve.
+/// Unbounded there, it awaits a loop whose last step is
+/// `QueryWorkers::mark_drained`, an `ObjectStoreBackend::put` that takes no
+/// deadline at all, so an unreachable store parks the whole shutdown in it --
+/// the exact issue #1291 failure, reintroduced in the distributed-query mode.
+///
+/// A `FaultStore` hold gate on the worker-record PUT is what makes the
+/// difference observable. `MemoryStore` cannot: its PUT always answers
+/// immediately, so
+/// [`heartbeat_worker_record_is_stamped_drained_on_shutdown`] passes either way
+/// and is not coverage for this. With the bound in place `shutdown` returns;
+/// without it, it never returns and the outer `timeout` below is what reports
+/// it.
+#[tokio::test]
+async fn shutdown_returns_when_the_heartbeat_drain_write_never_answers() {
+    /// Small, so the heartbeat stop's tenth-of-budget slice is short; large
+    /// enough that the slice still comfortably covers entering the drain PUT.
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+    /// Above `SHUTDOWN_TIMEOUT` plus that slice with wide margin, far below the
+    /// ~200s a deadline-less S3 PUT retries for, so which bound ended the
+    /// shutdown is unambiguous, and well inside the 60s heartbeat interval
+    /// (`QueryWorkers::with_defaults`), so no tick PUT lands in the gate.
+    const OUTER_BOUND: Duration = Duration::from_secs(30);
+
+    let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+    let running = start_server_configured(
+        store.clone(),
+        Mode::All,
+        Some(always_distribute_settings()),
+        |config| config.shutdown_timeout = SHUTDOWN_TIMEOUT,
+    )
+    .await;
+
+    await_heartbeat_record(store.as_ref()).await;
+
+    let before = worker_records(store.as_ref()).await;
+    assert_eq!(
+        before.len(),
+        1,
+        "one live record before shutdown: {before:?}"
+    );
+    assert_ne!(
+        before[0].started_unix_ns, DRAINED_STAMP_NS,
+        "the record must be a live tick before shutdown"
+    );
+    let own_key = format!("{QUERY_WORKERS_PREFIX}{}", before[0].process_id);
+
+    // Armed only after the first tick's PUT has landed, and the next tick is a
+    // full heartbeat interval away, so this gate can hold exactly one call: the
+    // drain PUT the heartbeat stop makes.
+    let gate = faults.hold(
+        Op::Put,
+        Some(QUERY_WORKERS_PREFIX.to_string()),
+        Occurrence::Always,
+    );
+
+    let shutdown = tokio::spawn(async move { running.shutdown().await });
+
+    // Park until the PUT is genuinely held, so the bound below is measured
+    // against a stuck store rather than against a race with the heartbeat loop.
+    tokio::time::timeout(OUTER_BOUND, gate.wait_until_held(1))
+        .await
+        .expect("the heartbeat stop must reach its worker-record drain PUT");
+    let held = gate.held_details();
+    assert_eq!(
+        held.len(),
+        1,
+        "exactly one call may be held: the worker-record drain PUT, got: {held:?}"
+    );
+    assert_eq!(held[0].1, Op::Put, "the held call must be the PUT");
+    assert_eq!(
+        held[0].2, own_key,
+        "the held PUT must be this process's worker record"
+    );
+
+    tokio::time::timeout(OUTER_BOUND, shutdown)
+        .await
+        .expect(
+            "shutdown must return on the heartbeat stop's own bound; waiting past this means the \
+             stop is unbounded and a deadline-less store PUT holds the drain",
+        )
+        .expect("the shutdown task joins")
+        .expect("a heartbeat stop cut off by its bound is a warning, not a shutdown error");
+
+    // The PUT is still held: the bound detached the heartbeat task rather than
+    // cancelling the call. Release it so the task can finish.
+    assert_eq!(
+        gate.held_count(),
+        1,
+        "the abandoned drain PUT must still be in flight, not cancelled"
+    );
+    for id in gate.held() {
+        assert!(gate.release(id), "releasing a held call must succeed");
+    }
+}
+
+/// A store whose audit data-object writes never answer, wrapping a
+/// [`MemoryStore`] that serves everything else. A `FaultStore` timeout returns
+/// an error the flush path handles and reports; holding the drain open needs a
+/// call that never resolves at all, which is what an unreachable object store
+/// looks like to a caller with no deadline of its own.
+struct StalledAuditWrites {
+    inner: MemoryStore,
+    /// Notified as the stalled PUT is entered, so the test can wait for the
+    /// audit flush to be in flight instead of sleeping for it.
+    entered: Arc<tokio::sync::Notify>,
+    /// How many audit PUTs this store has swallowed, so the test pins the count
+    /// rather than asserting it stalled at least once.
+    stalled: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for StalledAuditWrites {
+    async fn put(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        opts: ravel_object_store::PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        if key.contains("/u/l0/") {
+            self.stalled
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: ravel_object_store::GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        ravel_object_store::Capabilities {
+            multipart: false,
+            ..self.inner.capabilities()
+        }
+    }
+}
+
+/// The query-audit drain runs INSIDE the bounded drain block, so
+/// `--shutdown-timeout` bounds it as well as its own `audit_drain_timeout`.
+///
+/// The two bounds are set three orders of magnitude apart (a 2s
+/// `--shutdown-timeout` against an `--audit-max-age` of an hour, which makes
+/// `audit_drain_timeout` about 3605s), and the audit PUT never answers, so which
+/// bound cut the shutdown off is unambiguous. Inside the block, the overall
+/// budget fires and `shutdown` returns the overrun error. Moved back outside the
+/// block it is bounded only by `audit_drain_timeout` and `shutdown` does not
+/// return for the best part of an hour, which the outer `timeout` here reports;
+/// removed altogether, `shutdown` returns `Ok` without ever waiting on the
+/// pipeline.
+#[tokio::test]
+async fn audit_drain_is_bounded_by_the_overall_shutdown_timeout() {
+    // This drain overruns the outer `--shutdown-timeout`; see
+    // `DRAIN_OVERRUN_TEST_LOCK`'s own doc comment for why.
+    let _overrun_guard = DRAIN_OVERRUN_TEST_LOCK.lock().await;
+
+    /// Far above `DEFAULT_SHUTDOWN_TIMEOUT`, so `audit_drain_timeout`
+    /// (`--audit-max-age` plus the pipeline's own drain grace) cannot be the
+    /// bound that ends this shutdown.
+    const AUDIT_MAX_AGE: Duration = Duration::from_secs(3600);
+    /// The overall budget under test. Small enough to be unmistakable against
+    /// `AUDIT_MAX_AGE`, large enough that a loaded host still reaches the audit
+    /// drain before it fires.
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let stalled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(StalledAuditWrites {
+        inner: MemoryStore::new(),
+        entered: Arc::clone(&entered),
+        stalled: Arc::clone(&stalled),
+    });
+
+    let running = start_server_configured(store.clone(), Mode::All, None, |config| {
+        config.shutdown_timeout = SHUTDOWN_TIMEOUT;
+        config.audit_pipeline = ravel_maintain::AuditPipelineConfig {
+            // One record per batch, so the single query below reaches the
+            // data-object PUT rather than waiting for a batch to fill.
+            max_batch: 1,
+            max_age: AUDIT_MAX_AGE,
+            ..Default::default()
+        };
+    })
+    .await;
+    assert!(
+        running.has_audit_pipeline(),
+        "Mode::All must spawn the pipeline this test drains"
+    );
+    let service = running
+        .query_service
+        .clone()
+        .expect("Mode::All builds the query service");
+
+    // Through the in-process service rather than an HTTP route: in the default
+    // `Required` mode the query awaits its audit flush, which never completes
+    // here, and an in-flight HTTP connection would instead be absorbed by the
+    // listener join's own sub-budget before the audit drain is reached.
+    let tenant_hash = TenantId::new(TENANT).hash();
+    let query = tokio::spawn(async move {
+        let instant = ravel_query::http::service::InstantRequest {
+            query: "m".to_string(),
+            time_ms: 0,
+            min_tokens: Vec::new(),
+            deadline: Duration::from_secs(30),
+            allow_partial: false,
+            now_ns: now_ns(),
+            budgets: None,
+        };
+        service.promql_instant(tenant_hash, &instant).await
+    });
+
+    tokio::time::timeout(Duration::from_secs(30), entered.notified())
+        .await
+        .expect("the audit flush should reach its data-object PUT");
+
+    let err = tokio::time::timeout(Duration::from_secs(20), running.shutdown())
+        .await
+        .expect(
+            "shutdown must return on --shutdown-timeout; waiting past this means the audit \
+             drain is outside the bounded drain block and only its own bound applies",
+        )
+        .expect_err("a drain cut off by --shutdown-timeout is an error, not a swallowed Ok");
+
+    // The plain `Display` form, which is what `main.rs` logs with `%err`: the
+    // alternate `{:#}` form renders the whole chain, so it would pass on an
+    // overrun demoted to a cause under some other headline.
+    let headline = err.to_string();
+    assert!(
+        headline.contains("exceeded --shutdown-timeout"),
+        "the overrun must name the budget that cut it off, got: {headline}"
+    );
+    // This overrun fired AFTER the ingest flush (nothing was buffered to flush,
+    // and the audit drain that hangs is the last step of the block), so it is
+    // the "flush completed" branch: the message says the flush COMPLETED, not
+    // that the records were flushed (a returned flush may have abandoned), in
+    // contrast to `shutdown_timeout_during_ingest_flush_warns_records_may_not_be_durable`.
+    assert!(
+        headline.contains("the ingest flush completed but shutdown did not complete cleanly"),
+        "an overrun after the flush completed must report the flush completed, got: {headline}"
+    );
+    assert!(
+        !headline.contains("buffered records were flushed"),
+        "the message must NOT assert the records were flushed, got: {headline}"
+    );
+    assert!(
+        !headline.contains("may not be durable"),
+        "an overrun after the flush completed must NOT warn of possible loss, got: {headline}"
+    );
+    assert_eq!(
+        stalled.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one audit data-object PUT was attempted and swallowed"
+    );
+    query.abort();
+}

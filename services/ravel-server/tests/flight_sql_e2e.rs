@@ -1,0 +1,492 @@
+//! End-to-end Flight SQL against a RustFS-backed `ravel-server` with a pinned
+//! arrow-flight SQL client.
+//!
+//! Every other Flight test in this workspace runs over `MemoryStore`. This one
+//! closes the last gap: object storage is the only durable backend (CLAUDE.md
+//! invariant), so an e2e that never touches S3 never proves the two-RPC flow
+//! survives a real bucket -- segment PUTs, commit-record CAS, catalog LIST
+//! fan-out, and the pinned `DoGet` re-fetch all going over the network to
+//! RustFS. The client is arrow-flight's own [`FlightSqlServiceClient`], the
+//! same driver an external BI tool would use, so the ticket it receives from
+//! `GetFlightInfo` and replays at `DoGet` is exercised exactly as a real client
+//! exercises it.
+//!
+//! No new dependency: `arrow-flight` (with its `flight-sql` feature) is already
+//! the server's Flight dependency, `ravel-object-store` already carries the S3
+//! adapter, and `tonic`'s `channel` feature is already a dev-dependency for the
+//! other Flight tests. This file adds only test code.
+//!
+//! `#[ignore]`d by default because it needs a Docker daemon reachable by the
+//! executing user (in the `docker` group or root, a usable
+//! `/var/run/docker.sock`) and the ability to pull or already have the pinned
+//! RustFS and AWS CLI images. Run explicitly with:
+//!
+//! ```text
+//! cargo test -p ravel-server --features flight-sql --test flight_sql_e2e -- --ignored
+//! ```
+//!
+//! Like `remote_write_prometheus_e2e.rs`, it was authored but not executed in
+//! the fleet environment it was written in: that host has no Docker socket
+//! access and no egress to pull images. The in-process `flight_sql.rs` (real
+//! tonic channel, `MemoryStore`) and ravel-sql's `flight_differential.rs` /
+//! `flight_tenancy.rs` (bit-identical parity, tenancy) cover the behaviour; this
+//! file substitutes a real object store and a real Flight SQL driver for the
+//! in-memory doubles.
+
+#![cfg(feature = "flight-sql")]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::HashMap;
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow_flight::sql::client::FlightSqlServiceClient;
+use futures::TryStreamExt;
+use ravel_commit::publish::RetryPolicy;
+use ravel_commit::record::NewCommitRecord;
+use ravel_commit::{keys, publish, record};
+use ravel_object_store::s3::{S3Config, S3Store};
+use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
+use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
+use tonic::transport::Channel;
+use uuid::Uuid;
+
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+/// Small on purpose: `Catalog::resolve` issues one LIST per (shard,
+/// ingest-hour) pair across the window, so a wall-clock value would fan the
+/// listing out to hundreds of thousands of round trips against RustFS.
+const NOW_NS: i64 = 4 * NS_PER_HOUR;
+
+const QUERY: &str = "SELECT ts, value FROM samples ORDER BY ts";
+
+// Pinned images so the test is reproducible across runs. ghcr.io and ECR
+// Public rather than Docker Hub, the same registries and the same digests
+// ci.yml pins for the object-store contract suite: Docker Hub's anonymous
+// pull allowance is per-IP and shared across every project on a runner, so an
+// unauthenticated pull there fails unpredictably, and those two registries do
+// not share that allowance. The pin checker at
+// deploy/metricsbench/tests/every_comparator_pins_an_image_digest.sh only
+// scans workflow YAML for image references, not Rust string consts, so these
+// digests are not covered by that check and must be refreshed by hand.
+// Resolved with:
+//   curl -sS "https://ghcr.io/token?service=ghcr.io&scope=repository:rustfs/rustfs:pull" \
+//     | jq -r .token \
+//     | xargs -I{} curl -sS -D - -o /dev/null -H "Authorization: Bearer {}" \
+//         -H "Accept: application/vnd.oci.image.index.v1+json" \
+//         https://ghcr.io/v2/rustfs/rustfs/manifests/1.0.0
+// (and the equivalent request against public.ecr.aws for AWS_CLI_IMAGE)
+//
+// RUSTFS_IMAGE is the release the compose files already run
+// (deploy/docker-compose/rustfs.yml, ravel.yml, deploy/metricsbench/
+// docker-compose.yml). Keeping them on one release keeps the server arguments
+// this test passes, and the `/health` endpoint it polls, on a version
+// something else already runs; a nightly lane going red on a server argument
+// is a false alarm about interop.
+const RUSTFS_IMAGE: &str = "ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff";
+const AWS_CLI_IMAGE: &str = "public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed";
+const RUSTFS_USER: &str = "rustfsadmin";
+const RUSTFS_PASSWORD: &str = "rustfsadmin";
+const BUCKET: &str = "ravel-flight-e2e";
+/// RustFS S3 API port, off the default 9000 to avoid colliding with a local
+/// object store a developer may already be running. RustFS binds its console
+/// port whether or not the console is enabled, so `RUSTFS_PORT + 1` is moved
+/// off 9001 with it.
+const RUSTFS_PORT: u16 = 19900;
+
+const ACME_TOKEN: &str = "acme-token";
+const OTHER_TOKEN: &str = "other-token";
+
+// ---------------------------------------------------------------------------
+// RustFS container lifecycle
+// ---------------------------------------------------------------------------
+
+/// A RustFS container plus the bucket the server writes into. Dropping it
+/// stops the container so a panicking test does not leak it.
+struct Rustfs {
+    container: String,
+    endpoint: String,
+}
+
+impl Rustfs {
+    async fn start() -> Rustfs {
+        let container = format!("ravel-flight-e2e-{}", std::process::id());
+        let endpoint = format!("http://127.0.0.1:{RUSTFS_PORT}");
+
+        // `server` is the default subcommand, so the data directory is the
+        // only positional argument the image needs.
+        let status = Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--rm",
+                "--network",
+                "host",
+                "--name",
+                &container,
+                "-e",
+                &format!("RUSTFS_ACCESS_KEY={RUSTFS_USER}"),
+                "-e",
+                &format!("RUSTFS_SECRET_KEY={RUSTFS_PASSWORD}"),
+                RUSTFS_IMAGE,
+                "--address",
+                &format!("127.0.0.1:{RUSTFS_PORT}"),
+                "--console-address",
+                &format!("127.0.0.1:{}", RUSTFS_PORT + 1),
+                "/data",
+            ])
+            .status()
+            .expect("docker must be runnable in an environment that executes this ignored test");
+        assert!(status.success(), "docker run failed to start RustFS");
+
+        let rustfs = Rustfs {
+            container,
+            endpoint,
+        };
+        rustfs.wait_ready().await;
+        rustfs.make_bucket();
+        rustfs
+    }
+
+    /// Poll RustFS's health endpoint until it answers or the timeout passes.
+    /// It needs no credentials, so a failure here is never an auth problem.
+    async fn wait_ready(&self) {
+        let url = format!("{}/health", self.endpoint);
+        let client = reqwest::Client::new();
+        for _ in 0..60 {
+            let ready = client
+                .get(&url)
+                .send()
+                .await
+                .map(|resp| resp.status().is_success())
+                .unwrap_or(false);
+            if ready {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        panic!("RustFS did not become ready within 30s");
+    }
+
+    /// Create the bucket with a one-shot AWS CLI container. The RustFS container
+    /// this harness starts has no volume, so the bucket never pre-exists.
+    fn make_bucket(&self) {
+        let status = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--network",
+                "host",
+                "-e",
+                &format!("AWS_ACCESS_KEY_ID={RUSTFS_USER}"),
+                "-e",
+                &format!("AWS_SECRET_ACCESS_KEY={RUSTFS_PASSWORD}"),
+                "-e",
+                "AWS_DEFAULT_REGION=us-east-1",
+                // No IMDS on a CI runner or a developer laptop; without this
+                // the CLI spends its metadata timeout before falling back to
+                // the static credentials above.
+                "-e",
+                "AWS_EC2_METADATA_DISABLED=true",
+                AWS_CLI_IMAGE,
+                "--endpoint-url",
+                &self.endpoint,
+                "s3api",
+                "create-bucket",
+                "--bucket",
+                BUCKET,
+            ])
+            .status()
+            .expect("docker run aws-cli");
+        assert!(status.success(), "aws-cli failed to create the bucket");
+    }
+
+    fn config(&self) -> S3Config {
+        S3Config {
+            bucket: BUCKET.to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(self.endpoint.clone()),
+            access_key_id: RUSTFS_USER.to_string(),
+            secret_access_key: RUSTFS_PASSWORD.to_string(),
+            allow_http: true,
+            force_path_style: true,
+            kms_key_id: None,
+            session_token: None,
+            credentials_file: None,
+            auth: Default::default(),
+            instance_metadata_endpoint: None,
+        }
+    }
+}
+
+impl Drop for Rustfs {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["stop", &self.container])
+            .status();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixture data
+// ---------------------------------------------------------------------------
+
+fn labels_for(metric: &str) -> LabelSet {
+    LabelSet::new(vec![Label {
+        name: "__name__".to_string(),
+        value: metric.to_string(),
+    }])
+    .expect("valid labels")
+}
+
+/// Publish one real segment plus its commit record for `tenant` onto the
+/// S3-backed store, the same way the ingest path would.
+async fn publish_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    metric: &str,
+    samples: &[(i64, f64)],
+) {
+    let tenant_hash = tenant.hash();
+    let label_set = labels_for(metric);
+    let series = vec![SeriesInput {
+        series_id: SeriesId::compute(tenant, metric, &label_set).expect("series id"),
+        labels: label_set,
+        samples: samples
+            .iter()
+            .map(|(ts_ns, value)| Sample {
+                ts_ns: *ts_ns,
+                value: *value,
+            })
+            .collect(),
+    }];
+
+    let writer_id = Uuid::from_u128(4_000);
+    let identity = SegmentIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.to_string(),
+        writer_epoch: 1,
+        writer_seq: 1,
+    };
+    let written = SegmentWriter::write(
+        series,
+        identity,
+        IngestBounds {
+            min_ingest_ts_ns: 0,
+            max_ingest_ts_ns: 0,
+        },
+    )
+    .expect("write segment");
+
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Metrics,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: written.bytes.len() as u64,
+        content_hash: written.summary.blake3,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        min_ingest_ts_ns: written.summary.min_event_ts_ns,
+        max_ingest_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: 1,
+        created_unix_ns: 10,
+        ingest_hour_bucket: 0,
+    })
+    .expect("valid commit record");
+
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, written.bytes, PutOptions::default())
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish");
+}
+
+// ---------------------------------------------------------------------------
+// Client helpers
+// ---------------------------------------------------------------------------
+
+/// A Flight SQL client whose credential and event-time window are pinned in the
+/// request headers, the way an ADBC/arrow-flight driver configures a session.
+async fn client(grpc: &std::net::SocketAddr, token: &str) -> FlightSqlServiceClient<Channel> {
+    let channel = Channel::from_shared(format!("http://{grpc}"))
+        .expect("valid endpoint uri")
+        .connect()
+        .await
+        .expect("Flight client connects");
+    let mut client = FlightSqlServiceClient::new(channel);
+    client.set_header("authorization", format!("Bearer {token}"));
+    // The Flight SQL command carries no window; the server reads it from
+    // metadata exactly as the HTTP endpoint reads it from the JSON body.
+    client.set_header("x-ravel-start", "0");
+    client.set_header("x-ravel-end", format!("{}", NOW_NS as f64 / 1e9));
+    client
+}
+
+// ---------------------------------------------------------------------------
+// The test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a Docker daemon reachable by this user and the pinned RUSTFS_IMAGE and AWS_CLI_IMAGE images"]
+async fn flight_sql_against_rustfs_returns_rows_and_isolates_tenants() {
+    let rustfs = Rustfs::start().await;
+    let store: Arc<dyn ObjectStoreBackend> =
+        Arc::new(S3Store::new(rustfs.config()).expect("S3 store"));
+
+    let acme = TenantId::new("acme".to_string());
+    let other = TenantId::new("other".to_string());
+    let samples = [(100i64, 1.5f64), (200, 2.5), (300, -0.0)];
+    publish_segment(store.as_ref(), &acme, "cpu", &samples).await;
+    // A distinct segment for the other tenant, so a leak would be visible.
+    publish_segment(store.as_ref(), &other, "cpu", &[(100, 900.0)]).await;
+
+    let mut tokens = HashMap::new();
+    tokens.insert(ACME_TOKEN.to_string(), acme.clone());
+    tokens.insert(OTHER_TOKEN.to_string(), other);
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+
+    let config = ServerConfig {
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
+        query_budgets: Default::default(),
+        max_inflight_flushes: 1,
+        max_queued_flushes: 8,
+        adaptive_flush_delay: false,
+        max_flush_delay: std::time::Duration::from_secs(2),
+        max_flush_delay_idle: std::time::Duration::from_secs(40),
+        min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
+        mode: Mode::Query,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            fold_interval: Duration::from_secs(60),
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        metrics_tenant_labels: false,
+        limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
+        scrub_period: std::time::Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
+        parquet_profiles: None,
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
+        cache_dir: None,
+        catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
+        distrib: None,
+        remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
+    };
+    let running = ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts");
+    let grpc = running
+        .grpc_addr
+        .expect("query mode binds gRPC when flight-sql is on");
+
+    // A statement query as acme: GetFlightInfo (execute) then DoGet.
+    let mut acme_client = client(&grpc, ACME_TOKEN).await;
+    let info = acme_client
+        .execute(QUERY.to_string(), None)
+        .await
+        .expect("GetFlightInfo");
+    let ticket = info
+        .endpoint
+        .first()
+        .expect("one endpoint")
+        .ticket
+        .clone()
+        .expect("endpoint carries a ticket");
+
+    let batches = acme_client
+        .do_get(ticket.clone())
+        .await
+        .expect("DoGet")
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("decode batches");
+    let rows: usize = batches.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(rows, samples.len(), "every published sample comes back");
+    let columns: Vec<String> = batches
+        .first()
+        .map(|batch| {
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(columns, vec!["ts".to_string(), "value".to_string()]);
+
+    // The same ticket, replayed with the other tenant's credentials, is denied
+    // before the pinned snapshot is touched: the ticket's tenant is checked,
+    // never trusted.
+    let mut other_client = client(&grpc, OTHER_TOKEN).await;
+    let denied = other_client
+        .do_get(ticket)
+        .await
+        .expect_err("cross-tenant redemption is denied over the wire");
+    let status = flight_status(denied);
+    assert_eq!(
+        status.code(),
+        tonic::Code::PermissionDenied,
+        "a ticket minted for acme must not be redeemable by other"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+    drop(rustfs);
+}
+
+/// Unwrap the `tonic::Status` inside an arrow-flight client error, so the test
+/// can assert on the gRPC code the server actually returned.
+fn flight_status(err: arrow_flight::error::FlightError) -> tonic::Status {
+    match err {
+        arrow_flight::error::FlightError::Tonic(status) => *status,
+        other => panic!("expected a tonic status, got: {other}"),
+    }
+}

@@ -1,0 +1,26 @@
+[package]
+name = "ravel-promql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+promql-parser = { workspace = true }
+thiserror = { workspace = true }
+# promql-parser depends on regex itself (for its own compiled
+# Matcher::Re/NotRe) but does not re-export it, so our own MatchOp::Re/Nre
+# needs a direct dependency to name the type.
+regex = { workspace = true }
+# Keyed tokenization of query text for the redacted audit posture
+# (ADR-0062 decision 2e). `audit_token` here is the shared token generator
+# ravel-sql also calls, so the SQL and PromQL surfaces emit one token shape.
+blake3 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

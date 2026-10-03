@@ -1,0 +1,952 @@
+//! AST-level keyed tokenization of SQL query text (ADR-0062 decision 2e).
+//!
+//! The SQL counterpart of `ravel_promql::redact`: the audit trail's default
+//! posture stores a structure-preserving redacted form of every query, with
+//! each literal value replaced by a deterministic keyed token while column
+//! names, table names, operators, keywords, and structure stay readable.
+//!
+//! [`redact`] parses `query` through [`crate::complexity_guard::parse_guarded`],
+//! the same guarded parse the read-only gate ([`crate::validate`]) uses, walks
+//! the parsed statement with
+//! sqlparser's `VisitorMut` (the `visitor` feature is already enabled on
+//! `sqlparser` via `datafusion-sql`, and this crate already uses its immutable
+//! `Visitor` in `validate`), replaces every literal `Value` with a token, and
+//! re-renders through the AST's own `Display` impl.
+//!
+//! The token generator is shared with the PromQL side: [`redact`] calls
+//! `ravel_promql::redact::audit_token`, which lives in `ravel-promql` (a crate
+//! `ravel-sql` already depends on). Both surfaces therefore emit the identical
+//! `tok_<hex>` shape from the identical `blake3::keyed_hash` scheme, so equal
+//! values tokenize equally across the whole audit trail regardless of which
+//! query language produced them.
+//!
+//! What is redacted, and what stays readable:
+//!
+//! - **String literals and identifying numeric literals** (`WHERE user =
+//!   'alice' AND age > 30`) are tokenized. Unlike PromQL, a SQL numeric literal
+//!   *can* be tokenized while keeping the output re-parseable: it is replaced
+//!   with a single-quoted string token, and sqlparser accepts a string literal
+//!   anywhere an expression is expected, so `age > 'tok_...'` still parses. A
+//!   SQL numeric literal in a value position (an account number, an id) is as
+//!   much an identifier carrier as a string, so tokenizing it matches the ADR's
+//!   PII intent.
+//! - **Structural numeric literals stay readable.** A number that shapes the
+//!   query rather than naming a subject is not an identifier and is left
+//!   verbatim: the `LIMIT`/`OFFSET`/`FETCH` counts and a bare positional
+//!   `ORDER BY` ordinal (`ORDER BY 1`). Tokenizing these would both destroy
+//!   operationally useful information (`LIMIT 10` and `LIMIT 1000000` become
+//!   indistinguishable) and, for a positional `ORDER BY`, change the query's
+//!   meaning (an ordinal turned into a string literal is no longer an ordinal).
+//!   This mirrors the PromQL side, where durations and thresholds stay
+//!   readable. The carve-out is narrow: it covers only those four structural
+//!   positions. A literal anywhere else -- `WHERE`, `HAVING`, `JOIN ... ON`,
+//!   function arguments, projection, `IN (...)`, `CASE`, CTEs -- still
+//!   tokenizes, including a value hidden inside an `ORDER BY` expression that
+//!   is not a bare ordinal (e.g. `ORDER BY CASE WHEN a = 'x' THEN 1 END`).
+//! - **`NULL`, boolean literals, and placeholders** (`$1`, `?`) are left
+//!   readable: they carry no identifier and are structural.
+//! - Column names, table names, function names, operators, and keywords are
+//!   never touched: only `Value` nodes are visited.
+//!
+//! **Unsupported statement shapes fail loudly.** `DFParser` parses four
+//! non-`Statement` extensions -- `CREATE EXTERNAL TABLE`, `COPY`, `EXPLAIN`,
+//! and `RESET`. `COPY`, `EXPLAIN`, and `RESET` are rejected by the read-only
+//! gate ([`crate::validate::validate_query`]) with `QueryStatus::Error`, but
+//! the audit path is still invoked with the raw request text on that error
+//! branch, so they *do* reach redaction. This redactor does not know how to
+//! walk their value positions (an `EXPLAIN` in particular wraps a full inner
+//! statement whose `WHERE` literals would otherwise re-render verbatim), so
+//! rather than pass unredacted text through it returns
+//! [`RedactError::Unsupported`] for the whole call. A redaction primitive
+//! that silently echoes unredacted text on an input shape it does not handle
+//! is worse than one that fails: the caller must never store text this
+//! function did not actually redact.
+//!
+//! `CREATE EXTERNAL TABLE` is different: the three forms ADR-2040 D2 admits
+//! (`CREATE EXTERNAL TABLE`, `CREATE OR REPLACE EXTERNAL TABLE`, `DROP
+//! TABLE`) are executed, by [`crate::executor::SqlExecutor::execute_ddl`], not
+//! rejected, so their audit trail must actually render rather than fail
+//! loudly on every call. `DROP TABLE` parses as an ordinary `Statement::Drop`
+//! and already walks through the generic path below. For the
+//! `CreateExternalTable` extension, [`redact`] reuses
+//! [`crate::validate::create_external_intent`] -- the exact admission rule
+//! [`crate::validate::validate_ddl`] itself runs -- to tell the one admitted
+//! shape from every refused one (`TEMPORARY`, `UNBOUNDED`, `PARTITIONED BY`,
+//! `WITH ORDER`, a column list, non-`PARQUET` `STORED AS`, an unadmitted
+//! `OPTIONS` key or a non-string `OPTIONS` value, or a `LOCATION` that fails
+//! syntax validation): the admitted shape is rendered with its `LOCATION` and
+//! `OPTIONS` values tokenized the same as any other literal, and every
+//! refused shape still returns [`RedactError::Unsupported`].
+
+use datafusion::sql::parser::Statement as DFStatement;
+use datafusion::sql::sqlparser::ast::{
+    Expr, LimitClause, OrderByKind, Query, Statement, Value, ValueWithSpan, VisitMut, VisitorMut,
+};
+use ravel_promql::audit_token;
+use std::collections::BTreeMap;
+use std::ops::ControlFlow;
+
+use crate::validate::{DdlIntent, create_external_intent};
+
+/// A failure to redact a SQL query.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RedactError {
+    /// `query` did not parse as SQL.
+    ///
+    /// Carries no parser detail on purpose (F3): sqlparser's own error message
+    /// quotes the offending token verbatim, and that token can be a caller
+    /// literal (`SELECT * FROM 'alice'` yields `... found: 'alice' ...`).
+    /// Storing or logging such a message would leak exactly the PII this module
+    /// exists to redact, so the error is a fixed, input-independent label.
+    #[error("SQL parse error")]
+    Parse,
+
+    /// `query` parsed to a statement shape this redactor does not walk (a
+    /// `DFParser` extension: `CREATE EXTERNAL TABLE`, `COPY`, `EXPLAIN`, or
+    /// `RESET`). `kind` is a fixed static label for the shape; it is never
+    /// derived from the input text, so it cannot carry a caller value.
+    #[error("unsupported SQL statement for redaction: {kind}")]
+    Unsupported { kind: &'static str },
+}
+
+/// Parse `query`, replace every identifying literal with a deterministic keyed
+/// token, and re-render the result to SQL text.
+///
+/// The output re-parses as valid SQL: every tokenized literal becomes a
+/// single-quoted string token, which is a valid operand anywhere a literal was.
+/// See the module docs for the exact redaction rules.
+///
+/// # Errors
+///
+/// Returns [`RedactError::Parse`] if `query` does not parse, and
+/// [`RedactError::Unsupported`] if any parsed statement is an
+/// `EXPLAIN`/`COPY`/`RESET` extension, or a `CREATE EXTERNAL TABLE` that is
+/// not one of the two admitted `CREATE [OR REPLACE] EXTERNAL TABLE` forms
+/// (see the module docs; `DROP TABLE` is a separate, always-admitted third
+/// form that never reaches this arm). The whole call fails on the first such
+/// statement: a multi-statement input is never partially redacted, because
+/// returning the redacted prefix of a batch whose remainder went unredacted
+/// would still leak.
+pub fn redact(query: &str, token_key: &[u8; 32]) -> Result<String, RedactError> {
+    // This entry point is NOT behind `validate`: `sql_execute` audits the raw
+    // statement before it returns the executor's result, so text that
+    // `validate` just rejected as too complex still arrives here. Both walks
+    // below recurse per tree level (`VisitMut::visit`, then `Display`), and the
+    // parser's own recursion limit does not bound a flat operator chain, so the
+    // complexity guard has to run here too. It does, because it is part of the
+    // parse: `parse_guarded` is the crate's only parse of caller text.
+    //
+    // Its error is discarded rather than reported: the parser arm quotes the
+    // offending token, which can be a caller literal, and this module exists to
+    // keep exactly that out of stored text (F3, see `RedactError::Parse`).
+    let mut statements =
+        crate::complexity_guard::parse_guarded(query).map_err(|_| RedactError::Parse)?;
+
+    let mut redactor = LiteralRedactor {
+        key: token_key,
+        structural: Vec::new(),
+    };
+    let mut rendered = Vec::with_capacity(statements.len());
+    for statement in statements.iter_mut() {
+        match statement {
+            DFStatement::Statement(inner) => {
+                let stmt: &mut Statement = inner;
+                let _ = VisitMut::visit(stmt, &mut redactor);
+                rendered.push(statement.to_string());
+            }
+            DFStatement::CreateExternalTable(create) => match create_external_intent(create) {
+                Ok(DdlIntent::CreateExternal {
+                    name,
+                    if_not_exists,
+                    or_replace,
+                    location,
+                    options,
+                }) => rendered.push(render_create_external(
+                    &name,
+                    if_not_exists,
+                    or_replace,
+                    &location,
+                    &options,
+                    token_key,
+                )),
+                // `create_external_intent` takes a `&CreateExternalTable` and
+                // only ever builds a `CreateExternal` intent from it, never a
+                // DROP statement, so this arm cannot be reached today. A typed
+                // refusal survives a future change to that contract; a panic
+                // here would crash the request whose audit trail triggered it.
+                Ok(DdlIntent::Drop { .. }) => {
+                    return Err(RedactError::Unsupported {
+                        kind: "CREATE EXTERNAL TABLE",
+                    });
+                }
+                Err(_) => {
+                    return Err(RedactError::Unsupported {
+                        kind: "CREATE EXTERNAL TABLE",
+                    });
+                }
+            },
+            other => {
+                return Err(RedactError::Unsupported {
+                    kind: unsupported_kind(other),
+                });
+            }
+        }
+    }
+    Ok(rendered.join("; "))
+}
+
+/// A fixed, input-independent label naming a non-`Statement` `DFParser`
+/// extension, for [`RedactError::Unsupported`]. Never derived from input text.
+fn unsupported_kind(statement: &DFStatement) -> &'static str {
+    match statement {
+        // Unreachable: the caller only reaches here for non-`Statement`
+        // variants, but keep the arm so the match stays exhaustive.
+        DFStatement::Statement(_) => "STATEMENT",
+        DFStatement::CreateExternalTable(_) => "CREATE EXTERNAL TABLE",
+        DFStatement::CopyTo(_) => "COPY",
+        DFStatement::Explain(_) => "EXPLAIN",
+        DFStatement::Reset(_) => "RESET",
+    }
+}
+
+/// Render the one admitted `CREATE [OR REPLACE] EXTERNAL TABLE [IF NOT
+/// EXISTS] <name> STORED AS PARQUET LOCATION '<url>' [OPTIONS (...)]` shape,
+/// with `location` and every `OPTIONS` value tokenized like any other
+/// literal. `name` and every `OPTIONS` key stay readable, the same rule the
+/// rest of this module applies to column and table names.
+///
+/// This does not go through sqlparser's `Display`: DataFusion's own
+/// `CreateExternalTable` `Display` impl renders neither `OR REPLACE` nor
+/// `OPTIONS` at all (datafusion-sql 54.1.0), so reusing it here would silently
+/// drop both from the audit trail. Building the text by hand keeps it
+/// re-parseable and keeps every field the statement actually carried.
+fn render_create_external(
+    name: &str,
+    if_not_exists: bool,
+    or_replace: bool,
+    location: &str,
+    options: &BTreeMap<String, String>,
+    token_key: &[u8; 32],
+) -> String {
+    let mut out = String::from("CREATE ");
+    if or_replace {
+        out.push_str("OR REPLACE ");
+    }
+    out.push_str("EXTERNAL TABLE ");
+    if if_not_exists {
+        out.push_str("IF NOT EXISTS ");
+    }
+    out.push_str(name);
+    out.push_str(" STORED AS PARQUET LOCATION '");
+    out.push_str(&audit_token(token_key, location.as_bytes()));
+    out.push('\'');
+    if !options.is_empty() {
+        out.push_str(" OPTIONS (");
+        for (index, (key, value)) in options.iter().enumerate() {
+            if index > 0 {
+                out.push_str(", ");
+            }
+            out.push('\'');
+            out.push_str(&key.replace('\'', "''"));
+            out.push_str("' '");
+            out.push_str(&audit_token(token_key, value.as_bytes()));
+            out.push('\'');
+        }
+        out.push(')');
+    }
+    out
+}
+
+/// Visits every `Value` node in a statement and replaces each identifying
+/// literal with a keyed token, in place, while leaving structural numeric
+/// literals (see module docs) readable.
+struct LiteralRedactor<'a> {
+    key: &'a [u8; 32],
+    /// A stack of per-`Query` snapshots of the structural value positions,
+    /// captured on entry and restored on exit. See [`Self::pre_visit_query`].
+    /// Each position is `Some(original)` only when it is a structural literal
+    /// worth restoring (a bare `Value::Number`); `None` marks a position that
+    /// is still visited (so the snapshot and restore passes see the identical
+    /// position sequence -- required for `for_each_structural_value` to stay
+    /// aligned) but must NOT be restored, because it was never a number and
+    /// `pre_visit_value` genuinely tokenized it.
+    structural: Vec<Vec<Option<Value>>>,
+}
+
+impl VisitorMut for LiteralRedactor<'_> {
+    type Break = ();
+
+    /// Snapshot this query's structural value literals before the walk
+    /// descends into it.
+    ///
+    /// sqlparser's `VisitorMut` hooks are too coarse to skip specific fields:
+    /// `pre_visit_query` fires once for the whole `Query`, with no per-field
+    /// hook that would let a flag be toggled around only the `LIMIT`/`OFFSET`/
+    /// `FETCH`/`ORDER BY` tail. So instead of preventing tokenization there, we
+    /// snapshot those positions here (before `pre_visit_value` tokenizes them)
+    /// and restore the originals in `post_visit_query`, after the walk is done.
+    /// The stack keeps nested subqueries independent.
+    ///
+    /// Only a bare `Value::Number` is captured as `Some`: those are the
+    /// genuinely structural positions (a `LIMIT`/`OFFSET`/`FETCH` count or an
+    /// `ORDER BY` ordinal) this carve-out exists for. A non-number literal in
+    /// one of these positions (`LIMIT 'x'`, `ORDER BY 'x'` -- not valid SQL
+    /// shape-wise for most of these but sqlparser still parses a bare string
+    /// there) is captured as `None` and left to `pre_visit_value`'s
+    /// tokenization, which `post_visit_query` below must not undo.
+    fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        let mut snapshot = Vec::new();
+        for_each_structural_value(query, |vws| {
+            snapshot.push(match &vws.value {
+                Value::Number(..) => Some(vws.value.clone()),
+                _ => None,
+            });
+        });
+        self.structural.push(snapshot);
+        ControlFlow::Continue(())
+    }
+
+    /// Restore the structural value literals tokenized during the walk to
+    /// their pre-visit form, but only at a position the snapshot captured as
+    /// `Some` (a bare number). A `None` position was never a number and must
+    /// keep whatever `pre_visit_value` tokenized it to -- restoring it would
+    /// silently undo the redaction and leak the literal in a structural
+    /// position that isn't actually structural. Positions align with the
+    /// snapshot because tokenization only rewrites `Value` contents, never
+    /// the query's structure.
+    fn post_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+        if let Some(snapshot) = self.structural.pop() {
+            let mut originals = snapshot.into_iter();
+            for_each_structural_value(query, |vws| {
+                if let Some(Some(original)) = originals.next() {
+                    vws.value = original;
+                }
+            });
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_value(&mut self, value: &mut ValueWithSpan) -> ControlFlow<Self::Break> {
+        if let Some(text) = redactable_content(&value.value) {
+            value.value = Value::SingleQuotedString(audit_token(self.key, text.as_bytes()));
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// Invoke `f` on every `ValueWithSpan` that sits in a *structural* position of
+/// `query`: a `LIMIT`/`OFFSET`/`FETCH` count, or a bare positional `ORDER BY`
+/// ordinal. These shape the query rather than naming a subject, so they stay
+/// readable (see module docs). Only bare `Expr::Value` nodes are structural: a
+/// non-literal expression in one of these positions (a subquery, an
+/// arithmetic expression, a `CASE`) is left to tokenize normally, so a value
+/// hidden inside it never leaks.
+///
+/// The traversal order is deterministic and depends only on `query`'s
+/// structure, so a capture pass and a restore pass visit the same positions in
+/// the same order.
+fn for_each_structural_value<F: FnMut(&mut ValueWithSpan)>(query: &mut Query, mut f: F) {
+    if let Some(order_by) = &mut query.order_by
+        && let OrderByKind::Expressions(exprs) = &mut order_by.kind
+    {
+        for item in exprs {
+            if let Expr::Value(vws) = &mut item.expr {
+                f(vws);
+            }
+        }
+    }
+    match &mut query.limit_clause {
+        Some(LimitClause::LimitOffset { limit, offset, .. }) => {
+            if let Some(Expr::Value(vws)) = limit.as_mut() {
+                f(vws);
+            }
+            if let Some(offset) = offset.as_mut()
+                && let Expr::Value(vws) = &mut offset.value
+            {
+                f(vws);
+            }
+        }
+        Some(LimitClause::OffsetCommaLimit { offset, limit }) => {
+            if let Expr::Value(vws) = offset {
+                f(vws);
+            }
+            if let Expr::Value(vws) = limit {
+                f(vws);
+            }
+        }
+        None => {}
+    }
+    if let Some(fetch) = &mut query.fetch
+        && let Some(Expr::Value(vws)) = fetch.quantity.as_mut()
+    {
+        f(vws);
+    }
+}
+
+/// The canonical text to tokenize for `value`, or `None` if `value` is not a
+/// redactable literal (NULL, boolean, or placeholder: structural, no
+/// identifier). String literals hash their inner content; numbers hash their
+/// rendered form (feature-agnostic across sqlparser's `bigdecimal` flag).
+fn redactable_content(value: &Value) -> Option<String> {
+    match value {
+        Value::Null | Value::Boolean(_) | Value::Placeholder(_) => None,
+        Value::Number(..) => Some(value.to_string()),
+        other => Some(
+            other
+                .clone()
+                .into_string()
+                .unwrap_or_else(|| other.to_string()),
+        ),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    // guarded-parse-allow: test code parses this module's own output and its
+    // own fixed probes, never caller text, and asserts on what the raw front
+    // end does. The complexity guard is what production must not skip.
+    use datafusion::sql::parser::DFParser;
+
+    const KEY_A: [u8; 32] = [1u8; 32];
+    const KEY_B: [u8; 32] = [2u8; 32];
+
+    fn reparse(sql: &str) {
+        // guarded-parse-allow: the subject is the redacted output, which must
+        // re-parse; guarding it would test the guard instead.
+        let parsed = DFParser::parse_sql(sql).expect("redacted output re-parses as valid SQL");
+        assert_eq!(
+            parsed.len(),
+            1,
+            "redacted output must re-parse as exactly one statement: {sql}"
+        );
+    }
+
+    #[test]
+    fn where_literals_tokenized_structure_preserved() {
+        let out = redact(
+            "SELECT value FROM samples WHERE service = 'checkout' AND value > 30",
+            &KEY_A,
+        )
+        .expect("redacts");
+
+        // Column names, table name, and keywords stay readable.
+        assert!(out.contains("samples"), "table name preserved: {out}");
+        assert!(out.contains("service"), "column name preserved: {out}");
+        assert!(out.contains("value"), "column name preserved: {out}");
+
+        // Literal values are gone.
+        assert!(!out.contains("checkout"), "string literal leaked: {out}");
+        assert!(!out.contains("30"), "numeric literal leaked: {out}");
+        assert!(out.contains("tok_"), "tokens expected: {out}");
+
+        reparse(&out);
+    }
+
+    #[test]
+    fn same_value_same_key_is_deterministic() {
+        let a = redact("SELECT * FROM t WHERE a = 'x'", &KEY_A).expect("redacts");
+        let b = redact("SELECT * FROM t WHERE a = 'x'", &KEY_A).expect("redacts");
+        assert_eq!(a, b, "same value under same key must tokenize identically");
+    }
+
+    #[test]
+    fn different_key_produces_different_token() {
+        let a = redact("SELECT * FROM t WHERE a = 'x'", &KEY_A).expect("redacts");
+        let b = redact("SELECT * FROM t WHERE a = 'x'", &KEY_B).expect("redacts");
+        assert_ne!(a, b, "the token key must be load-bearing");
+    }
+
+    #[test]
+    fn token_matches_promql_side_generator() {
+        // The shared generator means a value tokenizes identically whether it
+        // came through the SQL or the PromQL surface.
+        let out = redact("SELECT * FROM t WHERE a = 'shared'", &KEY_A).expect("redacts");
+        let token = ravel_promql::audit_token(&KEY_A, b"shared");
+        assert!(
+            out.contains(&token),
+            "expected shared token {token} in {out}"
+        );
+    }
+
+    #[test]
+    fn query_without_literals_introduces_no_tokens() {
+        let out = redact("SELECT * FROM t", &KEY_A).expect("redacts");
+        assert!(!out.contains("tok_"), "no spurious tokens: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn null_and_boolean_stay_readable() {
+        let out =
+            redact("SELECT * FROM t WHERE a IS NOT NULL AND b = true", &KEY_A).expect("redacts");
+        assert!(out.to_uppercase().contains("NULL"), "NULL preserved: {out}");
+        assert!(
+            out.to_lowercase().contains("true"),
+            "boolean preserved: {out}"
+        );
+        reparse(&out);
+    }
+
+    #[test]
+    fn malformed_input_returns_typed_error_without_panic() {
+        let err = redact("SELECT * FROM t WHERE", &KEY_A).expect_err("must reject malformed input");
+        assert!(matches!(err, RedactError::Parse));
+    }
+
+    // --- Unsupported statement shapes fail loudly, never pass through ---
+
+    #[test]
+    fn explain_is_rejected_not_passed_through_unredacted() {
+        // `EXPLAIN` parses to `DFStatement::Explain`, whose Display re-renders
+        // the inner statement -- including its `WHERE` literal -- verbatim. The
+        // redactor must fail rather than echo the unredacted 'alice'.
+        let err = redact("EXPLAIN SELECT * FROM t WHERE a = 'alice'", &KEY_A)
+            .expect_err("EXPLAIN must be rejected");
+        assert_eq!(err, RedactError::Unsupported { kind: "EXPLAIN" });
+    }
+
+    #[test]
+    fn copy_to_is_rejected_not_passed_through_unredacted() {
+        let err = redact(
+            "COPY (SELECT a FROM t WHERE a = 'alice') TO 'out.parquet'",
+            &KEY_A,
+        )
+        .expect_err("COPY must be rejected");
+        assert_eq!(err, RedactError::Unsupported { kind: "COPY" });
+    }
+
+    #[test]
+    fn create_external_table_is_rejected() {
+        // Refused by `create_external_intent`: the LOCATION has no scheme, so
+        // `grants::parse_location` fails it. A refused shape still returns
+        // `Unsupported`, same as before this module admitted the other two.
+        let err = redact(
+            "CREATE EXTERNAL TABLE t (a INT) STORED AS PARQUET LOCATION '/data/secret'",
+            &KEY_A,
+        )
+        .expect_err("CREATE EXTERNAL TABLE must be rejected");
+        assert_eq!(
+            err,
+            RedactError::Unsupported {
+                kind: "CREATE EXTERNAL TABLE"
+            }
+        );
+    }
+
+    #[test]
+    fn admitted_create_external_table_is_redacted_not_rejected() {
+        // Inverted from the test above: a CREATE EXTERNAL TABLE that
+        // `validate_ddl` would actually admit (ADR-2040 D2) must render, not
+        // fail. The LOCATION and the OPTIONS value both carry identifying
+        // content and must tokenize; the table name and OPTIONS key stay
+        // readable.
+        let out = redact(
+            "CREATE EXTERNAL TABLE t1 STORED AS PARQUET LOCATION 's3://bucket/secret-prefix/' \
+             OPTIONS (binary_as_string 'true')",
+            &KEY_A,
+        )
+        .expect("the admitted form must redact, not reject");
+
+        assert!(
+            out.contains("CREATE EXTERNAL TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        assert!(
+            out.contains("binary_as_string"),
+            "OPTIONS key preserved: {out}"
+        );
+        assert!(!out.contains("s3://bucket"), "LOCATION leaked: {out}");
+        assert!(!out.contains("secret-prefix"), "LOCATION leaked: {out}");
+        assert!(!out.contains("'true'"), "OPTIONS value leaked: {out}");
+        assert!(out.contains("tok_"), "tokens expected: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn render_create_external_escapes_a_quote_in_an_options_key() {
+        // `create_external_intent`'s own charset check keeps a key like this
+        // from reaching `render_create_external` through `redact()`, but
+        // `render_create_external` must not rely on that alone: a key
+        // carrying an unescaped `'` would close the key's own string early
+        // and let the rest run as SQL text. Call it directly, bypassing the
+        // charset gate, to prove the escaping itself -- not just the gate in
+        // front of it -- is what keeps the output a single statement.
+        let mut options = BTreeMap::new();
+        options.insert(
+            "ravel.cast.x'); DROP TABLE evil--".to_string(),
+            "date-from-days".to_string(),
+        );
+        let out = render_create_external("t1", false, false, "s3://bucket/t1/", &options, &KEY_A);
+
+        assert!(
+            out.contains("x''); DROP TABLE evil--"),
+            "quote must be doubled, not dropped: {out}"
+        );
+
+        // guarded-parse-allow: test code parses this module's own rendered
+        // output to prove the escaped key yields one statement.
+        let parsed = DFParser::parse_sql(&out).expect("redacted output re-parses as valid SQL");
+        assert_eq!(parsed.len(), 1, "must re-parse as exactly one statement");
+    }
+
+    #[test]
+    fn create_or_replace_external_table_is_redacted() {
+        let out = redact(
+            "CREATE OR REPLACE EXTERNAL TABLE t1 STORED AS PARQUET LOCATION 's3://bucket/t1/'",
+            &KEY_A,
+        )
+        .expect("CREATE OR REPLACE EXTERNAL TABLE must redact");
+        assert!(out.contains("OR REPLACE"), "OR REPLACE preserved: {out}");
+        assert!(!out.contains("s3://bucket/t1"), "LOCATION leaked: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn create_external_table_if_not_exists_is_redacted() {
+        let out = redact(
+            "CREATE EXTERNAL TABLE IF NOT EXISTS t1 STORED AS PARQUET LOCATION 's3://bucket/t1/'",
+            &KEY_A,
+        )
+        .expect("CREATE EXTERNAL TABLE IF NOT EXISTS must redact");
+        assert!(
+            out.contains("IF NOT EXISTS"),
+            "IF NOT EXISTS preserved: {out}"
+        );
+        assert!(!out.contains("s3://bucket/t1"), "LOCATION leaked: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn ravel_cast_option_key_with_mixed_case_column_is_rendered() {
+        // Fix for issue #2054: `ravel.cast.EventDate` (ADR-2040 D5's own
+        // example) must round-trip through the audit trail, not just through
+        // `validate_ddl`'s admission check.
+        let out = redact(
+            "CREATE EXTERNAL TABLE t1 STORED AS PARQUET LOCATION 's3://bucket/t1/' \
+             OPTIONS ('ravel.cast.EventDate' 'date-from-days')",
+            &KEY_A,
+        )
+        .expect("the admitted ravel.cast.EventDate form must redact, not reject");
+
+        assert!(
+            out.contains("ravel.cast.EventDate"),
+            "OPTIONS key preserved with its original case: {out}"
+        );
+        assert!(
+            !out.contains("date-from-days"),
+            "OPTIONS value leaked: {out}"
+        );
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_is_redacted_via_the_generic_statement_path() {
+        // DROP TABLE parses as an ordinary `Statement::Drop`, so it already
+        // takes the generic walk below and was never rejected.
+        let out = redact("DROP TABLE IF EXISTS t1", &KEY_A).expect("DROP TABLE must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_restrict_is_redacted() {
+        let out =
+            redact("DROP TABLE t1 RESTRICT", &KEY_A).expect("DROP TABLE RESTRICT must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        assert!(
+            out.to_uppercase().contains("RESTRICT"),
+            "RESTRICT preserved: {out}"
+        );
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_purge_is_redacted() {
+        let out = redact("DROP TABLE t1 PURGE", &KEY_A).expect("DROP TABLE PURGE must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        assert!(
+            out.to_uppercase().contains("PURGE"),
+            "PURGE preserved: {out}"
+        );
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_temporary_is_redacted() {
+        let out =
+            redact("DROP TEMPORARY TABLE t1", &KEY_A).expect("DROP TEMPORARY TABLE must redact");
+        assert!(out.to_uppercase().contains("DROP"), "kind preserved: {out}");
+        assert!(
+            out.to_uppercase().contains("TEMPORARY"),
+            "TEMPORARY preserved: {out}"
+        );
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_schema_is_redacted() {
+        let out = redact("DROP SCHEMA s1", &KEY_A).expect("DROP SCHEMA must redact");
+        assert!(
+            out.to_uppercase().contains("DROP SCHEMA"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("s1"), "schema name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_qualified_name_is_redacted() {
+        let out =
+            redact("DROP TABLE IF EXISTS s1.t1", &KEY_A).expect("qualified DROP TABLE must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("s1"), "schema name preserved: {out}");
+        assert!(out.contains("t1"), "table name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn drop_table_quoted_name_is_redacted() {
+        let out =
+            redact("DROP TABLE \"Weird Name\"", &KEY_A).expect("quoted DROP TABLE must redact");
+        assert!(
+            out.to_uppercase().contains("DROP TABLE"),
+            "kind preserved: {out}"
+        );
+        assert!(out.contains("Weird Name"), "table name preserved: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn multi_statement_with_one_unsupported_fails_the_whole_call() {
+        // A normal SELECT followed by an EXPLAIN must not partially redact and
+        // return the SELECT's redacted form: the whole call fails.
+        let err = redact(
+            "SELECT * FROM t WHERE a = 'alice'; EXPLAIN SELECT * FROM t WHERE b = 'bob'",
+            &KEY_A,
+        )
+        .expect_err("a batch containing an unsupported statement fails whole");
+        assert_eq!(err, RedactError::Unsupported { kind: "EXPLAIN" });
+    }
+
+    // --- Structural numeric literals stay readable, value literals do not ---
+
+    #[test]
+    fn limit_offset_and_positional_order_by_stay_readable() {
+        // `ORDER BY 1`, `LIMIT 10`, `OFFSET 5` are structural and survive
+        // verbatim, while a `WHERE` literal in the same query still tokenizes.
+        let out = redact(
+            "SELECT * FROM t WHERE x = 'secret' ORDER BY 1 LIMIT 10 OFFSET 5",
+            &KEY_A,
+        )
+        .expect("redacts");
+
+        assert!(out.contains("ORDER BY 1"), "positional ordinal lost: {out}");
+        assert!(out.contains("LIMIT 10"), "LIMIT count lost: {out}");
+        assert!(out.contains("OFFSET 5"), "OFFSET count lost: {out}");
+
+        // The WHERE value is still redacted.
+        assert!(!out.contains("secret"), "WHERE literal leaked: {out}");
+        assert!(out.contains("tok_"), "WHERE value should tokenize: {out}");
+
+        reparse(&out);
+    }
+
+    #[test]
+    fn fetch_count_stays_readable() {
+        let out = redact("SELECT * FROM t FETCH FIRST 10 ROWS ONLY", &KEY_A).expect("redacts");
+        assert!(out.contains("10"), "FETCH count lost: {out}");
+        assert!(
+            !out.contains("tok_"),
+            "no token expected for a bare FETCH: {out}"
+        );
+        reparse(&out);
+    }
+
+    #[test]
+    fn non_ordinal_order_by_expression_still_redacts_hidden_values() {
+        // The carve-out is only for a *bare* positional ordinal. A value buried
+        // inside an ORDER BY expression is not structural and must tokenize, or
+        // the no-passthrough guarantee would have a hole here.
+        let out = redact(
+            "SELECT a FROM t ORDER BY CASE WHEN a = 'alice' THEN 1 ELSE 2 END",
+            &KEY_A,
+        )
+        .expect("redacts");
+        assert!(
+            !out.contains("alice"),
+            "value in ORDER BY expr leaked: {out}"
+        );
+        assert!(out.contains("tok_"), "hidden value should tokenize: {out}");
+        reparse(&out);
+    }
+
+    #[test]
+    fn non_numeric_structural_positions_still_tokenize() {
+        // The structural carve-out is for a bare NUMBER only. A string
+        // literal sitting in one of the four structural positions (ORDER BY,
+        // LIMIT, OFFSET, FETCH) is not a real ordinal or count and must still
+        // tokenize -- the snapshot/restore mechanism must not blindly restore
+        // whatever `pre_visit_value` tokenized there.
+        let cases = [
+            (
+                "SELECT a FROM t ORDER BY 'alice@example.com'",
+                "alice@example.com",
+            ),
+            (
+                "SELECT a FROM t ORDER BY b, 'secret-user-id'",
+                "secret-user-id",
+            ),
+            ("SELECT a FROM t LIMIT 'topsecret'", "topsecret"),
+            ("SELECT a FROM t OFFSET 'topsecret'", "topsecret"),
+            (
+                "SELECT a FROM t FETCH FIRST 'topsecret' ROWS ONLY",
+                "topsecret",
+            ),
+        ];
+        for (query, literal) in cases {
+            let out = redact(query, &KEY_A).expect("redacts");
+            assert!(
+                !out.contains(literal),
+                "non-numeric structural literal leaked for {query:?}: {out}"
+            );
+            assert!(
+                out.contains("tok_"),
+                "non-numeric structural literal should tokenize for {query:?}: {out}"
+            );
+            reparse(&out);
+        }
+    }
+
+    #[test]
+    fn substr_numeric_arguments_are_tokenized() {
+        // Decision: `substr`'s positional numeric arguments (1, 3) are NOT
+        // treated as structural. The structural carve-out is deliberately
+        // narrow -- only LIMIT/OFFSET/FETCH counts and positional ORDER BY --
+        // and a number passed to an arbitrary function can just as easily be an
+        // id as an offset. Tokenizing is the safe default; a false negative
+        // here would be a PII leak, a false positive only loses a length.
+        let out =
+            redact("SELECT substr(a, 1, 3) FROM t WHERE b = 'alice'", &KEY_A).expect("redacts");
+        // sqlparser re-renders function names upper-cased (`SUBSTR`).
+        assert!(
+            out.to_uppercase().contains("SUBSTR("),
+            "function name preserved: {out}"
+        );
+        assert!(!out.contains("alice"), "WHERE literal leaked: {out}");
+        // The exact tokens for the numeric arguments prove they were redacted.
+        assert!(
+            out.contains(&audit_token(&KEY_A, b"1")),
+            "substr arg 1 not tokenized: {out}"
+        );
+        assert!(
+            out.contains(&audit_token(&KEY_A, b"3")),
+            "substr arg 3 not tokenized: {out}"
+        );
+        reparse(&out);
+    }
+
+    // --- RedactError never carries input-derived text ---
+
+    #[test]
+    fn error_display_never_leaks_input_literals() {
+        // The raw parser message DOES quote the offending literal verbatim:
+        // this documents the leak the redactor closes. A trailing unexpected string
+        // literal makes sqlparser echo it (`... found: 'topsecret' ...`).
+        let probe = "SELECT * FROM t WHERE a = 'ok' 'topsecret'";
+        // guarded-parse-allow: the assertion is about the raw parser message
+        // quoting a literal, which is the leak this module closes, so the raw
+        // front end is the subject rather than an oversight.
+        let raw = DFParser::parse_sql(probe)
+            .expect_err("malformed input")
+            .to_string();
+        assert!(
+            raw.contains("topsecret"),
+            "raw parser message unexpectedly safe, F3 rationale stale: {raw}"
+        );
+
+        // Our Parse error carries none of it.
+        let parse_err = redact(probe, &KEY_A).expect_err("rejected");
+        assert!(matches!(parse_err, RedactError::Parse));
+        assert!(
+            !parse_err.to_string().contains("topsecret"),
+            "Parse Display leaked a literal: {parse_err}"
+        );
+
+        // The Unsupported variant's Display is a fixed label too.
+        let unsup_err =
+            redact("EXPLAIN SELECT * FROM t WHERE a = 'alice'", &KEY_A).expect_err("rejected");
+        assert!(
+            !unsup_err.to_string().contains("alice"),
+            "Unsupported Display leaked a literal: {unsup_err}"
+        );
+    }
+
+    /// The audit-redaction path takes untrusted text that `validate` never
+    /// admitted: `sql_execute` audits `request.sql` before it returns the
+    /// executor's result, so a statement rejected as too complex still reaches
+    /// `redact`. Both walks here recurse per tree level, so without the guard
+    /// this aborts the process on a flat operator chain, which is the #1680
+    /// failure on the surface that ticket did not cover.
+    ///
+    /// The chain runs at [`MAX_STATEMENT_COMPLEXITY`] + 1 rather than at the
+    /// half-million of the execution-path test: the point here is that the
+    /// bound is enforced at all on this entry point.
+    ///
+    /// Flip to watch it fail: replace the `complexity_guard::parse_guarded`
+    /// call at the top of `redact` with a bare parser build. The parser's own
+    /// recursion limit does not bound a flat operator chain, so the over-bound
+    /// tree is built and the `VisitMut` and `Display` walks below overflow the
+    /// stack, which aborts the test binary rather than reaching a clean
+    /// `expect_err`. The test still bites; an abort is a failure.
+    #[test]
+    fn an_over_complex_statement_is_refused_before_it_is_parsed() {
+        let chain = "+1".repeat(crate::complexity_guard::MAX_STATEMENT_COMPLEXITY);
+        let sql = format!("SELECT 1{chain}");
+        assert!(
+            crate::complexity_guard::structural_count(&sql)
+                > crate::complexity_guard::MAX_STATEMENT_COMPLEXITY,
+            "the probe must exceed the bound to be testing anything"
+        );
+
+        let err = redact(&sql, &KEY_A).expect_err("an over-bound statement is refused");
+        assert!(
+            matches!(err, RedactError::Parse),
+            "the guard maps to the input-independent Parse label, not a new variant: {err}"
+        );
+    }
+
+    /// The mirror: a statement at the bound is still redacted normally, so the
+    /// guard cannot be satisfied by refusing everything.
+    #[test]
+    fn a_statement_within_the_bound_is_still_redacted() {
+        let sql = "SELECT value FROM samples WHERE service = 'checkout'";
+        assert!(
+            crate::complexity_guard::structural_count(sql)
+                <= crate::complexity_guard::MAX_STATEMENT_COMPLEXITY,
+            "this probe must sit inside the bound"
+        );
+
+        let out = redact(sql, &KEY_A).expect("redacts");
+        assert!(!out.contains("checkout"), "string literal leaked: {out}");
+        reparse(&out);
+    }
+}

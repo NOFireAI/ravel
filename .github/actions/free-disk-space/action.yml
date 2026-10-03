@@ -1,0 +1,15 @@
+name: Free disk space
+description: >-
+  Remove preinstalled SDKs, toolchains, and cached images that the Ravel
+  build never uses, reclaiming runner disk before a workspace compile.
+runs:
+  using: composite
+  steps:
+    - name: Free disk space
+      shell: bash
+      run: |
+        sudo rm -rf /usr/share/dotnet || true
+        sudo rm -rf /opt/ghc || true
+        sudo rm -rf "${ANDROID_HOME:-/usr/local/lib/android}" || true
+        sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+        docker image prune -af || true

@@ -1,0 +1,69 @@
+# A minimal RavelCluster for local/dev use (ADR-0034 decision 6). Points at an
+# S3-compatible endpoint (RustFS/floci) and references three Secrets the
+# platform owner creates: one with keys accessKeyId/secretAccessKey, one whose
+# keys are tenant names and whose values are bearer tokens, and one with a
+# single key `key` holding the query-audit token key.
+apiVersion: ravel.nofire.ai/v1alpha1
+kind: RavelCluster
+metadata:
+  name: dev
+  namespace: ravel-system
+spec:
+  # A locally built/loaded tag, not a pull: this example is never applied by
+  # kind-up.sh (which renders its own RavelCluster with the built image) or
+  # by CI, so it carries no Docker Hub pull risk.
+  image: ravel-server:latest
+  imagePullPolicy: IfNotPresent
+  shards: 4
+  storage:
+    s3:
+      bucket: ravel
+      region: us-east-1
+      endpoint: http://rustfs.ravel-system.svc:9000
+      # The endpoint above is plaintext http:// to a Service name, which no
+      # pod reaches over loopback, so the server refuses to start without
+      # this. It is here because the in-cluster RustFS speaks no TLS; a
+      # cluster whose object store has an https:// endpoint omits it.
+      allowHttp: true
+      credentialsSecretRef:
+        name: ravel-s3-credentials
+  tenantTokensSecretRef:
+    name: ravel-tenant-tokens
+  # The platform owner creates this Secret too, with one key `key` holding
+  # 64 hex characters (32 bytes).
+  auditTokenKeySecretRef:
+    name: ravel-audit-token-key
+  gateway:
+    replicas: 1
+    # Explicit block (#1726): replaces the rendered default request entirely
+    # (100m CPU / 256Mi memory, no limits) rather than merging with it. Omit
+    # this block to keep that default. No memory limit: the server subtracts
+    # a fixed 2 GiB overhead reserve from its cgroup memory limit to size its
+    # memory budget and refuses to start when that leaves 0 bytes, so a limit
+    # at or below 2 GiB keeps the gateway from starting.
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+    # Ingest affinity (ADR-0076 decision 1) is off here and in every existing
+    # RavelCluster: omitting the block renders no Ingress and behaves exactly
+    # as before. It also needs an ingress controller, which the kind dev
+    # environment does not run. On a real cluster with ingress-nginx, adding
+    # the block below pins each tenant to a stable two-replica subset and
+    # divides its flush PUTs by replicas/subsetSize. Sizing, key choice, and
+    # rebalance behaviour: docs/guides/ingest-affinity.md.
+    #
+    # ingestAffinity:
+    #   ingressClassName: nginx
+    #   hosts: [ingest.example.com]
+    #   tlsSecretName: ingest-tls
+    #   subsetSize: 2
+  query:
+    replicas: 1
+  maintain:
+    enabled: true
+    intervalSecs: 300
+  retention:
+    default: 30d

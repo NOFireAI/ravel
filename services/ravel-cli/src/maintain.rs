@@ -1,0 +1,4668 @@
+//! `ravel-cli maintain` subcommands: one-shot drivers for the compaction,
+//! sweep, retention, and
+//! version-audit paths, plus decode/print for `CompactionRecord` and
+//! `RetentionTombstone`. Built strictly against `ravel-maintain`'s and
+//! `ravel-commit`'s public APIs; no maintenance decision logic lives here.
+
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::ValueEnum;
+use ravel_commit::keys;
+use ravel_ingest::Clock as _;
+use ravel_maintain::{
+    BlockedBucket, BlockedReason, Bucket, ClaimParticipant, ClaimSkip, ClaimedCompaction,
+    CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
+    L1PartMemoryTargetSource, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, MigrationPath,
+    NotMigratedBucket, NotMigratedReason, PublishOutcome, ReencodeBlockedBucket,
+    ReencodeBlockedReason, ResolvedL1PartMemoryTarget, SweepReport, Verification, census_family,
+    compact_bucket_claimed, count_below_target, migrate_family, sweep_shard,
+};
+use ravel_object_store::conformance::NoncurrentVersionSource;
+use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
+use ravel_types::{Signal, TenantHash, TenantId};
+use tokio::task::JoinSet;
+use uuid::Uuid;
+
+use crate::store::{DefaultedMemoryEmptyWalk, StoreSelection, require_tenant_data_present};
+
+/// CLI signal selector for the `--signal` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SignalArg {
+    Metrics,
+    Logs,
+    Spans,
+}
+
+impl SignalArg {
+    pub(crate) fn to_signal(self) -> Signal {
+        match self {
+            SignalArg::Metrics => Signal::Metrics,
+            SignalArg::Logs => Signal::Logs,
+            SignalArg::Spans => Signal::Spans,
+        }
+    }
+}
+
+/// A wall clock snapshot for a one-shot CLI invocation: the whole command runs
+/// at a single `now`, which is exactly what the compactor's seal check and the
+/// sweep/retention horizon gates need (a moving clock matters only for a
+/// long-lived loop, which the service task provides, not this CLI).
+fn wall_clock() -> anyhow::Result<FixedClock> {
+    Ok(FixedClock::new(crate::now_ns()?))
+}
+
+/// The moving wall clock advisory claims read. Delegates to `ravel-ingest`'s
+/// `SystemClock`, as the server's maintenance clock does.
+#[derive(Debug, Clone, Copy)]
+struct LiveClock;
+
+impl ravel_maintain::Clock for LiveClock {
+    fn now_ns(&self) -> i64 {
+        ravel_ingest::SystemClock.now_ns()
+    }
+}
+
+/// How one `compact-bucket` / `compact-tenant` invocation takes advisory
+/// compaction claims (ADR-1029 decision 5).
+///
+/// The CLI binary builds this once per invocation with
+/// [`ClaimOptions::for_invocation`], so every bucket of one walk is claimed
+/// under the same process id. The three override fields exist for callers of
+/// this library, the tests among them; the binary leaves all three at `None`.
+#[derive(Clone)]
+pub struct ClaimOptions {
+    /// `--no-claim`: take no claims at all. Against another compaction the
+    /// run is still correct, because the compaction record's `CreateIfAbsent`
+    /// decides which output is published, but it may duplicate a merge another
+    /// maintainer is running. Against an erasure rewrite of the same bucket
+    /// only the pre-publish re-list fences its publish, which leaves a short
+    /// window between that re-list and the record PUT.
+    pub no_claim: bool,
+    /// The identity this invocation's claims are written under.
+    pub process_id: Uuid,
+    /// Replaces the compactor's `claim_min_input_bytes` when set. The setting
+    /// no longer decides anything: a participating run claims every bucket.
+    pub min_input_bytes: Option<u64>,
+    /// Replaces the compactor's `claim_lease_duration` when set.
+    pub lease_duration: Option<Duration>,
+    /// Replaces the claim participant's clock when set. `None` is the binary's
+    /// case and resolves to the live wall clock (see [`Self::clock`]); a test
+    /// sets a [`FixedClock`] here and drives renewal and expiry by moving it,
+    /// which is what makes a claim-timing test deterministic and free of any
+    /// real sleep.
+    pub clock: Option<Arc<dyn ravel_maintain::Clock>>,
+}
+
+/// Hand-written because [`ravel_maintain::Clock`] is not `Debug`: the override
+/// is reported as present or absent, which is what a failure message needs.
+impl std::fmt::Debug for ClaimOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaimOptions")
+            .field("no_claim", &self.no_claim)
+            .field("process_id", &self.process_id)
+            .field("min_input_bytes", &self.min_input_bytes)
+            .field("lease_duration", &self.lease_duration)
+            .field("clock_override", &self.clock.is_some())
+            .finish()
+    }
+}
+
+impl ClaimOptions {
+    /// One fresh process id for this invocation, the compactor's claim
+    /// defaults, the live clock, and claiming off when `no_claim` is set.
+    pub fn for_invocation(no_claim: bool) -> Self {
+        ClaimOptions {
+            no_claim,
+            process_id: Uuid::new_v4(),
+            min_input_bytes: None,
+            lease_duration: None,
+            clock: None,
+        }
+    }
+
+    /// [`Self::for_invocation`] with claiming on.
+    pub fn fresh() -> Self {
+        Self::for_invocation(false)
+    }
+
+    /// The clock the claim participant reads: the override when one is set,
+    /// otherwise the live wall clock (`ravel_ingest::SystemClock`).
+    ///
+    /// The default is deliberately NOT the [`FixedClock`] each bucket's seal
+    /// check is evaluated at. Renewal cadence and lease expiry are elapsed-time
+    /// decisions, so under a frozen clock a merge longer than a third of the
+    /// lease would never renew its claim, and another maintainer could steal
+    /// the bucket mid-merge once the lease ran out.
+    pub fn clock(&self) -> Arc<dyn ravel_maintain::Clock> {
+        self.clock
+            .clone()
+            .unwrap_or_else(|| Arc::new(LiveClock) as Arc<dyn ravel_maintain::Clock>)
+    }
+}
+
+/// Install `claims` on `config`, and return the `claims:` header line that
+/// says what was installed.
+///
+/// A dry run installs no participant: the claim protocol does not honour
+/// `dry_run` itself, so a participant on a dry run would write claim objects.
+/// `--no-claim` installs none either. Without a participant,
+/// `compact_bucket_claimed` runs every bucket unclaimed.
+///
+/// The participant's clock is [`ClaimOptions::clock`], which is [`LiveClock`]
+/// for the binary and an injected clock for a test that drives claim timing.
+fn install_claims(config: &mut CompactorConfig, dry_run: bool, claims: &ClaimOptions) -> String {
+    if let Some(bytes) = claims.min_input_bytes {
+        config.claim_min_input_bytes = bytes;
+    }
+    if let Some(lease) = claims.lease_duration {
+        config.claim_lease_duration = lease;
+    }
+    if dry_run {
+        return "claims: off (--dry-run)".to_string();
+    }
+    if claims.no_claim {
+        return "claims: off (--no-claim)".to_string();
+    }
+    config.claim_participant = Some(ClaimParticipant::new(claims.process_id, claims.clock()));
+    format!(
+        "claims: on process_id={} min_input_bytes={} lease_ms={}",
+        claims.process_id,
+        config.claim_min_input_bytes,
+        config.claim_lease_duration.as_millis()
+    )
+}
+
+/// The report fields of a bucket refused its claim, shared by both commands.
+fn claim_skip_fields(skip: &ClaimSkip) -> String {
+    let holder = skip
+        .holder_process_id
+        .map_or_else(|| "unknown".to_string(), |id| id.to_string());
+    format!(
+        "reason={} work_id={} holder={holder} claim_expiry_unix_ms={} retry_after_unix_ms={}",
+        skip.reason.name(),
+        skip.work_id_hex,
+        skip.expiry_unix_ms,
+        skip.reschedule_after_unix_ms
+    )
+}
+
+/// An operator override of a memory-relevant compactor knob was rejected. Typed
+/// so the message names the flag and why zero is refused, rather than surfacing
+/// as a downstream merge misbehaviour. Only the two part-split byte targets
+/// carry a floor here: their config-field docs
+/// ([`CompactorConfig::l1_part_memory_target_bytes`],
+/// [`CompactorConfig::max_l1_part_bytes`]) frame each as the byte budget an
+/// in-progress part is *closed at*, which zero cannot express (a part would be
+/// closed before any record accumulates). `input_read_concurrency` is
+/// deliberately absent: its own field doc states "Values below 1 are treated as
+/// 1," so the CLI passes a zero through unchanged rather than enforcing more
+/// than that doc states.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CompactorKnobError {
+    #[error(
+        "--l1-part-memory-target-bytes must be greater than 0: it is the decoded record-heap \
+         budget an in-progress L1 part is closed at, and 0 would close a part before any record \
+         is buffered"
+    )]
+    ZeroL1PartMemoryTarget,
+    #[error(
+        "--max-l1-part-bytes must be greater than 0: it is the encoded/on-object byte budget an \
+         in-progress L1 part is closed at, and 0 would close a part before any bytes are written"
+    )]
+    ZeroMaxL1PartBytes,
+    #[error("--compaction-zstd-level: {0}")]
+    InvalidRlogZstdLevel(#[from] ravel_maintain::RlogZstdLevelError),
+}
+
+/// The compactor config a `compact-bucket` / `compact-tenant` invocation runs
+/// with: defaults, plus the dry-run switch and the optional operator overrides.
+///
+/// A FRESH [`MergeMemoryTracker`] is installed on every call, so the per-phase
+/// peak-memory event `ravel_maintain::rewrite_and_publish` emits fires for the
+/// bucket this config compacts (the tracker's `reset_for_run` runs at the
+/// bucket's start; never a shared static). On the `compact-bucket` path this
+/// config is used directly. On the `compact-tenant` path it is only a base:
+/// [`run_bucket_walk`] gives each concurrent bucket its own clone carrying a
+/// fresh tracker (and, for the default budget, a per-bucket share of it), so the
+/// tracker installed here is unused on that path and each bucket reports its own
+/// peaks. `max_flush_lifetime_ns` moves the seal margin
+/// (see [`crate::parse_max_flush_lifetime_ns`]); the three part-split /
+/// concurrency knobs each replace their config default when given.
+///
+/// The two byte-target overrides are validated: zero is refused with a typed
+/// [`CompactorKnobError`] because each field's own doc frames it as the byte
+/// budget a part is closed at. `input_read_concurrency` is not floored here:
+/// its field doc already states below-1 is treated as 1. `rlog_zstd_level`
+/// replaces [`CompactorConfig::rlog_zstd_level`] and is refused outside the
+/// range [`ravel_maintain::validate_rlog_zstd_level`] accepts.
+///
+/// Without an override the RLOG merge's memory split target is derived from
+/// `host_memory_total_bytes` (the host's memory capped by a cgroup limit, see
+/// [`ravel_maintain::detect_host_memory_total_bytes`]) with
+/// [`ResolvedL1PartMemoryTarget::resolve`]. The budget that is divided is the
+/// host memory less [`ravel_maintain::MEMORY_OVERHEAD_RESERVE_BYTES`] less the
+/// merge cursor budget the same invocation runs with
+/// ([`merge_cursor_budget_total_bytes`]: the default 20 GiB for any
+/// `concurrent_merges`, because [`per_bucket_config`] splits it between them),
+/// floored at zero before the division by `concurrent_merges`; the claim lease
+/// caps the result at what the lease supports
+/// ([`ravel_maintain::derive_l1_part_memory_target`]). A 32 GiB host at one
+/// merge divides `32 - 2 - 20 = 10 GiB` and derives 1.25 GiB. An unknown host
+/// memory falls back to 256 MiB. The RSPAN merge keeps 256 MiB unless the
+/// override is given ([`ResolvedL1PartMemoryTarget::apply_to`]).
+///
+/// An explicit `max_l1_part_bytes` sets the shared stored-size cap and the RLOG
+/// cap together; without it the RLOG cap follows the derived target.
+/// The resolution is returned beside the config so the caller can report where
+/// the value came from.
+#[allow(clippy::too_many_arguments)]
+pub fn build_compactor_config(
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    input_read_concurrency: Option<usize>,
+    rlog_zstd_level: Option<i32>,
+    host_memory_total_bytes: Option<u64>,
+    concurrent_merges: usize,
+    claim_lease_duration: Duration,
+) -> Result<(CompactorConfig, ResolvedL1PartMemoryTarget), CompactorKnobError> {
+    let mut config = CompactorConfig {
+        dry_run,
+        merge_memory_tracker: Some(MergeMemoryTracker::new()),
+        ..CompactorConfig::default()
+    };
+    if let Some(ns) = max_flush_lifetime_ns {
+        config.max_flush_lifetime_ns = ns;
+    }
+    if l1_part_memory_target_bytes == Some(0) {
+        return Err(CompactorKnobError::ZeroL1PartMemoryTarget);
+    }
+    let memory_budget = host_memory_total_bytes.map(|total| {
+        ravel_maintain::merge_memory_budget_bytes(
+            ravel_maintain::host_memory_budget_bytes(total),
+            merge_cursor_budget_total_bytes(&config, concurrent_merges),
+        )
+    });
+    let memory_target = ResolvedL1PartMemoryTarget::resolve(
+        l1_part_memory_target_bytes,
+        memory_budget,
+        concurrent_merges,
+        claim_lease_duration,
+    );
+    memory_target.apply_to(&mut config);
+    if let Some(bytes) = max_l1_part_bytes {
+        if bytes == 0 {
+            return Err(CompactorKnobError::ZeroMaxL1PartBytes);
+        }
+        config.max_l1_part_bytes = bytes;
+        config.rlog_max_l1_part_bytes = Some(bytes);
+    }
+    if let Some(n) = input_read_concurrency {
+        config.input_read_concurrency = n;
+    }
+    if let Some(level) = rlog_zstd_level {
+        config.rlog_zstd_level = ravel_maintain::validate_rlog_zstd_level(level)?;
+    }
+    Ok((config, memory_target))
+}
+
+/// The stderr note for a memory split target that fell back to 256 MiB
+/// because the host memory could not be read; `None` for any other source.
+pub fn l1_part_memory_target_fallback_note(
+    memory_target: &ResolvedL1PartMemoryTarget,
+) -> Option<String> {
+    (memory_target.source == L1PartMemoryTargetSource::Fallback).then(|| {
+        format!(
+            "note: host memory could not be read, so rlog_l1_part_memory_target_bytes falls back to {}",
+            memory_target.bytes
+        )
+    })
+}
+
+/// The claim lease the part-split derivation caps against:
+/// `ClaimOptions::lease_duration` when set (no `ravel-cli` flag sets it today;
+/// tests do), else the compactor's default.
+fn claim_lease_for_derivation(claims: &ClaimOptions) -> Duration {
+    claims
+        .lease_duration
+        .unwrap_or(ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION)
+}
+
+/// The part-split report lines, one per codec and prefixed by it, so a reader
+/// cannot take the RLOG-derived value for the span value or the other way
+/// round: `rlog_l1_part_memory_target_bytes` (with its provenance),
+/// `rlog_max_l1_part_bytes` (the RLOG stored-size cap),
+/// `rspan_l1_part_memory_target_bytes`, and `max_l1_part_bytes` (the shared
+/// cap RSEG reads).
+fn write_part_split_lines(
+    out: &mut dyn Write,
+    config: &CompactorConfig,
+    memory_target: &ResolvedL1PartMemoryTarget,
+) -> std::io::Result<()> {
+    writeln!(out, "rlog_l1_part_memory_target_bytes: {memory_target}")?;
+    writeln!(
+        out,
+        "rlog_max_l1_part_bytes: {}",
+        config.rlog_stored_target_bytes()
+    )?;
+    writeln!(
+        out,
+        "rspan_l1_part_memory_target_bytes: {}",
+        config.l1_part_memory_target_bytes
+    )?;
+    writeln!(out, "max_l1_part_bytes: {}", config.max_l1_part_bytes)
+}
+
+/// `maintain compact-bucket`: run one compaction pass over a single bucket.
+///
+/// `selection` is which store `--store` resolved to: it heads the report, and a
+/// tenant prefix holding nothing at all on the defaulted memory store is
+/// refused rather than compacted as an empty bucket (issue #1024).
+///
+/// Every bucket asks for its claim first, unless `--no-claim` is set (see
+/// [`install_claims`]). A bucket refused its claim is reported as
+/// `outcome: ClaimSkipped` with the reason, the holder and the claim expiry,
+/// and a run that lost its claim mid-merge as `outcome: ClaimCancelled`.
+/// Neither is an error: the command exits zero, as it does for a bucket that is
+/// not sealed yet.
+///
+/// [`compact_with_part_split_targets`] with neither part-split override.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    hour: u32,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    rlog_zstd_level: Option<i32>,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    compact_with_part_split_targets(
+        store,
+        selection,
+        tenant,
+        signal,
+        shard,
+        hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        None,
+        None,
+        rlog_zstd_level,
+        claims,
+    )
+    .await
+}
+
+/// `maintain compact-bucket` with its `--l1-part-memory-target-bytes` and
+/// `--max-l1-part-bytes` overrides, each replacing the derived or default
+/// value when given. Thin wrapper over [`compact_to`] that writes the report
+/// to stdout and derives the memory split target from the detected host
+/// memory.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_with_part_split_targets(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    hour: u32,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    rlog_zstd_level: Option<i32>,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    let mut out = std::io::stdout();
+    compact_with_part_split_targets_to(
+        &mut out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shard,
+        hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        rlog_zstd_level,
+        wall_clock()?,
+        claims,
+    )
+    .await
+}
+
+/// [`compact_with_part_split_targets`] with the report written to `out` and
+/// the bucket evaluated at `clock`. This is where the host's memory is
+/// detected and handed to [`compact_to`], so a test reaches that hand-off.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_with_part_split_targets_to(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    hour: u32,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    rlog_zstd_level: Option<i32>,
+    clock: FixedClock,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    compact_to(
+        out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shard,
+        hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        rlog_zstd_level,
+        ravel_maintain::detect_host_memory_total_bytes(),
+        clock,
+        claims,
+    )
+    .await
+}
+
+/// [`compact`] with the report written to `out`, the bucket evaluated at
+/// `clock`, and the memory split target derived from
+/// `host_memory_total_bytes` instead of the detected host memory. The
+/// store-selection header still prints to stdout.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_to(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    hour: u32,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    rlog_zstd_level: Option<i32>,
+    host_memory_total_bytes: Option<u64>,
+    clock: FixedClock,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    let bucket = Bucket::new(tenant_hash, signal.to_signal(), shard, hour);
+    let (mut config, memory_target) = build_compactor_config(
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        None,
+        rlog_zstd_level,
+        host_memory_total_bytes,
+        1,
+        claim_lease_for_derivation(claims),
+    )?;
+    if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
+        eprintln!("{note}");
+    }
+    let claims_line = install_claims(&mut config, dry_run, claims);
+
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain compact-bucket",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+
+    let outcome = compact_bucket_claimed(store.as_ref(), &clock, &config, &bucket)
+        .await
+        .map_err(|err| anyhow::anyhow!("compaction failed: {err}"))?;
+
+    writeln!(out, "dry_run: {dry_run}")?;
+    write_part_split_lines(out, &config, &memory_target)?;
+    writeln!(out, "{claims_line}")?;
+    let outcome = match outcome {
+        ClaimedCompaction::Ran(outcome) => outcome,
+        ClaimedCompaction::SkippedClaimed(skip) => {
+            writeln!(
+                out,
+                "outcome: ClaimSkipped (this bucket's compaction claim was not taken; \
+                 nothing was merged) {}",
+                claim_skip_fields(&skip)
+            )?;
+            return Ok(());
+        }
+        // A cancelled run publishes nothing; any parts it had already written stay
+        // in the store for a later run to reuse, so no part count is printed.
+        ClaimedCompaction::Cancelled { at, .. } => {
+            writeln!(
+                out,
+                "outcome: ClaimCancelled (the claim was lost mid-merge; nothing was \
+                 published) checkpoint={}",
+                at.name()
+            )?;
+            return Ok(());
+        }
+    };
+    match outcome {
+        CompactionOutcome::NotSealed => {
+            writeln!(out, "outcome: NotSealed (bucket not yet sealed)")?
+        }
+        CompactionOutcome::Tombstoned => {
+            writeln!(out, "outcome: Tombstoned (retired; not compacted)")?
+        }
+        CompactionOutcome::AlreadyCompacted => writeln!(
+            out,
+            "outcome: AlreadyCompacted (a compaction record already exists)"
+        )?,
+        CompactionOutcome::RewritePresent => writeln!(
+            out,
+            "outcome: RewritePresent (a live erasure rewrite record already \
+             serves this bucket; compacting it would make the catalog serve \
+             two record sets)"
+        )?,
+        CompactionOutcome::BelowMinInputs { count } => writeln!(
+            out,
+            "outcome: BelowMinInputs (only {count} L0 record(s); nothing to do)"
+        )?,
+        CompactionOutcome::Compacted { parts, publish } => {
+            let verb = if dry_run { "would write" } else { "wrote" };
+            writeln!(out, "outcome: Compacted")?;
+            writeln!(out, "parts ({verb}): {parts}")?;
+            match publish {
+                PublishOutcome::Published => writeln!(out, "publish: Published")?,
+                PublishOutcome::Converged { parts_repaired } => {
+                    writeln!(out, "publish: Converged (parts_repaired={parts_repaired})")?
+                }
+                PublishOutcome::Abandoned => {
+                    writeln!(out, "publish: Abandoned (past lifetime deadline)")?
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why a `compact-tenant` run could not decide which shards to walk. Typed so
+/// the message names the tenant and the fix, rather than surfacing as a bare
+/// store error or, worse, as a silent walk over the wrong shard range.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CompactTenantError {
+    #[error(
+        "tenant {tenant:?} has no shard-count provisioning record for signal {signal:?}, and no \
+         --shards was given; pass --shards N with the shard count the tenant was written at"
+    )]
+    NoProvisioningRecord { tenant: String, signal: Signal },
+    #[error(
+        "--shards {requested} disagrees with tenant {tenant:?}'s provisioning record for signal \
+         {signal:?}, whose shard ceiling at hour {hour} is {ceiling}; rerun with --shards \
+         {ceiling} or omit --shards"
+    )]
+    ShardCountDisagreement {
+        tenant: String,
+        signal: Signal,
+        requested: u32,
+        ceiling: u32,
+        hour: u32,
+    },
+    #[error(
+        "--bucket-concurrency must be greater than 0: it is the number of buckets compacted at \
+         once, and 0 would compact nothing"
+    )]
+    ZeroBucketConcurrency,
+    #[error(
+        "compact-tenant: {failed} bucket(s) failed to compact, {succeeded} succeeded: {details}"
+    )]
+    BucketsFailed {
+        failed: usize,
+        succeeded: usize,
+        details: String,
+    },
+}
+
+/// Per-outcome bucket counts for one `maintain compact-tenant` run, plus the
+/// parts written. Wall time is deliberately not a field: it is printed but
+/// never returned, so a test can pin this whole struct.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactTenantReport {
+    /// Which store the walk ran against, and whether the operator chose it.
+    /// The report header names it (`store: memory (default)`, `store: s3`), so
+    /// a zero-count report can never hide which data it looked at.
+    pub store: StoreSelection,
+    /// Shards walked (`0..shards`).
+    pub shards: u32,
+    /// Buckets newly compacted (or, under `--dry-run`, that would have been).
+    pub compacted: usize,
+    /// Buckets that already carried a compaction record.
+    pub already: usize,
+    /// Buckets refused because a live erasure rewrite record already serves
+    /// them (ADR-0064 decision 3 point 5). Counted separately from `already`:
+    /// the bucket is not compacted and never will be while the rewrite record
+    /// stands, which is a different operator-visible state from a bucket whose
+    /// compaction is done.
+    pub rewrite_present: usize,
+    /// Buckets reached that are not yet sealed. Hours ascend, so the walk stops
+    /// at the first one in each shard; this is therefore at most one per shard.
+    pub not_sealed: usize,
+    /// Buckets below `min_compaction_inputs` L0 records.
+    pub below_min: usize,
+    /// Buckets carrying a retention tombstone.
+    pub tombstoned: usize,
+    /// Buckets not compacted because this run was refused their compaction
+    /// claim (ADR-1029). Not counted in `compacted`.
+    pub claim_skipped: usize,
+    /// Buckets whose claim was lost mid-merge (taken over, or the claim
+    /// object gone), so the run stopped and published nothing. Not counted in
+    /// `compacted`.
+    pub claim_cancelled: usize,
+    /// L1 parts written across every compacted bucket (would-be writes under
+    /// `--dry-run`).
+    pub parts_written: usize,
+}
+
+/// Resolve how many shards `compact-tenant` walks for one (tenant, signal).
+///
+/// The same four-case resolve `ravel-bench`'s SQL latency tenant lane uses
+/// (`resolve_shard_count` in crates/ravel-bench/src/sql_latency.rs): the
+/// durable provisioning record `ravel-cli load` writes via `validate_or_adopt`
+/// carries the shard-generation history, and
+/// [`ravel_catalog::shard_ceiling`] over it at `now_hour` is the largest shard
+/// count active at or before that hour. Flag and record present must agree
+/// (never silently prefer one); flag only trusts the flag (a tenant written
+/// before provisioning records existed); record only uses the ceiling; neither
+/// refuses, naming the tenant.
+async fn resolve_shard_count(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    tenant: &str,
+    signal: Signal,
+    override_shards: Option<u32>,
+    now_hour: u32,
+) -> anyhow::Result<u32> {
+    let generations = ravel_catalog::read_generations_from_store(store, tenant_hash, signal)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "shard-generation history read failed for tenant {tenant:?} signal \
+                 {signal:?}: {err}; refusing to walk a possibly-truncated shard range"
+            )
+        })?;
+    match (override_shards, generations) {
+        (Some(requested), Some(gens)) => {
+            let ceiling = ravel_catalog::shard_ceiling(&gens, now_hour);
+            if requested != ceiling {
+                return Err(CompactTenantError::ShardCountDisagreement {
+                    tenant: tenant.to_string(),
+                    signal,
+                    requested,
+                    ceiling,
+                    hour: now_hour,
+                }
+                .into());
+            }
+            Ok(requested)
+        }
+        (Some(requested), None) => Ok(requested),
+        (None, Some(gens)) => Ok(ravel_catalog::shard_ceiling(&gens, now_hour)),
+        (None, None) => Err(CompactTenantError::NoProvisioningRecord {
+            tenant: tenant.to_string(),
+            signal,
+        }
+        .into()),
+    }
+}
+
+/// Every ingest-hour bucket present under one `(tenant, signal, shard)`,
+/// ascending. The same listing `ravel_maintain::scan`'s per-shard walk does
+/// (its `list_shard_hours` is private to that crate); a common prefix that is
+/// not an hour is layout drift and errors rather than being skipped.
+async fn shard_hours(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    shard: u32,
+) -> anyhow::Result<Vec<u32>> {
+    let shard_prefix = keys::commit_shard_prefix(tenant_hash, signal, shard)
+        .map_err(|err| anyhow::anyhow!("failed to build shard prefix: {err}"))?;
+    let listed = store
+        .list_delimited(&shard_prefix)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to list {shard_prefix}: {err}"))?;
+    let mut hours = Vec::with_capacity(listed.common_prefixes.len());
+    for common in &listed.common_prefixes {
+        let rest = common
+            .strip_prefix(&shard_prefix)
+            .and_then(|r| r.strip_suffix('/'))
+            .unwrap_or("");
+        let hour = keys::parse_ingest_hour_string(rest).map_err(|err| {
+            anyhow::anyhow!("unexpected key {common} under {shard_prefix}: {err}")
+        })?;
+        hours.push(hour);
+    }
+    hours.sort_unstable();
+    Ok(hours)
+}
+
+/// `maintain compact-tenant`: compact every sealed bucket of one (tenant,
+/// signal), across every shard.
+///
+/// Exposes `ravel_maintain::scan`'s per-shard hour walk rather than
+/// reimplementing it: hours ascend from the shard's oldest present hour (or
+/// `from_hour`) to `to_hour` (or the hour containing `now_ns`), each bucket
+/// goes through the same [`compact_bucket_claimed`] `compact-bucket` calls, and the
+/// walk stops at the first unsealed hour in a shard because every later hour is
+/// also unsealed. No advisory cursor is read or written: a one-shot operator
+/// invocation covers the range it was asked for, every time.
+///
+/// `NotSealed` is a reported outcome, not a failure. A bucket whose compaction
+/// errors does NOT abort its siblings: every in-flight bucket runs to
+/// completion, each bucket's outcome is reported (a failed bucket on its own
+/// `outcome=Failed error=...` line carrying its typed error), and the run exits
+/// non-zero with a summary of how many buckets succeeded and failed. This holds
+/// at every `bucket_concurrency`, including the default 1.
+///
+/// Every bucket asks for its claim before its
+/// merge, one independent claim per bucket, all under `claims`'s one process id
+/// (see [`install_claims`]; `--dry-run` and `--no-claim` take none). A bucket
+/// refused its claim prints `outcome=ClaimSkipped` with the reason, the holder
+/// and the claim expiry, and one that lost its claim mid-merge prints
+/// `outcome=ClaimCancelled`. Both are counted apart from `compacted`
+/// (`claim_skipped`, `claim_cancelled`) and neither is a failure: the walk goes
+/// on and exits zero unless some bucket failed, as it does for a bucket that is
+/// not sealed yet.
+///
+/// `bucket_concurrency` runs up to N buckets' compactions at once. Buckets are
+/// independent by construction (disjoint per-(shard, hour) input sets, separate
+/// content-addressed parts, separate CAS-published records), so the walk is
+/// embarrassingly parallel; [`ravel_maintain::compact_bucket`]'s own contract
+/// confirms its pipeline, which [`compact_bucket_claimed`] runs too, is safe to
+/// call concurrently against one store. Each concurrent bucket runs
+/// with its OWN [`CompactorConfig`] carrying a FRESH [`MergeMemoryTracker`],
+/// because ADR-0979's per-bucket memory model gives each bucket its own merge
+/// budget and tracker and a shared tracker would combine two runs' figures.
+/// Because ADR-0979 sized the default 20 GiB
+/// ([`ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES`]) merge cursor
+/// budget against one 30 GB reference box, running N buckets each at the whole
+/// budget would need N times that box; so when the operator has not configured a
+/// budget, each bucket's `merge_cursor_budget_bytes` is set to that default
+/// divided by N (floor; N=1 is unchanged at the full 20 GiB), keeping the whole
+/// N-bucket envelope inside one box. A bucket whose merge no longer fits its
+/// budget/N fails closed with the typed
+/// [`ravel_maintain::error::MaintainError::MergeCursorBudgetExceeded`] naming the
+/// figure, which is the deliberate, visible outcome, not an out-of-memory kill.
+/// See [`per_bucket_config`]. Per-bucket report lines are emitted in
+/// DETERMINISTIC walk order: each bucket's line is flushed as soon as every
+/// bucket before it in walk order (shard then hour) has also completed
+/// (contiguous-prefix streaming), so a long run prints partial progress as it
+/// goes rather than nothing until the end, lines are never interleaved by
+/// completion order, and N=1 output is byte-for-byte today's line-per-bucket-as-
+/// it-finishes behaviour. The stored objects are identical across any N.
+/// `bucket_concurrency` of 0 is refused with a typed
+/// [`CompactTenantError::ZeroBucketConcurrency`].
+///
+/// `selection` is which store `--store` resolved to. It heads the report, and
+/// on the defaulted memory store a walk that resolves zero present ingest-hour
+/// buckets across every shard is refused with
+/// [`DefaultedMemoryEmptyWalk`] rather than reported as
+/// `compacted: 0, not_sealed: 0` with exit 0, which is indistinguishable from a
+/// tenant that had nothing left to compact (issue #1024). An explicit
+/// `--store memory` keeps that zero-count report: the operator chose the empty
+/// store.
+/// Thin wrapper over [`compact_tenant_to`] that streams the report to the
+/// process stdout. The whole surface is routed through a `&mut dyn Write` so a
+/// test can capture the exact per-bucket line sequence; production passes
+/// `stdout` and the bytes are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_tenant(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shards: Option<u32>,
+    from_hour: Option<u32>,
+    to_hour: Option<u32>,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    input_read_concurrency: Option<usize>,
+    bucket_concurrency: usize,
+    rlog_zstd_level: Option<i32>,
+    now_ns: i64,
+    claims: &ClaimOptions,
+) -> anyhow::Result<CompactTenantReport> {
+    let mut out = std::io::stdout();
+    compact_tenant_on_detected_memory(
+        &mut out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shards,
+        from_hour,
+        to_hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        input_read_concurrency,
+        bucket_concurrency,
+        rlog_zstd_level,
+        now_ns,
+        claims,
+    )
+    .await
+}
+
+/// [`compact_tenant`] with the report written to `out`. This is where the
+/// host's memory is detected and handed to [`compact_tenant_to`], so a test
+/// reaches that hand-off.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_tenant_on_detected_memory(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shards: Option<u32>,
+    from_hour: Option<u32>,
+    to_hour: Option<u32>,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    input_read_concurrency: Option<usize>,
+    bucket_concurrency: usize,
+    rlog_zstd_level: Option<i32>,
+    now_ns: i64,
+    claims: &ClaimOptions,
+) -> anyhow::Result<CompactTenantReport> {
+    compact_tenant_to(
+        out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shards,
+        from_hour,
+        to_hour,
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        input_read_concurrency,
+        bucket_concurrency,
+        rlog_zstd_level,
+        ravel_maintain::detect_host_memory_total_bytes(),
+        now_ns,
+        claims,
+    )
+    .await
+}
+
+/// [`compact_tenant`] with the report surface written to `out`. Every line the
+/// command prints (the header block, each per-bucket outcome, and the summary)
+/// goes through `out`, so the whole output is capturable byte-for-byte; the
+/// store-selection header still prints via [`StoreSelection::print_header`] to
+/// stdout. Per-bucket lines stream in walk order as their contiguous prefix
+/// completes (see [`run_bucket_walk`]). The memory split target is derived from
+/// `host_memory_total_bytes`, which [`compact_tenant`] reads from the host.
+#[allow(clippy::too_many_arguments)]
+pub async fn compact_tenant_to(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shards: Option<u32>,
+    from_hour: Option<u32>,
+    to_hour: Option<u32>,
+    dry_run: bool,
+    max_flush_lifetime_ns: Option<i64>,
+    l1_part_memory_target_bytes: Option<u64>,
+    max_l1_part_bytes: Option<u64>,
+    input_read_concurrency: Option<usize>,
+    bucket_concurrency: usize,
+    rlog_zstd_level: Option<i32>,
+    host_memory_total_bytes: Option<u64>,
+    now_ns: i64,
+    claims: &ClaimOptions,
+) -> anyhow::Result<CompactTenantReport> {
+    let started = std::time::Instant::now();
+    let tenant_hash = TenantId::new(tenant).hash();
+    let sig = signal.to_signal();
+    let now_hour = u32::try_from(now_ns / ravel_maintain::config::NS_PER_HOUR)
+        .map_err(|_| anyhow::anyhow!("current ingest hour {now_ns} ns does not fit u32"))?;
+    // A zero fan-out is refused before any store access and before the config
+    // is built, because the derivation divides by it: it is an operator error,
+    // not a walk that compacts nothing.
+    if bucket_concurrency == 0 {
+        return Err(CompactTenantError::ZeroBucketConcurrency.into());
+    }
+    // Knob validation runs before any store access: a zero byte target must
+    // surface as its CompactorKnobError even on a tenant with no provisioning
+    // record, not be masked by NoProvisioningRecord.
+    let (mut config, memory_target) = build_compactor_config(
+        dry_run,
+        max_flush_lifetime_ns,
+        l1_part_memory_target_bytes,
+        max_l1_part_bytes,
+        input_read_concurrency,
+        rlog_zstd_level,
+        host_memory_total_bytes,
+        bucket_concurrency,
+        claim_lease_for_derivation(claims),
+    )?;
+    let claims_line = install_claims(&mut config, dry_run, claims);
+    if let Some(note) = l1_part_memory_target_fallback_note(&memory_target) {
+        eprintln!("{note}");
+    }
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain compact-tenant",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+    let shard_count =
+        resolve_shard_count(store.as_ref(), &tenant_hash, tenant, sig, shards, now_hour).await?;
+    let last_hour = to_hour.unwrap_or(now_hour);
+    let first_hour = from_hour.unwrap_or(0);
+    let mut report = CompactTenantReport {
+        store: selection,
+        shards: shard_count,
+        ..CompactTenantReport::default()
+    };
+
+    writeln!(out, "tenant: {tenant}")?;
+    writeln!(out, "signal: {sig:?}")?;
+    writeln!(out, "shards: {shard_count}")?;
+    writeln!(out, "hour_range: [{first_hour}, {last_hour}]")?;
+    writeln!(
+        out,
+        "max_flush_lifetime_ns: {}",
+        config.max_flush_lifetime_ns
+    )?;
+    write_part_split_lines(out, &config, &memory_target)?;
+    writeln!(
+        out,
+        "input_read_concurrency: {}",
+        config.input_read_concurrency
+    )?;
+    writeln!(out, "dry_run: {dry_run}")?;
+    writeln!(out, "{claims_line}")?;
+
+    // Build the walk in deterministic order (shard ascending, then hour
+    // ascending), truncating each shard at and including its first unsealed
+    // hour: hours ascend, so once a bucket is unsealed every later one in that
+    // shard is too. `Bucket::is_sealed` is a pure function of `now_ns` and the
+    // config, exactly the check `compact_bucket` runs internally, so this walk
+    // covers the identical set of buckets the old sequential walk did -- the
+    // first unsealed bucket is kept so it still reports its `NotSealed` outcome.
+    //
+    // `hours_present` still counts every present hour before the
+    // `[first_hour, last_hour]` filter, because that is the figure the
+    // empty-walk refusal below is about, unchanged by the seal truncation.
+    let mut hours_present = 0usize;
+    let mut work: Vec<(u32, u32)> = Vec::new();
+    for shard in 0..shard_count {
+        let shard_hours = shard_hours(store.as_ref(), &tenant_hash, sig, shard).await?;
+        hours_present += shard_hours.len();
+        for hour in shard_hours {
+            if hour < first_hour {
+                continue;
+            }
+            if hour > last_hour {
+                break;
+            }
+            let sealed = Bucket::new(tenant_hash, sig, shard, hour).is_sealed(now_ns, &config);
+            work.push((shard, hour));
+            if !sealed {
+                break;
+            }
+        }
+    }
+
+    // Compact the walk with up to `bucket_concurrency` buckets in flight.
+    // `run_bucket_walk` invokes the callback for each bucket in walk order as
+    // soon as its contiguous prefix has completed, so per-bucket lines stream
+    // deterministically (never interleaved by completion order) and a long run
+    // shows partial progress rather than nothing until the end.
+    let mut failed = 0usize;
+    let mut failure_details: Vec<String> = Vec::new();
+    run_bucket_walk(
+        &store,
+        &config,
+        now_ns,
+        tenant_hash,
+        sig,
+        &work,
+        bucket_concurrency,
+        |shard, hour, outcome| {
+            emit_bucket_outcome(
+                out,
+                &mut report,
+                &mut failed,
+                &mut failure_details,
+                shard,
+                hour,
+                outcome,
+            )
+        },
+    )
+    .await?;
+
+    let verb = if dry_run { "would write" } else { "wrote" };
+    writeln!(out, "compacted: {}", report.compacted)?;
+    writeln!(out, "already: {}", report.already)?;
+    writeln!(out, "rewrite_present: {}", report.rewrite_present)?;
+    writeln!(out, "not_sealed: {}", report.not_sealed)?;
+    writeln!(out, "below_min: {}", report.below_min)?;
+    writeln!(out, "tombstoned: {}", report.tombstoned)?;
+    writeln!(out, "claim_skipped: {}", report.claim_skipped)?;
+    writeln!(out, "claim_cancelled: {}", report.claim_cancelled)?;
+    writeln!(out, "parts ({verb}): {}", report.parts_written)?;
+    writeln!(out, "wall_time_ms: {}", started.elapsed().as_millis())?;
+    // Buckets that reported any non-error outcome (compacted, already,
+    // rewrite-present, not-sealed, below-min, tombstoned, claim-skipped,
+    // claim-cancelled). `failed` is the count of buckets whose compaction
+    // returned a typed error.
+    let succeeded = report.compacted
+        + report.already
+        + report.rewrite_present
+        + report.not_sealed
+        + report.below_min
+        + report.tombstoned
+        + report.claim_skipped
+        + report.claim_cancelled;
+    writeln!(out, "failed: {failed}")?;
+    writeln!(out, "bucket_concurrency: {bucket_concurrency}")?;
+    // The counters above are printed first even on the refusal path: an
+    // operator who sees the zeros also sees why they are not a result.
+    DefaultedMemoryEmptyWalk::check(
+        selection,
+        "maintain compact-tenant",
+        tenant,
+        "present ingest-hour buckets",
+        hours_present,
+    )?;
+    if failed > 0 {
+        // Siblings already ran to completion and are reported above; the run
+        // exits non-zero so a failed bucket is never mistaken for a clean pass.
+        return Err(CompactTenantError::BucketsFailed {
+            failed,
+            succeeded,
+            details: failure_details.join("; "),
+        }
+        .into());
+    }
+    Ok(report)
+}
+
+/// The [`CompactorConfig`] one concurrent bucket runs with, derived from the
+/// validated `base`. Each bucket gets a FRESH [`MergeMemoryTracker`] (the
+/// tracker is `Arc`-shared on `clone`, and ADR-0979's per-bucket memory
+/// accounting requires one tracker per concurrent run: two runs sharing one
+/// combine their figures) and, per ADR-0979's whole-box sizing, a per-bucket
+/// share of the merge cursor budget, applied ONLY while `base` carries the
+/// default 20 GiB
+/// ([`ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES`]): the
+/// default was sized against the whole 30 GB reference box, so at N buckets
+/// each holds up to 20 GiB / N (integer floor) and the N-bucket envelope
+/// stays inside the box. A budget the operator configured away from the
+/// default is an explicit whole-box decision and is passed through per
+/// bucket undivided; dividing it would also make
+/// `MergeCursorBudgetExceeded`'s raise-to-`required_bytes` remediation wrong
+/// at N > 1. N=1 is the full budget either way. A `concurrency` of zero is
+/// clamped to one (callers refuse it upstream with a typed error). Every
+/// other config field is `base`, copied verbatim.
+pub fn per_bucket_config(base: &CompactorConfig, concurrency: usize) -> CompactorConfig {
+    let mut config = base.clone();
+    config.merge_memory_tracker = Some(MergeMemoryTracker::new());
+    if base.merge_cursor_budget_bytes == ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES {
+        config.merge_cursor_budget_bytes =
+            base.merge_cursor_budget_bytes / (concurrency.max(1) as u64);
+    }
+    config
+}
+
+/// The merge cursor budget all `concurrency` buckets of one invocation may hold
+/// together, the quantity [`build_compactor_config`] deducts from the memory it
+/// derives the part-split target from. [`per_bucket_config`] splits the default
+/// budget between the buckets, so their sum is the default (not `concurrency`
+/// times it); a budget the operator configured away from the default is passed
+/// to each bucket undivided, so their sum is `concurrency` times it.
+pub fn merge_cursor_budget_total_bytes(base: &CompactorConfig, concurrency: usize) -> u64 {
+    if base.merge_cursor_budget_bytes == ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES {
+        base.merge_cursor_budget_bytes
+    } else {
+        base.merge_cursor_budget_bytes
+            .saturating_mul(concurrency.max(1) as u64)
+    }
+}
+
+/// Fold one bucket's outcome into `report` and emit its report line to `out`.
+/// The line shape is stable and per-bucket: a failed bucket prints its own
+/// `outcome=Failed error=...` line carrying its typed error (which the aggregate
+/// [`CompactTenantError::BucketsFailed`] names too), so a
+/// `MergeCursorBudgetExceeded` (or any typed failure) is attributable to the
+/// bucket it hit, not only to the summary.
+fn emit_bucket_outcome(
+    out: &mut dyn Write,
+    report: &mut CompactTenantReport,
+    failed: &mut usize,
+    failure_details: &mut Vec<String>,
+    shard: u32,
+    hour: u32,
+    outcome: Result<ClaimedCompaction, String>,
+) -> anyhow::Result<()> {
+    let outcome = match outcome {
+        Ok(ClaimedCompaction::Ran(outcome)) => Ok(outcome),
+        Ok(ClaimedCompaction::SkippedClaimed(skip)) => {
+            report.claim_skipped += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=ClaimSkipped {}",
+                claim_skip_fields(&skip)
+            )?;
+            out.flush()?;
+            return Ok(());
+        }
+        Ok(ClaimedCompaction::Cancelled { at, .. }) => {
+            report.claim_cancelled += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=ClaimCancelled checkpoint={}",
+                at.name()
+            )?;
+            out.flush()?;
+            return Ok(());
+        }
+        Err(err) => Err(err),
+    };
+    match outcome {
+        Ok(CompactionOutcome::NotSealed) => {
+            report.not_sealed += 1;
+            writeln!(out, "shard={shard} hour={hour} outcome=NotSealed")?;
+        }
+        Ok(CompactionOutcome::Tombstoned) => {
+            report.tombstoned += 1;
+            writeln!(out, "shard={shard} hour={hour} outcome=Tombstoned")?;
+        }
+        Ok(CompactionOutcome::AlreadyCompacted) => {
+            report.already += 1;
+            writeln!(out, "shard={shard} hour={hour} outcome=AlreadyCompacted")?;
+        }
+        Ok(CompactionOutcome::RewritePresent) => {
+            report.rewrite_present += 1;
+            writeln!(out, "shard={shard} hour={hour} outcome=RewritePresent")?;
+        }
+        Ok(CompactionOutcome::BelowMinInputs { count }) => {
+            report.below_min += 1;
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=BelowMinInputs l0_records={count}"
+            )?;
+        }
+        Ok(CompactionOutcome::Compacted { parts, publish }) => {
+            report.compacted += 1;
+            report.parts_written += parts;
+            let publish = match publish {
+                PublishOutcome::Published => "Published".to_string(),
+                PublishOutcome::Converged { parts_repaired } => {
+                    format!("Converged(parts_repaired={parts_repaired})")
+                }
+                PublishOutcome::Abandoned => "Abandoned".to_string(),
+            };
+            writeln!(
+                out,
+                "shard={shard} hour={hour} outcome=Compacted parts={parts} publish={publish}"
+            )?;
+        }
+        Err(err) => {
+            *failed += 1;
+            writeln!(out, "shard={shard} hour={hour} outcome=Failed error={err}")?;
+            failure_details.push(format!("shard {shard} hour {hour}: {err}"));
+        }
+    }
+    // Flush so partial progress is durable in the terminal: a mid-run kill of a
+    // multi-hour walk leaves every already-emitted bucket's line on disk/screen.
+    out.flush()?;
+    Ok(())
+}
+
+/// One bucket's walk-order slot: `(shard, hour, outcome)`.
+type BucketSlot = (u32, u32, Result<ClaimedCompaction, String>);
+/// A spawned bucket task's return value: its dispatch index plus its slot.
+type BucketTask = (usize, u32, u32, Result<ClaimedCompaction, String>);
+
+/// Compact every bucket in `work` (already in deterministic walk order) with up
+/// to `concurrency` buckets in flight at once, invoking `on_ready` for each
+/// bucket in walk order as soon as its contiguous prefix has completed. A
+/// bucket that finishes out of order is buffered until every earlier bucket has
+/// also finished, so `on_ready` always sees shard-then-hour order regardless of
+/// completion order (contiguous-prefix streaming), while a slow bucket does not
+/// stall the buckets after it from running.
+///
+/// Each bucket runs on its own task with the [`per_bucket_config`] derived from
+/// `base`. `compact_bucket_claimed` takes `&store` and a per-call config and
+/// clock, and runs `compact_bucket`'s pipeline, whose contract states it is safe
+/// to call concurrently against one store, so the disjoint per-(shard, hour)
+/// buckets never contend. Each bucket's claim guard lives on that call's own
+/// config clone, so N concurrent buckets hold N independent claims.
+///
+/// A bucket whose compaction errors is delivered as the `Err` of its slot; it
+/// does not cancel or abort its siblings, which all run to completion. A bucket
+/// task that PANICS is treated identically: its slot becomes an `Err` naming the
+/// panic (via the join error), the remaining tasks are still joined, and the
+/// caller counts it among the failures rather than the whole walk aborting and
+/// dropping the [`JoinSet`] (which would cancel every in-flight sibling and
+/// discard the outcomes already collected).
+#[allow(clippy::too_many_arguments)]
+async fn run_bucket_walk<F>(
+    store: &Arc<dyn ObjectStoreBackend>,
+    base: &CompactorConfig,
+    now_ns: i64,
+    tenant_hash: TenantHash,
+    signal: Signal,
+    work: &[(u32, u32)],
+    concurrency: usize,
+    mut on_ready: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(u32, u32, Result<ClaimedCompaction, String>) -> anyhow::Result<()>,
+{
+    // `concurrency >= 1` is guaranteed by the caller's ZeroBucketConcurrency
+    // check.
+    let mut set: JoinSet<BucketTask> = JoinSet::new();
+    // Task id -> dispatch index, so a panicked task (whose payload, and thus its
+    // index, is lost) can still be mapped back to its (shard, hour) slot.
+    let mut id_to_idx: HashMap<tokio::task::Id, usize> = HashMap::new();
+    let mut next = 0usize;
+
+    let spawn_one = |set: &mut JoinSet<BucketTask>, idx: usize| -> tokio::task::Id {
+        let (shard, hour) = work[idx];
+        let store = Arc::clone(store);
+        let config = per_bucket_config(base, concurrency);
+        let handle = set.spawn(async move {
+            // The walk's frozen clock decides sealing; the claim participant
+            // on `config` reads its own clock, live for the binary (see
+            // `install_claims` and `ClaimOptions::clock`).
+            let clock = FixedClock::new(now_ns);
+            let bucket = Bucket::new(tenant_hash, signal, shard, hour);
+            let result = compact_bucket_claimed(store.as_ref(), &clock, &config, &bucket)
+                .await
+                .map_err(|err| err.to_string());
+            (idx, shard, hour, result)
+        });
+        handle.id()
+    };
+
+    while next < work.len() && next < concurrency {
+        let id = spawn_one(&mut set, next);
+        id_to_idx.insert(id, next);
+        next += 1;
+    }
+
+    // Completed-but-not-yet-emitted outcomes, indexed by dispatch order; drained
+    // in a contiguous prefix so emission stays in walk order.
+    let mut ready: Vec<Option<BucketSlot>> = (0..work.len()).map(|_| None).collect();
+    let mut emit_next = 0usize;
+
+    while let Some(joined) = set.join_next_with_id().await {
+        match joined {
+            Ok((_id, (idx, shard, hour, result))) => {
+                ready[idx] = Some((shard, hour, result));
+            }
+            Err(join_err) => {
+                // A task panicked. Map its id back to the slot and record the
+                // panic as that bucket's failure instead of aborting the walk.
+                let idx = *id_to_idx.get(&join_err.id()).ok_or_else(|| {
+                    anyhow::anyhow!("compaction task join error for unknown id: {join_err}")
+                })?;
+                let (shard, hour) = work[idx];
+                ready[idx] = Some((
+                    shard,
+                    hour,
+                    Err(format!("compaction task panicked: {join_err}")),
+                ));
+            }
+        }
+
+        // Emit every now-contiguous completed bucket, in walk order.
+        while emit_next < ready.len() {
+            match ready[emit_next].take() {
+                Some((shard, hour, result)) => {
+                    on_ready(shard, hour, result)?;
+                    emit_next += 1;
+                }
+                None => break,
+            }
+        }
+
+        if next < work.len() {
+            let id = spawn_one(&mut set, next);
+            id_to_idx.insert(id, next);
+            next += 1;
+        }
+    }
+
+    Ok(())
+}
+
+/// The [`CompactorConfig`] `maintain sweep` runs with, from the durable
+/// `sys/gc` (ADR-1133 decision 4), validated the way the server's maintain mode
+/// validates its own before it sweeps.
+///
+/// `protection_horizon`, `grace`, `max_flush_lifetime`, `max_query_duration`
+/// and `head_cache_ttl` come from `sys/gc`, which is bootstrapped from the
+/// maintain defaults when absent, as the server's startup does. A dry run
+/// writes nothing, so on a bucket with no `sys/gc` it uses those same defaults
+/// without writing them. [`ravel_maintain::validate_maintain_skew`] then runs
+/// against this sweep's own `clock_skew_allowance`, and a violation is an error
+/// before any delete. So does
+/// [`ravel_maintain::validate_maintain_compaction_lifetime`], against this
+/// build's `max_compaction_lifetime` and the same skew allowance.
+/// [`ravel_maintain::validate_maintain`] also runs, but
+/// since horizon and grace are copied from the same `sys/gc`, it can only fail
+/// if a later edit stops sourcing them from there.
+pub async fn sweep_compactor_config(
+    store: &dyn ObjectStoreBackend,
+    dry_run: bool,
+    force_orphan_gc: bool,
+    now_ns: i64,
+) -> anyhow::Result<CompactorConfig> {
+    let gc = if dry_run {
+        match ravel_maintain::read_gc_config(store).await? {
+            Some((values, _version)) => values,
+            None => GcConfigValues::maintain_defaults(),
+        }
+    } else {
+        ravel_maintain::bootstrap_gc_config(store, GcConfigValues::maintain_defaults(), now_ns)
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!("failed to bootstrap or read the durable GC config (sys/gc): {err}")
+            })?
+    };
+    let config = CompactorConfig {
+        dry_run,
+        force_orphan_gc,
+        protection_horizon_ns: gc.protection_horizon_ns,
+        grace_ns: gc.grace_ns,
+        max_flush_lifetime_ns: gc.max_flush_lifetime_ns,
+        max_query_duration_ns: gc.max_query_duration_ns,
+        head_cache_ttl_ns: gc.head_cache_ttl_ns,
+        ..CompactorConfig::default()
+    };
+    ravel_maintain::validate_maintain(&gc, config.protection_horizon_ns, config.grace_ns)
+        .and_then(|()| ravel_maintain::validate_maintain_skew(&gc, config.clock_skew_allowance_ns))
+        .and_then(|()| {
+            ravel_maintain::validate_maintain_compaction_lifetime(
+                &gc,
+                config.max_compaction_lifetime_ns,
+                config.clock_skew_allowance_ns,
+            )
+        })
+        .map_err(|err| {
+            anyhow::anyhow!("maintain sweep GC-config validation failed against sys/gc: {err}")
+        })?;
+    Ok(config)
+}
+
+/// `maintain sweep`: run one sweep pass (all three GC rules) over a shard.
+///
+/// The pass runs with [`sweep_compactor_config`]'s configuration: protection
+/// horizon, grace, maximum flush lifetime and the two pinned-query terms from
+/// `sys/gc`, refused on the same skew violation as the server's maintain mode.
+/// The server takes its maximum flush lifetime from `--gc-max-flush-lifetime`
+/// instead, so the two orphan gates can differ when that flag and `sys/gc`
+/// disagree.
+///
+/// Refreshes the tenant's [`LegalHoldCheck`] before the pass, matching the
+/// server driver's semantics (ADR-0048 decision 1): the refresh happens once,
+/// per invocation, with no flag to skip it. A refresh failure skips the whole
+/// pass (`Err`, not a fallback to `NoLeases`), since running the sweep
+/// unprotected would convert a transient store fault into an unprotected
+/// delete pass.
+///
+/// Thin wrapper over [`sweep_at`] at the wall clock.
+pub async fn sweep(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    dry_run: bool,
+    override_orphan_breaker: bool,
+) -> anyhow::Result<()> {
+    sweep_at(
+        store,
+        selection,
+        tenant,
+        signal,
+        shard,
+        dry_run,
+        override_orphan_breaker,
+        wall_clock()?,
+    )
+    .await
+}
+
+/// [`sweep`] evaluated at `clock`.
+#[allow(clippy::too_many_arguments)]
+pub async fn sweep_at(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    dry_run: bool,
+    override_orphan_breaker: bool,
+    clock: FixedClock,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
+
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain sweep",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+
+    let config = sweep_compactor_config(
+        store.as_ref(),
+        dry_run,
+        override_orphan_breaker,
+        ravel_maintain::Clock::now_ns(&clock),
+    )
+    .await?;
+
+    let hold = LegalHoldCheck::refresh(store.as_ref(), &tenant_hash)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "legal hold refresh failed for tenant {tenant}: {err}; sweep skipped this \
+                 invocation rather than falling back to unprotected (rerun once the hold shard \
+                 is reachable)"
+            )
+        })?;
+
+    let SweepReport {
+        // Equal to orphans_quarantined since the ADR-0058 amendment; the
+        // quarantined figure is the one reported below.
+        orphans_deleted: _,
+        orphans_quarantined,
+        orphans_quarantine_refused,
+        quarantine_reaped,
+        superseded_records_deleted,
+        superseded_data_deleted,
+        superseded_deletes_refused,
+        superseded_held_by_snapshot,
+        superseded_held_by_unreadable_head,
+        superseded_held_by_pinned_window,
+        unnamed_markers,
+        unnamed_marker_reap,
+        superseded_groups_held_by_legal_hold,
+        unreferenced_parts_deleted,
+        // Byte totals for the reclaimed-bytes metric (issues #1729, #2073);
+        // this CLI reports counts, not bytes, so they are not printed here.
+        quarantine_reaped_bytes: _,
+        unreferenced_parts_bytes: _,
+        superseded_data_bytes: _,
+        orphan_breaker_tripped,
+        orphans_withheld,
+        orphan_breaker_overridden,
+        // Always `Run` here: this is `sweep_shard`, which never gates rule 1.
+        orphan_pass: _,
+        full_pass,
+    } = sweep_shard(
+        store.as_ref(),
+        &clock,
+        &config,
+        &hold,
+        &tenant_hash,
+        signal.to_signal(),
+        shard,
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("sweep failed: {err}"))?;
+
+    let verb = if dry_run { "would delete" } else { "deleted" };
+    let q_verb = if dry_run {
+        "would quarantine"
+    } else {
+        "quarantined"
+    };
+    // The reaper counts a candidate before the dry-run guard, which wraps only
+    // the delete, so a dry run reports what it would reap rather than what it
+    // did. Printing "physically deleted" for that figure tells an operator the
+    // opposite of what a dry run means.
+    let r_verb = if dry_run {
+        "would reap, past 2nd horizon"
+    } else {
+        "reaped, physically deleted past 2nd horizon"
+    };
+    println!("dry_run: {dry_run}");
+    // Orphan GC moves candidates to quarantine rather than deleting them
+    // (ADR-0058 amendment); orphans_deleted counts candidates removed from the
+    // live keyspace and equals orphans_quarantined.
+    println!("orphans ({q_verb}): {orphans_quarantined}");
+    println!("orphans quarantine refused (left live): {orphans_quarantine_refused}");
+    println!("quarantine ({r_verb}): {quarantine_reaped}");
+    println!("superseded_records ({verb}): {superseded_records_deleted}");
+    println!("superseded_data ({verb}): {superseded_data_deleted}");
+    println!("superseded deletes refused (kept for a later pass): {superseded_deletes_refused}");
+    println!("superseded held (HEAD still names them): {superseded_held_by_snapshot}");
+    println!("superseded held (HEAD unreadable): {superseded_held_by_unreadable_head}");
+    println!("superseded held (pinned-query window): {superseded_held_by_pinned_window}");
+    println!(
+        "unnamed-since markers: {} written, {} reset (named again), {} reset (anchor \
+         mismatch), {} retired",
+        unnamed_markers.written,
+        unnamed_markers.reset_renamed,
+        unnamed_markers.reset_mismatched,
+        unnamed_markers.retired
+    );
+    if let Some(reap) = unnamed_marker_reap {
+        println!(
+            "unnamed-since markers reaped (orphans): {} of {} listed, {} unparseable keys \
+             skipped, {} unreadable, {} failed",
+            reap.reaped, reap.listed, reap.unparseable, reap.unreadable, reap.failed
+        );
+    }
+    println!("superseded groups held (legal hold): {superseded_groups_held_by_legal_hold}");
+    println!("unreferenced_parts ({verb}): {unreferenced_parts_deleted}");
+    println!("full_pass: {full_pass}");
+    if orphan_breaker_tripped {
+        println!(
+            "orphan breaker: TRIPPED, {orphans_withheld} candidates withheld, deleted nothing \
+             (halt is sticky; see docs/consistency-model.md \"Deletion and GC\")"
+        );
+    } else if orphan_breaker_overridden {
+        println!("orphan breaker: overridden by force_orphan_gc, deleted despite tripping");
+    }
+    Ok(())
+}
+
+/// `maintain status`: report a bucket's current maintenance state without
+/// mutating anything (so it needs no `--dry-run`).
+pub async fn status(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shard: u32,
+    hour: u32,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    let sig = signal.to_signal();
+    let bucket = Bucket::new(tenant_hash, sig, shard, hour);
+    let config = CompactorConfig::default();
+    let now = crate::now_ns()?;
+
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain status",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+
+    let listing = ravel_maintain::read::list_bucket(store.as_ref(), &bucket)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to list bucket: {err}"))?;
+
+    // Superseded-input count: the L0 inputs every compaction record names,
+    // which the superseded sweep would delete once the horizon elapses. Also
+    // build the referenced-L1 set to count unreferenced parts.
+    let mut superseded_inputs = 0usize;
+    let mut referenced_parts: HashSet<String> = HashSet::new();
+    for key in &listing.compaction_record_keys {
+        let got = store
+            .get(key, GetRange::Full)
+            .await
+            .map_err(|err| anyhow::anyhow!("failed to fetch compaction record {key}: {err}"))?;
+        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
+            .map_err(|err| anyhow::anyhow!("compaction record {key} is corrupt: {err}"))?;
+        superseded_inputs += record.inputs.len();
+        for part in &record.parts {
+            referenced_parts.insert(
+                keys::reconstruct_l1_part_key(&record, part)
+                    .map_err(|err| anyhow::anyhow!("failed to reconstruct L1 part key: {err}"))?,
+            );
+        }
+    }
+
+    // Unreferenced parts: L1 objects physically present in this bucket that no
+    // compaction record references (what the unreferenced-part sweep targets).
+    let l1_prefix = format!(
+        "t/{}/{}/{}/{:04}/{}/",
+        tenant_hash.to_hex(),
+        sig.key_prefix(),
+        keys::L1_DIR,
+        shard,
+        keys::ingest_hour_string(hour),
+    );
+    let l1_objects = list_all(store.as_ref(), &l1_prefix)
+        .await
+        .map_err(|err| anyhow::anyhow!("failed to list {l1_prefix}: {err}"))?;
+    let unreferenced_parts = l1_objects
+        .iter()
+        .filter(|m| !referenced_parts.contains(&m.key))
+        .count();
+
+    println!("tenant: {tenant}");
+    println!("signal: {:?}", sig);
+    println!("shard: {shard}");
+    println!("ingest_hour_bucket: {hour}");
+    println!("sealed: {}", bucket.is_sealed(now, &config));
+    println!("tombstoned: {}", listing.tombstone_key.is_some());
+    println!(
+        "compacted: {} ({} compaction record(s))",
+        !listing.compaction_record_keys.is_empty(),
+        listing.compaction_record_keys.len()
+    );
+    println!("l0_commit_records: {}", listing.commit_keys.len());
+    println!("superseded_input_count: {superseded_inputs}");
+    println!("l1_parts_present: {}", l1_objects.len());
+    println!("unreferenced_part_count: {unreferenced_parts}");
+    Ok(())
+}
+
+/// The generation-aware shard scan range for one (tenant, signal): the union
+/// of every generation's shard range, i.e. the largest `shard_count` across the
+/// tenant's shard-generation history (ADR-0052 section 4). This mirrors the
+/// server maintain loop (`ravel_server::maintain::run_tick`): after an increase
+/// it covers the new, wider shards; after a decrease it keeps covering the old,
+/// wider shards until retention ages their hours out. An empty high shard lists
+/// cheaply and is tolerated by the per-shard loops. Read fresh and uncached.
+///
+/// Fail-closed on a read error: a CLI maintenance pass over a possibly-truncated
+/// shard range would silently skip live shards, so this refuses rather than
+/// scanning `0..configured_shards` blindly. An absent record (`Ok(None)`) is
+/// the single implicit generation at the configured `--shards`, unchanged from
+/// pre-ADR-0052 behavior.
+async fn generation_scan_shards(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    configured_shards: u32,
+) -> anyhow::Result<u32> {
+    match ravel_catalog::read_generations_from_store(store, tenant, signal).await {
+        Ok(Some(generations)) => Ok(generations
+            .iter()
+            .map(|g| g.shard_count)
+            .max()
+            .unwrap_or(configured_shards)),
+        Ok(None) => Ok(configured_shards),
+        Err(err) => Err(anyhow::anyhow!(
+            "shard-generation history read failed for signal {signal:?}: {err}; refusing to \
+             scan a possibly-truncated shard range (ADR-0052 section 4)"
+        )),
+    }
+}
+
+/// `maintain audit-versions`: a safety audit of the on-object format versions
+/// live for a tenant, across all three signals. For RSEG (metrics) it confirms
+/// the ADR-0027
+/// single-version policy holds: any live object at a version other than the
+/// one supported version is an anomaly (there is no migration path, only this
+/// report). For RLOG (logs) and RSPAN (spans) it reports the live population
+/// by trailer version, since neither format has a dual-reader path today: a
+/// live object at an unsupported version is unreadable, so this is a safety
+/// audit, not a migration tool.
+///
+/// The supported-version window is read from each reader crate's single source
+/// ([`signal_supported_versions`], wired to `ravel_segment::SUPPORTED_VERSIONS`,
+/// `ravel_logseg::footer::SUPPORTED_VERSIONS`,
+/// `ravel_rspan::footer::SUPPORTED_VERSIONS`) so a future version bump does not
+/// silently make this audit stale, and so an object at the reader's N-1 version
+/// (once a window carries one) is not miscounted as an anomaly. Version numbers
+/// are read from each surviving commit record's `segment_format_version` (an L0
+/// object's liveness == a surviving commit record) and each compaction
+/// record's parts (live L1 objects). Exits nonzero if any anomaly is found.
+///
+/// Beside each signal's histogram it classifies every recorded format floor of
+/// that (tenant, signal) against the records it just enumerated (ADR-1746
+/// decision 2, [`floor_evidence`]) and exits nonzero if any floor is
+/// `Contradicted`.
+pub async fn audit_versions(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shards: u32,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain audit-versions",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+    let mut anomalies = 0usize;
+    let mut contradicted = 0usize;
+    for signal in [Signal::Metrics, Signal::Logs, Signal::Spans] {
+        let window = signal_supported_versions(signal)?;
+        // Generation-aware scan range (ADR-0052 section 4), not the static
+        // `--shards`: a reshard-increase widens the live shard set, and this
+        // audit must visit every shard any generation ever wrote or it would
+        // silently skip live objects in the new range.
+        let scan_shards =
+            generation_scan_shards(store.as_ref(), &tenant_hash, signal, shards).await?;
+        let scan = enumerate_versions(store.as_ref(), &tenant_hash, signal, scan_shards).await?;
+
+        println!(
+            "== signal {:?} (supported versions: {}) ==",
+            signal,
+            window.display()
+        );
+        if scan.hist.is_empty() {
+            println!("  no live objects");
+        }
+        for (version, (l0, l1)) in &scan.hist {
+            let flag = if window.contains(*version) {
+                ""
+            } else {
+                "  <-- ANOMALY (unsupported version)"
+            };
+            println!("  version {version}: l0_records={l0} l1_parts={l1}{flag}");
+            if !window.contains(*version) {
+                anomalies += l0 + l1;
+            }
+        }
+
+        let floors =
+            floor_evidence(store.as_ref(), &tenant_hash, signal, scan_shards, &scan).await?;
+        if floors.is_empty() {
+            println!("  no format floors recorded");
+        }
+        for classified in &floors {
+            println!("  {}", classified.display());
+            if classified.evidence == ravel_catalog::FloorEvidence::Contradicted {
+                contradicted += 1;
+            }
+        }
+    }
+
+    let mut failures = Vec::new();
+    if anomalies > 0 {
+        failures.push(format!(
+            "audit-versions found {anomalies} live object(s) at an unsupported version; there is \
+             no dual-reader or migration path (ADR-0027 for RSEG, ADR-0032 and ADR-0095 for RLOG, \
+             ADR-0041 for RSPAN)"
+        ));
+    }
+    if contradicted > 0 {
+        failures.push(format!(
+            "audit-versions found {contradicted} contradicted format floor(s): a live record sits \
+             below a recorded floor, so the floor is false and no reader may be deleted on it \
+             (ADR-1746 decision 2)"
+        ));
+    }
+    if !failures.is_empty() {
+        anyhow::bail!("{}", failures.join("; "));
+    }
+    println!("audit-versions: all live objects are at a supported version");
+    Ok(())
+}
+
+/// What one `audit-versions` enumeration pass over a (tenant, signal) saw.
+#[derive(Debug, Default)]
+struct VersionScan {
+    /// `segment_format_version` -> (L0 commit records, L1 compaction and
+    /// rewrite parts), counting every commit record the shards list,
+    /// superseded ones included.
+    hist: std::collections::BTreeMap<u32, (usize, usize)>,
+    /// The same enumeration's live population, which floor classification
+    /// reads: the liveness `migrate`'s re-audit raises a floor on.
+    census: ravel_maintain::FamilyCensus,
+}
+
+impl VersionScan {
+    /// Newest `created_unix_ns` among the live records; `None` when there are
+    /// none.
+    fn newest_created_unix_ns(&self) -> Option<i64> {
+        self.census.newest_live_created_unix_ns
+    }
+}
+
+/// Enumerate every commit-family record of a (tenant, signal) across
+/// `scan_shards` once, read fresh: the version histogram `audit-versions`
+/// prints and the live census floor classification runs on.
+async fn enumerate_versions(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+) -> anyhow::Result<VersionScan> {
+    let census = census_family(store, tenant_hash, signal, scan_shards)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("enumerating commit-family records for signal {signal:?} failed: {err}")
+        })?;
+    let mut hist: std::collections::BTreeMap<u32, (usize, usize)> = Default::default();
+    for (version, n) in census.live_l0.iter().chain(&census.superseded_l0) {
+        hist.entry(*version).or_default().0 += n;
+    }
+    for (version, n) in &census.parts {
+        hist.entry(*version).or_default().1 += n;
+    }
+    Ok(VersionScan { hist, census })
+}
+
+/// One recorded floor, the observation it was classified against, and the
+/// resulting [`ravel_catalog::FloorEvidence`].
+#[derive(Debug)]
+struct ClassifiedFloor {
+    floor: ravel_catalog::FormatFloor,
+    observed: ravel_catalog::FloorObservation,
+    evidence: ravel_catalog::FloorEvidence,
+}
+
+impl ClassifiedFloor {
+    /// One report line: the floor, its basis (printed field by field, or
+    /// "none"), what the audit observed now, and the classification.
+    fn display(&self) -> String {
+        let f = &self.floor;
+        let basis = match f.basis {
+            Some(b) => format!(
+                "observed_entries={} observed_newest_created_unix_ns={} observed_shards={}",
+                b.observed_entries, b.observed_newest_created_unix_ns, b.observed_shards
+            ),
+            None => "none".to_string(),
+        };
+        let newest = self
+            .observed
+            .newest_created_unix_ns
+            .map_or_else(|| "none".to_string(), |n| n.to_string());
+        format!(
+            "floor {} >= {} (raised_unix_ns={} raised_by={:?}; basis: {basis}): {} \
+             [live_below_floor={} newest_created_unix_ns={newest} scan_shards={}]",
+            f.family,
+            f.floor_version,
+            f.raised_unix_ns,
+            f.raised_by,
+            self.evidence.as_str(),
+            self.observed.live_below_floor,
+            self.observed.scan_shards,
+        )
+    }
+}
+
+/// Classify every recorded format floor of a (tenant, signal) against current
+/// records (ADR-1746 decision 2), in the record's append order.
+///
+/// Both halves of each observation come from `scan`'s one enumeration and its
+/// live population: "live below the floor" is a prefix sum over the live
+/// histogram, equal to [`ravel_maintain::count_below_target`] at the floor's
+/// version, and the newest creation time excludes a superseded commit record
+/// sweep has not reclaimed. An L0 record an authoritative compaction or rewrite
+/// already supersedes therefore neither contradicts a floor migrate raised
+/// over it nor makes that floor stale. Every floor is counted against this
+/// signal's commit-family records whatever its family string, as `migrate`
+/// does when it raises one. Fails closed on an unreadable provisioning record
+/// rather than reporting no floors.
+async fn floor_evidence(
+    store: &dyn ObjectStoreBackend,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    scan_shards: u32,
+    scan: &VersionScan,
+) -> anyhow::Result<Vec<ClassifiedFloor>> {
+    let floors = match ravel_catalog::read_floors_from_store(store, tenant_hash, signal).await {
+        Ok(Some(floors)) => floors,
+        Ok(None) => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "format-floor read failed for signal {signal:?}: {err}; refusing to report the \
+                 floors as absent (ADR-1746 decision 2)"
+            ));
+        }
+    };
+    let mut out = Vec::with_capacity(floors.len());
+    for floor in floors {
+        let live_below = scan.census.live_below(floor.floor_version);
+        let observed = ravel_catalog::FloorObservation {
+            live_below_floor: u64::try_from(live_below).unwrap_or(u64::MAX),
+            newest_created_unix_ns: scan.newest_created_unix_ns(),
+            scan_shards,
+        };
+        let evidence = ravel_catalog::classify_floor(&floor, &observed);
+        out.push(ClassifiedFloor {
+            floor,
+            observed,
+            evidence,
+        });
+    }
+    Ok(out)
+}
+
+/// The canonical format-family identifier for a signal's on-object format
+/// (ADR-0066 decision 3): the lowercase family string the format floor is keyed
+/// by. One family per signal today (metrics=RSEG, logs=RLOG, spans=RSPAN).
+fn signal_family(signal: Signal) -> &'static str {
+    match signal {
+        Signal::Metrics => "rseg",
+        Signal::Logs => "rlog",
+        Signal::Spans => "rspan",
+        _ => "unknown",
+    }
+}
+
+/// A signal's reader-supported version window, projected to `u32` from the
+/// owning format crate's single source (ADR-0066 decision 1). One place in the
+/// CLI reads the crate constants; every consumer derives from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupportedWindow {
+    /// The current (newest, always-written) version: the default migrate target.
+    newest: u32,
+    /// The oldest accepted version (the window floor).
+    oldest: u32,
+}
+
+impl SupportedWindow {
+    /// Whether `version` is inside the accepted window.
+    fn contains(&self, version: u32) -> bool {
+        version >= self.oldest && version <= self.newest
+    }
+
+    /// Human-readable window for the audit header: a single version when the
+    /// window is one wide, else an inclusive range.
+    fn display(&self) -> String {
+        if self.oldest == self.newest {
+            format!("{}", self.newest)
+        } else {
+            format!("{}..={}", self.oldest, self.newest)
+        }
+    }
+}
+
+/// The single source in the CLI for a signal's reader-supported version window,
+/// wired to each format crate's own `SUPPORTED_VERSIONS` constant (ADR-0066
+/// decision 1). Both `audit-versions`' anomaly predicate and `migrate`'s
+/// default target version derive from this one function, so the CLI can never
+/// hand-mirror a version the readers do not actually accept: a bump to any
+/// crate's `SUPPORTED_VERSIONS` moves both consumers together.
+fn signal_supported_versions(signal: Signal) -> anyhow::Result<SupportedWindow> {
+    let (newest, oldest) = match signal {
+        Signal::Metrics => {
+            let w = ravel_segment::SUPPORTED_VERSIONS;
+            (w.newest(), w.oldest())
+        }
+        Signal::Logs => {
+            let w = ravel_logseg::footer::SUPPORTED_VERSIONS;
+            (w.newest(), w.oldest())
+        }
+        Signal::Spans => {
+            let w = ravel_rspan::footer::SUPPORTED_VERSIONS;
+            (w.newest(), w.oldest())
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "supported versions unknown for signal {other:?}"
+            ));
+        }
+    };
+    Ok(SupportedWindow {
+        newest: u32::from(newest),
+        oldest: u32::from(oldest),
+    })
+}
+
+/// The default `migrate` target for a signal: its current supported version,
+/// derived from the same single source [`signal_supported_versions`] the audit
+/// anomaly predicate uses, so the two never drift.
+fn signal_current_version(signal: Signal) -> anyhow::Result<u32> {
+    Ok(signal_supported_versions(signal)?.newest)
+}
+
+/// One line per blocked bucket, followed by the sentences that say what an
+/// operator can do about each reason present, which is never re-running this
+/// command (ADR-1331 decisions 2 and 3). A `rewrite_parts` block can be lowered
+/// by `ravel-cli maintain sweep` when it lists a superseded predecessor; a
+/// `loser_only_inputs` block and a `losing_record_parts` block clear only with
+/// retention. Each reason's paragraph prints only when a bucket with that
+/// reason is in the list.
+///
+/// The prose lines carry a leading `# ` because the rest of this command's
+/// output is `key: value` and the prose contains its own colons; without the
+/// prefix a parser reads a sentence fragment as a key.
+///
+/// Split out from the printing so a test asserts the exact text an operator
+/// reads. Returns the empty string for an empty list, so the caller can print
+/// unconditionally without emitting a stray blank line.
+fn blocked_bucket_report(blocked: &[BlockedBucket]) -> String {
+    if blocked.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for bucket in blocked {
+        let reason = match &bucket.reason {
+            BlockedReason::RewriteParts { below_target } => {
+                format!("rewrite_parts below_target={below_target}")
+            }
+            BlockedReason::LoserOnlyInputs => "loser_only_inputs".to_string(),
+            BlockedReason::LosingRecordParts { below_target } => {
+                format!("losing_record_parts below_target={below_target}")
+            }
+        };
+        out.push_str(&format!(
+            "blocked_bucket: shard={} hour={} reason={reason}\n",
+            bucket.shard, bucket.ingest_hour
+        ));
+    }
+    let has_rewrite_parts = blocked
+        .iter()
+        .any(|b| matches!(b.reason, BlockedReason::RewriteParts { .. }));
+    let has_loser_only = blocked
+        .iter()
+        .any(|b| matches!(b.reason, BlockedReason::LoserOnlyInputs));
+    let has_losing_parts = blocked
+        .iter()
+        .any(|b| matches!(b.reason, BlockedReason::LosingRecordParts { .. }));
+    if has_rewrite_parts {
+        out.push_str(
+            "# Re-running migrate does not clear any blocked bucket above; it reports the same \
+             list again. A rewrite_parts bucket holds a live selective-erasure rewrite record \
+             whose surviving parts sit below the target, and migrate never rewrites those. \
+             below_target counts the parts of every rewrite record the bucket still LISTS, \
+             including a predecessor a later rewrite already superseded, because a superseded \
+             record stays listed until sweep deletes it. So the block clears when retention \
+             ages the bucket out (subject to the format-version hold, which keeps an object \
+             this build cannot read), or when a later erasure request supersedes the record at \
+             the current output version AND a subsequent sweep removes the superseded \
+             predecessor. The erasure request is not something you trigger, but the sweep is: \
+             `ravel-cli maintain sweep` for that tenant, signal and shard removes the \
+             superseded predecessor once the superseding rewrite is past the protection \
+             horizon.",
+        );
+    }
+    if has_loser_only {
+        if has_rewrite_parts {
+            out.push('\n');
+        }
+        out.push_str(
+            "# A loser_only_inputs bucket clears only when retention ages those inputs out: no \
+             later compaction covers them, because compaction refuses a bucket that already \
+             carries a compaction record. That is not a command you run.",
+        );
+    }
+    if has_losing_parts {
+        if has_rewrite_parts || has_loser_only {
+            out.push('\n');
+        }
+        out.push_str(
+            "# A losing_record_parts bucket's authoritative compaction records are at the \
+             target, but compaction records that lost their overlap still hold below_target \
+             output parts under the target. Re-running migrate does not clear it: neither \
+             migrate nor sweep \
+             reclaims a losing record's parts, and they keep counting in l1_compaction_parts. \
+             It clears when retention ages the bucket out (subject to the format-version hold, \
+             which keeps an object this build cannot read). That is not a command you run.",
+        );
+    }
+    out
+}
+
+/// One line per bucket the walk found held below the target by its compaction
+/// records' parts and did not re-encode, followed by what clears each reason
+/// present. Returns the empty string for an empty list.
+fn reencode_blocked_report(blocked: &[ReencodeBlockedBucket]) -> String {
+    if blocked.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for bucket in blocked {
+        let reason = match &bucket.reason {
+            ReencodeBlockedReason::WriterDisabled { below_target } => {
+                format!("writer_disabled below_target={below_target}")
+            }
+            ReencodeBlockedReason::ContestedOverlap { largest_component } => {
+                format!("contested_overlap largest_component={largest_component}")
+            }
+            ReencodeBlockedReason::MultipleRecords { records } => {
+                format!("multiple_records records={records}")
+            }
+        };
+        out.push_str(&format!(
+            "reencode_blocked: shard={} hour={} reason={reason}\n",
+            bucket.shard, bucket.ingest_hour
+        ));
+    }
+    let has_disabled = blocked
+        .iter()
+        .any(|b| matches!(b.reason, ReencodeBlockedReason::WriterDisabled { .. }));
+    let has_permanent = blocked
+        .iter()
+        .any(|b| !matches!(b.reason, ReencodeBlockedReason::WriterDisabled { .. }));
+    if has_disabled {
+        out.push_str(
+            "# A writer_disabled bucket's one compaction record holds below_target parts under \
+             the target. A run with --reencode-compaction-parts re-encodes it, once every \
+             reader and maintainer runs a build that reads version 2 compaction records.\n",
+        );
+    }
+    if has_permanent {
+        out.push_str(
+            "# A contested_overlap or multiple_records bucket is not re-encoded by any run, with \
+             or without --reencode-compaction-parts. It clears when retention ages the bucket \
+             out (subject to the format-version hold, which keeps an object this build cannot \
+             read). That is not a command you run.\n",
+        );
+    }
+    out
+}
+
+/// When a migrate run's `not_migrated` buckets are retried, which follows from
+/// how the run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotMigratedRetry {
+    /// The walk drained and cleared its cursor, and the fresh re-audit refused
+    /// the floor: the next run starts over and reaches every one of them.
+    NextRun,
+    /// The run stopped on its budget with the cursor persisted past them: the
+    /// next run resumes after them, and only a walk that starts over reaches
+    /// them again.
+    AfterTheWalkDrains,
+    /// The walk drained and the fresh re-audit raised the floor: another writer
+    /// carried each of them to the target after this run passed it.
+    Resolved,
+}
+
+impl NotMigratedRetry {
+    fn of(report: &FamilyMigrateReport) -> Self {
+        match report.verification {
+            _ if !report.walk_complete => NotMigratedRetry::AfterTheWalkDrains,
+            Some(Verification::FloorRaised { .. }) => NotMigratedRetry::Resolved,
+            _ => NotMigratedRetry::NextRun,
+        }
+    }
+}
+
+/// One line per bucket the walk dispatched a rewrite for that published
+/// nothing, with the path and the reason, followed by the sentence that says
+/// when a later run retries them. Returns the empty string for an empty list.
+fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -> String {
+    if buckets.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for bucket in buckets {
+        let path = match bucket.path {
+            MigrationPath::L0Migration => "l0_migration",
+            MigrationPath::Reencode => "reencode",
+        };
+        let reason = match &bucket.reason {
+            NotMigratedReason::ClaimSkipped { reason } => {
+                format!("claim_skipped claim_reason={}", reason.name())
+            }
+            NotMigratedReason::Cancelled { at } => format!("cancelled checkpoint={}", at.name()),
+            NotMigratedReason::RecordSetChanged => "record_set_changed".to_string(),
+            NotMigratedReason::PublishAbandoned => "publish_abandoned".to_string(),
+        };
+        out.push_str(&format!(
+            "not_migrated: shard={} hour={} path={path} reason={reason}\n",
+            bucket.shard, bucket.ingest_hour
+        ));
+    }
+    out.push_str(match retry {
+        NotMigratedRetry::NextRun => {
+            "# Each not_migrated bucket published nothing this run. This run drained the walk \
+             and cleared its cursor, so the next migrate run starts over and retries every one \
+             of them.\n"
+        }
+        NotMigratedRetry::AfterTheWalkDrains => {
+            "# Each not_migrated bucket published nothing this run. This run stopped on its \
+             budget with the cursor past them, so the next run resumes after them: they are \
+             retried by the first run after the walk drains, which starts over from the \
+             beginning.\n"
+        }
+        NotMigratedRetry::Resolved => {
+            "# Each not_migrated bucket published nothing this run, and the fresh re-audit found \
+             nothing below the target: another writer carried it to the target after this run \
+             passed it. Nothing is left to retry.\n"
+        }
+    });
+    out
+}
+
+/// Everything `migrate` prints to stdout before the verification verdict, as
+/// one string: the `key: value` block, the blocked-bucket lines and the prose
+/// that explains them, in the order an operator reads them.
+///
+/// It is a function rather than a run of `println!` so a test drives the real
+/// printing, interleaving included, instead of only the blocked-bucket helper:
+/// the hazard that put the `# ` prefix on the prose is a property of where the
+/// prose sits relative to `buckets_blocked` and `records_migrated`, which a
+/// test of the helper alone cannot see.
+fn migrate_report_text(
+    tenant: &str,
+    signal: Signal,
+    family: &str,
+    target_version: u32,
+    budget_records: u64,
+    report: &FamilyMigrateReport,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("tenant: {tenant}\n"));
+    out.push_str(&format!("signal: {signal:?}\n"));
+    out.push_str(&format!("family: {family}\n"));
+    out.push_str(&format!("target_version: {target_version}\n"));
+    out.push_str(&format!(
+        "budget_records: {budget_records} (0 = unlimited)\n"
+    ));
+    out.push_str(&format!("buckets_examined: {}\n", report.buckets_examined));
+    out.push_str(&format!("buckets_migrated: {}\n", report.buckets_migrated));
+    out.push_str(&format!("buckets_blocked: {}\n", report.buckets_blocked()));
+    let blocked = blocked_bucket_report(&report.blocked_buckets);
+    if !blocked.is_empty() {
+        out.push_str(&blocked);
+        out.push('\n');
+    }
+    out.push_str(&format!("records_migrated: {}\n", report.records_migrated));
+    out.push_str(&format!(
+        "buckets_reencode_blocked: {}\n",
+        report.reencode_blocked.len()
+    ));
+    out.push_str(&reencode_blocked_report(&report.reencode_blocked));
+    out.push_str(&format!(
+        "buckets_not_migrated: {}\n",
+        report.not_migrated.len()
+    ));
+    out.push_str(&not_migrated_report(
+        &report.not_migrated,
+        NotMigratedRetry::of(report),
+    ));
+    if let Some((shard, hour)) = report.cursor_advanced_to {
+        out.push_str(&format!("cursor_advanced_to: shard={shard} hour={hour}\n"));
+    }
+    out.push_str(&format!("walk_complete: {}\n", report.walk_complete));
+    out
+}
+
+/// `maintain migrate`: raise a `(tenant, signal, format family)`'s recorded
+/// format floor to `target_version`, migrating every live record still below it
+/// first. The same operation the server
+/// maintain loop can call via [`migrate_family`]; this is its one-shot CLI
+/// driver.
+///
+/// Resumable and bounded: one invocation migrates at most `--budget-records` L0
+/// records (0 = unlimited) before persisting its durable cursor and returning,
+/// so a large migration runs across repeated invocations. Once a walk drains
+/// within budget, migrate re-audits fresh and raises the floor only if nothing
+/// below the target survives; if a straggler is found the floor is left
+/// untouched and this exits nonzero, reporting what it found. The re-audit
+/// excludes a bucket's pre-rewrite commit records once an AUTHORITATIVE
+/// compaction or rewrite record supersedes them (dead, sweepable leftovers of a
+/// rewrite this same invocation may have just performed, not stragglers). An
+/// input named only by a LOSING record of an overlap is not superseded: the
+/// resolver still serves it raw, so it stays counted. A clean migration
+/// therefore converges and raises the floor in one invocation, with no
+/// interleaved `sweep` required, but a below-target loser-only input is a
+/// straggler the walk cannot migrate, so that refusal is permanent until the
+/// overlap itself is resolved. A live erasure rewrite record whose surviving
+/// parts sit below the target is the other permanent case: this job never
+/// rewrites them (ADR-1331). Each such bucket this invocation examined is
+/// printed on its own `blocked_bucket` line with its reason, and
+/// `buckets_blocked` is how many there are. A below-target compaction part
+/// blocks the floor too; it shows up in `l1_compaction_parts`, and its bucket
+/// gets a `losing_record_parts` line when the parts belong to compaction
+/// records that lost their overlap while the bucket's authoritative records
+/// are at the target.
+///
+/// A bucket whose one authoritative compaction record holds below-target parts
+/// is re-encoded only when [`MigrateSwitches::reencode_compaction_parts`] sets
+/// [`CompactorConfig::reencode_writer_enabled`]; with it off, or when the
+/// bucket's records are contested or more than one, it gets a
+/// `reencode_blocked` line with its reason. A bucket whose rewrite published
+/// nothing (claim skipped, cancelled, record set changed, publish abandoned)
+/// gets a `not_migrated` line. Either kind of line makes the run exit nonzero,
+/// unless the walk drained and the fresh re-audit raised the floor: another
+/// writer then carried the bucket to the target after the walk passed it, and
+/// the run exits zero.
+///
+/// "Until a later run migrates it" below is the next run when this one drained
+/// the walk, since a drained walk clears its cursor. After a budget stop the
+/// cursor is persisted past every bucket this run examined, so the next run
+/// resumes after them, and a bucket this run skipped is reached again only by
+/// the first run after the walk drains.
+///
+/// `target_version` defaults to the signal's current supported version
+/// ([`signal_current_version`]); `family` defaults to the signal's canonical
+/// family ([`signal_family`]).
+///
+/// Each bucket's migration publishes a compaction record, so it takes the
+/// bucket's claim under `claims` exactly as `compact-bucket` does, and backs
+/// off a bucket whose claim another process holds; the floor then stays
+/// unraised until a later run migrates it. `--no-claim` takes none, which
+/// leaves only the pre-publish re-list between a migration and an erasure
+/// rewrite of the same bucket.
+///
+/// [`MigrateSwitches::dry_run`] does not run the walk, because the walk writes
+/// its cursor and the floor whatever the compactor's own dry-run switch says.
+/// It runs the read-only re-audit instead and prints what is below the target.
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shards: u32,
+    target_version: Option<u32>,
+    family: Option<String>,
+    budget_records: u64,
+    switches: MigrateSwitches,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    let mut out = std::io::stdout();
+    migrate_to(
+        &mut out,
+        store,
+        selection,
+        tenant,
+        signal,
+        shards,
+        target_version,
+        family,
+        budget_records,
+        switches,
+        claims,
+    )
+    .await
+}
+
+/// The operator switches of `maintain migrate`, both off by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MigrateSwitches {
+    /// Run the read-only re-audit instead of the walk; write nothing.
+    pub dry_run: bool,
+    /// Set [`CompactorConfig::reencode_writer_enabled`], so the walk writes a
+    /// version 2 compaction record over a bucket whose one compaction record
+    /// holds parts below the target.
+    pub reencode_compaction_parts: bool,
+}
+
+/// [`migrate`], with the report written to `out` instead of stdout. The
+/// store-selection header still prints to stdout.
+#[allow(clippy::too_many_arguments)]
+pub async fn migrate_to(
+    out: &mut dyn Write,
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    signal: SignalArg,
+    shards: u32,
+    target_version: Option<u32>,
+    family: Option<String>,
+    budget_records: u64,
+    switches: MigrateSwitches,
+    claims: &ClaimOptions,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain migrate",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+    let sig = signal.to_signal();
+    let target = match target_version {
+        Some(v) => v,
+        None => signal_current_version(sig)?,
+    };
+    let family = family.unwrap_or_else(|| signal_family(sig).to_string());
+    let clock = wall_clock()?;
+    let mut config = CompactorConfig {
+        reencode_writer_enabled: switches.reencode_compaction_parts,
+        ..CompactorConfig::default()
+    };
+    writeln!(
+        out,
+        "{}",
+        install_claims(&mut config, switches.dry_run, claims)
+    )?;
+    writeln!(out, "dry_run: {}", switches.dry_run)?;
+    writeln!(
+        out,
+        "reencode_compaction_parts: {}",
+        switches.reencode_compaction_parts
+    )?;
+    if switches.dry_run {
+        return migrate_dry_run(
+            out,
+            store.as_ref(),
+            tenant,
+            &tenant_hash,
+            sig,
+            &family,
+            target,
+            shards,
+        )
+        .await;
+    }
+    let budget = MigrateBudget {
+        max_records: budget_records,
+    };
+
+    let report: FamilyMigrateReport = migrate_family(
+        store.as_ref(),
+        &clock,
+        &config,
+        tenant_hash,
+        sig,
+        &family,
+        target,
+        shards,
+        budget,
+        "ravel-cli maintain migrate",
+    )
+    .await
+    .map_err(|err| anyhow::anyhow!("migrate failed: {err}"))?;
+
+    migrate_verdict(out, tenant, sig, &family, target, budget_records, &report)
+}
+
+/// Print a finished migrate run's report and return its exit verdict. A budget
+/// stop exits zero whatever it left listed: every `reencode_blocked` and
+/// `not_migrated` bucket it names still holds parts or records below the
+/// target, so the run that drains the walk fails on them through its fresh
+/// re-audit's stragglers.
+fn migrate_verdict(
+    out: &mut dyn Write,
+    tenant: &str,
+    sig: Signal,
+    family: &str,
+    target: u32,
+    budget_records: u64,
+    report: &FamilyMigrateReport,
+) -> anyhow::Result<()> {
+    write!(
+        out,
+        "{}",
+        migrate_report_text(tenant, sig, family, target, budget_records, report)
+    )?;
+
+    if !report.walk_complete {
+        writeln!(
+            out,
+            "budget exhausted; the walk did not finish. Re-run migrate to resume from the \
+             persisted cursor (the floor is not raised until the walk drains and the re-audit is \
+             clean)."
+        )?;
+        return Ok(());
+    }
+
+    match &report.verification {
+        // The fresh re-audit found nothing below the target, so the run
+        // succeeded whatever the walk left listed: another writer carried each
+        // such bucket to the target after the walk passed it.
+        Some(Verification::FloorRaised { floor_version }) => {
+            writeln!(out, "verification: clean (no records below target)")?;
+            writeln!(out, "floor_raised_to: {floor_version}")?;
+            if !report.reencode_blocked.is_empty() {
+                writeln!(
+                    out,
+                    "# Each reencode_blocked bucket was carried to the target by another writer \
+                     after this run passed it."
+                )?;
+            }
+            Ok(())
+        }
+        Some(Verification::Stragglers {
+            l0,
+            l1,
+            rewrite_parts,
+            blocked,
+        }) => {
+            writeln!(
+                out,
+                "verification: FOUND STRAGGLERS l0_commit_records={l0} l1_compaction_parts={l1} \
+                 rewrite_record_parts={rewrite_parts}"
+            )?;
+            anyhow::bail!(
+                "migrate refused to raise the {family} floor for tenant {tenant} signal {sig:?}: \
+                 the fresh re-audit found {l0} commit record(s), {l1} compaction part(s) and \
+                 {rewrite_parts} rewrite record part(s) still \
+                 below target version {target} (data landed below the target between the walk \
+                 finishing and the floor raise, or is not yet migratable -- e.g. still \
+                 unsealed). Of the three, l0_commit_records is the one that is entirely live and \
+                 that no `sweep` moves: a bucket's own pre-rewrite commit records are already \
+                 excluded from this count once an authoritative compaction or rewrite record \
+                 supersedes them, so a `sweep` will not make that figure converge. The other two \
+                 count the parts of every record the bucket still LISTS, so a `sweep` can lower \
+                 either: rewrite_record_parts may include a superseded predecessor rewrite \
+                 record, and l1_compaction_parts may include a compaction record that a later \
+                 rewrite superseded. Both stay listed until `ravel-cli maintain sweep` for this \
+                 tenant, signal and shard deletes them. Sweep does nothing to them until the \
+                 superseding record is older than the protection horizon and no HEAD still names \
+                 their parts; the first sweep pass after that writes their unnamed-since marker, \
+                 and a pass at least the pinned-query window later deletes them. The floor was \
+                 NOT raised.\n\n\
+                 Whether re-running helps depends on why they are below target. A below-target \
+                 L0 record that is merely not yet sealed migrates on a later run. A below-target \
+                 L0 that only \
+                 a LOSING compaction record names is served raw by the resolver and is not \
+                 migratable by the walk; a live erasure rewrite record's parts are never \
+                 migrated by this job at all. A below-target compaction part is re-encoded only \
+                 by a run with --reencode-compaction-parts, and only in a bucket whose one \
+                 compaction record survives supersession; the record it supersedes keeps \
+                 counting in l1_compaction_parts until `sweep` deletes it. Sweep does nothing to \
+                 it until the version 2 record is older than the protection horizon and no HEAD \
+                 still names the superseded record's parts; the first sweep pass after that \
+                 writes its unnamed-since marker, a pass at least the pinned-query window later \
+                 deletes the record and its parts, and the floor is raised by the first migrate \
+                 run after that. The {} blocked_bucket line(s) above \
+                 name every bucket THIS INVOCATION EXAMINED that no re-run clears, with its \
+                 reason -- a walk that resumed from a cursor does not re-report the loser-only \
+                 buckets an earlier invocation found, and a below-target compaction part gets a \
+                 blocked_bucket line only when it belongs to a compaction record that lost its \
+                 overlap in a bucket whose authoritative records are at the target \
+                 (losing_record_parts). If there are any, re-running is not the remedy. The {} \
+                 reencode_blocked line(s) name the buckets whose compaction parts this run did \
+                 not re-encode, and the {} not_migrated line(s) the buckets the next migrate \
+                 run retries: this run drained the walk and cleared its cursor, so the next run \
+                 starts over.",
+                blocked.len(),
+                report.reencode_blocked.len(),
+                report.not_migrated.len(),
+            )
+        }
+        None => {
+            // walk_complete is true, so verification is always set; defend
+            // against a future refactor rather than panicking.
+            anyhow::bail!("migrate completed the walk but produced no verification result")
+        }
+    }
+}
+
+/// `migrate --dry-run`: the read-only re-audit a real run ends with, run before
+/// any bucket is migrated. It writes nothing, takes no claim, and does not
+/// touch the cursor or the floor.
+#[allow(clippy::too_many_arguments)]
+async fn migrate_dry_run(
+    out: &mut dyn Write,
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    tenant_hash: &TenantHash,
+    signal: Signal,
+    family: &str,
+    target_version: u32,
+    shards: u32,
+) -> anyhow::Result<()> {
+    let scan_shards = generation_scan_shards(store, tenant_hash, signal, shards).await?;
+    let below = count_below_target(store, tenant_hash, signal, scan_shards, target_version)
+        .await
+        .map_err(|err| anyhow::anyhow!("migrate --dry-run re-audit failed: {err}"))?;
+    writeln!(out, "tenant: {tenant}")?;
+    writeln!(out, "signal: {signal:?}")?;
+    writeln!(out, "family: {family}")?;
+    writeln!(out, "target_version: {target_version}")?;
+    writeln!(out, "l0_commit_records: {}", below.l0)?;
+    writeln!(out, "l1_compaction_parts: {}", below.l1)?;
+    writeln!(out, "rewrite_record_parts: {}", below.rewrite_parts)?;
+    writeln!(out, "buckets_blocked: {}", below.blocked.len())?;
+    write!(out, "{}", blocked_bucket_report(&below.blocked))?;
+    if !below.blocked.is_empty() {
+        writeln!(out)?;
+    }
+    writeln!(
+        out,
+        "# Dry run: the walk did not run and nothing was written. The figures above are what is \
+         below the target now; a run without --dry-run migrates what it can and re-audits."
+    )?;
+    Ok(())
+}
+
+/// The outcome of independently re-hashing one content-addressed object at
+/// rest and comparing that hash against the `hash16` embedded in its key.
+enum ObjectCheck {
+    /// The object's content still hashes to the `hash16` its key embeds.
+    Verified,
+    /// The object exists but its content no longer matches its key's `hash16`:
+    /// corruption that happened after the write's own CRC pre-flight passed.
+    Mismatch { expected: String, actual: String },
+    /// The object is absent from the store (a plain `NotFound`, not a
+    /// transient error). Whether this is an anomaly is the caller's call: a
+    /// surviving record whose object vanished is corruption, but a compaction
+    /// input the sweeper legitimately reclaimed is expected.
+    Missing,
+}
+
+/// Extract the `hash16` component a data/part key embeds. Both the L0
+/// (`writer.epoch.seq.hash16.rseg`) and L1
+/// (`input_set_hash16.part.hash16.rseg`) filenames carry the object's own
+/// content hash prefix as the dot-segment immediately before the `.rseg`
+/// suffix, so one extraction serves both. Keys handed here are reconstructed
+/// via `ravel-commit`'s own builders, so they are always well-formed.
+fn embedded_hash16(key: &str) -> anyhow::Result<&str> {
+    let filename = key.rsplit('/').next().unwrap_or(key);
+    let stem = filename
+        .strip_suffix(".rseg")
+        .ok_or_else(|| anyhow::anyhow!("object key {key} has no .rseg suffix"))?;
+    stem.rsplit('.')
+        .next()
+        .filter(|s| s.len() == 16)
+        .ok_or_else(|| anyhow::anyhow!("object key {key} has no hash16 component"))
+}
+
+/// GET the object at `key`, hash its bytes with blake3, and compare the hex of
+/// the first 8 bytes against the `hash16` embedded in the key. This is the
+/// same content-addressing invariant `S3Store` checks pre-flight at write
+/// time, re-verified here independently and at rest, so corruption that
+/// happened after a successful write is caught.
+async fn check_object(store: &dyn ObjectStoreBackend, key: &str) -> anyhow::Result<ObjectCheck> {
+    let got = match store.get(key, GetRange::Full).await {
+        Ok(got) => got,
+        Err(StoreError::NotFound) => return Ok(ObjectCheck::Missing),
+        Err(err) => return Err(anyhow::anyhow!("failed to fetch {key}: {err}")),
+    };
+    let expected = embedded_hash16(key)?.to_string();
+    let actual = hex::encode(&blake3::hash(got.data.as_ref()).as_bytes()[..8]);
+    if actual == expected {
+        Ok(ObjectCheck::Verified)
+    } else {
+        Ok(ObjectCheck::Mismatch { expected, actual })
+    }
+}
+
+/// Check one live object's write time against the tenant's recorded key-epoch
+/// history (ADR-0062 decision 1b). When `epochs` is `None` the tenant has no
+/// `t/<hash>/enc` record, so every object was written under the deployment
+/// default key and there is no epoch contradiction to check. When it is
+/// `Some`, the object's write time must locate it in exactly one epoch
+/// ([`ravel_catalog::epoch_for_write`] cannot return a gap by construction: it
+/// finds the latest epoch whose `activated_ns <= write_ns`, so any write past
+/// epoch 0's activation always locates); a write time that predates the
+/// tenant's first recorded epoch is a distinct custody anomaly, counted and
+/// reported like a content-hash mismatch.
+///
+/// REQUIRES that whatever writes the first key-epoch record for a tenant
+/// (server startup wiring) bootstraps epoch 0 as `key_arn: ""`
+/// (deployment default) with an `activated_ns` at or before the tenant's
+/// earliest live object, not just at "whenever the operator first configures
+/// a per-tenant key." Otherwise every object written before that
+/// configuration moment -- the ordinary case for a tenant that ingested under
+/// the default for months before opting into a per-tenant key -- reads as a
+/// false-positive anomaly here, since it predates the (wrongly late) epoch 0.
+fn check_object_epoch(
+    epochs: Option<&[ravel_catalog::KeyEpoch]>,
+    write_ns: i64,
+    level: &str,
+    object_key: &str,
+    located: &mut usize,
+    inconsistencies: &mut usize,
+    anomalies: &mut usize,
+) {
+    let Some(epochs) = epochs else {
+        return;
+    };
+    match ravel_catalog::epoch_for_write(epochs, write_ns) {
+        Some(_) => *located += 1,
+        None => {
+            *inconsistencies += 1;
+            *anomalies += 1;
+            let first = epochs.first().map(|e| e.activated_ns).unwrap_or(0);
+            println!(
+                "  EPOCH INCONSISTENCY ({level}) {object_key}: write time {write_ns} ns predates \
+                 the tenant's first recorded key epoch (activated_ns {first})  <-- ANOMALY"
+            );
+        }
+    }
+}
+
+/// `maintain verify-custody`: independently re-verify the content-addressed
+/// chain for a tenant, at rest and after the fact (ADR-0042 decision 5). It
+/// extends `audit_versions`'s tenant/shard-scoped per-object walk (same
+/// liveness definition: an L0 object is live iff a surviving commit record
+/// references it, an L1 object iff a surviving compaction record references
+/// it) with two content-hash checks, plus a key-epoch consistency check
+/// (ADR-0062 decision 1b). This command only reads; there is no `--dry-run`
+/// because it never writes or deletes.
+///
+/// It distinguishes these outcomes:
+///
+/// - **content-hash mismatch** (ANOMALY): an object that exists but whose
+///   bytes no longer hash to the `hash16` its key embeds. Post-write
+///   corruption; the write-time CRC cannot catch it.
+/// - **missing-and-unexpected** (ANOMALY): a live data object (referenced by a
+///   surviving commit or compaction record) that is absent from the store.
+///   A surviving record must have its object.
+/// - **key-epoch inconsistency** (ANOMALY): when the tenant has a
+///   `t/<hash>/enc` key-epoch record, a live object whose write time predates
+///   the tenant's first recorded epoch. Every object's write time must locate
+///   it in exactly one epoch, so "which key encrypts what" stays answerable
+///   from the bucket alone. A tenant with no epoch record used the deployment
+///   default key, so there is no contradiction to check. Requires the epoch-0
+///   bootstrap discipline documented on [`check_object_epoch`] -- otherwise
+///   this reports a false positive for every pre-existing object once a
+///   tenant's first per-tenant key is configured.
+/// - **missing-but-expected** (NOT an anomaly): a compaction record's recorded
+///   input identity that no longer resolves to a present object. The sweeper
+///   legitimately reclaims superseded inputs once past their protection
+///   horizon, so this is steady-state behavior, reported as a count only.
+/// - **recoverable-prior-version** (ANOMALY, versioning-aware mode only): on a
+///   versioned bucket, a Ravel delete leaves a recoverable prior version that
+///   the content-addressed walk above cannot see (ADR-0064 §7, S4-12). Its own
+///   distinct anomaly class, separate from the four above.
+///
+/// `versioning_aware` enables the recoverable-prior-version check. It needs a
+/// versioned listing the `ObjectStoreBackend` contract does not expose, so
+/// against a real backend it reports an honest gap (not an anomaly); the check
+/// itself lives in [`check_noncurrent_versions`], which a versioning-aware
+/// fixture drives directly.
+///
+/// Exits nonzero if any anomaly is found.
+pub async fn verify_custody(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shards: u32,
+    versioning_aware: bool,
+) -> anyhow::Result<()> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    selection.print_header();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "maintain verify-custody",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+    let mut anomalies = 0usize;
+
+    // The tenant's key-epoch history (ADR-0062 decision 1b), read once and
+    // fresh. `None` means no per-tenant key was ever configured: every object
+    // is under the deployment default, so the epoch check is skipped. A corrupt
+    // or misfiled record fails closed here rather than being read as "no key".
+    let key_epochs = ravel_catalog::read_epochs_from_store(store.as_ref(), &tenant_hash)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!(
+                "key-epoch record read failed for tenant {tenant}: {err}; refusing to verify \
+                 custody without a trustworthy epoch history (ADR-0062 decision 1b)"
+            )
+        })?;
+    match &key_epochs {
+        Some(epochs) => println!(
+            "key-epoch history: {} epoch(s) recorded; checking every live object's write time \
+             against it",
+            epochs.len()
+        ),
+        None => println!(
+            "key-epoch history: none recorded; every object is under the deployment default key \
+             (no epoch check)"
+        ),
+    }
+
+    // Aggregate counters for the closing summary.
+    let mut data_objects_verified = 0usize; // live L0/L1 object, hash matches key
+    let mut content_mismatches = 0usize; // exists, wrong hash: ANOMALY
+    let mut missing_live_objects = 0usize; // surviving record, object gone: ANOMALY
+    let mut inputs_verified = 0usize; // compaction input resolved and hash matches
+    let mut inputs_swept = 0usize; // compaction input no longer present: expected
+    let mut epoch_objects_located = 0usize; // live object located in a recorded epoch
+    let mut epoch_inconsistencies = 0usize; // live object outside every recorded epoch: ANOMALY
+    let mut recoverable_prior_versions = 0usize; // noncurrent version under a swept key: ANOMALY
+
+    for signal in [Signal::Metrics, Signal::Logs] {
+        println!("== signal {:?} ==", signal);
+        // Generation-aware scan range (ADR-0052 section 4), not the static
+        // `--shards`: custody must be verified across every shard any
+        // generation ever wrote, so a reshard-increase's new shards are not
+        // silently skipped.
+        let scan_shards =
+            generation_scan_shards(store.as_ref(), &tenant_hash, signal, shards).await?;
+        for shard in 0..scan_shards {
+            // A compaction record's input identities carry only
+            // (writer_id, epoch, seq), never a content hash, so they cannot be
+            // reconstructed into a content-addressed L0 key directly. List the
+            // shard's physical L0 objects once and index them by identity, so
+            // each input can be resolved to the key it actually lives at (if
+            // any) and its content re-verified.
+            let l0_prefix = format!(
+                "t/{}/{}/l0/{:04}/",
+                tenant_hash.to_hex(),
+                signal.key_prefix(),
+                shard,
+            );
+            let l0_objects = list_all(store.as_ref(), &l0_prefix)
+                .await
+                .map_err(|err| anyhow::anyhow!("failed to list {l0_prefix}: {err}"))?;
+            let mut l0_by_identity: HashMap<(Uuid, u64, u64), String> = HashMap::new();
+            for meta in &l0_objects {
+                if let Ok(parsed) = keys::parse_data_key(&meta.key) {
+                    l0_by_identity.insert(
+                        (parsed.writer_id, parsed.epoch, parsed.seq),
+                        meta.key.clone(),
+                    );
+                }
+            }
+
+            let prefix = keys::commit_shard_prefix(&tenant_hash, signal, shard)
+                .map_err(|err| anyhow::anyhow!("failed to build shard prefix: {err}"))?;
+            let metas = list_all(store.as_ref(), &prefix)
+                .await
+                .map_err(|err| anyhow::anyhow!("failed to list {prefix}: {err}"))?;
+            for meta in metas {
+                match keys::partition_bucket_entry(&meta.key) {
+                    Ok(keys::BucketEntry::CommitRecord(_)) => {
+                        let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
+                            anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
+                        })?;
+                        let record = ravel_commit::record::decode(&got.data).map_err(|err| {
+                            anyhow::anyhow!("commit record {} is corrupt: {err}", meta.key)
+                        })?;
+                        let data_key = keys::reconstruct_data_key(&record).map_err(|err| {
+                            anyhow::anyhow!(
+                                "failed to reconstruct data key for {}: {err}",
+                                meta.key
+                            )
+                        })?;
+                        match check_object(store.as_ref(), &data_key).await? {
+                            ObjectCheck::Verified => data_objects_verified += 1,
+                            ObjectCheck::Mismatch { expected, actual } => {
+                                content_mismatches += 1;
+                                anomalies += 1;
+                                println!(
+                                    "  CONTENT MISMATCH (l0) {data_key}: key hash16={expected} \
+                                     content hash16={actual}  <-- ANOMALY"
+                                );
+                            }
+                            ObjectCheck::Missing => {
+                                missing_live_objects += 1;
+                                anomalies += 1;
+                                println!(
+                                    "  MISSING LIVE OBJECT (l0) {data_key}: referenced by \
+                                     surviving commit record {}  <-- ANOMALY",
+                                    meta.key
+                                );
+                            }
+                        }
+                        // Key-epoch consistency: the commit record's
+                        // created_unix_ns is used as this object's write time.
+                        // It is an approximation, not the exact PUT time --
+                        // durability order writes the data object first and
+                        // the commit record after, so created_unix_ns is
+                        // always >= the object's real write time. This can
+                        // only make the check MORE permissive at an epoch
+                        // boundary (an object written just before an epoch
+                        // activation but committed just after is attributed
+                        // to the later epoch), never produce a false anomaly.
+                        check_object_epoch(
+                            key_epochs.as_deref(),
+                            record.created_unix_ns,
+                            "l0",
+                            &data_key,
+                            &mut epoch_objects_located,
+                            &mut epoch_inconsistencies,
+                            &mut anomalies,
+                        );
+                    }
+                    Ok(keys::BucketEntry::CompactionRecord(_)) => {
+                        let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
+                            anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
+                        })?;
+                        let record = ravel_commit::record::decode_compaction(got.data.as_ref())
+                            .map_err(|err| {
+                                anyhow::anyhow!("compaction record {} is corrupt: {err}", meta.key)
+                            })?;
+
+                        // Live L1 objects: every part a surviving compaction
+                        // record references must exist and still match.
+                        for part in &record.parts {
+                            let part_key =
+                                keys::reconstruct_l1_part_key(&record, part).map_err(|err| {
+                                    anyhow::anyhow!("failed to reconstruct L1 part key: {err}")
+                                })?;
+                            match check_object(store.as_ref(), &part_key).await? {
+                                ObjectCheck::Verified => data_objects_verified += 1,
+                                ObjectCheck::Mismatch { expected, actual } => {
+                                    content_mismatches += 1;
+                                    anomalies += 1;
+                                    println!(
+                                        "  CONTENT MISMATCH (l1) {part_key}: key hash16={expected} \
+                                         content hash16={actual}  <-- ANOMALY"
+                                    );
+                                }
+                                ObjectCheck::Missing => {
+                                    missing_live_objects += 1;
+                                    anomalies += 1;
+                                    println!(
+                                        "  MISSING LIVE OBJECT (l1) {part_key}: referenced by \
+                                         surviving compaction record {}  <-- ANOMALY",
+                                        meta.key
+                                    );
+                                }
+                            }
+                            // Key-epoch consistency: an L1 part's write time
+                            // is approximated by its compaction record's
+                            // created_unix_ns (>= the part's real write time,
+                            // same durability-order caveat as the L0 case
+                            // above), shared by every part the record
+                            // produced.
+                            check_object_epoch(
+                                key_epochs.as_deref(),
+                                record.created_unix_ns,
+                                "l1",
+                                &part_key,
+                                &mut epoch_objects_located,
+                                &mut epoch_inconsistencies,
+                                &mut anomalies,
+                            );
+                        }
+
+                        // Recorded inputs: resolve each identity to the L0 key
+                        // it lives at. A resolved-and-present input must still
+                        // match its hash; an input the sweeper reclaimed is
+                        // expected, counted but never an anomaly.
+                        for input in &record.inputs {
+                            let writer_id = Uuid::parse_str(&input.writer_id).map_err(|_| {
+                                anyhow::anyhow!(
+                                    "compaction record {} has an invalid input writer_id {:?}",
+                                    meta.key,
+                                    input.writer_id
+                                )
+                            })?;
+                            let identity = (writer_id, input.writer_epoch, input.writer_seq);
+                            let Some(input_key) = l0_by_identity.get(&identity) else {
+                                // Unresolved: no surviving L0 object for this
+                                // identity. Expected once the sweeper reclaims
+                                // a superseded input past its horizon.
+                                inputs_swept += 1;
+                                continue;
+                            };
+                            match check_object(store.as_ref(), input_key).await? {
+                                ObjectCheck::Verified => inputs_verified += 1,
+                                ObjectCheck::Mismatch { expected, actual } => {
+                                    content_mismatches += 1;
+                                    anomalies += 1;
+                                    println!(
+                                        "  CONTENT MISMATCH (input) {input_key}: key \
+                                         hash16={expected} content hash16={actual}  <-- ANOMALY"
+                                    );
+                                }
+                                // Listed a moment ago but gone on GET: a
+                                // concurrent sweep raced us. Expected, not an
+                                // anomaly.
+                                ObjectCheck::Missing => inputs_swept += 1,
+                            }
+                        }
+                    }
+                    Ok(keys::BucketEntry::RewriteRecord(_)) => {
+                        // A selective-erasure rewrite record (ADR-0064 decision
+                        // 3) names live L1 output parts exactly as a compaction
+                        // record does; verify each exists and still matches its
+                        // content hash. Input-identity resolution and the
+                        // versioning-aware custody surface for erased data are
+                        // future extensions; this only covers the surviving
+                        // rewritten parts so verify-custody does not silently
+                        // ignore a bucket that has been erased once.
+                        let got = store.get(&meta.key, GetRange::Full).await.map_err(|err| {
+                            anyhow::anyhow!("failed to fetch {}: {err}", meta.key)
+                        })?;
+                        let record = ravel_commit::erasure::decode_rewrite(got.data.as_ref())
+                            .map_err(|err| {
+                                anyhow::anyhow!("rewrite record {} is corrupt: {err}", meta.key)
+                            })?;
+                        for part in &record.parts {
+                            let part_key = keys::reconstruct_rewrite_part_key(&record, part)
+                                .map_err(|err| {
+                                    anyhow::anyhow!("failed to reconstruct rewrite part key: {err}")
+                                })?;
+                            match check_object(store.as_ref(), &part_key).await? {
+                                ObjectCheck::Verified => data_objects_verified += 1,
+                                ObjectCheck::Mismatch { expected, actual } => {
+                                    content_mismatches += 1;
+                                    anomalies += 1;
+                                    println!(
+                                        "  CONTENT MISMATCH (l1 rewrite) {part_key}: key \
+                                         hash16={expected} content hash16={actual}  <-- ANOMALY"
+                                    );
+                                }
+                                ObjectCheck::Missing => {
+                                    missing_live_objects += 1;
+                                    anomalies += 1;
+                                    println!(
+                                        "  MISSING LIVE OBJECT (l1 rewrite) {part_key}: referenced \
+                                         by surviving rewrite record {}  <-- ANOMALY",
+                                        meta.key
+                                    );
+                                }
+                            }
+                            check_object_epoch(
+                                key_epochs.as_deref(),
+                                record.created_unix_ns,
+                                "l1",
+                                &part_key,
+                                &mut epoch_objects_located,
+                                &mut epoch_inconsistencies,
+                                &mut anomalies,
+                            );
+                        }
+                    }
+                    Ok(keys::BucketEntry::Tombstone(_)) => {}
+                    Err(err) => {
+                        return Err(anyhow::anyhow!("unknown key shape {}: {err}", meta.key));
+                    }
+                }
+            }
+        }
+    }
+
+    // Versioning-aware pass (ADR-0064 §7, S4-12): on a versioned bucket, list
+    // noncurrent versions under the tenant's keys and report each as the
+    // distinct recoverable-prior-version anomaly class. Against a real backend
+    // the source cannot enumerate versions, so this reports an honest gap
+    // rather than a false clean bill; a versioning-aware fixture surfaces the
+    // prior versions it holds.
+    if versioning_aware {
+        let tenant_prefix = format!("t/{}/", tenant_hash.to_hex());
+        println!("== versioning-aware: noncurrent versions under {tenant_prefix} ==");
+        let report = check_noncurrent_versions(store.as_ref(), &tenant_prefix).await?;
+        if report.supported {
+            recoverable_prior_versions = report.recoverable_versions;
+            anomalies += recoverable_prior_versions;
+        } else {
+            println!(
+                "  backend cannot enumerate noncurrent versions through the ObjectStoreBackend \
+                 contract (object_store 0.14 has no versioned listing); reporting an honest gap, \
+                 not an anomaly. On a versioned bucket, confirm noncurrent-version expiration is \
+                 configured (ADR-0064 §7) out of band"
+            );
+        }
+    }
+
+    println!("verify-custody summary:");
+    println!("  live data objects verified (content hash matches key): {data_objects_verified}");
+    println!("  compaction inputs resolved and verified: {inputs_verified}");
+    println!(
+        "  compaction inputs no longer present (expected; legitimately swept): {inputs_swept}"
+    );
+    println!("  content-hash mismatches (ANOMALY): {content_mismatches}");
+    println!("  live objects missing from store (ANOMALY): {missing_live_objects}");
+    if key_epochs.is_some() {
+        println!("  live objects located in a recorded key epoch: {epoch_objects_located}");
+        println!("  key-epoch inconsistencies (ANOMALY): {epoch_inconsistencies}");
+    }
+    if versioning_aware {
+        println!(
+            "  recoverable prior versions (ANOMALY, recoverable-prior-version): \
+             {recoverable_prior_versions}"
+        );
+    }
+    println!("  total anomalies: {anomalies}");
+
+    if anomalies > 0 {
+        anyhow::bail!(
+            "verify-custody found {anomalies} custody anomaly(ies): {content_mismatches} \
+             content-hash mismatch(es), {missing_live_objects} live object(s) missing from the \
+             store, {epoch_inconsistencies} key-epoch inconsistency(ies), and \
+             {recoverable_prior_versions} recoverable prior version(s) (a mismatch is \
+             post-write corruption; a missing live object is a surviving record whose data \
+             vanished; an epoch inconsistency is a live object whose write time falls outside \
+             every recorded key epoch; a recoverable prior version is data deleted on a versioned \
+             bucket that a prior-version restore could resurrect, ADR-0064 §7)"
+        );
+    }
+    println!("verify-custody: content-addressed chain intact for every live object");
+    Ok(())
+}
+
+/// Outcome of the versioning-aware [`check_noncurrent_versions`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoncurrentVersionReport {
+    /// Whether the source could enumerate versioned listings at all. `false`
+    /// is the honest gap through the `ObjectStoreBackend` contract, not an
+    /// anomaly.
+    pub supported: bool,
+    /// Number of noncurrent (prior) versions found: each one a distinct
+    /// recoverable-prior-version anomaly.
+    pub recoverable_versions: usize,
+}
+
+/// Versioning-aware custody check (ADR-0064 §7, S4-12): list noncurrent
+/// versions under `tenant_prefix` and report each as the distinct "deleted but
+/// recoverable as prior version" anomaly class, separate from the
+/// content-mismatch, missing-object, and epoch-inconsistency classes.
+///
+/// When the source cannot enumerate versions (`supported: false`, every
+/// production backend through the trait contract), this reports zero anomalies:
+/// it cannot see prior versions, so it neither confirms nor denies them, an
+/// honest gap rather than a false clean bill. A noncurrent version only ever
+/// exists on a versioned bucket, so a nonzero count here is proof both that the
+/// bucket is versioned and that a recoverable prior version is present.
+pub async fn check_noncurrent_versions<S: NoncurrentVersionSource + ?Sized>(
+    source: &S,
+    tenant_prefix: &str,
+) -> anyhow::Result<NoncurrentVersionReport> {
+    let listing = source
+        .list_noncurrent_versions(tenant_prefix)
+        .await
+        .map_err(|err| {
+            anyhow::anyhow!("failed to list noncurrent versions under {tenant_prefix}: {err}")
+        })?;
+    if !listing.supported {
+        return Ok(NoncurrentVersionReport {
+            supported: false,
+            recoverable_versions: 0,
+        });
+    }
+    for version in &listing.versions {
+        println!(
+            "  DELETED BUT RECOVERABLE AS PRIOR VERSION {} (version_id={})  \
+             <-- ANOMALY (recoverable-prior-version)",
+            version.key, version.version_id
+        );
+    }
+    Ok(NoncurrentVersionReport {
+        supported: true,
+        recoverable_versions: listing.versions.len(),
+    })
+}
+
+/// Decode and print a `CompactionRecord` (proto), mirroring `commit decode`'s
+/// field-by-field style. Reports the compaction identity plus every input
+/// identity and every part's summary and level/part_index/version.
+pub fn decode_compaction_record(bytes: &[u8]) -> anyhow::Result<()> {
+    let record = ravel_commit::record::decode_compaction(bytes)
+        .map_err(|err| anyhow::anyhow!("failed to decode compaction record: {err}"))?;
+    for line in compaction_record_lines(&record) {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The lines [`decode_compaction_record`] prints for a decoded record. A
+/// version 2 record also names the compaction record it supersedes.
+fn compaction_record_lines(record: &ravel_proto::commit::v1::CompactionRecord) -> Vec<String> {
+    let mut lines = vec![
+        format!("format_version: {}", record.format_version),
+        format!("tenant_hash: {}", hex::encode(&record.tenant_hash)),
+        format!("signal: {}", record.signal),
+        format!("shard: {}", record.shard),
+        format!("ingest_hour_bucket: {}", record.ingest_hour_bucket),
+        format!("level: {}", record.level),
+        format!("input_set_hash: {}", hex::encode(&record.input_set_hash)),
+    ];
+    if !record.superseded_record_key.is_empty() {
+        lines.push(format!(
+            "superseded_record_key: {}",
+            record.superseded_record_key
+        ));
+    }
+    lines.push(format!("created_unix_ns: {}", record.created_unix_ns));
+    lines.push(format!("inputs: {}", record.inputs.len()));
+    for input in &record.inputs {
+        lines.push(format!(
+            "  writer_id={} writer_epoch={} writer_seq={}",
+            input.writer_id, input.writer_epoch, input.writer_seq
+        ));
+    }
+    lines.push(format!("parts: {}", record.parts.len()));
+    for part in &record.parts {
+        lines.push(format!(
+            "  part_index={} first_series_id={} last_series_id={} content_hash={} \
+             object_size={} sample_count={} series_count={} run_count={} \
+             min_event_ts_ns={} max_event_ts_ns={} segment_format_version={}",
+            part.part_index,
+            hex::encode(&part.first_series_id),
+            hex::encode(&part.last_series_id),
+            hex::encode(&part.content_hash),
+            part.object_size,
+            part.sample_count,
+            part.series_count,
+            part.run_count,
+            part.min_event_ts_ns,
+            part.max_event_ts_ns,
+            part.segment_format_version,
+        ));
+    }
+    lines
+}
+
+/// Decode and print a `RetentionTombstone` (proto).
+pub fn decode_retention_tombstone(bytes: &[u8]) -> anyhow::Result<()> {
+    let tombstone = ravel_commit::record::decode_tombstone(bytes)
+        .map_err(|err| anyhow::anyhow!("failed to decode retention tombstone: {err}"))?;
+    println!("format_version: {}", tombstone.format_version);
+    println!("tenant_hash: {}", hex::encode(&tombstone.tenant_hash));
+    println!("signal: {}", tombstone.signal);
+    println!("shard: {}", tombstone.shard);
+    println!("ingest_hour_bucket: {}", tombstone.ingest_hour_bucket);
+    println!("retired_at_ns: {}", tombstone.retired_at_ns);
+    println!("retention_window_ns: {}", tombstone.retention_window_ns);
+    println!("record_count_observed: {}", tombstone.record_count_observed);
+    Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::store::StoreKind;
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_object_store::memory::MemoryStore;
+
+    /// These fixtures build their own `MemoryStore`, which is the explicit
+    /// `--store memory` case (issue #1024): an empty result stays a success.
+    const MEMORY: StoreSelection = StoreSelection::explicit(StoreKind::Memory);
+
+    /// Both CLI consumers of the supported-version window derive from the one
+    /// crate source (ADR-0066 decision 1): `audit-versions`' anomaly predicate
+    /// and `migrate`'s default target both read [`signal_supported_versions`],
+    /// itself wired to each format crate's `SUPPORTED_VERSIONS`. This pins that
+    /// wiring so the two can never drift back into independent hand-mirrored
+    /// literals: the CLI window equals the crate source for every signal, and
+    /// the migrate target equals the window's newest. A bump to any crate's
+    /// `SUPPORTED_VERSIONS` therefore moves both consumers together.
+    #[test]
+    fn cli_supported_versions_derive_from_the_crate_single_source() {
+        // Metrics -> RSEG.
+        let seg = ravel_segment::SUPPORTED_VERSIONS;
+        let w = signal_supported_versions(Signal::Metrics).expect("metrics window");
+        assert_eq!(w.newest, u32::from(seg.newest()));
+        assert_eq!(w.oldest, u32::from(seg.oldest()));
+        assert_eq!(
+            signal_current_version(Signal::Metrics).expect("metrics target"),
+            w.newest
+        );
+
+        // Logs -> RLOG.
+        let log = ravel_logseg::footer::SUPPORTED_VERSIONS;
+        let w = signal_supported_versions(Signal::Logs).expect("logs window");
+        assert_eq!(w.newest, u32::from(log.newest()));
+        assert_eq!(w.oldest, u32::from(log.oldest()));
+        assert_eq!(
+            signal_current_version(Signal::Logs).expect("logs target"),
+            w.newest
+        );
+
+        // Spans -> RSPAN.
+        let span = ravel_rspan::footer::SUPPORTED_VERSIONS;
+        let w = signal_supported_versions(Signal::Spans).expect("spans window");
+        assert_eq!(w.newest, u32::from(span.newest()));
+        assert_eq!(w.oldest, u32::from(span.oldest()));
+        assert_eq!(
+            signal_current_version(Signal::Spans).expect("spans target"),
+            w.newest
+        );
+
+        // The audit anomaly predicate is the window's `contains`: today's
+        // single-wide window flags anything but the current version, exactly
+        // like the reader gate.
+        let w = signal_supported_versions(Signal::Metrics).expect("metrics window");
+        assert!(w.contains(u32::from(seg.newest())));
+        assert!(!w.contains(u32::from(seg.newest()) + 1));
+        assert!(!w.contains(u32::from(seg.oldest()).saturating_sub(1)));
+    }
+
+    /// ADR-1331 decision 2, follow-up task 2: `migrate` prints one line per
+    /// blocked bucket naming its shard, hour and reason, and states that
+    /// re-running does not clear it.
+    ///
+    /// The exact line matters: it is what an operator reads to decide whether
+    /// to re-run, and before this the report said only `buckets_blocked: 0`
+    /// beside a straggler count that never drains. Prove-the-test: there was no
+    /// blocked-bucket line at all to assert on, so both `contains` checks fail
+    /// against the pre-change output.
+    ///
+    /// This drives `migrate_report_text`, the function `migrate` itself prints,
+    /// rather than only `blocked_bucket_report`. Two of the properties asserted
+    /// here are properties of the whole block and are invisible from the helper
+    /// alone: that every non-`blocked_bucket` line parses as `key: value`, and
+    /// that the prose sits between `buckets_blocked` and `records_migrated`
+    /// where an unprefixed sentence would be read as a key.
+    #[test]
+    fn migrate_prints_each_blocked_bucket_with_its_reason_and_how_it_clears() {
+        let report = FamilyMigrateReport {
+            buckets_examined: 9,
+            buckets_migrated: 4,
+            records_migrated: 41,
+            blocked_buckets: vec![
+                BlockedBucket {
+                    shard: 0,
+                    ingest_hour: 100,
+                    reason: BlockedReason::RewriteParts { below_target: 2 },
+                },
+                BlockedBucket {
+                    shard: 3,
+                    ingest_hour: 47,
+                    reason: BlockedReason::LoserOnlyInputs,
+                },
+            ],
+            reencode_blocked: Vec::new(),
+            not_migrated: Vec::new(),
+            cursor_advanced_to: None,
+            walk_complete: true,
+            budget_exhausted: false,
+            verification: None,
+        };
+        let printed = migrate_report_text("acme", Signal::Metrics, "rseg", 8, 0, &report);
+
+        assert!(
+            printed
+                .contains("blocked_bucket: shard=0 hour=100 reason=rewrite_parts below_target=2"),
+            "the rewrite-blocked bucket is named with its exact part count: {printed}"
+        );
+        assert!(
+            printed.contains("blocked_bucket: shard=3 hour=47 reason=loser_only_inputs"),
+            "the overlap-blocked bucket is named too: {printed}"
+        );
+        assert_eq!(
+            printed
+                .lines()
+                .filter(|line| line.starts_with("blocked_bucket:"))
+                .count(),
+            2,
+            "one line per blocked bucket, no more: {printed}"
+        );
+        assert!(
+            printed.contains("# Re-running migrate does not clear any blocked bucket"),
+            "the operator is told re-running is not the remedy: {printed}"
+        );
+        assert!(
+            printed.contains("retention ages the bucket out")
+                && printed.contains(
+                    "when a later erasure request supersedes the record at the current output \
+                     version AND a subsequent sweep removes the superseded predecessor"
+                ),
+            "and is told how a rewrite_parts block actually clears (ADR-1331 decision 3), \
+             including the sweep the superseding rewrite alone does not replace: {printed}"
+        );
+        assert!(
+            printed.contains(
+                "counts the parts of every rewrite record the bucket still LISTS, including a \
+                 predecessor a later rewrite already superseded"
+            ),
+            "below_target is over listed records, and the operator is told so rather than \
+             reading it as a live-part count: {printed}"
+        );
+        assert!(
+            printed.contains(
+                "A loser_only_inputs bucket clears only when retention ages those inputs out"
+            ),
+            "the loser-only case says what actually clears it; no later compaction does, \
+             because compaction refuses a bucket that already carries a record: {printed}"
+        );
+
+        // Every line the report emits is either a `blocked_bucket` line, a
+        // `key: value` line whose key is a single bare token, or a `# ` prose
+        // line. A prose sentence without the prefix lands in the second class
+        // and parses as a key, which is the defect the prefix removes.
+        let key_lines: Vec<&str> = printed
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect();
+        for line in &key_lines {
+            let (key, _) = line
+                .split_once(": ")
+                .unwrap_or_else(|| panic!("line is neither prose nor key: value: {line}"));
+            assert!(
+                !key.contains(' '),
+                "a `key: value` line's key must be one bare token, or the prose is being \
+                 parsed as a key: {line}"
+            );
+        }
+        assert!(
+            key_lines.contains(&"buckets_blocked: 2")
+                && key_lines.contains(&"records_migrated: 41"),
+            "the prose sits between these two and must not have displaced either: {printed}"
+        );
+
+        // Each reason's explanatory paragraph prints only when a bucket with
+        // that reason is present. Printed unconditionally, the loser-only
+        // report below carries the rewrite paragraph and the rewrite-only
+        // report carries the loser paragraph; each `assert!(!...)` below fails
+        // with `printed` naming the paragraph that leaked.
+        let rewrite_para = "A rewrite_parts bucket holds a live selective-erasure rewrite record";
+        let loser_para =
+            "A loser_only_inputs bucket clears only when retention ages those inputs out";
+
+        let loser_only = migrate_report_text(
+            "acme",
+            Signal::Metrics,
+            "rseg",
+            8,
+            0,
+            &FamilyMigrateReport {
+                blocked_buckets: vec![BlockedBucket {
+                    shard: 3,
+                    ingest_hour: 47,
+                    reason: BlockedReason::LoserOnlyInputs,
+                }],
+                ..report.clone()
+            },
+        );
+        assert!(
+            loser_only.contains(loser_para),
+            "a loser-only report keeps the loser paragraph: {loser_only}"
+        );
+        assert!(
+            !loser_only.contains(rewrite_para),
+            "a loser-only report does not carry the rewrite_parts paragraph: {loser_only}"
+        );
+
+        let rewrite_only = migrate_report_text(
+            "acme",
+            Signal::Metrics,
+            "rseg",
+            8,
+            0,
+            &FamilyMigrateReport {
+                blocked_buckets: vec![BlockedBucket {
+                    shard: 0,
+                    ingest_hour: 100,
+                    reason: BlockedReason::RewriteParts { below_target: 2 },
+                }],
+                ..report.clone()
+            },
+        );
+        assert!(
+            rewrite_only.contains(rewrite_para),
+            "a rewrite-only report keeps the rewrite paragraph: {rewrite_only}"
+        );
+        assert!(
+            !rewrite_only.contains(loser_para),
+            "a rewrite-only report does not carry the loser_only_inputs paragraph: {rewrite_only}"
+        );
+
+        let clean = FamilyMigrateReport {
+            blocked_buckets: Vec::new(),
+            ..report
+        };
+        let printed = migrate_report_text("acme", Signal::Metrics, "rseg", 8, 0, &clean);
+        assert!(
+            !printed.contains("blocked_bucket") && !printed.contains('#'),
+            "nothing blocked prints no bucket lines and no prose: {printed}"
+        );
+        assert!(
+            printed.contains("buckets_blocked: 0\nrecords_migrated: 41"),
+            "and no stray blank line between them: {printed}"
+        );
+
+        assert_eq!(
+            blocked_bucket_report(&[]),
+            "",
+            "nothing blocked prints nothing, not a blank line"
+        );
+    }
+
+    /// Every reencode_blocked and not_migrated reason prints its own line, with
+    /// its count, checkpoint or claim reason, and each comment prints only when
+    /// a bucket it explains is listed.
+    ///
+    /// Non-vacuity: delete the `if has_permanent` block in
+    /// `reencode_blocked_report` and the first `assert_eq!` fails with the
+    /// contested_overlap comment missing; swap the `Cancelled` arm's
+    /// `at.name()` for a constant and the second fails on
+    /// `checkpoint=part_boundary`.
+    #[test]
+    fn migrate_prints_every_reencode_blocked_and_not_migrated_reason() {
+        let blocked = |shard, reason| ReencodeBlockedBucket {
+            shard,
+            ingest_hour: 9,
+            reason,
+        };
+        assert_eq!(
+            reencode_blocked_report(&[
+                blocked(1, ReencodeBlockedReason::WriterDisabled { below_target: 3 }),
+                blocked(
+                    2,
+                    ReencodeBlockedReason::ContestedOverlap {
+                        largest_component: 2
+                    }
+                ),
+                blocked(3, ReencodeBlockedReason::MultipleRecords { records: 4 }),
+            ]),
+            "reencode_blocked: shard=1 hour=9 reason=writer_disabled below_target=3\n\
+             reencode_blocked: shard=2 hour=9 reason=contested_overlap largest_component=2\n\
+             reencode_blocked: shard=3 hour=9 reason=multiple_records records=4\n\
+             # A writer_disabled bucket's one compaction record holds below_target parts under \
+             the target. A run with --reencode-compaction-parts re-encodes it, once every \
+             reader and maintainer runs a build that reads version 2 compaction records.\n\
+             # A contested_overlap or multiple_records bucket is not re-encoded by any run, with \
+             or without --reencode-compaction-parts. It clears when retention ages the bucket \
+             out (subject to the format-version hold, which keeps an object this build cannot \
+             read). That is not a command you run.\n"
+        );
+        assert!(
+            !reencode_blocked_report(&[blocked(
+                1,
+                ReencodeBlockedReason::WriterDisabled { below_target: 1 }
+            )])
+            .contains("contested_overlap"),
+            "the permanent comment prints only beside a permanent reason"
+        );
+        assert_eq!(reencode_blocked_report(&[]), "");
+
+        let not_migrated = |path, reason| NotMigratedBucket {
+            shard: 0,
+            ingest_hour: 5,
+            path,
+            reason,
+        };
+        assert_eq!(
+            not_migrated_report(
+                &[
+                    not_migrated(
+                        MigrationPath::L0Migration,
+                        NotMigratedReason::ClaimSkipped {
+                            reason: ravel_maintain::ClaimSkipReason::StealLost
+                        }
+                    ),
+                    not_migrated(
+                        MigrationPath::Reencode,
+                        NotMigratedReason::Cancelled {
+                            at: ravel_maintain::Checkpoint::PartBoundary
+                        }
+                    ),
+                    not_migrated(
+                        MigrationPath::L0Migration,
+                        NotMigratedReason::RecordSetChanged
+                    ),
+                    not_migrated(MigrationPath::Reencode, NotMigratedReason::PublishAbandoned),
+                ],
+                NotMigratedRetry::NextRun
+            ),
+            "not_migrated: shard=0 hour=5 path=l0_migration reason=claim_skipped \
+             claim_reason=steal_lost\n\
+             not_migrated: shard=0 hour=5 path=reencode reason=cancelled \
+             checkpoint=part_boundary\n\
+             not_migrated: shard=0 hour=5 path=l0_migration reason=record_set_changed\n\
+             not_migrated: shard=0 hour=5 path=reencode reason=publish_abandoned\n\
+             # Each not_migrated bucket published nothing this run. This run drained the walk \
+             and cleared its cursor, so the next migrate run starts over and retries every one \
+             of them.\n"
+        );
+        assert_eq!(not_migrated_report(&[], NotMigratedRetry::NextRun), "");
+    }
+
+    /// The sentence under the not_migrated lines follows how the run ended: a
+    /// drained walk with stragglers retries them on the next run, a budget stop
+    /// on the first run after the walk drains, and a raised floor not at all.
+    ///
+    /// Non-vacuity: drop the `_ if !report.walk_complete` arm of
+    /// `NotMigratedRetry::of` and the budget-stop assertion fails with
+    /// `NextRun`; drop the `FloorRaised` arm and the raised-floor one fails.
+    #[test]
+    fn the_not_migrated_note_follows_how_the_run_ended() {
+        let budget_stop = FamilyMigrateReport {
+            budget_exhausted: true,
+            ..FamilyMigrateReport::default()
+        };
+        assert_eq!(
+            NotMigratedRetry::of(&budget_stop),
+            NotMigratedRetry::AfterTheWalkDrains
+        );
+        let raised = FamilyMigrateReport {
+            walk_complete: true,
+            verification: Some(Verification::FloorRaised { floor_version: 2 }),
+            ..FamilyMigrateReport::default()
+        };
+        assert_eq!(NotMigratedRetry::of(&raised), NotMigratedRetry::Resolved);
+        let refused = FamilyMigrateReport {
+            walk_complete: true,
+            verification: Some(Verification::Stragglers {
+                l0: 1,
+                l1: 0,
+                rewrite_parts: 0,
+                blocked: Vec::new(),
+            }),
+            ..FamilyMigrateReport::default()
+        };
+        assert_eq!(NotMigratedRetry::of(&refused), NotMigratedRetry::NextRun);
+    }
+
+    /// Each kind of bucket a migrate run can leave below the target without
+    /// raising the floor: one per `reencode_blocked` reason and a
+    /// `not_migrated` claim skip, with the line it prints.
+    fn unmigrated_buckets() -> Vec<(FamilyMigrateReport, &'static str)> {
+        let blocked = |reason| FamilyMigrateReport {
+            reencode_blocked: vec![ReencodeBlockedBucket {
+                shard: 0,
+                ingest_hour: 1,
+                reason,
+            }],
+            ..FamilyMigrateReport::default()
+        };
+        vec![
+            (
+                blocked(ReencodeBlockedReason::WriterDisabled { below_target: 1 }),
+                "reencode_blocked: shard=0 hour=1 reason=writer_disabled below_target=1\n",
+            ),
+            (
+                blocked(ReencodeBlockedReason::ContestedOverlap {
+                    largest_component: 2,
+                }),
+                "reencode_blocked: shard=0 hour=1 reason=contested_overlap largest_component=2\n",
+            ),
+            (
+                blocked(ReencodeBlockedReason::MultipleRecords { records: 2 }),
+                "reencode_blocked: shard=0 hour=1 reason=multiple_records records=2\n",
+            ),
+            (
+                FamilyMigrateReport {
+                    not_migrated: vec![NotMigratedBucket {
+                        shard: 0,
+                        ingest_hour: 1,
+                        path: MigrationPath::L0Migration,
+                        reason: NotMigratedReason::ClaimSkipped {
+                            reason: ravel_maintain::ClaimSkipReason::HeldByAnother,
+                        },
+                    }],
+                    ..FamilyMigrateReport::default()
+                },
+                "not_migrated: shard=0 hour=1 path=l0_migration reason=claim_skipped \
+                 claim_reason=held_by_another\n",
+            ),
+        ]
+    }
+
+    /// A run that stopped on its budget exits zero for every reason it can
+    /// leave a bucket below the target, and still prints the bucket's line and
+    /// the budget-stop note; a not_migrated bucket also gets the note saying it
+    /// is retried by the first run after the walk drains.
+    ///
+    /// Non-vacuity: make the `if !report.walk_complete` block of
+    /// `migrate_verdict` return an error when `reencode_blocked` holds a
+    /// contested_overlap or multiple_records bucket or `not_migrated` is
+    /// non-empty, as the earlier budget-stop verdict did, and the `expect`
+    /// fails for those three cases.
+    #[test]
+    fn a_budget_stop_exits_zero_and_prints_every_unmigrated_bucket() {
+        for (mut report, line) in unmigrated_buckets() {
+            report.budget_exhausted = true;
+            report.walk_complete = false;
+            let mut out: Vec<u8> = Vec::new();
+            migrate_verdict(&mut out, "acme", Signal::Logs, "rlog", 2, 1, &report)
+                .unwrap_or_else(|err| panic!("a budget stop exits zero for {line}: {err}"));
+            let text = String::from_utf8(out).expect("utf-8 output");
+            assert!(text.contains(line), "{line} missing from:\n{text}");
+            assert!(
+                text.contains("budget exhausted; the walk did not finish."),
+                "{text}"
+            );
+            if !report.not_migrated.is_empty() {
+                assert!(
+                    text.contains(
+                        "they are retried by the first run after the walk drains, which starts \
+                         over from the beginning."
+                    ),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    /// The run that drains the walk exits nonzero for every one of those
+    /// buckets, because the fresh re-audit counts what each still holds below
+    /// the target: a contested_overlap bucket's compaction parts, a
+    /// not_migrated L0 bucket's commit records.
+    ///
+    /// Non-vacuity: return `Ok(())` from the `Verification::Stragglers` arm of
+    /// `migrate_verdict` in place of its `anyhow::bail!` and the `expect_err`
+    /// fails for every case.
+    #[test]
+    fn the_draining_run_exits_nonzero_while_a_bucket_is_left_below_target() {
+        for (mut report, line) in unmigrated_buckets() {
+            report.walk_complete = true;
+            let (l0, l1) = if report.not_migrated.is_empty() {
+                (0, 2)
+            } else {
+                (2, 0)
+            };
+            report.verification = Some(Verification::Stragglers {
+                l0,
+                l1,
+                rewrite_parts: 0,
+                blocked: Vec::new(),
+            });
+            let mut out: Vec<u8> = Vec::new();
+            let err = migrate_verdict(&mut out, "acme", Signal::Logs, "rlog", 2, 0, &report)
+                .expect_err("the draining run fails while a bucket is below target")
+                .to_string();
+            assert!(err.contains("refused to raise the rlog floor"), "{err}");
+            let text = String::from_utf8(out).expect("utf-8 output");
+            assert!(text.contains(line), "{line} missing from:\n{text}");
+            assert!(
+                text.contains(&format!(
+                    "verification: FOUND STRAGGLERS l0_commit_records={l0} \
+                     l1_compaction_parts={l1} rewrite_record_parts=0\n"
+                )),
+                "{text}"
+            );
+        }
+    }
+
+    /// A `losing_record_parts` bucket prints its line with the exact count and
+    /// one comment line saying re-running does not clear it and retention
+    /// does, and that comment prints only when such a bucket is listed.
+    ///
+    /// Prove-the-test: before `BlockedReason::LosingRecordParts` existed there
+    /// was no line or comment to render; drop the `if has_losing_parts` block
+    /// and the first `assert_eq!` fails with the comment line missing.
+    #[test]
+    fn migrate_prints_a_losing_record_parts_bucket_and_how_it_clears() {
+        let losing = BlockedBucket {
+            shard: 2,
+            ingest_hour: 7,
+            reason: BlockedReason::LosingRecordParts { below_target: 3 },
+        };
+        assert_eq!(
+            blocked_bucket_report(std::slice::from_ref(&losing)),
+            "blocked_bucket: shard=2 hour=7 reason=losing_record_parts below_target=3\n\
+             # A losing_record_parts bucket's authoritative compaction records are at the \
+             target, but compaction records that lost their overlap still hold below_target \
+             output parts under the target. Re-running migrate does not clear it: neither \
+             migrate nor sweep \
+             reclaims a losing record's parts, and they keep counting in l1_compaction_parts. \
+             It clears when retention ages the bucket out (subject to the format-version hold, \
+             which keeps an object this build cannot read). That is not a command you run."
+        );
+
+        let loser_only = blocked_bucket_report(&[BlockedBucket {
+            shard: 3,
+            ingest_hour: 47,
+            reason: BlockedReason::LoserOnlyInputs,
+        }]);
+        assert!(
+            !loser_only.contains("losing_record_parts"),
+            "a report without such a bucket does not carry its comment: {loser_only}"
+        );
+
+        let both = blocked_bucket_report(&[
+            BlockedBucket {
+                shard: 3,
+                ingest_hour: 47,
+                reason: BlockedReason::LoserOnlyInputs,
+            },
+            losing.clone(),
+        ]);
+        assert!(
+            both.contains("That is not a command you run.\n# A losing_record_parts bucket's"),
+            "the comment starts on its own line after the loser_only_inputs one: {both}"
+        );
+
+        // Drop `has_rewrite_parts ||` from the newline condition and this
+        // fails: the comment runs on from the end of the rewrite_parts one.
+        let with_rewrite = blocked_bucket_report(&[
+            BlockedBucket {
+                shard: 0,
+                ingest_hour: 100,
+                reason: BlockedReason::RewriteParts { below_target: 2 },
+            },
+            losing,
+        ]);
+        assert!(
+            with_rewrite.contains("protection horizon.\n# A losing_record_parts bucket's"),
+            "the comment starts on its own line after the rewrite_parts one: {with_rewrite}"
+        );
+    }
+
+    /// Publish one commit record (and its data object) at `shard` for Metrics
+    /// with the given `segment_format_version`, so the version audit has a live
+    /// object to classify.
+    async fn publish_commit_at(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        shard: u32,
+        version: u32,
+    ) {
+        publish_commit_in_hour(store, tenant_hash, shard, version, 100).await;
+    }
+
+    /// [`publish_commit_at`] with the record's ingest hour (and so its
+    /// `created_unix_ns`) chosen by the caller.
+    async fn publish_commit_in_hour(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        shard: u32,
+        version: u32,
+        ingest_hour_bucket: u32,
+    ) {
+        publish_commit_created_at(
+            store,
+            tenant_hash,
+            shard,
+            version,
+            i64::from(ingest_hour_bucket) * NS_PER_HOUR,
+        )
+        .await;
+    }
+
+    /// [`publish_commit_at`] with the record's `created_unix_ns` chosen by the
+    /// caller; its ingest hour is the hour that time falls in (the commit
+    /// builder cross-checks the two). Returns the published record.
+    async fn publish_commit_created_at(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        shard: u32,
+        version: u32,
+        created_unix_ns: i64,
+    ) -> ravel_proto::commit::v1::CommitRecord {
+        let ingest_hour_bucket =
+            u32::try_from(created_unix_ns / NS_PER_HOUR).expect("hour fits u32");
+        let writer_id = Uuid::new_v4();
+        let payload = format!("seg-{shard}-{writer_id}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let commit = record::build(NewCommitRecord {
+            tenant_hash: *tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created_unix_ns,
+            max_event_ts_ns: created_unix_ns,
+            min_ingest_ts_ns: created_unix_ns,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: version,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&commit).expect("data key");
+        publish::put_data_object(store, &data_key, bytes::Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &commit, &RetryPolicy::default())
+            .await
+            .expect("publish commit record");
+        commit
+    }
+
+    /// Finding 5: the CLI `maintain audit-versions` loop must visit the
+    /// generation-aware shard range (ADR-0052 section 4), not the static
+    /// `--shards`. With an increase reshard (gen0 count 2, gen1 count 4) and a
+    /// live object in shard 3 -- outside `--shards=2` -- the audit must still
+    /// list shard 3 and surface the unsupported-version anomaly. Under the old
+    /// static `0..shards` loop shard 3 was never listed and the audit passed.
+    #[tokio::test]
+    async fn audit_versions_visits_post_reshard_shard_range() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-reshard";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        ravel_catalog::validate_or_adopt(
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Metrics,
+            2,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+        ravel_catalog::append_generation(store.as_ref(), &tenant_hash, Signal::Metrics, 4, 1, 0)
+            .await
+            .expect("append generation 1");
+
+        // An unsupported-version live object in shard 3 (reachable only under
+        // the widened count 4).
+        publish_commit_at(&store, &tenant_hash, 3, 99).await;
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 2)
+            .await
+            .expect_err("audit must visit the post-reshard shard 3 and find the anomaly");
+        assert!(
+            err.to_string().contains("unsupported version"),
+            "expected an unsupported-version anomaly, got: {err}"
+        );
+    }
+
+    /// Create a one-shard Metrics provisioning record for `tenant_hash`.
+    async fn provision_one_shard(store: &MemoryStore, tenant_hash: &TenantHash) {
+        ravel_catalog::validate_or_adopt(
+            store,
+            tenant_hash,
+            Signal::Metrics,
+            1,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("create generation 0");
+    }
+
+    /// Overwrite the Metrics provisioning record with the version-3 shape a
+    /// Release B `migrate` leaves behind (ADR-1746 decision 1): one `rseg`
+    /// floor at `floor_version` whose basis says the raising audit saw
+    /// `observed_entries` entries, the newest created at `newest_created_hour`,
+    /// over one shard.
+    async fn seed_v3_floor_with_basis(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        floor_version: u32,
+        observed_entries: u64,
+        newest_created_hour: i64,
+    ) {
+        use prost::Message;
+        use ravel_object_store::PutOptions;
+        use ravel_proto::sys::v1 as sysproto;
+
+        let key = ravel_catalog::provisioning_key(tenant_hash, Signal::Metrics);
+        let got = store.get(&key, GetRange::Full).await.expect("record");
+        let mut record =
+            sysproto::ProvisioningRecord::decode(got.data.as_ref()).expect("decode record");
+        record.format_version = 3;
+        record.format_floors = vec![sysproto::FormatFloor {
+            family: "rseg".to_string(),
+            floor_version,
+            raised_unix_ns: newest_created_hour * NS_PER_HOUR + 1,
+            raised_by: "migrate".to_string(),
+            observed_entries,
+            observed_newest_created_unix_ns: newest_created_hour * NS_PER_HOUR,
+            observed_shards: 1,
+        }];
+        store
+            .put(&key, record.encode_to_vec().into(), PutOptions::default())
+            .await
+            .expect("seed version-3 record");
+    }
+
+    fn rseg_newest() -> u32 {
+        u32::from(ravel_segment::SUPPORTED_VERSIONS.newest())
+    }
+
+    /// Classify the tenant's Metrics floors the way `audit-versions` does: one
+    /// enumeration pass over the one-shard range, then [`floor_evidence`].
+    async fn classify_now(store: &MemoryStore, tenant_hash: &TenantHash) -> Vec<ClassifiedFloor> {
+        let scan = enumerate_versions(store, tenant_hash, Signal::Metrics, 1)
+            .await
+            .expect("enumerate");
+        floor_evidence(store, tenant_hash, Signal::Metrics, 1, &scan)
+            .await
+            .expect("classify")
+    }
+
+    /// ADR-1746 follow-up 1, first acceptance case: a floor is raised, then one
+    /// commit record lands with `segment_format_version` one below the floor
+    /// and a later `created_unix_ns`. The floor is `Contradicted`, and
+    /// `audit-versions` exits nonzero on that alone: the floor sits one above
+    /// the supported RSEG version so the record itself is no anomaly.
+    #[tokio::test]
+    async fn audit_versions_reports_a_contradicted_floor_and_exits_nonzero() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-floor-contradicted";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let floor = rseg_newest() + 1;
+        ravel_catalog::raise_format_floor(
+            store.as_ref(),
+            &tenant_hash,
+            Signal::Metrics,
+            "rseg",
+            floor,
+            "migrate",
+            50 * NS_PER_HOUR,
+        )
+        .await
+        .expect("raise the floor");
+
+        publish_commit_in_hour(&store, &tenant_hash, 0, floor - 1, 100).await;
+
+        let evidence = classify_now(&store, &tenant_hash).await;
+        assert_eq!(evidence.len(), 1, "one recorded floor: {evidence:?}");
+        assert_eq!(evidence[0].floor.floor_version, floor);
+        assert_eq!(evidence[0].observed.live_below_floor, 1);
+        assert_eq!(
+            evidence[0].evidence,
+            ravel_catalog::FloorEvidence::Contradicted
+        );
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("a contradicted floor must fail the audit");
+        let msg = err.to_string();
+        assert!(msg.contains("contradicted"), "got: {msg}");
+        assert!(
+            !msg.contains("unsupported version"),
+            "the record is at a supported version, so the failure is the floor alone: {msg}"
+        );
+    }
+
+    /// ADR-1746 follow-up 1, second acceptance case: a floor with a basis, then
+    /// one commit record at the floor, created after the basis's newest
+    /// record. Nothing sits below the floor but the basis no longer covers
+    /// every record: `Stale`, and the audit passes.
+    #[tokio::test]
+    async fn audit_versions_reports_a_stale_floor_for_a_record_at_the_floor() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-floor-stale";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let floor = rseg_newest();
+        seed_v3_floor_with_basis(&store, &tenant_hash, floor, 1, 50).await;
+
+        publish_commit_in_hour(&store, &tenant_hash, 0, floor, 100).await;
+
+        let evidence = classify_now(&store, &tenant_hash).await;
+        assert_eq!(evidence.len(), 1, "one recorded floor: {evidence:?}");
+        assert_eq!(evidence[0].observed.live_below_floor, 0);
+        assert_eq!(evidence[0].evidence, ravel_catalog::FloorEvidence::Stale);
+
+        audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect("a stale floor is reported, not a failure");
+    }
+
+    /// The same record at the floor, with a basis whose newest record IS that
+    /// record: `Current`. Pins that the Stale case above is driven by the
+    /// record's creation time, not by the presence of a record.
+    #[tokio::test]
+    async fn floor_evidence_is_current_when_the_basis_covers_every_record() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-floor-current";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let floor = rseg_newest();
+        seed_v3_floor_with_basis(&store, &tenant_hash, floor, 1, 100).await;
+
+        publish_commit_in_hour(&store, &tenant_hash, 0, floor, 100).await;
+
+        let evidence = classify_now(&store, &tenant_hash).await;
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].evidence, ravel_catalog::FloorEvidence::Current);
+    }
+
+    /// The audit's own newest-`created_unix_ns` figure is what classification
+    /// runs on: the enumeration pass returns the newest record it saw.
+    #[tokio::test]
+    async fn audit_enumeration_reports_the_newest_created_unix_ns() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("cli-audit-newest").hash();
+        publish_commit_in_hour(&store, &tenant_hash, 0, rseg_newest(), 90).await;
+        publish_commit_in_hour(&store, &tenant_hash, 0, rseg_newest(), 120).await;
+        publish_commit_in_hour(&store, &tenant_hash, 0, rseg_newest(), 100).await;
+
+        let scan = enumerate_versions(store.as_ref(), &tenant_hash, Signal::Metrics, 1)
+            .await
+            .expect("enumerate");
+        assert_eq!(scan.newest_created_unix_ns(), Some(120 * NS_PER_HOUR));
+        assert_eq!(scan.hist.get(&rseg_newest()), Some(&(3, 0)));
+    }
+
+    /// PUT a compaction record over `inputs`' bucket naming each as an input,
+    /// with one part at `part_version`, created at `created_unix_ns`. No part
+    /// data object is written: the enumeration reads only records.
+    async fn put_compaction_over(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        inputs: &[&ravel_proto::commit::v1::CommitRecord],
+        created_unix_ns: i64,
+        part_version: u32,
+    ) -> String {
+        use prost::Message;
+        use ravel_object_store::PutOptions;
+        use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionPart, CompactionRecord};
+
+        let first = inputs.first().expect("at least one input");
+        let input_set_hash = vec![0x5a; 32];
+        let record = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant_hash.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: first.shard,
+            ingest_hour_bucket: first.ingest_hour_bucket,
+            level: 1,
+            inputs: inputs
+                .iter()
+                .map(|c| CompactionInputIdentity {
+                    writer_id: c.writer_id.clone(),
+                    writer_epoch: c.writer_epoch,
+                    writer_seq: c.writer_seq,
+                })
+                .collect(),
+            input_set_hash: input_set_hash.clone(),
+            parts: vec![CompactionPart {
+                part_index: 0,
+                first_series_id: vec![0u8; 16],
+                last_series_id: vec![0xff; 16],
+                content_hash: vec![0x5a; 32],
+                object_size: 4096,
+                sample_count: 1,
+                series_count: 1,
+                run_count: 1,
+                min_event_ts_ns: created_unix_ns,
+                max_event_ts_ns: created_unix_ns,
+                segment_format_version: part_version,
+                declared_column_stats: Vec::new(),
+            }],
+            created_unix_ns,
+            superseded_record_key: String::new(),
+        };
+        let hash16: String = input_set_hash[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let key = keys::compaction_record_key(
+            tenant_hash,
+            Signal::Metrics,
+            first.shard,
+            first.ingest_hour_bucket,
+            &hash16,
+        )
+        .expect("compaction record key");
+        store
+            .put(
+                &key,
+                record.encode_to_vec().into(),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put compaction record");
+        key
+    }
+
+    /// Seed one live commit record in hour 99 and a commit record in hour 100
+    /// that a compaction record created at hour 100 supersedes, all at
+    /// `version`. The superseded record was created half an hour after the
+    /// compaction record (writer clock skew), so it is the newest record the
+    /// shard lists while the compaction record is the newest live one.
+    async fn seed_live_and_unswept_superseded(
+        store: &MemoryStore,
+        tenant_hash: &TenantHash,
+        version: u32,
+    ) {
+        publish_commit_in_hour(store, tenant_hash, 0, version, 99).await;
+        let superseded = publish_commit_created_at(
+            store,
+            tenant_hash,
+            0,
+            version,
+            100 * NS_PER_HOUR + NS_PER_HOUR / 2,
+        )
+        .await;
+        put_compaction_over(
+            store,
+            tenant_hash,
+            &[&superseded],
+            100 * NS_PER_HOUR,
+            version,
+        )
+        .await;
+    }
+
+    /// Both halves of a floor observation come from the live population: a
+    /// superseded L0 commit record sweep has not reclaimed, created after every
+    /// live record, neither sits below the floor nor makes a floor whose basis
+    /// covers the live population `Stale`.
+    #[tokio::test]
+    async fn floor_evidence_ignores_an_unswept_superseded_record_newer_than_the_basis() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-floor-superseded";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let floor = rseg_newest();
+        // The live population: one L0 record and one compaction part, the
+        // newest created at hour 100.
+        seed_v3_floor_with_basis(&store, &tenant_hash, floor, 2, 100).await;
+        seed_live_and_unswept_superseded(&store, &tenant_hash, floor).await;
+
+        let evidence = classify_now(&store, &tenant_hash).await;
+        assert_eq!(evidence.len(), 1, "one recorded floor: {evidence:?}");
+        assert_eq!(evidence[0].observed.live_below_floor, 0);
+        assert_eq!(
+            evidence[0].observed.newest_created_unix_ns,
+            Some(100 * NS_PER_HOUR),
+            "the newest live record is the compaction record, not the superseded commit"
+        );
+        assert_eq!(evidence[0].evidence, ravel_catalog::FloorEvidence::Current);
+    }
+
+    /// LIST and GET calls one `audit-versions` run issues against a tenant with
+    /// one shard of Metrics data and `floor_versions` recorded as `rseg`
+    /// floors, counted by the store's own instrumentation.
+    async fn audit_requests_with_floors(floor_versions: &[u32]) -> (u64, u64) {
+        use ravel_object_store::InstrumentedStore;
+
+        let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let tenant = "cli-audit-floor-requests";
+        let tenant_hash = TenantId::new(tenant).hash();
+        let mem = store.inner();
+        provision_one_shard(mem, &tenant_hash).await;
+        for (i, version) in (0i64..).zip(floor_versions) {
+            ravel_catalog::raise_format_floor(
+                mem,
+                &tenant_hash,
+                Signal::Metrics,
+                "rseg",
+                *version,
+                "migrate",
+                (50 + i) * NS_PER_HOUR,
+            )
+            .await
+            .expect("raise the floor");
+        }
+        seed_live_and_unswept_superseded(mem, &tenant_hash, rseg_newest()).await;
+
+        let before = store.metrics().snapshot();
+        audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect("no floor is contradicted and every record is supported");
+        let after = store.metrics().snapshot();
+        (
+            after.list_calls() - before.list_calls(),
+            after.get.calls - before.get.calls,
+        )
+    }
+
+    /// `audit-versions` enumerates each signal's commit family once however
+    /// many floors are recorded: three floors on one signal cost exactly the
+    /// requests one floor does.
+    #[tokio::test]
+    async fn audit_versions_request_count_does_not_grow_with_recorded_floors() {
+        let newest = rseg_newest();
+        assert!(newest >= 3, "three distinct floors at or below {newest}");
+        // One shard listing per signal; per signal one generation read and one
+        // floor read of the provisioning record, plus the three Metrics
+        // records (two commit records and the compaction record), each read
+        // once.
+        const LISTS: u64 = 3;
+        const GETS: u64 = 3 + 3 + 3;
+        let one = audit_requests_with_floors(&[newest]).await;
+        let three = audit_requests_with_floors(&[newest - 2, newest - 1, newest]).await;
+        assert_eq!(one, (LISTS, GETS), "one floor: (LIST, GET)");
+        assert_eq!(three, (LISTS, GETS), "three floors: (LIST, GET)");
+    }
+
+    /// `audit-versions` over a commit record whose stored bytes do not decode
+    /// fails naming that record's key, so the operator can find the object.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_an_undecodable_commit_record() {
+        use ravel_object_store::PutOptions;
+
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-audit-corrupt-commit";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&store, &tenant_hash).await;
+        let commit =
+            publish_commit_created_at(&store, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = keys::commit_key_for_record(&commit).expect("commit key");
+        store
+            .put(
+                &key,
+                bytes::Bytes::from_static(b"not a commit record"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite the commit record with undecodable bytes");
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("an undecodable commit record must fail the audit");
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(
+            msg.contains("is corrupt during format census"),
+            "got: {msg}"
+        );
+    }
+
+    /// `audit-versions` over a commit record deleted between the LIST and its
+    /// GET fails naming that record's key and saying it is no longer present.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_a_commit_record_gone_after_the_list() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let mem = MemoryStore::new();
+        let tenant = "cli-audit-vanished-commit";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&mem, &tenant_hash).await;
+        let commit =
+            publish_commit_created_at(&mem, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = keys::commit_key_for_record(&commit).expect("commit key");
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(&key));
+        let store = Arc::new(FaultStore::new(mem, plan));
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("a commit record gone after the listing must fail the audit");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the record's GET must have been faulted exactly once"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(msg.contains("no longer present"), "got: {msg}");
+    }
+
+    /// `audit-versions` over a compaction record deleted between the LIST and
+    /// its GET fails naming that record's key, the same as a commit record.
+    #[tokio::test]
+    async fn audit_versions_names_the_key_of_a_compaction_record_gone_after_the_list() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let mem = MemoryStore::new();
+        let tenant = "cli-audit-vanished-compaction";
+        let tenant_hash = TenantId::new(tenant).hash();
+        provision_one_shard(&mem, &tenant_hash).await;
+        let input =
+            publish_commit_created_at(&mem, &tenant_hash, 0, rseg_newest(), 100 * NS_PER_HOUR)
+                .await;
+        let key = put_compaction_over(
+            &mem,
+            &tenant_hash,
+            &[&input],
+            100 * NS_PER_HOUR,
+            rseg_newest(),
+        )
+        .await;
+        let plan = FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::NotFoundBlip).with_key_contains(&key));
+        let store = Arc::new(FaultStore::new(mem, plan));
+
+        let err = audit_versions(store.clone(), MEMORY, tenant, 1)
+            .await
+            .expect_err("a compaction record gone after the listing must fail the audit");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::NotFoundBlip),
+            1,
+            "the record's GET must have been faulted exactly once"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains(&key), "error must name {key}: {msg}");
+        assert!(msg.contains("compaction record"), "got: {msg}");
+        assert!(msg.contains("no longer present"), "got: {msg}");
+    }
+
+    const NS_PER_HOUR: i64 = 3_600_000_000_000;
+    const ARN: &str = "arn:aws:kms:us-east-1:111122223333:key/aaaaaaaa";
+
+    /// verify-custody's key-epoch check passes clean when every live object's
+    /// write time falls inside a recorded epoch. The object is written at hour
+    /// 100 (publish_commit_at's fixed created_unix_ns) and the tenant's epoch 0
+    /// activated at hour 50, so the write time locates in exactly one epoch.
+    #[tokio::test]
+    async fn verify_custody_epoch_check_passes_when_object_inside_epoch() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-custody-epoch-ok";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        publish_commit_at(&store, &tenant_hash, 0, 6).await;
+        ravel_catalog::record_key_epoch(store.as_ref(), &tenant_hash, ARN, 50 * NS_PER_HOUR, 0)
+            .await
+            .expect("record epoch 0 activated before the object's write time");
+
+        verify_custody(store.clone(), MEMORY, tenant, 1, false)
+            .await
+            .expect("every object's write time is inside a recorded epoch");
+    }
+
+    /// verify-custody flags an object written before the tenant's first
+    /// recorded epoch as a distinct key-epoch anomaly, counted separately from
+    /// content-hash mismatches (of which there are none: the object's content
+    /// still matches its key). Object at hour 100, epoch 0 activated at hour
+    /// 200: the write time predates every recorded epoch.
+    #[tokio::test]
+    async fn verify_custody_epoch_check_flags_object_before_first_epoch() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-custody-epoch-anomaly";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        publish_commit_at(&store, &tenant_hash, 0, 6).await;
+        ravel_catalog::record_key_epoch(store.as_ref(), &tenant_hash, ARN, 200 * NS_PER_HOUR, 0)
+            .await
+            .expect("record epoch 0 activated after the object's write time");
+
+        let err = verify_custody(store.clone(), MEMORY, tenant, 1, false)
+            .await
+            .expect_err("an object predating the first epoch must be a custody anomaly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("1 key-epoch inconsistency"),
+            "the epoch anomaly must be counted: {msg}"
+        );
+        assert!(
+            msg.contains("0 content-hash mismatch"),
+            "the epoch anomaly must be counted separately from content mismatches: {msg}"
+        );
+    }
+
+    /// With no `t/<hash>/enc` record, verify-custody runs its content checks and
+    /// skips the epoch check entirely (the tenant used the deployment default
+    /// key), so a clean object passes.
+    #[tokio::test]
+    async fn verify_custody_no_epoch_record_skips_epoch_check() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = "cli-custody-no-epoch";
+        let tenant_hash = TenantId::new(tenant).hash();
+
+        publish_commit_at(&store, &tenant_hash, 0, 6).await;
+
+        verify_custody(store.clone(), MEMORY, tenant, 1, false)
+            .await
+            .expect("no epoch record means no epoch check; the object passes clean");
+    }
+
+    /// The versioning-aware recoverable-prior-version anomaly (ADR-0064 §7,
+    /// S4-12) fires only on a versioned bucket that actually holds a noncurrent
+    /// version. A noncurrent version exists only on a versioned bucket, so a
+    /// nonzero count is proof of both conditions. When the source cannot
+    /// enumerate versions (the production trait-contract default) or holds none,
+    /// no anomaly fires.
+    #[tokio::test]
+    async fn versioning_aware_recoverable_prior_version_fires_only_when_present() {
+        use ravel_object_store::StoreError;
+        use ravel_object_store::conformance::{
+            NoncurrentVersion, NoncurrentVersionListing, NoncurrentVersionSource,
+        };
+
+        struct Fixture(NoncurrentVersionListing);
+
+        #[async_trait::async_trait]
+        impl NoncurrentVersionSource for Fixture {
+            async fn list_noncurrent_versions(
+                &self,
+                _prefix: &str,
+            ) -> Result<NoncurrentVersionListing, StoreError> {
+                Ok(self.0.clone())
+            }
+        }
+
+        // A versioned bucket with an actual noncurrent version present: the
+        // anomaly fires (count 1).
+        let present = Fixture(NoncurrentVersionListing {
+            supported: true,
+            versions: vec![NoncurrentVersion {
+                key: "t/ab/m/l0/0000/obj.rseg".to_string(),
+                version_id: "v-prior-1".to_string(),
+            }],
+        });
+        let report = check_noncurrent_versions(&present, "t/ab/")
+            .await
+            .expect("check runs");
+        assert!(report.supported);
+        assert_eq!(
+            report.recoverable_versions, 1,
+            "a present noncurrent version must fire the anomaly"
+        );
+
+        // A versioned bucket with no noncurrent versions: no anomaly.
+        let clean = Fixture(NoncurrentVersionListing {
+            supported: true,
+            versions: vec![],
+        });
+        let report = check_noncurrent_versions(&clean, "t/ab/")
+            .await
+            .expect("check runs");
+        assert!(report.supported);
+        assert_eq!(
+            report.recoverable_versions, 0,
+            "no noncurrent version means no anomaly"
+        );
+
+        // A backend that cannot enumerate versions (production default): an
+        // honest gap, not an anomaly.
+        let store = MemoryStore::new();
+        let report = check_noncurrent_versions(&store as &dyn ObjectStoreBackend, "t/ab/")
+            .await
+            .expect("check runs");
+        assert!(
+            !report.supported,
+            "the trait-contract default cannot enumerate versions"
+        );
+        assert_eq!(report.recoverable_versions, 0);
+    }
+
+    /// The `maintain inspect` decode path refuses a compaction record stamped a
+    /// future `format_version` (ADR-0066 decision 2), rather than printing it as
+    /// a version-1 record. Routing the bytes back through the raw prost
+    /// `Message::decode` (the pre-fix path) makes this test fail: the record
+    /// decodes silently and the call returns `Ok`.
+    #[test]
+    fn inspect_refuses_a_future_version_compaction_record() {
+        let record = ravel_proto::commit::v1::CompactionRecord {
+            format_version: 3,
+            tenant_hash: vec![0u8; 16],
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            input_set_hash: vec![0x44; 32],
+            ..Default::default()
+        };
+        let bytes = record::encode_compaction(&record);
+        let err = decode_compaction_record(bytes.as_ref())
+            .expect_err("a version-3 compaction record must be refused, not printed as v1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compaction record")
+                && msg.contains("format_version")
+                && msg.contains('3'),
+            "the error names the record kind, the gate, and the version seen: {msg}"
+        );
+    }
+
+    /// `maintain inspect` names the record a version 2 compaction record
+    /// supersedes, beside its `format_version`, and prints no such line for a
+    /// version 1 record.
+    #[test]
+    fn inspect_prints_a_version_2_compaction_records_superseded_key() {
+        use ravel_proto::commit::v1::{CompactionInputIdentity, CompactionRecord};
+
+        let tenant = TenantHash([0x3c; 16]);
+        let inputs = vec![CompactionInputIdentity {
+            writer_id: Uuid::from_u128(7).to_string(),
+            writer_epoch: 1,
+            writer_seq: 1,
+        }];
+        let v1_hash = ravel_commit::erasure::compute_compaction_input_set_hash(&inputs);
+        let predecessor = keys::compaction_record_key(
+            &tenant,
+            Signal::Metrics,
+            0,
+            5,
+            &hex::encode(&v1_hash[..8]),
+        )
+        .expect("predecessor key");
+        let v1 = CompactionRecord {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 5,
+            level: 1,
+            inputs: inputs.clone(),
+            input_set_hash: v1_hash.to_vec(),
+            ..Default::default()
+        };
+        let v2 = CompactionRecord {
+            format_version: 2,
+            input_set_hash: ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+                &inputs,
+                &predecessor,
+            )
+            .to_vec(),
+            superseded_record_key: predecessor.clone(),
+            ..v1.clone()
+        };
+        let decoded = record::decode_compaction(record::encode_compaction(&v2).as_ref())
+            .expect("the fixture is a valid version 2 record");
+        let lines = compaction_record_lines(&decoded);
+        assert!(lines.iter().any(|l| l == "format_version: 2"), "{lines:?}");
+        let expected = format!("superseded_record_key: {predecessor}");
+        assert_eq!(
+            lines.iter().filter(|l| **l == expected).count(),
+            1,
+            "{lines:?}"
+        );
+
+        let lines = compaction_record_lines(&v1);
+        assert!(lines.iter().any(|l| l == "format_version: 1"), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.starts_with("superseded_record_key")),
+            "{lines:?}"
+        );
+    }
+
+    /// The `maintain inspect` decode path refuses a retention tombstone stamped
+    /// a future `format_version`. Same raw-prost-decode failure argument as the
+    /// compaction case.
+    #[test]
+    fn inspect_refuses_a_future_version_tombstone() {
+        let tombstone = ravel_proto::commit::v1::RetentionTombstone {
+            format_version: 2,
+            tenant_hash: vec![0u8; 16],
+            signal: ravel_commit::signal::to_proto(Signal::Metrics) as i32,
+            shard: 0,
+            ingest_hour_bucket: 1,
+            retired_at_ns: 1,
+            retention_window_ns: 1,
+            record_count_observed: 0,
+        };
+        let bytes = record::encode_tombstone(&tombstone);
+        let err = decode_retention_tombstone(bytes.as_ref())
+            .expect_err("a version-2 tombstone must be refused, not printed as v1");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retention tombstone")
+                && msg.contains("format_version")
+                && msg.contains('2'),
+            "the error names the record kind, the gate, and the version seen: {msg}"
+        );
+    }
+}

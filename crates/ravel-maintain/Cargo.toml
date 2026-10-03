@@ -1,0 +1,39 @@
+[package]
+name = "ravel-maintain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-fleet = { workspace = true }
+ravel-object-store = { workspace = true }
+ravel-segment = { workspace = true }
+ravel-logseg = { workspace = true }
+ravel-rspan = { workspace = true }
+ravel-catalog = { workspace = true }
+ravel-commit = { workspace = true }
+ravel-ingest = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }
+crc32c = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+ravel-segment = { workspace = true }
+# test-util for `#[tokio::test(start_paused = true)]`: the write-budget
+# deadline tests race a held PUT against a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

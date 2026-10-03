@@ -1,0 +1,123 @@
+{
+  "version": 1,
+  "seed": 927000933,
+  "generator": {
+    "scaling_label": "instance",
+    "scaling_label_value_prefix": "metricsbench-instance-",
+    "classic_histogram_bounds": [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5],
+    "native_histogram_schema": 2,
+    "native_histogram_buckets": 8,
+    "absent_metric_name": "metricsbench_absent_metric",
+    "anomalies": {
+      "missing_sample_one_in": 500,
+      "stale_marker_one_in": 900,
+      "counter_reset_one_in": 1200,
+      "out_of_order_one_in": 800
+    }
+  },
+  "label_dimensions": [
+    {
+      "name": "job",
+      "values": [
+        "metricsbench-api",
+        "metricsbench-web",
+        "metricsbench-worker",
+        "metricsbench-db"
+      ]
+    },
+    {
+      "name": "region",
+      "values": ["eu-west-1", "us-east-1", "ap-south-1"]
+    },
+    {
+      "name": "method",
+      "values": ["GET", "POST", "PUT", "DELETE"]
+    },
+    {
+      "name": "status",
+      "values": ["200", "204", "404", "500"]
+    },
+    {
+      "name": "version",
+      "values": ["1.24.0", "1.25.0"]
+    }
+  ],
+  "families": [
+    {
+      "name": "metricsbench_gauge_cpu_percent",
+      "kind": "gauge",
+      "labels": ["job", "region"],
+      "series_permille": 400
+    },
+    {
+      "name": "metricsbench_requests_total",
+      "kind": "counter",
+      "labels": ["job", "method", "status"],
+      "series_permille": 300
+    },
+    {
+      "name": "metricsbench_request_duration_seconds",
+      "kind": "classic_histogram",
+      "labels": ["job"],
+      "series_permille": 150
+    },
+    {
+      "name": "metricsbench_latency_native",
+      "kind": "native_histogram",
+      "labels": ["job"],
+      "series_permille": 100
+    },
+    {
+      "name": "metricsbench_build_info",
+      "kind": "gauge",
+      "labels": ["job", "version"],
+      "series_permille": 50
+    }
+  ],
+  "profiles": [
+    {
+      "name": "cardinality",
+      "active_series": 1000000,
+      "samples_per_series": 360,
+      "scrape_interval_secs": 15,
+      "duration_secs": 5400,
+      "churn_basis_points_per_hour": 0,
+      "total_samples": 360000000,
+      "comparability": "comparable"
+    },
+    {
+      "name": "history",
+      "active_series": 10000,
+      "samples_per_series": 172800,
+      "scrape_interval_secs": 15,
+      "duration_secs": 2592000,
+      "churn_basis_points_per_hour": 0,
+      "total_samples": 1728000000,
+      "comparability": "comparable"
+    },
+    {
+      "name": "churn",
+      "active_series": 50000,
+      "samples_per_series": 8640,
+      "scrape_interval_secs": 15,
+      "duration_secs": 129600,
+      "churn_basis_points_per_hour": 2000,
+      "total_samples": 432000000,
+      "comparability": "comparable"
+    },
+    {
+      "name": "ci",
+      "active_series": 1000,
+      "samples_per_series": 120,
+      "scrape_interval_secs": 15,
+      "duration_secs": 1800,
+      "churn_basis_points_per_hour": 0,
+      "total_samples": 120000,
+      "comparability": {
+        "non_comparable": {
+          "reason": "1,000 series over 30 minutes exercises the same code paths as the three measured profiles and measures none of them: it is sized to fit a CI job, not a workload. ADR-0927 decision 11 forbids presenting it as a performance result, and this field is why a reader that loads the artifact can refuse to publish it rather than having to know the rule."
+        }
+      }
+    }
+  ]
+}

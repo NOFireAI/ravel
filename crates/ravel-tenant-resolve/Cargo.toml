@@ -1,0 +1,32 @@
+[package]
+name = "ravel-tenant-resolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# OIDC tenant resolution (ADR-0042 decision 6): JWT validation and the JWKS
+# fetch behind OidcResolver/OidcJwksCache.
+jsonwebtoken = { workspace = true }
+reqwest = { workspace = true }
+# Constant-secrecy bearer-token lookup: configured tokens are stored only as a
+# keyed BLAKE3 hash under a process-local key, mirroring ravel-catalog's
+# auth_token_map, so a raw token is never held or compared in the clear.
+blake3 = { workspace = true }
+# The process-local hash key StaticBearerTokenResolver generates from two v4
+# UUIDs (getrandom entropy) at construction.
+uuid = { workspace = true }
+
+[dev-dependencies]
+# The OIDC resolver tests base64url-encode key material into JWK fields and
+# reuse a public key's own bytes as an HMAC secret for the algorithm-confusion
+# regression tests. No network, no keypair generation.
+base64 = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,1506 @@
+# RLOG: Ravel Log Segment Format
+
+Persistent contract (ADR-0029). Any change bumps the trailer version. The
+current trailer version is 5 (ADR-2135 added the footer's sort descriptor and
+clustering generation, put the covered-column list, under its own crc32c, at
+the head of BLOOM, sized bloom filters to a multiple of 512 bits, and
+registered encoding tags 10 to 13). It is the only version any reader
+accepts: the version-4 reader was deleted in the same change, as ADR-0892
+deleted the version-3 reader, and
+version 2 (which added the footer's compaction-identity fields) and version 1
+(the format-only initial release) were retired the same way before it.
+
+<!-- reader-supported-versions: ravel_logseg = 5 -->
+<!-- Checked against ravel_logseg::footer::SUPPORTED_VERSIONS by
+     scripts/check_format_version_docs.py; keep it in step with the current
+     trailer version above when the reader window changes. -->
+
+**Upgrade and rollback posture at HEAD.** A trailer-version bump is a
+non-rollbackable, forward-only data-migration event: the reader admits exactly
+one version, so once any object at the new version exists, a build that predates
+the bump cannot read it: it fails closed with a typed `UnsupportedVersion`, and
+retention's version hold declines to delete it but cannot make it readable
+(ADR-0531, 2026-09-27 amendment). A tombstoned bucket holding such an object is
+kept past its retention window rather than swept, and is retired by the first
+pass of a build that reads the version. The irreversible step is the first write
+at the new version; before it, a rollback to the earlier build is safe. The
+N/N-1 window described below is staged for the v1.0 release: ADR-0531 fixes the
+format-lifecycle activation milestone at v1.0, which is distinct from the
+software's first public release at 0.9.0 and has not shipped. Before v1.0 a
+trailer-version bump may break backward compatibility outright.
+
+RLOG is the one format with a released two-version reader behind it, so read
+the paragraph above as the posture at HEAD and not as a description of every
+bump this format has had. 0.11.0 shipped a reader accepting v3 and v4 while
+writers emitted v4, and a v3 store upgrading to 0.11.0 kept its objects
+readable. ADR-0892 closed that window in 0.12.0 and characterises it as an
+unretired predecessor reader rather than an N/N-1 policy in force. The
+irreversible boundary for a v3 store was 0.11.0 to 0.12.0, not 0.10.x to
+0.11.0.
+
+Version 5 changed two byte layouts: the BLOOM section gained its
+covered-column list, and filters are no longer rounded to a power of two, so
+the version-4 BLOOM parser would misread a version-5 section. The footer gained
+two fields (`sort_descriptor`, `clustering_generation`). By default the writer
+at version 5 records no sort descriptor and generation 0, covers every column
+version 4 indexed, and emits tags 10 to 13. It chooses each page's encoding
+by stored size, and stores a string column chunk on one row-group dictionary
+(tags 12 and 13) when that is strictly smaller (see "Encodings (tag
+registry)" and "Row-group string dictionaries"). A version-4 object is
+refused with `UnsupportedVersion` from the
+trailer alone, before the footer or any section is requested. Under the
+pre-v1.0 posture below, a development store holding version-4 objects is wiped
+or re-ingested.
+
+Version 4 changed the BLOCKS layout, deleted the per-block header, and
+redefined the SKIP_IDX level-0 block crc, so it was a versioned change rather
+than the additive kind ADR-0029's carve-out excepts -- whatever PAGE_DIR's own
+kind number would imply on its own. Since version 4 every object carries a
+PAGE_DIR section, and one that does not is refused.
+
+Version 3 changed no byte layout: it changed which value a `NumStat` bounds
+(see "SKIP_IDX" below). Nothing in the bytes distinguishes a v2 stat from a v3
+one, which is exactly why the trailer version moved rather than a section-local
+one. v2 read and write support was deleted in the same change that introduced
+v3.
+
+**Version lifecycle and migration (ADR-0066, normative).** RLOG is a Class A
+bulk data-object format. The supported-version window is single-sourced as
+`ravel_logseg::footer::SUPPORTED_VERSIONS`; the writer, reader gate,
+`audit-versions`, `migrate`, and the compactor's output-version constant all
+read it. Until the v1.0 release (ADR-0531: the format-lifecycle activation
+milestone is v1.0, distinct from the software's 0.9.0 first public release and
+not yet shipped) the window holds exactly one version (ADR-0027 decision 7,
+ADR-0892): a bump deletes
+the previous version's reader, and a pre-1.0.0 development store holding older
+objects is wiped or re-ingested. RLOG v3 to v4 in 0.11.0 is the one bump that
+did not do this in the same change; ADR-0892 removed the v3 reader in 0.12.0
+instead. The N/N-1 window ADR-0066 describes, rolled out readers-before-writers
+-- a release writing N+1 requires a fleet already reading N+1 -- opens at, and
+only at, v1.0.
+
+RLOG compaction already decodes every input's records and re-encodes them from
+scratch, so once the window is two versions wide an old-version object is
+migrated forward by the normal compaction and `maintain migrate` paths with no
+special page-copy carve-out; retention also ages old objects out. The migrate
+job verifies and raises the per-(tenant, signal) format floor, and N-1 read
+support is deleted only once every bucket's floor is >= N, citing those floors.
+`audit-versions` reports the mix.
+
+Parsers treat every offset, length, count, and tag read from stored bytes
+as untrusted input: bounds-check everything, overflow-check every
+accumulation, fuzz all decoders. No `unsafe`. Every violation is a typed
+`Corrupted` error, never a panic and never wrong data.
+
+RLOG is a sibling of RSEG (docs/segment-format.md), not an amendment: it
+copies RSEG's conventions (16-byte trailer, protobuf footer, crc32c
+discipline, suffix-GET reader protocol) and shares none of its bytes. All
+integers are little-endian. "varint" means protobuf-style LEB128;
+"ivarint" means a signed value zigzag-mapped then LEB128-encoded. A
+canonical LEB128 varint is at most 10 bytes and readers reject overlong
+encodings.
+
+## Object layout
+
+```
++---------------------------------------------------+
+| STREAM_DIR   stream directory                     |  kind 1
+| FIELD_DIR    field directory                      |  kind 2
+| BLOCKS       row blocks (column pages)            |  kind 3
+| SKIP_IDX     multi-level min/max index            |  kind 4
+| PAGE_DIR     per row group, per column chunk,     |  kind 8
+|              per page: offset/len/enc/comp/crc    |
+| BLOOM        per-block token blooms               |  kind 5
+| POSTINGS     per-field term -> block postings     |  kind 6 (optional)
+| footer: LogFooter protobuf bytes                  |
+| trailer (16 bytes):                               |
+|   footer_len:   u32                               |
+|   footer_crc32c:u32                               |
+|   version:      u16   (= 5)                       |
+|   signal:       u8    (2 = logs)                  |
+|   reserved:     u8    (= 0)                       |
+|   magic:        [u8;4] = "RLG1"                   |
++---------------------------------------------------+
+```
+
+Writers emit the sections physically in the order shown above (PAGE_DIR
+between SKIP_IDX and BLOOM, not in kind order); readers rely only on the
+footer's section offsets, never on adjacency or on kind order. Bytes between
+sections are permitted and MUST be `0x00`; readers never interpret them.
+
+`footer_crc32c` is computed over: the `LogFooter` bytes, then `footer_len`
+(u32 LE), `version` (u16 LE), `signal`, `reserved`, `magic`. Every
+trailer byte except the crc field itself is covered (ADR-0010 §4).
+
+## Reader protocol
+
+Identical in shape to RSEG v1:
+
+1. Reject objects smaller than 16 bytes as `Corrupted`.
+2. Suffix-GET the object's tail (or the whole object if smaller). Verify
+   `magic`, `version`, `signal`, `reserved`. The suffix length is a reader
+   choice, not a format constant: it should cover the footer and whatever tail
+   sections the reader is about to need, and a reader that guesses short
+   pays for it with step 3's extra ranged GET. `ravel-query`'s log fetcher
+   probes 256 KiB, sized so that one probe carries the footer, SKIP_IDX and
+   PAGE_DIR past the BLOOM section that sits between them (ADR-0699
+   decision 5).
+3. Require `footer_len > 0` and `16 + footer_len <= total_size`;
+   otherwise `Corrupted`. If the suffix did not cover the footer, issue
+   one more ranged GET.
+4. Verify `footer_crc32c` (over the bytes defined above) before decoding
+   the footer.
+
+## LogFooter
+
+Defined in `proto/ravel/logseg.proto` (`ravel.logseg.v1.LogFooter`).
+Field numbers are frozen; only additive changes with new field numbers
+are permitted.
+
+- identity: `tenant_hash` (16 bytes), `shard`, `writer_id` (16 bytes),
+  `writer_epoch`, `writer_seq`. These MUST match the commit record the
+  reader resolved the object from (ADR-0010 §7).
+- summary (skip index level 2): `min_ts_ns`, `max_ts_ns`,
+  `min_observed_ts_ns`, `max_observed_ts_ns`, `record_count`,
+  `block_count`, `stream_count`.
+- `sections`: repeated `Section { kind, offset, len, crc32c, comp
+  (0=none, 2=zstd), uncompressed_len }`.
+- compaction identity (ADR-0032, field numbers 14-16, added in trailer
+  version 2): `level` (uint32, 0 = L0 flush object, 1 = L1 compacted
+  part), `input_set_hash` (bytes, over the sorted input list, same
+  canonical convention as RSEG), `part_index` (uint32, part ordinal
+  within one compaction output). RLOG carries no
+  `base_created_unix_ns`-equivalent: unlike RSEG it has no cross-writer
+  record dedup that needs a recovered per-run creation time (retry
+  duplicates are structurally impossible at the RLOG write path).
+- row order (ADR-2135 decision 2, field numbers 17-18, added in trailer
+  version 5): `sort_descriptor` (optional `SortDescriptor { bucket_width,
+  key_columns }`) and `clustering_generation` (uint64). An absent descriptor
+  means the default `(stream_ref, ts)` order. A present one orders rows by
+  `(stream_ref, ts.div_euclid(bucket), key_1, ..., key_n, ts)`, with
+  `bucket_width` one of 1 hour, 6 hours, 1 day and one to four key columns,
+  each a name and a type (str, i64, bool, bytes). `clustering_generation` is
+  the tenant clustering generation the object was written under: 0 means the
+  tenant never set a key, and a cleared key leaves the descriptor absent with
+  a nonzero generation. The writer records the descriptor and generation its
+  caller passes to `RlogWriter::with_sort_descriptor`, and no descriptor and
+  generation 0 when the caller passes none; see "BLOCKS" for the order it
+  writes and the descriptors it refuses.
+- unknown section kinds MUST be skipped by readers (forward
+  compatibility).
+
+An **L0 flush object** (one object per writer flush, emitted by the
+ingest log shard via `RlogWriter::finish`) stamps the compaction-identity
+fields at their sentinels explicitly: `level = 0`, `input_set_hash`
+empty, `part_index = 0`. An **L1 compacted part** is emitted by the
+compactor (`ravel-maintain`) via `RlogWriter::finish_compacted`, which
+runs the identical section-building pipeline as `finish` and stamps
+`level = 1`, the compaction's `input_set_hash`, and the part's
+`part_index` (see "Compaction (L0 → L1)" below). These three fields live
+inside the protobuf-encoded `LogFooter` and are therefore already covered
+end to end by `footer_crc32c` (verified before the footer is decoded);
+they need no separate checksum.
+
+Validation (all violations `Corrupted`, never panics):
+
+- At most one section per known kind. All five v1 kinds
+  (STREAM_DIR, FIELD_DIR, BLOCKS, SKIP_IDX, BLOOM) are mandatory. PAGE_DIR
+  (kind 8, ADR-0699) is mandatory.
+  POSTINGS (kind 6, ADR-0049) is optional: present only when the writer was
+  given one or more indexed field names (`RlogWriter::with_indexed_fields`);
+  absence is legal and never treated as corruption.
+- Every section `[offset, offset+len)` lies within
+  `[0, total_size - 16 - footer_len)`, with overflow-checked arithmetic.
+- `uncompressed_len` is capped by config (default 1 GiB per section) and
+  the decompressed length must equal it exactly.
+- A present `sort_descriptor` with `clustering_generation` 0, an unspecified
+  or unknown `bucket_width`, a key column count outside 1..=4, a key column
+  with an unspecified or unknown type, a key column with an empty name, or
+  two key columns with the same name (whatever their types).
+
+### Section kinds
+
+| kind | name | content | comp |
+|---|---|---|---|
+| 1 | STREAM_DIR | stream_id -> canonical resource+scope blob, block range | zstd |
+| 2 | FIELD_DIR | field name+type -> column id, stats | zstd |
+| 3 | BLOCKS | row blocks, per-column pages | none (per-page) |
+| 4 | SKIP_IDX | skip index levels 0 and 1 | zstd |
+| 5 | BLOOM | per-block token bloom filters | none (per-entry) |
+| 6 | POSTINGS | per-field term -> block-index postings (optional) | none (per-block, zstd inside) |
+| 7 | GRAM_IDX | reserved (ADR-0105, not implemented) | - |
+| 8 | PAGE_DIR | per row group, per column chunk, per page: offset, length, enc/comp, crc32c | zstd |
+
+STREAM_DIR, FIELD_DIR, and SKIP_IDX are compressed as whole sections
+(zstd level 3 default) and always read whole. BLOCKS, BLOOM, and
+POSTINGS are containers: not compressed as a unit, their entries
+individually addressable so one block, one bloom entry, or one term
+block is readable alone.
+
+## STREAM_DIR (uncompressed form)
+
+```
+count: u32
+count entries, sorted ascending by stream_id (16 bytes):
+  stream_id:  [u8;16]
+  blob_len:   varint
+  blob:       blob_len bytes, the stream-identity preimage (below)
+  first_blk:  varint   } block range containing
+  last_blk:   varint   } this stream's records
+```
+
+The `stream_ref` used everywhere else is the entry's ordinal (0-based).
+Sorting by `stream_id` makes lookup a binary search and makes the
+directory mergeable at compaction with a linear pass. Readers reject a
+non-ascending sequence and an entry count exceeding the configured cap.
+
+### The identity blob
+
+`blob` is exactly the byte string that `stream_id` is the hash of, minus
+the domain string, in this concatenation order:
+
+```
+canonical(resource_attrs)         self-delimiting: leading entry count
+varint(len(scope_name))    scope_name     UTF-8, no terminator
+varint(len(scope_version)) scope_version  UTF-8, no terminator
+canonical(scope_attrs)            self-delimiting: leading entry count
+```
+
+`canonical(..)` is the frozen canonical attribute-set encoding of
+ADR-0029 (`ravel_types::logstream::canonical_attr_bytes`): a LEB128 entry
+count, then each entry as `len(key) key encode_value(value)`, entries
+sorted by `(key bytes, encoded value bytes)`. `varint(..)` is LEB128.
+Both attribute sets carry their own entry count and both scope strings
+are length-prefixed, so the concatenation is injective: no two distinct
+resource+scope inputs produce the same blob.
+
+It follows that
+
+```
+stream_id == blake3("ravel-logstream-v1" || blob)[..16]
+```
+
+for the recipe in ADR-0029, so a reader can verify a STREAM_DIR entry's
+identity from the object alone, and log stream identity is recoverable
+without a side table. The blob is never empty: an empty resource+scope
+still encodes as four zero bytes (two zero entry counts, two zero string
+lengths).
+
+Writers build the blob with `ravel_logseg::stream_attrs_bytes` and hand
+it to the writer in every record's `stream_attrs` field; the writer
+stores the bytes from the first record seen for each `stream_id`
+verbatim. Every record sharing a `stream_id` must carry identical
+`stream_attrs`. A disagreement means either a caller bug or a stream-id
+hash collision, and neither has a truthful blob, so the writer rejects
+the whole object with `LogSegError::InconsistentStreamAttrs` rather than
+silently keeping one of them. That is writer input validation, not object
+corruption.
+
+## FIELD_DIR (uncompressed form)
+
+```
+count: u32
+count entries, sorted ascending by (name bytes, type):
+  name_len:       varint
+  name:           name_len UTF-8 bytes
+  type:           u8   (1=str 2=i64 3=f64 4=bool 5=bytes)
+  column_id:      varint
+  present_blocks: varint    total blocks with >= 1 value for this field
+  null_count:     varint    object-wide null count for this field
+```
+
+Fixed columns occupy reserved column ids 0..=9 (`ts`, `observed_ts`,
+`stream_ref`, `severity_num`, `severity_text`, `body`, `trace_id`,
+`span_id`, `flags`, `attrs_raw`) and never appear in FIELD_DIR. Dynamic
+attribute columns start at column id 10. A key observed with two value
+types yields two entries (per-type splitting). At most 1000 dynamic
+columns per object; overflow keys are encoded into the `attrs_raw` fixed
+column (canonical bytes, column id 9), which is scan-queryable but not
+columnar and never pruned by field predicates. Readers reject a
+non-ascending sequence, an entry count over the cap, an unknown type
+byte, and truncation.
+
+A FIELD_DIR column normally exists because at least one record carries the
+key as a per-record attribute. Two kinds of key that appear only at stream
+level (a resource or scope attribute) across the whole object, and per-record
+on no record, get a `(name, type)` column anyway:
+
+- An **indexed** field (POSTINGS, below), if the writer was told to index the
+  name (`with_indexed_fields`), so its merged-view postings have a `column_id`
+  to key by (ADR-0049).
+- A **numeric** field (i64, f64, bool), so its SKIP_IDX numeric stat has a
+  `column_id` to key by (ADR-0095). String and bytes keys get no such column,
+  since they feed no stat.
+
+Such a column is a POSTINGS or stat key, not a materialized value: no
+row writes a per-record value to it, so it is all-null in every block, it gets
+no page in any block, its `present_blocks` is 0, and the reader's exact
+per-record equality on the key still reads only the per-record layer (it never
+resolves against the resource or scope blob). It counts against the same 1000-
+dynamic-column budget as any column; one that cannot fit degrades to bloom plus
+exact scan and to no stat, always legal.
+
+## BLOCKS
+
+When the footer carries no `sort_descriptor`, records are sorted
+`(stream_ref ascending, ts_ns ascending)`. When it carries one, records are
+sorted `(stream_ref, time bucket, key columns, ts_ns)` as the descriptor
+defines (see "LogFooter", row order). Target 8192 records per block, cap 8 MiB
+uncompressed. Per block, one page per column that has at least one value in
+the block.
+
+The writer uses the descriptor order when its caller sets one with
+`RlogWriter::with_sort_descriptor`, and the rules below hold on the row-major
+and the columnar write paths alike, which produce byte-identical objects:
+
+- A record's value for a key column is its first per-record attribute with the
+  key's name whose value stores as the key's type (see FIELD_DIR's per-type
+  splitting; a list or map value stores as bytes), whether or not that
+  attribute took a dynamic column. Stream-level (resource and scope)
+  attributes are not per-record values. A record with no such attribute has no
+  value for the key.
+- Key values compare as values, never as dictionary ids: a record with no
+  value sorts before every record with one, i64 values compare as signed
+  integers, str and bytes values compare bytewise (a prefix before its
+  extensions, so the empty value before every other), and false sorts before
+  true.
+- The time bucket is `ts_ns.div_euclid(bucket_width)` in nanoseconds (1 hour
+  is 3,600,000,000,000). Rows equal on the whole
+  `(stream_ref, bucket, key_1, ..., key_n, ts_ns)` tuple keep the order the
+  writer received them in.
+- Block and object min/max `ts_ns` stay folds over their rows: under a
+  descriptor a block's first and last rows need not hold its extremes.
+
+The writer refuses the whole object with `InvalidSortDescriptor` when it
+builds it (`finish` or `finish_compacted`), before encoding any block, for a
+descriptor with `clustering_generation` 0, with no key column or more than
+four, or with an empty key column name or a name used twice. These are the
+footer decoder's own descriptor checks, so a descriptor the writer records
+passes them. A key column no record has a per-record value for, including a
+name that appears only as a stream-level attribute or only with another type,
+is accepted and orders nothing, since every row has an absent value for it.
+When no key column has a value on any row, the rows sort by
+`(stream_ref, bucket, ts_ns)` and the footer still records the descriptor and
+generation. A key present on only some records is accepted too, and records
+whose value sits only on the stream layer have no value for it.
+
+A **block** is a logical unit, not a byte range. It is what SKIP_IDX level 0,
+BLOOM, and POSTINGS are keyed by, and nothing about its size or its pruning
+granularity changed in version 4.
+
+A **row group** is a run of `group_target_blocks` consecutive blocks (writer
+configuration, default 32, so 262,144 records at the block target). BLOCKS is
+the object's row groups laid end to end in block order. Within a row group the
+pages are stored **grouped by column, then by block**: all of one column's
+pages for that group's blocks are contiguous (a **column chunk**), and the
+column chunks of one row group follow each other in ascending `column_id`
+order. The last row group of an object is short; an object with fewer blocks
+than `group_target_blocks` has exactly one row group, and its layout is the
+same, so a small flush object pays nothing for the level (ADR-0699 decision 1).
+
+```
+BLOCKS (version 4 and later):
+  row group 0 (blocks 0..31):
+    chunk column 0:   page(b0) page(b1) ... page(b31)
+    chunk column 1:   page(b0) page(b1) ... page(b31)
+    ...
+    chunk column 104: page(b0) page(b1) ... page(b31)
+  row group 1 (blocks 32..63):
+    ...
+```
+
+There is no block header. Every page's `column_id`, `enc`, `comp`, `len`, and
+`uncomp_len` live in PAGE_DIR, together with the page's offset and its own
+crc32c. A page a query
+does not want is therefore never read at all, rather than fetched and walked
+past.
+
+A column with values in only some rows of a block carries a presence
+bitmap page (a bitmap-encoded page, `enc = 8`) immediately before the value
+page, so decode restores exact row alignment. Both pages sit in the same column
+chunk, in that order, so one block contributes one or two pages to one chunk.
+A column absent from every row of a block is all-null and occupies zero bytes,
+and contributes no page to the chunk.
+
+### Row-group string dictionaries
+
+A string column chunk (`severity_text`, `body`, `attrs_raw`, or a FIELD_DIR
+column of type `Str` or `Bytes`) may store its values on one row-group
+dictionary instead of per-block value pages (ADR-2135 decision 6). Its first
+page is then a **dictionary page** (tag 12) holding the group's distinct values
+for the column, and each block that carries the column stores a **dictionary
+id page** (tag 13) in place of its value page, still after the block's
+presence bitmap page when it has one:
+
+```
+chunk column c, dictionary form:
+  dict(tag 12)  [bitmap(b0)] ids(b0)  [bitmap(b1)] ids(b1) ...
+```
+
+The dictionary page belongs to the chunk, not to a block. It sits at the
+chunk's `offset`, and every id page of the chunk resolves through it, so a
+reader of any block of the chunk needs it.
+
+The writer considers a string column of a row group when its distinct values
+number at least one and at most half its present values (`2 * distinct <=
+present`), and takes the dictionary form only when it is strictly smaller.
+Each side counts its pages' stored bytes, measured after the page compression
+envelope, plus each page's PAGE_DIR entry at the length the uncompressed
+PAGE_DIR encoding gives it; presence bitmap pages are the same either way and
+are not counted. A tie keeps the per-block pages. A chunk with one block's
+value page in it therefore keeps that page whenever neither form is
+compressed: its dictionary form holds the bytes of the block's tag 7 page less
+the width byte, split over two pages that each carry an entry of at least 9
+bytes, and the per-block page was already the smallest of its candidates,
+tag 7 among them. Because the entries are counted before PAGE_DIR's own
+section compression, a decision can still move the finished object by a few
+bytes either way. The dictionary's entries are
+sorted bytewise and an id is the entry's rank, so the row-major and columnar
+write paths produce the same dictionary and the same bytes. A column whose
+group dictionary would pass 65,536 entries, or whose distinct bytes plus 4
+bytes for each present value's id would take the group's total across string
+columns past the writer's `block_max_bytes` (8 MiB by default), is dropped
+from the decision and keeps its per-block pages. The writer holds those ids
+until the group flushes, so they take at most the budget plus one block's ids,
+the most one block's fold can pass it by. A decoded block's dictionary for a
+column is the subset of the group's entries that block uses, in the same
+order: the dictionary a tag 7 page over the same values would hold. Where the per-block page chose another encoding
+(plain, for example) a reader sees no per-block dictionary for it, but decodes
+the same values under either form.
+
+`observed_ts` in a block where it equals `ts` row for row is stored as a
+column reference to `ts` (tag 11), a one-byte page, instead of a copy of the
+values. In any other block it is an ordinary i64 page. A reader decodes `ts`
+first, which every projection includes, and copies its values; a projection
+naming `observed_ts` therefore needs the `ts` page too, which it already
+fetches.
+
+The block's crc32c is stored in its SKIP_IDX level-0 entry, not inline, and
+covers the concatenation of the block's pages in ascending `column_id` order --
+which is what a whole-block read assembles once it has located them through
+PAGE_DIR, and is the order PAGE_DIR lists them in. A row-group dictionary page
+is not one of the block's pages and the block crc does not cover it; every
+reader, whole-block or subset, verifies each dictionary page it uses against
+its own crc32c before decoding any id page of that chunk, so a corrupt
+dictionary fails every block of its chunk. A scan, and a ranged decode of a
+stream span or a row group loc, verifies and decodes each dictionary page once
+and shares the result among the chunk's blocks it reads; only a successful
+decode is kept. Scan statistics still charge the page to every block that
+reads through it. A whole-block reader verifies the
+block crc; a reader taking a subset of the columns cannot (it does not have
+the other pages) and verifies each page's own crc32c instead. Both are
+mandatory on their own access path, which is what keeps every interpreted byte
+checksum-covered (ADR-0010 §4, "Checksum coverage map" below). This is what
+lets a fetcher bring one coalesced byte range per `(row group, projected
+column)` and hand it to a projected decode: the range's holes -- pages of
+pruned blocks, and of columns the projection dropped -- may still be fetched
+when coalescing folds them into a requested range, but they are never
+interpreted, so nothing depends on a checksum over them.
+
+A reader may decode a *subset* of a block's columns (`decode_v4_block_with`,
+which reads the wanted columns' pages through `read_block_pages_with_dicts`;
+ADR-0087); the SQL logs scan uses this to decode only the columns a query
+references. Under version 4 the subset is also a *fetch* subset: PAGE_DIR gives
+each column chunk's byte extent, so a projection of `k` columns over a row
+group is `k` contiguous ranges instead of one range per block. A fetch of some
+of a group's blocks takes each kept column chunk's dictionary page once,
+whatever number of its blocks it keeps, and nothing of a chunk it keeps no
+page of. A skipped column
+is indistinguishable from an absent one in the decoded result, so a reader that
+projects is responsible for having asked for every column it goes on to read.
+
+`block_offset` and `block_len` in a version-4 SKIP_IDX level-0 entry describe
+the block's *page span*: from its first page's offset to the end of its last.
+Because the pages are column-major, that span overlaps its neighbours' and
+covers most of the row group. It is a superset range containing every one of
+the block's pages, not the block's exact extent, and nothing locates a
+version-4 page through it.
+
+```
+   one row block, columnar (unchanged by version 4; only page placement moved):
+
+   rows ->   r0 r1 r2 r3 r4 ... r8191
+   ts        [ GCD / delta / double-delta page ]
+   observed  [ reference to ts, when equal     ]
+   stream    [ RLE page: (ref,run)(ref,run) ...]
+   sev_num   [ bit-packed FOR page             ]
+   body      [ string plain: lengths | blob    ]
+   attr.k    [ presence bitmap | FOR page      ]
+```
+
+## PAGE_DIR (uncompressed form)
+
+Mandatory. Compressed as a whole section and
+covered by its `Section.crc32c`, like SKIP_IDX: it is read whole on every open,
+because without it no page can be located at all. A corrupt or undecodable
+PAGE_DIR is a loud `Corrupted` error and never a degrade.
+
+```
+group_count: varint
+group_count groups:
+  first_block: varint      index of the group's first block, whole-object
+  block_count: varint
+  chunk_count: varint
+  chunk_count chunks:
+    column_id:   varint
+    offset:      varint    absolute offset of the chunk's first page, into BLOCKS
+    page_count:  varint
+    page_count pages:
+      block:       varint  block index within the group, ascending
+      enc:         u8      encoding tag (see registry)
+      comp:        u8      0=none, 2=zstd
+      len:         varint  stored page bytes
+      uncomp_len:  varint  page bytes before compression
+      crc32c:      u32     over the page's stored bytes
+```
+
+Page offsets are derived, not stored: a chunk's pages are contiguous from the
+chunk's `offset` in listed order, so the *n*th page begins at `offset` plus the
+`len`s of the pages before it. That makes the section about 14 bytes per page:
+a few KB for a two-block flush object, about 1.5 MB for a 10M-row L1 segment
+with 105 columns, read once per object per query.
+
+Two entries may name the same `block` within one chunk: a partially present
+column contributes its presence bitmap page and then its value page, so
+`page_count` is the number of *pages* the group's blocks carry for the column,
+between one and two per block that carries it -- not the number of blocks that
+carry it.
+
+A row-group dictionary page (tag 12) is the one entry that relaxes three of
+these rules, and only as its chunk's first page: its `block` is the group's
+`block_count` (one past the last block, since it names none), it precedes the
+chunk's block 0 pages, and it may take `page_count` to `2 * block_count + 1`.
+A chunk carrying one has at least one id page (tag 13) after it, and an id page
+appears only in a chunk whose first page is a dictionary page. Every other page
+of the chunk keeps every rule. A reader listing a block's pages never returns
+the dictionary page among them; it locates it as the chunk's first page.
+
+Groups partition the object's blocks into consecutive runs starting at block 0:
+the first group's `first_block` is 0 and each subsequent group's continues
+where the previous ended. The whole directory's `block_count` total equals the
+SKIP_IDX level-0 entry count.
+
+## Encodings (tag registry)
+
+| tag | encoding | applies to |
+|---|---|---|
+| 1 | plain | any (fallback) |
+| 2 | constant | one value repeated `count` times |
+| 3 | RLE | runs of (value, run length) |
+| 4 | delta-zigzag | i64, timestamps |
+| 5 | double-delta | near-monotonic i64 runs |
+| 6 | FOR bit-pack | i64 frame-of-reference |
+| 7 | dictionary | strings, f64 bits, fixed-width |
+| 8 | bitmap | bool columns, presence bitmaps |
+| 9 | fixed-width | trace_id (16B), span_id (8B) |
+| 10 | GCD i64 (ADR-2135 decision 3) | i64 pages whose offsets from the page minimum share a divisor |
+| 11 | column reference (ADR-2135 decision 3) | `observed_ts` equal to `ts` |
+| 12 | row-group dictionary page (ADR-2135 decision 6) | a string column chunk's first page |
+| 13 | row-group dictionary ids (ADR-2135 decision 6) | a string page of a chunk whose first page is tag 12 |
+
+Tags 10 to 13 are registered in the shared `ravel-codec` registry, whose
+encoders never emit them and whose decoders refuse them, so RSEG and RSPAN
+keep refusing all four. They are RLOG-only codecs, encoded and decoded in
+`ravel-logseg`. A tag 12 or 13 page on a column that is not a string column,
+or placed other than as "PAGE_DIR" above describes, is `Corrupted`.
+
+**Encoding choice (ADR-2135 decision 4).** The writer encodes every
+candidate encoding of a page once, passes each through the page
+compression envelope once (the 512-byte floor, zstd at the writer's
+`zstd_level` only when strictly smaller), and keeps the candidate with the
+fewest stored bytes. On a tie the earlier candidate in priority order wins.
+The candidates, in priority order:
+
+- i64 pages (`ts`, `observed_ts`, `stream_ref`, `severity_num`, `flags`,
+  i64 attributes): constant (only when every value is equal), RLE, plain,
+  delta-zigzag and double-delta (each only when no intermediate overflows),
+  FOR bit-pack, then GCD i64 (only when it applies). At most six at once:
+  a page whose values are all equal has all-zero offsets, so constant and
+  GCD i64 never both apply.
+- string pages (`severity_text`, `body`, `attrs_raw`, string and bytes
+  attributes): dictionary and plain. The one the `distinct / total <= 0.5`
+  heuristic would pick comes first. Two.
+- `observed_ts`, when it equals `ts` row for row: the column reference
+  alone, which is one byte.
+
+Bool, f64, `trace_id` and `span_id` pages and presence bitmaps keep their
+single encoding, chosen as before. A reader never needs to know which
+candidates the writer considered: the tag makes each page
+self-describing. An unknown
+`enc` byte is a typed `Corrupted` error, never a panic or a guess. All
+codecs are self-terminating against the caller-supplied element `count`
+and MUST consume exactly the bytes handed to them; trailing or missing
+bytes are `Corrupted`. Every decode allocation is bounded by `count`
+(itself bounded by the block record cap) and by the remaining input.
+
+f64 values travel as their `u64` bit pattern (`f64::to_bits`) everywhere;
+NaN payloads and -0.0 are significant and survive round-trips exactly.
+Comparisons are on the bit pattern, never `==`.
+
+### Integer codec layouts (i64)
+
+- **plain (1):** `count` values, each an ivarint.
+- **constant (2):** one ivarint, the shared value. Applies only when all
+  `count` values are equal (`count >= 1`).
+- **RLE (3):** `run_count` varint, then `run_count` pairs
+  `(value ivarint, run_len varint)`. The run lengths sum to `count`;
+  each `run_len >= 1`.
+- **delta-zigzag (4):** first value ivarint, then `count - 1` deltas,
+  each `delta[i] = v[i] - v[i-1]` as an ivarint. Decode accumulates with
+  overflow-checked addition; overflow is `Corrupted`. Emitted only when
+  every delta is representable in i64 (checked at encode).
+- **double-delta (5):** first value ivarint (`count >= 1`), then first
+  delta ivarint (`count >= 2`), then `count - 2` deltas-of-deltas, each
+  `dod[i] = (v[i]-v[i-1]) - (v[i-1]-v[i-2])` as an ivarint. Decode is
+  overflow-checked; overflow is `Corrupted`. Emitted only when every
+  intermediate is representable in i64.
+- **FOR bit-pack (6):** `min` ivarint, `bit_width` u8 (`0..=64`), then
+  `count` frame-of-reference values `(v - min)` bit-packed LSB-first as
+  unsigned. `bit_width = 0` means every value equals `min` and no packed
+  bytes follow. The offset `v - min` and the reconstruction
+  `min + offset` use wrapping two's-complement arithmetic and are exact
+  for the encoded range (`min` is the true minimum). Packed byte length
+  is `ceil(count * bit_width / 8)`; a `bit_width > 64` or a packed length
+  that disagrees with the payload is `Corrupted`.
+- **GCD i64 (10):** `gcd` varint, `base` ivarint, the inner encoding tag
+  u8, then the inner encoding of the `count` quotients. The writer takes
+  `base` as the page minimum and each offset as `v.wrapping_sub(base)` in
+  u64, as FOR does, and offers the candidate only when the offsets share a
+  divisor of at least 2 and every quotient `offset / gcd` fits in i64. The
+  quotients are encoded with whatever the shared integer picker
+  (`encode_i64`) chooses for them by encoded length, which is one of tags 1
+  to 6. Decode reads the quotients with that inner codec, computes each
+  `quotient * gcd` with a checked u64 multiply, and adds it to `base` with
+  a wrapping add, which inverts the encoder exactly (a page spanning
+  `i64::MIN` and a large positive value round-trips). `Corrupted`: a `gcd`
+  below 2, an inner tag outside 1 to 6, a negative quotient, a multiply
+  that overflows u64, and trailing or missing bytes, including any the
+  inner codec rejects. Unlike RSEG's `TS_GCD_I64`, which divides the values
+  themselves, a page whose values share no divisor but whose offsets from
+  the minimum do still qualifies.
+- **column reference (11):** one varint, the column id of a column in the
+  same block whose values this column equals row for row, with identical
+  presence. The value is a copy of the referenced column's decoded values.
+  At version 5 the only permitted pair is `observed_ts` (column 1)
+  referring to `ts` (column 0); tag 11 on any other column, a target other
+  than `ts`, a presence that differs from the target's, or trailing bytes
+  are `Corrupted`. `ts` has the lowest column id, PAGE_DIR lists a block's
+  pages in ascending column id, and every projection decodes `ts`, so the
+  reader has decoded the target by the time it reaches `observed_ts`; a
+  reference whose target was not decoded is `Corrupted`.
+
+### Bitmap codec layout
+
+- **bitmap (8):** `count` bits packed LSB-first (bit `i` of the value
+  sequence is bit `i % 8` of byte `i / 8`), zero-padded to a whole
+  number of bytes. Payload length is exactly `ceil(count / 8)`.
+
+### String codec layouts
+
+The RLOG writer builds both layouts for every string page and keeps the
+one with fewer stored bytes (see "Encoding choice" above). A tie goes to
+the layout the `distinct / total <= 0.5` heuristic picks: dictionary when
+it holds, else plain.
+
+- **plain (1):** `count` lengths, each a varint, then the values
+  concatenated as one blob. Decode reads the `count` lengths, then slices
+  the blob; the lengths MUST sum to exactly the remaining blob length.
+- **dictionary (7):** `dict_count` varint, then `dict_count` entries
+  each `(len varint, bytes)` sorted ascending by byte value, then the
+  `count` ids as a FOR bit-pack body (`bit_width` u8, then packed ids
+  LSB-first) selecting into the dictionary. An id `>= dict_count` is
+  `Corrupted`; a blob shorter than the offsets claim is `Corrupted`.
+- **row-group dictionary page (12):** `dict_count` varint, then
+  `dict_count` entries each `(len varint, bytes)`, strictly ascending by
+  byte value: the dictionary section of a tag 7 page with no ids after it.
+  A `dict_count` of zero, above 65,536, or above the page's byte length
+  plus one, entries not strictly ascending, a truncated entry, and
+  trailing bytes are `Corrupted`.
+- **row-group dictionary ids (13):** the block's `count` ids, one per
+  present value, packed LSB-first at `w = bit_width(dict_count - 1)` bits,
+  the width a tag 7 page over the same dictionary would use. The page
+  stores no width byte: the reader derives `w` from the chunk's tag 12
+  page, so a one-entry dictionary's id pages are empty. The payload length
+  MUST be exactly `ceil(count * w / 8)`, and an id `>= dict_count` is
+  `Corrupted`.
+
+### f64-bits codec layouts
+
+Callers pass values as `u64` (`f64::to_bits`). `encode_f64` tries
+dictionary, else plain; constant when all equal.
+
+- **plain (1):** `count` values, each 8 bytes LE.
+- **constant (2):** one value, 8 bytes LE (`count >= 1`, all equal).
+- **dictionary (7):** `dict_count` varint, then `dict_count` values each
+  8 bytes LE sorted ascending by `u64` value, then the `count` ids as a
+  FOR bit-pack body, as for strings.
+
+### Fixed-width codec layouts
+
+`encode_fixed` takes a `width`; every value is exactly `width` bytes.
+
+- **fixed-width (9):** the `count` values concatenated raw; payload
+  length is exactly `count * width`.
+- **dictionary (7):** `dict_count` varint, then `dict_count` entries of
+  `width` bytes each (no per-entry length) sorted ascending, then the
+  `count` ids as a FOR bit-pack body.
+
+### Page compression envelope
+
+Each page's stored bytes are its encoded codec bytes, optionally zstd
+compressed. The writer compresses a page only when its encoded length is
+at least the 512-byte floor and zstd is strictly smaller; below the floor
+zstd overhead exceeds the win and the page stays raw. The descriptor
+records `comp` (0=none, 2=zstd), `len` (stored bytes), and `uncomp_len`
+(encoded bytes before compression). The writer applies this envelope to
+every candidate encoding of an i64 or string page and compares candidates
+by the resulting `len` (see "Encoding choice"), so a candidate under the
+floor competes with its raw length.
+
+Readers reject an unknown `comp` tag, an `uncomp_len` above the config cap
+(default 64 MiB per page) before allocating, and a decompressed length
+that does not equal `uncomp_len`. Decompression allocates exactly
+`uncomp_len` bytes and fails closed if the payload expands past it (zstd
+bomb guard).
+
+## SKIP_IDX (uncompressed form)
+
+Skip-list shape: the coarse level is probed first, and the reader
+descends only into survivors, so pruning cost scales with surviving data.
+
+```
+ level 2 (footer):    whole-object min/max ts, stream/record/block counts
+                                    |
+ level 1 (per 64      [ g0 ][ g1 ][ g2 ] ...   merged min/max ts,
+ blocks):             min/max stream_ref, per-column min/max
+                                    |
+ level 0 (per block): [b0][b1] ... [bN]   min/max ts, min/max stream_ref,
+                      record_count, block byte range and crc, per numeric
+                      column min/max and null_count
+```
+
+```
+count0: u32
+count0 level-0 entries:
+  block_offset:   varint   (into BLOCKS; the block's page span, see "BLOCKS")
+  block_len:      varint
+  block_crc32c:   u32      crc32c over the block's pages concatenated in
+                           ascending column_id order
+  record_count:   varint
+  min_ts, max_ts: ivarint
+  min_stream_ref, max_stream_ref: varint
+  stat_count:     varint
+  stat_count numeric stats:
+    column_id: varint
+    ty:        u8   (2=i64 3=f64 4=bool 5=bytes)
+    min_bits:  8 bytes LE
+    max_bits:  8 bytes LE
+    null_count:varint
+    has_nan:   u8   (0 or 1)
+count1: u32
+count1 level-1 entries: same fields as a level-0 entry with the byte
+  range and crc omitted, merged over the entry's <= 64 children:
+  mins/maxes by the per-type order, has_nan OR-ed, null_count as
+  defined in "null_count at both levels" below
+```
+
+A level-1 stat merges the min/max bounds of only the children that carry a stat
+for that column, so its bounds are the group's bounds only because every child
+that resolves a value for the column carries one (see "What a numeric stat
+bounds" below). A child block that resolved values but carried no stat would
+read as "no information" for the bounds and be dropped from the merge silently,
+leaving a level-1 entry that looks complete and bounds a subset of its group.
+`null_count`, unlike the bounds, does account for the children that carry no
+stat: see "null_count at both levels" below.
+
+Fanout is 64: one level-1 entry per 64 level-0 blocks. A numeric stat
+stores i64 as its two's-complement `u64` bit pattern (`v as u64`), and
+f64 as its `to_bits` pattern; min/max for f64 use `total_cmp` order over
+non-NaN values, and NaN values are counted in `has_nan` and excluded from
+min/max. Readers reject a block count over the configured cap and any
+truncation.
+
+### What a numeric stat bounds (trailer version 3, ADR-0095, normative)
+
+A numeric stat for a `(name, type)` dynamic column bounds, over the rows of
+its block, each row's **resolved merged-view value** for that column's
+attribute name, and only when that value's type is the column's type. A row
+whose resolved value for the name is of another type, or which does not resolve
+the name at all, contributes to `null_count` and to neither bound.
+
+The resolved value is the one a reader reports for the name, which is
+`ravel_sql::rlog_attrs::find_attr` over `merged_attrs`: the record's stream
+layer (its resource attributes, then its scope attributes) seeds the view and
+the record layer overrides it, the record winning a collision. A name the
+record itself does not carry keeps its resource- or scope-level value -- the
+ordinary OTLP shape, where an attribute like `service.version` lives only on
+the resource -- and a stat over that name has to bound that value like any
+other.
+
+Within the record layer, when a record carries the name more than once, the
+winning occurrence is fixed by the order `rebuild_record` lays a record's
+attributes out and `merged_attrs` folds them last-wins (see "FIELD_DIR" and
+POSTINGS "Version"): the record's columnar occurrences ascending by FIELD_DIR
+type byte, then its `attrs_raw` overflow occurrences ascending by canonical
+encoded value bytes, last entry wins.
+
+The writer resolves this once per record and both POSTINGS and SKIP_IDX are
+projections of that one resolved view, so the two sections cannot disagree
+about which value a reader sees for a key.
+
+Three consequences a reader must expect, all by design:
+
+- A block's value page for the column may hold values outside the stat's
+  `[min, max]`: a losing occurrence is still stored (nothing is dropped), it
+  just does not widen the bounds. Anything reading the page directly must
+  resolve the value itself, exactly as `rebuild_record` plus `merged_attrs` do.
+- Conversely, the stat's `[min, max]` may cover values that appear in no value
+  page of the block at all: a row that resolves the name off its stream layer
+  contributes its resource- or scope-level value, which is stored once in
+  STREAM_DIR and not per row.
+- A stat's `null_count` may exceed the FIELD_DIR `null_count` for the same
+  column, which counts raw column presence over the whole object rather than
+  merged-view resolution per row.
+
+A block carries a stat for every column some row of it resolves a value for,
+which is a superset of the columns it has value pages for: a block where the
+name is resolved only off the stream layer, with no per-record occurrence in the
+block at all, still carries the stat, and that stat still bounds the resolved
+values. The block's pages are unaffected -- a column no row of the block wrote a
+value to gets no page, so a stat-only column costs zero BLOCKS bytes.
+
+For the same reason, a numeric name (i64, f64, bool) that no record in the
+object carries per-record still takes a dynamic column, on the strength of its
+stream-level occurrences alone, so its stat has a column to be keyed by. That
+mirrors what an indexed name already gets (see "FIELD_DIR"); the column holds no
+value page anywhere in the object, it exists to key the stat and the postings.
+
+A name still ends up with no column, and so no stat, when it overflows the
+writer's dynamic-column budget. An absent stat is "no information": it prunes
+nothing, exactly like an absent posting list.
+
+This is what makes range pruning on these stats sound: where a stat exists, a
+reader materializing a declared typed column produces exactly the value the
+stat folded in (or NULL when that value is of another type), so a block whose
+stat range cannot overlap a queried range holds no matching row. Under version
+2 the stats bounded the raw columnar occurrences instead, which could exclude
+the block holding the record a range query wanted; that is the defect version 3
+fixes, and it is why a v2 object cannot be read as a v3 one.
+
+An f64 range test carries one further condition: a reader must decline to
+prune any block whose stat has `has_nan` set, unconditionally, rather than
+testing the query arm against that stat's `[min, max]` as usual. `min`/`max`
+bound only the non-NaN resolved values (see above), but under the `total_cmp`
+order this format's f64 stats and range predicates share, a `+NaN` value
+sorts above every finite value and a `-NaN` value sorts below every finite
+value, so a NaN row in the block can satisfy a half-open arm the finite
+bounds alone would rule out. `has_nan` does not record which sign was
+present, so a reader cannot narrow the decline to just the arm shape that
+sign would satisfy; it must decline pruning on the whole stat instead.
+
+### null_count at both levels (trailer version 3, normative)
+
+A stat's `null_count` counts rows that resolve nothing the stat's `[min, max]`
+bounds. It never contributes to pruning (`candidate_blocks` reads only min/max,
+and null rows never satisfy a range); it is a per-column cardinality hint for a
+future reader, and this section is its only contract.
+
+- **Level-0** (per block). `null_count` is the number of rows of the block whose
+  resolved merged-view value for the column's name is absent or of a type other
+  than the column's type, i.e. the block's `record_count` minus the count of
+  rows that resolve a value of the column's type (the rows the bounds fold in).
+  A block carries a stat for every column it plans, and it plans a numeric
+  column when some row carries a record-level occurrence of that column, or
+  some row's merged-view winner is of its type. The first condition does not
+  require the second, so a present level-0 stat may have
+  `null_count == record_count`: rows carried an occurrence of the column, but
+  every merged-view winner for the name was of another type. That is the
+  cross-type duplicate case (ADR-0095), and such a stat carries
+  `min_bits == max_bits == 0`, bounds that bound nothing. A stat is absent only
+  when neither condition holds, and then no row of the block resolves the
+  column either (see "What a numeric stat bounds").
+
+- **Level-1** (per <= 64 children). `null_count` is the number of rows *beneath
+  the entry* -- summed across all children -- that resolve nothing of the
+  column's type. This counts, for each child, the rows that child's own stat
+  reports null, PLUS every row of any child that carries no stat for the column
+  at all: by the level-0 rule a child with no stat for a column resolves nothing
+  of that type in any of its rows, so all `record_count` of them are null. The
+  writer computes it as `sum(child.stat.null_count for children with the stat) +
+  sum(child.record_count for children without it)`. A level-1 stat exists iff
+  some child carries one, and a child's stat may itself be all-null, so a
+  level-1 stat may also have `null_count == record_count`. An all-null child
+  stat folds its degenerate `0`/`0` bounds into the merged min/max as well,
+  widening them; pruning stays sound, because a wider range only keeps more
+  blocks, but it is less precise.
+
+The rule a reader must honor at both levels: **neither the presence of a stat
+nor its bounds is evidence that any row resolves the column.** A column no row
+resolves has two encodings, and they carry different information even though
+they state the same fact. The stat is absent when no row carries an occurrence
+of the column and no row's winner is of its type. It is present with
+`null_count == record_count` when rows carry an occurrence but every winner is
+of another type. They differ in whether bounds accompany the fact: an absent
+stat carries none and prunes nothing, exactly like an absent posting list,
+while a present stat always carries bounds, which in this case are the
+degenerate `0`/`0` pair. A reader must not read a present stat as "at least one
+row resolves this column", must not read an absent stat as
+`null_count == record_count`, and must not use `null_count` to prune.
+
+`null_count` is a `u32` written as a varint, and the level-1 sum above can in
+principle exceed `u32::MAX` (up to 64 children, each with a `u32` `record_count`).
+The merge saturates: a level-1 `null_count` of `u32::MAX` means "at least
+`u32::MAX` null rows beneath this entry", an exact value lost to saturation. A
+reader that consumes the field must treat `u32::MAX` as a saturated lower bound,
+not an exact count. Saturation is the only approximation in the field and is
+confined to this case; every non-saturated value is exact. (The current writer's
+block sizing keeps real `record_count` values far below `u32::MAX / 64`, so
+saturation is unreachable in practice; it is documented because the format
+contract, not the current writer, bounds `record_count`.)
+
+`candidate_blocks(ts_min, ts_max, stream_refs, numeric)` returns the level-0
+block indices whose entries survive the coarse predicate. Alongside the ts and
+stream-ref bounds, `numeric` carries prune-only inclusive range arms, one per
+NumStat-eligible column: a block is dropped when its stat's min/max for that
+column proves no overlap with the queried range, and a whole level-1 group is
+dropped the same way before its blocks are examined. A column with no stat in
+the entry under test prunes nothing there (absence is "no information"), so a
+level-1 group carrying no stat for the column is descended into and a level-0
+block with none survives. These arms drive block pruning only, through
+`RlogReader::scan_blocks`'s prune channel (ADR-0095 decision 6); the exact,
+exactly-typed range is re-evaluated above the scan by the caller. The pruning is
+sound (ADR-0013): a block is dropped only when its bounds prove no record in it
+can match. Precision is not guaranteed; survivors are scanned and re-evaluated
+exactly.
+
+## BLOOM
+
+One blocked bloom filter per row block. The BLOOM section (version 5) is a
+container that starts with the list of column ids its filters cover:
+
+```
+covered_count: u32
+covered_count column ids: varint each, strictly ascending
+covered_crc32c: u32   crc32c over the list bytes above (covered_count and
+                      the id varints)
+count: u32
+count entries, entry i for block i:
+  entry_len: varint
+  crc32c:    u32    crc32c over the entry's stored bytes (below)
+  entry:     entry_len bytes:
+    m_bits:  varint   (multiple of 512, >= 512)
+    k:       u8       (hash count, > 0)
+    seed:    u64 LE
+    bits:    m_bits / 8 bytes
+```
+
+A reader builds a bloom arm only for a covered column. A filter probe for an
+uncovered column proves nothing, so that column is scanned instead of pruned
+and no matching row is dropped (ADR-2135 decision 5). A covered id is either a
+fixed column id (below 10) or a column FIELD_DIR names. The writer's covered set
+is its BLOOM scope, which its caller sets with `RlogWriter::with_bloom_scope`:
+
+- `All`, the default: `severity_text`, `body`, and every string attribute
+  column in FIELD_DIR, which is every column version 4 inserted.
+- `Undeclared`, given the tenant's declared-column names: `severity_text`,
+  `body`, and every string attribute column in FIELD_DIR whose name is not
+  declared. Matching is by name alone, whatever type the name was declared
+  with: a declared name that is an i64 column in the object, say, also leaves
+  a string column of that name uncovered. That costs pruning only, since an
+  uncovered column is scanned and no matching row is dropped. A declared name
+  with no string column of that name changes nothing, and an empty declared
+  list covers exactly what `All` covers.
+- `Text`: `severity_text` and `body` only.
+
+The covered list is exactly that set, ascending, and no filter holds a key of
+a column outside it.
+
+Inserted keys are hashed as
+`h = blake3(seed_le(8) || column_id_le(4) || token)`, reading three 64-bit
+values from disjoint bytes of the digest:
+`block = u64::from_le_bytes(h[0..8])`,
+`g1 = u64::from_le_bytes(h[8..16])`, and
+`g2 = u64::from_le_bytes(h[16..24]) | 1`. The filter is blocked on 512-bit
+blocks: `block % (m_bits / 512)` selects the block, and for `i in 0..k`
+the bit at `(block % (m_bits/512)) * 512 + ((g1 + i*g2) % 512)` is set
+(all additions and the multiply wrap). Block selection and the
+within-block offsets read disjoint digest bytes so the first probe is not
+congruent to the block index (which would collapse most set bits onto two
+offsets and wreck the false-positive rate). `k = 7`, chosen for a ~1%
+false-positive rate; `m_bits = max(512, ceil(n * 9.585))` rounded up to a
+multiple of 512, where `n` is the block's distinct `(column_id, token)`
+count (9.585 bits per element for p = 0.01). Version 4 rounded up to a power
+of two, which gave up to twice the bits and a lower false-positive rate than
+the design point; version 5 filters run at the designed rate. The probe
+already reduces the block index modulo `m_bits / 512`, so it needs no power
+of two.
+
+Inserted per block, all field-scoped by `column_id`:
+
+- every word token (see Tokenizer) of every covered column's value;
+- the exact value, for covered values of at most 64 bytes, to accelerate
+  equality where the page was not dictionary-encoded.
+
+Field-scoping (the `column_id` in the hash) means a `body` match never
+collides with an `attr.k` match, so `has_word(body, 'timeout')` and
+`has_word(attr_k, 'timeout')` prune independently.
+
+The FPR is a pruning-efficiency knob, never a correctness knob. A false
+positive costs one block scan; a false negative is impossible by
+construction, which is what makes bloom-based skipping sound (ADR-0013).
+Readers reject a truncated entry, an `m_bits` that is not a multiple of 512
+or is below 512, a `k` of 0, a `bits` length that is not `m_bits / 8`,
+and an entry index outside `[0, count)`. In the covered list they reject a
+`covered_count` above the object's column count (the fixed ids plus FIELD_DIR's
+entries) and a `covered_crc32c` that does not match the list bytes, and only
+then, on a list whose crc matched, an id that is not strictly above the one
+before it and an id of 10 or more that FIELD_DIR does not name. The crc is what
+catches a flipped id that still leaves an ascending list of real columns: the
+structural checks accept that list, and probing the substituted column in
+filters that hold no key for it would drop matching rows. Like any other BLOOM
+corruption, a rejected covered list is `Corrupted` and degrades the scan to no
+bloom pruning (see "Pruning soundness").
+
+## POSTINGS
+
+Optional (ADR-0049). Exact block-level pruning for equality
+predicates on dynamic attribute fields the writer was told to index
+(`RlogWriter::with_indexed_fields`), a stronger complement to BLOOM: a
+bloom probe can only prove absence with a false-positive rate, but a
+POSTINGS probe returns the exact set of blocks containing a value, so it
+can prune all the way to zero blocks. Absence of the section, or of a
+given field within it, is always legal: unindexed fields, fields never
+seen by the writer, and fields dropped for exceeding their distinct-value
+cap all fall back to bloom pruning plus an exact scan, with identical
+query results to an object that never had POSTINGS at all.
+
+Per indexed field, a sorted term dictionary maps each distinct value to
+the sorted set of block indices holding a row with that value. The
+dictionary is split into fixed-stride term blocks (`postings_stride` in
+`RlogConfig`, default 128 terms), each independently zstd-compressed and
+crc32c-verified, addressed through a sparse index holding every block's
+first term -- the same two-piece sparse-index-plus-data-blocks shape as
+RSEG's `SERIES_IDX`, collapsed into one section here since POSTINGS has
+no separate whole-object summary to keep apart from its per-field detail.
+
+```
+version: u8            (this section's own grammar version, currently 2;
+                         independent of the trailer version -- see "Version")
+field_count: u32 LE
+repeat field_count, ascending column_id:
+  column_id: uvarint
+  capped: u8                     (0 = postings present, 1 = dropped: over cap)
+  if capped == 0:
+    stride: uvarint              (terms per term block)
+    term_count: uvarint          (total distinct terms for this field)
+    block_count: uvarint
+    repeat block_count, ascending first_term:
+      first_term_len: uvarint
+      first_term_bytes: [first_term_len]u8
+      block_offset: u64 LE       (absolute offset from section start)
+      block_stored_len: u64 LE   (compressed byte length)
+      block_uncompressed_len: u64 LE
+      block_crc32c: u32 LE       (over the stored/compressed bytes)
+term_blocks: [remaining bytes]   (concatenated zstd frames, field then block
+                                  order, exactly at the offsets above)
+```
+
+`column_id`, `capped`, `stride`, `term_count`, `block_count`, and
+`first_term` fields are read eagerly when the section is opened, so a
+probe only needs to decompress and crc-verify the one term block a
+binary search over `first_term` lands on. Offset/length fields are
+fixed-width `u64`/`u32` rather than varint so the header's total byte
+length -- and therefore every block's absolute offset -- is computable in
+one pass, with no fixed-point dependency on the offsets' own encoded size
+(the same reasoning as RSEG's `SERIES_IDX`). A term's sort/equality key
+(`ravel_logseg::postings::term_key`) is `Str`/`Bytes` verbatim, `I64` as
+big-endian bytes, `F64` as its big-endian bit pattern (bit-exact, matching
+the reader's `-0.0`/NaN-payload equality convention), and `Bool` as one
+byte -- POSTINGS only ever serves equality/`IN` probes, never a range
+scan, so the encoding only needs a consistent total order, not numeric
+meaning.
+
+One term block's payload, before compression:
+
+```
+term_count_in_block: uvarint     (<= stride)
+repeat term_count_in_block, ascending term:
+  term_len: uvarint
+  term_bytes: [term_len]u8
+  posting_count: uvarint
+  repeat posting_count: delta-uvarint block index (first absolute, then
+                                                    strictly increasing deltas)
+```
+
+Parse-time validation additionally requires each field's declared blocks
+to tile the bytes following the header exactly: walking fields and blocks
+in declaration order, the first block's `block_offset` must equal the
+header's own length and every next block's `block_offset` must equal the
+previous block's `block_offset + block_stored_len`, with the last block
+ending exactly at the section's end. This catches a corrupted offset or
+a gap/overlap between blocks, not just an offset past the section.
+
+### Per-field distinct-value cap
+
+A writer bounds per-field cardinality with `RlogConfig.postings_max_distinct`
+(default 10,000): if one object's indexed field exceeds it, that field's
+postings are dropped for the whole object (`capped = 1`) rather than
+failing the write, and `WriteStats.postings_capped_fields` (from
+`RlogWriter::finish_with_stats` / `finish_compacted_with_stats`) counts
+how many fields this happened to. A capped field is queried exactly as an
+unindexed one: bloom pruning plus an exact scan, never a narrowed or
+missing result.
+
+The count is over merged values (version 2): a field's distinct terms are
+its distinct merged-view values across the object, so resource and scope
+values count too. Resource attributes are low cardinality by nature, so
+this moves the count little, and the cap already degrades loudly to the
+bloom.
+
+### Version
+
+The POSTINGS `version` byte records what a posting list contains. The byte
+layout is the same for every version; a reader cannot tell the meanings
+apart from the bytes, which is why the version byte exists.
+
+- version 1: a posting list indexes the per-record attribute layer only. A
+  reader must not prune a merged-view query on a key that also appears at
+  resource or scope level anywhere in the object; it declines and falls
+  back to the exact scan.
+- version 2: a posting list indexes the merged attribute view of each
+  record. The merged view is the union of the record's resource, scope, and
+  per-record attributes, the record winning on a key collision (the view
+  `ravel_sql::rlog_attrs::merged_attrs` computes for the `attrs` column). A
+  reader prunes a merged-view query directly. This is the version the writer
+  emits (ADR-0049 amendment).
+
+The version-2 writer gives a merged-view key that is resource- or scope-level
+across the whole object (the ordinary OTLP `service.name` shape) a
+stream-level-only FIELD_DIR column (above), so its merged-view postings exist
+even without a per-record column. This adds entries under the existing
+version-2 meaning (a posting list indexes the merged view) rather than
+changing what a posting list means, so the bytes and their interpretation are
+unchanged. A version-2 object that carries no posting list for a given key is
+handled as "no information" (probe returns `Ok(None)`, no prune) exactly as
+for any unindexed field.
+
+The section decoder still accepts a version-1 byte and applies the
+conservative rule above, but no stored object can reach it: POSTINGS version 1
+was only ever written under trailer version 2, and a reader refuses that
+trailer outright (see the top of this document -- v2 read support was deleted
+with ADR-0095, with no dual-reader window). So the version-1 arm is dead for
+stored data, and the "reader accepts both versions" migration story it used to
+carry no longer applies to anything. It is kept as a decoder arm, not a
+supported input: only the trailer version window decides what opens.
+
+Adding POSTINGS did not bump the trailer `version` (2 at the time): ADR-0029's
+versioning carve-out excepts a new section kind, since unknown kinds are
+already skipped by old readers and an absent kind is already legal --
+exactly POSTINGS's own fallback behavior. The POSTINGS `version` byte above
+is this section's own grammar version, separate from the trailer version;
+its 1 → 2 bump changed no bytes and needs no trailer bump. Only a change to
+an *existing* section's grammar shape, or to a mandatory/optional kind's
+legality, needs a trailer version bump and an ADR.
+
+SKIP_IDX's v3 change (above) is the other side of that rule: SKIP_IDX is a
+mandatory section that already existed, and redefining what one of its fields
+means -- with no byte a reader could use to tell the two meanings apart -- is
+precisely the case the carve-out does not cover, so it took the trailer bump
+to 3 (ADR-0095).
+
+Adding PAGE_DIR would have been free under the same carve-out, but version 4
+is not an additive change: it re-lays BLOCKS, deletes the block header, and
+redefines the SKIP_IDX level-0 block crc. Those are exactly the
+existing-section grammar changes the carve-out does not cover, so it took the
+trailer bump to 4 (ADR-0699 decision 3), which is also what lets the version
+byte, rather than a section's presence, be what selects the layout.
+
+## Compaction (L0 → L1)
+
+Compaction (ADR-0032) rewrites many small L0 `.rlog` flush
+objects for one sealed `(tenant, shard, ingest-hour)` bucket into a
+handful of large L1 segments, the log analogue of RSEG's L0→L1 compaction
+(ADR-0018). It lives in `ravel-maintain` behind a per-signal codec seam;
+the transaction machinery (seal detection, `CreateIfAbsent` publish,
+convergence, abandonment, the advisory cursor) is shared with RSEG and
+signal-generic. An L1 segment is byte-for-byte a normal RLOG object with
+`level = 1`; readers need no special path.
+
+The merge is defined entirely in terms of this format:
+
+- **Global `stream_ref` remap.** The inputs' sorted `STREAM_DIR`s are
+  merged into one global sorted stream ordering across all inputs. This
+  ordering is used for iteration order (streams are merged in sorted
+  `stream_id` order), for the cross-object identity check, and for
+  splitting output on disjoint output-segment boundaries (a stream never
+  straddles two output segments). It is not itself written to any object:
+  when the merge splits into multiple output segments, each segment's own
+  `STREAM_DIR` is built fresh by `RlogWriter` from only the streams that
+  landed in it, with dense `stream_ref` ordinals starting at zero per
+  segment, exactly as an ordinary L0 write already does. So there is no
+  single merged directory shared across the output; the global ordering
+  governs the merge, and each output segment re-derives its own local
+  `stream_ref` numbering. Because
+  `stream_id` is the canonical hash of a stream's resource+scope blob,
+  two inputs may list the same `stream_id` only with byte-identical
+  blobs; a disagreement is an upstream identity violation or a hash
+  collision and is a hard, typed error (the cross-object form of the
+  single-writer `InconsistentStreamAttrs` check), never a silent pick.
+- **Re-sort, re-block, and re-group.** The merged records are re-sorted by
+  the output object's sort descriptor: `(stream_ref ascending, ts
+  ascending)` when the output carries none, and `(stream_ref, time bucket,
+  key columns, ts)` when it carries one (ADR-2135 decision 2 picks the
+  output descriptor). The output takes the descriptor and
+  `clustering_generation` of the input with the highest generation (the first
+  such input in input order on a tie); with no input carrying a descriptor
+  the output carries none, at the inputs' highest generation (0 when every
+  input is unkeyed). Compaction reads no tenant config: a key the tenant
+  declared after the newest input was written reaches the data at its next
+  write, not at compaction. The records are then
+  re-chunked at the same 8192 record block target, then placed into row groups of `group_target_blocks`
+  consecutive blocks with their pages column-major (ADR-0699 decision 1).
+  Compaction is where full row groups arise: an L0 flush object is usually one
+  short group, an L1 segment is many full ones, which is what makes a narrow
+  projection over a compacted tenant a few contiguous ranges per object
+  instead of one per block. There is no record-level dedup: distinct
+  submissions of identical content are distinct records (the write path
+  makes retry duplicates structurally impossible), so the L1 object holds
+  the union of all inputs' records.
+- **Rebuilt directories and indexes.** `FIELD_DIR` is rebuilt from the
+  merged column set under the same 1000-dynamic-column cap, with overflow
+  keys folded into `attrs_raw` exactly as a single-object write does: the
+  union of columns across inputs can exceed the cap even when no single
+  input does. `SKIP_IDX` and every per-block `BLOOM` are rebuilt from the
+  merged, re-blocked contents (each bloom sized by its own block's
+  distinct-token count); an input's `SKIP_IDX`/`BLOOM` bytes are never
+  reused or concatenated, since the merged block boundaries differ from
+  any input's. The BLOOM covered set follows the bloom scope of the same
+  input the descriptor comes from, recovered from that input's covered list
+  and applied to the output's columns rather than copied by name. When that
+  input covers every string attribute column it carries, or carries none,
+  the output covers every string column. When it covers none of them, the
+  output covers only the two fixed text columns. Otherwise the output covers
+  every string column except the ones that input carries uncovered, so a
+  string column that only other inputs carry is covered. The coverages of
+  the inputs are never unioned. A tie on the highest generation goes to the
+  first such input in input order for the scope as for the descriptor. A
+  bloom scope change is meant to bump the clustering generation, and until
+  the catalog does so a scope-only change reaches compacted
+  data only through this tie rule: it reaches the output when an input
+  written under the new scope is the first input at the highest
+  generation. Reading that input's covered list costs one ranged GET per merge
+  of at most `8 + 5 * (10 + string columns)` bytes (the whole section when
+  its BLOOM is compressed), and none when that input holds no string column,
+  in which case the output covers every string column.
+- **Compression level.** The compactor and the erasure rewrite encode every
+  L1 page and zstd section at `CompactorConfig::rlog_zstd_level`, default 9
+  (ADR-2135 decision 4), not the writer's level-3 default. The level changes
+  stored bytes only; a reader decodes any level the same way.
+
+Because these are exactly the steps `RlogWriter` already performs for an
+L0 write, the compactor performs them by decoding each input back to
+records and feeding the merged records through the same writer via
+`finish_compacted`; the L0 and L1 encoders are one implementation.
+
+No input is decoded whole. The merge is a k-way streaming merge with one
+cursor per input over the stream it is merging, and its read-side working
+set is one row group's stored bytes plus one decoded block per input: the
+row group is what one ranged GET brings (under version 4 a block's pages
+are spread across the group's column chunks, so no smaller contiguous
+range holds a whole block), and the group's blocks are decoded one at a
+time out of those bytes, each released before the next. The one term that
+scales with the data is the in-progress output segment's own buffer, bounded
+by the segment size cap, because a segment's content-addressed key does not
+exist until the whole output segment is encoded.
+
+## Tokenizer
+
+`tokens(text)` yields the word tokens used as bloom keys and as the unit
+of word/phrase match. It is a normative part of the format because it
+defines word semantics identically on the write and read paths:
+
+- split on any non-alphanumeric character (`char::is_alphanumeric`,
+  Unicode-aware);
+- lowercase each character (`char::to_lowercase`, Unicode-aware), dropping
+  any resulting character that is not alphanumeric. Full case mapping can
+  emit a combining mark: U+0130 `İ` lowercases to `i` + U+0307 COMBINING
+  DOT ABOVE (a Mark), so the mark is dropped and `İ` folds to `i`, matching
+  what a query typed `istanbul` produces. This keeps every emitted
+  character alphanumeric;
+- truncate each token to its longest character-boundary prefix of at most
+  64 bytes, measured on the folded characters so a length-changing
+  lowercase can neither exceed the cap nor split a codepoint;
+- drop empty tokens; keep duplicates (deduplication is the bloom's job).
+
+A change to these rules is not a format version bump (token bytes are
+not a pinned invariant; the bloom framing and POSTINGS structure are),
+but it does change what an already-written object indexed. An object
+written under an earlier fold keeps its old token keys in its bloom and
+POSTINGS, so a query folded under the current rules can miss a word in
+that object. The miss is a false negative only: a bloom or POSTINGS
+negative prunes, and the exact scan re-tokenizes with the current rules,
+so no wrong row is returned. Re-ingesting or compacting the object
+rewrites its tokens under the current rules.
+
+A multi-token query word is a phrase: the scan requires all its tokens to
+be present, in order, in the tokenized field value; a single-token word
+requires containment.
+
+## Checksum coverage map
+
+Every byte a reader interprets is covered by a checksum it can verify on
+its access path (ADR-0010 §4), except BLOOM's `count` and `entry_len`
+framing, which is checked structurally (see below):
+
+| bytes | checksum | where it lives | when verified |
+|---|---|---|---|
+| footer proto + trailer (minus crc field) | `footer_crc32c` | trailer | before decoding the footer |
+| STREAM_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
+| FIELD_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
+| SKIP_IDX stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
+| PAGE_DIR stored bytes | `Section.crc32c` | footer section entry | before decoding the section |
+| one page's stored bytes | that page's `crc32c` | PAGE_DIR | before decompressing the page |
+| one block's pages concatenated in `column_id` order (no row-group dictionary page) | `block_crc32c` | that block's SKIP_IDX level-0 entry | before decoding the block, by a reader that took every page of it |
+| one row-group dictionary page's stored bytes | that page's `crc32c` | PAGE_DIR | before decompressing it, and before any id page of its chunk is decoded, on every read path |
+| BLOOM covered-column list (`covered_count` and the id varints) | `covered_crc32c` | BLOOM, right after the ids | before any id is validated or used, in `RlogBloomSection::parse` |
+| one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
+| POSTINGS header (`column_id`, `capped`, `stride`, counts, `first_term`s, offsets, for every field) | whole-section `Section.crc32c` | footer section entry | before `PostingsSection::parse`, in `RlogReader::scan` |
+| one POSTINGS term block's stored bytes | per-block `crc32c` | POSTINGS sparse-index entry | before decompressing the block a probe lands on |
+
+The writer stores a `Section.crc32c` for BLOCKS and BLOOM as for every
+section, but `RlogReader::scan` does not verify either. BLOCKS is read by
+page and by block, and verifying a whole-section crc would mean fetching
+the whole section, defeating the projection; its per-page and per-block
+crc32c are the access-path-verifiable equivalents. BLOOM is read whole by
+`scan` (one fetch of its stored bytes), and its checksums are the
+covered-list crc and the per-entry crc above: the list crc covers every
+byte of the header that decides which columns may prune, and each entry's
+crc covers the filter it frames. The remaining bytes, `count` and each
+`entry_len`, are checked structurally: the entries must tile the section
+exactly, with no trailing bytes.
+
+Version 4's per-page crc32c exists for the same reason one level down. A
+reader that fetched two of a hundred columns holds no more than those two
+columns' pages, so it cannot verify the block crc without fetching the block
+and defeating the projection. Every page it decompresses is covered by its own
+checksum instead, and the `enc`/`comp` tags that decide how to interpret it sit
+under PAGE_DIR's section crc, so a flipped tag fails a checksum before it can
+cause a misdecode.
+
+POSTINGS is read differently: `scan` always reads the section's stored
+bytes in full to reach any block within it, so its whole-section
+`Section.crc32c` is verified the same way STREAM_DIR's and FIELD_DIR's
+is, before `PostingsSection::parse` touches the header. This is the only
+protection an out-of-bounds or garbage `first_term`, offset, or count in
+the header gets; earlier revisions of this format checked it only
+structurally (ascending order, cap checks, exact block tiling) and not
+by crc, which let a header byte flip route `probe` to the wrong block
+without detection as long as ordering and per-block checksums still
+passed. `probe` adds a second, independent check for a future reader
+that fetches one block via a range read instead of the whole section: it
+requires the decompressed block's first term to equal the sparse
+entry's `first_term`, and every term in the block to sort below the next
+entry's `first_term`. The `enc`/`comp` bytes of a page are covered by the
+enclosing block's crc, so a flipped tag fails the crc rather than causing
+a silent misdecode. Pad bytes between sections are never interpreted and
+fall under the whole-object BLAKE3 in the commit record.
+
+## Pruning soundness (invariant)
+
+Extends the ADR-0013 rule to logs: a structure may prune only what it
+proves absent.
+
+- Skip-index min/max: a block is dropped only when its bounds prove no
+  record matches the ts/stream/numeric predicate.
+- POSTINGS is exact, not probabilistic: for an indexed field, a probed
+  term's block list is the complete truth, so it may prune all the way to
+  zero blocks. An unindexed or capped field's probe reports "no
+  information" (not "term absent"), same as a field POSTINGS never heard
+  of, and prunes nothing. `RlogReader::scan` applies it between skip-index
+  and bloom pruning, so bloom only has to consider whatever POSTINGS
+  could not already rule out.
+- Bloom negative on a covered column is proof of absence: skip the block.
+  Bloom positive, or any probe of a column the covered list omits, is no
+  information: scan the block and evaluate the predicate exactly on
+  decoded values.
+- Regex/substring predicates consult blooms only when the planner can
+  extract word literals that any match must contain; otherwise only
+  time/stream/min-max pruning applies and the scan evaluates exactly.
+- A corrupt BLOOM section (one that fails to parse, including a covered-column
+  list that fails its own crc) degrades to scanning without bloom pruning and
+  sets `ScanStats`' `bloom_degraded`, never wrong results; an entry that fails
+  its own crc only leaves its block unpruned. A missing BLOOM section is not
+  a degrade: footer open refuses it as `Corrupted`, as it does a missing
+  STREAM_DIR, FIELD_DIR, BLOCKS or SKIP_IDX. A missing POSTINGS
+  section, a missing per-field entry, or a corrupt section/entry likewise
+  degrades to no postings pruning for the affected arm (`ScanStats`'
+  `postings_degraded`), never wrong results. A corrupt or undecodable
+  SKIP_IDX is a loud `Corrupted` error, not a degrade: its level-0 entries
+  are the only source of block byte ranges and per-block checksums, so
+  without it blocks cannot be located at all. Corrupt BLOCKS data is
+  likewise a loud `Corrupted` error.
+
+## Validation summary
+
+All violations are `Corrupted`, never panics:
+
+- object smaller than 16 bytes; bad magic; unsupported version or signal;
+  non-zero reserved byte; `footer_len` zero or past the trailer; footer
+  crc mismatch; footer proto decode failure.
+- duplicate section kind; missing mandatory section; section range out of
+  bounds or overflowing; section or page `uncompressed_len` over the cap;
+  decompressed length not equal to the declared length; section crc
+  mismatch.
+- overlong or truncated varint; trailing bytes past a declared structure;
+  unsorted STREAM_DIR or FIELD_DIR; entry count over the configured cap;
+  unknown field type byte; unknown encoding or compression tag.
+- codec: id out of dictionary range; delta/double-delta accumulation
+  overflow; FOR `bit_width > 64` or packed length mismatch; a codec not
+  consuming exactly its bytes; a GCD i64 page with `gcd < 2`, an inner tag
+  outside 1 to 6, a negative quotient, or a quotient whose product with
+  `gcd` overflows u64; a column reference on any column but `observed_ts`,
+  naming any column but `ts`, whose target was not decoded, or whose
+  presence differs from its target's; a row-group dictionary page that is
+  empty, over 65,536 entries, not strictly ascending, truncated, or followed
+  by trailing bytes; a dictionary id page whose length is not exactly its
+  ids at the derived width, or with an id `>= dict_count`.
+- bloom: `covered_count` over the object's column count; covered ids not
+  strictly ascending, or a dynamic id FIELD_DIR does not name; `m_bits` not a
+  multiple of 512 or below 512; `k = 0`; `bits` length wrong; entry crc
+  mismatch; entry index out of range.
+- postings: whole-section crc mismatch (checked before the header is
+  parsed at all); unknown section grammar version; field count or one
+  field's term/block count over its cap; non-ascending `column_id`
+  across fields or `first_term` within a field; a term block's declared
+  `uncompressed_len` over its cap; a `block_offset` that does not exactly
+  continue the running cursor (catches both an offset past the section
+  and a gap or overlap between blocks); a term block's crc mismatch or a
+  decompressed length not equal to its declared `uncompressed_len`; a
+  decompressed block's first term not equal to its sparse-index entry's
+  `first_term`, or any term in it not sorting below the next entry's
+  `first_term`; terms within a decompressed block not ascending, or
+  trailing bytes left over once the declared term count is consumed; a
+  declared term or posting count the block's remaining bytes cannot
+  support.
+- page_dir: whole-section crc mismatch (checked before the section is decoded
+  at all, so no offset in it is ever followed unverified); a group count over
+  `MAX_BLOCKS`; a group with no blocks or no chunks; a group whose
+  `first_block` does not continue where the previous group ended (catches both
+  a gap and an overlap in the block partition); a chunk count above what the
+  group's blocks could carry pages for (`block_count * MAX_PAGES`);
+  non-ascending `column_id` across a group's chunks; a page count outside
+  `1..=2 * block_count` (`2 * block_count + 1` for a chunk whose first page
+  is a row-group dictionary page); a page other than that dictionary page
+  naming a block outside its group or going backwards within a chunk; an
+  unknown `enc` tag; a tag 12 page that is not its chunk's first page, names
+  a block other than the group's `block_count`, or has no tag 13 page after
+  it; a tag 13 page in a chunk with no tag 12 page; a tag 12 or 13 page in a
+  chunk whose column is not a string column; an overflowing chunk length
+  or extent; a chunk whose extent ends past the BLOCKS section; a total block
+  count disagreeing with the SKIP_IDX level-0 entry count; truncation; trailing
+  bytes.
+- page crc mismatch (since version 4, before the page is decompressed).
+- footer: a present `sort_descriptor` with `clustering_generation` 0, an
+  unknown bucket width or key column type, or a key column count outside
+  1..=4.
+- block crc mismatch.
