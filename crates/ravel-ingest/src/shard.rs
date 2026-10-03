@@ -52,6 +52,7 @@ use crate::config::{
     MAX_FLUSH_CLOCK_HOLD_NS, SEGMENT_FORMAT_VERSION, StoreClockLag, checked_ingest_hour_bucket,
     idle_age_threshold, memory_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
+use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -195,6 +196,10 @@ struct TenantBuf {
     /// corridor floor in `adaptive_age_threshold_ns` with no special case.
     last_arrival_ns: Option<i64>,
     avg_gap_ns: i64,
+    /// When this buffer's flush trigger was first refused at the queued-flush
+    /// cap, carried across every later refusal so the deferral is measured
+    /// from its start (issue #1916). `None` for a buffer never refused.
+    deferred_since_ns: Option<i64>,
 }
 
 impl TenantBuf {
@@ -970,6 +975,18 @@ pub(crate) struct ShardActor {
     /// Read at trigger time rather than resolved once, because the router
     /// installs the budget after the actors are spawned.
     backstop_ceiling: BufferBudgetCeiling,
+    /// [`IngestConfig::flush_deferral_cap_ns`], resolved once.
+    deferral_cap_ns: i64,
+    /// The earliest `deferred_since_ns` across `tenants`, `None` when no buffer
+    /// is deferred. Lowered on every refusal and recomputed after each age
+    /// tick and drain, so between those it can only read older than the
+    /// truth, which errs toward refusing an append rather than accepting one.
+    /// Published to `cap_flag` on every change.
+    oldest_deferral_ns: Option<i64>,
+    /// This shard's at-cap flag, shared with the router's `ShardHandle` so the
+    /// router refuses a write to a shard at the deferral cap before enqueue,
+    /// buffered mode included.
+    cap_flag: DeferralCapFlag,
 }
 
 impl ShardActor {
@@ -987,8 +1004,12 @@ impl ShardActor {
         rx: mpsc::Receiver<ShardMsg>,
         flush_floor_ns: Arc<AtomicI64>,
         backstop_ceiling: BufferBudgetCeiling,
+        cap_flag: DeferralCapFlag,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<MetricStageTimings>,
     ) -> Self {
+        // A fresh incarnation starts with no buffers, so nothing it inherits
+        // from a dead one is deferred.
+        cap_flag.publish(None, clock.now_ns());
         let rtt = Arc::new(RttTracker::new());
         let ctx = Arc::new(FlushCtx {
             shard,
@@ -1020,10 +1041,16 @@ impl ShardActor {
             rx,
             tenants: HashMap::new(),
             backstop_ceiling,
+            deferral_cap_ns: config.flush_deferral_cap_ns(),
+            oldest_deferral_ns: None,
+            cap_flag,
         }
     }
 
     pub(crate) async fn run(mut self) {
+        // Dropped after every other local and before `self`, so a return or a
+        // panic clears this actor's deferral before its mailbox closes.
+        let _clear_cap_on_exit = self.cap_flag.clear_on_exit();
         // The flush-tick cadence runs on the injected `Clock`, not the tokio
         // timer, so age-based flush timing shares the one clock the age check
         // itself reads (docs/ingest.md "Shard actor"). A test
@@ -1123,7 +1150,7 @@ impl ShardActor {
         tenant: TenantId,
         points: Vec<IngestPoint>,
         exemplars: Vec<IngestExemplar>,
-        ack: Option<Ack>,
+        mut ack: Option<Ack>,
         charge: Option<Arc<IngestByteCharge>>,
     ) {
         if points.is_empty() && exemplars.is_empty() && ack.is_none() {
@@ -1132,6 +1159,9 @@ impl ShardActor {
             return;
         }
         let arrival_ns = self.clock.now_ns();
+        if self.refuse_at_deferral_cap(&mut ack, arrival_ns) {
+            return;
+        }
         let points_len = points.len() as u64;
         // Grab the timing handle before the mutable buffer borrow so recording
         // `merge` does not clash with the `&mut self.tenants` borrow held below.
@@ -1240,27 +1270,75 @@ impl ShardActor {
         (threshold_ns, trigger)
     }
 
+    /// Fires every due age trigger. A deferred buffer is always due, since its
+    /// trigger already fired once, possibly a size trigger on a buffer still
+    /// below its age threshold, and stripping its waiters at the deferral cap
+    /// can raise that threshold; it must not wait either out. Deferred
+    /// buffers go first, oldest deferral first, then the rest by oldest row,
+    /// so a freed queue slot goes to the flush that has waited longest rather
+    /// than to whichever tenant `HashMap` order yields.
     async fn flush_aged(&mut self) {
         let now = self.clock.now_ns();
-        let due: Vec<(TenantId, FlushTrigger)> = self
+        let mut due: Vec<(i64, i64, TenantId, FlushTrigger)> = self
             .tenants
             .iter()
             .filter_map(|(tenant, buf)| {
                 let oldest = buf.oldest_arrival_ns?;
                 let (threshold_ns, trigger) = self.age_threshold_ns(buf);
-                if now.saturating_sub(oldest) >= threshold_ns {
-                    Some((tenant.clone(), trigger))
-                } else {
-                    None
-                }
+                (buf.deferred_since_ns.is_some() || now.saturating_sub(oldest) >= threshold_ns)
+                    .then(|| {
+                        let since = buf.deferred_since_ns.unwrap_or(i64::MAX);
+                        (since, oldest, tenant.clone(), trigger)
+                    })
             })
             .collect();
-        for (tenant, trigger) in due {
+        due.sort_unstable_by_key(|(since, oldest, ..)| (*since, *oldest));
+        for (_, _, tenant, trigger) in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
                     .await;
             }
         }
+        self.refresh_oldest_deferral();
+    }
+
+    /// Answers a strict-mode write with [`WriteError::DeferralCapReached`],
+    /// taking its ack, when a deferred flush on this shard has been deferred
+    /// for at least the deferral cap at `now_ns`. The router refuses such a
+    /// write before enqueue; this catches one that was enqueued before the
+    /// shard reached the cap. The caller returns on `true`, dropping the
+    /// write's charge, which refunds it (ADR-0069). A buffered-mode write
+    /// carries no ack because the router already acknowledged it, so it is
+    /// never refused here and merges as usual.
+    fn refuse_at_deferral_cap(&self, ack: &mut Option<Ack>, now_ns: i64) -> bool {
+        let reached = self
+            .oldest_deferral_ns
+            .is_some_and(|since| deferral_cap_reached(since, now_ns, self.deferral_cap_ns));
+        match ack.take() {
+            Some(ack) if reached => {
+                self.metrics.record_deferral_cap_refused();
+                self.cap_flag.note_refusal(self.ctx.signal, self.shard);
+                self.ctx
+                    .ack_waiters(vec![ack], Err(WriteError::DeferralCapReached));
+                true
+            }
+            other => {
+                *ack = other;
+                false
+            }
+        }
+    }
+
+    /// Recomputes `oldest_deferral_ns` from the buffers, clearing it once every
+    /// deferred flush has opened, and publishes it to the router.
+    fn refresh_oldest_deferral(&mut self) {
+        self.oldest_deferral_ns = self
+            .tenants
+            .values()
+            .filter_map(|buf| buf.deferred_since_ns)
+            .min();
+        self.cap_flag
+            .publish(self.oldest_deferral_ns, self.clock.now_ns());
     }
 
     /// Returns `(tenant_count, buffered_point_count)` across every currently
@@ -1350,6 +1428,7 @@ impl ShardActor {
             }
         }
         self.join_all_flushes().await;
+        self.refresh_oldest_deferral();
     }
 
     /// One drain pass: a fresh snapshot of the buffered tenant keys, each
@@ -1570,7 +1649,30 @@ impl ShardActor {
             debug_assert!(buf.waiters.is_empty());
             return;
         }
-        if self.queued_flush_cap_reached(trigger, &buf) {
+        let raw_ns = self.clock.now_ns();
+        let refused = self.queued_flush_cap_reached(trigger, &buf);
+        if refused {
+            buf.deferred_since_ns.get_or_insert(raw_ns);
+        }
+        if buf
+            .deferred_since_ns
+            .is_some_and(|since| deferral_cap_reached(since, raw_ns, self.deferral_cap_ns))
+            && !buf.waiters.is_empty()
+        {
+            // This buffer has been deferred for the whole deferral cap, so a
+            // flush opening from here on pins an ingest hour past what the
+            // read-side slack covers for its strict rows. Do not acknowledge
+            // them from that flush. The rows are still written, by the flush
+            // that opens past the cap, so the answer is the outcome-unknown
+            // `Abandoned` (503), not a refusal: a client retry stores a second
+            // copy, which query-time dedup by `(series_id, ts)` collapses.
+            let waiters = std::mem::take(&mut buf.waiters);
+            self.ctx.ack_waiters(
+                waiters,
+                Err(WriteError::Abandoned(DEFERRAL_CAP_ABANDONED.into())),
+            );
+        }
+        if refused {
             // Issue #1740: this shard is already holding `max_queued_flushes`
             // flush windows, and this buffer is still under its memory
             // backstop. Refuse the trigger rather than spawn another task
@@ -1585,19 +1687,23 @@ impl ShardActor {
             // The rows carry no ingest-hour bucket across the deferral. The
             // bucket is pinned below, from the reading taken by the flush that
             // finally opens, so a deferral adds its own length to the gap
-            // between a record's routing and its bucket, and can overrun the
-            // `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` the read side allows
-            // for that gap. Pinning before this check instead would move the
-            // overrun to the other side of the flush, past the catalog's
-            // sealed-hour watermark, where it is unrecoverable rather than
-            // bounded; both overruns are measured in this module's tests.
-            // Issue #1916 owns the redesign that bounds the deferral itself,
-            // which is what closes either one.
+            // between a record's routing and its bucket. What keeps that gap
+            // inside `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` for every
+            // acknowledged strict row is the deferral cap: `deferred_since_ns`
+            // dates the first refusal, a strict waiter is never acknowledged
+            // from a flush that opens past the cap (above), and once the oldest
+            // deferral on this shard reaches the cap the router and this actor
+            // refuse new writes until it opens. Pinning before this check
+            // instead would move the overrun past the catalog's sealed-hour
+            // watermark, where it is unrecoverable rather than bounded; this
+            // module's tests hold both.
             self.metrics.record_shard_flush_trigger_deferred(self.shard);
+            let since = buf.deferred_since_ns.unwrap_or(raw_ns);
+            self.oldest_deferral_ns = Some(self.oldest_deferral_ns.map_or(since, |o| o.min(since)));
+            self.cap_flag.publish(self.oldest_deferral_ns, raw_ns);
             self.tenants.insert(tenant, buf);
             return;
         }
-        let raw_ns = self.clock.now_ns();
         // The flush-open stamp is decided before the buffer is consumed and
         // before `record_flush`: a refused flush never touched the store, so it
         // must not be counted as a flush that happened, and (on the retryable
@@ -2253,6 +2359,20 @@ mod tests {
         }
     }
 
+    /// Like [`until`], but gives up after a fixed number of scheduler turns and
+    /// reports whether `probe` came true, for a probe the code under test may
+    /// rightly leave false: an assertion on the result fails where `until`
+    /// would hang. Bounded by yields, not time.
+    async fn settles(mut probe: impl FnMut() -> bool) -> bool {
+        for _ in 0..10_000 {
+            if probe() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        probe()
+    }
+
     fn one_permit_one_queue(max_flush_lifetime: Duration) -> IngestConfig {
         IngestConfig {
             shard_count: 1,
@@ -2298,11 +2418,19 @@ mod tests {
         }
     }
 
-    /// What one deferred flush produced: when its record was routed, and the
-    /// commit record the flush eventually wrote.
+    /// What one deferred flush produced: when its record was routed, and
+    /// either the commit record the deferred write was acknowledged with or
+    /// the error it was answered with instead.
     struct DeferredFlush {
         routed_ns: i64,
-        record: CommitRecord,
+        outcome: Result<CommitRecord, WriteError>,
+    }
+
+    impl DeferredFlush {
+        fn record(self) -> CommitRecord {
+            self.outcome
+                .unwrap_or_else(|e| panic!("the deferred write was refused: {e}"))
+        }
     }
 
     /// Drives exactly one deferred flush and returns its evidence.
@@ -2314,13 +2442,18 @@ mod tests {
     /// tick that jump fires, so the buffer is deferred across more than one
     /// round. Releasing the gate drains the parked flush and the next tick
     /// finally opens the deferred one, in a later ingest hour than the trigger
-    /// fired in.
-    async fn drive_one_deferred_flush(deferral_ns: i64) -> DeferredFlush {
+    /// fired in. `lifetime` must exceed the deferral so the parked flush's own
+    /// deadline never competes. When the deferral reaches the deferral cap that
+    /// `lifetime` leaves, the deferred write is answered with the
+    /// outcome-unknown `Abandoned` rather than acknowledged.
+    async fn drive_one_deferred_flush(deferral_ns: i64, lifetime: Duration) -> DeferredFlush {
         let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
         let clock = TestClock::new(BASE_NS);
-        let lifetime =
-            Duration::from_nanos(u64::try_from(deferral_ns.saturating_mul(4)).unwrap_or(u64::MAX));
+        assert!(
+            i64::try_from(lifetime.as_nanos()).expect("lifetime fits i64") > deferral_ns,
+            "the parked flush must outlive the deferral"
+        );
         let router = Arc::new(
             IngestRouter::new(
                 one_permit_one_queue(lifetime),
@@ -2360,8 +2493,8 @@ mod tests {
         let deferred = write("h1");
         until(|| router.metrics().snapshot().buffered_points_total >= 2).await;
 
-        // Round one: the trigger fires and is refused. This is where the fix
-        // pins the bucket.
+        // Round one: the trigger fires and is refused, which starts the
+        // deferral. No bucket is pinned here.
         clock.advance_ns(TICK_ADVANCE_NS);
         until(|| deferred_triggers(&router) >= 1 || in_flight(&router) > 1).await;
         assert_eq!(
@@ -2371,16 +2504,16 @@ mod tests {
         );
 
         // The deferral itself, crossing at least one ingest-hour boundary.
-        // Round two: the tick this jump fires finds the shard still at its cap
-        // and refuses again, so the pin from round one has to survive a second
-        // refusal rather than be re-taken.
+        // Round two: the tick this jump fires finds the shard still at its
+        // queued-flush cap and refuses again, so the buffer is deferred across
+        // more than one round and keeps the deferral start of round one.
         clock.advance_ns(deferral_ns);
         until(|| deferred_triggers(&router) >= 2 || in_flight(&router) > 1).await;
         assert_eq!(
             in_flight(&router),
             1,
-            "the second round is deferred too, so the carried pin is what the \
-             flush below opens with"
+            "the second round is deferred too, so the flush below is the first \
+             one this buffer opens"
         );
 
         // Drain the parked flush, freeing both the permit and the queue slot.
@@ -2393,34 +2526,31 @@ mod tests {
             .expect("parked write acks once the gate is released");
         until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
 
-        // One more tick: the deferred buffer kept `oldest_arrival_ns` through
-        // every refusal, so it is still due, and it opens now.
+        // One more tick: a deferred buffer is always due, so it opens now.
         clock.advance_ns(TICK_ADVANCE_NS);
-        let receipt = deferred
-            .await
-            .expect("deferred write task")
-            .expect("deferred write acks once the cap clears");
-        assert_eq!(receipt.tokens.len(), 1);
-        let token = receipt.tokens[0].clone();
-
-        let commit_key =
-            keys::commit_key_for_token(&acme.hash(), Signal::Metrics, &token).expect("commit key");
-        let bytes = store
-            .get(&commit_key, GetRange::Full)
-            .await
-            .expect("get commit record")
-            .data;
-        let decoded = record::decode(&bytes).expect("decode commit record");
-        assert_eq!(
-            decoded.ingest_hour_bucket, token.ingest_hour_bucket,
-            "the token and the object it points at must name one ingest hour"
-        );
+        let outcome = match deferred.await.expect("deferred write task") {
+            Ok(receipt) => {
+                assert_eq!(receipt.tokens.len(), 1);
+                let token = receipt.tokens[0].clone();
+                let commit_key = keys::commit_key_for_token(&acme.hash(), Signal::Metrics, &token)
+                    .expect("commit key");
+                let bytes = store
+                    .get(&commit_key, GetRange::Full)
+                    .await
+                    .expect("get commit record")
+                    .data;
+                let decoded = record::decode(&bytes).expect("decode commit record");
+                assert_eq!(
+                    decoded.ingest_hour_bucket, token.ingest_hour_bucket,
+                    "the token and the object it points at must name one ingest hour"
+                );
+                Ok(decoded)
+            }
+            Err(e) => Err(e),
+        };
 
         router.flush_all().await;
-        DeferredFlush {
-            routed_ns,
-            record: decoded,
-        }
+        DeferredFlush { routed_ns, outcome }
     }
 
     fn in_flight(router: &IngestRouter) -> u64 {
@@ -2460,18 +2590,21 @@ mod tests {
     ///
     /// The deferral here runs from one second before an ingest-hour boundary
     /// to well past it, so those are two different hours rather than the same
-    /// one read twice, and the assertion can tell them apart. This pins an
-    /// open defect, not a desired property: the deferral's own length lands in
-    /// the gap `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` bounds, which is what
-    /// the next test measures. When issue #1916 bounds the deferral, this
-    /// assertion is the one to flip.
+    /// one read twice, and the assertion can tell them apart. The deferral's
+    /// own length therefore lands in the gap
+    /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` bounds, and what keeps it
+    /// inside that slack is the deferral cap (issue #1916), which the next
+    /// test holds. Two seconds is well inside the cap, so this write is
+    /// acknowledged.
     #[tokio::test]
     async fn a_deferred_flush_takes_the_ingest_hour_it_opened_in() {
         // Two seconds spans the boundary one second ahead of `BASE_NS`.
-        let flush = drive_one_deferred_flush(2_000_000_000).await;
+        let flush = drive_one_deferred_flush(2_000_000_000, Duration::from_secs(8)).await;
 
-        let fired_hour = hour_of(flush.routed_ns);
-        let created_hour = hour_of(flush.record.created_unix_ns);
+        let routed_ns = flush.routed_ns;
+        let record = flush.record();
+        let fired_hour = hour_of(routed_ns);
+        let created_hour = hour_of(record.created_unix_ns);
         assert_eq!(
             fired_hour,
             hour_of(BASE_NS),
@@ -2485,7 +2618,7 @@ mod tests {
              a run that never left one hour and would prove nothing"
         );
         assert_eq!(
-            flush.record.ingest_hour_bucket, created_hour,
+            record.ingest_hour_bucket, created_hour,
             "a deferred flush pins the ingest hour it opened in \
              ({created_hour}), not the one its trigger fired in ({fired_hour})"
         );
@@ -2493,94 +2626,571 @@ mod tests {
 
     /// The read-side scan slack (`ravel_catalog::FLUSH_BOUND_SLACK_HOURS`,
     /// ADR-0052 section 3) is meant to cover the whole span between a record
-    /// being routed and the ingest hour its flush pins. The queued-flush cap's
-    /// deferral is not covered by it, and this measures the overrun on a live
-    /// shard actor: a real refusal, a deferral longer than the constant
-    /// allows, and the distance in whole ingest hours between the record's
-    /// arrival and the bucket the flush actually wrote.
+    /// being routed and the ingest hour its flush pins, plus the flush's own
+    /// lifetime. A queued-flush cap deferral adds its own length to that span,
+    /// and an unbounded one acknowledged a strict write with a bucket hours
+    /// past its routing. This drives such a deferral on a live shard actor and
+    /// asserts the write is not acknowledged: its waiter gets the
+    /// outcome-unknown `Abandoned`, so no acknowledged write carries a pin past
+    /// the slack.
+    ///
+    /// The fixture's 90 minute lifetime leaves a nonzero deferral cap, and the
+    /// same fixture with a deferral just inside that cap is acknowledged, with
+    /// its routing-to-pin span plus the lifetime inside the slack. A cap
+    /// forced to 0 answers that second write too, so this test fails on it.
     ///
     /// Behavioural on purpose. An arithmetic-only guard restates the terms
-    /// someone believed the code produces (`max_flush_delay_idle` plus one
-    /// `flush_tick`) and passes whether or not a deferral moved the pin, which
-    /// is how this gap shipped under a green test in the first place.
+    /// someone believed the code produces and passes whether or not a deferral
+    /// moved the pin, which is how this gap shipped under a green test in the
+    /// first place.
     ///
-    /// Neither available one-line fix closes it.
+    /// Neither one-line fix would have closed it.
     /// `FLUSH_BOUND_SLACK_HOURS` is a frozen read-side contract
     /// (`DEFAULT_SCAN_SLACK_HOURS`, ADR-0052 section 3), and raising it does
     /// not bound an unbounded number of rounds anyway; pinning the bucket
     /// before the cap check moves the overrun past the catalog's sealed-hour
     /// watermark instead, which
     /// `carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour` shows is
-    /// the worse of the two. Issue #1916 owns bounding the deferral itself.
+    /// the worse of the two.
     #[tokio::test]
-    async fn a_deferred_flush_can_overrun_the_flush_bound_slack() {
-        // Three hours of deferral against a two-hour slack.
-        let deferral_ns = 3 * NS_PER_HOUR;
-        assert!(
-            deferral_ns > i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR,
-            "the fixture must out-run the slack, or it cannot measure a pin \
-             that carries the deferral's own length"
-        );
-        let flush = drive_one_deferred_flush(deferral_ns).await;
+    async fn a_deferred_flush_is_never_acked_past_the_flush_bound_slack() {
+        let slack_ns = i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR;
+        let lifetime_ns = 90 * 60 * 1_000_000_000_i64;
+        let lifetime = Duration::from_nanos(u64::try_from(lifetime_ns).expect("positive"));
+        let config = one_permit_one_queue(lifetime);
+        // 7200 s less the 5400 s lifetime less the 40 s idle delay and one
+        // 10 ms tick.
+        let cap_ns = config.flush_deferral_cap_ns();
+        assert_eq!(cap_ns, 1_759_990_000_000);
 
+        // One hour of deferral: past the cap, inside the parked flush's own
+        // lifetime, and with the lifetime the deferred flush then gets, past
+        // the slack.
+        let deferral_ns = NS_PER_HOUR;
+        assert!(deferral_ns > cap_ns && deferral_ns < lifetime_ns);
+        assert!(
+            deferral_ns + lifetime_ns > slack_ns,
+            "the fixture must out-run the slack, or it cannot show that a \
+             deferral past it is not acknowledged"
+        );
+        let flush = drive_one_deferred_flush(deferral_ns, lifetime).await;
         let routed_hour = hour_of(flush.routed_ns);
-        let created_hour = hour_of(flush.record.created_unix_ns);
+        match flush.outcome {
+            Err(WriteError::Abandoned(msg)) => assert!(
+                msg.contains("deferral cap"),
+                "the outcome-unknown answer names the deferral cap: {msg}"
+            ),
+            Ok(record) => panic!(
+                "a record routed in hour {routed_hour} was acknowledged in ingest \
+                 hour {} with a {lifetime_ns}ns lifetime still ahead of it, past \
+                 the {FLUSH_BOUND_SLACK_HOURS} hours FLUSH_BOUND_SLACK_HOURS \
+                 covers: the deferral cap did not withhold the ack",
+                record.ingest_hour_bucket,
+            ),
+            Err(other) => panic!("expected the outcome-unknown Abandoned, got {other}"),
+        }
+
+        // Just inside the cap: the flush opens one `TICK_ADVANCE_NS` after the
+        // second round and the deferral started one before the jump, so this
+        // opens 100 ms short of the cap and is acknowledged.
+        let within_ns = cap_ns - 2 * TICK_ADVANCE_NS;
+        let flush = drive_one_deferred_flush(within_ns, lifetime).await;
+        let routed_ns = flush.routed_ns;
+        let record = flush.record();
+        let span_ns = record.created_unix_ns - routed_ns;
         assert!(
-            created_hour >= routed_hour + 3,
-            "the fixture deferred across at least three ingest hours \
-             (routed in {routed_hour}, opened in {created_hour})"
-        );
-        let hours_late = flush.record.ingest_hour_bucket.saturating_sub(routed_hour);
-        assert!(
-            hours_late > FLUSH_BOUND_SLACK_HOURS,
-            "a record routed in hour {routed_hour} landed in ingest hour {} \
-             ({hours_late} hours later), inside the {FLUSH_BOUND_SLACK_HOURS} \
-             hours FLUSH_BOUND_SLACK_HOURS covers. If a deferral no longer \
-             reaches the pin, issue #1916 has been resolved: assert the \
-             covering property here instead of this overrun, and update \
-             docs/ingest.md and FLUSH_BOUND_SLACK_HOURS's own documentation, \
-             which both record the gap as open",
-            flush.record.ingest_hour_bucket
+            span_ns + lifetime_ns <= slack_ns,
+            "an acknowledged deferred write's routing-to-pin span ({span_ns}ns) \
+             plus max_flush_lifetime ({lifetime_ns}ns) must fit inside \
+             FLUSH_BOUND_SLACK_HOURS ({slack_ns}ns)"
         );
 
-        // The routing-to-pin gap the constant bounds: the worst buffer age at
-        // flush open (the idle clock, or with a non-zero idle flush byte floor
-        // the sub-floor hold, ADR-1737 decision 3) plus one tick, restated from
-        // the config. It fits; the deferral is the term that does not, and it
-        // is absent here because no configured value bounds it.
+        // The derivation at the shipped defaults: a row's routing-to-pin bound
+        // outside the sub-floor hold is the idle clock plus one tick, and the
+        // deferral cap is exactly what the slack leaves after that and the
+        // lifetime it reserves.
         let shipped = IngestConfig::default();
-        let lifetime_ns = shipped.max_flush_lifetime.as_nanos() as i64;
+        let shipped_lifetime_ns = shipped.max_flush_lifetime.as_nanos() as i64;
         let tick_ns = shipped.flush_tick.as_nanos() as i64;
+        let bound_ns = shipped.flush_trigger_age_bound_ns();
+        assert_eq!(
+            bound_ns,
+            shipped.max_flush_delay_idle.as_nanos() as i64 + tick_ns,
+            "an idle buffered row waits out the idle clock, the slowest trigger \
+             outside the sub-floor hold"
+        );
+        assert_eq!(
+            bound_ns + shipped.flush_deferral_cap_ns() + shipped_lifetime_ns,
+            slack_ns,
+            "the deferral cap is exactly what the slack leaves after the \
+             routing-to-pin bound ({bound_ns}ns) and the lifetime it reserves"
+        );
+        // A buffered row with no deferral is the case the constant itself was
+        // derived for: the sub-floor hold plus the tick the age check may take
+        // to notice it is the worst buffer age at flush open (ADR-1737
+        // decision 3 as amended), and with the lifetime it fits the slack.
         let hold_ns = sub_floor_hold_ns(&shipped);
-        let worst_age_ns = hold_ns + tick_ns;
         assert!(
-            worst_age_ns <= lifetime_ns,
-            "the sub-floor hold ({hold_ns}ns) plus the one {tick_ns}ns flush_tick \
-             the age check may take to notice it is {worst_age_ns}ns, which must \
-             not exceed max_flush_lifetime ({lifetime_ns}ns): \
-             FLUSH_BOUND_SLACK_HOURS was derived with the lifetime as the worst \
-             buffer age at flush open (ADR-1737 decision 3 as amended)"
+            hold_ns + tick_ns <= shipped_lifetime_ns,
+            "the sub-floor hold ({hold_ns}ns) plus one {tick_ns}ns tick must not \
+             exceed max_flush_lifetime ({shipped_lifetime_ns}ns)"
         );
         assert!(
-            worst_age_ns + lifetime_ns <= i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR,
-            "the derivation itself must hold in nanoseconds: worst buffer age at \
-             flush open ({worst_age_ns}ns) + max_flush_lifetime ({lifetime_ns}ns) \
-             must fit inside FLUSH_BOUND_SLACK_HOURS ({}ns)",
-            i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
-        );
-        let bound_ns = routing_to_pin_bound_ns(&shipped);
-        assert!(
-            bound_ns <= i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR,
-            "the worst buffer age at flush open ({:?} idle or {hold_ns}ns \
-             sub-floor hold) plus one {:?} tick = {bound_ns}ns must fit inside \
-             FLUSH_BOUND_SLACK_HOURS ({}ns)",
-            shipped.max_flush_delay_idle,
-            shipped.flush_tick,
-            i64::from(FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
+            hold_ns + tick_ns + shipped_lifetime_ns <= slack_ns,
+            "the sub-floor hold ({hold_ns}ns) plus one {tick_ns}ns tick plus \
+             max_flush_lifetime ({shipped_lifetime_ns}ns) must fit inside \
+             FLUSH_BOUND_SLACK_HOURS ({slack_ns}ns)"
         );
     }
 
-    /// Why the overrun above is not closed by pinning the bucket before the
+    /// A shard whose oldest deferred flush reaches the deferral cap refuses
+    /// every new write before enqueue with `DeferralCapReached`, from any
+    /// tenant and in both write modes, answers the strict waiter already on the
+    /// capped buffer with the outcome-unknown `Abandoned`, and accepts again
+    /// once its queue drains and the deferred flush opens. The cap here is the
+    /// one a 4000 s lifetime leaves (7200 s less 4000 s less the 40 s idle
+    /// delay and one 10 ms tick), reached by a single clock jump that stays
+    /// inside the parked flush's own 4000 s lifetime, so the abandonment path
+    /// never frees the slot.
+    #[tokio::test]
+    async fn a_shard_at_the_deferral_cap_refuses_appends_until_it_drains() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let config = one_permit_one_queue(Duration::from_secs(4000));
+        let cap_ns = config.flush_deferral_cap_ns();
+        assert_eq!(cap_ns, 3_159_990_000_000);
+        let router = Arc::new(
+            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
+                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let acme = TenantId::new("acme");
+        let globex = TenantId::new("globex");
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+        let write = |tenant: &TenantId, host: &'static str, mode: WriteMode| {
+            let router = Arc::clone(&router);
+            let tenant = tenant.clone();
+            tokio::spawn(async move {
+                let points = vec![point(&tenant, host)];
+                router
+                    .write(tenant, points, mode, Duration::from_secs(60))
+                    .await
+            })
+        };
+        let buffered = || router.metrics().snapshot().buffered_points_total;
+        let refusals = || router.metrics().snapshot().deferral_cap_refused;
+        let enqueued = || -> u64 {
+            router
+                .metrics()
+                .shard_skew_by_shard()
+                .into_iter()
+                .map(|(_, s)| s.messages_enqueued)
+                .sum()
+        };
+
+        let parked = write(&acme, "h0", WriteMode::Strict);
+        until(|| buffered() >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| in_flight(&router) == 1).await;
+        gate.wait_until_held(1).await;
+
+        // The first refusal starts the deferral.
+        let deferred = write(&acme, "h1", WriteMode::Strict);
+        until(|| buffered() >= 2).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| deferred_triggers(&router) >= 1).await;
+        assert!(
+            !deferred.is_finished(),
+            "below the cap the write still waits"
+        );
+
+        // One jump to the cap: the next tick finds the deferral at the cap and
+        // withholds the deferred write's ack. Its row stays buffered, so the
+        // answer is outcome-unknown, not a refusal.
+        clock.advance_ns(cap_ns);
+        until(|| deferred_triggers(&router) >= 2).await;
+        let stripped = deferred.await.expect("deferred write task");
+        assert!(
+            matches!(&stripped, Err(WriteError::Abandoned(msg)) if msg.contains("deferral cap")),
+            "the deferred write is answered outcome-unknown at the cap, got {stripped:?}"
+        );
+        assert_eq!(refusals(), 0, "a withheld ack is not a refused write");
+
+        // At the cap the whole shard refuses, not only the deferred tenant, in
+        // both modes, and before enqueue: nothing reaches the shard's channel
+        // and nothing is buffered.
+        let (rows_before, enqueued_before) = (buffered(), enqueued());
+        let shed = write(&globex, "g0", WriteMode::Strict)
+            .await
+            .expect("globex write task");
+        assert!(
+            matches!(shed, Err(WriteError::DeferralCapReached)),
+            "a shard at the deferral cap refuses a strict write, got {shed:?}"
+        );
+        let shed = write(&globex, "g1", WriteMode::Buffered)
+            .await
+            .expect("globex write task");
+        assert!(
+            matches!(shed, Err(WriteError::DeferralCapReached)),
+            "a shard at the deferral cap refuses a buffered write, got {shed:?}"
+        );
+        assert!(WriteError::DeferralCapReached.is_retryable());
+        assert_eq!(buffered(), rows_before, "a refused write buffers nothing");
+        assert_eq!(enqueued(), enqueued_before, "refused before enqueue");
+        assert_eq!(refusals(), 2);
+
+        // Drain: the parked flush lands, the next tick opens the deferred one.
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        parked
+            .await
+            .expect("parked write task")
+            .expect("parked write acks once the gate is released");
+        until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+        let flushes_before = router.metrics().snapshot().flushes_by_age;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| {
+            router.metrics().snapshot().flushes_by_age > flushes_before
+                && in_flight(&router) == 0
+                && queued_gauge(&router) == 0
+        })
+        .await;
+
+        // Accepting again, in both modes.
+        let receipt = write(&globex, "g2", WriteMode::Buffered)
+            .await
+            .expect("buffered write task")
+            .expect("the shard accepts a buffered write once its deferred flush opened");
+        assert!(receipt.tokens.is_empty());
+        until(|| buffered() == rows_before + 1).await;
+        let accepted = write(&globex, "g3", WriteMode::Strict);
+        until(|| accepted.is_finished() || buffered() > rows_before + 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        let receipt = accepted
+            .await
+            .expect("accepted write task")
+            .expect("the shard accepts again once its deferred flush opened");
+        assert_eq!(receipt.tokens.len(), 1);
+        assert_eq!(refusals(), 2);
+        router.flush_all().await;
+    }
+
+    /// The cap boundary on a live actor: a strict write that arrives one
+    /// `flush_tick` before the oldest deferral reaches the cap is accepted and
+    /// buffered, and one that arrives at the cap is refused. The first write
+    /// reaches the shard actor, so it fails if `refuse_at_deferral_cap` refuses
+    /// whenever any buffer is deferred, whatever the cap.
+    #[tokio::test]
+    async fn a_write_one_tick_before_the_deferral_cap_is_accepted_and_one_at_it_refused() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        // The parked flush's 4000 s lifetime outlasts the jump to the cap.
+        let config = one_permit_one_queue(Duration::from_secs(4000));
+        let cap_ns = config.flush_deferral_cap_ns();
+        let tick_ns = config.flush_tick.as_nanos() as i64;
+        let router = Arc::new(
+            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
+                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+        let write = |tenant: &'static str| {
+            let router = Arc::clone(&router);
+            let tenant = TenantId::new(tenant);
+            tokio::spawn(async move {
+                let points = vec![point(&tenant, "h")];
+                router
+                    .write(tenant, points, WriteMode::Strict, Duration::from_secs(60))
+                    .await
+            })
+        };
+        let buffered = || router.metrics().snapshot().buffered_points_total;
+
+        let parked = write("parked");
+        until(|| buffered() >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| in_flight(&router) == 1).await;
+        gate.wait_until_held(1).await;
+
+        // The deferral starts on this tick.
+        let deferred = write("acme");
+        until(|| buffered() >= 2).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| deferred_triggers(&router) >= 1).await;
+
+        // One tick short of the cap. The tick this jump fires refuses the
+        // deferred buffer again, which also proves the actor is past it.
+        clock.advance_ns(cap_ns - tick_ns);
+        until(|| deferred_triggers(&router) >= 2).await;
+        let early = write("globex");
+        until(|| buffered() >= 3 || early.is_finished()).await;
+        assert!(
+            !early.is_finished(),
+            "a strict write one tick before the cap is accepted and waits for \
+             its flush, not answered at arrival"
+        );
+        assert_eq!(buffered(), 3, "the accepted write is buffered");
+
+        // At the cap.
+        clock.advance_ns(tick_ns);
+        until(|| deferred_triggers(&router) >= 3).await;
+        let refused = write("initech").await.expect("initech write task");
+        assert!(
+            matches!(refused, Err(WriteError::DeferralCapReached)),
+            "a strict write at the cap is refused, got {refused:?}"
+        );
+        assert_eq!(buffered(), 3, "the refused write buffers nothing");
+
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        parked
+            .await
+            .expect("parked write task")
+            .expect("parked write acks once the gate is released");
+        assert!(matches!(
+            deferred.await.expect("deferred write task"),
+            Err(WriteError::Abandoned(_))
+        ));
+        // The deferred buffer opens on the first tick after the drain and
+        // takes the slot; globex, refused on that tick, opens on a later one.
+        let mut opened = false;
+        for _ in 0..2 {
+            until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+            clock.advance_ns(TICK_ADVANCE_NS);
+            if settles(|| early.is_finished()).await {
+                opened = true;
+                break;
+            }
+        }
+        assert!(opened, "globex's flush opens within two ticks of the drain");
+        let receipt = early
+            .await
+            .expect("globex write task")
+            .expect("the write accepted before the cap is acknowledged");
+        assert_eq!(receipt.tokens.len(), 1);
+        router.flush_all().await;
+    }
+
+    /// A deferred buffer is due on the next tick even when it is below its own
+    /// age threshold. Here a size trigger on a buffered-mode buffer is refused:
+    /// with no strict waiter and less than `min_flush_bytes` of object its age
+    /// threshold is the 40 s idle clock, so only its deferral makes it due on
+    /// the first tick after the queue drains.
+    #[tokio::test]
+    async fn a_deferred_buffer_below_its_age_threshold_is_still_due() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let config = IngestConfig {
+            // Every write fires the size trigger, well under min_flush_bytes.
+            target_bytes: 1,
+            ..one_permit_one_queue(Duration::from_secs(3600))
+        };
+        assert!(config.max_flush_delay_idle >= Duration::from_secs(40));
+        let router = Arc::new(
+            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
+                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+        let parked = {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move {
+                let tenant = TenantId::new("parked");
+                let points = vec![point(&tenant, "h")];
+                router
+                    .write(tenant, points, WriteMode::Strict, Duration::from_secs(60))
+                    .await
+            })
+        };
+        until(|| in_flight(&router) == 1).await;
+        gate.wait_until_held(1).await;
+
+        let tenant = TenantId::new("idle");
+        let points = vec![point(&tenant, "h")];
+        router
+            .write(tenant, points, WriteMode::Buffered, Duration::from_secs(60))
+            .await
+            .expect("buffered write acks at enqueue");
+        until(|| deferred_triggers(&router) >= 1).await;
+
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        parked
+            .await
+            .expect("parked write task")
+            .expect("parked write acks once the gate is released");
+        until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+
+        let flushes_before = router.metrics().snapshot().flushes_by_age;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        assert!(
+            settles(|| router.metrics().snapshot().flushes_by_age > flushes_before).await,
+            "the deferred buffer, {TICK_ADVANCE_NS}ns old against a 40 s idle \
+             threshold, must open on the first tick after the drain"
+        );
+        router.flush_all().await;
+    }
+
+    /// Oldest deferral first, with a fixture where deferral order and row
+    /// arrival order disagree. Tenant `early` buffers a row first, in buffered
+    /// mode, so it waits for the 40 s idle clock; tenant `late` arrives after
+    /// it with a strict waiter, so its trigger fires and is refused first. Once
+    /// the queue drains, the single slot must go to `late`, the older
+    /// deferral, which sorting by oldest row would give to `early`.
+    #[tokio::test]
+    async fn deferred_flushes_retry_by_deferral_age_not_row_age() {
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let config = one_permit_one_queue(Duration::from_secs(3600));
+        let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
+        let router = Arc::new(
+            IngestRouter::new(config, Arc::clone(&store), Signal::Metrics, clock.clone())
+                .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+        let write = |tenant: &'static str, mode: WriteMode| {
+            let router = Arc::clone(&router);
+            let tenant = TenantId::new(tenant);
+            tokio::spawn(async move {
+                let points = vec![point(&tenant, "h")];
+                router
+                    .write(tenant, points, mode, Duration::from_secs(60))
+                    .await
+            })
+        };
+        let buffered = || router.metrics().snapshot().buffered_points_total;
+
+        let parked = write("parked", WriteMode::Strict);
+        until(|| buffered() >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| in_flight(&router) == 1).await;
+        gate.wait_until_held(1).await;
+
+        // `early`'s row arrives first; `late`'s one millisecond after it,
+        // short of the next tick.
+        write("early", WriteMode::Buffered)
+            .await
+            .expect("early write task")
+            .expect("buffered write acks at enqueue");
+        until(|| buffered() >= 2).await;
+        clock.advance_ns(1_000_000);
+        let late = write("late", WriteMode::Strict);
+        until(|| buffered() >= 3).await;
+
+        // `late` is past its 50 ms strict threshold and is refused first.
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| deferred_triggers(&router) >= 1).await;
+        // `early` reaches the idle clock 40 s later and is refused then.
+        clock.advance_ns(idle_ns);
+        until(|| deferred_triggers(&router) >= 3).await;
+
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        parked
+            .await
+            .expect("parked write task")
+            .expect("parked write acks once the gate is released");
+        until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+
+        clock.advance_ns(TICK_ADVANCE_NS);
+        assert!(
+            settles(|| late.is_finished()).await,
+            "the first tick after the drain must open `late`, deferred 40 s \
+             before `early` though its row arrived after `early`'s"
+        );
+        late.await
+            .expect("late write task")
+            .expect("late acks from the flush it got the slot for");
+        router.flush_all().await;
+    }
+
+    /// Deferred flushes retry oldest deferral first. Eight tenants are
+    /// deferred one tick apart behind a single parked flush; once it drains,
+    /// each tick frees exactly one slot, and the tenant that gets it must be
+    /// the one deferred earliest. `HashMap` order would match this sequence
+    /// by chance once in 8! runs.
+    #[tokio::test]
+    async fn deferred_flushes_retry_oldest_first() {
+        const TENANTS: usize = 8;
+        let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let store: Arc<dyn ObjectStoreBackend> = fault_store.clone();
+        let clock = TestClock::new(BASE_NS);
+        let router = Arc::new(
+            IngestRouter::new(
+                one_permit_one_queue(Duration::from_secs(3600)),
+                Arc::clone(&store),
+                Signal::Metrics,
+                clock.clone(),
+            )
+            .with_budget(IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited)),
+        );
+        let gate = fault_store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+        let write = |tenant: TenantId| {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move {
+                let points = vec![point(&tenant, "h")];
+                router
+                    .write(tenant, points, WriteMode::Strict, Duration::from_secs(60))
+                    .await
+            })
+        };
+        let buffered = || router.metrics().snapshot().buffered_points_total;
+
+        let parked = write(TenantId::new("parked"));
+        until(|| buffered() >= 1).await;
+        clock.advance_ns(TICK_ADVANCE_NS);
+        until(|| in_flight(&router) == 1).await;
+        gate.wait_until_held(1).await;
+
+        // Tenant i is first refused on tick i, so tick i refuses i + 1
+        // buffers and the deferral start times are strictly increasing in i.
+        let mut writes = Vec::new();
+        let mut refusals = 0u64;
+        for i in 0..TENANTS {
+            writes.push(write(TenantId::new(format!("t{i}"))));
+            let want = (i + 2) as u64;
+            until(|| buffered() >= want).await;
+            clock.advance_ns(TICK_ADVANCE_NS);
+            refusals += (i + 1) as u64;
+            until(|| deferred_triggers(&router) >= refusals).await;
+        }
+        assert!(writes.iter().all(|w| !w.is_finished()));
+
+        for id in gate.held() {
+            assert!(gate.release(id));
+        }
+        parked
+            .await
+            .expect("parked write task")
+            .expect("parked write acks once the gate is released");
+        until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+
+        for step in 0..TENANTS {
+            clock.advance_ns(TICK_ADVANCE_NS);
+            until(|| writes.iter().filter(|w| w.is_finished()).count() > step).await;
+            let finished: Vec<usize> = (0..TENANTS).filter(|&i| writes[i].is_finished()).collect();
+            assert_eq!(
+                finished,
+                (0..=step).collect::<Vec<_>>(),
+                "tick {step} after the drain must open tenant t{step}, the oldest \
+                 deferral left"
+            );
+            until(|| in_flight(&router) == 0 && queued_gauge(&router) == 0).await;
+        }
+        for (i, w) in writes.into_iter().enumerate() {
+            w.await
+                .expect("write task")
+                .unwrap_or_else(|e| panic!("t{i} acks: {e}"));
+        }
+        router.flush_all().await;
+    }
+
+    /// Why the deferral is bounded rather than closed by pinning the bucket before the
     /// cap check and carrying it across the deferral, which is the obvious
     /// fix and a worse one.
     ///
@@ -2599,8 +3209,6 @@ mod tests {
     ///
     /// The arithmetic below is the worst case, a trigger firing at the very
     /// end of `H`, and one deferral round is already enough to overrun it.
-    /// `flush_aged` retries in `HashMap` order with no fairness, so the number
-    /// of rounds is not bounded either.
     #[test]
     fn carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour() {
         // A trigger firing at the very end of `H` has spent all of `H`
@@ -2626,25 +3234,6 @@ mod tests {
              or a pre-deferral pin would be a safe fix and this test is \
              recording a constraint that no longer exists"
         );
-    }
-
-    /// The worst-case span between a record being routed and its flush pinning
-    /// an ingest hour, recomputed from `config`, as
-    /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` was derived.
-    /// - the oldest a buffer with no strict waiter gets before its age trigger
-    ///   fires: `max_flush_delay_idle`, or, with a non-zero
-    ///   `idle_flush_byte_floor`, the sub-floor hold (ADR-1737), whichever is
-    ///   longer. `ravel-server` refuses an idle ceiling below
-    ///   `max_flush_delay`, so this is the validated worst case.
-    /// - one `flush_tick`: the trigger is evaluated on a tick, not at the
-    ///   instant the threshold is crossed.
-    ///
-    /// The queued-flush cap's deferral is a third term this does not include
-    /// and no configured value bounds (issue #1916);
-    /// `a_deferred_flush_can_overrun_the_flush_bound_slack` measures it.
-    fn routing_to_pin_bound_ns(config: &IngestConfig) -> i64 {
-        let idle_ns = config.max_flush_delay_idle.as_nanos() as i64;
-        idle_ns.max(sub_floor_hold_ns(config)) + config.flush_tick.as_nanos() as i64
     }
 
     /// The age threshold the shard actor applies to an empty-waiter buffer

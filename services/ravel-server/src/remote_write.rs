@@ -383,8 +383,12 @@ fn write_error_response(err: WriteError) -> Response {
     // The buffer-budget shed (ADR-0069) is admission backpressure, not a
     // durability failure: 429 + `Retry-After`, matching the byte-rate
     // rejection and the in-flight shed, rather than the 503 the other
-    // retryable write failures take.
-    if matches!(err, WriteError::BufferBudgetExceeded) {
+    // retryable write failures take. A shard at the flush deferral cap refuses
+    // before buffering too, so it takes the same answer.
+    if matches!(
+        err,
+        WriteError::BufferBudgetExceeded | WriteError::DeferralCapReached
+    ) {
         let mut response = (StatusCode::TOO_MANY_REQUESTS, err.to_string()).into_response();
         if let Ok(value) =
             HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string())
@@ -652,6 +656,19 @@ mod tests {
     use crate::ingest_concurrency::IngestConcurrencyLimit;
 
     use super::*;
+
+    /// A write refused at the flush deferral cap takes the budget shed's 429
+    /// with `Retry-After`, not the 503 the other retryable failures take,
+    /// while an `Abandoned` (the outcome-unknown answer a stripped strict
+    /// waiter gets) stays 503.
+    #[test]
+    fn a_deferral_cap_refusal_is_429_and_an_abandoned_flush_503() {
+        let refused = write_error_response(WriteError::DeferralCapReached);
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(refused.headers().contains_key(RETRY_AFTER_HEADER));
+        let abandoned = write_error_response(WriteError::Abandoned("x".into()));
+        assert_eq!(abandoned.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     #[test]
     fn points_dropped_does_not_double_count_native_histograms() {

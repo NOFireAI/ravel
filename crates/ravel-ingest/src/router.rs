@@ -15,6 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::budget::{BufferBudgetCeiling, IngestByteBudget, IngestByteBudgetLimit};
 use crate::clock::Clock;
 use crate::config::IngestConfig;
+use crate::deferral::DeferralCapFlag;
 use crate::error::WriteError;
 use crate::generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed, load_generations};
 use crate::metrics::IngestMetrics;
@@ -54,6 +55,11 @@ struct ShardHandle {
     /// incarnation would narrow the guarantee to one actor's lifetime, which is
     /// exactly the window a respawn ends.
     flush_floor_ns: Arc<AtomicI64>,
+    /// The shard's at-cap flag (ADR-1642 deferral cap amendment), set and
+    /// cleared by whichever incarnation of the actor is live. The router reads
+    /// it before enqueue, which is the only place a buffered-mode write can be
+    /// refused, since that write is acknowledged at enqueue.
+    cap_flag: DeferralCapFlag,
 }
 
 /// Supervisor state guarded together so a death observation, the respawn that
@@ -82,7 +88,11 @@ struct ShardInner {
 }
 
 impl ShardHandle {
-    fn new(tx: mpsc::Sender<ShardMsg>, flush_floor_ns: Arc<AtomicI64>) -> Self {
+    fn new(
+        tx: mpsc::Sender<ShardMsg>,
+        flush_floor_ns: Arc<AtomicI64>,
+        cap_flag: DeferralCapFlag,
+    ) -> Self {
         ShardHandle {
             inner: Mutex::new(ShardInner {
                 tx,
@@ -92,6 +102,7 @@ impl ShardHandle {
                 condemned: false,
             }),
             flush_floor_ns,
+            cap_flag,
         }
     }
 
@@ -250,6 +261,7 @@ impl IngestRouter {
                         // One flush-open floor per shard index, shared with
                         // every later incarnation of this actor (ADR-1307).
                         let flush_floor_ns = Arc::new(AtomicI64::new(0));
+                        let cap_flag = DeferralCapFlag::new(config.flush_deferral_cap_ns());
                         let actor = ShardActor::new(
                             shard,
                             signal,
@@ -263,11 +275,12 @@ impl IngestRouter {
                             rx,
                             Arc::clone(&flush_floor_ns),
                             backstop_ceiling.clone(),
+                            cap_flag.clone(),
                             #[cfg(feature = "stage-timing")]
                             Arc::clone(&stage_timings),
                         );
                         tokio::spawn(actor.run());
-                        ShardHandle::new(tx, flush_floor_ns)
+                        ShardHandle::new(tx, flush_floor_ns, cap_flag)
                     })
                     .collect()
             }
@@ -524,6 +537,33 @@ impl IngestRouter {
         shard_ids.sort_unstable();
         shard_ids.dedup();
 
+        // The flush deferral cap (ADR-1642 deferral cap amendment): refuse the
+        // whole write before any shard is sent anything if one of its shards
+        // has a flush deferred for the whole cap. This is the only refusal a
+        // buffered-mode write can get, since it is acknowledged at enqueue. A
+        // dead shard is checked first, so a deferral its actor published
+        // before dying cannot hide the death, and only an observed death
+        // respawns it.
+        for &shard in &shard_ids {
+            let handle = &set[shard as usize];
+            let (shard_tx, incarnation) = handle.send_target();
+            if shard_tx.is_closed() {
+                self.observe_shard_death(shard, handle, incarnation);
+                return Err(WriteError::ShardUnavailable);
+            }
+        }
+        let now_ns = self.clock.now_ns();
+        if let Some(&capped) = shard_ids
+            .iter()
+            .find(|&&shard| set[shard as usize].cap_flag.reached(now_ns))
+        {
+            self.metrics.record_deferral_cap_refused();
+            set[capped as usize]
+                .cap_flag
+                .note_refusal(self.signal, capped);
+            return Err(WriteError::DeferralCapReached);
+        }
+
         // Parallel to `ack_rxs`: the (shard, incarnation) each receiver belongs
         // to, so a closed ack channel is attributed to the right shard and to
         // the exact actor incarnation this request sent on (issue #1299), and
@@ -684,7 +724,11 @@ impl IngestRouter {
         inner.respawns += 1;
         inner.last_respawn_ns = now_ns;
         inner.incarnation += 1;
-        inner.tx = self.spawn_shard_actor(shard, Arc::clone(&handle.flush_floor_ns));
+        inner.tx = self.spawn_shard_actor(
+            shard,
+            Arc::clone(&handle.flush_floor_ns),
+            handle.cap_flag.clone(),
+        );
     }
 
     /// Spawn a replacement actor for `shard` with a fresh writer identity and
@@ -701,6 +745,7 @@ impl IngestRouter {
         &self,
         shard: u32,
         flush_floor_ns: Arc<AtomicI64>,
+        cap_flag: DeferralCapFlag,
     ) -> mpsc::Sender<ShardMsg> {
         let writer_id = self.rng.new_uuid();
         let epoch =
@@ -719,6 +764,7 @@ impl IngestRouter {
             rx,
             flush_floor_ns,
             self.backstop_ceiling.clone(),
+            cap_flag,
             #[cfg(feature = "stage-timing")]
             Arc::clone(&self.stage_timings),
         );

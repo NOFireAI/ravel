@@ -23,6 +23,12 @@ pub enum LogWriteError {
     /// exhausted its retry budget, or `max_flush_lifetime` elapsed first.
     /// Per docs/consistency-model.md, nothing in this flush was acknowledged
     /// so retrying the whole write is safe.
+    ///
+    /// Also the outcome-unknown answer for a waiter taken off a buffer whose
+    /// records stay buffered (a flush the clock checks refused at flush open,
+    /// or a strict waiter on a buffer whose deferral reached the flush
+    /// deferral cap): a later flush writes those records, so a retry stores
+    /// them twice.
     #[error("flush abandoned: {0}")]
     Abandoned(String),
     /// Building the RLOG object failed (a deterministic input problem, e.g.
@@ -63,9 +69,19 @@ pub enum LogWriteError {
     /// request's estimated buffered bytes would exceed it, so it is shed before
     /// any buffering, with no shard touched and no commit token issued.
     /// Retryable: a buffer slot frees as soon as any in-flight flush completes.
-    /// The gateway maps it to HTTP 429 / gRPC `RESOURCE_EXHAUSTED`.
+    /// The gateway maps it to HTTP 429 / gRPC `RESOURCE_EXHAUSTED`. The byte
+    /// budget is the only cause: a shard at the flush deferral cap answers
+    /// with [`Self::DeferralCapReached`] instead.
     #[error("ingest buffer byte budget reached")]
     BufferBudgetExceeded,
+    /// A log shard this write routes to has a flush that has stayed deferred
+    /// for the whole flush deferral cap, so the write is refused before
+    /// anything is buffered, in either write mode; the log-side counterpart of
+    /// [`crate::WriteError::DeferralCapReached`]. Retryable: the shard accepts
+    /// again once its deferred flushes have opened. The gateway maps it to
+    /// HTTP 429 with `Retry-After` / gRPC `RESOURCE_EXHAUSTED`.
+    #[error("ingest shard flush deferral cap reached")]
+    DeferralCapReached,
     /// A multi-shard Strict write in which at least one shard failed *after*
     /// one or more sibling shards had already acked their commit durably in
     /// the same [`LogIngestRouter::write`](crate::LogIngestRouter::write) call
@@ -104,7 +120,8 @@ impl LogWriteError {
             | LogWriteError::AckTimeout
             | LogWriteError::Abandoned(_)
             | LogWriteError::StaleProvisioningView
-            | LogWriteError::BufferBudgetExceeded => true,
+            | LogWriteError::BufferBudgetExceeded
+            | LogWriteError::DeferralCapReached => true,
             LogWriteError::SegmentBuild(_)
             | LogWriteError::StreamIdCollision(_)
             | LogWriteError::MixedBufferRepresentation(_) => false,

@@ -10,6 +10,7 @@ mod attribution;
 mod budget;
 mod clock;
 mod config;
+mod deferral;
 mod error;
 mod generation;
 mod idempotency;

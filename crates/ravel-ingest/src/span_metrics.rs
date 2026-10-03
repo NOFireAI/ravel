@@ -161,6 +161,10 @@ pub struct SpanIngestMetrics {
     /// docs/consistency-model.md). The metrics and log pipelines keep the
     /// same counter.
     partial_writes: AtomicU64,
+    /// Writes refused at the flush deferral cap
+    /// ([`crate::SpanWriteError::DeferralCapReached`]), the span-side copy of
+    /// [`crate::IngestMetrics`]'s counter of the same name.
+    deferral_cap_refused: AtomicU64,
     /// Flushes failed closed on a stale provisioning view (ADR-0052 section 3),
     /// the span-pipeline counterpart of `IngestMetrics::stale_provisioning_flushes`.
     stale_provisioning_flushes: AtomicU64,
@@ -257,6 +261,9 @@ pub struct SpanIngestMetricsSnapshot {
     /// [`crate::SpanWriteError::PartialWrite`] (issue #1130): a partial
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
+    /// Writes refused at the flush deferral cap. Exported as
+    /// `ravel_ingest_deferral_cap_refused_total`.
+    pub deferral_cap_refused: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
     /// Sum across shards of [`SpanIngestMetrics::in_flight_flushes_by_shard`]
@@ -502,6 +509,11 @@ impl SpanIngestMetrics {
         self.partial_writes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One write refused at the flush deferral cap.
+    pub(crate) fn record_deferral_cap_refused(&self) {
+        self.deferral_cap_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Adjusts shard `shard`'s in-flight-flush gauge by `delta`. Both deltas
     /// belong to `span_shard`'s `InFlightFlushGuard`: +1 in its constructor, -1
     /// in its `Drop`, including on panic. Nothing else may call this, or the
@@ -585,6 +597,7 @@ impl SpanIngestMetrics {
                 .load(Ordering::Relaxed),
             flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
+            deferral_cap_refused: self.deferral_cap_refused.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
             in_flight_flushes_total: self
@@ -741,6 +754,13 @@ mod tests {
             SpanIngestMetrics::record_partial_write,
             SpanIngestMetricsSnapshot {
                 partial_writes: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            SpanIngestMetrics::record_deferral_cap_refused,
+            SpanIngestMetricsSnapshot {
+                deferral_cap_refused: 1,
                 ..Default::default()
             },
         );

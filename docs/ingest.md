@@ -192,19 +192,45 @@ smaller range is a subset of the new one.
 
 The queued-flush cap adds a term `S` does not include. A shard at
 `max_queued_flushes` refuses its size and age triggers and leaves the rows
-buffered, while the ingest-hour bucket is pinned from a clock reading taken
-after that refusal, so a deferred flush's records land in a later ingest hour
-than their routing by the length of the deferral as well. One deferral round
-waits for a queued flush to leave the shard's `JoinSet`, which under a stalled
-store takes up to `max_flush_lifetime`, and `flush_aged` retries due tenants in
-`HashMap` order with no fairness, so nothing bounds the number of rounds. At
-today's defaults one round alone puts the worst case at `40s + 3600s + 3600s =
-7240s`, past the 7200s `FLUSH_BOUND_SLACK_HOURS` allows;
-`ravel_ingest::shard::tests::a_deferred_flush_can_overrun_the_flush_bound_slack`
-measures that on a live shard actor, deferring three ingest hours against the
-two-hour constant. So a straggler deferred at the cap during a shard-count
-decrease can land in an ingest hour the retiring generation's scan set no
-longer covers.
+buffered, while the ingest-hour bucket is pinned from the clock reading taken
+when the flush finally opens, so a deferred flush's records land in a later
+ingest hour than their routing by the length of the deferral as well. One
+deferral round waits for a queued flush to leave the shard's `JoinSet`, which
+under a stalled store takes up to `max_flush_lifetime`, and a deferral can take
+any number of rounds. Left unbounded, a straggler deferred at the cap during a
+shard-count decrease could land in an ingest hour the retiring generation's
+scan set no longer covers.
+
+The flush deferral cap bounds it for every acknowledged strict-mode write
+(ADR-1642 deferral cap amendment). `IngestConfig::flush_deferral_cap_ns` is
+`S`'s flush term less `max_flush_lifetime` less
+`IngestConfig::flush_trigger_age_bound_ns`, the largest age any buffer reaches
+before its flush trigger fires leaving out the sub-floor hold: the largest of
+`max_flush_delay`, `max_flush_delay_idle` and (when adaptive delay is on) the
+adaptive corridor's widest ceiling, `strict_visibility_budget_ns` less one
+`put_retry_base_delay`, plus one `flush_tick`:
+`7200s - 3600s - (40s + 0.2s) = 3559.8s` at the defaults, whatever
+`idle_flush_byte_floor` holds, since the sub-floor hold is not a term. For a
+buffered row outside that hold the cap bounds when the refusal starts: before
+the row could open its flush too late for `S`. Buffered rows held under a
+non-zero `idle_flush_byte_floor`, and rows of a strict write that already
+timed out (`AckTimeout`), are not bounded by the cap. Each tenant buffer
+records when its trigger was first refused, and each shard publishes its oldest such deferral to the router. A strict
+waiter on a buffer whose deferral has reached the cap is answered with the
+outcome-unknown `Abandoned` (503) instead of an ack, and its rows are still
+written by the flush that opens past the cap. While the shard's oldest
+deferral is at the cap the router refuses every write routed to it before enqueue, in both write modes, with the
+retryable `DeferralCapReached` (429 / `RESOURCE_EXHAUSTED`, counted on
+`ravel_ingest_deferral_cap_refused_total`), and the shard refuses a strict
+append that was enqueued just before. It accepts again once its deferred
+flushes have opened. A shard whose actor has died is checked before the cap,
+so it answers `ShardUnavailable` (and a metrics shard is respawned) rather
+than refusing at the cap, and each actor clears its deferral start when it
+exits. Deferred buffers are always due and retry oldest deferral first.
+`ravel_ingest::shard::tests::a_deferred_flush_is_never_acked_past_the_flush_bound_slack`
+holds the bound on a live shard actor. What the cap does not bound is a
+buffered-mode row acknowledged before its shard reached the cap: that buffer
+still waits for a queue slot for as long as the stall lasts.
 
 Neither obvious fix is available, and the reason is worth stating so it is not
 re-tried. Raising `FLUSH_BOUND_SLACK_HOURS` does not work: it is a frozen
@@ -229,8 +255,8 @@ was written without it, and the fold watermark only moves forward. The
 seal-divergence check classifies it `missing`, and that check detects and
 reports, never repairs.
 `ravel_ingest::shard::tests::carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour`
-holds that arithmetic against the catalog's own margin constants. What closes
-the gap is bounding the deferral itself, which is open.
+holds that arithmetic against the catalog's own margin constants, which is why
+the deferral is bounded instead.
 
 Operationally: do **not** decrease `shard_count` and immediately assume every
 prior write is now under the new, narrower range. For `S` hours past the
@@ -543,6 +569,12 @@ The cost is deadline, not durability: a deferred age trigger misses
 Strict-mode writers behind those
 queued flushes stay unacked for the duration; buffered-mode writers were acked
 at enqueue and their data stays invisible to queries until the flush commits.
+The duration is bounded by the flush deferral cap (see "Generation live
+switch" above): once a shard's oldest deferral reaches it, its waiting strict
+writers are answered `Abandoned` with their rows still buffered, and new
+writes to the shard are refused with `DeferralCapReached` until the deferred
+flushes open, counted on `ravel_ingest_deferral_cap_refused_total` by
+`{mode, signal}`.
 
 One trigger is exempt, and the queue can exceed `max_queued_flushes` because
 of it: a tenant buffer that has crossed its per-(shard, tenant) memory
@@ -949,7 +981,10 @@ others charge honestly. If the charge would push the gauge past the ceiling
 is shed *before* buffering: no shard is touched, no commit token is minted,
 the shed counter increments, and the caller gets HTTP 429 with `Retry-After`
 (gRPC `RESOURCE_EXHAUSTED`), exactly like the layer-2 byte-rate rejection and
-the in-flight shed. The charge is an RAII guard cloned into every shard
+the in-flight shed. The flush deferral cap's refusal (`DeferralCapReached`,
+see "Generation live switch" above) gets the same 429 but is a
+different error with its own counter, `ravel_ingest_deferral_cap_refused_total`;
+this shed is the byte budget alone. The charge is an RAII guard cloned into every shard
 message the request fans out to; each shard buffer holds its clones and moves
 them into the flush, and the guard refunds the exact charged amount when the
 last buffer holding any of the request's bytes flushes (or its flush fails or

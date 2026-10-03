@@ -243,6 +243,12 @@ pub struct IngestMetrics {
     /// user-visible duplication; see docs/consistency-model.md). The logs and
     /// span pipelines keep the same counter.
     partial_writes: AtomicU64,
+    /// Writes refused because a shard they route to had reached the flush
+    /// deferral cap (`WriteError::DeferralCapReached`, ADR-1642 deferral cap
+    /// amendment), by the router before enqueue or by the shard on a strict
+    /// append. Once per refused write at the router, once per refused shard
+    /// message at the actor. The log and span pipelines keep the same counter.
+    deferral_cap_refused: AtomicU64,
     /// Exemplars written into a flushed object's EXEMPLARS section
     /// (ADR-0047). Attempt-time, like `flushes_by_*`: counted when the flush
     /// is built, so a flush later abandoned counts here too.
@@ -744,6 +750,10 @@ pub struct IngestMetricsSnapshot {
     /// (issue #1130): a partial multi-shard commit. Exported as
     /// `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
+    /// Writes refused at the flush deferral cap
+    /// (`WriteError::DeferralCapReached`). Exported as
+    /// `ravel_ingest_deferral_cap_refused_total`.
+    pub deferral_cap_refused: u64,
     pub shard_deaths: u64,
     /// Shards condemned after exhausting their respawn budget (issue #1299).
     /// Nonzero drives `IngestRouter::ready` false so `/readyz` turns 503.
@@ -1050,6 +1060,11 @@ impl IngestMetrics {
         self.partial_writes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One write refused at the flush deferral cap.
+    pub(crate) fn record_deferral_cap_refused(&self) {
+        self.deferral_cap_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One flush's exemplar outcome: `written` reached the object's EXEMPLARS
     /// section, `dropped` did not (no parent sample in the flush, or lost the
     /// flush-scoped window cap).
@@ -1144,6 +1159,7 @@ impl IngestMetrics {
                 .load(Ordering::Relaxed),
             flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
+            deferral_cap_refused: self.deferral_cap_refused.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             shards_condemned: self.shards_condemned.load(Ordering::Relaxed),
             exemplars_written_total: self.exemplars_written_total.load(Ordering::Relaxed),
@@ -1198,6 +1214,7 @@ mod tests {
         metrics.record_clock_lag_bypassed_at_shutdown();
         metrics.record_flush_all_residue(2);
         metrics.record_partial_write();
+        metrics.record_deferral_cap_refused();
         metrics.record_shard_death();
         metrics.record_shard_condemned();
         metrics.record_exemplars(2, 5);
@@ -1223,6 +1240,7 @@ mod tests {
         assert_eq!(snap.clock_lag_bypassed_at_shutdown, 1);
         assert_eq!(snap.flush_all_residue_tenants, 2);
         assert_eq!(snap.partial_writes, 1);
+        assert_eq!(snap.deferral_cap_refused, 1);
         assert_eq!(snap.shard_deaths, 1);
         assert_eq!(snap.shards_condemned, 1);
         assert_eq!(metrics.condemned_shards(), 1);

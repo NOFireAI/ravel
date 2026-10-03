@@ -218,6 +218,22 @@ below the floor, since that is what the tick-inclusive worst case now is, and
 no flush-count band in the Consequences moves: a buffer held for 3,599.8 s
 instead of 3,600 s still flushes 24 times a day.
 `ravel_ingest::shard::tests::a_deferred_flush_can_overrun_the_flush_bound_slack`
+(renamed since, see the slack test amendment below)
 asserts both halves in nanoseconds against the shipped config: the hold plus
 one tick is at most `max_flush_lifetime`, and that sum plus
 `max_flush_lifetime` is at most `FLUSH_BOUND_SLACK_HOURS`.
+
+## Amendment (2026-10-03, #1916): the slack test was renamed
+
+<!-- amendment-supersedes: phrase="`ravel_ingest::shard::tests::a_deferred_flush_can_overrun_the_flush_bound_slack`" pointer="slack test amendment" -->
+
+The test the amendment above names is now
+`ravel_ingest::shard::tests::a_deferred_flush_is_never_acked_past_the_flush_bound_slack`.
+ADR-1642's deferral cap amendment bounded the queued-flush deferral the old
+name measured, and inverted the test to assert that no strict write is
+acknowledged past the slack. It still asserts both halves of this ADR's
+derivation against the shipped config: the sub-floor hold plus one tick is at
+most `max_flush_lifetime`, and that sum plus `max_flush_lifetime` is at most
+`FLUSH_BOUND_SLACK_HOURS`. Nothing in this ADR's decisions changes. The
+deferral cap does not take the sub-floor hold into account, because a buffer
+holding a strict-mode waiter never waits it out.

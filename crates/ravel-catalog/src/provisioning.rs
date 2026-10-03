@@ -443,23 +443,34 @@ pub const MAX_SHARD_COUNT: u32 = 10_000;
 /// ADR-0052 section 3 formula (below) are each named and independently
 /// reviewable, rather than folded into one unexplained literal.
 ///
-/// A third term is now reachable and this constant does NOT cover it. Issue
+/// A third term is reachable and this constant does not absorb it. Issue
 /// #1740 added a per-shard queued-flush cap to `ravel-ingest`: at the cap a
 /// size or age trigger is refused and the rows stay buffered, while the
-/// ingest-hour bucket is pinned from the clock reading taken after that
-/// refusal, so a deferred flush's records land in a later ingest hour than
-/// their routing. One deferral round waits for a queued flush to leave the
+/// ingest-hour bucket is pinned from the clock reading taken when the flush
+/// finally opens, so a deferred flush's records land in a later ingest hour
+/// than their routing. A deferral waits for a queued flush to leave the
 /// shard's `JoinSet`, which under a stalled store takes up to
-/// `max_flush_lifetime`, and nothing makes the retry fair, so nothing bounds
-/// the number of rounds. At today's defaults one round alone gives
-/// `40s + 3600s + 3600s = 7240s`, past the 7200s this constant allows, and
-/// with a non-zero `idle_flush_byte_floor` it gives `3600s + 3600s + 3600s`.
-/// `ravel_ingest::shard::tests::a_deferred_flush_can_overrun_the_flush_bound_slack`
-/// measures that overrun against a live shard actor, deferring three ingest
-/// hours against this two-hour constant.
+/// `max_flush_lifetime` per round, and it can take any number of rounds.
 ///
-/// The constant is deliberately left alone here, and so is the pin. Raising
-/// this number is not the fix: it is a frozen read-side contract, and no fixed
+/// Ingest bounds that term instead, with its flush deferral cap
+/// (`ravel_ingest::IngestConfig::flush_deferral_cap_ns`, the ADR-1642
+/// deferral cap amendment): this slack less `max_flush_lifetime` less the
+/// largest age any buffer reaches before its flush trigger fires, leaving out
+/// the sub-floor hold (the largest of `max_flush_delay`,
+/// `max_flush_delay_idle` and the adaptive corridor's widest ceiling, plus
+/// one `flush_tick`), 3559.8s at today's defaults. A strict-mode waiter is
+/// never acknowledged from a flush that opens past the cap, and a shard whose
+/// oldest deferral reaches it refuses new writes in both write modes until
+/// its deferred flushes open, so every acknowledged strict-mode row keeps its
+/// routing-to-pin span plus the flush lifetime inside this slack, and the
+/// refusal starts before a deferred buffered row outside the sub-floor hold
+/// could open its flush too late for it. A buffered-mode row acknowledged
+/// before its shard reached the cap is not covered: its buffer still waits
+/// for a queue slot for as long as the stall lasts. `ravel_ingest::shard::tests::a_deferred_flush_is_never_acked_past_the_flush_bound_slack`
+/// holds the strict-mode bound against a live shard actor.
+///
+/// The constant is deliberately left alone, and so is the pin. Raising this
+/// number is not the fix: it is a frozen read-side contract, and no fixed
 /// value bounds an unbounded number of deferral rounds. Pinning the bucket
 /// before the cap check and carrying it across the deferral is not the fix
 /// either, and is worse, because it spends the deferral out of the sealed-hour
@@ -468,8 +479,7 @@ pub const MAX_SHARD_COUNT: u32 = 10_000;
 /// when the flush opens). A record past this slack is invisible to the
 /// retiring generation of a shard-count decrease; a record in a sealed hour is
 /// never read again at all, since resolution starts its listing above the
-/// watermark and the fold never revisits a sealed hour. What closes the gap is
-/// bounding the deferral itself, which is open on issue #1916;
+/// watermark and the fold never revisits a sealed hour.
 /// `ravel_ingest::shard::tests::carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour`
 /// holds that arithmetic against this crate's own margin constants.
 ///
