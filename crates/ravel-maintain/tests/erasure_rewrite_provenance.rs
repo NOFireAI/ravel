@@ -12,9 +12,10 @@
 //! verbatim by compaction), and a native histogram series. It is resolved by
 //! [`resolve`], which mirrors the query fetcher's provenance rule, in three
 //! states: the raw L0 inputs, the compaction record, and the rewrite record
-//! that erased an unrelated series. Then a later commit from a fifth writer
-//! duplicates three of those timestamps, and the winner must be the same
-//! whether that commit is resolved against the compaction or the rewrite.
+//! that erased an unrelated series or part of a merged one. Then later commits
+//! from two more writers duplicate contested timestamps, one winning and one
+//! losing each, and the winner must be the same whether those commits are
+//! resolved against the compaction or the rewrite.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -121,6 +122,8 @@ enum Resolved {
 
 type Priority = (i64, u64, u64, u32);
 type Resolution = BTreeMap<([u8; 16], i64), Resolved>;
+/// One flush's series, each with its labels and samples.
+type Batch = Vec<(SeriesId, LabelSet, SeriesValues)>;
 
 /// How the query fetcher stamps a segment's samples: an L0 object by its commit
 /// record, an L1 or rewrite part by each run's own catalog provenance or, when
@@ -181,11 +184,7 @@ fn bits(v: f64) -> u64 {
 
 /// Seed one single-run-per-series L0 object and its commit record, with every
 /// run stamped by `w`'s commit identity. Returns the data object key.
-async fn seed_l0(
-    store: &dyn ObjectStoreBackend,
-    w: Writer,
-    batch: Vec<(SeriesId, LabelSet, SeriesValues)>,
-) -> String {
+async fn seed_l0(store: &dyn ObjectStoreBackend, w: Writer, batch: Batch) -> String {
     let th = tenant_hash();
     let mut inputs: Vec<SeriesInputV4> = batch
         .into_iter()
@@ -266,7 +265,7 @@ async fn seed_l0(
 /// The original four flushes. Seeded W3, W1, W4, W2, so the last write seeded
 /// is the lowest priority, and the winner at each duplicate is set by a
 /// different component of the dedup key.
-fn original_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> {
+fn original_flushes() -> Vec<(Writer, Batch)> {
     vec![
         (
             W3,
@@ -323,7 +322,7 @@ fn original_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> 
 /// The later commits: W5 adds one more duplicate on a merged scalar run, a
 /// verbatim single-writer run, and a merged histogram run, and wins each; W6
 /// duplicates a timestamp on each of those runs and on `beta`, and loses each.
-fn later_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> {
+fn later_flushes() -> Vec<(Writer, Batch)> {
     vec![
         (
             W5,

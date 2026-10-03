@@ -7177,8 +7177,8 @@ mod tests {
     /// and timestamps intact.
     ///
     /// Flip-line proof: this fails against the pre-fix code. Reverting
-    /// `build_rewrite_part`'s `write_v5_with_exemplars(..., exemplars)` back to
-    /// `write_v5_with_exemplars(..., Vec::new())` drops every exemplar, so
+    /// `build_rewrite_part`'s `write_v7_with_provenance(..., exemplars)` back to
+    /// `write_v7_with_provenance(..., Vec::new())` drops every exemplar, so
     /// `read_output_exemplars` returns an empty vec and the `expected` (3
     /// records) assertion fails. That is the exact line the pre-fix bug lived
     /// on.
@@ -7328,7 +7328,7 @@ mod tests {
     /// Flip-line proof: an implementation that carries everything (deleting the
     /// whole exemplar filter in `build_rewrite`, both the `surviving_series`
     /// guard and the per-record predicate) hands `alpha`'s exemplar -- naming a
-    /// series absent from the output -- to `write_v5_with_exemplars`, which
+    /// series absent from the output -- to `write_v7_with_provenance`, which
     /// fails with `WriteError::ExemplarUnknownSeries`; the rewrite then errors
     /// and the `.expect("rewrite")` below panics.
     ///
@@ -7527,7 +7527,7 @@ mod tests {
     ///
     /// With the guard, `alpha`'s exemplar is dropped (its series is absent from
     /// `surviving_series`) and only `beta`'s survives. Without the guard, the
-    /// predicate keeps `alpha`'s exemplar, `write_v5_with_exemplars` is handed a
+    /// predicate keeps `alpha`'s exemplar, `write_v7_with_provenance` is handed a
     /// record naming a series absent from the output part, and it fails with
     /// `WriteError::ExemplarUnknownSeries` -- the rewrite errors and the
     /// `.expect("rewrite")` below panics. Deleting the guard leaves the four
