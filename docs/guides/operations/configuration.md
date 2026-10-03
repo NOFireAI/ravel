@@ -1305,24 +1305,66 @@ raising this ceiling adds breadth across prefixes and never depth within one.
 Three more settings are derived the same way: `--cache-max-bytes` (fetcher
 cache, 25% normally or 40% against a loopback `--s3-endpoint`),
 `--catalog-cache-max-bytes` (catalog byte cache, always a separate 5%
-ceiling; 256 MiB each if memory is unknown) and `--gc-max-query-duration` (11
+ceiling; 256 MiB each if memory is unknown and `--memory-budget-bytes` is
+unset) and `--gc-max-query-duration` (11
 minutes). Each cache flag bounds only its own cache; setting one never
 changes the other. Memory is read from `/proc/meminfo`'s
 `MemTotal` on Linux and is "unknown" everywhere else; cores come from the
 process's available parallelism, floored at 1. Percentages truncate.
 
 Unlike the two SQL ceilings above, `--cache-max-bytes` does not derive from
-raw `MemTotal`: it derives from a process-wide memory budget, itself
-`MemTotal` (capped by the cgroup memory limit) minus a fixed 2 GiB overhead
-reserve for the allocator and everything outside this accounting. Whatever
-of that budget the two resolved cache ceilings do not claim sizes a shared
-memory accountant the SQL executor's per-tenant tracking reserves against, so
-raising `--cache-max-bytes` on a memory-constrained host leaves less headroom
-for concurrent SQL queries even though the two are configured by separate
-flags. This budget, its two carves, and the remainder are computed once at
-startup from the host profile observed at that moment; nothing about it
-changes while the process runs, and a container whose cgroup limit changes
-later is not noticed until the next restart. Startup refuses outright when
+raw `MemTotal`: it derives from a process-wide memory budget, which starts
+from available memory rather than raw total whenever that is possible: with
+no cgroup memory limit
+and a readable `MemAvailable` (Linux's own `/proc/meminfo` estimate of memory
+a new allocation could claim without swapping), the budget is
+`min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`,
+every subtraction saturating at zero. `RESERVE` is the same fixed 2 GiB
+overhead reserve as before; `FLOOR` is a 1 GiB floor under the
+`MemAvailable + own RSS - RESERVE` term only, not under the final budget:
+binding it logs at `WARN` with the `MemAvailable` reading that hit it and
+`--memory-budget-bytes` named as the remedy, but the outer `min` against
+`MemTotal - RESERVE` keeps the final budget at or below the pre-amendment
+figure, so a host whose `MemTotal` is at or below the reserve still derives
+0 and is refused at startup, as before.
+The process's own resident set counts as available because the kernel does
+not call a process's own resident pages "available" even though this
+process may reuse them rather than compete with them. A cgroup memory
+limit, when present, keeps the pre-amendment rule instead: the limit is
+already this process's whole share, so a whole-host `MemAvailable` would
+only be wrong to consult, and the budget is that limit minus the reserve.
+With no cgroup limit, a readable `MemTotal`, and no readable `MemAvailable`
+(an unusual Linux kernel or container runtime whose `/proc/meminfo` parses
+`MemTotal` but not `MemAvailable`), the budget is `MemTotal` minus the
+reserve, same as before the amendment. A host with neither a readable
+`MemTotal` nor a cgroup limit (every non-Linux build, or a Linux host with no
+cgroup limit whose `/proc/meminfo` cannot be read) derives no budget at all:
+the budget is unlimited, same as before this amendment existed. When
+`/proc/meminfo` cannot be read but a cgroup limit is set, the limit is the
+memory figure and the source is `derived-cgroup`. Set `--memory-budget-bytes` to
+override every one of these branches outright; it still goes through the
+same startup refusal as a derived budget (below). This is the one setting
+to reach for on a host where this process shares memory with another one it
+cannot see: the available-memory derivation reads `MemAvailable` once at
+startup and cannot anticipate a sibling process claiming memory afterward.
+Whatever of the resulting budget the two resolved cache ceilings do not
+claim sizes a shared memory accountant the SQL executor's per-tenant
+tracking reserves against, so raising `--cache-max-bytes` on a
+memory-constrained host leaves less headroom for concurrent SQL queries
+even though the two are configured by separate flags. A derived (not
+explicit-flag) `--sql-max-query-bytes` or `--sql-tenant-max-bytes` is
+additionally held at or below 90% of that remainder: the two SQL ceilings
+above derive from raw `MemTotal` and so can otherwise outrun what the
+budget actually leaves once the caches are carved out. The cap binds on
+every deployment whose store is on loopback, where the 40% fetch-cache share
+leaves a remainder whose 90% is below 50% of `MemTotal`. It also binds on an
+S3 deployment whose effective memory is below about 9.7 GiB, cgroup pods
+included, and on a host with co-resident processes where available memory is
+well below total. An explicit flag on either is never capped this way. This budget, its two
+cache carves, the SQL cap, and the remainder are computed once at startup
+from the host profile observed at that moment; nothing about it changes
+while the process runs, and a container whose cgroup limit or available
+memory changes later is not noticed until the next restart. Startup refuses outright when
 the two cache ceilings leave no strictly positive remainder, naming both
 figures; `--disable-cache` is exempt, because a process that builds neither
 cache claims nothing against the budget and the remainder is all of it.
@@ -1374,12 +1416,19 @@ Every resolved value is logged once at startup with the source it came from:
 `flag` (the operator set it, used verbatim), `legacy-flag` (no flag for this
 setting, but the legacy `--fetch-concurrency` was set and its value is used),
 `derived` (computed from the host profile, or from a host-independent rule),
-`budget-carve` (a fixed share of `memory_budget_bytes` rather than of raw
-`MemTotal`, which is what the two cache ceilings resolve to on a host whose
-memory could be read), `budget-carve-loopback` (the fetcher cache's larger
-40% share, resolved instead of `budget-carve` when the store is `s3` against
-a loopback endpoint and `--cache-max-bytes` is unset), or `fallback` (no flag
-and no readable `MemTotal`, so the compiled-in constant is used). So
+`derived-available` (`memory_budget_bytes` only: no cgroup limit, derived
+from `MemAvailable` per the available-memory branch above),
+`derived-cgroup` (`memory_budget_bytes` only: a cgroup memory limit is
+present, so the budget is that limit minus the reserve, ignoring
+`MemAvailable`), `budget-carve` (a fixed share of `memory_budget_bytes`
+rather than of raw `MemTotal`, which is what the two cache ceilings resolve
+to on a host whose memory could be read or whose budget was set with
+`--memory-budget-bytes`), `budget-carve-loopback` (the
+fetcher cache's larger 40% share, resolved instead of `budget-carve` when
+the store is `s3` against a loopback endpoint and `--cache-max-bytes` is
+unset), or `fallback` (no flag and no readable `MemTotal`, so the
+compiled-in constant is used). `memory_budget_bytes` resolved with source
+`flag` means `--memory-budget-bytes` won over every derivation branch. So
 `journalctl -u ravel-server | grep
 'performance default resolved'` answers "what is this process actually running
 with" without reading the unit file:
@@ -1396,9 +1445,32 @@ INFO performance default resolved setting="memory_budget_bytes" value=3006477107
 INFO performance default resolved setting="memory_overhead_reserve_bytes" value=2147483648 source="derived"
 INFO performance default resolved setting="memory_hard_caps_bytes" value=9019431321 source="derived"
 INFO performance default resolved setting="memory_remainder_bytes" value=21045339751 source="derived"
-INFO performance default resolved setting="sql_max_query_bytes" value=16106127360 source="derived" clamped=false
-INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived" raised=false
+INFO performance default resolved setting="sql_max_query_bytes" value=16106127360 source="derived" clamped=false remainder_capped=false
+INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived" raised=false remainder_capped=false
 INFO performance default resolved setting="gc_max_query_duration" value_ms=660000 source="derived"
+```
+
+`source="derived"` on `memory_budget_bytes` above means this host's `MemTotal`
+was readable but its `MemAvailable` was not (an unusual Linux kernel or
+container runtime): the budget is plain `MemTotal` minus the reserve, the
+pre-amendment rule. A non-Linux build, or a Linux host with no cgroup limit
+whose `/proc/meminfo` cannot be read, never reaches this source: `MemTotal`
+itself is unknown there, so the source reads `fallback` and the budget is
+unlimited (with a cgroup limit set, that host reads `derived-cgroup` instead),
+regardless of any cache or SQL caps set on it. On a Linux host with a
+readable `MemAvailable` and no cgroup memory limit, the source instead reads
+`derived-available` and the value comes from the available-memory formula above;
+[`docs/internal/clickbench.md`](../../internal/clickbench.md#deriving-the-reference-sizes)
+has a worked example from a real measured host, including the SQL-pool cap at
+90% of the remainder. When a cgroup memory limit is present, the source reads
+`derived-cgroup` and `MemAvailable` is not consulted at all: the limit minus the
+reserve is used directly, unchanged from before the amendment. When
+`MemAvailable` plus this process's own resident set would collapse the budget
+below the 1 GiB floor, one extra line appears inside the block above, after
+the `memory_remainder_bytes` line and before the two SQL pool lines:
+
+```
+WARN memory_budget_bytes was held at MEMORY_BUDGET_FLOOR_BYTES: MemAvailable plus this process's own resident set left little or no room after the overhead reserve, most likely a co-resident process claiming most of the host; the subsequent min against MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES can still clip memory_budget_bytes below this floor, down to 0 on a genuinely tiny host; set --memory-budget-bytes to size the budget explicitly memory_budget_bytes=1073741824 mem_available_bytes=2147483648 own_rss_bytes=0
 ```
 
 The last two flags are meaningful only in a build with the `sql` feature. See
