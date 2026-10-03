@@ -7449,6 +7449,17 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             0,
             "admitted live, so this is the run's bound, not a capability reject"
         );
+        assert_eq!(
+            fx.metrics
+                .fragment_deadline_stops_total(AdmissionClass::Pinned),
+            1,
+            "the stop counts under its own class"
+        );
+        assert_eq!(
+            fx.metrics
+                .fragment_deadline_stops_total(AdmissionClass::Resolve),
+            0
+        );
     }
 
     /// A slice stopped at its expiry reports what it spent before the stop
@@ -7583,6 +7594,136 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             1,
             "the held data GET, counted at issue"
         );
+        assert_eq!(
+            fx.metrics
+                .fragment_deadline_stops_total(AdmissionClass::Resolve),
+            1,
+            "the stop counts under its own class"
+        );
+        assert_eq!(
+            fx.metrics
+                .fragment_deadline_stops_total(AdmissionClass::Pinned),
+            0
+        );
+        assert_eq!(
+            control
+                .metrics
+                .fragment_deadline_stops_by_class()
+                .map(|(_, stops)| stops),
+            [0, 0],
+            "a slice served before its deadline is no stop"
+        );
+    }
+
+    /// A federating coordinator's link to the expiry fixture's peer: every
+    /// Resolve request is answered by the fixture's own `FragmentService` under
+    /// [`PEER_TOKEN`], after its deadline is recorded. The first request costs
+    /// `first_spend`: the coordinator's paused tokio clock and the peer's
+    /// clock both move by it before the peer answers.
+    struct SpendingPeer {
+        service: FragmentService,
+        clock: Arc<SteppedClock>,
+        first_spend: Duration,
+        deadlines: Mutex<Vec<i64>>,
+    }
+
+    #[async_trait]
+    impl SliceFetcher for SpendingPeer {
+        async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+            let first = {
+                let mut deadlines = self.deadlines.lock();
+                deadlines.push(request.deadline_unix_ns);
+                deadlines.len() == 1
+            };
+            if first {
+                tokio::time::sleep(self.first_spend).await;
+                let spent = i64::try_from(self.first_spend.as_nanos()).expect("small");
+                self.clock.set(self.clock.now_ns() + spent);
+            }
+            fetch_decoded(&self.service, request, PEER_TOKEN)
+                .await
+                .map_err(|status| DistribError::Transport(status.to_string()))
+        }
+    }
+
+    /// Issue #2385: every `match[]` selector of one metadata request sends a
+    /// federated peer the request's own wall clock deadline, entry plus the
+    /// request deadline, however much of it earlier selectors spent. The first
+    /// selector spends 3 s of a 5 s deadline, more than half, so a deadline
+    /// counted from the second selector's start with only the 2 s left (entry
+    /// plus 2 s) is already behind the peer's clock (entry plus 3 s): the peer
+    /// refuses it and the request fails `DeadlineExceeded`.
+    ///
+    /// Mutation proof: calling `resolve_series_with_budgets` with the remaining
+    /// time in `resolve_matched_series` again, as before, records entry plus
+    /// 2 s for the second selector and fails the request.
+    #[tokio::test(start_paused = true)]
+    async fn every_metadata_selector_sends_a_federated_peer_the_request_deadline() {
+        let fx = expiry_fixture("metadata-selectors").await;
+        let entry_ns = fx.clock.now_ns();
+        let request_deadline = Duration::from_secs(5);
+        let peer = Arc::new(SpendingPeer {
+            service: fx.service.clone(),
+            clock: fx.clock.clone(),
+            first_spend: Duration::from_secs(3),
+            deadlines: Mutex::new(Vec::new()),
+        });
+        let federation =
+            ravel_query::distrib::Federation::new(vec![ravel_query::distrib::RemoteCluster {
+                name: "peer".to_string(),
+                fetcher: peer.clone(),
+                tenant: None,
+                skip_unavailable: false,
+                soft_timeout: Duration::from_secs(60),
+            }]);
+        let local: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            Arc::new(Catalog::new(local.clone(), CatalogConfig::default()).expect("catalog"));
+        let engine = ravel_query::QueryEngine::new(
+            catalog,
+            local,
+            ravel_query::EngineConfig {
+                deadline: Duration::from_secs(60),
+                ..ravel_query::EngineConfig::default()
+            },
+        )
+        .with_federation(Arc::new(federation));
+        let engine = Arc::new(engine);
+        let controls = ravel_query::http::AppState::new(
+            Arc::clone(&engine),
+            Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+                std::collections::HashMap::new(),
+            )),
+        )
+        .controls();
+        let request = ravel_query::http::MetadataRequest {
+            selectors: vec!["m".to_string(), "{__name__=\"m\"}".to_string()],
+            window: ravel_types::TimeRange {
+                start_ns: 0,
+                end_ns: 2 * HOUR_NS,
+            },
+            min_tokens: Vec::new(),
+            deadline: request_deadline,
+            allow_partial: false,
+            now_ns: entry_ns,
+            budgets: None,
+        };
+
+        let outcome = ravel_query::http::service::series(
+            &controls,
+            &engine,
+            ravel_types::TenantId::new("coordinator".to_string()).hash(),
+            &request,
+        )
+        .await;
+
+        assert_eq!(
+            *peer.deadlines.lock(),
+            vec![entry_ns + 5_000_000_000; 2],
+            "both selectors carry entry plus the 5 s request deadline"
+        );
+        let outcome = outcome.unwrap_or_else(|err| panic!("the request answers: {err:?}"));
+        assert_eq!(outcome.series.len(), 1, "the peer's one series");
     }
 
     /// Issue #2385, the coordinator half: a remote worker that ends a slice
