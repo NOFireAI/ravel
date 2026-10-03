@@ -248,7 +248,11 @@ tenant's cached generation history. That view is trusted for `h` only before
   buffer's rows with the pipeline's own routing function under the count of
   the tenant's current generation and sends each target shard one hand-back
   message, after checking that every target's actor is live (a dead or closed
-  target keeps the whole buffer where it is). The target merges the rows
+  target keeps the whole buffer where it is). A target whose mailbox closes
+  between that check and the send returns its message, and its rows and
+  charges go back into the source buffer for the next flush attempt to retry;
+  the strict waiters were already answered, so nothing is acknowledged twice.
+  The target merges the rows
   without admission or the deferral-cap refusal, keeping their original
   arrival times, and flushes them on its own triggers. Each target carries a
   clone of every ADR-0069 charge the buffer held, so the bytes stay charged
@@ -257,20 +261,33 @@ tenant's cached generation history. That view is trusted for `h` only before
   is in the scan set of every hour its shards pin, so rows are handed back
   again only if another decrease activates first.
 - With no view, or one past its horizon, the flush does not open and the
-  buffer stays as it was. The refusal counts on
-  `ravel_ingest_stale_provisioning_flushes_total`, and the switch starts one
-  background re-read of the tenant's provisioning record; the next trigger
-  retries on the refreshed view.
+  buffer stays as it was. The episode counts once per buffer on
+  `ravel_ingest_stale_provisioning_flushes_total`, however many triggers
+  retry it, and the switch starts one background re-read of the tenant's
+  provisioning record; the next trigger retries on the refreshed view. A
+  drain (`flush_all`, `FlushNow`, shutdown, channel close) does not leave it
+  to the next trigger: it waits for that re-read, joining one already in
+  flight, for at most `max_flush_lifetime`, and then applies the check, so one
+  drain flushes every buffer the re-read confirms. Only a re-read that fails
+  keeps the buffer.
 
-Each pipeline's metrics count hand-backs as `rerouted_flushes` (on the
-`IngestMetrics`, `LogIngestMetrics` and `SpanIngestMetrics` snapshots; not yet
-exported on `/metrics`), and the first hand-back of an episode on a shard logs
-once at WARN. `flush_all` repeats while a pass handed rows back, and
-`shutdown` drains shard sets largest first, so handed-back rows reach a set
-that has not drained yet. A shutdown or channel-close drain that cannot
-confirm the view or reach a target writes the rows in place on its teardown
-bypass passes rather than drop them. `crates/ravel-ingest/tests/scan_set_handback.rs`
-holds this for all three pipelines.
+Each pipeline counts hand-backs as `rerouted_flushes`, exported as
+`ravel_ingest_rerouted_flushes_total` by signal, and the first hand-back of an
+episode on a shard logs once at WARN. A hand-back that finds a target not
+live, or whose send fails, counts once per buffer on
+`ravel_ingest_hand_back_failures_total` and logs once (WARN for metrics, whose
+dead shard the next write respawns; ERROR for logs and spans, whose dead shard
+is condemned and whose rows then wait for the teardown drain). `flush_all`
+repeats while a pass handed rows back, and `shutdown` drains shard sets
+largest first, listing them again after each one because a hand-back can
+construct the current generation's set during the drain, so handed-back rows
+reach a set that has not drained yet. A shutdown or channel-close drain whose
+own re-read failed writes the rows in place on its teardown bypass passes
+rather than drop them, with a WARN. One whose target is not live writes rows
+known to be outside the scan set: that write logs at ERROR with the tenant,
+shard and hour and counts on `ravel_ingest_teardown_unscanned_writes_total`.
+`crates/ravel-ingest/tests/scan_set_handback.rs` holds this for all three
+pipelines.
 
 Neither obvious fix is available, and the reason is worth stating so it is not
 re-tried. Raising `FLUSH_BOUND_SLACK_HOURS` does not work: it is a frozen

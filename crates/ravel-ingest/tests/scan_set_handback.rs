@@ -77,6 +77,16 @@ fn config() -> IngestConfig {
     }
 }
 
+/// Nothing flushes on its own: the age clocks are longer than any clock jump
+/// a case makes, so only a drain the case asks for flushes.
+fn drain_only_config() -> IngestConfig {
+    IngestConfig {
+        max_flush_delay: Duration::from_secs(24 * 3600),
+        max_flush_delay_idle: Duration::from_secs(24 * 3600),
+        ..config()
+    }
+}
+
 fn start_of(hour: u32) -> i64 {
     i64::from(hour) * HOUR_NS
 }
@@ -95,6 +105,7 @@ struct Counters {
 trait Pipe: Send + Sync + Sized + 'static {
     const SIGNAL: Signal;
     fn build(
+        config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<TestClock>,
         budget: Arc<IngestByteBudget>,
@@ -110,6 +121,9 @@ trait Pipe: Send + Sync + Sized + 'static {
     fn shard_of(tenant: &TenantId, i: usize, count: u32) -> u32;
     fn counters(&self) -> Counters;
     fn flush(&self) -> impl Future<Output = ()> + Send;
+    fn shutdown(self) -> impl Future<Output = ()> + Send + 'static;
+    /// Reads the teardown-unscanned-writes counter, usable after `shutdown`.
+    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static;
     /// Event times of every row in one data object.
     fn rows(data: &[u8]) -> Vec<i64>;
 }
@@ -127,11 +141,12 @@ impl Pipe for IngestRouter {
     const SIGNAL: Signal = Signal::Metrics;
 
     fn build(
+        config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<TestClock>,
         budget: Arc<IngestByteBudget>,
     ) -> Self {
-        IngestRouter::new(config(), store, Signal::Metrics, clock).with_budget(budget)
+        IngestRouter::new(config, store, Signal::Metrics, clock).with_budget(budget)
     }
 
     fn send_row(
@@ -181,6 +196,15 @@ impl Pipe for IngestRouter {
         self.flush_all().await;
     }
 
+    fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
+        Self::shutdown(self)
+    }
+
+    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
+        let metrics = self.metrics_handle();
+        move || metrics.snapshot().teardown_unscanned_writes
+    }
+
     fn rows(data: &[u8]) -> Vec<i64> {
         let limits = ReaderLimits::default();
         let loc = ravel_segment::open_from_full(data, limits).expect("opens segment");
@@ -224,11 +248,12 @@ impl Pipe for LogIngestRouter {
     const SIGNAL: Signal = Signal::Logs;
 
     fn build(
+        config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<TestClock>,
         budget: Arc<IngestByteBudget>,
     ) -> Self {
-        LogIngestRouter::new(config(), store, clock).with_budget(budget)
+        LogIngestRouter::new(config, store, clock).with_budget(budget)
     }
 
     fn send_row(
@@ -277,6 +302,15 @@ impl Pipe for LogIngestRouter {
         self.flush_all().await;
     }
 
+    fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
+        Self::shutdown(self)
+    }
+
+    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
+        let metrics = self.metrics_handle();
+        move || metrics.snapshot().teardown_unscanned_writes
+    }
+
     fn rows(data: &[u8]) -> Vec<i64> {
         let reader = RlogReader::new(data, &RlogConfig::default()).expect("open rlog");
         let (records, _stats) = reader
@@ -290,11 +324,12 @@ impl Pipe for SpanIngestRouter {
     const SIGNAL: Signal = Signal::Spans;
 
     fn build(
+        config: IngestConfig,
         store: Arc<dyn ObjectStoreBackend>,
         clock: Arc<TestClock>,
         budget: Arc<IngestByteBudget>,
     ) -> Self {
-        SpanIngestRouter::new(config(), store, clock).with_budget(budget)
+        SpanIngestRouter::new(config, store, clock).with_budget(budget)
     }
 
     fn send_row(
@@ -341,6 +376,15 @@ impl Pipe for SpanIngestRouter {
 
     async fn flush(&self) {
         self.flush_all().await;
+    }
+
+    fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
+        Self::shutdown(self)
+    }
+
+    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
+        let metrics = self.metrics_handle();
+        move || metrics.snapshot().teardown_unscanned_writes
     }
 
     fn rows(data: &[u8]) -> Vec<i64> {
@@ -574,6 +618,10 @@ struct World<P> {
 
 impl<P: Pipe> World<P> {
     async fn new() -> Self {
+        Self::with_config(config()).await
+    }
+
+    async fn with_config(config: IngestConfig) -> Self {
         let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = fault.clone();
         let clock = TestClock::new(T0_NS);
@@ -593,6 +641,7 @@ impl<P: Pipe> World<P> {
             .expect("create the provisioning record at generation 0");
         }
         let router = Arc::new(P::build(
+            config,
             Arc::clone(&store),
             clock.clone(),
             Arc::clone(&budget),
@@ -813,10 +862,13 @@ async fn covered_index_writes_in_place_however_late<P: Pipe>() {
 /// shard 3 inside the scan set; it is past its trust horizon, so it is not
 /// used.
 ///
-/// Guard: the `hour < trust_horizon(..)` match guard in
+/// Guards: the `hour < trust_horizon(..)` match guard in
 /// `GenerationSwitch::scan_check`. Without it the stale generation-0 view
 /// clears the flush, which writes under shard 3 while the re-read is held,
-/// and the fail-closed assertion below never sees a refusal.
+/// and the fail-closed assertion below never sees a refusal. And the
+/// `stale_view_counted` test in each actor's `ScanCheck::Unknown` arm: without
+/// it every tick that retries the closed flush counts again, and the
+/// once-per-episode assertion reads one per tick.
 async fn unrefreshable_view_keeps_the_flush_closed<P: Pipe>() {
     let world = World::<P>::new().await;
     let keys = rows_on::<P>(&world.deferred, RETIRED_SHARD, 1, 3);
@@ -833,10 +885,16 @@ async fn unrefreshable_view_keeps_the_flush_closed<P: Pipe>() {
     let stale_before = world.router.counters().stale;
     assert!(
         drive(&world.clock, || world.router.counters().stale
-            >= stale_before + 5)
+            > stale_before)
         .await,
-        "the flush fails closed on every tick, counters {:?}",
+        "the flush fails closed, counters {:?}",
         world.router.counters()
+    );
+    ticks(&world.clock, 10).await;
+    assert_eq!(
+        world.router.counters().stale,
+        stale_before + 1,
+        "the stale-view episode counts once for the buffer, not once per tick"
     );
     let store = world.store.as_ref();
     let held_gets = held(&reread, Op::Get, "/prov");
@@ -869,51 +927,75 @@ async fn unrefreshable_view_keeps_the_flush_closed<P: Pipe>() {
     );
 }
 
-/// The byte charges move with the rows: the same bytes are held while the
-/// handed-back rows wait in the successor's buffer, and the budget returns to
-/// zero once they flush.
+/// The byte charges move with the rows, a clone to every target: while one
+/// successor's flush of the handed-back rows has landed and another's is still
+/// held, exactly the deferred rows' bytes are still charged, and the budget
+/// returns to zero once the held one lands too.
 ///
 /// Guard: `charges: charges.clone()` in each pipeline's `hand_back`. Sending
-/// an empty charge list instead refunds the bytes at hand-back, and the
-/// held-while-buffered assertion fails.
+/// an empty charge list instead refunds the bytes at hand-back; sending every
+/// charge to the first (lowest) target only and none to the rest refunds them
+/// when that target's flush lands, while the highest target's PUT is held.
+/// Either way the held-while-buffered assertion fails.
 async fn charges_follow_the_rows<P: Pipe>() {
     let world = World::<P>::new().await;
-    let keys = rows_on::<P>(&world.deferred, RETIRED_SHARD, 1, 3);
+    let keys = rows_on::<P>(&world.deferred, RETIRED_SHARD, 1, 6);
+    let targets: std::collections::BTreeSet<u32> = keys
+        .iter()
+        .map(|&i| P::shard_of(&world.deferred, i, NEW_COUNT))
+        .collect();
+    assert!(
+        targets.len() >= 2,
+        "the fixture splits across successor shards, {targets:?}"
+    );
+    let first = *targets.first().expect("a first target");
+    let last = *targets.last().expect("a last target");
     let deferred_bytes = world.defer(RETIRED_SHARD, &keys).await;
     assert!(deferred_bytes > 0);
     world.reshard_down().await;
     let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS;
-    // Holds every data PUT from here on: the successor flushes of the
-    // handed-back rows. The parked tenant's flush is abandoned at the jump,
-    // which refunds its own charge.
-    let target_put = world
+    // Holds only the last successor target's data PUTs. The parked tenant's
+    // flush is abandoned at the jump, which refunds its own charge.
+    let last_put = world
         .fault
-        .hold(Op::Put, Some("/l0/".to_string()), Occurrence::Always);
+        .hold(Op::Put, Some(format!("/l0/{last:04}/")), Occurrence::Always);
     world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
     assert!(
         drive(&world.clock, || world.router.counters().rerouted == 1).await,
         "the flush is handed back"
     );
+    let store = world.store.as_ref();
+    let mut first_landed = false;
+    for _ in 0..10 {
+        first_landed = !commits_at(store, &world.deferred, P::SIGNAL, first, pin_hour)
+            .await
+            .is_empty();
+        if first_landed {
+            break;
+        }
+        ticks(&world.clock, 20).await;
+    }
+    assert!(first_landed, "the first target's flush lands");
     assert!(
         drive(&world.clock, || !held(
-            &target_put,
+            &last_put,
             Op::Put,
             &world.deferred.hash().to_hex()
         )
         .is_empty())
         .await,
-        "a successor flush reaches its data PUT"
+        "the last target's flush reaches its data PUT"
     );
     assert_eq!(
         world.budget.in_flight_bytes(),
         deferred_bytes,
-        "exactly the deferred rows' bytes are held while they wait in the successor: \
-         not refunded at hand-back and not charged twice"
+        "exactly the deferred rows' bytes are held while one target still holds them: \
+         not refunded at hand-back or by the first target's flush, and not charged twice"
     );
     assert!(
         drive(&world.clock, || {
-            for id in held(&target_put, Op::Put, &world.deferred.hash().to_hex()) {
-                target_put.release(id);
+            for id in held(&last_put, Op::Put, &world.deferred.hash().to_hex()) {
+                last_put.release(id);
             }
             world.budget.in_flight_bytes() == 0
         })
@@ -922,7 +1004,147 @@ async fn charges_follow_the_rows<P: Pipe>() {
         world.budget.in_flight_bytes()
     );
     assert_eq!(
-        scanned_rows::<P>(world.store.as_ref(), &world.deferred, H0..=pin_hour + 1).await,
+        scanned_rows::<P>(store, &world.deferred, H0..=pin_hour + 1).await,
+        expected(&keys)
+    );
+}
+
+/// Buffers `keys` of the `deferred` tenant on the 4-shard set, appends the
+/// 3-shard successor, and moves the clock `S` hours past its activation, so
+/// a flush of those rows on the retired index must hand them back. The
+/// router's view of the tenant is now past its trust horizon.
+async fn retired_rows_past_the_window<P: Pipe>(world: &World<P>, keys: &[usize]) -> u32 {
+    for &i in keys {
+        let write = world
+            .router
+            .send_row(&world.deferred, i, WriteMode::Buffered);
+        assert_eq!(write.await.expect("write task"), "ok");
+    }
+    world.reshard_down().await;
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    pin_hour
+}
+
+/// One drain hands the rows back and flushes them: its first pass finds the
+/// view past its horizon, re-reads it and hands the rows to the 3-shard set,
+/// which that pass did not list because the hand-back constructed it, and the
+/// second pass flushes them there.
+///
+/// Guards: the repeat in each router's `flush_all` (`if
+/// self.metrics.rerouted_flushes() == handed_back { break; }` in a loop of
+/// `HAND_BACK_DRAIN_PASSES`). With a single pass the rows stay buffered in
+/// the successor and the scan rule finds none. And the `reread_and_check(..)`
+/// call in each actor's `scan_check`: without it the drain only starts a
+/// background re-read, hands nothing back, and nothing is written.
+async fn one_drain_hands_back_and_flushes<P: Pipe>() {
+    let world = World::<P>::with_config(drain_only_config()).await;
+    let keys = rows_on::<P>(&world.deferred, RETIRED_SHARD, 0, 6);
+    let pin_hour = retired_rows_past_the_window(&world, &keys).await;
+
+    world.router.flush().await;
+
+    assert_eq!(world.router.counters().rerouted, 1);
+    let store = world.store.as_ref();
+    assert_eq!(
+        keys_under_shard(store, &world.deferred, P::SIGNAL, RETIRED_SHARD).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        scanned_rows::<P>(store, &world.deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "one drain wrote every row where the scan rule finds it"
+    );
+}
+
+/// Shutdown drains the 4-shard set before the 3-shard set, so the rows the
+/// retiring set hands back reach a set that is still running.
+///
+/// Guard: `.max_by_key(|(count, _)| **count)` in
+/// `GenerationSwitch::largest_undrained_set`. Draining smallest first stops
+/// the 3-shard set before the hand-back, which then finds no live target and
+/// writes the rows in place on the retired index at teardown.
+async fn shutdown_drains_the_largest_set_first<P: Pipe>() {
+    let world = World::<P>::with_config(drain_only_config()).await;
+    let keys = rows_on::<P>(&world.deferred, RETIRED_SHARD, 0, 6);
+    let pin_hour = retired_rows_past_the_window(&world, &keys).await;
+    // A write after the activation builds the 3-shard set before shutdown.
+    let other = world.router.send_row(&world.parked, 0, WriteMode::Buffered);
+    assert_eq!(other.await.expect("write task"), "ok");
+
+    let World {
+        router,
+        store,
+        deferred,
+        ..
+    } = world;
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let unscanned = router.unscanned_writes();
+    router.shutdown().await;
+
+    assert_eq!(unscanned(), 0, "nothing was written outside the scan set");
+    assert_eq!(
+        keys_under_shard(store.as_ref(), &deferred, P::SIGNAL, RETIRED_SHARD).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        scanned_rows::<P>(store.as_ref(), &deferred, H0..=pin_hour + 1).await,
+        expected(&keys)
+    );
+}
+
+/// A hand-back during shutdown can construct the 3-shard set, which no list
+/// taken before the drain holds; shutdown still signals it and waits for its
+/// flush before returning.
+///
+/// Guard: the `while let Some(..) = self.switch.largest_undrained_set(..)`
+/// loop in each router's `shutdown`. Draining a list of sets taken once,
+/// shutdown returns after the 4-shard set while the 3-shard set's flush is
+/// still parked on its held PUT, left to an unawaited channel-close drain.
+async fn shutdown_drains_a_set_a_hand_back_built<P: Pipe>() {
+    let world = World::<P>::with_config(drain_only_config()).await;
+    let keys = rows_on::<P>(&world.deferred, RETIRED_SHARD, 0, 6);
+    let pin_hour = retired_rows_past_the_window(&world, &keys).await;
+    let tenant_data = format!(
+        "t/{}/{}/l0/",
+        world.deferred.hash().to_hex(),
+        P::SIGNAL.key_prefix()
+    );
+    let gate = world
+        .fault
+        .hold(Op::Put, Some(tenant_data.clone()), Occurrence::Always);
+
+    let World {
+        router,
+        store,
+        deferred,
+        ..
+    } = world;
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let shutdown = tokio::spawn(router.shutdown());
+    assert!(
+        settle(|| shutdown.is_finished() || !held(&gate, Op::Put, &tenant_data).is_empty()).await
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "shutdown waits for the flush of the set the hand-back built"
+    );
+    assert!(
+        settle(|| {
+            for id in held(&gate, Op::Put, &tenant_data) {
+                gate.release(id);
+            }
+            shutdown.is_finished()
+        })
+        .await
+    );
+    shutdown.await.expect("shutdown task");
+    assert_eq!(
+        keys_under_shard(store.as_ref(), &deferred, P::SIGNAL, RETIRED_SHARD).await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        scanned_rows::<P>(store.as_ref(), &deferred, H0..=pin_hour + 1).await,
         expected(&keys)
     );
 }
@@ -985,6 +1207,9 @@ scan_set_cases!(
     metrics_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     metrics_charges_follow_the_rows => charges_follow_the_rows,
     metrics_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
+    metrics_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
+    metrics_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
+    metrics_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
 );
 
 scan_set_cases!(
@@ -995,6 +1220,9 @@ scan_set_cases!(
     logs_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     logs_charges_follow_the_rows => charges_follow_the_rows,
     logs_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
+    logs_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
+    logs_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
+    logs_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
 );
 
 scan_set_cases!(
@@ -1005,4 +1233,7 @@ scan_set_cases!(
     spans_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     spans_charges_follow_the_rows => charges_follow_the_rows,
     spans_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
+    spans_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
+    spans_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
+    spans_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
 );

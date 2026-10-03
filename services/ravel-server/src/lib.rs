@@ -1307,8 +1307,12 @@ fn ingest_health_sources(
 /// best-effort step. The flush ALWAYS runs (it takes `&self`); the join runs
 /// only when this is the sole `Arc` owner, because joining consumes the router.
 /// If another task still holds a clone the flush still runs but the actors are
-/// not joined, which is safe: the join only reaps the actors and adds no
-/// durability that the flush did not already attempt. Factored out of
+/// not joined. The join adds durability: it is each actor's teardown drain,
+/// whose bypass passes write a buffer the flush had to keep, such as one held
+/// on a generation view the flush's own re-read of the provisioning record
+/// could not confirm (ADR-1642 scan-set amendment). An unjoined router leaves
+/// those buffers to the channel-close drain that runs, unawaited, when its last
+/// clone drops. Factored out of
 /// [`Running::shutdown`] so the "flush is unconditional, join is best-effort"
 /// contract is unit-testable; deleting the flush here makes that test fail
 /// rather than passing on the incidental flush a later owner's own shutdown

@@ -530,9 +530,17 @@ onward routes with the new count. Guarantees:
   current generation, and on a view it cannot trust it does not open the
   flush and keeps the rows. A strict write still waiting on handed-back rows
   is answered `Abandoned` (503, outcome unknown): the rows are written by
-  another shard. The one exception is a shutdown or channel-close drain that
-  cannot confirm the view or reach the current generation: it writes the rows
-  in place rather than drop them.
+  another shard. A target shard that is dead, or whose mailbox closes before
+  the rows arrive, leaves them with the shard that held them, which retries.
+  Two exceptions remain:
+  - A shutdown or channel-close drain that still cannot confirm the view after
+    re-reading the provisioning record, or cannot reach a live shard of the
+    current generation, writes the rows in place rather than drop them. When
+    the target was not live the rows are known to be outside the scan set:
+    stored but returned by no query, logged at ERROR with the tenant, shard
+    and hour, and counted on `ravel_ingest_teardown_unscanned_writes_total`.
+  - A writer or reshard-append clock skewed beyond the tolerated clock skew
+    (one hour) can make the view's scan set wider than the true one.
 - Commit tokens are unaffected: a token minted under any generation resolves
   forever, because token resolution reconstructs the exact key from the
   token's own fields and never consults `shard_count`. Read-your-write holds

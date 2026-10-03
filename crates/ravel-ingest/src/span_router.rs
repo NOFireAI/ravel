@@ -514,9 +514,13 @@ impl SpanIngestRouter {
     /// tasks end on their own after the drain; the `done` acknowledgement fires
     /// after the flush, so durability holds without joining them. Sets drain
     /// largest first, each finished before the next is signalled, so spans a
-    /// retiring set hands back land in a set still running.
+    /// retiring set hands back land in a set still running; the sets are
+    /// listed again after each one, since a hand-back can construct the
+    /// current generation's set during the drain.
     pub async fn shutdown(self) {
-        for set in self.switch.all_sets_largest_first() {
+        let mut drained = Vec::new();
+        while let Some((count, set)) = self.switch.largest_undrained_set(&drained) {
+            drained.push(count);
             let mut dones = Vec::new();
             for shard in set.iter() {
                 let (tx, rx) = oneshot::channel();
