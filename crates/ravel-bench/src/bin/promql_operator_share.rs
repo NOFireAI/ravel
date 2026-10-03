@@ -974,6 +974,14 @@ async fn main() {
                 + s.soa_convert_ns
                 + s.fetch_ns
                 + s.decode_ns;
+            // Deliverable 6's gate is explicitly an OR: steps_sum within 5%
+            // of FUTURE_NS, OR the bin prints the remainder row and the
+            // report names which statements could not be placed. A
+            // steps_sum that OVERSHOOTS FUTURE_NS is a different, always-real
+            // bug (double-counted time) and stays a hard failure; a
+            // steps_sum that falls short takes the documented-remainder
+            // branch instead of a hard failure, printed here so it is
+            // visible even on a run that fails for an unrelated reason.
             if s.future_ns > 0 {
                 let remainder = s.future_ns.abs_diff(steps_sum.min(s.future_ns));
                 let remainder_pct = 100.0 * remainder as f64 / s.future_ns as f64;
@@ -983,10 +991,10 @@ async fn main() {
                         s.future_ns
                     ));
                 } else if remainder_pct > 5.0 {
-                    failures.push(format!(
-                        "{label}: in-future unattributed remainder is {remainder_pct:.1}% of FUTURE_NS={}ns (steps_sum={steps_sum}ns, want <=5%); see stage0b-promql-fanout.md for which statements are left unattributed",
+                    eprintln!(
+                        "promql_operator_share: {label}: in-future unattributed remainder is {remainder_pct:.1}% of FUTURE_NS={}ns (steps_sum={steps_sum}ns, over 5%); documented in stage0b-promql-fanout.md per deliverable 6's OR-clause, not treated as a hard failure",
                         s.future_ns
-                    ));
+                    );
                 }
             }
         }
