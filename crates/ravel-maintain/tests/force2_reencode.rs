@@ -1250,7 +1250,7 @@ fn is_published(outcome: &ErasureRewriteOutcome) -> bool {
 ///
 /// Removing the `claim_bucket(store, config, bucket, "reencode")` call (so R
 /// runs unclaimed) lets E take the claim without a steal and R's checkpoints
-/// pass; R is then stopped by its re-list instead, `RecordSetChanged`, which
+/// pass; R is then stopped by its re-list instead, `RewritePresent`, which
 /// fails the `Cancelled` assertion. The re-list test below pins the re-list.
 #[tokio::test]
 async fn an_erasure_rewrite_that_steals_the_claim_cancels_the_reencode() {
@@ -1304,11 +1304,11 @@ async fn an_erasure_rewrite_that_steals_the_claim_cancels_the_reencode() {
 /// The re-list fence, with no claims anywhere: re-encode R is parked at its
 /// first part PUT while erasure E publishes its rewrite record. R resumes,
 /// builds, and its pre-publish re-list finds the rewrite record, so it
-/// publishes nothing.
+/// publishes nothing and reports `RewritePresent`.
 ///
 /// Removing the `relist_changed` check in `reencode_and_publish` lets R
 /// publish a version 2 record beside E's rewrite record (`Reencoded`), which
-/// fails the `RecordSetChanged` assertion and the record count.
+/// fails the `RewritePresent` assertion and the record count.
 #[tokio::test]
 async fn an_erasure_rewrite_that_publishes_mid_reencode_stops_it_at_the_relist() {
     let now_ns = sealed_now_ns();
@@ -1335,7 +1335,7 @@ async fn an_erasure_rewrite_that_publishes_mid_reencode_stops_it_at_the_relist()
     let (r_outcome, e_outcome) = tokio::join!(r, e);
 
     assert!(is_published(&e_outcome), "E publishes: {e_outcome:?}");
-    assert_eq!(r_outcome, ReencodeOutcome::RecordSetChanged);
+    assert_eq!(r_outcome, ReencodeOutcome::RewritePresent);
     assert_eq!(record_sets(store.as_ref()).await, (1, 1));
     assert_eq!(r_ledger.report().publish.requests, 0, "R PUT no record");
     assert_eq!(
