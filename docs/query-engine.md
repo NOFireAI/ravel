@@ -465,13 +465,22 @@ partition:
   (`fast_path_reads_the_probe_and_the_front_directory_sections`), in exchange
   for the scan phase requesting none of them.
 - **The carried directories are reserved.** A segment with at least one
-  surviving block keeps its directories resident until the query's plan counts
-  drop, and reserves their decoded length (`SegmentDirectories::decoded_bytes`,
-  the four sections' `uncomp_len`) against the fetch memory budget a carried
-  whole object is reserved against; a refusal fails the statement with the same
-  typed error. A relevant segment with no surviving block keeps nothing and
-  reserves nothing
+  surviving block keeps its directories resident and reserves their decoded
+  length (`SegmentDirectories::decoded_bytes`, the four sections' `uncomp_len`)
+  against the fetch memory budget a carried whole object is reserved against; a
+  refusal fails the statement with the same typed error. A relevant segment
+  with no surviving block keeps nothing and reserves nothing
   (`carried_directories_reserve_decoded_bytes_for_segments_with_survivors`).
+  The plan phase counts the partitions that own a row group of each segment,
+  and each owner holds a handle it drops when it finishes the segment (its scan
+  is exhausted, its open finds nothing to read, or the stream fails); the
+  directories and their reservation are released when the last owner's handle
+  drops, not when the statement ends. An `attrs_raw` reopen of a segment by an
+  owner still on it uses that owner's handle
+  (`carried_directories_are_released_when_every_owner_finishes_the_segment`).
+  The plan phase decodes and reserves every such segment's directories before
+  any partition drains one, so the peak reservation still covers every segment
+  with a surviving block; release only shortens how long each is held.
 - **An open must reproduce the plan's survivor list.** A partition's share is a
   subset of the survivor list the plan phase produced, and a row-ref position is
   taken from that list. The open prunes again over the same immutable object; if

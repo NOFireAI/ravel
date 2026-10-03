@@ -2761,6 +2761,7 @@ impl ExecutionPlan for LogsScanExec {
                     Arc::clone(&ctx),
                     Arc::clone(&self.segments),
                     self.target_partitions,
+                    self.stripe_blocks,
                     blocks.plan_init_elapsed.clone(),
                 );
                 (VecDeque::new(), false, LogScanState::Planning(counts_fut))
@@ -2785,7 +2786,6 @@ impl ExecutionPlan for LogsScanExec {
             first_batch_seen: false,
             done_seen: false,
             partition,
-            target_partitions: self.target_partitions,
             stripe_blocks: self.stripe_blocks,
             fast_whole_segment,
             segments: Arc::clone(&self.segments),
@@ -2819,7 +2819,11 @@ impl ExecutionPlan for LogsScanExec {
 /// partition.
 struct PlanCounts {
     segs: Vec<Option<SegPlan>>,
-    total_blocks: usize,
+    /// The partition count [`owned_work`] deals over: `target_partitions`,
+    /// capped by the surviving block count (ADR-0102).
+    /// [`compute_plan_counts`] counts each segment's owners against this same
+    /// figure.
+    partitions: usize,
     /// Relevant segments the plan phase read whole instead of counting from the
     /// skip index (#761). A segment planned from footer alone or from the skip
     /// index carries its plan footer forward (`SegPlan::footer` is `Some`); the
@@ -2837,16 +2841,112 @@ struct PlannedBlocks {
     /// each partition's share, and the list every per-partition open's own
     /// pruning must reproduce.
     indices: Arc<Vec<usize>>,
-    /// This segment's directories, decoded once by the plan phase
-    /// ([`LogSegmentFetcher::plan_segment`]) and carried to every
-    /// per-partition subset open through [`OwnedSeg`] so the open reuses them
-    /// via `RlogReader::from_decoded` instead of decoding them again.
+    /// `indices` grouped into whole row groups ([`row_groups`]), computed
+    /// here so the deal does not need the directories, which the segment's
+    /// last owner may already have released.
+    groups: Vec<Vec<usize>>,
+    /// This segment's directories, one handle per owning partition.
+    carried: CarriedDirsSlot,
+}
+
+impl PlannedBlocks {
+    /// A segment's plan with no owners counted yet: until
+    /// [`CarriedDirsSlot::set_owners`] runs, the directories stay held for as
+    /// long as the plan counts live.
+    fn new(
+        indices: Vec<usize>,
+        dirs: Arc<SegmentDirectories>,
+        reservation: ravel_memory::Reservation,
+    ) -> Self {
+        let groups = row_groups(&indices, dirs.page_dir());
+        PlannedBlocks {
+            indices: Arc::new(indices),
+            groups,
+            carried: CarriedDirsSlot::new(CarriedDirs {
+                dirs,
+                _reservation: reservation,
+            }),
+        }
+    }
+}
+
+/// A segment's directories, decoded once by the plan phase
+/// ([`LogSegmentFetcher::plan_segment`]) and carried to every per-partition
+/// subset open through [`OwnedSeg`] so the open reuses them via
+/// `RlogReader::from_decoded` instead of decoding them again, together with
+/// the fetch memory budget's reservation for them
+/// ([`LogSegmentFetcher::reserve_carried_directories`]). Both are released
+/// when the last handle drops.
+struct CarriedDirs {
     dirs: Arc<SegmentDirectories>,
-    /// The fetch memory budget's reservation for `dirs`
-    /// ([`LogSegmentFetcher::reserve_carried_directories`]), the budget a
-    /// carried whole object is reserved against. Held until the plan counts
-    /// drop at the end of the query.
-    _dirs_reservation: ravel_memory::Reservation,
+    _reservation: ravel_memory::Reservation,
+}
+
+/// Hands one [`CarriedDirs`] handle to each partition that owns a row group of
+/// the segment, and keeps its own until the last of them has taken one. Each
+/// partition drops its handle when it finishes the segment, so the reservation
+/// is released once every owner has finished it rather than when the
+/// statement ends.
+struct CarriedDirsSlot {
+    state: std::sync::Mutex<CarriedDirsState>,
+}
+
+struct CarriedDirsState {
+    held: Option<Arc<CarriedDirs>>,
+    /// Owners that have not taken their handle yet. `usize::MAX` until the
+    /// deal counts them.
+    takers_left: usize,
+}
+
+impl CarriedDirsSlot {
+    fn new(carried: CarriedDirs) -> Self {
+        CarriedDirsSlot {
+            state: std::sync::Mutex::new(CarriedDirsState {
+                held: Some(Arc::new(carried)),
+                takers_left: usize::MAX,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CarriedDirsState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// How many partitions own a row group of this segment.
+    fn set_owners(&self, owners: usize) {
+        let mut state = self.lock();
+        state.takers_left = owners;
+        if owners == 0 {
+            state.held = None;
+        }
+    }
+
+    /// One owner's handle. The slot lets its own go once every owner has
+    /// taken one.
+    fn take(&self) -> Option<Arc<CarriedDirs>> {
+        let mut state = self.lock();
+        let handle = state.held.clone();
+        state.takers_left = state.takers_left.saturating_sub(1);
+        if state.takers_left == 0 {
+            state.held = None;
+        }
+        handle
+    }
+}
+
+/// How many partitions [`owned_work`] gives a row group of a segment with
+/// `groups` row groups when it deals over `partitions`: the segment's groups
+/// are consecutive in the round-robin order, so they land on `min(groups,
+/// partitions)` distinct partitions. Without striping one partition owns the
+/// whole segment.
+fn segment_owners(groups: usize, partitions: usize, stripe_blocks: bool) -> usize {
+    if stripe_blocks {
+        groups.min(partitions)
+    } else {
+        1
+    }
 }
 
 /// One relevant segment's contribution to [`PlanCounts`].
@@ -2887,6 +2987,7 @@ fn plan_counts_future(
     ctx: Arc<PartitionCtx>,
     segments: Arc<Vec<SegmentRef>>,
     plan_concurrency: usize,
+    stripe_blocks: bool,
     plan_init_elapsed: Time,
 ) -> CountsFuture {
     Box::pin(async move {
@@ -2895,7 +2996,8 @@ fn plan_counts_future(
                 // Only the initializing partition runs this closure, so the
                 // metric it records is the barrier's cost counted once.
                 let started = Instant::now();
-                let counts = compute_plan_counts(&ctx, &segments, plan_concurrency).await;
+                let counts =
+                    compute_plan_counts(&ctx, &segments, plan_concurrency, stripe_blocks).await;
                 plan_init_elapsed.add_elapsed(started);
                 counts
             })
@@ -2958,6 +3060,7 @@ async fn compute_plan_counts(
     ctx: &PartitionCtx,
     segments: &[SegmentRef],
     plan_concurrency: usize,
+    stripe_blocks: bool,
 ) -> DFResult<Arc<PlanCounts>> {
     // Not-yet-polled futures, one per segment tagged with its snapshot
     // position, so `buffer_unordered` decides how many run at once and the
@@ -3033,11 +3136,7 @@ async fn compute_plan_counts(
                     .fetcher
                     .reserve_carried_directories(&dirs)
                     .map_err(SqlError::from)?;
-                Some(PlannedBlocks {
-                    indices: Arc::new(indices),
-                    dirs,
-                    _dirs_reservation: reservation,
-                })
+                Some(PlannedBlocks::new(indices, dirs, reservation))
             } else {
                 None
             };
@@ -3059,9 +3158,19 @@ async fn compute_plan_counts(
     ctx.phase_accounting
         .plan()
         .observe_intermediate_bytes(carried_bytes);
+    // Cap the stride by the real block count (ADR-0102): with fewer blocks
+    // than partitions the extra partitions get empty work.
+    let partitions = plan_concurrency.max(1).min(total_blocks.max(1));
+    for planned in segs.iter().flatten().filter_map(|s| s.planned.as_ref()) {
+        planned.carried.set_owners(segment_owners(
+            planned.groups.len(),
+            partitions,
+            stripe_blocks,
+        ));
+    }
     Ok(Arc::new(PlanCounts {
         segs,
-        total_blocks,
+        partitions,
         full_reads,
     }))
 }
@@ -3091,11 +3200,11 @@ struct OwnedSeg {
     /// `None` whenever [`SegPlan::whole_object`] was `None`, and always
     /// `None` on the whole-segment fast path (no plan phase).
     whole_object: Option<CarriedWholeObject>,
-    /// This segment's directories, decoded once by the plan phase (ADR-2414
-    /// decision A1), carried to the subset open so it reuses them instead of
-    /// decoding them again. `None` only on the whole-segment fast path (no
-    /// plan phase ever runs there).
-    dirs: Option<Arc<SegmentDirectories>>,
+    /// This partition's handle on the segment's directories, decoded once by
+    /// the plan phase (ADR-2414 decision A1), carried to the subset open so it
+    /// reuses them instead of decoding them again. `None` on the whole-segment
+    /// fast path (no plan phase ever runs there).
+    dirs: Option<Arc<CarriedDirs>>,
 }
 
 /// Groups `indices` (a segment's surviving whole-object block indices,
@@ -3161,9 +3270,9 @@ fn owned_work(
                 continue;
             };
             let mut indices = Vec::new();
-            for group in row_groups(&planned.indices, planned.dirs.page_dir()) {
+            for group in &planned.groups {
                 if global_group % n == partition {
-                    indices.extend(group);
+                    indices.extend_from_slice(group);
                 }
                 global_group += 1;
             }
@@ -3175,7 +3284,7 @@ fn owned_work(
                     survivors: Some(Arc::clone(&planned.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
-                    dirs: Some(Arc::clone(&planned.dirs)),
+                    dirs: planned.carried.take(),
                 });
             }
         }
@@ -3194,7 +3303,7 @@ fn owned_work(
                     survivors: Some(Arc::clone(&planned.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
-                    dirs: Some(Arc::clone(&planned.dirs)),
+                    dirs: planned.carried.take(),
                 });
             }
             seg_ordinal += 1;
@@ -3714,11 +3823,10 @@ struct LogScanStream {
     /// drains the row path.
     columnar_eligible: bool,
     blocks: BlockMetrics,
-    /// This stream's DataFusion partition index, and the total declared count.
-    /// Together with the shared [`PlanCounts`] they determine which
-    /// `(segment, block-index-list)` units this partition owns (ADR-0102).
+    /// This stream's DataFusion partition index. Together with the shared
+    /// [`PlanCounts`] it determines which `(segment, block-index-list)` units
+    /// this partition owns (ADR-0102).
     partition: usize,
-    target_partitions: usize,
     /// The assignment mode (ADR-0102, amended by #693): block striping when a
     /// cache is wired, segment-granular otherwise. Passed to [`owned_work`].
     stripe_blocks: bool,
@@ -3808,11 +3916,14 @@ struct LogScanStream {
     /// those opens were charged under as cache hits before this carry existed.
     /// The memory bound is unaffected: `Bytes` clones share one allocation.
     current_whole_object: Option<CarriedWholeObject>,
-    /// This segment's directories, decoded once by the plan phase (ADR-2414
-    /// decision A1), kept so the `attrs_raw` fallback re-opens the subset
-    /// through the same reused decode rather than a fresh one. `None` on the
-    /// whole-segment fast path (no plan phase).
-    current_dirs: Option<Arc<SegmentDirectories>>,
+    /// This partition's handle on the segment's directories, decoded once by
+    /// the plan phase (ADR-2414 decision A1), kept so the `attrs_raw` fallback
+    /// re-opens the subset through the same reused decode rather than a fresh
+    /// one. Dropped when this partition finishes the segment
+    /// ([`Self::finish_segment`]), which releases the directories' reservation
+    /// once every owner has. `None` on the whole-segment fast path (no plan
+    /// phase).
+    current_dirs: Option<Arc<CarriedDirs>>,
     state: LogScanState,
     /// The `fetch` pushed into the exec (issue #362), carried unchanged from
     /// [`LogsScanExec::fetch`]. `None` means this stream drains every segment
@@ -4006,9 +4117,18 @@ impl LogScanStream {
         self.pending = Pending::None;
     }
 
+    /// This partition is done with the current segment: drop its handle on the
+    /// segment's directories and move to the next owned segment.
+    fn finish_segment(&mut self) {
+        self.current_dirs = None;
+        self.state = LogScanState::NextSegment;
+    }
+
     /// Abandon the stream on error, releasing everything the scan still holds.
     fn fail(&mut self, e: DataFusionError) -> Poll<Option<DFResult<RecordBatch>>> {
         self.state = LogScanState::Done;
+        self.current_dirs = None;
+        self.work.clear();
         self.release_block();
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         Poll::Ready(Some(Err(e)))
@@ -4085,14 +4205,11 @@ impl LogScanStream {
                         this.blocks
                             .planning_wait_elapsed
                             .add_elapsed(this.stream_started);
-                        // Cap the stride by the real block count (ADR-0102): with
-                        // fewer blocks than partitions this collapses the extra
-                        // partitions to empty work, exactly what the declared
-                        // `min(target_partitions, total_blocks)` would give.
-                        let n = this
-                            .target_partitions
-                            .max(1)
-                            .min(counts.total_blocks.max(1));
+                        // The stride the plan counted each segment's owners
+                        // against: `target_partitions` capped by the real block
+                        // count (ADR-0102), so with fewer blocks than partitions
+                        // the extra partitions get empty work.
+                        let n = counts.partitions;
                         // Partition 0 publishes every relevant segment's
                         // whole-segment prune totals, once, so striping a segment
                         // across partitions does not multiply them.
@@ -4143,7 +4260,8 @@ impl LogScanStream {
                         this.current_indices = indices.clone();
                         this.current_survivors = survivors.clone();
                         this.current_footer = footer.clone();
-                        this.current_dirs = dirs.clone();
+                        let open_dirs = dirs.as_ref().map(|c| Arc::clone(&c.dirs));
+                        this.current_dirs = dirs;
                         // Moved, not cloned: this stream consumes the carried
                         // whole object exactly once, by whichever open below
                         // `take()`s it first. A later `ReopenRows` reopen
@@ -4191,7 +4309,7 @@ impl LogScanStream {
                                 survivors,
                                 footer,
                                 whole_object,
-                                dirs,
+                                open_dirs,
                             ))
                         };
                     }
@@ -4217,7 +4335,7 @@ impl LogScanStream {
                         if let Some(started) = this.open_started.take() {
                             this.blocks.open_elapsed.add_elapsed(started);
                         }
-                        this.state = LogScanState::NextSegment;
+                        this.finish_segment();
                     }
                     Poll::Ready(Err(e)) => return this.fail(e),
                     Poll::Pending => {
@@ -4239,7 +4357,7 @@ impl LogScanStream {
                     // Cannot happen for a segment already opened once this scan;
                     // treat a vanished segment as end-of-segment rather than
                     // panicking.
-                    Poll::Ready(Ok(None)) => this.state = LogScanState::NextSegment,
+                    Poll::Ready(Ok(None)) => this.finish_segment(),
                     Poll::Ready(Err(e)) => return this.fail(e),
                     Poll::Pending => return Poll::Pending,
                 },
@@ -4339,7 +4457,7 @@ impl LogScanStream {
                                 this.blocks.record_segment_totals(&stats);
                             }
                             this.mark_segment("seg_done_offset");
-                            this.state = LogScanState::NextSegment;
+                            this.finish_segment();
                         }
                         Step::Fallback => {
                             // Re-open the segment on the row path over the SAME
@@ -4399,7 +4517,7 @@ impl LogScanStream {
                                     this.current_survivors.clone(),
                                     this.current_footer.clone(),
                                     this.current_whole_object.take(),
-                                    this.current_dirs.clone(),
+                                    this.current_dirs.as_ref().map(|c| Arc::clone(&c.dirs)),
                                 )
                             };
                             this.blocks.reopens.add(1);
@@ -4467,7 +4585,7 @@ impl LogScanStream {
                                 this.blocks.record_segment_totals(&stats);
                             }
                             this.mark_segment("seg_done_offset");
-                            this.state = LogScanState::NextSegment;
+                            this.finish_segment();
                         }
                         Err(e) => return this.fail(SqlError::from(e).into()),
                     }
@@ -4491,7 +4609,7 @@ impl LogScanStream {
                                     this.blocks.record_segment_totals(&stats);
                                 }
                                 this.mark_segment("seg_done_offset");
-                                this.state = LogScanState::NextSegment;
+                                this.finish_segment();
                             }
                             Err(e) => return this.fail(SqlError::from(e).into()),
                         }
@@ -4561,7 +4679,7 @@ impl LogScanStream {
                                 this.blocks.record_segment_totals(&stats);
                             }
                             this.mark_segment("seg_done_offset");
-                            this.state = LogScanState::NextSegment;
+                            this.finish_segment();
                         }
                         Err(e) => return this.fail(SqlError::from(e).into()),
                     }
@@ -7912,11 +8030,11 @@ mod owned_work_tests {
         let segs = (0..segments)
             .map(|_| {
                 Some(SegPlan {
-                    planned: Some(PlannedBlocks {
-                        indices: Arc::new((0..BLOCKS).collect()),
-                        dirs: Arc::clone(&dirs),
-                        _dirs_reservation: budget.reserve(0).expect("reserve"),
-                    }),
+                    planned: Some(PlannedBlocks::new(
+                        (0..BLOCKS).collect(),
+                        Arc::clone(&dirs),
+                        budget.reserve(0).expect("reserve"),
+                    )),
                     stats: ScanStats::default(),
                     footer: None,
                     whole_object: None,
@@ -7927,7 +8045,7 @@ mod owned_work_tests {
         (
             PlanCounts {
                 segs,
-                total_blocks: segments * BLOCKS,
+                partitions: segments * BLOCKS,
                 full_reads: 0,
             },
             refs,
@@ -8048,9 +8166,9 @@ mod owned_work_tests {
 mod carried_directory_reservation_tests {
     //! ADR-2414 decision A1: the plan phase's carried directories are charged to
     //! the fetch memory budget a carried whole object is charged to, for the
-    //! segments a partition will open and no others, until the plan counts drop;
-    //! and an open whose own pruning disagrees with the plan's survivor list
-    //! fails closed.
+    //! segments a partition will open and no others, until every partition
+    //! owning one of the segment's row groups has finished it; and an open whose
+    //! own pruning disagrees with the plan's survivor list fails closed.
 
     use super::*;
     use ravel_catalog::SegmentLevel;
@@ -8208,7 +8326,7 @@ mod carried_directory_reservation_tests {
             phase_accounting: PhaseAccounting::new(),
         };
         assert_eq!(budget.reserved(), 0);
-        let counts = compute_plan_counts(&ctx, &segments, 4)
+        let counts = compute_plan_counts(&ctx, &segments, 4, true)
             .await
             .expect("plan counts");
         assert_eq!(
@@ -8236,7 +8354,7 @@ mod carried_directory_reservation_tests {
             fetcher: ctx.fetcher.clone().with_memory_budget(tight),
             ..ctx
         };
-        let refused = compute_plan_counts(&ctx, &segments, 4).await;
+        let refused = compute_plan_counts(&ctx, &segments, 4, true).await;
         let err = refused
             .err()
             .expect("a budget too small for the directories refuses");
@@ -8282,19 +8400,18 @@ mod carried_directory_reservation_tests {
             Arc::new(Vec::new()),
         )
         .expect("scan");
-        let total_blocks = plan_indices.len();
         let counts = PlanCounts {
             segs: vec![Some(SegPlan {
-                planned: Some(PlannedBlocks {
-                    indices: Arc::new(plan_indices),
+                planned: Some(PlannedBlocks::new(
+                    plan_indices,
                     dirs,
-                    _dirs_reservation: budget.reserve(0).expect("reserve"),
-                }),
+                    budget.reserve(0).expect("reserve"),
+                )),
                 stats: ScanStats::default(),
                 footer: None,
                 whole_object: None,
             })],
-            total_blocks,
+            partitions: 1,
             full_reads: 1,
         };
         assert!(exec.counts.set(Arc::new(counts)).is_ok());
@@ -8341,5 +8458,223 @@ mod carried_directory_reservation_tests {
                 "plan {wrong:?} refused with the typed error, got: {err}"
             );
         }
+    }
+
+    /// One stream whose resource attribute is this long, so each object's
+    /// STREAM_DIR, and with it the carried directories, dwarfs the few page
+    /// bytes an open holds for a timestamp projection.
+    const RESOURCE_VALUE_LEN: usize = 64 * 1024;
+
+    /// One-record blocks, `ts` 0..12, in groups of four, whose two attributes
+    /// overflow a one-column dynamic budget: every block carries an `attrs_raw`
+    /// page, so the columnar drain falls back to a row-path reopen.
+    fn overflow_object(seq: u64) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            group_target_blocks: 4,
+            max_dynamic_columns: 1,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: seq,
+        };
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str(format!("{seq}-{}", "r".repeat(RESOURCE_VALUE_LEN))),
+        )];
+        let mut writer = RlogWriter::new(cfg, identity);
+        for ts in 0..BLOCKS as i64 {
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("row {ts}"),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: vec![
+                        ("a".to_string(), AttrValue::Str(format!("a{ts}"))),
+                        ("b".to_string(), AttrValue::Str(format!("b{ts}"))),
+                    ],
+                })
+                .expect("push");
+        }
+        writer.finish().expect("finish")
+    }
+
+    fn rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    fn metric_total(exec: &LogsScanExec, name: &str) -> usize {
+        exec.metrics()
+            .expect("metrics")
+            .iter()
+            .filter(|m| m.value().name() == name)
+            .map(|m| m.value().as_usize())
+            .sum()
+    }
+
+    /// Three segments of three row groups, striped over two partitions, so
+    /// both partitions own a group of every segment. A segment's directories
+    /// stay reserved while either owner is still on it and are released once
+    /// both have finished it, not when the statement ends.
+    ///
+    /// Partition 0 drains first: every segment is still reserved, because
+    /// partition 1 has not finished any. Partition 1 is then held on its first
+    /// GET of segment 0, and segment 0 is still reserved. Released, it finishes
+    /// segment 0, including the `attrs_raw` row-path reopens of it that come
+    /// after partition 0 finished it, and is held again on segment 1: segment
+    /// 0's directories are gone from the budget and the other two are not. At
+    /// the end nothing is reserved while the exec is still alive.
+    ///
+    /// Fails against releasing on the first owner's finish (segment 0 is gone
+    /// while partition 1 is still on it) and against never releasing (segment
+    /// 0 is still reserved once both owners have finished it).
+    #[tokio::test]
+    async fn carried_directories_are_released_when_every_owner_finishes_the_segment() {
+        use futures::StreamExt;
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let objects: Vec<Vec<u8>> = (1..=3).map(overflow_object).collect();
+        let mut segments = Vec::new();
+        for (i, obj) in objects.iter().enumerate() {
+            let key = format!("t/held{i}.rlog");
+            store
+                .put(&key, bytes::Bytes::from(obj.clone()), PutOptions::default())
+                .await
+                .expect("put");
+            segments.push(seg_ref(&key, obj, 1, i as u64 + 1));
+        }
+        let dirs: Vec<u64> = objects.iter().map(|o| directory_bytes(o).1).collect();
+        let all: u64 = dirs.iter().sum();
+        // What an open holds besides the directories (a timestamp projection's
+        // pages and the tail sections) is far below this.
+        let slack = dirs.iter().min().copied().unwrap_or(0) / 2;
+        assert!(slack as usize > RESOURCE_VALUE_LEN / 4);
+
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let cache_bytes = 64u64 << 20;
+        let cache: Arc<ravel_cache::Cache<ravel_query::CacheFetchError>> =
+            Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+                cache_bytes,
+                4096,
+                cache_bytes,
+            )));
+        let fetcher = LogSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)
+            .with_memory_budget(Arc::clone(&budget))
+            .with_cache(cache)
+            .with_block_range(
+                BlockRangeFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)
+                    .with_suffix_len(256)
+                    .with_whole_object_threshold(0),
+            )
+            .with_block_range_threshold(0);
+        let schema = crate::logs_schema::logs_schema_with_declared(&[]);
+        // The window starts after each segment's first block, so no segment is
+        // contained in it and the striped route runs.
+        let exec = LogsScanExec::new(
+            TENANT,
+            fetcher,
+            &segments,
+            2,
+            1,
+            BLOCKS as i64,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Some(&vec![crate::logs_schema::LOG_COL_TS]),
+            PhaseAccounting::new(),
+            schema,
+            Arc::new(Vec::new()),
+        )
+        .expect("scan");
+        let task_ctx = Arc::new(TaskContext::default());
+        let first = exec.execute(0, Arc::clone(&task_ctx)).expect("execute");
+        let second = exec.execute(1, task_ctx).expect("execute");
+
+        let drained: Vec<RecordBatch> =
+            first.map(|b| b.expect("partition 0 batch")).collect().await;
+        // Groups 0, 2, 4, 6, 8 of nine: two groups of segments 0 and 2 (the
+        // first group is short of block 0) and one of segment 1.
+        assert_eq!(rows(&drained), 18);
+        assert!(
+            budget.reserved() >= all && budget.reserved() < all + slack,
+            "partition 1 has finished no segment, so all three are reserved: {} of {all}",
+            budget.reserved()
+        );
+
+        let gate = store.hold(Op::Get, Some("t/held".to_string()), Occurrence::Always);
+        let task = tokio::spawn(async move {
+            second
+                .map(|b| b.expect("partition 1 batch"))
+                .collect::<Vec<_>>()
+                .await
+        });
+        gate.wait_until_held(1).await;
+        let on = |key: &str| gate.held_details().iter().all(|(_, _, k)| k.contains(key));
+        assert!(on("held0"), "partition 1 opens segment 0 first");
+        assert!(
+            budget.reserved() >= all && budget.reserved() < all + slack,
+            "partition 1 is still on segment 0: {} of {all}",
+            budget.reserved()
+        );
+
+        // Let partition 1 through segment 0 until it waits on segment 1.
+        loop {
+            gate.wait_until_held(1).await;
+            if on("held1") {
+                break;
+            }
+            for (id, _, key) in gate.held_details() {
+                if key.contains("held0") {
+                    gate.release(id);
+                }
+            }
+        }
+        let rest = all - dirs[0];
+        assert!(
+            budget.reserved() >= rest && budget.reserved() < rest + slack,
+            "both owners finished segment 0, so only segments 1 and 2 stay reserved: {} of {rest}",
+            budget.reserved()
+        );
+
+        let releaser = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                loop {
+                    gate.wait_until_held(1).await;
+                    for (id, _, _) in gate.held_details() {
+                        gate.release(id);
+                    }
+                }
+            })
+        };
+        let second_rows = task.await.expect("partition 1 task");
+        releaser.abort();
+        assert_eq!(rows(&second_rows), 3 * (BLOCKS - 1) - 18);
+        // The read cache keeps what it admitted, with that read's reservation,
+        // until it drops with the exec.
+        assert!(
+            budget.reserved() < slack,
+            "every segment's directories released while the exec is alive: {}",
+            budget.reserved()
+        );
+        assert_eq!(
+            metric_total(&exec, "reopens"),
+            12,
+            "two `attrs_raw` reopens per partition per segment"
+        );
+        drop(exec);
+        assert_eq!(budget.reserved(), 0);
     }
 }
