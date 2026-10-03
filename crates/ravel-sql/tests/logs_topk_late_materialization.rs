@@ -49,10 +49,12 @@
 //!
 //! Both row-ref addressing branches are exercised: the `LIKE` statements push
 //! no block-level predicate, so they take #693's whole-segment fast path where
-//! a partition's block-index list is empty and the cursor position IS the
-//! surviving-block index; `has_word_reaches_the_same_rows_through_the_striped_\
-//! path` pushes a content predicate, which forces the plan-then-stripe path
-//! where that list is explicit.
+//! every block survives and a block's whole-object index IS its surviving-block
+//! index; `has_word_reaches_the_same_rows_through_the_striped_path` pushes a
+//! content predicate, which forces the plan-then-stripe path where a row ref is
+//! the block's position in the plan's survivor list, and
+//! `split_row_groups_address_the_surviving_block_through_the_plan_list` splits
+//! each segment's row groups across partitions.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -123,11 +125,18 @@ fn declared_columns() -> Vec<DeclaredColumn> {
 
 /// Blocks of exactly [`RECORDS_PER_BLOCK`] records, so a record's index maps to
 /// a `(segment, block, row)` address the header's table can state.
-fn block_config() -> RlogConfig {
-    RlogConfig {
+///
+/// `group_blocks`, when `Some`, is the row group size in blocks; `None` keeps
+/// the writer's default, which holds a whole segment's four blocks in one group.
+fn block_config(group_blocks: Option<usize>) -> RlogConfig {
+    let mut cfg = RlogConfig {
         block_target_records: RECORDS_PER_BLOCK,
         ..RlogConfig::default()
+    };
+    if let Some(blocks) = group_blocks {
+        cfg.group_target_blocks = blocks;
     }
+    cfg
 }
 
 /// The record at global index `index`. `ts` is strictly increasing in `index`,
@@ -178,7 +187,12 @@ fn tied_record(index: usize) -> LogRecord {
     r
 }
 
-async fn write_segment(store: &dyn ObjectStoreBackend, seg: usize, tied: bool) -> SegmentRef {
+async fn write_segment(
+    store: &dyn ObjectStoreBackend,
+    seg: usize,
+    tied: bool,
+    group_blocks: Option<usize>,
+) -> SegmentRef {
     let recs: Vec<LogRecord> = (0..RECORDS_PER_SEG)
         .map(|r| {
             let index = seg * RECORDS_PER_SEG + r;
@@ -189,7 +203,7 @@ async fn write_segment(store: &dyn ObjectStoreBackend, seg: usize, tied: bool) -
             }
         })
         .collect();
-    let mut w = RlogWriter::new(block_config(), identity((seg + 1) as u64));
+    let mut w = RlogWriter::new(block_config(group_blocks), identity((seg + 1) as u64));
     for r in &recs {
         w.push(r.clone()).expect("push");
     }
@@ -221,10 +235,14 @@ async fn write_segment(store: &dyn ObjectStoreBackend, seg: usize, tied: bool) -
     }
 }
 
-async fn build_snapshot(store: &dyn ObjectStoreBackend, tied: bool) -> Snapshot {
+async fn build_snapshot(
+    store: &dyn ObjectStoreBackend,
+    tied: bool,
+    group_blocks: Option<usize>,
+) -> Snapshot {
     let mut segments = Vec::with_capacity(SEGMENTS);
     for s in 0..SEGMENTS {
-        segments.push(write_segment(store, s, tied).await);
+        segments.push(write_segment(store, s, tied, group_blocks).await);
     }
     Snapshot {
         segments,
@@ -393,6 +411,8 @@ struct Setup {
     tied: bool,
     cache: bool,
     partitions: usize,
+    /// Row group size in blocks; `None` is the writer's default.
+    group_blocks: Option<usize>,
 }
 
 impl Setup {
@@ -403,6 +423,7 @@ impl Setup {
             tied: false,
             cache: true,
             partitions: 1,
+            group_blocks: None,
         }
     }
     fn rule(mut self, rule: bool) -> Self {
@@ -417,21 +438,36 @@ impl Setup {
         self.cache = false;
         self
     }
-    /// Fan the scan out, so a segment's surviving blocks are striped across
-    /// partitions (ADR-0102) and a partition's block-index list stops being the
-    /// identity. Only the result set and the phase-2 block count stay
-    /// deterministic at this setting; see the module header.
+    /// Fan the scan out across `partitions`. Whole row groups are dealt to
+    /// partitions (ADR-2414 decision A1), and with the default group size a
+    /// segment's four blocks are one group, so each segment goes whole to one
+    /// partition; [`Setup::group_blocks`] splits a segment into several groups
+    /// that can land on different partitions. Only the result set and the
+    /// phase-2 block count stay deterministic at this setting; see the module
+    /// header.
     fn partitions(mut self, partitions: usize) -> Self {
         self.partitions = partitions;
+        self
+    }
+    /// Write each segment with row groups of `blocks` blocks, so one segment
+    /// holds several row groups that the striped deal can hand to different
+    /// partitions.
+    fn group_blocks(mut self, blocks: usize) -> Self {
+        self.group_blocks = Some(blocks);
         self
     }
 }
 
 /// Plan and execute `sql` over a fresh copy of the fixture.
 async fn run(sql: &str, setup: Setup) -> Run {
-    let Setup { tied, cache, .. } = setup;
+    let Setup {
+        tied,
+        cache,
+        group_blocks,
+        ..
+    } = setup;
     let base = Arc::new(MemoryStore::new());
-    let snapshot = build_snapshot(base.as_ref(), tied).await;
+    let snapshot = build_snapshot(base.as_ref(), tied, group_blocks).await;
     let counting = CountingStore::new(base);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let accounting = QueryAccounting::new();
@@ -799,20 +835,20 @@ async fn has_word_reaches_the_same_rows_through_the_striped_path() {
     assert_eq!(with.rows, without.rows, "the rewrite changed the result");
 }
 
-/// The same `has_word` statement fanned across four partitions, where a
-/// segment's surviving blocks really are striped (ADR-0102) and a partition's
-/// block-index list is NOT the identity: with ten surviving blocks over four
-/// segments, partition 0 owns segment 0's survivor 0, segment 1's survivor 1,
-/// and segment 3's survivor 1. A row ref that recorded the cursor position
-/// instead of the surviving-block index it names would address a different
-/// block for two of those three and return the wrong rows.
+/// The same `has_word` statement fanned across four partitions. With the
+/// default group size a segment's four blocks are one row group, so the deal
+/// hands each segment whole to one partition (segments 0 to 3 to partitions 0 to
+/// 3); a segment is not split here, and the row refs of a partition's blocks are
+/// positions in that segment's survivor list, which is not the identity either
+/// (segment 0's survivors are blocks 0, 1 and 3). The split-group case is
+/// `split_row_groups_address_the_surviving_block_through_the_plan_list`.
 ///
 /// Only the result and the phase-2 block count are asserted: with four
 /// partitions feeding a `CoalescePartitionsExec` the GET count and the decode
 /// counters depend on the scheduler. The `ts` values are distinct, so the
 /// answer itself does not.
 #[tokio::test]
-async fn striped_partitions_address_the_surviving_block_not_the_cursor() {
+async fn whole_segments_dealt_to_partitions_return_the_same_rows() {
     let sql = format!("SELECT * FROM logs WHERE has_word(body, '{NEEDLE}') ORDER BY ts LIMIT 4");
     let with = run(&sql, Setup::new().partitions(4)).await;
     let without = run(&sql, Setup::new().rule(false).partitions(4)).await;
@@ -832,6 +868,44 @@ async fn striped_partitions_address_the_surviving_block_not_the_cursor() {
     assert_eq!(
         with.rows, without.rows,
         "the rewrite changed the result under striping"
+    );
+}
+
+/// A segment whose row groups sit on different partitions. Groups of two blocks
+/// give each segment two groups, and the deal numbers groups across segments, so
+/// with four partitions segment 0's groups (blocks 0 and 1, then block 3 alone
+/// after pruning) go to partitions 0 and 1, and every segment is split between
+/// two partitions. Partition 1 owns segment 0's block 3, which is position 2 in
+/// that segment's survivor list `[0, 1, 3]`; a row ref built from the block's
+/// whole-object index (3) or from the cursor position in the partition's own
+/// list (0) names a different block, or none, and phase 2 returns other rows.
+///
+/// Fails against a row ref carrying the whole-object block index instead of the
+/// survivor position (segment 0's block 3 would address a block that does not
+/// exist in the list), and against one carrying the position in the
+/// partition's own share (partition 1's first block would address survivor 0).
+#[tokio::test]
+async fn split_row_groups_address_the_surviving_block_through_the_plan_list() {
+    let sql = format!("SELECT * FROM logs WHERE has_word(body, '{NEEDLE}') ORDER BY ts LIMIT 10");
+    let setup = Setup::new().partitions(4).group_blocks(2);
+    let with = run(&sql, setup).await;
+    let without = run(&sql, setup.rule(false)).await;
+    report("split groups rule=on", &with);
+    report("split groups rule=off", &without);
+
+    assert!(with.has_fetch_node(), "the rule fires:\n{}", with.explain);
+    assert_eq!(
+        with.blocks_scanned, MATCHES,
+        "the partitions between them decode the ten surviving blocks"
+    );
+    assert_eq!(with.row_count(), MATCHES);
+    assert_eq!(
+        with.blocks_fetched, MATCHES,
+        "ten winners in ten distinct blocks"
+    );
+    assert_eq!(
+        with.rows, without.rows,
+        "the rewrite changed the result when a segment's groups are split"
     );
 }
 
