@@ -5670,6 +5670,180 @@ mod tests {
         );
     }
 
+    /// The reference suite's q33 shape (issue #2416): two string GROUP BY
+    /// keys, an exact `COUNT`, an exact integer `SUM`, an exact integer `AVG`,
+    /// ordered by the count descending with a `LIMIT`. Every aggregate here is
+    /// spill-exact on its own; the only question the tests below answer is
+    /// whether the trailing `ORDER BY` is total over the group key.
+    fn q33_schema() -> Arc<datafusion::arrow::datatypes::Schema> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Int64, false),
+        ]))
+    }
+
+    const Q33_SQL: &str = "SELECT a, b, count(*) AS c, sum(x) AS sx, avg(y) AS ay \
+                            FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10";
+
+    /// The first `Sort` node found by depth-first walk, or `None` if the plan
+    /// has none. Every plan below has exactly one.
+    fn find_sort(plan: &LogicalPlan) -> Option<&Sort> {
+        if let LogicalPlan::Sort(sort) = plan {
+            return Some(sort);
+        }
+        plan.inputs().into_iter().find_map(find_sort)
+    }
+
+    /// The unqualified column name a [`SortExpr`]'s expression names. Panics
+    /// on anything else: every term this module appends or starts from is a
+    /// bare column reference.
+    fn sort_term_column_name(term: &SortExpr) -> &str {
+        match &term.expr {
+            Expr::Column(column) => column.name.as_str(),
+            other => panic!("expected a bare column reference, got {other:?}"),
+        }
+    }
+
+    /// Before the rewrite, `ORDER BY c DESC` alone is not total over the `(a,
+    /// b)` groups (many groups can share one count), so the q33 shape is
+    /// refused. [`rewrite_sort_group_key_tie_order`] appends `(a, b)` as
+    /// trailing tiebreak terms, which makes the same Sort's key total and the
+    /// plan eligible: this is the fix issue #2416 asks for.
+    #[tokio::test]
+    async fn a_q33_shaped_sort_is_ineligible_before_the_rewrite_and_eligible_after() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([101u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let plan = executor
+            .analyzed_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
+            .await
+            .expect("the q33 shape plans");
+
+        assert!(
+            !plan_is_spill_eligible(&plan),
+            "ORDER BY c alone must not be treated as total over (a, b) before the rewrite"
+        );
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite never errors");
+        assert!(
+            plan_is_spill_eligible(&rewritten),
+            "appending (a, b) as trailing tiebreak terms must make the Sort eligible"
+        );
+    }
+
+    /// Pins the exact shape of the rewrite: the original `c DESC` term is
+    /// untouched, and the group keys are appended afterward, in GROUP BY
+    /// order, ascending, with nulls last.
+    #[tokio::test]
+    async fn the_rewrite_appends_group_keys_in_order_ascending_nulls_last() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([102u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let plan = executor
+            .analyzed_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
+            .await
+            .expect("the q33 shape plans");
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite never errors");
+        let sort = find_sort(&rewritten).expect("the rewritten plan has a Sort node");
+
+        assert_eq!(
+            sort.expr.len(),
+            3,
+            "the original c DESC term plus two appended tiebreak terms"
+        );
+        assert_eq!(sort_term_column_name(&sort.expr[0]), "c");
+        assert!(!sort.expr[0].asc, "the original DESC term is untouched");
+        assert_eq!(
+            sort_term_column_name(&sort.expr[1]),
+            "a",
+            "group keys are appended in GROUP BY order"
+        );
+        assert!(sort.expr[1].asc, "tiebreak terms are ascending");
+        assert!(!sort.expr[1].nulls_first, "tiebreak terms put nulls last");
+        assert_eq!(sort_term_column_name(&sort.expr[2]), "b");
+        assert!(sort.expr[2].asc, "tiebreak terms are ascending");
+        assert!(!sort.expr[2].nulls_first, "tiebreak terms put nulls last");
+    }
+
+    /// A `Sort` whose key is already total over the group (every group
+    /// expression already has a matching term) is left unchanged: the rewrite
+    /// has nothing to add, and the plan was already eligible.
+    #[tokio::test]
+    async fn an_already_total_sort_is_unchanged_by_the_rewrite() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([103u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let sql = "SELECT a, b, count(*) AS c, sum(x) AS sx, avg(y) AS ay \
+                   FROM q33 GROUP BY a, b ORDER BY c DESC, a, b LIMIT 10";
+        let plan = executor
+            .analyzed_classification_plan(tenant, sql, &[], Some(&schemas))
+            .await
+            .expect("the already-total q33 shape plans");
+        assert!(
+            plan_is_spill_eligible(&plan),
+            "a sort key already total over the group must already be eligible"
+        );
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite never errors");
+        let sort = find_sort(&rewritten).expect("the rewritten plan has a Sort node");
+        assert_eq!(
+            sort.expr.len(),
+            3,
+            "an already-total key gets nothing appended"
+        );
+    }
+
+    /// A `GROUP BY GROUPING SETS` aggregate is excluded outright
+    /// ([`missing_group_key_tiebreak_terms`]'s synthetic-column arm): the
+    /// rewrite cannot resolve a grouping set's per-row-null group columns by
+    /// name, so it leaves the Sort unchanged and the plan stays ineligible.
+    #[tokio::test]
+    async fn a_grouping_set_sort_stays_ineligible_after_the_rewrite() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([104u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let sql = "SELECT a, b, count(*) AS c FROM q33 \
+                   GROUP BY GROUPING SETS ((a, b), (a)) ORDER BY c DESC LIMIT 10";
+        let plan = executor
+            .analyzed_classification_plan(tenant, sql, &[], Some(&schemas))
+            .await
+            .expect("the grouping-set shape plans");
+        assert!(!plan_is_spill_eligible(&plan));
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite never errors");
+        assert!(
+            !plan_is_spill_eligible(&rewritten),
+            "a grouping set's synthetic group columns must fail closed, not be guessed at"
+        );
+    }
+
+    /// A `Projection` that renames a group key (`a AS a2`) hides it from
+    /// [`missing_group_key_tiebreak_terms`]'s by-name lookup in the Sort's
+    /// input schema: the rewrite cannot find a column named `a` to append, so
+    /// it fails closed and the Sort stays ineligible.
+    #[tokio::test]
+    async fn a_renamed_group_key_stays_ineligible_after_the_rewrite() {
+        let executor = eviction_test_executor();
+        let tenant = TenantHash([105u8; 16]);
+        let schemas = vec![("q33".to_string(), q33_schema())];
+        let sql = "SELECT a AS a2, b, count(*) AS c FROM q33 \
+                   GROUP BY a, b ORDER BY c DESC LIMIT 10";
+        let plan = executor
+            .analyzed_classification_plan(tenant, sql, &[], Some(&schemas))
+            .await
+            .expect("the renamed-key shape plans");
+        assert!(!plan_is_spill_eligible(&plan));
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite never errors");
+        assert!(
+            !plan_is_spill_eligible(&rewritten),
+            "a renamed group key must fail closed rather than being skipped silently"
+        );
+    }
+
     fn eviction_test_executor() -> SqlExecutor {
         use ravel_catalog::{Catalog, CatalogConfig};
         use ravel_object_store::memory::MemoryStore;
