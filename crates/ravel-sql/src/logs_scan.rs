@@ -3074,10 +3074,8 @@ struct OwnedSeg {
 /// (ADR-2414 decision A1) instead of splitting it across partitions. Indices
 /// are ascending and row groups are contiguous ranges of block numbers, so
 /// consecutive indices mapping to the same group's `first_block` are always
-/// one unbroken run. A block [`PageDir::locate_block`] cannot place (it
-/// should not happen: PAGE_DIR is validated at decode time to cover every
-/// block the segment's footer declares) keeps its own singleton group rather
-/// than joining one it does not belong to.
+/// one unbroken run. A block [`PageDir::locate_block`] cannot place keeps its
+/// own singleton group rather than joining one it does not belong to.
 fn row_groups(indices: &[usize], page_dir: &PageDir) -> Vec<Vec<usize>> {
     let mut groups: Vec<(Option<u32>, Vec<usize>)> = Vec::new();
     for &idx in indices {
@@ -3100,15 +3098,14 @@ fn row_groups(indices: &[usize], page_dir: &PageDir) -> Vec<Vec<usize>> {
 ///   blocks are grouped into whole row groups by [`row_groups`], and group
 ///   `i` in the segment-then-group order over all surviving row groups goes
 ///   to partition `i % n` -- every block of a row group to the same
-///   partition, never split. Dealing by group rather than by block is what
-///   deliverable 2 requires: a row group's column chunks and dictionary
-///   pages are decoded together, so splitting one across partitions would
-///   make more than one partition decode (and charge `decompressed_bytes`
-///   for) the same chunk. Round-robin over groups, not blocks, stays
-///   balanced in practice because PAGE_DIR groups are uniform-sized by
-///   construction (`group_target_blocks`, default 32) except each segment's
-///   own last, possibly partial, group -- the same bound the old
-///   per-block round robin had on its own last partial pass over `n`.
+///   partition, never split. A row group is the unit the format stores
+///   column-major, and a column chunk's dictionary page is shared by every
+///   block of the group, so splitting a group across partitions makes each of
+///   them decode that dictionary again. Dealing round-robin over groups keeps
+///   the assignment deterministic, and the number of groups per partition
+///   differs by at most one; block counts are as even as the groups are, and
+///   a segment's last group may be short. A segment with fewer groups than
+///   partitions leaves some of them without a share of it.
 /// - **`stripe_blocks` false** (un-cached): the segment-granular assignment.
 ///   Counting only segments with a surviving block, in snapshot order, segment
 ///   `j` goes to partition `j % n` and that partition drains all of the
