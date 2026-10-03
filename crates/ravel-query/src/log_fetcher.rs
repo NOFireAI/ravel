@@ -833,6 +833,20 @@ impl LogSegmentFetcher {
         self
     }
 
+    /// Sets the projection break-even (ADR-2414 decision A3,
+    /// [`BlockRangeFetcher::with_projection_break_even_bytes`]): the bytes a
+    /// projection must save before [`Self::ranged_projection_pays`] routes it
+    /// ranged, and the object size at or below which the ranged fetch reads
+    /// the object whole. `None` keeps the threshold
+    /// [`Self::with_block_range_threshold`] set as the break-even. The engine
+    /// sets it from `EngineConfig::logs_projection_break_even_bytes`, which only
+    /// the cost-based policy resolves to `Some`.
+    #[must_use]
+    pub fn with_projection_break_even_bytes(mut self, n: Option<u64>) -> Self {
+        self.block_range = self.block_range.with_projection_break_even_bytes(n);
+        self
+    }
+
     /// Bounds the in-flight object-store GETs of BOTH RLOG paths with one
     /// private [`crate::GetLimiter`] of `n` permits (0 is clamped to 1): the
     /// fetcher's own whole-object funnel and the block-range path share it, so
@@ -1329,6 +1343,12 @@ impl LogSegmentFetcher {
     /// ranged path SAVES, never what it costs, so the same threshold generalizes
     /// by moving the projection into the saving.
     ///
+    /// When a projection break-even is set
+    /// ([`Self::with_projection_break_even_bytes`], cost-based only, ADR-2414
+    /// decision A3) the saving is compared against it instead, and the fetch
+    /// layer's size crossover reads the same value, so an object routed ranged
+    /// here is not read whole one layer down.
+    ///
     /// At or below [`Self::block_range_threshold`] the answer is always false:
     /// there [`tenant_bytes`](Self::tenant_bytes) reads the whole object
     /// whichever entry point opens it, so routing buys nothing and would only
@@ -1349,7 +1369,7 @@ impl LogSegmentFetcher {
         }
         let fraction = projected_fraction.clamp(0.0, 1.0);
         let saved = object_size as f64 * (1.0 - fraction);
-        saved > self.block_range.effective_whole_object_threshold() as f64
+        saved > self.block_range.effective_projection_break_even() as f64
     }
 
     /// Per-object relevance from the catalog summary alone, with no object
@@ -4264,6 +4284,12 @@ pub struct BlockRangeFetcher {
     /// `request_cost_bytes`; `Some(n)` pins it (and `Some(0)` forces the ranged
     /// path). See [`Self::effective_whole_object_threshold`].
     whole_object_threshold: Option<u64>,
+    /// The projection break-even (ADR-2414 decision A3). `Some` replaces the
+    /// size crossover above wherever a projection is weighed: the size
+    /// crossover in the ranged fetch and
+    /// [`LogSegmentFetcher::ranged_projection_pays`]. See
+    /// [`Self::effective_projection_break_even`].
+    projection_break_even: Option<u64>,
     coverage_threshold: f64,
     /// Cost of one store request as a byte volume (a latency-bandwidth product);
     /// the single quantity every range-vs-whole-object decision here is driven
@@ -4320,6 +4346,7 @@ impl BlockRangeFetcher {
             suffix_len: None,
             coalesce_gap: None,
             whole_object_threshold: None,
+            projection_break_even: None,
             coverage_threshold: DEFAULT_LOG_COVERAGE_THRESHOLD,
             request_cost_bytes: DEFAULT_LOG_REQUEST_COST_BYTES,
             max_fetch_run_bytes: crate::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
@@ -4477,6 +4504,17 @@ impl BlockRangeFetcher {
     #[must_use]
     pub fn with_whole_object_threshold(mut self, n: u64) -> Self {
         self.whole_object_threshold = Some(n);
+        self
+    }
+
+    /// Sets the projection break-even (ADR-2414 decision A3). `Some(n)` makes
+    /// `n` the size crossover of the ranged fetch, in place of
+    /// [`Self::with_whole_object_threshold`]'s value, and the saving
+    /// [`LogSegmentFetcher::ranged_projection_pays`] weighs against; `None`
+    /// leaves both on that value.
+    #[must_use]
+    pub fn with_projection_break_even_bytes(mut self, n: Option<u64>) -> Self {
+        self.projection_break_even = n;
         self
     }
 
@@ -4697,6 +4735,14 @@ impl BlockRangeFetcher {
                 .saturating_mul(WHOLE_OBJECT_REQUEST_MULTIPLE)
                 .max(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD)
         })
+    }
+
+    /// The break-even a projection is weighed against: the projection
+    /// break-even when set (ADR-2414 decision A3, cost-based only), else
+    /// [`Self::effective_whole_object_threshold`].
+    fn effective_projection_break_even(&self) -> u64 {
+        self.projection_break_even
+            .unwrap_or_else(|| self.effective_whole_object_threshold())
     }
 
     /// Sets the coverage-based post-pruning crossover fraction (0.0..=1.0). When
@@ -5593,8 +5639,10 @@ impl BlockRangeFetcher {
         // driven (deliverable 2): below the break-even the ranged path's extra
         // round trips cost more than the bytes they could save at any
         // selectivity, so the whole-object read is the faster option even though
-        // it moves the most bytes.
-        if seg_ref.object_size <= self.effective_whole_object_threshold() {
+        // it moves the most bytes. Under cost-based the projection break-even
+        // replaces it (ADR-2414 decision A3), the value the fast path's route
+        // was chosen against.
+        if seg_ref.object_size <= self.effective_projection_break_even() {
             // Covering read, bounded by the fetch bound (ADR-0996 decision 2):
             // one `GetRange::Full` for an object at or under the bound, else
             // `ceil(object_size / bound)` sequential covering sub-range GETs.
@@ -11201,6 +11249,103 @@ mod ranged_projection_cost_tests {
         );
     }
 
+    /// A fetcher built the way the engine builds one from a resolution of
+    /// `policy` at the reference profile and the default routing threshold.
+    fn resolved(policy: crate::LogsFetchPolicy) -> LogSegmentFetcher {
+        let r = crate::resolve_logs_fetch(
+            policy,
+            &ravel_types::cost_profile::StoreCostProfile::reference(),
+            None,
+            DEFAULT_LOG_REQUEST_COST_BYTES,
+            DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        LogSegmentFetcher::new(Arc::new(MemoryStore::new()))
+            .with_block_range_threshold(r.block_range_threshold)
+            .with_request_cost_bytes(r.request_cost_bytes)
+            .with_projection_break_even_bytes(r.projection_break_even_bytes)
+    }
+
+    /// ADR-2414 decision A3: under cost-based the break-even is five request
+    /// costs of the time term, 31,500,000 bytes, not the 512 KiB routing
+    /// threshold. A 35 MB object at a 3% projection saves 33,950,000 bytes and
+    /// reads ranged; a 3 MB object saves 2,910,000 and reads whole. Under
+    /// byte-minimal the routing threshold stays the break-even, so the same
+    /// 3 MB projection reads ranged there.
+    ///
+    /// Prove-the-test, each shown failing: a break-even of the routing
+    /// threshold alone (`with_projection_break_even_bytes` ignored) flips the
+    /// 3 MB cost-based assertion; resolving a break-even under byte-minimal too
+    /// (`max(threshold, 5 * 1,887,437)` = 9,437,185) flips the byte-minimal
+    /// one.
+    #[test]
+    fn the_projection_break_even_governs_only_cost_based() {
+        let cost_based = resolved(crate::LogsFetchPolicy::CostBased);
+        assert_eq!(
+            cost_based.block_range_threshold(),
+            DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert!(cost_based.ranged_projection_pays(35_000_000, 0.03));
+        assert!(!cost_based.ranged_projection_pays(3_000_000, 0.03));
+
+        let byte_minimal = resolved(crate::LogsFetchPolicy::ByteMinimal);
+        assert_eq!(
+            byte_minimal.block_range_threshold(),
+            DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
+        );
+        assert!(byte_minimal.ranged_projection_pays(3_000_000, 0.03));
+    }
+
+    /// The coalescing gap is one request cost floored at 64 KiB and is not
+    /// special-cased under cost-based (ADR-2414 decision A3): at the time
+    /// term's 6,300,000 bytes, two projected ranges 6,000,000 bytes apart
+    /// coalesce into one request and two 6,600,000 apart do not; at the
+    /// byte-minimal 1,887,437 neither pair does.
+    ///
+    /// Prove-the-test: a gap capped at `DEFAULT_LOG_COALESCE_GAP` reads 4 runs
+    /// and 400 bytes at 6,300,000, against the 3 runs and 6,000,400 bytes
+    /// asserted.
+    #[test]
+    fn the_coalescing_gap_is_the_resolved_request_cost() {
+        let store: Arc<MemoryStore> = Arc::new(MemoryStore::new());
+        let extents = [
+            ByteExtent {
+                abs_start: 0,
+                len: 100,
+            },
+            ByteExtent {
+                abs_start: 6_000_100,
+                len: 100,
+            },
+            ByteExtent {
+                abs_start: 20_000_000,
+                len: 100,
+            },
+            ByteExtent {
+                abs_start: 26_600_100,
+                len: 100,
+            },
+        ];
+        let runs_at = |cost: u64| {
+            let f = BlockRangeFetcher::new(store.clone()).with_request_cost_bytes(cost);
+            coalesce_fenced(&extents, f.effective_coalesce_gap(), &[])
+        };
+        let bytes = |runs: &[ByteExtent]| runs.iter().map(|r| r.len).sum::<u64>();
+
+        let time_term = runs_at(6_300_000);
+        assert_eq!(time_term.len(), 3, "{time_term:?}");
+        assert_eq!(bytes(&time_term), 6_000_200 + 100 + 100);
+        assert_eq!(
+            (time_term[0].abs_start, time_term[0].len),
+            (0, 6_000_200),
+            "the 6,000,000-byte gap is bridged"
+        );
+
+        let byte_minimal = runs_at(DEFAULT_LOG_REQUEST_COST_BYTES);
+        assert_eq!(byte_minimal.len(), 4, "{byte_minimal:?}");
+        assert_eq!(bytes(&byte_minimal), 400);
+    }
+
     /// An explicit whole-object threshold overrides the derived break-even, so a
     /// test fixture pinning one gets exactly the break-even it pinned. `0` makes
     /// any nonzero saving a win.
@@ -11215,6 +11360,188 @@ mod ranged_projection_cost_tests {
         assert!(
             !f.ranged_projection_pays(1, 1.0),
             "a full projection still saves nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod projection_break_even_crossover_tests {
+    //! ADR-2414 decision A3 at the ranged fetch's size crossover: under
+    //! cost-based the object size is weighed against the projection
+    //! break-even (31,500,000 bytes on the reference profile), not against the
+    //! 512 KiB routing threshold `with_block_range_threshold` pins, so an
+    //! object the fast path's route judged too small to range is read whole
+    //! here too.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::accounting::AccountedOp;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([21u8; 16]);
+    const KEY: &str = "t/break-even.rlog";
+    const BODY_LEN: usize = 64 * 1024;
+
+    /// One record whose body is `BODY_LEN` pseudo-random printable bytes, so
+    /// the object's size tracks the record count rather than collapsing under
+    /// compression.
+    fn record(ts: i64, state: &mut u64) -> LogRecord {
+        let mut body = String::with_capacity(BODY_LEN);
+        while body.len() < BODY_LEN {
+            *state ^= *state << 13;
+            *state ^= *state >> 7;
+            *state ^= *state << 17;
+            for byte in state.to_le_bytes() {
+                body.push(char::from(b' ' + byte % 95));
+            }
+        }
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body,
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// An object of `n` records, stored under `KEY`, and its `SegmentRef`.
+    async fn object(n: i64) -> (Arc<MemoryStore>, SegmentRef) {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let records: Vec<LogRecord> = (0..n).map(|ts| record(ts, &mut state)).collect();
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            zstd_level: 1,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(
+            cfg,
+            ObjectIdentity {
+                tenant_hash: TENANT.0,
+                shard: 0,
+                writer_id: [5u8; 16],
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        for r in records {
+            w.push(r).expect("push");
+        }
+        let bytes = w.finish().expect("finish");
+        let seg = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: bytes.len() as u64,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: n - 1,
+            ingest_hour_bucket: 0,
+            sample_count: n as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [23u8; 32],
+            writer_id: Uuid::from_u128(5),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        (store, seg)
+    }
+
+    /// The fetcher the engine builds from a cost-based resolution at the
+    /// reference profile: routing threshold 524,288, request cost 6,300,000,
+    /// break-even 31,500,000.
+    fn cost_based(store: Arc<MemoryStore>) -> LogSegmentFetcher {
+        let r = crate::resolve_logs_fetch(
+            crate::LogsFetchPolicy::CostBased,
+            &ravel_types::cost_profile::StoreCostProfile::reference(),
+            None,
+            DEFAULT_LOG_REQUEST_COST_BYTES,
+            DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        assert_eq!(r.projection_break_even_bytes, Some(31_500_000));
+        LogSegmentFetcher::new(store)
+            .with_block_range_threshold(r.block_range_threshold)
+            .with_request_cost_bytes(r.request_cost_bytes)
+            .with_projection_break_even_bytes(r.projection_break_even_bytes)
+    }
+
+    /// Opens `seg` through the fast path's ranged entry point with a
+    /// one-column projection and returns (GETs, bytes) it moved.
+    async fn ranged_open(f: &LogSegmentFetcher, seg: &SegmentRef) -> (u64, u64) {
+        let acc = QueryAccounting::new();
+        let scan = f
+            .scan_accounted_with_tenant(
+                seg,
+                TENANT,
+                &LogQuery::new(i64::MIN, i64::MAX),
+                &ColumnSelection::fixed_only().with_severity_num(),
+                &acc,
+            )
+            .await
+            .expect("scan")
+            .expect("relevant");
+        drop(scan);
+        let snap = acc.snapshot();
+        (
+            snap.s3_requests(AccountedOp::Get),
+            snap.s3_bytes(AccountedOp::Get),
+        )
+    }
+
+    /// An object under the break-even is one whole-object GET; one above it
+    /// takes the ranged protocol and moves a small fraction of its bytes.
+    ///
+    /// Prove-the-test: a crossover that reads the configured routing
+    /// threshold verbatim (`effective_whole_object_threshold` at the size
+    /// crossover) ranges the smaller object too, and its GET count is no
+    /// longer 1.
+    #[tokio::test]
+    async fn the_size_crossover_reads_the_projection_break_even() {
+        let (store, small) = object(490).await;
+        assert!(
+            small.object_size > 29_000_000 && small.object_size <= 31_500_000,
+            "fixture precondition: about 30 MB, under the break-even: {}",
+            small.object_size
+        );
+        let (gets, bytes) = ranged_open(&cost_based(store), &small).await;
+        assert_eq!(gets, 1, "one whole-object GET");
+        assert_eq!(bytes, small.object_size);
+
+        let (store, large) = object(570).await;
+        assert!(
+            large.object_size > 31_500_000 && large.object_size <= 36_000_000,
+            "fixture precondition: about 35 MB, over the break-even: {}",
+            large.object_size
+        );
+        let (gets, bytes) = ranged_open(&cost_based(store), &large).await;
+        assert_eq!(
+            gets, 6,
+            "the ranged protocol's probe, directory and run GETs"
+        );
+        assert!(
+            bytes * 5 < large.object_size,
+            "a one-column projection moves under a fifth of the object: {bytes} of {}",
+            large.object_size
         );
     }
 }

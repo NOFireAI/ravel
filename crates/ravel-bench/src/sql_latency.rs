@@ -291,6 +291,23 @@ pub struct Provenance {
     /// written before this field existed, which recorded no threshold at all.
     #[serde(default)]
     pub logs_block_range_threshold_effective: Option<u64>,
+    /// Where the effective request cost came from
+    /// ([`ravel_query::ResolvedLogsFetch::rate_term_label`]): `price`, `time`
+    /// or `saturated` for a cost-based derivation (ADR-2414 decision A3),
+    /// `flag` for an explicit `--logs-request-cost-bytes`, `none` for a policy
+    /// that sets the rate without one. `None` on the Flight lane and in a
+    /// report written before this field existed, for the reason
+    /// [`Self::logs_request_cost_bytes_effective`] gives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_rate_term_effective: Option<String>,
+    /// The projection break-even that governed the fast path's route and the
+    /// ranged fetch's size crossover
+    /// ([`ravel_query::ResolvedLogsFetch::projection_break_even_bytes`]), `0`
+    /// when the policy resolved none and the routing threshold served as the
+    /// break-even. `None` on the Flight lane and in a report written before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs_projection_break_even_bytes_effective: Option<u64>,
     /// The per-query DataFusion memory-pool ceiling this run ASKED for
     /// (`--sql-max-query-bytes`, ADR-0088). A report written before this field
     /// existed deserializes to [`ravel_sql::DEFAULT_MAX_QUERY_BYTES`].
@@ -1589,6 +1606,10 @@ pub struct ExecutorSettings {
     /// [`Self::logs_block_range_threshold`] are RESOLVED quantities on the
     /// measurement lanes ([`logs_fetch_resolution`]), never raw flag values.
     pub logs_request_cost_bytes: u64,
+    /// The projection break-even the same resolution produced (ADR-2414
+    /// decision A3), handed to the fetcher and the engine config exactly as
+    /// `ravel-server` hands it over. `None` outside cost-based.
+    pub logs_projection_break_even_bytes: Option<u64>,
     /// The policy the two byte quantities above were resolved from, carried into
     /// [`EngineConfig::logs_fetch_policy`] so the engine config the bench builds
     /// names the same intent the server's would.
@@ -1618,6 +1639,7 @@ impl Default for ExecutorSettings {
             logs_block_range_threshold: resolved.block_range_threshold,
             logs_suffix_len: None,
             logs_request_cost_bytes: resolved.request_cost_bytes,
+            logs_projection_break_even_bytes: resolved.projection_break_even_bytes,
             logs_fetch_policy: LogsFetchPolicy::default(),
         }
     }
@@ -1669,6 +1691,7 @@ fn cold_executor(
         logs_block_range_threshold,
         logs_suffix_len,
         logs_request_cost_bytes,
+        logs_projection_break_even_bytes,
         logs_fetch_policy,
     } = settings;
     let catalog = Arc::new(Catalog::new(
@@ -1696,7 +1719,8 @@ fn cold_executor(
     let mut log_fetcher = LogSegmentFetcher::new(Arc::clone(store))
         .with_max_concurrent_gets(store_get_concurrency.unwrap_or(fetch_concurrency).max(1))
         .with_block_range_threshold(logs_block_range_threshold)
-        .with_request_cost_bytes(logs_request_cost_bytes);
+        .with_request_cost_bytes(logs_request_cost_bytes)
+        .with_projection_break_even_bytes(logs_projection_break_even_bytes);
     if let Some(n) = logs_suffix_len {
         log_fetcher = log_fetcher.with_suffix_len(n);
     }
@@ -1724,6 +1748,7 @@ fn cold_executor(
                 max_segments,
                 logs_request_cost_bytes,
                 logs_block_range_threshold,
+                logs_projection_break_even_bytes,
                 logs_fetch_policy,
                 ..EngineConfig::default()
             },
@@ -2368,6 +2393,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         logs_suffix_len: cfg.logs_suffix_len,
         logs_request_cost_bytes: resolved_logs_fetch.request_cost_bytes,
         logs_block_range_threshold: resolved_logs_fetch.block_range_threshold,
+        logs_projection_break_even_bytes: resolved_logs_fetch.projection_break_even_bytes,
         logs_fetch_policy: cfg.logs_fetch_policy,
     };
     let (entries, skipped, failed) = measure_corpus(
@@ -2427,6 +2453,14 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             logs_request_cost_bytes_effective: Some(resolved_logs_fetch.request_cost_bytes),
             logs_fetch_policy: cfg.logs_fetch_policy.as_str().to_string(),
             logs_block_range_threshold_effective: Some(resolved_logs_fetch.block_range_threshold),
+            logs_rate_term_effective: Some(
+                resolved_logs_fetch
+                    .rate_term_label(cfg.logs_request_cost_bytes.is_some())
+                    .to_string(),
+            ),
+            logs_projection_break_even_bytes_effective: Some(
+                resolved_logs_fetch.projection_break_even_bytes.unwrap_or(0),
+            ),
             sql_max_query_bytes_requested: cfg.max_query_bytes,
             // In-process lane: the requested ceiling reaches the executor's
             // `SqlConfig`, so it is also the effective one.
@@ -2489,6 +2523,7 @@ fn tenant_executor_settings(
         logs_suffix_len: cfg.logs_suffix_len,
         logs_request_cost_bytes: resolved_logs_fetch.request_cost_bytes,
         logs_block_range_threshold: resolved_logs_fetch.block_range_threshold,
+        logs_projection_break_even_bytes: resolved_logs_fetch.projection_break_even_bytes,
         logs_fetch_policy: cfg.logs_fetch_policy,
     }
 }
@@ -2632,6 +2667,18 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             logs_block_range_threshold_effective: match &cfg.flight {
                 Some(_) => None,
                 None => Some(resolved_logs_fetch.block_range_threshold),
+            },
+            logs_rate_term_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(
+                    resolved_logs_fetch
+                        .rate_term_label(cfg.logs_request_cost_bytes.is_some())
+                        .to_string(),
+                ),
+            },
+            logs_projection_break_even_bytes_effective: match &cfg.flight {
+                Some(_) => None,
+                None => Some(resolved_logs_fetch.projection_break_even_bytes.unwrap_or(0)),
             },
             sql_max_query_bytes_requested: cfg.max_query_bytes,
             // `settings` is passed only on the in-process arm of the match
