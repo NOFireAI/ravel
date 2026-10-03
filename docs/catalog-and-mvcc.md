@@ -725,11 +725,16 @@ and decodes, that part's segment lands in the loaded statistics keyed by its
 own content hash -- one GET per such part, and no other object is ever
 fetched on its account. If the ref is absent, or the GET comes back
 not-found, or the object fails to decode (`FetchOutcome::DecodeRefused`,
-logged once via `tracing::warn!` and counted once in
-`Catalog::column_stats_decode_refusals`), that part is left with no loaded
-statistics at all: the query scans for it, exactly as if no statistics
-existed for that part. There is no whole-tenant fallback and no
-declared-entry-count coverage comparison to decide whether one is needed --
+logged once per object key via `tracing::warn!` and counted on every
+occurrence in `Catalog::column_stats_decode_refusals`), that part is left
+with no loaded statistics. A read CPU gate decode job that failed is not a
+refused decode and leaves the part uncovered the same way: a cancelled job,
+or a closed gate, never ran and a retry can succeed, so it is logged each
+time and not counted; a panicked job panics again on the same bytes, so it
+is logged once per object key and counted on every occurrence in
+`Catalog::column_stats_decode_panics`. The query scans a part left with no
+loaded statistics, exactly as if no statistics existed for that part. There
+is no whole-tenant fallback and no declared-entry-count coverage comparison to decide whether one is needed --
 per-part coverage is decided per part, from that part's own field-7 ref
 alone.
 
@@ -1581,10 +1586,12 @@ pinning are unchanged:
    any other decode error of that object without the object being
    corrupt: a part falls back to listing (step 2), a postings object
    disables pruning for the resolve, and a column-statistics object leaves
-   its part uncovered and is counted as a refused decode, with the
+   its part uncovered without being counted as a refused decode (a
+   cancelled job is logged each time; a panicked one is logged once per
+   object key and counted in `Catalog::column_stats_decode_panics`), with the
    statistics loaded from the other parts cached for that HEAD as usual.
-   Without a gate every decode runs on the resolving task. The server does
-   not install the gate yet.
+   Without a gate every decode runs on the resolving task. The server
+   installs its read gate on the catalog it builds.
 2. On any other failure in step 1 (HEAD absent, corrupt, part missing or
    hash-mismatched, postings content-hash or entry-count mismatch): log,
    fall back to full listing for the whole window. Queries never

@@ -575,6 +575,25 @@ pub struct Catalog {
     /// not it logged, so a metric can show the condition persisting after the
     /// single WARN. Surfaced by [`Catalog::column_stats_decode_refusals`].
     column_stats_decode_refusals: AtomicU64,
+    /// `(tenant, signal, object key)` triples whose column-stats decode job
+    /// has already panicked on the read CPU gate and been logged (issue
+    /// #2402). The same bytes panic again on every eligible query, so the WARN
+    /// is emitted once per key. Kept apart from [`Catalog::warned_decode_failures`]
+    /// so a panic does not silence a later genuine refusal of the same key,
+    /// and swept with it in [`Catalog::evict_idle_tenants`].
+    warned_decode_panics: Mutex<HashSet<(TenantHash, Signal, String)>>,
+    /// Cumulative count of column-stats decode jobs that panicked on the read
+    /// CPU gate (issue #2402), incremented on every panic whether or not it
+    /// logged. Surfaced by [`Catalog::column_stats_decode_panics`].
+    column_stats_decode_panics: AtomicU64,
+    /// Test-only: when set, every column-stats object that would load fails
+    /// its decode with this gate error instead (issue #2402).
+    /// [`ravel_cpu_gate::CpuGateError::Panicked`] is produced by running a
+    /// panicking job on the installed read gate; the other variants, which a
+    /// healthy runtime cannot be made to return on demand, are substituted
+    /// for the outcome directly.
+    #[cfg(test)]
+    column_stats_decode_job_fault: Option<ravel_cpu_gate::CpuGateError>,
     /// Test-only override of the per-part column-statistics ceiling
     /// (ADR-1413 decision 3, normally
     /// [`crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES`]), so a fold
@@ -781,6 +800,10 @@ impl Catalog {
             column_stats_cache,
             warned_decode_failures: Mutex::new(HashSet::new()),
             column_stats_decode_refusals: AtomicU64::new(0),
+            warned_decode_panics: Mutex::new(HashSet::new()),
+            column_stats_decode_panics: AtomicU64::new(0),
+            #[cfg(test)]
+            column_stats_decode_job_fault: None,
             column_stats_part_ceiling_override: None,
             memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
             decode_reserve_retries: AtomicU64::new(0),
@@ -1549,7 +1572,10 @@ impl Catalog {
     /// them (the fields are `reserved`). Every failure degrades silently
     /// EXCEPT a decode refusal, which emits one `tracing::warn!` per object
     /// key and increments [`Catalog::column_stats_decode_refusals`] before
-    /// degrading (issue #1400).
+    /// degrading (issue #1400), and a read CPU gate decode job that failed,
+    /// which is not a refusal: a panicked job warns once per object key and
+    /// increments [`Catalog::column_stats_decode_panics`], a cancelled one
+    /// warns every time (issue #2402).
     pub async fn load_column_stats(
         &self,
         tenant: &TenantHash,
@@ -1629,15 +1655,17 @@ impl Catalog {
         for part in &covered {
             // No field-7 ref at all: the part is simply left uncovered.
             if let Some(resolved) = column_stats_resolve::resolve_part_stats_ref(part) {
-                match column_stats_resolve::fetch_stats_object(
+                let outcome = column_stats_resolve::fetch_stats_object(
                     &getter,
                     tenant,
                     &resolved,
                     self,
                     self.read_gate(),
                 )
-                .await?
-                {
+                .await?;
+                #[cfg(test)]
+                let outcome = self.inject_column_stats_decode_job_fault(outcome).await;
+                match outcome {
                     column_stats_resolve::FetchOutcome::Loaded(decoded, reservation) => {
                         segments.extend(decoded.segments);
                         by_content_hash.extend(decoded.by_content_hash);
@@ -1646,11 +1674,9 @@ impl Catalog {
                     // Store read or stale binding: this part is simply
                     // left uncovered, silently.
                     column_stats_resolve::FetchOutcome::Absent => {}
-                    // The part's own ref points at an object the reader
-                    // refused to decode: log once per key, count, and
-                    // leave the part uncovered (issue #1400).
+                    // The decode failed: leave the part uncovered.
                     column_stats_resolve::FetchOutcome::DecodeRefused(err) => {
-                        self.note_column_stats_decode_refusal(tenant, signal, &resolved.key, &err);
+                        self.note_column_stats_decode_failure(tenant, signal, &resolved.key, &err);
                     }
                 }
             }
@@ -1685,6 +1711,93 @@ impl Catalog {
             }
         }
         *blake3::hash(&buf).as_bytes()
+    }
+
+    /// Apply [`Catalog::column_stats_decode_job_fault`] to a fetch outcome: a
+    /// `Loaded` outcome is dropped, reservation included, and replaced by the
+    /// decode failure the fault names. Every other outcome passes through.
+    #[cfg(test)]
+    async fn inject_column_stats_decode_job_fault(
+        &self,
+        outcome: column_stats_resolve::FetchOutcome,
+    ) -> column_stats_resolve::FetchOutcome {
+        let Some(fault) = self.column_stats_decode_job_fault else {
+            return outcome;
+        };
+        let column_stats_resolve::FetchOutcome::Loaded(..) = outcome else {
+            return outcome;
+        };
+        drop(outcome);
+        let err = match fault {
+            ravel_cpu_gate::CpuGateError::Panicked => {
+                let failed: Result<(), _> = crate::read_gate::run_snapshot_decode(
+                    self.read_gate(),
+                    ravel_cpu_gate::ReadSite::CatalogColumnStats,
+                    1,
+                    || panic!("injected column-stats decode panic"),
+                )
+                .await;
+                match failed {
+                    Err(err) => err,
+                    Ok(()) => unreachable!("the injected job panics"),
+                }
+            }
+            other => crate::snapshot_format::SnapshotFormatError::DecodeJob(other),
+        };
+        column_stats_resolve::FetchOutcome::DecodeRefused(err)
+    }
+
+    /// Route a failed column-stats decode for `(tenant, signal)` at `key`
+    /// (issue #2402). A read CPU gate job that failed is no refusal of the
+    /// object, so it never moves [`Catalog::column_stats_decode_refusals`] or
+    /// spends the refusal latch, and the variants differ by whether a retry
+    /// can succeed. A cancelled job, or a closed gate, never ran: the next
+    /// query may decode the object, so each occurrence warns and nothing
+    /// latches. A panicked job panics again on the same bytes, and nothing
+    /// caches the failed load, so every eligible query would repeat it: it is
+    /// counted in [`Catalog::column_stats_decode_panics`] every time and warns
+    /// once per key on its own latch. Anything else is a refusal of the object
+    /// itself ([`Catalog::note_column_stats_decode_refusal`], issue #1400).
+    fn note_column_stats_decode_failure(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        key: &str,
+        err: &crate::snapshot_format::SnapshotFormatError,
+    ) {
+        match err {
+            crate::snapshot_format::SnapshotFormatError::DecodeJob(
+                ravel_cpu_gate::CpuGateError::Panicked,
+            ) => {
+                self.column_stats_decode_panics
+                    .fetch_add(1, Ordering::Relaxed);
+                let first =
+                    self.warned_decode_panics
+                        .lock()
+                        .insert((*tenant, signal, key.to_string()));
+                if first {
+                    tracing::warn!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        key = %key,
+                        "column-statistics decode job panicked on the read CPU gate. It will \
+                         panic again on the same object, so this is logged once per object key. \
+                         The query proceeds without column statistics and scans."
+                    );
+                }
+            }
+            crate::snapshot_format::SnapshotFormatError::DecodeJob(gate_err) => {
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    signal = ?signal,
+                    key = %key,
+                    error = %gate_err,
+                    "column-statistics decode job on the read CPU gate failed. The query \
+                     proceeds without column statistics and scans."
+                );
+            }
+            other => self.note_column_stats_decode_refusal(tenant, signal, key, other),
+        }
     }
 
     /// Record a decode refusal on the column-stats object HEAD references for
@@ -1769,9 +1882,11 @@ impl Catalog {
         // Collect the idle tenants under the activity lock, then drop the lock
         // before touching the cache locks: never hold two cache-related locks
         // at once, so this can never deadlock against a concurrent resolve.
-        // The one lock nested inside it is the warn-once marks lock, whose
-        // only other holder (`note_column_stats_decode_refusal`) takes no
-        // other lock, so activity-then-marks is the only order that exists.
+        // The locks nested inside it are the two warn-once marks locks, taken
+        // one at a time; their only other holders
+        // (`note_column_stats_decode_refusal`, `note_column_stats_decode_failure`)
+        // take no other lock, so activity-then-marks is the only order that
+        // exists.
         let idle: Vec<TenantHash> = {
             let mut activity = self.tenant_activity.lock();
             let idle: Vec<TenantHash> = activity
@@ -1795,6 +1910,9 @@ impl Catalog {
             // Runs on every call, not only when `idle` is non-empty, for the
             // same reason.
             self.warned_decode_failures
+                .lock()
+                .retain(|(tenant, _, _)| activity.contains_key(tenant));
+            self.warned_decode_panics
                 .lock()
                 .retain(|(tenant, _, _)| activity.contains_key(tenant));
             idle
@@ -1888,6 +2006,19 @@ impl Catalog {
     /// cache is disabled. Exporting it on `/metrics` is the server's follow-up.
     pub fn column_stats_decode_refusals(&self) -> u64 {
         self.column_stats_decode_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Cumulative column-statistics decode jobs that panicked on the read CPU
+    /// gate (issue #2402). Counted on every occurrence, while the matching
+    /// WARN fires once per object key: a panic repeats on the same bytes, so a
+    /// climbing value means a folded HEAD keeps pointing at an object whose
+    /// decode panics and the tenant runs with no column statistics for it.
+    /// Not a refusal, so never counted in
+    /// [`Catalog::column_stats_decode_refusals`]. A cancelled job is not
+    /// counted here or anywhere. Exporting it on `/metrics` is the server's
+    /// follow-up.
+    pub fn column_stats_decode_panics(&self) -> u64 {
+        self.column_stats_decode_panics.load(Ordering::Relaxed)
     }
 
     /// Bytes currently held by the column-statistics cache (issue #905), the
@@ -9428,6 +9559,26 @@ mod tests {
     }
 
     impl WarnCapture {
+        /// A fresh capture installed as this thread's default subscriber. An
+        /// always-on process-global default goes in first, once: with only
+        /// thread-local subscribers, tracing rebuilds callsite interest and
+        /// its max-level gate from whichever of them are alive at that
+        /// instant, so a sibling test's subscriber coming and going
+        /// concurrently can leave a WARN callsite disabled for this thread.
+        fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+            static GLOBAL: std::sync::Once = std::sync::Once::new();
+            GLOBAL.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+            });
+            let capture = Self::default();
+            let subscriber = {
+                use tracing_subscriber::layer::SubscriberExt;
+                tracing_subscriber::registry().with(capture.clone())
+            };
+            let guard = tracing::subscriber::set_default(subscriber);
+            (capture, guard)
+        }
+
         fn lines(&self) -> Vec<String> {
             self.lines.lock().clone()
         }
@@ -9516,11 +9667,13 @@ mod tests {
     /// declared and cap bytes in the single WARN.
     ///
     /// Prove-the-test: the WARN and the count both flow from
-    /// `load_column_stats`'s `FetchOutcome::DecodeRefused` arm calling
-    /// `note_column_stats_decode_refusal`. Flip that arm to
-    /// `FetchOutcome::DecodeRefused(_) => return Ok(None)` (the pre-fix silent
-    /// degrade) and `count_containing` reads 0 against the expected 1 while
-    /// `column_stats_decode_refusals()` reads 0 against the expected 3.
+    /// `load_column_stats`'s `FetchOutcome::DecodeRefused(err)` arm calling
+    /// `self.note_column_stats_decode_failure(tenant, signal, &resolved.key, &err)`,
+    /// which routes a non-gate error to `note_column_stats_decode_refusal`.
+    /// Flip that arm to `FetchOutcome::DecodeRefused(_) => return Ok(None)`
+    /// (the pre-fix silent degrade) and `count_containing` reads 0 against the
+    /// expected 1 while `column_stats_decode_refusals()` reads 0 against the
+    /// expected 3.
     #[tokio::test]
     async fn column_stats_decode_refusal_warns_once_and_counts_each() {
         let store = Arc::new(MemoryStore::new());
@@ -9539,12 +9692,7 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
-        let capture = WarnCapture::default();
-        let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
-            tracing_subscriber::registry().with(capture.clone())
-        };
-        let _default = tracing::subscriber::set_default(subscriber);
+        let (capture, _default) = WarnCapture::install();
 
         let (range, now_ns) = full_window();
         for _ in 0..3 {
@@ -9609,12 +9757,7 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
-        let capture = WarnCapture::default();
-        let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
-            tracing_subscriber::registry().with(capture.clone())
-        };
-        let _default = tracing::subscriber::set_default(subscriber);
+        let (capture, _default) = WarnCapture::install();
 
         let (range, now_ns) = full_window();
         let first = catalog
@@ -9706,12 +9849,7 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
-        let capture = WarnCapture::default();
-        let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
-            tracing_subscriber::registry().with(capture.clone())
-        };
-        let _default = tracing::subscriber::set_default(subscriber);
+        let (capture, _default) = WarnCapture::install();
 
         let (range, now_ns) = full_window();
         let first = catalog
@@ -9767,12 +9905,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
-        let capture = WarnCapture::default();
-        let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
-            tracing_subscriber::registry().with(capture.clone())
-        };
-        let _default = tracing::subscriber::set_default(subscriber);
+        let (capture, _default) = WarnCapture::install();
 
         let (range, now_ns) = full_window();
         let got = catalog
@@ -10963,13 +11096,14 @@ mod tests {
     /// whole-tenant case (`column_stats_decode_refusal_warns_once_and_counts_each`).
     ///
     /// Prove-the-test: this pins the per-part loop's
-    /// `FetchOutcome::DecodeRefused(err) => { self.note_column_stats_decode_refusal(...);
-    /// needs_fallback.push(part); }` arm actually excluding the refused
-    /// part's records. Flip that arm to a bare `needs_fallback.push(part)`
-    /// with no `note_column_stats_decode_refusal` call and the refusal-count
-    /// and WARN assertions below both fail: `column_stats_decode_refusals()`
-    /// reads 0 against the expected 1 and `count_containing` reads 0 against
-    /// the expected 1.
+    /// `FetchOutcome::DecodeRefused(err) => { self.note_column_stats_decode_failure(tenant,
+    /// signal, &resolved.key, &err); }` arm, which leaves the refused part's
+    /// records out of the merge and routes the non-gate error to
+    /// `note_column_stats_decode_refusal`. Empty that arm to
+    /// `FetchOutcome::DecodeRefused(_) => {}` and the refusal-count and WARN
+    /// assertions below both fail: `column_stats_decode_refusals()` reads 0
+    /// against the expected 1 and `count_containing` reads 0 against the
+    /// expected 1.
     #[tokio::test]
     async fn a_part_whose_v3_object_fails_to_decode_subtracts_its_coverage_and_warns() {
         let store = Arc::new(MemoryStore::new());
@@ -11060,12 +11194,7 @@ mod tests {
 
         let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
 
-        let capture = WarnCapture::default();
-        let subscriber = {
-            use tracing_subscriber::layer::SubscriberExt;
-            tracing_subscriber::registry().with(capture.clone())
-        };
-        let _default = tracing::subscriber::set_default(subscriber);
+        let (capture, _default) = WarnCapture::install();
 
         let (range, now_ns) = full_window();
         let loaded = catalog
@@ -13000,5 +13129,186 @@ mod tests {
             (1, 0),
             "the refused decode ran as one gate job"
         );
+    }
+
+    /// The substring of the WARN a cancelled column-stats gate job logs.
+    const GATE_JOB_WARN: &str = "decode job on the read CPU gate failed";
+
+    /// The substring of the WARN a panicked column-stats gate job logs.
+    const GATE_PANIC_WARN: &str = "decode job panicked on the read CPU gate";
+
+    /// Issue #2402: a column-stats decode job the read CPU gate reports as
+    /// cancelled or panicked is not a refusal of the object: it leaves
+    /// `column_stats_decode_refusals()` flat and does not spend the key's
+    /// refusal latch, so a later genuine refusal of the same key still counts
+    /// and still warns. A cancelled job warns on every occurrence; a panicked
+    /// one is counted every time and warns once per key.
+    ///
+    /// Prove-the-test: drop the `if first` guard around the panic WARN in
+    /// `note_column_stats_decode_failure` and the panic WARN count reads 2
+    /// against the expected 1.
+    #[test]
+    fn a_failed_column_stats_gate_job_is_not_a_decode_refusal() {
+        let catalog = Catalog::new(Arc::new(MemoryStore::new()), config(8)).expect("catalog");
+        let (capture, _default) = WarnCapture::install();
+        let key = oversized_stats_key("gate");
+
+        for gate_err in [
+            ravel_cpu_gate::CpuGateError::Panicked,
+            ravel_cpu_gate::CpuGateError::Cancelled,
+            ravel_cpu_gate::CpuGateError::Panicked,
+            ravel_cpu_gate::CpuGateError::Cancelled,
+        ] {
+            catalog.note_column_stats_decode_failure(
+                &tenant(),
+                Signal::Logs,
+                &key,
+                &crate::snapshot_format::SnapshotFormatError::DecodeJob(gate_err),
+            );
+        }
+        assert_eq!(
+            capture.count_containing(GATE_JOB_WARN),
+            2,
+            "one WARN per cancelled job"
+        );
+        assert_eq!(
+            capture.count_containing(GATE_PANIC_WARN),
+            1,
+            "one WARN per key for a panicked job"
+        );
+        assert_eq!(catalog.column_stats_decode_panics(), 2);
+        assert_eq!(capture.count_containing(DECODE_REFUSAL_WARN), 0);
+        assert_eq!(catalog.column_stats_decode_refusals(), 0);
+        assert!(
+            !catalog
+                .warned_decode_failures
+                .lock()
+                .contains(&(tenant(), Signal::Logs, key.clone())),
+            "a gate failure does not spend the refusal latch"
+        );
+
+        catalog.note_column_stats_decode_failure(
+            &tenant(),
+            Signal::Logs,
+            &key,
+            &crate::snapshot_format::SnapshotFormatError::ColumnStatsDecompressedTooLarge {
+                declared: 2_000_102_795,
+                cap: 1,
+            },
+        );
+        assert_eq!(catalog.column_stats_decode_refusals(), 1);
+        assert_eq!(
+            capture.count_containing(DECODE_REFUSAL_WARN),
+            1,
+            "the first genuine refusal of the key still warns"
+        );
+        assert_eq!(catalog.column_stats_decode_panics(), 2);
+        assert_eq!(capture.count_containing(GATE_JOB_WARN), 2);
+        assert_eq!(capture.count_containing(GATE_PANIC_WARN), 1);
+    }
+
+    /// Issue #2402 through `load_column_stats`: a covered part whose
+    /// column-stats decode fails on the read CPU gate is left uncovered (the
+    /// load returns nothing, so the query scans it, where the same store with
+    /// no fault loads the part's statistics), and the failure never reaches the
+    /// refusal accounting. Two loads per variant: a cancelled job warns on
+    /// both and counts nowhere; a panicked one, run as a real panicking job
+    /// on the gate, moves `column_stats_decode_panics()` by exactly one per
+    /// failed decode and warns on the first load only.
+    ///
+    /// Prove-the-test: in `load_column_stats`, change the
+    /// `FetchOutcome::DecodeRefused(err)` arm's call to
+    /// `self.note_column_stats_decode_refusal(tenant, signal, &resolved.key, &err)`
+    /// and `column_stats_decode_refusals()` reads 2 against the expected 0 on
+    /// the cancelled pass.
+    #[tokio::test]
+    async fn load_column_stats_keeps_a_failed_gate_job_out_of_the_refusal_accounting() {
+        let store = Arc::new(MemoryStore::new());
+        install_logs_stats(&store, *blake3::hash(b"part-gate-fault").as_bytes(), 7).await;
+        let (range, now_ns) = full_window();
+        let (capture, _default) = WarnCapture::install();
+
+        let control = Catalog::new(store.clone(), config(8))
+            .expect("catalog")
+            .with_read_gate(crate::read_gate::test_support::gate(0));
+        let loaded = control
+            .load_column_stats(
+                &tenant(),
+                Signal::Logs,
+                range,
+                now_ns,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("load")
+            .expect("with no fault the part is covered");
+        assert_eq!(loaded_value(&loaded), 7);
+
+        for fault in [
+            ravel_cpu_gate::CpuGateError::Cancelled,
+            ravel_cpu_gate::CpuGateError::Panicked,
+        ] {
+            let gate = crate::read_gate::test_support::gate(0);
+            let mut catalog = Catalog::new(store.clone(), config(8))
+                .expect("catalog")
+                .with_read_gate(gate.clone());
+            catalog.column_stats_decode_job_fault = Some(fault);
+            let warns_before = (
+                capture.count_containing(GATE_JOB_WARN),
+                capture.count_containing(GATE_PANIC_WARN),
+            );
+            for _ in 0..2 {
+                let loaded = catalog
+                    .load_column_stats(
+                        &tenant(),
+                        Signal::Logs,
+                        range,
+                        now_ns,
+                        &QueryAccounting::new(),
+                    )
+                    .await
+                    .expect("a failed gate job degrades rather than failing the load");
+                assert!(loaded.is_none(), "{fault:?}: the part is left uncovered");
+            }
+            let warns = (
+                capture.count_containing(GATE_JOB_WARN) - warns_before.0,
+                capture.count_containing(GATE_PANIC_WARN) - warns_before.1,
+            );
+
+            assert_eq!(catalog.column_stats_decode_refusals(), 0, "{fault:?}");
+            assert!(
+                catalog.warned_decode_failures.lock().is_empty(),
+                "{fault:?}: the refusal latch is unspent"
+            );
+            assert_eq!(
+                capture.count_containing(DECODE_REFUSAL_WARN),
+                0,
+                "{fault:?}"
+            );
+            match fault {
+                ravel_cpu_gate::CpuGateError::Panicked => {
+                    assert_eq!(catalog.column_stats_decode_panics(), 2);
+                    assert_eq!(
+                        warns,
+                        (0, 1),
+                        "the second load of the key logs no second panic WARN"
+                    );
+                    assert_eq!(catalog.warned_decode_panics.lock().len(), 1);
+                    assert_eq!(
+                        crate::read_gate::test_support::counts(
+                            &gate,
+                            ravel_cpu_gate::ReadSite::CatalogColumnStats
+                        ),
+                        (4, 0),
+                        "each load ran the decode and the panicking job on the gate"
+                    );
+                }
+                _ => {
+                    assert_eq!(catalog.column_stats_decode_panics(), 0);
+                    assert_eq!(warns, (2, 0), "a cancelled job warns on every load");
+                    assert!(catalog.warned_decode_panics.lock().is_empty());
+                }
+            }
+        }
     }
 }

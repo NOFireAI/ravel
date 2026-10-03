@@ -33,7 +33,9 @@
 //! actually references means the fold wrote an object the reader cannot
 //! open, so the fetch path surfaces it as [`FetchOutcome::DecodeRefused`]
 //! (rather than folding it into a bare miss) for the caller to log once and
-//! count (issue #1400). A GET failure on either the HEAD or a resolved stats
+//! count (issue #1400). A read CPU gate job that failed takes the same
+//! variant but says nothing about the bytes; the caller accounts for it
+//! separately (`Catalog::note_column_stats_decode_failure`). A GET failure on either the HEAD or a resolved stats
 //! object degrades like a miss when [`StoreError::is_retryable`] reports it
 //! throttling, a timeout, or otherwise transient: the artifact is optional
 //! and the query is correct without it, so a blip is not worth failing a
@@ -202,7 +204,9 @@ pub(crate) struct ResolvedStatsHead {
 /// that fails with `NotFound` or retryably, and a stale binding, are
 /// legitimately "no statistics" ([`Self::Absent`]); a DECODE failure on the
 /// object HEAD (or a covered part) points at is not ([`Self::DecodeRefused`])
-/// and the caller logs and counts it (issue #1400).
+/// and the caller logs and counts it (issue #1400), apart from a failed gate
+/// job, which `Catalog::note_column_stats_decode_failure` keeps out of the
+/// refusal accounting.
 pub(crate) enum FetchOutcome {
     /// Fetched, hash-verified, tenant-checked, part-bound, and decoded, with
     /// the reservation charging the decoded body (ADR-1702 decision 6).
@@ -218,7 +222,9 @@ pub(crate) enum FetchOutcome {
     /// HEAD (or a covered part) references an object the reader refused to
     /// DECODE: the fold wrote it and the ref points at it, but the bytes will
     /// not open (an oversized declared body, corruption, a crc or header
-    /// failure). Never normal. Carries the decode error so the caller can name
+    /// failure). Also carries a read CPU gate job that failed
+    /// ([`SnapshotFormatError::DecodeJob`]), which did not judge the bytes.
+    /// Never normal. Carries the decode error so the caller can name
     /// the cause and, for [`SnapshotFormatError::ColumnStatsDecompressedTooLarge`],
     /// the declared and cap bytes.
     DecodeRefused(SnapshotFormatError),
@@ -456,8 +462,9 @@ pub(crate) async fn fetch_stats_object(
         Ok(decoded) => decoded,
         // Decode of an object the ref points at: the fold wrote it, so a
         // failure to open it is never the ordinary not-covered case. Surface
-        // it for the caller to log once and count (issue #1400); the query
-        // still degrades to a miss and scans.
+        // it for the caller to log once and count (issue #1400), or, for a
+        // failed gate job, to account for separately; the query still
+        // degrades to a miss and scans.
         Err(err) => return Ok(FetchOutcome::DecodeRefused(err)),
     };
 
