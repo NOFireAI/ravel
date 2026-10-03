@@ -152,8 +152,8 @@ The six rules, and what each is measured against on #968:
 | `--fetch-concurrency` | `max(8, 2 x cores)` | 32 on the 16-core host; this is the knob that moved a cold full scan the most, and it also sets the SQL scan partition count |
 | `--cache-max-bytes` (fetcher cache) | 80% of `MemTotal` | ~24 GiB, chosen to exceed the ~12 GB corpus so a warm run has a hot column to report |
 | catalog byte cache | 5% of `MemTotal` (a separate ceiling, resolved as `catalog_cache_max_bytes`) | ~1.5 GiB; the fetcher cache and the catalog byte cache are two independent LRU caches, so deriving both at 80% would commit 160% of `MemTotal`. An explicit `--cache-max-bytes` still bounds both at that one value (no longer: see the catalog-cache amendment below) |
-| `--sql-max-query-bytes` | 25% of `MemTotal` | ~8 GiB, an order of magnitude above the largest value the in-process lane had been run at; this is the pool an `ORDER BY` or high-cardinality `GROUP BY` exhausts with `query memory budget exhausted` |
-| `--sql-tenant-max-bytes` | 50% of `MemTotal` | ~16 GiB, twice the per-query pool so a serial run never binds on the isolation ceiling |
+| `--sql-max-query-bytes` | 25% of `MemTotal` (now 50%, see the ADR-2414 amendment below) | ~8 GiB, an order of magnitude above the largest value the in-process lane had been run at; this is the pool an `ORDER BY` or high-cardinality `GROUP BY` exhausts with `query memory budget exhausted` |
+| `--sql-tenant-max-bytes` | 50% of `MemTotal` | ~16 GiB, twice the per-query pool so a serial run never binds on the isolation ceiling (equal to it since the ADR-2414 amendment below) |
 | `--max-segments` | 1,000,000 | a folded ClickBench tenant resolves ~8,400 sealed segments, so the old 1024 cap failed every statement with `8424 exceeds max 1024` |
 | `--gc-max-query-duration` | 11 minutes | the deadline the run was configured with, well above the 30s compiled-in engine default its longest statements would have hit, and well under the durable `sys/gc` `max_query_duration` default of 1h that query-mode startup validates against |
 
@@ -203,3 +203,18 @@ derives at its own 5% share whether or not that flag is set, and a separate
 `--catalog-cache-max-bytes` sets it explicitly (ADR-2023, #2023). On a
 loopback store the fetcher cache's derived share is also larger than the
 figure in the table above; ADR-1170 and ADR-2023 carry the current shares.
+
+## Amendment (2026-10-03, ADR-2414): the per-query SQL share is the tenant's share
+
+<!-- amendment-applies: sections="Amended 2026-09-02: unset means derive (issue #1141)" pointer="ADR-2414 amendment" -->
+
+The 2026-09-02 amendment's table derives `--sql-max-query-bytes` at 25% of
+`MemTotal` and `--sql-tenant-max-bytes` at twice that. ADR-2414 decision B1
+moves the per-query share to 50%, equal to the per-tenant share, so a lone
+statement may use the tenant's whole SQL share; the per-query pool still
+nests inside the per-tenant pool, so the tenant total is unchanged and a
+second concurrent statement gets what the first left. The explicit-flag
+rule is unchanged: an explicit `--sql-max-query-bytes` wins, clamped to an
+explicit tenant ceiling and raising a derived one. The measurement that
+motivated it is in ADR-2414's Context.
+

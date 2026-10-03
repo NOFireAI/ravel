@@ -1183,8 +1183,8 @@ pub struct Cli {
     /// derived, 50% of MemTotal, the same share as `--sql-tenant-max-bytes`, so
     /// a lone statement may use the tenant's whole SQL share; reference host
     /// (16 cores, 30 GiB): 16,106,127,360. Concurrent statements still share the
-    /// per-tenant ceiling. To keep a four-way split, set this flag to a quarter
-    /// of the tenant ceiling. Fallback when MemTotal is unknown: 256 MiB.
+    /// per-tenant ceiling. To keep the earlier split, set this flag to half the
+    /// tenant ceiling, 25% of MemTotal. Fallback when MemTotal is unknown: 256 MiB.
     ///
     /// Omitted, the value is DERIVED from the host
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141):
@@ -3039,8 +3039,9 @@ pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
 /// first left. One tenant's sum stays 80% of memory (fetch cache 25%, catalog
 /// cache 5%, SQL tenant share 50%), not 130%: the per-query share is a
 /// ceiling inside the tenant share, not a reservation on top of it. An
-/// explicit `--sql-max-query-bytes` still wins and is still clamped to the
-/// tenant ceiling.
+/// explicit `--sql-max-query-bytes` still wins: over an explicit
+/// `--sql-tenant-max-bytes` it is clamped to that ceiling, and over a derived
+/// or fallback tenant ceiling it raises the ceiling to match, as before.
 pub const SQL_QUERY_MEMORY_PERCENT: u64 = 50;
 
 /// Share of `MemTotal` the derived `--sql-tenant-max-bytes` takes (~15 GiB on

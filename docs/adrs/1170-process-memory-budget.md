@@ -65,7 +65,7 @@ Verified against the tree at `4e5c0ea8`.
   amendment below), SQL per-tenant 50%, with exact-integer
   tests (`config.rs:4896-4904`). The per-query share nests inside the
   per-tenant share (`crates/ravel-sql/src/memory.rs:321-336` charges the same
-  bytes to both), so the sum for one tenant is 80%, not 135%. The per-tenant
+  bytes to both), so the sum for one tenant is 80%, not 130%. The per-tenant
   share is per `TenantHash` (`crates/ravel-sql/src/executor.rs:459-470`), so N
   active tenants can reserve N x 50%.
 - **Two of the four ceilings are eviction caps, not reservations.** The fetch
@@ -864,7 +864,8 @@ bytes each on the 30 GiB reference host). The per-query pool still nests
 inside the per-tenant pool, so the per-tenant total and the 80% sum for one
 tenant are unchanged. A second concurrent statement no longer has a guaranteed
 quarter of memory; it gets what the first left. An explicit
-`--sql-max-query-bytes` still wins and is still clamped to the tenant ceiling.
-An operator who wants the earlier four-way split sets the flag to a quarter of
-the tenant ceiling. The reasoning and the measured statement that motivated it
+`--sql-max-query-bytes` still wins: over an explicit `--sql-tenant-max-bytes`
+it is clamped to that ceiling, and over a derived or fallback tenant ceiling it
+raises the ceiling to match, as before. An operator who wants the earlier
+split sets the flag to half the tenant ceiling, 25% of `MemTotal`. The reasoning and the measured statement that motivated it
 are in ADR-2414.
