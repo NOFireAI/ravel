@@ -150,7 +150,9 @@ nests inside the per-tenant pool, which refuses the byte that would exceed
 concurrent statement no longer has a guaranteed quarter of memory; it gets
 what the first left. The ten-connection envelope (#2367) does not move,
 because the tenant pool bounds the sum. An explicit `--sql-max-query-bytes`
-still wins and is still clamped to the tenant ceiling. On the reference box q33 then runs inside
+still wins: over an explicit `--sql-tenant-max-bytes` it is clamped to that
+ceiling, and over a derived or fallback tenant ceiling it raises the ceiling
+to match, the existing rule. On the reference box q33 then runs inside
 16,451,897,344 against its 10.86 GB peak.
 
 B2. **Spill eligibility for the `Sort` node is not changed here.** ADR-0954
@@ -213,8 +215,8 @@ while q33 is reported as a 43rd row.
   directory decode per block; the striped route costs what the fast path
   costs plus one fetch-side directory read per segment.
 - A lone statement can use the tenant's whole SQL share; the operator who
-  wants the old four-way split sets `--sql-max-query-bytes` to a quarter of
-  the tenant ceiling.
+  wants the old split sets `--sql-max-query-bytes` to half the tenant
+  ceiling, 25% of memory.
 - Spill eligibility is unchanged; a `Sort` over an aggregate still refuses
   spill until the tie-order question is answered on issue #2416.
 - The store cost profile gains two measured constants per profile (request
