@@ -55,8 +55,9 @@ pub use footer::{
 };
 pub use ranged::{RlogRangeReader, StreamBlockLoc, StreamBlockRows, StreamBlockSpan};
 pub use reader::{
-    BlockScan, RlogReader, ScanStats, decode_section, decode_section_accounted, read_section,
-    read_section_accounted, read_section_accounted_from, read_section_from, stream_attr_pairs,
+    BlockScan, RlogReader, ScanStats, SegmentDirectories, decode_section, decode_section_accounted,
+    read_section, read_section_accounted, read_section_accounted_from, read_section_from,
+    stream_attr_pairs,
 };
 pub use record::{FieldSel, FieldType, LogRecord, Predicate, stream_attrs_bytes};
 pub use source::{ByteSource, SparseObject};

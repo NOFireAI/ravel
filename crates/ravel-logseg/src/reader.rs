@@ -126,6 +126,36 @@ pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
     open_decompressed_bytes: u64,
 }
 
+/// The decoded footer directories for one segment (STREAM_DIR, FIELD_DIR,
+/// SKIP_IDX, PAGE_DIR) plus the trailer facts [`RlogReader::from_decoded`]
+/// needs beside them (ADR-2414 decision A1).
+///
+/// Decoding a segment's directories is the expensive, cacheable half of
+/// opening it; placing its pages is cheap and source-specific (a whole
+/// object vs. a [`crate::SparseObject`] holding only a partition's own
+/// ranged extents). Splitting [`RlogReader::from_source`] into
+/// [`RlogReader::decode_directories`] plus [`RlogReader::from_decoded`] lets
+/// a caller that opens the same segment more than once within one query (a
+/// striped scan dealing more than one partition's worth of blocks from it)
+/// decode this struct exactly once and clone it into each
+/// [`RlogReader`]/[`BlockScan`] it builds, rather than re-running the zstd
+/// decompression and validation this struct represents on every open.
+#[derive(Clone)]
+pub struct SegmentDirectories {
+    stream_dir: StreamDir,
+    field_dir: FieldDir,
+    skip: SkipIndex,
+    blocks_offset: u64,
+    page_dir: Arc<PageDir>,
+    bloom: SectionDesc,
+    postings: Option<SectionDesc>,
+    /// Bytes zstd produced decoding these four sections, summed once here so
+    /// every [`RlogReader::from_decoded`] built from a shared, cached copy
+    /// seeds [`ScanStats::decompressed_bytes`] with the same open-time total
+    /// without re-decompressing anything to get it.
+    open_decompressed_bytes: u64,
+}
+
 impl<'a> RlogReader<'a> {
     /// Opens and validates the object, decoding the directories and the skip
     /// index. The skip index carries the block framing, so a corrupt SKIP_IDX
@@ -137,13 +167,13 @@ impl<'a> RlogReader<'a> {
 }
 
 impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
-    /// [`RlogReader::new`] over any [`ByteSource`]. Every byte the open and the
-    /// later scans address is read through `source`, so a sparse source must
-    /// hold the footer and trailer, STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR,
-    /// BLOOM, POSTINGS when present, and the pages of every block a scan
-    /// decodes. A range it does not hold fails with
-    /// [`LogSegError::Unplaced`].
-    pub fn from_source(source: &'a S, cfg: &RlogConfig) -> Result<Self, LogSegError> {
+    /// Decodes STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR from `source` and
+    /// returns them as a [`SegmentDirectories`], without constructing a
+    /// reader. A caller that will open this same segment more than once
+    /// within one query calls this once and passes the result to
+    /// [`RlogReader::from_decoded`] for every subsequent open, instead of
+    /// paying this decode again (ADR-2414 decision A1).
+    pub fn decode_directories(source: &S, cfg: &RlogConfig) -> Result<SegmentDirectories, LogSegError> {
         let footer = open_source(source)?;
         let mut open_decompressed_bytes = 0u64;
         let stream_desc = *section(&footer, kind::STREAM_DIR)?;
@@ -179,8 +209,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
                 &field_dir,
             )?)
         };
-        Ok(RlogReader {
-            source,
+        Ok(SegmentDirectories {
             stream_dir,
             field_dir,
             skip,
@@ -190,6 +219,43 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             postings,
             open_decompressed_bytes,
         })
+    }
+
+    /// Builds a reader over `source` from an already-decoded
+    /// [`SegmentDirectories`], cloning its fields rather than decoding
+    /// anything. `source` may hold a different placement than whatever
+    /// source `dirs` was originally decoded from (a different partition's
+    /// [`crate::SparseObject`] over the same segment, holding only that
+    /// partition's own ranged extents) -- only the directory CONTENT is
+    /// shared, never the placed bytes.
+    pub fn from_decoded(source: &'a S, dirs: &SegmentDirectories) -> Self {
+        RlogReader {
+            source,
+            stream_dir: dirs.stream_dir.clone(),
+            field_dir: dirs.field_dir.clone(),
+            skip: dirs.skip.clone(),
+            blocks_offset: dirs.blocks_offset,
+            page_dir: Arc::clone(&dirs.page_dir),
+            bloom: dirs.bloom,
+            postings: dirs.postings,
+            open_decompressed_bytes: dirs.open_decompressed_bytes,
+        }
+    }
+
+    /// [`RlogReader::new`] over any [`ByteSource`]. Every byte the open and the
+    /// later scans address is read through `source`, so a sparse source must
+    /// hold the footer and trailer, STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR,
+    /// BLOOM, POSTINGS when present, and the pages of every block a scan
+    /// decodes. A range it does not hold fails with
+    /// [`LogSegError::Unplaced`].
+    ///
+    /// Decodes the directories fresh every call. A caller opening the same
+    /// segment more than once within one query should call
+    /// [`RlogReader::decode_directories`] once instead and build each
+    /// reader with [`RlogReader::from_decoded`] (ADR-2414 decision A1).
+    pub fn from_source(source: &'a S, cfg: &RlogConfig) -> Result<Self, LogSegError> {
+        let dirs = Self::decode_directories(source, cfg)?;
+        Ok(Self::from_decoded(source, &dirs))
     }
 
     /// The byte extent in BLOCKS of one `(row group, column)` column chunk,
