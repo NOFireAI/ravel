@@ -325,9 +325,10 @@ fn cell_from_array(array: &dyn Array, row: usize, index: usize) -> Result<Cell, 
                     array.as_primitive::<TimestampMicrosecondType>().value(row),
                     1_000,
                 ),
-                TimeUnit::Nanosecond => {
-                    (array.as_primitive::<TimestampNanosecondType>().value(row), 1)
-                }
+                TimeUnit::Nanosecond => (
+                    array.as_primitive::<TimestampNanosecondType>().value(row),
+                    1,
+                ),
             };
             let ns = raw
                 .checked_mul(factor)
@@ -402,7 +403,9 @@ fn days_from_civil_checked(y: i64, m: i64, d: i64) -> Option<i64> {
         .checked_add(yoe / 4)?
         .checked_sub(yoe / 100)?
         .checked_add(doy)?;
-    era.checked_mul(146097)?.checked_add(doe)?.checked_sub(719468)
+    era.checked_mul(146097)?
+        .checked_add(doe)?
+        .checked_sub(719468)
 }
 
 const DAYS_IN_MONTH: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -1580,8 +1583,7 @@ mod tests {
     /// Required test (4e): month 13 is invalid.
     #[test]
     fn month_13_is_typed_error() {
-        let err =
-            parse_date_to_days(0, "2013-13-01").expect_err("month 13 is out of range 1..=12");
+        let err = parse_date_to_days(0, "2013-13-01").expect_err("month 13 is out of range 1..=12");
         assert!(matches!(err, ComparatorError::InvalidDate { .. }));
     }
 
