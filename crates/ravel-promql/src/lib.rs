@@ -25,6 +25,8 @@ mod eval;
 mod functions;
 pub mod histogram;
 mod matchers;
+#[doc(hidden)]
+pub mod op_timers;
 mod plan;
 pub mod redact;
 mod source;

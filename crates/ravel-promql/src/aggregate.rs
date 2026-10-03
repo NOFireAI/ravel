@@ -74,6 +74,8 @@
 //! independent top-k selections are made, never a selected row's own labels.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use promql_parser::label::Labels;
 use promql_parser::parser::token::{
@@ -116,9 +118,14 @@ pub(crate) fn eval_aggregate(
         }
     };
     let mut input = operand;
-    input.sort_by(|a, b| label_set_cmp(&a.labels, &b.labels));
-
     let op = agg.op.id();
+    // `AGG_SORT_NS`/`AGG_NS` (issue #2445) are only folded in on the plain-
+    // aggregate arm below, but the sort itself runs once here regardless of
+    // `op`, so it is timed unconditionally and attributed there.
+    let sort_start = Instant::now();
+    input.sort_by(|a, b| label_set_cmp(&a.labels, &b.labels));
+    let sort_elapsed_ns = sort_start.elapsed().as_nanos() as u64;
+
     match op {
         T_COUNT_VALUES => eval_count_values(evaluator, source, agg, input, eval_ts_ns, ctx),
         T_TOPK | T_BOTTOMK => {
@@ -143,13 +150,13 @@ pub(crate) fn eval_aggregate(
             )))
         }
         T_SUM | T_AVG | T_MIN | T_MAX | T_COUNT | T_GROUP | T_STDDEV | T_STDVAR => {
-            Ok(Value::Vector(eval_plain_aggregate(
-                op,
-                agg.modifier.as_ref(),
-                input,
-                eval_ts_ns,
-                ctx,
-            )))
+            crate::op_timers::AGG_SORT_NS.fetch_add(sort_elapsed_ns, Ordering::Relaxed);
+            let agg_start = Instant::now();
+            let result = eval_plain_aggregate(op, agg.modifier.as_ref(), input, eval_ts_ns, ctx);
+            let agg_elapsed_ns = agg_start.elapsed().as_nanos() as u64;
+            crate::op_timers::AGG_NS.fetch_add(sort_elapsed_ns + agg_elapsed_ns, Ordering::Relaxed);
+            crate::op_timers::AGG_CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(Value::Vector(result))
         }
         T_LIMITK | T_LIMIT_RATIO => {
             // promql-parser 0.10 parses `limitk`/`limit_ratio` (Prometheus'

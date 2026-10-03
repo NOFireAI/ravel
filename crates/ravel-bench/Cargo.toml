@@ -232,6 +232,11 @@ name = "query_latency_bench"
 path = "src/bin/query_latency_bench.rs"
 bench = false
 
+[[bin]]
+name = "promql_operator_share"
+path = "src/bin/promql_operator_share.rs"
+bench = false
+
 
 [[bin]]
 name = "distrib_crossover_bench"

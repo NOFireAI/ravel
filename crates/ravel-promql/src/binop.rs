@@ -47,6 +47,8 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use promql_parser::label::Labels;
 use promql_parser::parser::token::{
@@ -577,7 +579,14 @@ fn eval_vector_vector(
         });
     }
     match &modifier.card {
-        VectorMatchCardinality::OneToOne => one_to_one(op, lhs, rhs, modifier, ctx),
+        VectorMatchCardinality::OneToOne => {
+            let start = Instant::now();
+            let result = one_to_one(op, lhs, rhs, modifier, ctx);
+            crate::op_timers::MATCH_NS
+                .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            crate::op_timers::MATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+            result
+        }
         VectorMatchCardinality::ManyToOne(extra) => {
             group_match(op, lhs, rhs, modifier, extra, true, ctx)
         }
