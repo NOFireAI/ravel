@@ -655,8 +655,10 @@ pub(crate) mod ram_recheck_seam {
 /// This type exists for the shape those fields cannot express: a run that
 /// merged several inputs' samples, where each sample keeps the provenance of
 /// the write it came from and array position no longer reconstructs the fourth
-/// element (ADR-0092 "Why 11.46 is not the target", decision 1). Nothing
-/// produces that shape yet; issue #315 makes L1 compaction emit it.
+/// element (ADR-0092 "Why 11.46 is not the target", decision 1). Issue #315
+/// makes L1 compaction emit it. The scan-time erasure mask also gives a
+/// run-wide run this shape when it drops samples, so every survivor keeps the
+/// key its original position implied (`erasure::compact_parallel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SamplePriority {
     pub created_unix_ns: i64,

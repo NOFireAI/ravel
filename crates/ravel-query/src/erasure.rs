@@ -238,7 +238,8 @@ pub fn retain_series_soa(series: &mut Vec<FetchedSeriesSoa>, predicates: &[Erasu
         compact_parallel(
             &mut s.timestamps,
             &mut s.values,
-            s.per_sample_priorities.as_mut(),
+            &mut s.per_sample_priorities,
+            (s.created_unix_ns, s.writer_epoch, s.writer_seq),
             &matching,
         );
         !s.timestamps.is_empty()
@@ -259,11 +260,21 @@ pub fn retain_series_aos(series: &mut Vec<FetchedSeries>, predicates: &[ErasureP
         if matching.iter().any(|p| !p.has_window()) {
             return false;
         }
-        // A per-sample dedup priority column is positional, so it is compacted
-        // in lockstep with the samples: dropping samples under it would hand
-        // the survivors another sample's provenance, which decides duplicate
-        // winners. Same rule as `compact_parallel` on the SoA shapes.
+        // Same rule as `compact_parallel` on the SoA shapes: survivors keep
+        // their original dedup keys, so the priority column is pinned before
+        // anything is dropped and compacted in lockstep with the samples.
         let sample_count = s.samples.len();
+        if s.samples
+            .iter()
+            .all(|sample| sample_survives(sample.ts_ns, &matching))
+        {
+            return sample_count != 0;
+        }
+        pin_run_wide_positions(
+            &mut s.per_sample_priorities,
+            (s.created_unix_ns, s.writer_epoch, s.writer_seq),
+            sample_count,
+        );
         let mut column = s
             .per_sample_priorities
             .as_mut()
@@ -306,7 +317,8 @@ pub fn retain_histogram_series(
         compact_parallel(
             &mut s.timestamps,
             &mut s.values,
-            s.per_sample_priorities.as_mut(),
+            &mut s.per_sample_priorities,
+            (s.created_unix_ns, s.writer_epoch, s.writer_seq),
             &matching,
         );
         !s.timestamps.is_empty()
@@ -462,25 +474,38 @@ pub fn snapshot_pending_erasure_predicates(snapshot: &Snapshot) -> Vec<ErasurePr
 }
 
 /// Compacts positionally-aligned vecs (timestamps, values, and a run's
-/// optional per-sample dedup priority column) in place, keeping only the
-/// indices whose timestamp survives the matching windowed predicates.
-/// `timestamps` and `values` must have equal length; all are truncated to the
-/// surviving prefix, preserving on-disk order.
+/// per-sample dedup priority column) in place, keeping only the indices whose
+/// timestamp survives the matching windowed predicates. `timestamps` and
+/// `values` must have equal length; all are truncated to the surviving prefix,
+/// preserving on-disk order.
 ///
-/// `priorities` is compacted in lockstep because it is positional: leaving it
-/// whole would give the surviving samples other samples' provenance, which
-/// decides duplicate winners at query time. A column whose length disagrees
-/// with the sample count is left alone rather than swapped past its end; it
-/// reaches the merge as the `QueryError::PrioritySampleCountMismatch` it
-/// already was, never a panic here.
+/// A non-erased sample must resolve the same with a request pending as before
+/// it and after the erasure rewrite, so every survivor keeps its original
+/// dedup key. A run with no column derives the fourth key element from array
+/// position, which compaction would shift, so before dropping anything it is
+/// given an explicit column of the keys its positions imply
+/// ([`pin_run_wide_positions`]); a run nothing is dropped from is left exactly
+/// as fetched.
+///
+/// The column is compacted in lockstep because it is positional: leaving it
+/// whole would give the surviving samples other samples' provenance. A column
+/// whose length disagrees with the sample count is left alone rather than
+/// swapped past its end; it reaches the merge as the
+/// `QueryError::PrioritySampleCountMismatch` it already was, never a panic
+/// here.
 fn compact_parallel<V>(
     timestamps: &mut Vec<i64>,
     values: &mut Vec<V>,
-    priorities: Option<&mut Vec<SamplePriority>>,
+    priorities: &mut Option<Vec<SamplePriority>>,
+    run_wide: (i64, u64, u64),
     matching: &[&ErasurePredicate],
 ) {
     debug_assert_eq!(timestamps.len(), values.len());
-    let mut column = priorities.filter(|c| c.len() == timestamps.len());
+    if timestamps.iter().all(|&ts| sample_survives(ts, matching)) {
+        return;
+    }
+    pin_run_wide_positions(priorities, run_wide, timestamps.len());
+    let mut column = priorities.as_mut().filter(|c| c.len() == timestamps.len());
     let mut write = 0usize;
     for read in 0..timestamps.len() {
         if sample_survives(timestamps[read], matching) {
@@ -497,6 +522,32 @@ fn compact_parallel<V>(
     if let Some(c) = column {
         c.truncate(write);
     }
+}
+
+/// Replaces a run-wide-provenance run's absent priority column with the
+/// explicit per-sample keys the merge would otherwise derive for its
+/// `sample_count` samples: `run_wide` plus the sample's position, saturating
+/// at `u32::MAX` exactly as the merge's position-derived key does. A run that
+/// already carries a column keeps it.
+fn pin_run_wide_positions(
+    priorities: &mut Option<Vec<SamplePriority>>,
+    run_wide: (i64, u64, u64),
+    sample_count: usize,
+) {
+    if priorities.is_some() {
+        return;
+    }
+    let (created_unix_ns, writer_epoch, writer_seq) = run_wide;
+    *priorities = Some(
+        (0..sample_count)
+            .map(|pos| SamplePriority {
+                created_unix_ns,
+                writer_epoch,
+                writer_seq,
+                in_page_index: u32::try_from(pos).unwrap_or(u32::MAX),
+            })
+            .collect(),
+    );
 }
 
 #[cfg(test)]
@@ -747,6 +798,81 @@ mod tests {
             hist[0].per_sample_priorities,
             Some(vec![column[0], column[2]])
         );
+    }
+
+    /// The key a run-wide run's sample at `pos` presents to the merge.
+    fn run_wide_key(pos: u32) -> SamplePriority {
+        SamplePriority {
+            created_unix_ns: 7,
+            writer_epoch: 3,
+            writer_seq: 5,
+            in_page_index: pos,
+        }
+    }
+
+    /// A run with no per-sample column takes its fourth key element from
+    /// array position. Masking a sample must not renumber the survivors, so
+    /// each one is left with the explicit key of its original position, on
+    /// every shape (issue #2423).
+    #[test]
+    fn windowed_erasure_keeps_run_wide_survivors_original_positions() {
+        let erasure = [pred(&[("user_id", "u1")], 100, 200)];
+        let lbls = labels(&[("user_id", "u1")]);
+        let pinned = Some(vec![run_wide_key(0), run_wide_key(2), run_wide_key(3)]);
+
+        let mut scalar = soa(
+            lbls.clone(),
+            &[(50, 1.0), (150, 2.0), (300, 3.0), (300, 4.0)],
+        );
+        (scalar.created_unix_ns, scalar.writer_epoch, scalar.writer_seq) = (7, 3, 5);
+        let mut scalar = vec![scalar];
+        retain_series_soa(&mut scalar, &erasure);
+        assert_eq!(scalar[0].timestamps, vec![50, 300, 300]);
+        assert_eq!(scalar[0].per_sample_priorities, pinned);
+
+        let mut aos = vec![FetchedSeries {
+            series_id: SeriesId([0; 16]),
+            labels: lbls.clone(),
+            samples: [(50, 1.0), (150, 2.0), (300, 3.0), (300, 4.0)]
+                .iter()
+                .map(|&(ts_ns, value)| Sample { ts_ns, value })
+                .collect(),
+            created_unix_ns: 7,
+            writer_epoch: 3,
+            writer_seq: 5,
+            per_sample_priorities: None,
+        }];
+        retain_series_aos(&mut aos, &erasure);
+        assert_eq!(
+            aos[0].samples.iter().map(|s| s.ts_ns).collect::<Vec<_>>(),
+            vec![50, 300, 300]
+        );
+        assert_eq!(aos[0].per_sample_priorities, pinned);
+
+        let mut hist = vec![FetchedHistogramSeries {
+            series_id: SeriesId([0; 16]),
+            labels: lbls,
+            timestamps: vec![50, 150, 300, 300],
+            values: vec![empty_histogram_value(); 4],
+            created_unix_ns: 7,
+            writer_epoch: 3,
+            writer_seq: 5,
+            per_sample_priorities: None,
+        }];
+        retain_histogram_series(&mut hist, &erasure);
+        assert_eq!(hist[0].timestamps, vec![50, 300, 300]);
+        assert_eq!(hist[0].per_sample_priorities, pinned);
+    }
+
+    /// A matching series the window drops nothing from is left exactly as
+    /// fetched: no column is materialized for a run whose positions did not
+    /// move.
+    #[test]
+    fn windowed_erasure_dropping_nothing_leaves_a_run_wide_run_alone() {
+        let mut series = vec![soa(labels(&[("user_id", "u1")]), &[(50, 1.0), (300, 2.0)])];
+        retain_series_soa(&mut series, &[pred(&[("user_id", "u1")], 100, 200)]);
+        assert_eq!(series[0].timestamps, vec![50, 300]);
+        assert_eq!(series[0].per_sample_priorities, None);
     }
 
     /// A column that already disagrees with the sample count is not swapped
