@@ -243,8 +243,8 @@ per-role tables imply. Know this before your first deployment:
   does not weaken the delete boundary: a create-if-absent write cannot overwrite
   or delete an existing object, and `sys/tenancy` is deny-delete for every role.
   The effect is only that a fresh operator-managed cluster boots without a
-  manual bootstrap step, except on AWS S3 under per-role credentials (see the
-  `sys/gc` entry below).
+  manual bootstrap step. On AWS S3 under per-role credentials this needs the
+  current templates; see the AWS paragraph below.
 - **`sys/gc`**, the durable garbage-collection configuration, is created by
   the first process to reach a fresh bucket, and only the Maintain and Admin
   roles carry a write grant on it. Under per-role credentials, start the
@@ -262,18 +262,43 @@ per-role tables imply. Know this before your first deployment:
   process refused that create instead gets an error naming the PutObject grant
   on `sys/gc` its role needs (and `kms:GenerateDataKey` on the bucket's
   default key under SSE-KMS, which the shipped templates grant only on the
-  tenant key), not start-order advice. On AWS S3, a GET of an absent key is
-  refused rather than reported missing when the credential holds no
-  `s3:ListBucket` covering it, and the gateway, query and maintain templates
-  grant none covering `sys/tenancy` or `sys/gc`. Every server process reads
-  `sys/tenancy` before `sys/gc`, and no `ravel-cli` command creates
-  `sys/tenancy`, so on a fresh AWS bucket under those templates start order
-  does not solve the first startup yet: run it under one shared credential
-  that can create both objects, then move to per-role credentials. Under one
-  shared credential any server process creates `sys/gc`, so start order does
-  not matter there. The mutation path that changes an existing `sys/gc` is
-  Admin-only, matching that it is an explicit operator action rather than
-  something a server does on its own.
+  tenant key), not start-order advice. Under one shared credential any server
+  process creates `sys/gc`, so start order does not matter there. The mutation
+  path that changes an existing `sys/gc` is Admin-only, matching that it is an
+  explicit operator action rather than something a server does on its own.
+
+On AWS S3, a GET of an absent key is refused rather than reported
+missing unless the credential holds an `s3:ListBucket` grant covering that key.
+The gateway, query and maintain templates in `deploy/iam/` grant one on exactly
+the keys each process reads where absence is normal, and on nothing else (see
+"Bootstrap keys" in `deploy/iam/README.md`). Under them, every process sees an
+absent `sys/qualification`, `sys/tenancy` or `sys/gc` as absent, so a fresh AWS
+bucket starts the same way as any other store:
+
+1. Run `ravel-cli store qualify` under the Admin credential. It writes
+   `sys/qualification`, which no server process creates; until it exists,
+   every server process exits with the error naming `store qualify`.
+2. Start the processes. Whichever starts first creates `sys/tenancy`. The
+   `maintain` process creates `sys/gc`; a gateway or query process that starts
+   before it exits as described above until `sys/gc` exists. To create
+   `sys/gc` without starting `maintain`, run `ravel-cli gc-config set` under
+   the Admin credential with the values described above.
+
+The per-tenant objects need no step of their own. A process started with
+`--tenant-kms-config` creates each named tenant's key-epoch record at startup
+if it is absent. The gateway creates a tenant's provisioning record on the
+tenant's first write and its metric metadata record on the first metadata
+flush. A tenant with no config record runs on the deployment defaults, and a
+keyed bucket with no `sys/auth` has no durable tokens yet.
+
+Templates copied before these list grants existed grant no list covering
+`sys/tenancy` or `sys/gc`, so on a fresh AWS bucket every server process is
+refused the read of `sys/tenancy` before it reaches `sys/gc`, and no
+`ravel-cli` command creates `sys/tenancy`. Creating `sys/gc` with
+`ravel-cli gc-config set` under the Admin credential still works there, but it
+is not enough on its own: update the policies from `deploy/iam/`, or run the
+first startup under one shared credential that can create both objects, then
+move to per-role credentials.
 
 `sys/qualification` gets no such exception. It is written by the Admin
 credential running `store qualify`, one time for the life of the bucket, and no

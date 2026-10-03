@@ -195,6 +195,12 @@ writes the record, because its startup check does not adopt. The prov write
 conditions amendment below grants each writer and conditions every `prov`
 write on the put mode its callers send.
 
+The table's Read column says nothing about listing, and on AWS S3 a read of an
+absent key is refused unless a `ListBucket` grant covers the key. Each server
+role's reads of `sys/tenancy`, `sys/qualification`, `sys/gc` and the other keys
+whose absence is a normal state therefore also need a list grant on exactly
+those keys; the bootstrap-key list amendment below adds it.
+
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
 runs inside the same `Mode::Maintain` process as compaction and retention
@@ -430,6 +436,10 @@ operator step per its own documented contract ("never reads, lists, or
 writes any tenant-prefixed key... safe to run against a bucket that already
 holds production data," `docs/object-store-contract.md:332-334`). No server
 role needs to write it.
+
+The bootstrap race above only runs on AWS S3 if each process sees an absent
+`sys/tenancy` or `sys/gc` as absent rather than refused, which needs a
+`ListBucket` grant on the key; see the bootstrap-key list amendment below.
 
 ### 5. Operator change
 
@@ -726,7 +736,8 @@ follow-up, not fixed here.
 
 The control-plane key amendment below provisions it: the read, write and
 deny-delete above are in the templates. The `ListBucket` prefix is not, because
-no code lists `t/<hash>/enc`.
+no code lists `t/<hash>/enc` (the bootstrap-key list amendment below adds a list
+grant on the exact key, for the 404 an absent record needs on AWS S3).
 
 ## Amendment: the selective-erasure `del/` paths
 
@@ -1101,7 +1112,8 @@ below are the narrowest that cover each call:
   `MaintainWrite` gain `t/*/enc`. Admin reads it for `ravel-cli
   verify-custody` through its blanket `t/*` and writes it nowhere. Nothing
   lists it, so no `ListBucket` prefix is added, unlike the follow-up the
-  `t/<hash>/enc` amendment above proposed.
+  `t/<hash>/enc` amendment above proposed (the bootstrap-key list amendment
+  below adds one on the exact key, so an absent record reads as 404 on AWS S3).
 - **`t/<hash>/m/meta`, the metric metadata record (ADR-0085 decision 1).** The
   ingest metadata sink in `Mode::Gateway` and `Mode::All` GETs it and PUTs it
   with `CreateIfAbsent` or `CasVersion`; the query metadata cache in
@@ -1583,3 +1595,88 @@ signals' records, only Maintain and Admin can overwrite one.
 
 Recorded as an appended amendment, with an inline pointer added to §1 and
 §3.
+
+## Amendment (2026-10-03): bootstrap-key list grants per role
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|4. The two remaining bootstrap-write exceptions|Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant|Amendment (2026-10-01): the control-plane keys each role reads and writes" pointer="bootstrap-key list amendment" -->
+<!-- amendment-supersedes: phrase="so no `ListBucket` prefix is added" pointer="bootstrap-key list amendment" -->
+
+Issue #2332. On AWS S3, a GET or HEAD of a key that does not exist is answered
+with 403, not 404, unless the caller holds an `s3:ListBucket` grant covering
+that key. A live check against AWS on 2026-10-03, recorded on issue #2332,
+confirmed it, and confirmed that a `ListBucket` statement whose `s3:prefix`
+condition is a `StringEquals` on exactly the key makes S3 report the missing
+key as 404, while a key the condition does not name keeps answering 403.
+
+The templates granted the reads of §1 and of the control-plane key amendment
+and no list covering `sys/tenancy`, `sys/qualification` or `sys/gc`. Every
+server process reads all three at startup, and each read passes only
+`NotFound` through as absence, so on a fresh AWS bucket every server role was
+refused the read of each object before it could create it, and no start order
+helped. The same held for the per-tenant keys a role reads where absence is a
+normal state: a tenant with no config record, no key-epoch record, no
+provisioning record, no metric metadata, no alert state memo, no Parquet grants
+record, or, for Maintain, no catalog `HEAD`.
+
+Decision, made by the owner: each server role gets an `s3:ListBucket` grant
+whose `s3:prefix` condition names exactly the control-plane keys that role
+reads where absence is an expected state. Not `sys/*`, and not an
+unconditioned `ListBucket`. Fixed keys are named with `StringEquals` on the
+exact key. Per-tenant keys are named with `StringLike`, the tenant hash
+written as 32 single-character wildcards and no `*`, the form the `prov` write
+grants use. IAM requires every operator in one `Condition` block to match, so
+each template carries two new statements, `<Role>ListBootstrapKeys`
+(`StringEquals`) and `<Role>ListTenantBootstrapKeys` (`StringLike`). The
+existing list statements and every `Deny` are unchanged.
+
+The key set, derived from the call sites (the code's handling of
+`AccessDenied` is unchanged; a key is included only where the code already
+treats a real 404 as a normal state, and only for the role that reads it):
+
+| Key | Gateway | Query | Maintain | Call site |
+|---|---|---|---|---|
+| `sys/qualification` | yes | yes | yes | `qualification::enforce`, startup; absent refuses naming `store qualify` |
+| `sys/tenancy` | yes | yes | yes | `read_marker` in `resolve_and_pin`, startup; absent writes the marker |
+| `sys/gc` | yes | yes | yes | `read_gc_config` in `bootstrap_gc_config`, startup; absent tries the create |
+| `sys/auth` | yes | yes | | `DurableAuthState::refresh`, keyed bucket; absent is an empty map |
+| `t/<hash>/config` | yes | yes | yes | `read_config`; absent is the deployment defaults |
+| `t/<hash>/enc` | yes | yes | yes | `bootstrap_tenant_epoch`, startup under `--tenant-kms-config`; absent records the first epochs |
+| `t/<hash>/m/meta` | yes | yes | | the metadata sink (creates it) and the metadata cache |
+| `t/<hash>/<sig>/prov` | `m`, `l`, `s` | every signal | `m`, `l`, `s` | `validate_or_adopt` and the generation reads; the query catalog's enforcement reads it for every signal it resolves |
+| `t/<hash>/catalog/<sig>/HEAD` | | | `m`, `l`, `s` | the scheduled fold's `get_head`; absent is the first fold |
+| `t/<hash>/a/state/latest` | | yes | yes | `read_alert_state_memo` in the evaluator and in `alert_keep_set` |
+| `t/<hash>/pq/grants` | | yes | | `grants::list`; absent is no grants |
+
+Gateway's and Query's catalog `HEAD` reads were already admitted by their
+`t/*/catalog/*/*` list prefix, and Maintain's scrub cursor and the other keys
+under `t/*/*/maint/*` by `MaintainList`, so they gain nothing. Left out:
+`sys/t/<hash>`, the alert lease and the compaction claims are written with
+`CreateIfAbsent` first and read only after that write reports the object
+exists; the idempotency markers are found by a prefix listing, not a
+single-key read; and a data object a concurrent compaction deleted is a race,
+not a bootstrap state, whose key cannot be named without a `*`.
+
+A list request whose prefix is one of these keys can return only that key,
+since no key the system writes begins with one and continues, so the grants
+enumerate nothing else. `crates/ravel-commit/tests/iam_templates.rs` pins the
+exact condition values per role, checks each call site's key against its
+role's list statement, and checks that the new statements admit no other key:
+not a sibling a role does not read (`sys/auth` for Maintain), not a key one
+segment deeper, not a listing prefix such as `sys/` or `t/<hash>/`, and not a
+tenant segment 31 or 33 characters wide.
+
+On a fresh AWS bucket under per-role credentials, every server role now
+creates `sys/tenancy`, Maintain creates `sys/gc` as §4 describes, and the
+per-tenant records are created as before. `sys/qualification` still needs
+Admin's `store qualify`. A bucket whose policies predate this amendment still
+needs its first startup under one shared credential, since no `ravel-cli`
+command creates `sys/tenancy`.
+
+Net effect on §1: each server role's reads gain a list grant on exactly the
+keys above. Net effect on §4: the bootstrap race now runs on AWS S3 under the
+per-role templates. The `t/<hash>/enc` key-epoch amendment's proposed list
+prefix is added on the exact key, and the control-plane key amendment's "so no
+`ListBucket` prefix is added" no longer holds.
+
+Recorded as an appended amendment, with an inline pointer added to §1, §4, the
+`t/<hash>/enc` key-epoch amendment and the control-plane key amendment.

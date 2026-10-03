@@ -512,7 +512,8 @@ Gateway and Query carry no write on `sys/gc`, although every mode runs the
 fresh bucket needs the `maintain` process started first, or the object created
 with `ravel-cli gc-config set` under Admin (see
 `docs/guides/operations/deployment.md`, "The first deployment against a fresh
-bucket").
+bucket"). On AWS S3 each role also needs to see an absent `sys/gc` as absent
+rather than refused; see "Bootstrap keys" below.
 
 ### Which credential each `ravel-cli` command takes
 
@@ -702,6 +703,71 @@ PutObject that `QueryWrite` and `AdminWrite` grant for audit records. The
 audit signal has no provisioning record, so nothing legitimate is there to
 replace; a planted one could widen the shard range an audit scan reads or make
 audit reads fail, and cannot hide any record.
+
+## Bootstrap keys: a list grant on each absent key a role reads
+
+On AWS S3, a GET or HEAD of an absent key is answered with 403,
+not 404, unless the credential holds an `s3:ListBucket` grant whose `s3:prefix`
+condition covers that key. A live check against AWS on 2026-10-03 (recorded on
+issue #2332) confirmed this, and confirmed that a `ListBucket` statement whose
+`s3:prefix` condition names exactly the key turns the answer into 404 while a
+key the condition does not name keeps answering 403.
+
+Every server role reads control-plane keys whose absence is a normal state: a
+fresh bucket has no `sys/tenancy` or `sys/gc` yet, a tenant with no overrides
+has no config record, and so on. The code treats `NotFound` on each as that
+state and any other error, `AccessDenied` included, as a failed read. Without a
+list grant covering the key, every such read on a fresh bucket or a new tenant
+fails, and start order cannot help, since the first process to start is refused
+the read of each object before it can create it.
+
+Each server template therefore carries two list statements naming exactly the
+keys that role reads this way:
+
+- `GatewayListBootstrapKeys`, `QueryListBootstrapKeys` and
+  `MaintainListBootstrapKeys` name the fixed keys under `StringEquals`.
+- `GatewayListTenantBootstrapKeys`, `QueryListTenantBootstrapKeys` and
+  `MaintainListTenantBootstrapKeys` name the per-tenant keys under
+  `StringLike`, with the tenant hash spelled as 32 `?` and no `*`.
+
+They are two statements because IAM requires every operator in one `Condition`
+block to match, so `StringEquals` and `StringLike` together in one statement
+would admit nothing. The existing list statements are unchanged.
+
+| Key | Gateway | Query | Maintain | Read by, and what absence means |
+|---|---|---|---|---|
+| `sys/qualification` | yes | yes | yes | `qualification::enforce` at startup; absent refuses startup with the error naming `ravel-cli store qualify` |
+| `sys/tenancy` | yes | yes | yes | `resolve_and_pin` at startup; absent means no process has pinned the scheme yet, and this one writes the marker |
+| `sys/gc` | yes | yes | yes | `bootstrap_gc_config` at startup; absent means a fresh bucket, and the process tries to create it |
+| `sys/auth` | yes | yes | | `DurableAuthState::refresh` on a keyed bucket; absent is an empty token map |
+| `t/<tenant_hash>/config` | yes | yes | yes | `read_config`; absent means the tenant runs on the deployment defaults |
+| `t/<tenant_hash>/enc` | yes | yes | yes | `bootstrap_tenant_epoch` at startup under `--tenant-kms-config`; absent means no epoch is recorded yet, and the process records the first ones |
+| `t/<tenant_hash>/m/meta` | yes | yes | | the metadata sink (creates it) and the metadata cache (serves nothing) |
+| `t/<tenant_hash>/<signal>/prov` | `m`, `l`, `s` | every signal | `m`, `l`, `s` | `validate_or_adopt` and the shard-generation reads; absent means a tenant with no write yet. The query catalog reads it for whichever signal a query resolves, including signals that never get a record |
+| `t/<tenant_hash>/catalog/<signal>/HEAD` | | | `m`, `l`, `s` | the scheduled fold's `get_head`; absent means the first fold |
+| `t/<tenant_hash>/a/state/latest` | | yes | yes | the alert evaluator (folds the full history) and alert retention (checks the commit prefix) |
+| `t/<tenant_hash>/pq/grants` | | yes | | `grants::list`; absent is an empty grant list |
+
+The catalog `HEAD` that Gateway and Query read was already covered by their
+`t/*/catalog/*/*` list prefix, and Maintain's scrub cursor and other keys
+under `t/*/*/maint/*` by `MaintainList`, so those need no new grant.
+
+These statements list nothing else. A list request whose prefix is one of
+these keys can return only that key, since no key the system writes begins
+with one of them and continues. They admit no `sys/` or `t/<tenant_hash>/`
+listing, no key one segment deeper, and no tenant segment wider or narrower
+than a tenant hash. `crates/ravel-commit/tests/iam_templates.rs` pins the
+exact condition values per role, checks that each read above is admitted by
+its role's statement, and checks that the bootstrap statements admit no other
+key: neither a sibling key the role does not read (`sys/auth` for Maintain),
+nor a deeper key, a listing prefix or a 31- or 33-character tenant segment.
+
+Some keys are deliberately left out. `sys/t/<tenant_hash>`, the alert lease
+and the compaction claims are written with a create-if-absent PUT first and
+read only once that PUT reports the object exists. The idempotency markers are
+found by listing a prefix, not by a single-key read. A data object that a
+concurrent compaction deleted is a race, not a bootstrap state, and naming
+those keys would need a `*`.
 
 ## Bucket-configuration reads: granted by no template
 
