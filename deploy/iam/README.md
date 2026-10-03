@@ -545,7 +545,9 @@ after every completed walk and stops the run on a refusal, and the
 floor after a clean re-audit. The delete falls under `MaintainDelete`
 `t/*/*/maint/*`, since IAM's `*` matches `/`. The floor raise is
 `MaintainProvCas`, a CAS-only grant (see "Provisioning records: conditioned
-writes" below). Issue #2359 changes the migrate cursor; the grants here are
+writes" below). `maintain_template_covers_every_maintain_migrate_call` in
+`crates/ravel-commit/tests/iam_templates.rs` checks every call the command
+issues against this template. Issue #2359 changes the migrate cursor; the grants here are
 for the cursor as it is today.
 
 ### Parquet table DDL
@@ -622,34 +624,70 @@ conditioned statements only (ADR-0055, prov write conditions amendment):
 | Call | Role | Put mode | Grant |
 |---|---|---|---|
 | `ProvisioningRecordWriter::ensure` (`services/ravel-server/src/provisioning.rs`), `validate_or_adopt` with `CreateFromConfig` on a tenant's first ingest write | Gateway | `CreateIfAbsent` | `GatewayProvCreate` |
-| `validate_static_provisioning` (same file, called from `main.rs` at startup in every mode), `validate_or_adopt` with `AdoptIfData` for every statically known tenant whose data predates its record | Gateway, Query, Maintain | `CreateIfAbsent` | `GatewayProvCreate`, `QueryProvCreate`, `MaintainProvCreate` |
+| `validate_static_provisioning` (same file, called from `main.rs` at startup), `validate_or_adopt` with `AdoptIfData` for every statically known tenant whose data predates its record, in `gateway`, `maintain` and `all` mode | Gateway, Maintain | `CreateIfAbsent` | `GatewayProvCreate`, `MaintainProvCreate` |
 | The maintain tick (`services/ravel-server/src/maintain.rs`), `validate_or_adopt` with `AdoptIfData` per tenant and signal | Maintain | `CreateIfAbsent` | `MaintainProvCreate` |
 | `ravel-cli maintain migrate`, `raise_format_floor` after a clean re-audit (`crates/ravel-maintain/src/migrate.rs`) | Maintain | `CasVersion` | `MaintainProvCas` |
 | `ravel-cli provision adopt`, `validate_or_adopt` with `AdoptIfData` | Admin | `CreateIfAbsent` | `AdminProvCreate` |
 | `ravel-cli provision reshard`, `append_generation` | Admin | `CasVersion` | `AdminProvCas` |
 
-Each create-only statement is `s3:PutObject` on `t/*/*/prov` conditioned on
-`StringEquals` `s3:if-none-match` `*`, the form `QueryManifestCreate` uses.
-Each CAS-only statement is `s3:PutObject` on `t/*/*/prov` conditioned on
-`Null` `s3:if-match` `false`: a PUT that sends `If-Match` passes, and an
-unconditional PUT or a create-if-absent PUT is refused. Gateway and Query hold
-the create-only grant alone, because no path under their credentials appends
-a generation or raises a floor. The operator's reshard calls `append_generation`
-too, under the shared credential named by `spec.storage.s3.credentials_secret_ref`
-rather than any template here. `ravel-cli load` creates the record too, with
-`CreateFromConfig`, so a create-only grant covers it.
+A `query` process runs the same startup check with `CheckOnly`
+(`static_absent_policy` in `services/ravel-server/src/provisioning.rs`): it
+validates a present record and refuses startup on one it cannot read, and it
+passes an absent record without listing the tenant's shards or writing
+anything. Adoption belongs to ingest, maintenance and the CLI. The read role
+therefore holds no provisioning write, and needs no `l0/` listing for this
+check: `QueryList` does not admit `t/*/*/l0/*`, so an adopting Query startup
+would be refused at that listing before it reached the write.
 
-Without the create grant, a Query or Maintain process with a statically known
-tenant whose data predates its record fails at startup with `AccessDenied`,
-and the maintain tick skips that tenant's signal on every tick. Without the CAS grant,
+Each create-only statement is `s3:PutObject` conditioned on `StringEquals`
+`s3:if-none-match` `*`, the form `QueryManifestCreate` uses. Each CAS-only
+statement is `s3:PutObject` conditioned on `Null` `s3:if-match` `false`: a PUT
+that sends `If-Match` passes, and an unconditional PUT or a create-if-absent
+PUT that sends no `If-Match` is refused. Every one of them names exactly three
+resources, one per provisioned signal:
+
+```
+t/????????????????????????????????/m/prov
+t/????????????????????????????????/l/prov
+t/????????????????????????????????/s/prov
+```
+
+IAM's `*` matches `/`, so `t/*/*/prov` would also reach nested keys that end
+in `/prov` (for example `t/<tenant_hash>/m/c/<shard>/<hour>/prov` or
+`t/<tenant_hash>/m/del/prov`) and the `prov` key of the alerts, audit and
+profiles signals, none of which has a provisioning record. The tenant hash is
+spelled as 32 `?`, the way `QueryManifestCreate` spells it, so the grant
+reaches only `t/<tenant_hash>/<signal>/prov` for metrics, logs and spans.
+`DenyDeleteProtected` keeps the broader `t/*/*/prov`, since a broad deny is
+the safe direction.
+
+Gateway holds the create-only grant alone, because no path under its
+credential appends a generation or raises a floor. The operator's reshard
+calls `append_generation` too, under the shared credential named by
+`spec.storage.s3.credentials_secret_ref` rather than any template here.
+`ravel-cli load` creates the record too, with `CreateFromConfig`, so a
+create-only grant covers it.
+
+Without the create grant, a Maintain process with a statically known tenant
+whose data predates its record fails at startup with `AccessDenied`, and the
+maintain tick skips that tenant's signal on every tick. Without the CAS grant,
 `maintain migrate` finishes its rewrite and cannot raise the floor.
 
-What the conditions buy: a compromised Gateway or Query credential can create
-a missing record and cannot replace an existing one. A compromised Maintain
-or Admin credential can still rewrite a record through a CAS PUT, since it can
-read the current ETag first; that is the overwrite gap ADR-0055 section 3
-already names. `DenyDeleteProtected` still denies delete on `t/*/*/prov` in all
-four templates, so no role can delete a record and recreate it.
+What the conditions buy, for the metrics, logs and spans records: a
+compromised Gateway credential can create a missing record and cannot replace
+an existing one, and a compromised Query credential cannot write one at all. A
+compromised Maintain or Admin credential can still rewrite a record through a
+CAS PUT, since it can read the current ETag first; that is the overwrite gap
+ADR-0055 section 3 already names. `DenyDeleteProtected` still denies delete
+on `t/*/*/prov` in all four templates, so no role can delete a record and
+recreate it.
+
+One key outside those three is still writable: `t/<tenant_hash>/u/prov`, the
+`prov` key of the audit signal, falls under the unconditioned `t/*/u/*`
+PutObject that `QueryWrite` and `AdminWrite` grant for audit records. The
+audit signal has no provisioning record, so nothing legitimate is there to
+replace; a planted one could widen the shard range an audit scan reads or make
+audit reads fail, and cannot hide any record.
 
 ## Bucket-configuration reads: granted by no template
 
