@@ -128,6 +128,108 @@ pub async fn publish_record_with_conservation(
     start_ns: i64,
     conservation: impl ConservationPredicate,
 ) -> Result<PublishOutcome> {
+    let identities: Vec<CompactionInputIdentity> = inputs
+        .iter()
+        .map(|i| CompactionInputIdentity {
+            writer_id: i.record.writer_id.clone(),
+            writer_epoch: i.record.writer_epoch,
+            writer_seq: i.record.writer_seq,
+        })
+        .collect();
+    publish_compaction_record(
+        store,
+        config,
+        clock,
+        bucket,
+        inputs.iter().map(|i| i.record.sample_count),
+        identities,
+        None,
+        1,
+        input_set_hash,
+        parts,
+        start_ns,
+        conservation,
+    )
+    .await
+}
+
+/// Publish a version 2 compaction record (ADR-0066, the force 2 amendment)
+/// that supersedes `predecessor`, the record at `predecessor_key`, with
+/// `parts` as its re-encoded part set.
+///
+/// The record's inputs are copied verbatim from the predecessor, its
+/// `superseded_record_key` names it, and its `input_set_hash` is the version 2
+/// hash over both, which `input_set_hash` must equal: the parts were built
+/// under it, since it is in their keys and footers. The conservation gate
+/// compares the predecessor's part record counts with `parts`'. Its `level`
+/// is the predecessor's, the level the re-encoded parts' footers carry.
+/// Everything else is [`publish_record_with_conservation`]'s protocol unchanged: the
+/// abandonment deadline, the `CreateIfAbsent` record PUT under the canonical
+/// key for the stored hash, and the convergence on an equal winner.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_superseding_record(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    clock: &dyn Clock,
+    bucket: &Bucket,
+    predecessor_key: &str,
+    predecessor: &CompactionRecord,
+    input_set_hash: &[u8; 32],
+    parts: &[BuiltPart],
+    start_ns: i64,
+    conservation: impl ConservationPredicate,
+) -> Result<PublishOutcome> {
+    let expected = ravel_commit::erasure::compute_superseding_compaction_input_set_hash(
+        &predecessor.inputs,
+        predecessor_key,
+    );
+    if &expected != input_set_hash {
+        return Err(MaintainError::Invariant(format!(
+            "superseding record over {predecessor_key} was built under input_set_hash {} \
+             but its version 2 hash is {}",
+            hex::encode(input_set_hash),
+            hex::encode(expected)
+        )));
+    }
+    publish_compaction_record(
+        store,
+        config,
+        clock,
+        bucket,
+        predecessor.parts.iter().map(|p| p.sample_count),
+        predecessor.inputs.clone(),
+        Some(predecessor_key),
+        predecessor.level,
+        input_set_hash,
+        parts,
+        start_ns,
+        conservation,
+    )
+    .await
+}
+
+/// The publish protocol both record versions share. `input_sample_counts` is
+/// what the record's parts must conserve; `superseded_record_key` is `Some`
+/// for a version 2 record and `None` for version 1. `level` is the record's
+/// level: 1 for a compaction of L0 inputs, the predecessor's for a version 2
+/// record. Every compaction record today is at level 1, which is also what
+/// the logs and spans codecs stamp in their part footers and what the query
+/// path's L1 identity check accepts.
+#[allow(clippy::too_many_arguments)]
+async fn publish_compaction_record(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    clock: &dyn Clock,
+    bucket: &Bucket,
+    input_sample_counts: impl Iterator<Item = u64>,
+    identities: Vec<CompactionInputIdentity>,
+    superseded_record_key: Option<&str>,
+    level: u32,
+    input_set_hash: &[u8; 32],
+    parts: &[BuiltPart],
+    start_ns: i64,
+    conservation: impl ConservationPredicate,
+) -> Result<PublishOutcome> {
     // Abandonment mirror of the writer interlock: past the deadline, a run
     // must never publish, so the sweeper's unreferenced-part rule stays safe.
     let now = clock.now_ns();
@@ -151,7 +253,7 @@ pub async fn publish_record_with_conservation(
     // PUT: the L0 inputs stay live and queryable, and any parts already PUT
     // age out under sweep rule 3 like any abandoned run's. This runs under
     // dry_run too, so a dry run reports the violation.
-    let input_sample_count = checked_sample_sum(inputs.iter().map(|i| i.record.sample_count))?;
+    let input_sample_count = checked_sample_sum(input_sample_counts)?;
     let part_sample_count = checked_sample_sum(parts.iter().map(|p| p.part.sample_count))?;
     if !conservation.conserved(input_sample_count, part_sample_count) {
         return Err(MaintainError::ConservationViolation {
@@ -165,26 +267,22 @@ pub async fn publish_record_with_conservation(
     }
 
     let signal = ravel_commit::signal::to_proto(bucket.signal) as i32;
-    let identities: Vec<CompactionInputIdentity> = inputs
-        .iter()
-        .map(|i| CompactionInputIdentity {
-            writer_id: i.record.writer_id.clone(),
-            writer_epoch: i.record.writer_epoch,
-            writer_seq: i.record.writer_seq,
-        })
-        .collect();
+    let format_version = match superseded_record_key {
+        Some(_) => ravel_commit::record::COMPACTION_SUPERSEDING_FORMAT_VERSION,
+        None => 1,
+    };
     let record = CompactionRecord {
-        format_version: 1,
+        format_version,
         tenant_hash: bucket.tenant_hash.0.to_vec(),
         signal,
         shard: bucket.shard,
         ingest_hour_bucket: bucket.ingest_hour_bucket,
-        level: 1,
+        level,
         inputs: identities,
         input_set_hash: input_set_hash.to_vec(),
         parts: parts.iter().map(|p| p.part.clone()).collect(),
         created_unix_ns: now,
-        superseded_record_key: String::new(),
+        superseded_record_key: superseded_record_key.unwrap_or_default().to_string(),
     };
 
     let record_key = keys::compaction_record_key_for(&record)?;
@@ -200,10 +298,15 @@ pub async fn publish_record_with_conservation(
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
 
     // Dry-run: the record and its key are assembled identically, but the
-    // publishing PUT is skipped. A dry run only reaches here for a bucket with
-    // no existing compaction record (compact_bucket returns AlreadyCompacted
-    // before building anything otherwise), so the real run's outcome here is
-    // always Published; the convergence/repair path is never dry-run reachable.
+    // publishing PUT is skipped and the outcome reported is Published; the
+    // convergence/repair path is never dry-run reachable. A version 1 record
+    // reaches here only for a bucket with no compaction record
+    // (compact_bucket returns AlreadyCompacted otherwise). A version 2 record
+    // reaches here for a bucket that holds its predecessor, but only when the
+    // planning listing held no record superseding that predecessor (the
+    // selector would have excluded the predecessor and the run planned from
+    // the superseding record instead), so no record existed at this key when
+    // the run planned.
     if config.dry_run {
         return Ok(PublishOutcome::Published);
     }
