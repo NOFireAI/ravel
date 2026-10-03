@@ -1824,6 +1824,24 @@ pub struct Cli {
     #[arg(long)]
     pub otap: bool,
 
+    /// Explicit override for the process-wide memory budget
+    /// (`memory_budget_bytes`, ADR-1170, amended 2026-10-03 by issue #2367)
+    /// that `--cache-max-bytes`, `--catalog-cache-max-bytes`,
+    /// `--sql-max-query-bytes`, and `--sql-tenant-max-bytes` derive their
+    /// shares from when THOSE are unset. Wins over every derivation,
+    /// including the cgroup-memory-limit branch and the available-memory
+    /// branch, and is still subject to the same startup refusal as a derived
+    /// budget: a value that, together with the resolved cache ceilings,
+    /// reaches or exceeds this budget is refused, not clamped.
+    ///
+    /// The escape hatch for a co-resident process this one cannot see: the
+    /// available-memory derivation reads `MemAvailable` once at startup, so
+    /// it cannot anticipate memory a sibling process claims afterward. An
+    /// operator who knows the host's real split sets this directly. Read at
+    /// startup only; there is no live resize.
+    #[arg(long, value_name = "BYTES", env = "RAVEL_MEMORY_BUDGET_BYTES")]
+    pub memory_budget_bytes: Option<u64>,
+
     /// Maximum resident bytes for the query fetcher cache's RAM tier
     /// (`store::build_cache`), the ADR-0046 read cache that holds byte ranges
     /// of the data objects a query scans. This flag bounds the fetcher cache
@@ -2805,16 +2823,60 @@ pub struct HostProfile {
     /// `None` when neither can be read or parsed, and on every non-Linux
     /// target.
     pub mem_total_bytes: Option<u64>,
+    /// The uncapped `/proc/meminfo` `MemTotal`, read independently of any
+    /// cgroup limit (ADR-1170, amended 2026-10-03 by issue #2367): the
+    /// available-memory budget derivation needs the host's whole memory when
+    /// no cgroup limit caps this process, which [`Self::mem_total_bytes`]
+    /// cannot supply once a limit is set (it is already the capped figure).
+    /// `None` under the same conditions as [`Self::mem_total_bytes`].
+    pub mem_total_raw_bytes: Option<u64>,
+    /// The cgroup memory limit itself, when this process runs under a finite
+    /// one: v2 `memory.max`, else v1 `memory.limit_in_bytes`, with `max` or
+    /// an implausibly large v1 value (the same `>= 1 << 60` sentinel
+    /// [`Self::mem_total_bytes`]'s detection already treats as no limit) read
+    /// as `None`. `None` on every non-Linux target too. The budget
+    /// derivation branches on this: a cgroup limit present keeps the
+    /// pre-amendment derivation (the limit is already this process's share of
+    /// the host), and only its absence looks at [`Self::mem_available_bytes`].
+    pub cgroup_memory_limit_bytes: Option<u64>,
+    /// `/proc/meminfo`'s `MemAvailable`: a kernel estimate of memory
+    /// available for new allocations without swapping, including reclaimable
+    /// page cache. `None` when unreadable or unparsable, and on every
+    /// non-Linux target; the budget derivation then falls back to the
+    /// pre-amendment rule unchanged.
+    pub mem_available_bytes: Option<u64>,
+    /// This process's own resident set (`VmRSS` from `/proc/self/status`) at
+    /// the moment [`Self::detect`] ran. Added to `mem_available_bytes` in the
+    /// budget derivation because the process's own resident pages are not
+    /// "available" memory by the kernel's own accounting, yet they are memory
+    /// this process may reuse rather than a competing claim against it.
+    /// `None` when unreadable, and on every non-Linux target; treated as `0`
+    /// wherever the derivation reads it.
+    pub own_rss_bytes: Option<u64>,
 }
 
 impl HostProfile {
     /// Build a profile from known values. `cores` is floored at 1 here, so a
     /// caller (or a test) cannot construct a zero-core host that would resolve
-    /// a zero fetch concurrency.
-    pub fn new(cores: usize, mem_total_bytes: Option<u64>) -> Self {
+    /// a zero fetch concurrency. Six explicit arguments rather than defaulting
+    /// the new fields internally, so every existing call site states what it
+    /// assumes about a cgroup limit, `MemAvailable`, and this process's own
+    /// RSS instead of inheriting it silently.
+    pub fn new(
+        cores: usize,
+        mem_total_bytes: Option<u64>,
+        mem_total_raw_bytes: Option<u64>,
+        cgroup_memory_limit_bytes: Option<u64>,
+        mem_available_bytes: Option<u64>,
+        own_rss_bytes: Option<u64>,
+    ) -> Self {
         HostProfile {
             cores: cores.max(1),
             mem_total_bytes,
+            mem_total_raw_bytes,
+            cgroup_memory_limit_bytes,
+            mem_available_bytes,
+            own_rss_bytes,
         }
     }
 
@@ -2826,6 +2888,10 @@ impl HostProfile {
         HostProfile {
             cores: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
             mem_total_bytes: Self::detect_mem_total_bytes(),
+            mem_total_raw_bytes: Self::detect_mem_total_raw_bytes(),
+            cgroup_memory_limit_bytes: Self::detect_cgroup_memory_limit_bytes(),
+            mem_available_bytes: Self::detect_mem_available_bytes(),
+            own_rss_bytes: Self::detect_own_rss_bytes(),
         }
     }
 
@@ -2840,6 +2906,115 @@ impl HostProfile {
     #[cfg(not(target_os = "linux"))]
     fn detect_mem_total_bytes() -> Option<u64> {
         None
+    }
+
+    /// Read independently of [`Self::detect_mem_total_bytes`] (which returns
+    /// the cgroup-capped figure): the amendment needs the raw total even
+    /// under a finite cgroup limit, to compare against in tests, though the
+    /// budget derivation itself only reads it on the no-cgroup-limit branch.
+    #[cfg(target_os = "linux")]
+    fn detect_mem_total_raw_bytes() -> Option<u64> {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| parse_meminfo_field_bytes(&meminfo, "MemTotal:"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detect_mem_total_raw_bytes() -> Option<u64> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn detect_mem_available_bytes() -> Option<u64> {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| parse_meminfo_field_bytes(&meminfo, "MemAvailable:"))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detect_mem_available_bytes() -> Option<u64> {
+        None
+    }
+
+    /// cgroup v2 first (`memory.max`), then v1 (`memory.limit_in_bytes`): the
+    /// same precedence `ravel_maintain`'s own detector uses, duplicated here
+    /// rather than imported because that detector folds the limit into its
+    /// already-capped total and exposes neither the limit nor the raw total
+    /// on their own.
+    #[cfg(target_os = "linux")]
+    fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
+        std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+            .ok()
+            .and_then(|contents| parse_cgroup_memory_limit_bytes(&contents))
+            .or_else(|| {
+                std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                    .ok()
+                    .and_then(|contents| parse_cgroup_memory_limit_bytes(&contents))
+            })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detect_cgroup_memory_limit_bytes() -> Option<u64> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn detect_own_rss_bytes() -> Option<u64> {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| parse_vmrss_bytes(&status))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn detect_own_rss_bytes() -> Option<u64> {
+        None
+    }
+}
+
+/// A `/proc/meminfo` field (`MemTotal:` or `MemAvailable:`) in bytes. A
+/// missing line, a non-numeric count, or a unit other than `kB` is `None`.
+/// `#[cfg(test)]` builds parse it on every target (not only Linux) so the
+/// fixture-string tests run on the CI host that builds this crate.
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_field_bytes(meminfo: &str, prefix: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|line| line.starts_with(prefix))?;
+    let mut fields = line.split_whitespace().skip(1);
+    let value: u64 = fields.next()?.parse().ok()?;
+    match fields.next() {
+        Some("kB") => value.checked_mul(1024),
+        None => Some(value),
+        Some(_) => None,
+    }
+}
+
+/// A cgroup memory limit file (`memory.max` or `memory.limit_in_bytes`) as a
+/// finite byte limit. `max` (the v2 no-limit spelling), `0`, and any value at
+/// or above `1 << 60` (the v1 no-limit sentinel, the same implausibly-large
+/// convention `ravel_maintain`'s own parser treats as unlimited) are `None`,
+/// as is anything malformed.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_memory_limit_bytes(contents: &str) -> Option<u64> {
+    let raw = contents.trim();
+    if raw == "max" {
+        return None;
+    }
+    let bytes: u64 = raw.parse().ok()?;
+    if bytes == 0 || bytes >= (1 << 60) {
+        return None;
+    }
+    Some(bytes)
+}
+
+/// `/proc/self/status`'s `VmRSS` line in bytes. The kernel always reports it
+/// in `kB`; a missing line, a non-numeric count, or any other unit is `None`.
+#[cfg(any(target_os = "linux", test))]
+fn parse_vmrss_bytes(status: &str) -> Option<u64> {
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    let mut fields = line.split_whitespace().skip(1);
+    let value: u64 = fields.next()?.parse().ok()?;
+    match fields.next() {
+        Some("kB") => value.checked_mul(1024),
+        _ => None,
     }
 }
 
@@ -3049,6 +3224,27 @@ pub const SQL_QUERY_MEMORY_PERCENT: u64 = 50;
 /// pool equals the ceiling and never crosses it.
 pub const SQL_TENANT_MEMORY_PERCENT: u64 = 50;
 
+/// Floor under the available-memory `memory_budget_bytes` derivation (ADR-1170,
+/// amended 2026-10-03 by issue #2367): `max(FLOOR, MemAvailable + own_rss -
+/// MEMORY_OVERHEAD_RESERVE_BYTES)`, 1 GiB. A co-resident process can leave
+/// `MemAvailable` arbitrarily small; the floor keeps the derivation from
+/// collapsing the budget toward `0` on that host, while
+/// [`Self::memory_budget_bytes`]'s own `min` against `MemTotal -
+/// MEMORY_OVERHEAD_RESERVE_BYTES` still lets a genuinely tiny host (less
+/// memory than the floor plus the reserve) derive a budget below it, which
+/// `check_memory_budget` can still refuse.
+pub const MEMORY_BUDGET_FLOOR_BYTES: u64 = 1 << 30;
+
+/// Cap on the derived (non-explicit-flag) `sql_tenant_max_bytes` and
+/// `sql_max_query_bytes`, as a percentage of `memory_remainder_bytes` (ADR-1170,
+/// amended 2026-10-03 by issue #2367, item 3): the two pools together may draw
+/// the whole remainder plus the fetch path's own claim on it, which the
+/// available-memory derivation's `own_rss` term cannot see growing after
+/// startup. 90%, not 100%, leaves that headroom. Applies only when the
+/// corresponding flag (`--sql-tenant-max-bytes` / `--sql-max-query-bytes`) was
+/// not set; an explicit flag is never capped.
+pub const SQL_POOL_REMAINDER_CAP_PERCENT: u64 = 90;
+
 /// The derived `--max-segments`: the fan-out cap the #968 ClickBench result ran
 /// under. Host-independent -- a segment list is a per-query bound on plan width,
 /// not on resident bytes -- so it is the same on every host.
@@ -3088,6 +3284,17 @@ pub const PERF_SOURCE_BUDGET_CARVE_LOOPBACK: &str = "budget-carve-loopback";
 /// of the ADR-1170 memory budget ([`Mode::uses_memory_budget`]), so no budget
 /// was derived and no cache ceiling was carved from one.
 pub const PERF_SOURCE_NOT_APPLICABLE: &str = "not-applicable";
+/// [`ResolvedPerformanceDefaults`] source: `--memory-budget-bytes` was unset,
+/// no cgroup memory limit applies, and `MemAvailable` was known, so
+/// `memory_budget_bytes` was derived from available memory rather than from
+/// `MemTotal` (ADR-1170, amended 2026-10-03 by issue #2367).
+pub const PERF_SOURCE_DERIVED_AVAILABLE: &str = "derived-available";
+/// [`ResolvedPerformanceDefaults`] source: `--memory-budget-bytes` was unset
+/// and this process runs under a finite cgroup memory limit, so
+/// `memory_budget_bytes` is that limit minus the overhead reserve, with
+/// `MemAvailable` ignored: the limit is already this process's share of the
+/// host (ADR-1170, amended 2026-10-03 by issue #2367).
+pub const PERF_SOURCE_DERIVED_CGROUP: &str = "derived-cgroup";
 
 /// The operator's explicit performance flags: `None` per field means "derive".
 /// One field is not a flag: `store_is_loopback`, a fact about the store the
@@ -3153,6 +3360,12 @@ pub struct PerformanceFlags {
     /// [`ResolvedPerformanceDefaults::check_memory_budget`] has nothing to
     /// refuse.
     pub memory_budget_not_applicable: bool,
+    /// `--memory-budget-bytes` (ADR-1170, amended 2026-10-03 by issue #2367):
+    /// wins over every derivation, including the cgroup-limit branch and the
+    /// available-memory branch, and is still subject to
+    /// [`ResolvedPerformanceDefaults::check_memory_budget`]'s refusal like
+    /// any other resolved budget.
+    pub memory_budget_bytes: Option<u64>,
 }
 
 /// The six performance settings this process runs with, each with the source it
@@ -3287,6 +3500,21 @@ pub struct ResolvedPerformanceDefaults {
     /// says so, because the per-tenant number in force is not what the
     /// derivation alone produced.
     pub sql_tenant_max_bytes_raised: bool,
+    /// Whether the available-memory `memory_budget_bytes` derivation
+    /// (`source == PERF_SOURCE_DERIVED_AVAILABLE`) was held at
+    /// [`MEMORY_BUDGET_FLOOR_BYTES`]: `MemAvailable + own_rss -
+    /// MEMORY_OVERHEAD_RESERVE_BYTES`, before the subsequent `min` against
+    /// `MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES`, fell at or below the
+    /// floor. Set independent of whether that `min` then clips the budget
+    /// even lower on a genuinely tiny host: the floor is what the WARN names,
+    /// not the final figure. Always `false` on every other source.
+    pub memory_budget_floor_bound: bool,
+    /// Whether [`Self::sql_tenant_max_bytes`] or [`Self::sql_max_query_bytes`]
+    /// was reduced to [`SQL_POOL_REMAINDER_CAP_PERCENT`] of
+    /// [`Self::memory_remainder_bytes`] (ADR-1170, amended 2026-10-03 by
+    /// issue #2367, item 3). Never set for a pool whose flag was explicit:
+    /// the cap applies only to a derived or fallback value.
+    pub sql_pools_remainder_capped: bool,
 }
 
 /// The provenance of each field of [`ResolvedPerformanceDefaults`], carried
@@ -3359,10 +3587,21 @@ fn resolve_knob(
 ///   [`INTERIM_CATALOG_RESOLVE_CEILING`] until the ADR-1170 reservation lands
 ///   (decision 3). `Q` is `--max-concurrent-queries` when the operator set a
 ///   ceiling, else the same core estimate `fetch_concurrency` uses.
-/// - `memory_budget_bytes` (ADR-1170 decision 3, amended by issue #1255):
-///   cgroup-capped effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`],
-///   or `u64::MAX` when memory is unknown (no trustworthy ceiling can be
-///   derived, which is unlimited, not `0`).
+/// - `memory_budget_bytes` (ADR-1170 decision 3, amended by issue #1255, and
+///   amended again 2026-10-03 by issue #2367): `--memory-budget-bytes` wins
+///   unconditionally (source [`PERF_SOURCE_FLAG`]). Absent that flag, a
+///   finite cgroup memory limit keeps the pre-#2367 rule unchanged -- the
+///   limit minus [`MEMORY_OVERHEAD_RESERVE_BYTES`] (source
+///   [`PERF_SOURCE_DERIVED_CGROUP`]), `MemAvailable` ignored, since the limit
+///   is already this process's share of the host. With no cgroup limit and
+///   `MemAvailable` known: `min(MemTotal - RESERVE, max(FLOOR, MemAvailable +
+///   own_rss - RESERVE))`, every subtraction saturating, `FLOOR` being
+///   [`MEMORY_BUDGET_FLOOR_BYTES`] (source
+///   [`PERF_SOURCE_DERIVED_AVAILABLE`]). Otherwise (`MemAvailable` unknown,
+///   including every non-Linux target): the pre-#2367 rule, `MemTotal -
+///   RESERVE` (source [`PERF_SOURCE_DERIVED`]), or `u64::MAX` when `MemTotal`
+///   itself is unknown (source [`PERF_SOURCE_FALLBACK`]; no trustworthy
+///   ceiling can be derived, which is unlimited, not `0`).
 /// - `cache_max_bytes` (fetcher cache): [`CACHE_MEMORY_PERCENT`] of
 ///   `memory_budget_bytes`, or [`LOOPBACK_CACHE_MEMORY_PERCENT`] instead when
 ///   `flags.store_is_loopback` (a `--store s3` deployment against a loopback
@@ -3392,6 +3631,10 @@ fn resolve_knob(
 ///   [`DEFAULT_SQL_MAX_QUERY_BYTES`].
 /// - `sql_tenant_max_bytes`: [`SQL_TENANT_MEMORY_PERCENT`] of `MemTotal`, else
 ///   [`DEFAULT_SQL_TENANT_MAX_BYTES`].
+/// - Issue #2367 item 3: a non-explicit `sql_tenant_max_bytes` or
+///   `sql_max_query_bytes` is then capped at [`SQL_POOL_REMAINDER_CAP_PERCENT`]
+///   of `memory_remainder_bytes` (`sql_pools_remainder_capped` when either
+///   was). An explicit flag for either is never capped.
 /// - `max_segments`: [`DERIVED_MAX_SEGMENTS`].
 /// - `query_deadline`: [`DERIVED_QUERY_DEADLINE`].
 ///
@@ -3489,14 +3732,53 @@ pub fn resolve_performance_defaults(
     // A mode that uses no part of the budget derives none: subtracting the
     // reserve there would refuse a small gateway pod over memory it never
     // claims.
-    let (memory_budget_bytes, memory_budget_source) = match host.mem_total_bytes {
-        _ if flags.memory_budget_not_applicable => (u64::MAX, PERF_SOURCE_NOT_APPLICABLE),
-        Some(total) => (
-            total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES),
-            PERF_SOURCE_DERIVED,
-        ),
-        None => (u64::MAX, PERF_SOURCE_FALLBACK),
-    };
+    // ADR-1170, amended 2026-10-03 by issue #2367: an explicit
+    // --memory-budget-bytes wins unconditionally. Absent that, a finite
+    // cgroup memory limit keeps the pre-amendment rule (the limit is already
+    // this process's share, so MemAvailable -- a whole-host figure -- would
+    // only be wrong to consult). Only with no cgroup limit does the
+    // derivation look at MemAvailable: min(MemTotal - RESERVE, max(FLOOR,
+    // MemAvailable + own_rss - RESERVE)), every subtraction saturating. Own
+    // RSS counts as available because the kernel's own accounting does not
+    // call a process's resident pages "available", yet they are memory this
+    // process may reuse rather than a competing claim against it.
+    let (memory_budget_bytes, memory_budget_source, memory_budget_floor_bound) =
+        if let Some(explicit) = flags.memory_budget_bytes {
+            (explicit, PERF_SOURCE_FLAG, false)
+        } else if flags.memory_budget_not_applicable {
+            (u64::MAX, PERF_SOURCE_NOT_APPLICABLE, false)
+        } else {
+            match host.mem_total_bytes {
+                None => (u64::MAX, PERF_SOURCE_FALLBACK, false),
+                Some(total) if host.cgroup_memory_limit_bytes.is_some() => (
+                    total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES),
+                    PERF_SOURCE_DERIVED_CGROUP,
+                    false,
+                ),
+                Some(total) => match (host.mem_total_raw_bytes, host.mem_available_bytes) {
+                    (Some(raw_total), Some(available)) => {
+                        let own_rss = host.own_rss_bytes.unwrap_or(0);
+                        let mem_total_minus_reserve =
+                            raw_total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES);
+                        let raw_available_term = available
+                            .saturating_add(own_rss)
+                            .saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES);
+                        let floor_bound = raw_available_term <= MEMORY_BUDGET_FLOOR_BYTES;
+                        let available_term = raw_available_term.max(MEMORY_BUDGET_FLOOR_BYTES);
+                        (
+                            mem_total_minus_reserve.min(available_term),
+                            PERF_SOURCE_DERIVED_AVAILABLE,
+                            floor_bound,
+                        )
+                    }
+                    _ => (
+                        total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES),
+                        PERF_SOURCE_DERIVED,
+                        false,
+                    ),
+                },
+            }
+        };
 
     // ADR-2023: a loopback store's cache miss still costs a local disk round
     // trip, not a network one, so the fetcher cache affords a larger share of
@@ -3566,12 +3848,38 @@ pub fn resolve_performance_defaults(
             ),
             (None, None) => (DEFAULT_SQL_MAX_QUERY_BYTES, PERF_SOURCE_FALLBACK),
         };
+
+    // ADR-1170, amended 2026-10-03 by issue #2367, item 3: a derived (not
+    // explicit-flag) pool may not exceed SQL_POOL_REMAINDER_CAP_PERCENT of
+    // the remainder the SQL/fetch accountant actually draws from. An
+    // explicit flag is never capped: the operator asked for that ceiling
+    // knowing what it costs.
+    let sql_pool_remainder_cap_bytes = bytes_as_usize(percent_of(
+        memory_remainder_bytes,
+        SQL_POOL_REMAINDER_CAP_PERCENT,
+    ));
+    let query_bytes_explicit = query_bytes_source == PERF_SOURCE_FLAG;
+    let tenant_explicit = tenant_source == PERF_SOURCE_FLAG;
+    let tenant_remainder_capped =
+        !tenant_explicit && sql_tenant_max_bytes > sql_pool_remainder_cap_bytes;
+    let sql_tenant_max_bytes = if tenant_remainder_capped {
+        sql_pool_remainder_cap_bytes
+    } else {
+        sql_tenant_max_bytes
+    };
+    let query_remainder_capped =
+        !query_bytes_explicit && unclamped_query_bytes > sql_pool_remainder_cap_bytes;
+    let unclamped_query_bytes = if query_remainder_capped {
+        sql_pool_remainder_cap_bytes
+    } else {
+        unclamped_query_bytes
+    };
+    let sql_pools_remainder_capped = tenant_remainder_capped || query_remainder_capped;
+
     // Reconcile the per-query pool with the per-tenant ceiling, keeping the
     // invariant sql_max_query_bytes <= sql_tenant_max_bytes. An EXPLICIT
     // per-query flag raises a non-explicit tenant ceiling to fit; any other
     // crossing clamps the per-query pool down (see the doc comment above).
-    let query_bytes_explicit = query_bytes_source == PERF_SOURCE_FLAG;
-    let tenant_explicit = tenant_source == PERF_SOURCE_FLAG;
     let mut sql_max_query_bytes = unclamped_query_bytes;
     let mut sql_tenant_max_bytes = sql_tenant_max_bytes;
     let mut sql_max_query_bytes_clamped = false;
@@ -3628,6 +3936,8 @@ pub fn resolve_performance_defaults(
         },
         sql_max_query_bytes_clamped,
         sql_tenant_max_bytes_raised,
+        memory_budget_floor_bound,
+        sql_pools_remainder_capped,
     }
 }
 
@@ -3884,6 +4194,23 @@ impl ResolvedPerformanceDefaults {
                 "performance default resolved"
             );
         }
+        // ADR-1170, amended 2026-10-03 by issue #2367: the available-memory
+        // derivation held memory_budget_bytes at MEMORY_BUDGET_FLOOR_BYTES
+        // rather than letting MemAvailable (plus this process's own RSS)
+        // collapse it further. The likely cause is a co-resident process
+        // claiming most of the host; --memory-budget-bytes is the remedy
+        // that does not depend on what that other process does next.
+        if self.memory_budget_floor_bound {
+            tracing::warn!(
+                memory_budget_bytes = self.memory_budget_bytes,
+                mem_available_bytes = host.mem_available_bytes.unwrap_or(0),
+                own_rss_bytes = host.own_rss_bytes.unwrap_or(0),
+                "memory_budget_bytes was held at MEMORY_BUDGET_FLOOR_BYTES: MemAvailable plus \
+                 this process's own resident set left little or no room after the overhead \
+                 reserve, most likely a co-resident process claiming most of the host; set \
+                 --memory-budget-bytes to size the budget explicitly"
+            );
+        }
         // Startup refuses a `0` remainder on every other path (see
         // `check_memory_budget`), so this WARN is the only signal on the one
         // path that is allowed to start with one: `--disable-cache` on a host
@@ -3908,6 +4235,7 @@ impl ResolvedPerformanceDefaults {
             value = self.sql_max_query_bytes,
             source = self.sources.sql_max_query_bytes,
             clamped = self.sql_max_query_bytes_clamped,
+            remainder_capped = self.sql_pools_remainder_capped,
             "performance default resolved"
         );
         // `raised` rides on the info line for the same reason `clamped` does
@@ -3919,6 +4247,7 @@ impl ResolvedPerformanceDefaults {
             value = self.sql_tenant_max_bytes,
             source = self.sources.sql_tenant_max_bytes,
             raised = self.sql_tenant_max_bytes_raised,
+            remainder_capped = self.sql_pools_remainder_capped,
             "performance default resolved"
         );
         // Milliseconds, not seconds: an explicit sub-second deadline would
@@ -6798,6 +7127,7 @@ impl Cli {
             query_deadline,
             disable_cache: self.disable_cache,
             memory_budget_not_applicable: !self.mode.uses_memory_budget(),
+            memory_budget_bytes: self.memory_budget_bytes,
         })
     }
 
@@ -9149,7 +9479,14 @@ mod tests {
     #[test]
     fn small_host_floors_the_three_unbundled_knobs_at_the_minimum() {
         let tiny = resolve_performance_defaults(
-            HostProfile::new(1, Some(8 * 1024 * 1024 * 1024)),
+            HostProfile::new(
+                1,
+                Some(8 * 1024 * 1024 * 1024),
+                Some(8 * 1024 * 1024 * 1024),
+                None,
+                None,
+                None,
+            ),
             PerformanceFlags::default(),
         );
         assert_eq!(tiny.store_get_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
@@ -9545,7 +9882,14 @@ mod tests {
     /// rules agree on 1,610,612,736 and the mutation would pass unnoticed.
     #[test]
     fn small_host_resolves_proportional_settings() {
-        let host = HostProfile::new(4, Some(8 * 1024 * 1024 * 1024));
+        let host = HostProfile::new(
+            4,
+            Some(8 * 1024 * 1024 * 1024),
+            Some(8 * 1024 * 1024 * 1024),
+            None,
+            None,
+            None,
+        );
         let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
 
         assert_eq!(resolved.fetch_concurrency, 8);
@@ -9555,8 +9899,13 @@ mod tests {
         assert_eq!(resolved.catalog_cache_max_bytes, 322_122_547);
         assert_eq!(resolved.memory_hard_caps_bytes, 1_932_735_283);
         assert_eq!(resolved.memory_remainder_bytes, 4_509_715_661);
-        assert_eq!(resolved.sql_max_query_bytes, 4_294_967_296);
-        assert_eq!(resolved.sql_tenant_max_bytes, 4_294_967_296);
+        // The 50%-of-total derived figure (4,294,967,296) exceeds
+        // SQL_POOL_REMAINDER_CAP_PERCENT of the remainder above, so
+        // ADR-1170, amended by issue #2367 item 3, caps both pools down to
+        // 90% of 4,509,715,661, truncated.
+        assert_eq!(resolved.sql_max_query_bytes, 4_058_744_094);
+        assert_eq!(resolved.sql_tenant_max_bytes, 4_058_744_094);
+        assert!(resolved.sql_pools_remainder_capped);
         // The two host-independent rules do not shrink with the host: a
         // segment-count cap and a deadline are not resident bytes.
         assert_eq!(resolved.max_segments, 1_000_000);
@@ -9564,7 +9913,14 @@ mod tests {
 
         // A one-core host still gets the floor, never 2.
         let tiny = resolve_performance_defaults(
-            HostProfile::new(1, Some(8 * 1024 * 1024 * 1024)),
+            HostProfile::new(
+                1,
+                Some(8 * 1024 * 1024 * 1024),
+                Some(8 * 1024 * 1024 * 1024),
+                None,
+                None,
+                None,
+            ),
             PerformanceFlags::default(),
         );
         assert_eq!(tiny.fetch_concurrency, MIN_DERIVED_FETCH_CONCURRENCY);
@@ -9592,7 +9948,14 @@ mod tests {
     /// 7,689,077,760.
     #[test]
     fn clickbench_host_derives_the_expected_fetch_cache_carve() {
-        let host = HostProfile::new(16, Some(CLICKBENCH_HOST_MEM_BYTES));
+        let host = HostProfile::new(
+            16,
+            Some(CLICKBENCH_HOST_MEM_BYTES),
+            Some(CLICKBENCH_HOST_MEM_BYTES),
+            None,
+            None,
+            None,
+        );
         let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
 
         let expected_budget = CLICKBENCH_HOST_MEM_BYTES - MEMORY_OVERHEAD_RESERVE_BYTES;
@@ -9646,7 +10009,7 @@ mod tests {
     /// 268,435,456.
     #[test]
     fn unknown_memory_falls_back_to_the_compiled_in_constants() {
-        let host = HostProfile::new(16, None);
+        let host = HostProfile::new(16, None, None, None, None, None);
         let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
 
         assert_eq!(resolved.cache_max_bytes, 268_435_456);
@@ -9720,7 +10083,14 @@ mod tests {
     /// every path.
     #[test]
     fn host_at_or_below_the_overhead_reserve_refuses_to_start() {
-        let host = HostProfile::new(4, Some(MEMORY_OVERHEAD_RESERVE_BYTES));
+        let host = HostProfile::new(
+            4,
+            Some(MEMORY_OVERHEAD_RESERVE_BYTES),
+            Some(MEMORY_OVERHEAD_RESERVE_BYTES),
+            None,
+            None,
+            None,
+        );
         let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
         assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_DERIVED);
         assert_eq!(resolved.memory_budget_bytes, 0);
@@ -10009,14 +10379,23 @@ mod tests {
 
         // 4 cores / 8 GiB.
         let small = resolve_performance_defaults(
-            HostProfile::new(4, Some(8 * 1024 * 1024 * 1024)),
+            HostProfile::new(
+                4,
+                Some(8 * 1024 * 1024 * 1024),
+                Some(8 * 1024 * 1024 * 1024),
+                None,
+                None,
+                None,
+            ),
             PerformanceFlags::default(),
         );
         assert_eq!(small.catalog_cache_max_bytes, 322_122_547);
 
         // Unknown memory: both fall back to the compiled-in constant.
-        let unknown =
-            resolve_performance_defaults(HostProfile::new(16, None), PerformanceFlags::default());
+        let unknown = resolve_performance_defaults(
+            HostProfile::new(16, None, None, None, None, None),
+            PerformanceFlags::default(),
+        );
         assert_eq!(unknown.catalog_cache_max_bytes, 268_435_456);
         assert_eq!(
             unknown.sources.catalog_cache_max_bytes,
@@ -10222,7 +10601,7 @@ mod tests {
     fn unknown_memory_on_loopback_falls_back_like_today() {
         let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
         let resolved = loopback
-            .resolve_performance(HostProfile::new(16, None))
+            .resolve_performance(HostProfile::new(16, None, None, None, None, None))
             .expect("fallback path resolves");
 
         assert_eq!(resolved.cache_max_bytes, DEFAULT_CACHE_MAX_BYTES);
@@ -10248,7 +10627,7 @@ mod tests {
         // Flag per-query 8 GiB against the FALLBACK tenant ceiling (memory
         // unknown, so tenant is the 1 GiB compiled-in default).
         let raised_over_fallback = resolve_performance_defaults(
-            HostProfile::new(16, None),
+            HostProfile::new(16, None, None, None, None, None),
             PerformanceFlags {
                 sql_max_query_bytes: Some(8 * 1024 * 1024 * 1024),
                 ..PerformanceFlags::default()
@@ -10532,7 +10911,14 @@ mod tests {
     #[test]
     fn unbounded_queries_derive_the_resolve_ceiling_from_cores() {
         let eight_cores = resolve_performance_defaults(
-            HostProfile::new(8, Some(REFERENCE_MEM_BYTES)),
+            HostProfile::new(
+                8,
+                Some(REFERENCE_MEM_BYTES),
+                Some(REFERENCE_MEM_BYTES),
+                None,
+                None,
+                None,
+            ),
             PerformanceFlags::default(),
         );
         assert_eq!(
@@ -10561,7 +10947,14 @@ mod tests {
         // derivation directly, and setting both pins it against both inputs at
         // once.
         let low_fetch_flags = resolve_performance_defaults(
-            HostProfile::new(8, Some(REFERENCE_MEM_BYTES)),
+            HostProfile::new(
+                8,
+                Some(REFERENCE_MEM_BYTES),
+                Some(REFERENCE_MEM_BYTES),
+                None,
+                None,
+                None,
+            ),
             PerformanceFlags {
                 store_get_concurrency: Some(2),
                 fetch_concurrency: Some(2),
@@ -10587,7 +10980,14 @@ mod tests {
         // The cap does not apply there: the clamp product lands exactly on
         // 1,024 rather than above it, and only a product above it is held down.
         let one_core = resolve_performance_defaults(
-            HostProfile::new(1, Some(REFERENCE_MEM_BYTES)),
+            HostProfile::new(
+                1,
+                Some(REFERENCE_MEM_BYTES),
+                Some(REFERENCE_MEM_BYTES),
+                None,
+                None,
+                None,
+            ),
             PerformanceFlags::default(),
         );
         assert_eq!(one_core.catalog_resolve_query_concurrency, 8);
@@ -10686,7 +11086,14 @@ mod tests {
         // overhead reserve derives a `0` budget, which refuses with the caches
         // on (`host_at_or_below_the_overhead_reserve_refuses_to_start`) and
         // must start with them off.
-        let tiny = HostProfile::new(2, Some(MEMORY_OVERHEAD_RESERVE_BYTES));
+        let tiny = HostProfile::new(
+            2,
+            Some(MEMORY_OVERHEAD_RESERVE_BYTES),
+            Some(MEMORY_OVERHEAD_RESERVE_BYTES),
+            None,
+            None,
+            None,
+        );
         let cli = Cli::try_parse_from(["ravel-server", "--disable-cache"]).expect("flag parses");
         let resolved = cli
             .resolve_performance(tiny)
@@ -10727,7 +11134,14 @@ mod tests {
     /// panics on the `MemoryBudgetExceeded` refusal of a `0`-byte budget.
     #[test]
     fn a_gateway_starts_under_a_512_mib_memory_limit() {
-        let host = HostProfile::new(2, Some(SMALL_POD_MEM_BYTES));
+        let host = HostProfile::new(
+            2,
+            Some(SMALL_POD_MEM_BYTES),
+            Some(SMALL_POD_MEM_BYTES),
+            None,
+            None,
+            None,
+        );
         let cli = Cli::try_parse_from(["ravel-server", "--mode", "gateway"]).expect("flags parse");
         let resolved = cli
             .resolve_performance(host)
@@ -10757,6 +11171,16 @@ mod tests {
 
         // Everything outside the budget is mode-independent: the gateway's
         // values equal a query process's on the same host, field by field.
+        // The SQL pools are the one exception on this particular host: ADR-1170,
+        // amended by issue #2367 item 3, caps a derived SQL pool at 90% of
+        // `memory_remainder_bytes`, and this 512 MiB host's query-mode remainder
+        // is crushed to 0 (see `query_all_and_maintain_still_refuse_under_a_512_mib_memory_limit`),
+        // which would cap a raw query-mode computation's pools to 0. The
+        // gateway's own remainder is the `u64::MAX` not-applicable sentinel, so
+        // its pools stay uncapped and derive straight from host total memory,
+        // same as every other mode-independent field above -- they are just no
+        // longer comparable to a raw query-mode computation on a host this
+        // small.
         let query = resolve_performance_defaults(host, PerformanceFlags::default());
         assert_eq!(resolved.fetch_concurrency, query.fetch_concurrency);
         assert_eq!(resolved.store_get_concurrency, query.store_get_concurrency);
@@ -10767,8 +11191,15 @@ mod tests {
             query.catalog_resolve_concurrency
         );
         assert_eq!(resolved.max_segments, query.max_segments);
-        assert_eq!(resolved.sql_max_query_bytes, query.sql_max_query_bytes);
-        assert_eq!(resolved.sql_tenant_max_bytes, query.sql_tenant_max_bytes);
+        assert_eq!(
+            resolved.sql_max_query_bytes,
+            (SMALL_POD_MEM_BYTES / 2) as usize
+        );
+        assert_eq!(
+            resolved.sql_tenant_max_bytes,
+            (SMALL_POD_MEM_BYTES / 2) as usize
+        );
+        assert!(!resolved.sql_pools_remainder_capped);
         assert_eq!(resolved.query_deadline, query.query_deadline);
 
         // An explicit cache flag is kept verbatim, not replaced, and charges
@@ -10800,7 +11231,14 @@ mod tests {
     /// byte cache.
     #[test]
     fn query_all_and_maintain_still_refuse_under_a_512_mib_memory_limit() {
-        let host = HostProfile::new(2, Some(SMALL_POD_MEM_BYTES));
+        let host = HostProfile::new(
+            2,
+            Some(SMALL_POD_MEM_BYTES),
+            Some(SMALL_POD_MEM_BYTES),
+            None,
+            None,
+            None,
+        );
         for mode in ["query", "all", "maintain"] {
             let cli = Cli::try_parse_from(["ravel-server", "--mode", mode]).expect("flags parse");
             let err = cli
@@ -10842,7 +11280,14 @@ mod tests {
     /// `value=18446744073709551615 source="not-applicable"`.
     #[test]
     fn a_gateway_logs_its_memory_budget_as_not_applicable() {
-        let host = HostProfile::new(2, Some(SMALL_POD_MEM_BYTES));
+        let host = HostProfile::new(
+            2,
+            Some(SMALL_POD_MEM_BYTES),
+            Some(SMALL_POD_MEM_BYTES),
+            None,
+            None,
+            None,
+        );
         let cli = Cli::try_parse_from(["ravel-server", "--mode", "gateway"]).expect("flags parse");
         let resolved = cli.resolve_performance(host).expect("gateway resolves");
         let (captured, _guard) = capture_events(tracing::Level::INFO);
@@ -10983,7 +11428,14 @@ mod tests {
 
     /// The reference [`HostProfile`], injected.
     fn reference_host() -> HostProfile {
-        HostProfile::new(REFERENCE_CORES, Some(REFERENCE_MEM_BYTES))
+        HostProfile::new(
+            REFERENCE_CORES,
+            Some(REFERENCE_MEM_BYTES),
+            Some(REFERENCE_MEM_BYTES),
+            None,
+            None,
+            None,
+        )
     }
 
     /// The performance defaults a parsed CLI resolves on the reference host.
@@ -12131,14 +12583,14 @@ mod tests {
     /// gate's derivation.
     #[test]
     fn cpu_gate_permits_derive_from_cores_unless_a_flag_is_set() {
-        let host = HostProfile::new(8, None);
+        let host = HostProfile::new(8, None, None, None, None, None);
         let unset = Cli::try_parse_from(["ravel-server"]).expect("parses");
         assert_eq!(
             unset.resolve_cpu_gate_permits(host),
             CpuGatePermits { read: 7, write: 4 }
         );
         assert_eq!(
-            unset.resolve_cpu_gate_permits(HostProfile::new(1, None)),
+            unset.resolve_cpu_gate_permits(HostProfile::new(1, None, None, None, None, None)),
             CpuGatePermits { read: 1, write: 1 }
         );
         let read_only =
@@ -12538,7 +12990,14 @@ mod tests {
                 .resolve_gc_runtime(Duration::from_secs(30))
                 .expect("gc runtime");
             let performance = big
-                .resolve_performance(HostProfile::new(REFERENCE_CORES, Some(128 << 30)))
+                .resolve_performance(HostProfile::new(
+                    REFERENCE_CORES,
+                    Some(128 << 30),
+                    Some(128 << 30),
+                    None,
+                    None,
+                    None,
+                ))
                 .expect("performance defaults resolve");
             big.resolve_compactor_config(&gc_runtime, &performance)
                 .expect("128 GiB host")
@@ -12554,7 +13013,14 @@ mod tests {
         // An unknown host memory falls back to 256 MiB.
         let unknown = cli(&[]);
         let performance = unknown
-            .resolve_performance(HostProfile::new(REFERENCE_CORES, None))
+            .resolve_performance(HostProfile::new(
+                REFERENCE_CORES,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ))
             .expect("performance defaults resolve");
         let target = unknown
             .resolve_l1_part_memory_target(
@@ -12591,7 +13057,14 @@ mod tests {
                 .resolve_gc_runtime(Duration::from_secs(30))
                 .expect("gc runtime");
             let performance = big
-                .resolve_performance(HostProfile::new(REFERENCE_CORES, Some(128 << 30)))
+                .resolve_performance(HostProfile::new(
+                    REFERENCE_CORES,
+                    Some(128 << 30),
+                    Some(128 << 30),
+                    None,
+                    None,
+                    None,
+                ))
                 .expect("performance defaults resolve");
             big.resolve_compactor_config(&gc_runtime, &performance)
                 .expect("compactor")
@@ -12634,7 +13107,14 @@ mod tests {
                 .resolve_gc_runtime(Duration::from_secs(30))
                 .expect("gc runtime");
             let performance = cli
-                .resolve_performance(HostProfile::new(REFERENCE_CORES, None))
+                .resolve_performance(HostProfile::new(
+                    REFERENCE_CORES,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ))
                 .expect("performance defaults resolve");
             let (lines, guard) = capture_events(tracing::Level::WARN);
             let config = cli
@@ -15500,5 +15980,399 @@ mod tests {
         ])
         .validate()
         .expect("--store memory ignores the S3 checksum flags");
+    }
+
+    // ADR-1170, amended 2026-10-03 by issue #2367: the budget starts from
+    // available memory. The figures below are the ADR's own worked example:
+    // the IMDSv2-confirmed MemTotal and MemAvailable of a real host, no
+    // cgroup limit, zero own RSS.
+    const AVAILABLE_ADR_MEM_TOTAL_BYTES: u64 = 32_903_794_688;
+    const AVAILABLE_ADR_MEM_AVAILABLE_BYTES: u64 = 29_922_488_320;
+    /// `MemTotal - RESERVE - (MemTotal - MemAvailable)`, i.e.
+    /// `MemAvailable + 0 - RESERVE`: the ADR's worked answer.
+    const AVAILABLE_ADR_EXPECTED_BUDGET_BYTES: u64 = 27_775_004_672;
+
+    fn adr_reference_host_no_cgroup() -> HostProfile {
+        HostProfile::new(
+            16,
+            Some(AVAILABLE_ADR_MEM_TOTAL_BYTES),
+            Some(AVAILABLE_ADR_MEM_TOTAL_BYTES),
+            None,
+            Some(AVAILABLE_ADR_MEM_AVAILABLE_BYTES),
+            Some(0),
+        )
+    }
+
+    /// The ADR's reference figures, S3 (non-loopback) store: the derived
+    /// budget is exactly `MemAvailable + own_rss - RESERVE`, and the SQL
+    /// pools derive at 50% of `MemTotal` each, under the 90%-of-remainder
+    /// cap, so the cap never applies.
+    ///
+    /// Prove-the-test: revert the amendment (fall through to the pre-ADR
+    /// `PERF_SOURCE_DERIVED` branch, ignoring `MemAvailable`) and
+    /// `memory_budget_bytes` reads 30,756,311,040 (`MemTotal - RESERVE`)
+    /// against the expected 27,775,004,672.
+    #[test]
+    fn adr_reference_figures_derive_the_available_memory_budget_for_s3() {
+        let host = adr_reference_host_no_cgroup();
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        assert_eq!(
+            resolved.memory_budget_bytes,
+            AVAILABLE_ADR_EXPECTED_BUDGET_BYTES
+        );
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_AVAILABLE
+        );
+        assert!(!resolved.memory_budget_floor_bound);
+
+        assert_eq!(resolved.sql_tenant_max_bytes, 16_451_897_344);
+        assert_eq!(resolved.sql_max_query_bytes, 16_451_897_344);
+        assert!(!resolved.sql_pools_remainder_capped);
+        assert!(!resolved.sql_tenant_max_bytes_raised);
+        assert!(!resolved.sql_max_query_bytes_clamped);
+    }
+
+    /// The same ADR reference host, but a loopback S3 store: the fetcher
+    /// cache carves 40% instead of 25% of the budget, which shrinks
+    /// `memory_remainder_bytes` enough that the 90%-of-remainder cap binds
+    /// both derived SQL pools down from their 50%-of-`MemTotal` shares.
+    ///
+    /// Prove-the-test: drop the `SQL_POOL_REMAINDER_CAP_PERCENT` cap
+    /// entirely (use the uncapped 50%-of-`MemTotal` shares) and
+    /// `sql_tenant_max_bytes` reads 16,451,897,344 against the expected
+    /// 13,748,627,313, and `sql_pools_remainder_capped` reads `false`.
+    #[test]
+    fn adr_reference_figures_derive_the_available_memory_budget_for_loopback() {
+        let host = adr_reference_host_no_cgroup();
+        let loopback = cli(&["--store", "s3", "--s3-endpoint", "http://127.0.0.1:9000"]);
+        let resolved = loopback
+            .resolve_performance(host)
+            .expect("performance defaults resolve");
+
+        assert_eq!(
+            resolved.memory_budget_bytes,
+            AVAILABLE_ADR_EXPECTED_BUDGET_BYTES
+        );
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_AVAILABLE
+        );
+
+        assert_eq!(resolved.sql_tenant_max_bytes, 13_748_627_313);
+        assert_eq!(resolved.sql_max_query_bytes, 13_748_627_313);
+        assert!(resolved.sql_pools_remainder_capped);
+        assert!(!resolved.sql_tenant_max_bytes_raised);
+        assert!(!resolved.sql_max_query_bytes_clamped);
+    }
+
+    /// Under a finite cgroup limit the pre-amendment derivation is
+    /// unchanged: `MemAvailable` is a whole-host figure and is wrong to
+    /// consult once the limit already states this process's own share.
+    /// `MemAvailable` here is deliberately far below the limit, so a
+    /// derivation that read it anyway would collapse the budget much
+    /// further than the limit alone does.
+    ///
+    /// Prove-the-test: apply the available-memory term unconditionally
+    /// (drop the `host.cgroup_memory_limit_bytes.is_some()` guard) and
+    /// `memory_budget_bytes` reads 1,073,741,824 (the floor, since
+    /// `MemAvailable` here saturates below it) against the expected
+    /// 2,147,483,648 (`limit - RESERVE`).
+    #[test]
+    fn cgroup_limit_branch_ignores_mem_available() {
+        const CGROUP_LIMIT_BYTES: u64 = 4_294_967_296; // 4 GiB
+        const LOW_MEM_AVAILABLE_BYTES: u64 = 1_073_741_824; // 1 GiB, far below the limit
+        let host = HostProfile::new(
+            4,
+            Some(CGROUP_LIMIT_BYTES),
+            Some(AVAILABLE_ADR_MEM_TOTAL_BYTES),
+            Some(CGROUP_LIMIT_BYTES),
+            Some(LOW_MEM_AVAILABLE_BYTES),
+            Some(0),
+        );
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        assert_eq!(
+            resolved.memory_budget_bytes,
+            CGROUP_LIMIT_BYTES - MEMORY_OVERHEAD_RESERVE_BYTES
+        );
+        assert_eq!(resolved.memory_budget_bytes, 2_147_483_648);
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_CGROUP
+        );
+        assert!(!resolved.memory_budget_floor_bound);
+    }
+
+    /// The `min` rule: when `MemAvailable + own_rss` exceeds `MemTotal`, the
+    /// derived budget is still capped at `MemTotal - RESERVE`, never allowed
+    /// to exceed the host's own total.
+    ///
+    /// Prove-the-test: drop the `min` (resolve to the available-term alone)
+    /// and `memory_budget_bytes` reads 7,516,192,768 against the expected
+    /// 6,442,450,944.
+    #[test]
+    fn available_plus_rss_above_mem_total_is_capped_by_the_min_rule() {
+        const MEM_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+        const MEM_AVAILABLE_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GiB
+        const OWN_RSS_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+        let host = HostProfile::new(
+            4,
+            Some(MEM_TOTAL_BYTES),
+            Some(MEM_TOTAL_BYTES),
+            None,
+            Some(MEM_AVAILABLE_BYTES),
+            Some(OWN_RSS_BYTES),
+        );
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+
+        assert_eq!(
+            resolved.memory_budget_bytes,
+            MEM_TOTAL_BYTES - MEMORY_OVERHEAD_RESERVE_BYTES
+        );
+        assert_eq!(resolved.memory_budget_bytes, 6_442_450_944);
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_AVAILABLE
+        );
+        assert!(!resolved.memory_budget_floor_bound);
+    }
+
+    /// The floor binds when `MemAvailable + own_rss <= RESERVE +
+    /// MEMORY_BUDGET_FLOOR_BYTES`: a co-resident process has claimed most of
+    /// the host, and the budget is held at the 1 GiB floor rather than
+    /// collapsing further. A second host proves the floor never LIFTS the
+    /// budget above `MemTotal - RESERVE`: at exactly 2 GiB of MemTotal (the
+    /// reserve itself), the derived budget is 0, and `check_memory_budget`
+    /// still refuses.
+    ///
+    /// Prove-the-test: move the floor outside the `min` (apply
+    /// `.max(MEMORY_BUDGET_FLOOR_BYTES)` to the final `min` result rather
+    /// than to the available-term before the `min`). The first host's
+    /// assertion is unaffected (both orderings land on the floor), but the
+    /// second reads 1,073,741,824 against the expected 0, and the host no
+    /// longer refuses to start.
+    #[test]
+    fn the_floor_binds_but_never_lifts_the_budget_above_mem_total_minus_reserve() {
+        // A co-resident process has claimed almost all of a 32,903,794,688
+        // -byte host: MemAvailable collapses to near nothing, well under
+        // RESERVE + MEMORY_BUDGET_FLOOR_BYTES, so the floor binds.
+        let starved = HostProfile::new(
+            16,
+            Some(AVAILABLE_ADR_MEM_TOTAL_BYTES),
+            Some(AVAILABLE_ADR_MEM_TOTAL_BYTES),
+            None,
+            Some(500_000_000),
+            Some(0),
+        );
+        let resolved = resolve_performance_defaults(starved, PerformanceFlags::default());
+        assert_eq!(resolved.memory_budget_bytes, MEMORY_BUDGET_FLOOR_BYTES);
+        assert_eq!(resolved.memory_budget_bytes, 1_073_741_824);
+        assert!(resolved.memory_budget_floor_bound);
+
+        // A 2 GiB host: MemTotal equals RESERVE exactly, so MemTotal -
+        // RESERVE is 0. The floor must not lift the budget back above that:
+        // the derivation still answers 0, and the host still refuses to
+        // start with caches on.
+        let tiny = HostProfile::new(
+            1,
+            Some(MEMORY_OVERHEAD_RESERVE_BYTES),
+            Some(MEMORY_OVERHEAD_RESERVE_BYTES),
+            None,
+            Some(1_500_000_000),
+            Some(0),
+        );
+        let resolved = resolve_performance_defaults(tiny, PerformanceFlags::default());
+        assert_eq!(resolved.memory_budget_bytes, 0);
+        assert!(resolved.memory_budget_floor_bound);
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_AVAILABLE
+        );
+
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        cli.resolve_performance(tiny)
+            .expect_err("a 0-byte derived budget must still refuse to start");
+    }
+
+    /// `--memory-budget-bytes` wins unconditionally: over the no-cgroup
+    /// available-memory derivation, over the cgroup-limit derivation, over
+    /// the pre-amendment fallback when memory is wholly unknown, and over
+    /// `memory_budget_not_applicable` (the gateway path).
+    ///
+    /// Prove-the-test: move the `flags.memory_budget_bytes` check below the
+    /// `memory_budget_not_applicable` branch and the last case's assertion
+    /// reads `u64::MAX` against the expected explicit value.
+    #[test]
+    fn explicit_memory_budget_flag_wins_in_every_branch() {
+        const EXPLICIT_BUDGET_BYTES: u64 = 123_456_789;
+        let flags_with_flag = PerformanceFlags {
+            memory_budget_bytes: Some(EXPLICIT_BUDGET_BYTES),
+            ..PerformanceFlags::default()
+        };
+
+        // No cgroup, MemAvailable known: would otherwise derive-available.
+        let available_host = adr_reference_host_no_cgroup();
+        let resolved = resolve_performance_defaults(available_host, flags_with_flag);
+        assert_eq!(resolved.memory_budget_bytes, EXPLICIT_BUDGET_BYTES);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
+        assert!(!resolved.memory_budget_floor_bound);
+
+        // A finite cgroup limit: would otherwise derive-cgroup.
+        let cgroup_host = HostProfile::new(
+            4,
+            Some(4 * 1024 * 1024 * 1024),
+            Some(AVAILABLE_ADR_MEM_TOTAL_BYTES),
+            Some(4 * 1024 * 1024 * 1024),
+            Some(1_073_741_824),
+            Some(0),
+        );
+        let resolved = resolve_performance_defaults(cgroup_host, flags_with_flag);
+        assert_eq!(resolved.memory_budget_bytes, EXPLICIT_BUDGET_BYTES);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
+
+        // Memory wholly unknown: would otherwise fall back.
+        let unknown_host = HostProfile::new(16, None, None, None, None, None);
+        let resolved = resolve_performance_defaults(unknown_host, flags_with_flag);
+        assert_eq!(resolved.memory_budget_bytes, EXPLICIT_BUDGET_BYTES);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
+
+        // Gateway mode: memory_budget_not_applicable would otherwise win.
+        let flags_gateway = PerformanceFlags {
+            memory_budget_bytes: Some(EXPLICIT_BUDGET_BYTES),
+            memory_budget_not_applicable: true,
+            ..PerformanceFlags::default()
+        };
+        let resolved = resolve_performance_defaults(available_host, flags_gateway);
+        assert_eq!(resolved.memory_budget_bytes, EXPLICIT_BUDGET_BYTES);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
+    }
+
+    /// `check_memory_budget` still refuses against an explicit
+    /// `--memory-budget-bytes` that is too small for the caches: the flag
+    /// changes where the number comes from, not whether a too-small budget
+    /// is enforced. A `--memory-budget-bytes` alone is not enough to trigger
+    /// the refusal on this host: with no explicit cache flags, the caches
+    /// derive as a percentage of the tiny budget and come out at `0` too, so
+    /// the refusal needs an explicit `--cache-max-bytes` that outright
+    /// exceeds the tiny budget.
+    ///
+    /// Prove-the-test: drop `--cache-max-bytes` from the parsed flags and the
+    /// `expect_err` panics on `Ok` (a derived, not explicit, cache share of a
+    /// 1-byte budget is `0`, which does not exceed it).
+    #[test]
+    fn explicit_memory_budget_flag_is_still_subject_to_the_refusal_check() {
+        let host = adr_reference_host_no_cgroup();
+        let cli = Cli::try_parse_from([
+            "ravel-server",
+            "--memory-budget-bytes",
+            "1",
+            "--cache-max-bytes",
+            "1000000",
+        ])
+        .expect("flags parse");
+        let err = cli
+            .resolve_performance(host)
+            .expect_err("an explicit budget too small for the caches must still refuse");
+        let exceeded = err
+            .downcast_ref::<MemoryBudgetExceeded>()
+            .expect("typed MemoryBudgetExceeded error");
+        assert_eq!(exceeded.memory_budget_bytes, 1);
+        assert_eq!(exceeded.cache_max_bytes, 1_000_000);
+    }
+
+    /// The 90%-of-remainder cap applies only to a DERIVED pool: an explicit
+    /// `--sql-tenant-max-bytes` is kept verbatim even though it exceeds the
+    /// cap, and `sql_pools_remainder_capped` stays `false` so the log does
+    /// not claim a cap it did not apply.
+    ///
+    /// Prove-the-test: drop the `!tenant_explicit` guard in
+    /// `tenant_remainder_capped` and `sql_tenant_max_bytes` reads
+    /// 13,748,627,313 (the 90%-of-remainder cap) against the explicit
+    /// 20,000,000,000.
+    #[test]
+    fn an_explicit_sql_tenant_max_bytes_is_never_capped() {
+        let host = adr_reference_host_no_cgroup();
+        let loopback = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--sql-tenant-max-bytes",
+            "20000000000",
+            "--sql-max-query-bytes",
+            "1000000",
+        ]);
+        let resolved = loopback
+            .resolve_performance(host)
+            .expect("performance defaults resolve");
+
+        assert_eq!(resolved.sql_tenant_max_bytes, 20_000_000_000);
+        assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_FLAG);
+        assert!(!resolved.sql_pools_remainder_capped);
+    }
+
+    /// `parse_meminfo_field_bytes` reads a `kB`-suffixed field, converts to
+    /// bytes, and is `None` for a missing line, a non-numeric count, or an
+    /// unexpected unit.
+    #[test]
+    fn parse_meminfo_field_bytes_reads_kb_fields() {
+        let meminfo =
+            "MemTotal:       32132612 kB\nMemAvailable:   29220008 kB\nMemFree:         1234 kB\n";
+        assert_eq!(
+            parse_meminfo_field_bytes(meminfo, "MemTotal:"),
+            Some(32_132_612 * 1024)
+        );
+        assert_eq!(
+            parse_meminfo_field_bytes(meminfo, "MemAvailable:"),
+            Some(29_220_008 * 1024)
+        );
+        assert_eq!(parse_meminfo_field_bytes(meminfo, "HugePages_Total:"), None);
+        assert_eq!(
+            parse_meminfo_field_bytes("MemTotal:       not-a-number kB", "MemTotal:"),
+            None
+        );
+        assert_eq!(
+            parse_meminfo_field_bytes("MemTotal:       1234 MB", "MemTotal:"),
+            None
+        );
+        assert_eq!(
+            parse_meminfo_field_bytes("MemTotal:       1234", "MemTotal:"),
+            Some(1234)
+        );
+    }
+
+    /// `parse_cgroup_memory_limit_bytes`: `max` (v2's no-limit spelling), `0`,
+    /// and any value at or above `1 << 60` (the v1 no-limit sentinel) are
+    /// `None`; anything else parses as a finite limit.
+    #[test]
+    fn parse_cgroup_memory_limit_bytes_reads_finite_limits_and_no_limit_sentinels() {
+        assert_eq!(parse_cgroup_memory_limit_bytes("max\n"), None);
+        assert_eq!(parse_cgroup_memory_limit_bytes("max"), None);
+        assert_eq!(parse_cgroup_memory_limit_bytes("0\n"), None);
+        assert_eq!(
+            parse_cgroup_memory_limit_bytes(&(1u64 << 60).to_string()),
+            None
+        );
+        assert_eq!(
+            parse_cgroup_memory_limit_bytes(&((1u64 << 60) + 1).to_string()),
+            None
+        );
+        assert_eq!(
+            parse_cgroup_memory_limit_bytes("4294967296\n"),
+            Some(4_294_967_296)
+        );
+        assert_eq!(parse_cgroup_memory_limit_bytes("not-a-number"), None);
+    }
+
+    /// `parse_vmrss_bytes` reads `/proc/self/status`'s `VmRSS` line, always
+    /// `kB`-suffixed; a missing line or any other unit is `None`.
+    #[test]
+    fn parse_vmrss_bytes_reads_the_kb_field() {
+        let status = "Name:\tcat\nVmRSS:\t    1234 kB\nVmSize:\t  5678 kB\n";
+        assert_eq!(parse_vmrss_bytes(status), Some(1234 * 1024));
+        assert_eq!(parse_vmrss_bytes("Name:\tcat\n"), None);
+        assert_eq!(parse_vmrss_bytes("VmRSS:\t    1234 B\n"), None);
     }
 }

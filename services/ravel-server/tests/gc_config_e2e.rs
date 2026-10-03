@@ -33,6 +33,10 @@ fn query_deadline(cli: &Cli) -> std::time::Duration {
     cli.resolve_performance(ravel_server::config::HostProfile::new(
         16,
         Some(32_212_254_720),
+        Some(32_212_254_720),
+        None,
+        None,
+        None,
     ))
     .expect("performance defaults resolve")
     .query_deadline
