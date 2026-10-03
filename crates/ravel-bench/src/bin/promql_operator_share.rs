@@ -271,10 +271,18 @@ async fn main() {
     // reads flushed, stored segments -- never the unflushed buffer.
     router.flush_all().await;
 
+    // `EngineConfig::default()`'s `max_series` (10_000, `DEFAULT_MAX_SERIES`)
+    // caps the raw series a fetch may return before aggregation collapses
+    // them; Q_AGG's selector alone matches all `SERIES_PER_METRIC` series of
+    // metric A pre-aggregation, so the cap must be raised past that for this
+    // bench's known volume, not past Q_MATCH's combined selector need.
     let engine = QueryEngine::new(
         Arc::clone(&catalog),
         Arc::clone(&store),
-        EngineConfig::default(),
+        EngineConfig {
+            max_series: SERIES_PER_METRIC * 2 + 1,
+            ..EngineConfig::default()
+        },
     );
     let query_now_ns = clock.now_ns();
     let t_ms = START_TS_NS / 1_000_000;
@@ -382,6 +390,20 @@ async fn main() {
 
     let agg_sort_total_ns: u64 = agg_samples.agg_sort_ns.iter().sum();
     let agg_sort_mean_ns = mean(&agg_samples.agg_sort_ns);
+
+    // Raw per-run figures (5 run-means each), printed before the aggregated
+    // stats below so the report's appendix can quote them verbatim.
+    println!("promql_operator_share raw per-run means (run order, ns unless noted)");
+    println!("  Q_AGG   wall_ns per run   : {agg_run_means:?}");
+    println!("  Q_AGG   op_ns per run     : {agg_op_run_means:?}");
+    println!("  Q_AGG   share_pct per run : {agg_share_run:?}");
+    println!("  Q_MATCH wall_ns per run   : {match_run_means:?}");
+    println!("  Q_MATCH op_ns per run     : {match_op_run_means:?}");
+    println!("  Q_MATCH share_pct per run : {match_share_run:?}");
+    println!(
+        "  Q_AGG   sort_ns per query : {:?}",
+        agg_samples.agg_sort_ns
+    );
 
     println!("promql_operator_share report");
     println!("  accepted_points   : {accepted}");
