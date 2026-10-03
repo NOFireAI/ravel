@@ -317,13 +317,9 @@ async fn main() -> anyhow::Result<()> {
         auth,
         cli.oidc_ddl_claim.clone(),
     )?;
-    // Retention windows are validated at startup against the ADR-0019 floor,
-    // using the SAME max_ingest_lag this process's catalog resolve window uses
-    // (ravel_catalog::CatalogConfig, the value query::build_catalog builds the
-    // catalog with) rather than ravel_maintain's own constant in isolation: a
-    // mismatch would validate the retention floor against a different lag
-    // assumption than the catalog actually resolves with. A window below the
-    // floor fails startup here rather than being silently clamped.
+    // Retention windows are validated at startup against the ADR-0019 floor
+    // (with the ingest lag resolved below, see resolve_ingest_lag); a window
+    // below the floor fails startup here rather than being silently clamped.
     // The GC knobs (ADR-0050 section 4, EC4) resolved from the `--gc-*` flags,
     // each defaulting to its compiled-in value when unset (byte-identical to a
     // process that predates the flags). This is the single resolution point:
@@ -355,13 +351,8 @@ async fn main() -> anyhow::Result<()> {
              ravel_maintain_claims_lost_total climbs"
         );
     }
-    // The catalog listing window and the OTLP admission bound are one
-    // coordinated value (ADR-0051 section 4), from `--max-ingest-lag`. Resolve
-    // the pair here so the retention floor below is validated against the SAME
-    // window the catalog actually resolves with, not the compiled-in 2h default:
-    // a deployment that raised the flag would otherwise validate retention
-    // against the wrong lag. `ravel_server::start` resolves it again from the
-    // `max_ingest_lag` duration threaded onto `ServerConfig`.
+    // Resolved here so the retention floor below is validated against the
+    // catalog window the flag sets; see `ravel_server::resolve_ingest_lag`.
     let max_ingest_lag = cli
         .parse_max_ingest_lag()
         .context("failed to parse --max-ingest-lag")?;
