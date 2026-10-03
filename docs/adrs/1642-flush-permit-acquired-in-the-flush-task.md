@@ -1,9 +1,10 @@
 # ADR-1642: acquire the flush permit inside the flush task
 
 Status: Accepted (2026-09-12). Amended 2026-09-20 (issue #1740, see
-"Amendment: the queued-flush cap" below) and 2026-10-03 (issue #1916, see
-"Amendment (2026-10-03): the deferral cap" below). Supersedes ADR-0067
-decision 2. Issues #1292, #1641, #1740, and #1916.
+"Amendment: the queued-flush cap" below), 2026-10-03 (issue #1916, see
+"Amendment (2026-10-03): the deferral cap" below) and 2026-10-03 (issue
+#2410, see "Amendment (2026-10-03): the scan-set check at flush open" below).
+Supersedes ADR-0067 decision 2. Issues #1292, #1641, #1740, #1916, and #2410.
 
 ## Context
 
@@ -507,7 +508,9 @@ from `max_flush_delay` to the idle tier, and it must not wait either out while
 holding the shard at the cap.
 
 **What this does not bound.** Four things, stated so the guarantee is not
-read wider than it is:
+read wider than it is. The first three no longer cost visibility: the
+scan-set amendment below keeps their rows inside the read-side scan set
+however late their flush opens. The fourth stands.
 
 - Buffered-mode rows held under a non-zero `idle_flush_byte_floor`. The
   sub-floor hold is left out of `flush_trigger_age_bound`, so a sub-floor
@@ -559,3 +562,143 @@ repeats the refusal and the ordering for the log and span routers.
 `a_deferred_flush_takes_the_ingest_hour_it_opened_in` and
 `carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour` stand as before:
 the pin is still taken at flush open.
+
+## Amendment (2026-10-03): the scan-set check at flush open (issue #2410)
+
+<!-- amendment-applies: sections="Amendment (2026-10-03): the deferral cap (issue #1916)" pointer="scan-set amendment" -->
+
+The deferral cap bounds what a strict write is acknowledged from. It does not
+bound when a deferred flush opens, and the ingest-hour bucket is pinned at
+flush open, so a flush from a retiring, larger shard-actor set that opens late
+enough (a long deferral behind a stalled store, a sub-floor hold, a writer
+clock far ahead) wrote objects under a shard index the readers no longer scan
+for the hour it pinned: stored, acknowledged in buffered mode, and invisible to
+every query. The writer now closes that itself.
+
+**The invariant.** No flush writes under a shard index outside the scan set
+of the ingest hour it pins. A flush on shard `i` that is about to pin hour `h`
+writes only when `i < ravel_catalog::scan_count(generations, h,
+DEFAULT_SCAN_SLACK_HOURS)`, the rule the read side resolves hour `h` with
+(ADR-0052 section 4). `FLUSH_BOUND_SLACK_HOURS`, `TOLERATED_CLOCK_SKEW_HOURS`
+and `scan_count` are unchanged.
+
+**Where the check runs.** On the shard actor, at flush open, in all three
+pipelines: after the queued-flush refusal and the clock checks that produce the
+flush-open stamp, and before a `seq` is allocated or a task spawned. The hour
+it checks is the bucket the flush is about to pin, from that same stamp, so the
+pin stays at flush open (the subsection on the deferral moving the ingest hour
+above still holds) and forcing a flush past the queue cap stays rejected. A
+shard index the check passes writes in place exactly as before, however long
+its flush was deferred.
+
+**The generation view, and how stale it may be.** The check reads the
+tenant's generation history from the router's own cache, the one its
+`GenerationSwitch` routes on. It trusts that view for hour `h` only while
+`h < hour(refreshed_at) + ceil(C) + 1`, the horizon of the router's grace
+window (ADR-0052, bounded degraded-grace routing amendment); a view younger
+than `C` is always inside it. Inside the horizon the view's scan set is never
+wider than the true one: a generation appended after `refreshed_at` activates
+no earlier than the horizon less the tolerated append-clock skew, and a new
+generation removes its predecessor from the scan set only `S` hours after its
+own activation, so it cannot remove one from any hour before the horizon. The
+same argument keeps a passed check true after the pin: a later append cannot
+shrink the scan set of an hour already pinned.
+
+The check fails closed as routing does. A tenant with no cached view (never
+resolved by this router, or evicted as idle) or a view past its horizon does
+not open the flush: the buffer stays exactly as it was, rows, waiters, charges
+and trigger bookkeeping, the refusal counts on the pipeline's
+`stale_provisioning_flushes`, and the actor starts one background re-read of
+the tenant's provisioning record, at most one in flight per tenant per router.
+A successful re-read is stamped with the time it was issued, and the next
+trigger retries against it. Nothing is written on an unknown view, except at
+teardown (below).
+
+**What happens to the rows.** When the check fails, nothing is written under
+that shard index. The actor routes the buffer's rows under the tenant's
+current generation, the count `active_shard_count` gives for the flush-open
+reading from the same trusted view, with the pipeline's own routing function
+(`shard_for` with exemplars following their series, `shard_for_log` with
+columnar batches re-partitioned, `shard_for_span`), and sends each target
+shard of that generation's set one hand-back message. The target merges the
+rows into its tenant buffer, keeping their original arrival bounds so its age
+trigger sees how long they have waited, and flushes them on its own triggers.
+A hand-back skips what a new write passes on the router, admission with its
+ADR-0069 charge and the deferral-cap refusal, because these rows were admitted
+and charged once already. It does not skip the dead-shard check: a target whose
+actor is gone or whose mailbox is closed is sent nothing, and the whole buffer
+stays where it is for the next trigger to retry. A dead metrics shard is
+respawned by the next write that observes it; a dead log or span shard is
+condemned, and its rows wait for the teardown below.
+
+**Strict waiters.** A strict waiter still on a handed-back buffer is answered
+with the existing outcome-unknown `Abandoned` (503), since its rows are written
+by another shard's flush whose token it never sees. A client retry stores a
+second copy: query-time dedup by `(series_id, ts)` collapses it for metrics,
+and for logs and spans it is the at-least-once duplicate a lost
+acknowledgement already produces (docs/consistency-model.md "Duplicates and
+idempotency").
+
+**Byte budget.** The buffer's ADR-0069 charges move with its rows. Every
+target's message carries a clone of each charge `Arc` and the source buffer
+drops its own, so each charge is refunded once, when the last target flush
+holding a clone completes or fails. No new charge is taken, so nothing is
+charged twice, and every clone sits in exactly one target buffer, so nothing
+leaks. A charge covering rows split across several targets stays held until
+the slowest of their flushes ends, as a charge the router clones across shards
+already does.
+
+**No loop.** The target generation is the latest one activated by the
+flush-open reading, which stays in the scan set of every later hour until `S`
+hours past its successor's activation, so its shards are inside the scan set of
+the hour they pin. Rows are handed back a second time only if another
+shard-count decrease activates and their new flush opens past that one's
+window, which is progress, not a loop. Since the failed index `i` is at least
+`scan_count(h)`, which is at least the target count, a hand-back always goes
+from a set to a strictly smaller one; that is why the actor can await the
+target's mailbox without a wait cycle.
+
+**Drains.** The router's `flush_all` repeats its fan-out while a pass handed
+rows back, and `shutdown` drains the sets in descending shard count, waiting
+for each set before signalling the next, so rows handed back during a drain
+land in a set that has not drained yet. A teardown (shutdown or channel close)
+that cannot confirm the view or reach a target within its enforced passes
+writes the buffer in place on its bypass passes and logs a WARN: the choice
+the ADR-1685 teardown bypass makes for the clock-lag check, since a row
+written where the read side may not scan it can still be found, and a row
+dropped at shutdown cannot.
+
+**Observability.** Each pipeline's metrics (`IngestMetrics`,
+`LogIngestMetrics`, `SpanIngestMetrics`) count handed-back flushes as
+`rerouted_flushes`, which is the counter by signal. The first hand-back of an
+episode on a shard logs once at WARN with the signal, shard, pinned hour and
+scan count; the episode ends when that shard next opens a flush in place.
+
+**What this supersedes.** The deferral cap amendment's "What this does not
+bound" entries for buffered rows held under a non-zero `idle_flush_byte_floor`,
+for strict writes that already timed out, and for buffered rows acknowledged
+before the shard reached the cap. Those rows can still open late, but a late
+flush on a retired index now hands its rows back instead of writing them where
+no reader looks. Neither of that amendment's rejected alternatives is revived.
+
+**What remains unbounded.**
+
+- The wall-clock length of a deferral, as before. Rows not yet flushed are
+  invisible to every reader until their flush lands; that is buffered latency,
+  not this defect.
+- Teardown residue written in place, above, when the view cannot be confirmed
+  or no target is reachable during a shutdown or channel-close drain.
+- A writer or reshard-append clock skewed beyond `TOLERATED_CLOCK_SKEW_HOURS`,
+  the assumption ADR-0052's degraded-grace amendment already records.
+- A target actor that dies between the liveness check and the send: the
+  message dies with it, as the dead actor's own buffer does.
+- `rerouted_flushes` is on the pipeline metrics snapshots only; exporting it on
+  `ravel-server`'s `/metrics` is a follow-up.
+
+**Rejected: deciding at route time.** The router cannot know when a buffer's
+flush will open, which is the whole problem; only the actor at flush open
+knows the hour it is about to pin.
+
+**Rejected: writing in place and counting it.** A counter makes the loss
+visible and leaves it a loss for every query; the rows can be put where the
+read side looks for the price of one message per target shard.
