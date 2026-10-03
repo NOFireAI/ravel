@@ -127,9 +127,19 @@ builds that feature, so the route is available there. Its response envelope is
 ```
 
 with one array per row under `data.rows`. A non-finite float comes back as a
-string: `NaN`, `+Inf`, and `-Inf`. Sending `Accept:
-application/vnd.apache.arrow.stream` yields an Arrow IPC stream instead, which is
-bit-exact for every float. The SQL surface registers exactly five tables, one
+string: `NaN`, `+Inf`, and `-Inf`. Other column types are encoded as follows:
+
+- every integer width is a JSON number;
+- a timestamp of any unit is an integer count of nanoseconds since the epoch,
+  with its time zone dropped (a value past 2^53 needs a client that parses
+  JSON integers exactly, which a JavaScript `JSON.parse` does not);
+- `Date32` and `Date64` are `YYYY-MM-DD` strings;
+- `Decimal128` is a string holding its exact decimal text;
+- binary columns are lowercase hex strings.
+
+A column type with no JSON encoding fails the query with an error naming the
+type. Sending `Accept: application/vnd.apache.arrow.stream` yields an Arrow IPC
+stream instead, which is bit-exact for every type. The SQL surface registers exactly five tables, one
 per signal: `samples` (metrics), `logs`, `spans` (traces), `alerts` (alert
 state transitions), and `audit` (audit records, including the query-audit
 trail).
