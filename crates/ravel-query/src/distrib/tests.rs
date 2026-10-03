@@ -16,6 +16,7 @@
 #![allow(clippy::unwrap_used)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use proptest::prelude::*;
@@ -43,7 +44,6 @@ use tonic::transport::{Channel, Server};
 use uuid::Uuid;
 
 use crate::config::EngineConfig;
-use crate::distrib::Distributed;
 use crate::distrib::client::{
     DistribError, RemoteSliceFetcher, SliceFetcher, SliceLogResponse, SliceResponse,
     SliceSpanResponse,
@@ -51,6 +51,7 @@ use crate::distrib::client::{
 use crate::distrib::federation::{Federation, RemoteCluster};
 use crate::distrib::partition::DistribThresholds;
 use crate::distrib::proto::series_fetch_server::SeriesFetch;
+use crate::distrib::{Distributed, WallDeadline};
 use crate::distrib::{
     log_record_order_key, service::ReconstructingSegmentResolver, service::SeriesFetchService,
     service::SnapshotSegmentResolver, span_cmp, span_order_key,
@@ -64,6 +65,12 @@ use crate::span_fetcher::{SpanFetchError, SpanRow, SpanSegmentFetcher};
 
 const NS: i64 = 1_000_000;
 const TENANT: TenantHash = TenantHash([7u8; 16]);
+/// The deadline a test fan-out carries: never reached on the wall clock, and a
+/// request deadline distinct enough that a stop reporting it is recognisable.
+const TEST_DEADLINE: WallDeadline = WallDeadline {
+    unix_ns: i64::MAX,
+    request: Duration::from_secs(7),
+};
 
 fn tenant_id() -> TenantId {
     TenantId::new("acme".to_string())
@@ -408,7 +415,7 @@ async fn assert_distributed_matches_local(
             &[],
             &accounting,
             &config,
-            i64::MAX,
+            TEST_DEADLINE,
             None,
         )
         .await
@@ -572,7 +579,7 @@ async fn run_pushdown_count_acceptance(per_series: Vec<Vec<(i64, u64)>>, cap: us
             &[],
             &accounting,
             &EngineConfig::default(),
-            i64::MAX,
+            TEST_DEADLINE,
             Some(pb::PartialAggregateRequest {
                 want_count: true,
                 want_min: false,
@@ -813,7 +820,7 @@ fn run_merged_series_distributed_over_the_wire_not_refused() {
                 &[],
                 &accounting,
                 &EngineConfig::default(),
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -898,7 +905,7 @@ fn run_merged_series_distributed_equals_local_bitwise() {
                 &[],
                 &accounting,
                 &EngineConfig::default(),
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -961,7 +968,7 @@ async fn distributed_metric_names(
             erasure,
             &accounting,
             &EngineConfig::default(),
-            i64::MAX,
+            TEST_DEADLINE,
             None,
         )
         .await
@@ -1167,7 +1174,7 @@ fn coordinator_reenforces_series_budget_over_honest_worker() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -1322,7 +1329,7 @@ fn coordinator_reenforces_bytes_budget_over_lying_worker() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -1489,7 +1496,7 @@ fn record_gets_do_not_count_toward_the_byte_budget() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await;
@@ -1608,7 +1615,7 @@ fn distrib_fetch_sends_the_full_byte_budget_to_every_slice() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -1664,7 +1671,7 @@ fn distrib_fetch_byte_budget_does_not_shrink_with_slice_count() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -1715,7 +1722,7 @@ fn distrib_fetch_unlimited_byte_budget_stays_the_zero_sentinel_across_slices() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -1852,7 +1859,7 @@ fn skewed_slice_over_its_share_but_under_query_budget_never_returns_distrib() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await;
@@ -1929,7 +1936,7 @@ fn distrib_fold_over_query_budget_renders_422_not_503() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -2121,7 +2128,7 @@ async fn federation_fetch(fed: &Federation, config: EngineConfig) -> crate::erro
         Vec::new(),
         QueryAccounting::new(),
         config,
-        i64::MAX,
+        TEST_DEADLINE,
     )
     .await
     .expect_err("a remote refusal must fail the query")
@@ -2411,7 +2418,7 @@ fn many_invalidated_slices_map_to_one_retryable_error() {
                 &[],
                 &accounting,
                 &EngineConfig::default(),
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -2761,7 +2768,7 @@ fn coordinator_fold_saturates_overflowing_worker_reports() {
                 &[],
                 &accounting,
                 &config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -2900,7 +2907,7 @@ fn histogram_series_distributed_equals_local_bitwise() {
                 &[],
                 &accounting,
                 &EngineConfig::default(),
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -3051,7 +3058,7 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
                 &erasure,
                 &accounting,
                 &EngineConfig::default(),
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -4406,7 +4413,7 @@ fn duplicate_partial_series_id_is_a_hard_error() {
                 &[],
                 &accounting,
                 &EngineConfig::default(),
-                i64::MAX,
+                TEST_DEADLINE,
                 Some(pb::PartialAggregateRequest {
                     want_count: true,
                     want_min: false,
@@ -4825,7 +4832,7 @@ fn failed_slice_spend_reaches_the_live_accounting_handle() {
                 &[],
                 &accounting,
                 &EngineConfig::default(),
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -4990,7 +4997,7 @@ async fn folded_spend_of(
                 &[],
                 &accounting,
                 config,
-                i64::MAX,
+                TEST_DEADLINE,
             )
             .await
             .err(),
@@ -5003,7 +5010,7 @@ async fn folded_spend_of(
                 &[],
                 &accounting,
                 config,
-                i64::MAX,
+                TEST_DEADLINE,
             )
             .await
             .err(),
@@ -5016,7 +5023,7 @@ async fn folded_spend_of(
                 &[],
                 &accounting,
                 config,
-                i64::MAX,
+                TEST_DEADLINE,
                 None,
             )
             .await
@@ -5105,14 +5112,17 @@ fn every_terminal_slice_status_folds_its_spend_on_every_signal() {
 }
 
 /// Issue #2385: a slice a worker stopped at the query's deadline (`TIMEOUT`)
-/// fails the query with `DeadlineExceeded`, the error the engine's own timer
-/// raises, on every signal, never with a `Distrib` error, and the spend the
-/// worker made before the stop is folded first.
+/// fails the query with `DeadlineExceeded` naming the request's own deadline,
+/// the error the engine's own timer raises, on every signal, never with a
+/// `Distrib` error, and the spend the worker made before the stop is folded
+/// first. The fan-out is called directly, outside any engine deadline wrapper,
+/// so the deadline in the error is the slice loop's own.
 ///
 /// Mutation proof: deleting the `Timeout` arm from `Distributed::fetch`,
 /// `fetch_logs` or `fetch_spans` (`mod.rs`) sends that signal's slice to the
 /// catch-all arm, which fails the query with `Distrib`, and the list below
-/// names exactly that signal.
+/// names exactly that signal; `Duration::ZERO` in `slice_deadline_exceeded`
+/// names all three.
 #[test]
 fn a_timeout_slice_fails_the_query_with_deadline_exceeded_on_every_signal() {
     let rt = Runtime::new().expect("runtime");
@@ -5137,7 +5147,10 @@ fn a_timeout_slice_fails_the_query_with_deadline_exceeded_on_every_signal() {
                 &config,
             )
             .await;
-            if !matches!(outcome, Some(QueryError::DeadlineExceeded { .. })) {
+            if !matches!(
+                outcome,
+                Some(QueryError::DeadlineExceeded { deadline }) if deadline == TEST_DEADLINE.request
+            ) {
                 wrong.push(format!("{signal:?}: failed with {outcome:?}"));
             }
             if folded.total_s3_bytes() != case * 2_048 || folded.total_s3_requests() != case {

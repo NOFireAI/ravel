@@ -28,6 +28,7 @@ use ravel_types::{
 };
 
 use crate::config::{ByteLimit, EngineConfig, RequestLimit};
+use crate::distrib::WallDeadline;
 use crate::erasure::ErasurePredicate;
 use crate::error::{FoldLag, QueryError};
 use crate::fetcher::{
@@ -1127,20 +1128,16 @@ impl QueryEngine {
         now_ns: i64,
         deadline: Duration,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
-        let deadline_unix_ns = QueryDeadline::from_entry(now_ns, deadline).unix_ns;
-        let outcome = tokio::time::timeout(
+        self.resolve_series_until(
+            tenant_hash,
+            matchers,
+            window,
+            min_tokens,
+            now_ns,
             deadline,
-            self.resolve_series_inner(
-                tenant_hash,
-                matchers,
-                window,
-                min_tokens,
-                now_ns,
-                deadline_unix_ns,
-            ),
+            deadline,
         )
-        .await;
-        unify_deadline(outcome, deadline)
+        .await
     }
 
     /// [`Self::resolve_series_with_stats`] under one request's
@@ -1158,31 +1155,92 @@ impl QueryEngine {
         deadline: Duration,
         budgets: Option<&RequestBudgets>,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        self.resolve_series_within(
+            tenant_hash,
+            matchers,
+            window,
+            min_tokens,
+            now_ns,
+            deadline,
+            deadline,
+            budgets,
+        )
+        .await
+    }
+
+    /// [`Self::resolve_series_with_budgets`] for one of several resolves that
+    /// share one request's deadline, the way the metadata endpoints resolve
+    /// each `match[]` selector: the request entered at `now_ns` with
+    /// `deadline`, and `remaining` of it is left. The resolve stops after
+    /// `remaining`, its distributed and federated reads carry the request's
+    /// own wall clock deadline `now_ns + deadline`, and a deadline error
+    /// names `deadline`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_series_within(
+        &self,
+        tenant_hash: TenantHash,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+        remaining: Duration,
+        budgets: Option<&RequestBudgets>,
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
         match budgets {
             None => {
-                self.resolve_series_with_stats(
+                self.resolve_series_until(
                     tenant_hash,
                     matchers,
                     window,
                     min_tokens,
                     now_ns,
                     deadline,
+                    remaining,
                 )
                 .await
             }
             Some(budgets) => {
                 self.scoped_to(budgets)
-                    .resolve_series_with_stats(
+                    .resolve_series_until(
                         tenant_hash,
                         matchers,
                         window,
                         min_tokens,
                         now_ns,
                         deadline,
+                        remaining,
                     )
                     .await
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_series_until(
+        &self,
+        tenant_hash: TenantHash,
+        matchers: &[LabelMatcher],
+        window: TimeRange,
+        min_tokens: &[CommitToken],
+        now_ns: i64,
+        deadline: Duration,
+        remaining: Duration,
+    ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
+        let wall_deadline = QueryDeadline::within(now_ns, deadline, remaining).wall;
+        let outcome = tokio::time::timeout(
+            remaining,
+            self.resolve_series_inner(
+                tenant_hash,
+                matchers,
+                window,
+                min_tokens,
+                now_ns,
+                wall_deadline,
+            ),
+        )
+        .await;
+        unify_deadline(outcome, deadline)
     }
 
     async fn resolve_series_inner(
@@ -1192,7 +1250,7 @@ impl QueryEngine {
         window: TimeRange,
         min_tokens: &[CommitToken],
         now_ns: i64,
-        deadline_unix_ns: i64,
+        wall_deadline: WallDeadline,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, QueryStats), QueryError> {
         if let Some(metric) = log_series::log_metric_of(matchers) {
             return self
@@ -1246,7 +1304,7 @@ impl QueryEngine {
                     window,
                     &accounting,
                     fold_lag,
-                    deadline_unix_ns,
+                    wall_deadline,
                 )
                 .await?;
             // Union local + remote identities and enforce `max_series` ONCE
@@ -1413,7 +1471,7 @@ impl QueryEngine {
         window: TimeRange,
         accounting: &PhaseAccounting,
         fold_lag: FoldLag,
-        deadline_unix_ns: i64,
+        wall_deadline: WallDeadline,
     ) -> Result<(Vec<(SeriesId, LabelSet)>, Vec<String>, bool), QueryError> {
         let mut series: Vec<(SeriesId, LabelSet)> = Vec::new();
         let Some(federation) = &self.federation else {
@@ -1438,7 +1496,7 @@ impl QueryEngine {
                 Vec::new(),
                 accounting.scan().clone(),
                 self.config,
-                deadline_unix_ns,
+                wall_deadline,
             )
             .await?;
         // Re-enforce the coordinator's bytes-scanned budget over the combined
@@ -1519,7 +1577,7 @@ impl QueryEngine {
                 eval_window,
                 min_tokens,
                 now_ns,
-                query_deadline.unix_ns,
+                query_deadline.wall,
             )
             .await?;
 
@@ -1848,7 +1906,7 @@ impl QueryEngine {
     /// or matchers differ. An empty plan list (no metrics selector in the
     /// query -- a bare scalar/string literal, or a query naming only log
     /// metrics) skips storage entirely and issues zero `Signal::Metrics`
-    /// resolves. `deadline_unix_ns` is the query's [`QueryDeadline::unix_ns`],
+    /// resolves. `wall_deadline` is the query's [`QueryDeadline::wall`],
     /// threaded to the distributed fan-out as every fragment capability's
     /// expiry; the local path does not read it.
     async fn prefetch_metric_plans(
@@ -1858,7 +1916,7 @@ impl QueryEngine {
         eval_window: &EvalWindow,
         min_tokens: &[CommitToken],
         now_ns: i64,
-        deadline_unix_ns: i64,
+        wall_deadline: WallDeadline,
     ) -> Result<(MergedSource, QueryStats), QueryError> {
         if plans.is_empty() {
             return Ok((
@@ -2023,7 +2081,7 @@ impl QueryEngine {
                                 accounting,
                                 max_bytes_scanned,
                                 RequestBudget::new(max_s3_requests, fold_lag),
-                                deadline_unix_ns,
+                                wall_deadline,
                                 partial_req,
                             )
                             .await?;
@@ -2117,13 +2175,7 @@ impl QueryEngine {
             // phase breakdown of its own), but its budget re-check needs
             // `pooled()` to see the local resolve/plan/probe spend too.
             let (fed_runs, fed_hist_runs, fed_stats, fed_warnings, fed_partial) = self
-                .federate_scalar(
-                    tenant_hash,
-                    fed_plans,
-                    &accounting,
-                    fold_lag,
-                    deadline_unix_ns,
-                )
+                .federate_scalar(tenant_hash, fed_plans, &accounting, fold_lag, wall_deadline)
                 .await?;
             all_scalar_runs.extend(fed_runs);
             // Merge every remote's native-histogram runs into the same
@@ -2698,7 +2750,7 @@ impl QueryEngine {
         accounting: &PhaseAccounting,
         max_bytes_scanned: ByteLimit,
         max_s3_requests: RequestBudget,
-        deadline_unix_ns: i64,
+        wall_deadline: WallDeadline,
         partial_aggregate: Option<pb::PartialAggregateRequest>,
     ) -> Result<
         (
@@ -2743,7 +2795,7 @@ impl QueryEngine {
                         &erasure,
                         accounting.scan(),
                         &self.config,
-                        deadline_unix_ns,
+                        wall_deadline,
                         partial_aggregate,
                     )
                     .await?
@@ -2827,7 +2879,7 @@ impl QueryEngine {
         plan_matchers_windows: Vec<(Vec<LabelMatcher>, i64, i64)>,
         accounting: &PhaseAccounting,
         fold_lag: FoldLag,
-        deadline_unix_ns: i64,
+        wall_deadline: WallDeadline,
     ) -> Result<
         (
             Vec<Vec<FetchedSeriesSoa>>,
@@ -2870,7 +2922,7 @@ impl QueryEngine {
                     Vec::new(),
                     accounting.scan().clone(),
                     self.config,
-                    deadline_unix_ns,
+                    wall_deadline,
                 )
                 .await?;
             // Re-enforce the coordinator's bytes-scanned budget over the
@@ -3300,18 +3352,31 @@ fn range_value_into_value(value: RangeValue) -> Value {
 struct QueryDeadline {
     /// Monotonic: the engine timeout, the evaluator, and the log fetch.
     instant: Instant,
-    /// Wall clock, unix nanoseconds: the request's entry `now_ns` plus its
-    /// deadline. The coordinator mints every fragment capability with this
-    /// as its expiry (ADR-0071 amendment, decision 2), so a worker stops
-    /// reading for the query when the query itself stops.
-    unix_ns: i64,
+    /// Wall clock: the request's entry `now_ns` plus its deadline. The
+    /// coordinator mints every fragment capability with this as its expiry
+    /// (ADR-0071 amendment, decision 2), so a worker stops reading for the
+    /// query when the query itself stops.
+    wall: WallDeadline,
 }
 
 impl QueryDeadline {
     fn from_entry(now_ns: i64, deadline: Duration) -> Self {
+        QueryDeadline::within(now_ns, deadline, deadline)
+    }
+
+    /// The deadline of one sub-query of a request that entered at `now_ns`
+    /// with `deadline` and has `remaining` of it left. The wall clock instant
+    /// stays the request's own, `now_ns + deadline`: counting it from the
+    /// sub-query's start with only `remaining` would put it early by the time
+    /// already spent.
+    fn within(now_ns: i64, deadline: Duration, remaining: Duration) -> Self {
         QueryDeadline {
-            instant: Instant::now() + deadline,
-            unix_ns: now_ns.saturating_add(i64::try_from(deadline.as_nanos()).unwrap_or(i64::MAX)),
+            instant: Instant::now() + remaining,
+            wall: WallDeadline {
+                unix_ns: now_ns
+                    .saturating_add(i64::try_from(deadline.as_nanos()).unwrap_or(i64::MAX)),
+                request: deadline,
+            },
         }
     }
 }
@@ -10457,7 +10522,10 @@ mod log_prefetch_deadline_tests {
                 NOW_NS,
                 QueryDeadline {
                     instant: eval_deadline,
-                    unix_ns: i64::MAX,
+                    wall: WallDeadline {
+                        unix_ns: i64::MAX,
+                        request: Duration::MAX,
+                    },
                 },
             )
             .await
