@@ -1114,6 +1114,13 @@ pub struct Running {
     /// to the end of [`Running::shutdown`], so the heartbeat keeps beating
     /// through the drain.
     runtime_heartbeat_task: Option<AbortOnDrop>,
+    /// This process's hold on `<cache-dir>/sql-spill/<instance-id>` (ADR-0954
+    /// requirement 7, amended by issue #2416), `Some` when SQL spill resolved
+    /// under `--cache-dir`. Its lock tells every other process's startup sweep
+    /// the root is live, so it is held to the end of [`Running::shutdown`],
+    /// past the last query that could spill there.
+    #[cfg(feature = "sql")]
+    sql_spill_owner: Option<ravel_sql::spill::SpillRootOwner>,
 }
 
 /// Aborts the task when dropped.
@@ -1398,6 +1405,8 @@ impl Running {
             drain_settle_interval,
             query_worker_heartbeat,
             runtime_heartbeat_task: _runtime_heartbeat_task,
+            #[cfg(feature = "sql")]
+                sql_spill_owner: _sql_spill_owner,
             // `..` drops the fields with no shutdown behavior: the bound addresses
             // and the `metadata_sink`/`query_service`/`mtls_query_service`
             // handles. The struct has no `Drop`, so they are released here. This
@@ -2906,6 +2915,26 @@ pub async fn start_with_heartbeat(
         use ravel_commit::rng::RngSource as _;
         ravel_commit::rng::SystemRng.new_uuid()
     };
+    // One `WorkerSet` for the whole maintain-role process (ADR-0065 decision
+    // 1): a single membership identity shared by the maintenance supervisor
+    // (which writes the heartbeat on its `H` cadence), the scrub loop, and the
+    // scheduled fold (both of which only read the resulting live set to gate
+    // ownership). Constructed unconditionally (it's cheap: a UUID and config,
+    // no I/O). Its `process_id` is what the rendezvous hash resolves ownership
+    // against, so every loop must share one, never mint separate ones (that
+    // would make one process look like several workers to the fleet). Built
+    // before the query block because the SQL spill root is keyed by the same
+    // `process_id` (ADR-0954, amended by issue #2416).
+    let maintain_worker = Arc::new(ravel_maintain::WorkerSet::new(
+        <SystemClock as ravel_ingest::Clock>::now_ns(&SystemClock),
+        config.maintain.heartbeat_interval,
+        ravel_maintain::worker_set::DEFAULT_LIVENESS_FACTOR,
+        config.maintain.unit_concurrency,
+    ));
+    // This process's hold on its `--cache-dir` SQL spill root, assigned in the
+    // query block below before any route is served and moved onto `Running`.
+    #[cfg(feature = "sql")]
+    let mut sql_spill_owner: Option<ravel_sql::spill::SpillRootOwner> = None;
     // The SQL executor the idle-tenant sweep evicts idle memory accountants
     // from. Assigned inside the query block below (the one place the executor
     // is built) and read at the sweep spawn site; `None` in a mode that builds
@@ -3053,6 +3082,15 @@ pub async fn start_with_heartbeat(
             // startup in `main`) rather than a second read of the durable
             // object here.
             let ddl_min_grace_ms = query::ddl_min_grace_ms(config.gc.max_query_duration_ns)?;
+            // ADR-0954, amended by issue #2416: resolve spill, log its two
+            // startup lines, and take and sweep the `--cache-dir` spill root
+            // before the executor that writes under it exists.
+            let sql_spill = query::prepare_sql_spill(
+                config.cache_dir.as_deref(),
+                config.query_budgets.sql_spill,
+                &maintain_worker.process_id().to_string(),
+            )?;
+            sql_spill_owner = sql_spill.owner;
             let state = query::build_sql_state_with_parquet(
                 catalog.clone(),
                 store.clone(),
@@ -3083,6 +3121,7 @@ pub async fn start_with_heartbeat(
                 // `None`, which leaves every Parquet table unqueryable.
                 config.parquet_profiles.clone(),
                 ddl_min_grace_ms,
+                &sql_spill.inputs,
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).
@@ -3416,22 +3455,8 @@ pub async fn start_with_heartbeat(
     // process that owns everything). A gateway or query process scales on
     // request load, and an extra replica there used to mean another full copy
     // of the fold; it keeps only the on-demand route (ADR-1693 decisions 1
-    // to 3).
+    // to 3). Both share `maintain_worker`, built above.
     //
-    // One `WorkerSet` for the whole maintain-role process (ADR-0065 decision
-    // 1): a single membership identity shared by the maintenance supervisor
-    // (which writes the heartbeat on its `H` cadence), the scrub loop, and the
-    // scheduled fold (both of which only read the resulting live set to gate
-    // ownership). Constructed unconditionally (it's cheap: a UUID and config,
-    // no I/O). Its `process_id` is what the rendezvous hash resolves ownership
-    // against, so every loop must share one, never mint separate ones (that
-    // would make one process look like several workers to the fleet).
-    let maintain_worker = Arc::new(ravel_maintain::WorkerSet::new(
-        <SystemClock as ravel_ingest::Clock>::now_ns(&SystemClock),
-        config.maintain.heartbeat_interval,
-        ravel_maintain::worker_set::DEFAULT_LIVENESS_FACTOR,
-        config.maintain.unit_concurrency,
-    ));
     // The membership view both loops partition against. The maintenance
     // heartbeat task publishes every freshly computed live set here; the fold
     // reads the latest value at the top of each tick. It starts as this
@@ -4198,6 +4223,8 @@ pub async fn start_with_heartbeat(
         drain_settle_interval: config.drain_settle_interval,
         query_worker_heartbeat,
         runtime_heartbeat_task: None,
+        #[cfg(feature = "sql")]
+        sql_spill_owner,
     })
 }
 
