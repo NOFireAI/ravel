@@ -87,8 +87,9 @@ struct Args {
 }
 
 /// The bearer token from the environment variable named `name`, read
-/// through `lookup`. Refuses a name that is not a plain variable name, so a
-/// token pasted in place of the name is not echoed back in an error.
+/// through `lookup`. Refuses a name that is not a plain variable name. No
+/// error includes `name`: a hex token pasted in its place can pass the
+/// name check.
 fn read_token(name: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<String, String> {
     let valid = name
         .chars()
@@ -104,7 +105,7 @@ fn read_token(name: &str, lookup: impl Fn(&str) -> Option<String>) -> Result<Str
     }
     match lookup(name) {
         Some(token) if !token.is_empty() => Ok(token),
-        _ => Err(format!("environment variable {name} is unset or empty")),
+        _ => Err("the environment variable named by --token-env is unset or empty".to_string()),
     }
 }
 
@@ -387,6 +388,20 @@ mod tests {
         );
         assert!(read_token("RAVEL_TOKEN", |_| None).is_err());
         assert!(read_token("RAVEL_TOKEN", |_| Some(String::new())).is_err());
+    }
+
+    #[test]
+    fn a_hex_token_in_place_of_the_name_is_never_echoed() {
+        // The shape `openssl rand -hex 16` prints, starting with a letter,
+        // so it passes the variable-name check.
+        let token = "deadbeef0123456789abcdef01234567";
+        assert_eq!(token.len(), 32);
+        let error = read_token(token, |_| None).expect_err("no such variable");
+        assert!(!error.contains(token), "{error}");
+        assert_eq!(
+            error,
+            "the environment variable named by --token-env is unset or empty"
+        );
     }
 
     #[test]
