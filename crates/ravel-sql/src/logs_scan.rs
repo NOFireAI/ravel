@@ -8020,7 +8020,9 @@ mod owned_work_tests {
 mod carried_directory_reservation_tests {
     //! ADR-2414 decision A1: the plan phase's carried directories are charged to
     //! the fetch memory budget a carried whole object is charged to, for the
-    //! segments a partition will open and no others, until the plan counts drop.
+    //! segments a partition will open and no others, until the plan counts drop;
+    //! and an open whose own pruning disagrees with the plan's survivor list
+    //! fails closed.
 
     use super::*;
     use ravel_catalog::SegmentLevel;
@@ -8197,5 +8199,102 @@ mod carried_directory_reservation_tests {
         );
         drop(counts);
         assert_eq!(budget.reserved(), 0, "released when the plan counts drop");
+    }
+    /// A segment's rows through a scan whose plan counts are seeded with
+    /// `plan_indices` as the survivor list, over a ts window that keeps blocks
+    /// 6..12 of the object. Returns the rows' timestamps, or the stream's error.
+    async fn scan_with_plan(plan_indices: Vec<usize>) -> Result<Vec<i64>, String> {
+        use datafusion::arrow::array::Array;
+        let store = Arc::new(MemoryStore::new());
+        let obj = object(1, 1);
+        store
+            .put(
+                "t/dense0.rlog",
+                bytes::Bytes::from(obj.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        let seg = seg_ref("t/dense0.rlog", &obj, 1, 1);
+        let dirs = Arc::new(
+            RlogReader::decode_directories(&obj[..], &RlogConfig::default()).expect("directories"),
+        );
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let schema = crate::logs_schema::logs_schema_with_declared(&[]);
+        let exec = LogsScanExec::new(
+            TENANT,
+            LogSegmentFetcher::new(store),
+            std::slice::from_ref(&seg),
+            1,
+            6,
+            i64::MAX,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            None,
+            PhaseAccounting::new(),
+            schema,
+            Arc::new(Vec::new()),
+        )
+        .expect("scan");
+        let total_blocks = plan_indices.len();
+        let counts = PlanCounts {
+            segs: vec![Some(SegPlan {
+                planned: Some(PlannedBlocks {
+                    indices: Arc::new(plan_indices),
+                    dirs,
+                    _dirs_reservation: budget.reserve(0).expect("reserve"),
+                }),
+                stats: ScanStats::default(),
+                footer: None,
+                whole_object: None,
+            })],
+            total_blocks,
+            full_reads: 1,
+        };
+        assert!(exec.counts.set(Arc::new(counts)).is_ok());
+        let mut stream = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let mut ts = Vec::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| e.to_string())?;
+            let col = batch
+                .column(crate::logs_schema::LOG_COL_TS)
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ts type")
+                .clone();
+            ts.extend((0..col.len()).map(|i| col.value(i)));
+        }
+        Ok(ts)
+    }
+
+    /// A plan whose survivor list is the blocks this open's own pruning keeps
+    /// reads them all; a plan listing a block the open pruned (or missing one it
+    /// kept) is refused with the typed mismatch error instead of reading the
+    /// intersection.
+    ///
+    /// Fails against an open that intersects the dealt blocks with its own
+    /// survivors (it returns rows for the plan that lists blocks 0..12, here 6
+    /// of them, with no error), and against an open that only compares the two
+    /// lists' lengths (the plan below that lists 5..11 has the same length as
+    /// the truth and must still be refused).
+    #[tokio::test]
+    async fn an_open_that_prunes_differently_from_the_plan_fails_closed() {
+        assert_eq!(
+            scan_with_plan((6..12).collect()).await,
+            Ok((6..12).collect::<Vec<i64>>()),
+            "a plan that matches the open reads every surviving block"
+        );
+        for wrong in [(0..12).collect::<Vec<usize>>(), (5..11).collect()] {
+            let err = scan_with_plan(wrong.clone())
+                .await
+                .expect_err("a plan that differs from the open must refuse");
+            assert!(
+                err.contains("segment survivor mismatch"),
+                "plan {wrong:?} refused with the typed error, got: {err}"
+            );
+        }
     }
 }
