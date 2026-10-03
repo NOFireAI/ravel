@@ -192,10 +192,15 @@ pub struct FloatTolerance {
 
 const SIGN_MASK: u64 = 0x8000_0000_0000_0000;
 
-/// Map an `f64` bit pattern to a monotonically ordered `i64`: for
-/// non-negative values the bits already sort the same as the value: for
-/// negative values (sign bit set), flipping every bit restores the
-/// sort-matches-value property. Standard IEEE-754 total-ordering trick.
+/// Map an `f64` bit pattern to an `i64` that is monotonic with the value
+/// WITHIN one sign: non-negative bits already sort the same as the value;
+/// negative bits get every bit flipped, which restores sort-matches-value
+/// ordering among themselves. The two ranges are not monotonic with each
+/// other (every mapped negative value sorts below every mapped
+/// non-negative one by construction, not by comparing magnitudes), so a
+/// caller must compare same-sign values only; [`float_explanation`] enforces
+/// this by returning `None` outright when the two bit patterns' sign bits
+/// differ, before ever calling this function.
 fn ordered_bits(bits: u64) -> i64 {
     if bits & SIGN_MASK == 0 {
         bits as i64
@@ -885,16 +890,22 @@ fn project(row: &[Cell], key: &[usize]) -> Vec<Cell> {
     key.iter().map(|&i| row[i].clone()).collect()
 }
 
-/// Whether two key tuples sit at the same cut boundary, ignoring float bit
-/// differences: a float cell inside an ORDER BY key must still be
-/// recognized as the cut (its value is reported as a [`FloatMismatch`] by
-/// [`compare_multiset`], never silently misrouted into an exact-equality
-/// interior-row Fail because its bits happened to differ).
-fn keys_match_structurally(a: &[Cell], b: &[Cell]) -> bool {
+/// Whether two key tuples are the same cut boundary by exact value: every
+/// non-float cell equal, and every float cell bit-equal or within `tolerance`
+/// (D1). This alone is what a key made entirely of float cells must use: with
+/// no non-float cell to discriminate, treating "any float matches any float"
+/// as this function used to would make every row in the result (not just the
+/// one actually tied with the boundary) match the cut (the Q28/Q29 bug: a
+/// single-column float ORDER BY key reduced every row to its key tuple and
+/// compared no other column).
+fn key_cells_match(a: &[Cell], b: &[Cell], tolerance: Option<&FloatTolerance>) -> bool {
     a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| matches!((x, y), (Cell::Float(_), Cell::Float(_))) || x == y)
+        && a.iter().zip(b).all(|(x, y)| match (x, y) {
+            (Cell::Float(fa), Cell::Float(fb)) => {
+                fa == fb || float_explanation(*fa, *fb, tolerance).is_some()
+            }
+            _ => x == y,
+        })
 }
 
 /// Split a row into its non-float "shape" (every non-float cell, with each
@@ -1022,6 +1033,149 @@ fn compare_multiset(
     )
 }
 
+/// Resolve the rows each side nominated as sitting at a cut boundary (D1
+/// rule 1c): a nominee only clears membership by [`key_cells_match`], so a
+/// row that merely shares a cut's non-float key cells while its float key
+/// cell differs by more than `tolerance` covers was never nominated at all
+/// and is not an input here. What membership by itself cannot settle is the
+/// asymmetric case explicitly required: the reference's true boundary row
+/// matches itself trivially and is always nominated, but the subject's
+/// counterpart clears membership only when its float cell is bit-equal or
+/// tolerance-covered. An undeclared or out-of-tolerance mismatch leaves the
+/// reference's row nominated alone, with no subject counterpart in this set
+/// at all.
+///
+/// A nominee without a counterpart on the far side is not "the cut passed
+/// with a mismatch" (there is nothing here to pair it against); it is simply
+/// not part of a tie after all, and its full row is handed back to the
+/// caller to fold into the ordinary interior comparison, where
+/// [`compare_multiset`]'s shape grouping (which blanks every float cell,
+/// key or not) will pair it against its true counterpart if one exists and
+/// surface the difference as an ordinary [`FloatMismatch`], or as a genuine
+/// row mismatch if it truly has none.
+///
+/// Returns the float mismatches found among rows that did pair here (column
+/// already remapped to the row's real index), the float cells compared, the
+/// leftover full rows for each side to fold into the interior comparison,
+/// and the number of rows paired on each side (so the caller's
+/// `tie_rows_reduced` counts only rows that actually tied, not nominees that
+/// turned out to have no counterpart).
+/// `(float_mismatches, float_cells_compared, leftover_ref, leftover_subj,
+/// paired_count)`, see [`reduce_cut_group`].
+type ReducedCutResult = (
+    Vec<FloatMismatch>,
+    u64,
+    Vec<Vec<Cell>>,
+    Vec<Vec<Cell>>,
+    usize,
+);
+
+fn reduce_cut_group(
+    ref_entries: Vec<(Vec<Cell>, Vec<Cell>)>,
+    subj_entries: Vec<(Vec<Cell>, Vec<Cell>)>,
+    tolerance: Option<&FloatTolerance>,
+) -> ReducedCutResult {
+    struct Entry {
+        floats: Vec<u64>,
+        key: Vec<Cell>,
+        full_row: Vec<Cell>,
+    }
+    struct Group {
+        float_columns: Vec<usize>,
+        ref_rows: Vec<Entry>,
+        subj_rows: Vec<Entry>,
+    }
+
+    let mut groups: std::collections::BTreeMap<String, Group> = std::collections::BTreeMap::new();
+    for (key, full_row) in ref_entries {
+        let (shape, floats) = split_row(&key);
+        let shape_key = format!("{shape:?}");
+        let group = groups.entry(shape_key).or_insert_with(|| Group {
+            float_columns: float_columns_of(&shape),
+            ref_rows: Vec::new(),
+            subj_rows: Vec::new(),
+        });
+        group.ref_rows.push(Entry {
+            floats,
+            key,
+            full_row,
+        });
+    }
+    for (key, full_row) in subj_entries {
+        let (shape, floats) = split_row(&key);
+        let shape_key = format!("{shape:?}");
+        let group = groups.entry(shape_key).or_insert_with(|| Group {
+            float_columns: float_columns_of(&shape),
+            ref_rows: Vec::new(),
+            subj_rows: Vec::new(),
+        });
+        group.subj_rows.push(Entry {
+            floats,
+            key,
+            full_row,
+        });
+    }
+
+    let mut float_mismatches = Vec::new();
+    let mut float_cells_compared = 0u64;
+    let mut leftover_ref = Vec::new();
+    let mut leftover_subj = Vec::new();
+    let mut paired_count = 0usize;
+
+    for (_, mut group) in groups {
+        group.ref_rows.sort_by(|a, b| a.floats.cmp(&b.floats));
+        group.subj_rows.sort_by(|a, b| a.floats.cmp(&b.floats));
+        let paired = group.ref_rows.len().min(group.subj_rows.len());
+        paired_count += paired;
+        for i in 0..paired {
+            let r = &group.ref_rows[i];
+            let s = &group.subj_rows[i];
+            float_cells_compared += (r.floats.len() + s.floats.len()) as u64;
+            for (slot, (&rb, &sb)) in r.floats.iter().zip(s.floats.iter()).enumerate() {
+                if rb != sb {
+                    float_mismatches.push(FloatMismatch {
+                        column: group.float_columns[slot],
+                        row_key: r.key.clone(),
+                        reference_bits: rb,
+                        subject_bits: sb,
+                        reference_f64: f64::from_bits(rb),
+                        subject_f64: f64::from_bits(sb),
+                        explanation: float_explanation(rb, sb, tolerance),
+                    });
+                }
+            }
+        }
+        for r in &group.ref_rows[paired..] {
+            leftover_ref.push(r.full_row.clone());
+        }
+        for s in &group.subj_rows[paired..] {
+            leftover_subj.push(s.full_row.clone());
+        }
+    }
+
+    (
+        float_mismatches,
+        float_cells_compared,
+        leftover_ref,
+        leftover_subj,
+        paired_count,
+    )
+}
+
+/// Remove, from `pool`, one occurrence of each row in `targets` (by value),
+/// at most one per target. Used to strip a cut nominee's leftover row back
+/// out of an interior comparison's missing/extra list when it found no
+/// counterpart there either: it is not a row-level defect, just a cut
+/// nominee that turned out to have no match anywhere (see
+/// [`reduce_cut_group`]).
+fn remove_one_each(pool: &mut Vec<Vec<Cell>>, targets: &[Vec<Cell>]) {
+    for target in targets {
+        if let Some(pos) = pool.iter().position(|row| row == target) {
+            pool.remove(pos);
+        }
+    }
+}
+
 /// Compare `reference` against `subject` under `tie`, applying D7's
 /// boundary-key tie reduction. Both must already be normalized (see
 /// [`rows_from_arrow`] / [`rows_from_json`]). `float_tolerance` is the
@@ -1049,14 +1203,38 @@ pub fn compare(
         }
     }
 
+    // A statement with no resolvable row identity (a declared cardinality
+    // reason, or a LIMIT with no key at all): no row past a count mismatch
+    // can be told apart from any other, so the verdict says so instead of
+    // attempting a listing that would name arbitrary rows as "the" mismatch.
+    let is_cardinality_mode =
+        tie.cardinality_reason.is_some() || (tie.limit.is_some() && tie.key.is_empty());
+
     // Row counts must agree in every verdict mode (D7 rule 1a), including
     // CardinalityOnly: a row-count mismatch is always a Fail, checked
-    // before anything else can mask it.
+    // before anything else can mask it. Outside cardinality mode, the key
+    // resolves row identity, so the missing/extra rows are computed and
+    // listed the same way a content mismatch would be, capped at
+    // `MAX_MISMATCH_ROWS` each, rather than left empty.
     if reference.len() != subject.len() {
+        let row_mismatch = if is_cardinality_mode {
+            RowMismatch::default()
+        } else {
+            let (unpaired, _, _) =
+                compare_multiset(reference.to_vec(), subject.to_vec(), float_tolerance);
+            RowMismatch {
+                missing: unpaired
+                    .missing
+                    .into_iter()
+                    .take(MAX_MISMATCH_ROWS)
+                    .collect(),
+                extra: unpaired.extra.into_iter().take(MAX_MISMATCH_ROWS).collect(),
+            }
+        };
         return Ok(ComparisonReport {
             verdict: Verdict::Fail,
             float_mismatches: Vec::new(),
-            row_mismatch: RowMismatch::default(),
+            row_mismatch,
             tie_rows_reduced: 0,
             float_cells_compared: 0,
         });
@@ -1110,70 +1288,87 @@ pub fn compare(
         None
     };
 
+    // A row nominates for cut membership only by exact (or
+    // tolerance-covered) key match (rule 1c): with no non-float key cell to
+    // discriminate, this is the only test an all-float key can use, and
+    // treating "any float matches any float" as membership (the pre-fix
+    // behavior) made every row in the result reduce to its key tuple against
+    // a single-column float ORDER BY key, comparing no other column (the
+    // Q28/Q29 bug). A nominee's counterpart on the far side is resolved
+    // below by [`reduce_cut_group`], not here: a row can nominate alone.
     let is_cut_key = |k: &Vec<Cell>| {
         top_cut_key
             .as_ref()
-            .is_some_and(|c| keys_match_structurally(k, c))
+            .is_some_and(|c| key_cells_match(k, c, float_tolerance))
             || bottom_cut_key
                 .as_ref()
-                .is_some_and(|c| keys_match_structurally(k, c))
+                .is_some_and(|c| key_cells_match(k, c, float_tolerance))
     };
 
-    // Rows whose key tuple equals a cut's key tuple reduce to the key
-    // tuple (rule 1c); all other rows are compared in full. The reduced
-    // tuples from both sides go into their own multiset, which must be
-    // equal (counted, never silently dropped), not merely tallied.
-    let mut tie_rows_reduced = 0u64;
+    // Rows whose key tuple equals a cut's key tuple nominate for reduction
+    // (rule 1c); all other rows go straight to the interior comparison.
+    // Nominees carry their full row alongside the projected key, because
+    // `reduce_cut_group` may hand a nominee back as a leftover (no
+    // counterpart on the far side) for the interior comparison to retry.
     let mut interior_ref = Vec::new();
-    let mut reduced_ref = Vec::new();
+    let mut reduced_ref_entries = Vec::new();
     for row in reference {
         let key = project(row, &tie.key);
         if is_cut_key(&key) {
-            tie_rows_reduced += 1;
-            reduced_ref.push(key);
+            reduced_ref_entries.push((key, row.clone()));
         } else {
             interior_ref.push(row.clone());
         }
     }
     let mut interior_subj = Vec::new();
-    let mut reduced_subj = Vec::new();
+    let mut reduced_subj_entries = Vec::new();
     for row in subject {
         let key = project(row, &tie.key);
         if is_cut_key(&key) {
-            tie_rows_reduced += 1;
-            reduced_subj.push(key);
+            reduced_subj_entries.push((key, row.clone()));
         } else {
             interior_subj.push(row.clone());
         }
     }
 
-    // The reduced (cut) side is compared only to decide whether it matches
-    // (D1 rule 1c): its own missing/extra rows are partial key tuples, not
-    // full rows, and are never surfaced in the report's `row_mismatch`. Its
-    // float mismatches ARE surfaced (D2c): a float cell inside the ORDER BY
-    // key still gets reported, with its column remapped from an index into
-    // the key tuple back to the row's real column index.
-    let (reduced_result, mut reduced_float_mismatches, reduced_float_cells) =
-        compare_multiset(reduced_ref, reduced_subj, float_tolerance);
+    // Float mismatches among rows that actually paired at the cut ARE
+    // surfaced (D2c): a float cell inside the ORDER BY key still gets
+    // reported, with its column remapped from an index into the key tuple
+    // back to the row's real column index. A nominee with no counterpart is
+    // not a mismatch here; it is folded into the interior rows below, where
+    // it gets a full, fair comparison against its true counterpart (if any).
+    let (mut reduced_float_mismatches, reduced_float_cells, leftover_ref, leftover_subj, paired) =
+        reduce_cut_group(reduced_ref_entries, reduced_subj_entries, float_tolerance);
     for m in &mut reduced_float_mismatches {
         m.column = tie.key[m.column];
     }
-    let reduced_has_mismatch =
-        !reduced_result.missing.is_empty() || !reduced_result.extra.is_empty();
+    let tie_rows_reduced = 2 * paired as u64;
+    interior_ref.extend(leftover_ref.iter().cloned());
+    interior_subj.extend(leftover_subj.iter().cloned());
 
     let (interior_result, interior_float_mismatches, interior_float_cells) =
         compare_multiset(interior_ref, interior_subj, float_tolerance);
+
+    // A leftover that still finds no counterpart here genuinely has none:
+    // it sat at a cut boundary and nominated, but neither matched the cut
+    // strictly nor shared a shape with anything on the far side. That is
+    // not a row-level defect to report, it is the tie-breaking slack rule
+    // 1c exists for (the far side was free to pick any row for that slot,
+    // including none that happens to share this one's shape): drop it
+    // silently rather than listing it as missing/extra. A row that was
+    // never a cut nominee (ordinary interior content, on either side)
+    // keeps full, normal reporting.
+    let mut missing = interior_result.missing;
+    let mut extra = interior_result.extra;
+    remove_one_each(&mut missing, &leftover_ref);
+    remove_one_each(&mut extra, &leftover_subj);
 
     let mut float_mismatches = reduced_float_mismatches;
     float_mismatches.extend(interior_float_mismatches);
     let float_cells_compared = reduced_float_cells + interior_float_cells;
     let has_unexplained_float_mismatch = float_mismatches.iter().any(|m| m.explanation.is_none());
 
-    let verdict = if !reduced_has_mismatch
-        && interior_result.missing.is_empty()
-        && interior_result.extra.is_empty()
-        && !has_unexplained_float_mismatch
-    {
+    let verdict = if missing.is_empty() && extra.is_empty() && !has_unexplained_float_mismatch {
         Verdict::Pass
     } else {
         Verdict::Fail
@@ -1183,16 +1378,8 @@ pub fn compare(
         verdict,
         float_mismatches,
         row_mismatch: RowMismatch {
-            missing: interior_result
-                .missing
-                .into_iter()
-                .take(MAX_MISMATCH_ROWS)
-                .collect(),
-            extra: interior_result
-                .extra
-                .into_iter()
-                .take(MAX_MISMATCH_ROWS)
-                .collect(),
+            missing: missing.into_iter().take(MAX_MISMATCH_ROWS).collect(),
+            extra: extra.into_iter().take(MAX_MISMATCH_ROWS).collect(),
         },
         tie_rows_reduced,
         float_cells_compared,
@@ -2074,6 +2261,190 @@ mod tests {
         );
         assert_eq!(fm.reference_bits, 20.0_f64.to_bits());
         assert_eq!(fm.subject_bits, bumped.to_bits());
+    }
+
+    /// Required test (D1, 1a): Q28/Q29 shape, a single `Float64` ORDER BY
+    /// key column with no other key column to discriminate with. The
+    /// reference returns exactly `LIMIT` rows (the bottom cut fires); the
+    /// subject carries the identical float key values but wrong `CounterID`
+    /// and `count` on every row. Red on HEAD: the old permissive float
+    /// match (`Cell::Float(_) == Cell::Float(_)` regardless of bits) made
+    /// every row's key "match" any cut key, so every row reduced to its key
+    /// tuple and `CounterID`/`count` were never compared.
+    #[test]
+    fn float_only_key_wrong_other_columns_fails() {
+        let reference = vec![
+            vec![Cell::Float(5.0_f64.to_bits()), Cell::Int(100), Cell::Int(7)],
+            vec![Cell::Float(4.0_f64.to_bits()), Cell::Int(150), Cell::Int(8)],
+            vec![Cell::Float(3.0_f64.to_bits()), Cell::Int(200), Cell::Int(9)],
+        ];
+        let subject = vec![
+            vec![Cell::Float(5.0_f64.to_bits()), Cell::Int(901), Cell::Int(1)],
+            vec![Cell::Float(4.0_f64.to_bits()), Cell::Int(902), Cell::Int(2)],
+            vec![Cell::Float(3.0_f64.to_bits()), Cell::Int(903), Cell::Int(3)],
+        ];
+        let report =
+            compare(&reference, &subject, &tie(vec![0], Some(3), 0), None).expect("compare");
+        assert_eq!(
+            report.verdict,
+            Verdict::Fail,
+            "wrong CounterID/count must be caught even though the floats all match"
+        );
+        assert!(
+            !report.row_mismatch.missing.is_empty() || !report.row_mismatch.extra.is_empty(),
+            "the mismatched rows must be listed"
+        );
+    }
+
+    /// Required test (D1, 1b): a mixed `[Int, Float64]` key where the Int
+    /// cell alone is not a unique row identity. A row that merely shares its
+    /// non-float key cell with the bottom cut, while its float key cell is
+    /// nowhere near a tie, carries a wrong string in a non-key column; that
+    /// must still fail, never silently exempted because the shared Int cell
+    /// used to be enough on its own.
+    #[test]
+    fn mixed_key_wrong_string_on_non_cut_row_fails() {
+        // `CounterID` (an Int key cell) is not a unique row identity here:
+        // row 1 happens to share its value (2) with the true bottom-cut row
+        // (row 2), while its `AvgValue` (90.0 vs 20.0) is nowhere near a
+        // tie. Pre-fix, `keys_match_structurally` wildcarded any
+        // `Cell::Float` against any other, so row 1's key `[Int(2),
+        // Float(90.0)]` matched the bottom cut `[Int(2), Float(20.0)]` by
+        // the Int cell alone and reduced away, silently exempting its wrong
+        // string from comparison (Pass). Row 1 is not actually tied with
+        // the cut: only a key that is bit-equal (or tolerance-covered) on
+        // every float cell may nominate (`key_cells_match`), so row 1 stays
+        // interior and its wrong string is caught in full.
+        let reference = vec![
+            vec![
+                Cell::Int(2),
+                Cell::Float(90.0_f64.to_bits()),
+                Cell::Str("a".into()),
+            ],
+            vec![
+                Cell::Int(2),
+                Cell::Float(20.0_f64.to_bits()),
+                Cell::Str("b".into()),
+            ],
+        ];
+        let subject = vec![
+            vec![
+                Cell::Int(2),
+                Cell::Float(90.0_f64.to_bits()),
+                Cell::Str("WRONG".into()),
+            ],
+            vec![
+                Cell::Int(2),
+                Cell::Float(20.0_f64.to_bits()),
+                Cell::Str("b".into()),
+            ],
+        ];
+        let report =
+            compare(&reference, &subject, &tie(vec![0, 1], Some(2), 0), None).expect("compare");
+        assert_eq!(
+            report.verdict,
+            Verdict::Fail,
+            "row 1 is not at the bottom cut (its AvgValue is nowhere near row 2's); sharing \
+             CounterID with the cut row must not exempt its wrong string"
+        );
+    }
+
+    /// Required test (D1, 1c, no declaration branch): a mixed `[Int,
+    /// Float64]` key with a 1-ulp float difference on the bottom-cut row and
+    /// no declared tolerance fails, with the mismatch listed as a
+    /// [`FloatMismatch`] (never a silent, unexplained row-level Fail). This
+    /// is exactly [`float_in_order_key_bottom_cut_is_listed_as_mismatch`]
+    /// above; kept here as its own named case per the D1 test list.
+    #[test]
+    fn float_key_cut_mismatch_fails_and_is_listed_without_tolerance() {
+        let reference = vec![
+            vec![Cell::Int(1), Cell::Float(10.0_f64.to_bits())],
+            vec![Cell::Int(2), Cell::Float(20.0_f64.to_bits())],
+        ];
+        let bumped = f64::from_bits(20.0_f64.to_bits() + 1);
+        let subject = vec![
+            vec![Cell::Int(1), Cell::Float(10.0_f64.to_bits())],
+            vec![Cell::Int(2), Cell::Float(bumped.to_bits())],
+        ];
+        let report =
+            compare(&reference, &subject, &tie(vec![0, 1], Some(2), 0), None).expect("compare");
+        assert_eq!(report.verdict, Verdict::Fail);
+        assert_eq!(report.float_mismatches.len(), 1);
+        assert_eq!(report.float_mismatches[0].explanation, None);
+    }
+
+    /// Required test (D1, 1c, declared branch): the same mismatch as above,
+    /// but with `float_max_ulps = 1` declared, is "Explained" and the
+    /// comparison passes.
+    #[test]
+    fn float_key_cut_mismatch_explained_with_declared_tolerance() {
+        let reference = vec![
+            vec![Cell::Int(1), Cell::Float(10.0_f64.to_bits())],
+            vec![Cell::Int(2), Cell::Float(20.0_f64.to_bits())],
+        ];
+        let bumped = f64::from_bits(20.0_f64.to_bits() + 1);
+        let subject = vec![
+            vec![Cell::Int(1), Cell::Float(10.0_f64.to_bits())],
+            vec![Cell::Int(2), Cell::Float(bumped.to_bits())],
+        ];
+        let tolerance = FloatTolerance {
+            reason: "sequential-fold avg rounding (ADR-0022)".to_string(),
+            max_ulps: 1,
+        };
+        let report = compare(
+            &reference,
+            &subject,
+            &tie(vec![0, 1], Some(2), 0),
+            Some(&tolerance),
+        )
+        .expect("compare");
+        assert_eq!(report.verdict, Verdict::Pass);
+        assert_eq!(report.float_mismatches.len(), 1);
+        assert_eq!(
+            report.float_mismatches[0].explanation.as_deref(),
+            Some("sequential-fold avg rounding (ADR-0022)")
+        );
+    }
+
+    /// Required test (D1, 1d): a single-column `Float64` key with a
+    /// bit-equal tie at the bottom cut; the subject's row at that position
+    /// carries different (irrelevant, since exempted) content. Passes: an
+    /// exact-bit tie at the cut is still forgiven, same as an ordinary
+    /// (non-float) key.
+    #[test]
+    fn float_key_bit_equal_tie_different_row_content_passes() {
+        let reference = vec![
+            vec![
+                Cell::Float(5.0_f64.to_bits()),
+                Cell::Int(100),
+                Cell::Str("a".into()),
+            ],
+            vec![
+                Cell::Float(3.0_f64.to_bits()),
+                Cell::Int(200),
+                Cell::Str("b".into()),
+            ],
+        ];
+        let subject = vec![
+            vec![
+                Cell::Float(5.0_f64.to_bits()),
+                Cell::Int(100),
+                Cell::Str("a".into()),
+            ],
+            vec![
+                Cell::Float(3.0_f64.to_bits()),
+                Cell::Int(999),
+                Cell::Str("different".into()),
+            ],
+        ];
+        let report =
+            compare(&reference, &subject, &tie(vec![0], Some(2), 0), None).expect("compare");
+        assert_eq!(
+            report.verdict,
+            Verdict::Pass,
+            "a bit-equal tie at the cut is exempt from content comparison"
+        );
+        assert_eq!(report.tie_rows_reduced, 2);
     }
 
     /// D3d: build every one of the frozen corpus's 43 statements' `TieSpec`
