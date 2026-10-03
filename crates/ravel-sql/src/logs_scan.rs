@@ -7747,3 +7747,215 @@ mod tests {
         assert_eq!(cells, want);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod owned_work_tests {
+    //! ADR-2414 decision A1: `owned_work` deals whole row groups, never a
+    //! row group's blocks across partitions. Fixtures are writer-produced
+    //! objects of one block per record, `GROUP_BLOCKS` blocks per row group.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_logseg::{ObjectIdentity, RlogConfig, RlogReader, RlogWriter};
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const GROUP_BLOCKS: usize = 4;
+    const GROUPS: usize = 3;
+    const BLOCKS: usize = GROUPS * GROUP_BLOCKS;
+
+    fn object() -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            group_target_blocks: GROUP_BLOCKS,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut writer = RlogWriter::new(cfg, identity);
+        for ts in 0..BLOCKS as i64 {
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("row {ts}"),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: Vec::new(),
+                })
+                .expect("push");
+        }
+        writer.finish().expect("finish")
+    }
+
+    fn dirs() -> Arc<SegmentDirectories> {
+        let obj = object();
+        Arc::new(
+            RlogReader::decode_directories(&obj[..], &RlogConfig::default()).expect("directories"),
+        )
+    }
+
+    fn seg_ref(key: &str) -> SegmentRef {
+        SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: 0,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: BLOCKS as i64,
+            ingest_hour_bucket: 0,
+            sample_count: BLOCKS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    /// `segments` identical objects, each with every block surviving.
+    fn plan(segments: usize) -> (PlanCounts, Vec<SegmentRef>) {
+        let dirs = dirs();
+        let segs = (0..segments)
+            .map(|_| {
+                Some(SegPlan {
+                    indices: Arc::new((0..BLOCKS).collect()),
+                    dirs: Arc::clone(&dirs),
+                    stats: ScanStats::default(),
+                    footer: None,
+                    whole_object: None,
+                })
+            })
+            .collect();
+        let refs = (0..segments).map(|s| seg_ref(&format!("seg{s}"))).collect();
+        (
+            PlanCounts {
+                segs,
+                total_blocks: segments * BLOCKS,
+                full_reads: 0,
+            },
+            refs,
+        )
+    }
+
+    /// Every partition's owned `(segment ordinal, blocks)` list.
+    fn deal(
+        counts: &PlanCounts,
+        refs: &[SegmentRef],
+        n: usize,
+        stripe: bool,
+    ) -> Vec<Vec<(usize, Vec<usize>)>> {
+        (0..n)
+            .map(|p| {
+                owned_work(counts, refs, p, n, stripe)
+                    .into_iter()
+                    .map(|w| (w.ordinal, w.indices))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// One object with more blocks (12) than partitions (3): every row group
+    /// lands whole on one partition, every partition owns exactly one group,
+    /// and every block is owned exactly once.
+    ///
+    /// Fails against the per-block deal (`unit i -> partition i % n`), which
+    /// puts blocks 0, 3, 6, 9 on partition 0 and so splits every group, and
+    /// against a deal that hands every group to partition 0 (partitions 1 and 2
+    /// would own nothing).
+    #[test]
+    fn a_row_group_stays_on_one_partition() {
+        let (counts, refs) = plan(1);
+        let dealt = deal(&counts, &refs, 3, true);
+        assert_eq!(
+            dealt,
+            vec![
+                vec![(0, vec![0, 1, 2, 3])],
+                vec![(0, vec![4, 5, 6, 7])],
+                vec![(0, vec![8, 9, 10, 11])],
+            ],
+            "each partition owns exactly one whole row group"
+        );
+        assert_eq!(dealt, deal(&counts, &refs, 3, true), "the deal is stable");
+    }
+
+    /// Group numbering runs on across segments, not from zero per segment:
+    /// two objects of three groups over four partitions deal groups
+    /// 0..6 to partitions 0, 1, 2, 3, 0, 1, so partition 0 owns segment 0's
+    /// first group and segment 1's second, and group counts differ by at most
+    /// one.
+    ///
+    /// Fails against a deal that restarts the group count per segment (segment
+    /// 1 would again start at partition 0, leaving partition 3 with one group
+    /// and partition 0 with two of segment 1's).
+    #[test]
+    fn group_numbering_runs_on_across_segments() {
+        let (counts, refs) = plan(2);
+        let dealt = deal(&counts, &refs, 4, true);
+        assert_eq!(
+            dealt,
+            vec![
+                vec![(0, vec![0, 1, 2, 3]), (1, vec![4, 5, 6, 7])],
+                vec![(0, vec![4, 5, 6, 7]), (1, vec![8, 9, 10, 11])],
+                vec![(0, vec![8, 9, 10, 11])],
+                vec![(1, vec![0, 1, 2, 3])],
+            ]
+        );
+        let groups: Vec<usize> = dealt
+            .iter()
+            .map(|p| p.iter().map(|(_, b)| b.len() / GROUP_BLOCKS).sum())
+            .collect();
+        let (lo, hi) = (groups.iter().min().unwrap(), groups.iter().max().unwrap());
+        assert!(hi - lo <= 1, "group counts are balanced: {groups:?}");
+    }
+
+    /// A pruned survivor list is grouped by the object's own row-group
+    /// boundaries, not by runs of consecutive survivors or by a fixed survivor
+    /// count: blocks 3 and 4 are consecutive survivors but sit in different
+    /// groups, and 4 and 5 share one.
+    ///
+    /// Fails against grouping consecutive survivor runs (`[[3,4,5],[9]]`) and
+    /// against chunking survivors by `GROUP_BLOCKS` (`[[3,4,5,9]]`).
+    #[test]
+    fn survivors_group_by_page_dir_boundaries() {
+        let dirs = dirs();
+        assert_eq!(
+            row_groups(&[3, 4, 5, 9], dirs.page_dir()),
+            vec![vec![3], vec![4, 5], vec![9]]
+        );
+        assert_eq!(
+            row_groups(&[], dirs.page_dir()),
+            Vec::<Vec<usize>>::new(),
+            "no survivors, no groups"
+        );
+    }
+
+    /// Without a read cache the assignment stays segment-granular: segment `j`
+    /// goes whole to partition `j % n`.
+    #[test]
+    fn the_uncached_deal_is_still_per_segment() {
+        let (counts, refs) = plan(3);
+        let dealt = deal(&counts, &refs, 2, false);
+        let all: Vec<usize> = (0..BLOCKS).collect();
+        assert_eq!(
+            dealt,
+            vec![vec![(0, all.clone()), (2, all.clone())], vec![(1, all)]]
+        );
+    }
+}
