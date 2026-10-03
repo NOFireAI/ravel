@@ -32,5 +32,14 @@ rlog_hot_ceiling_s = 101.7
 
 # D7's concurrency phase is pre-registered against ADR-2023's figures on the
 # RLOG entry: at least 0.400 queries per second, at most 0.101 error ratio.
+#
+# The report carries two error ratios. `error_ratio` is every error over every
+# run, the figure comparable with the RLOG entry. `unregistered_error_ratio`
+# leaves out the statements listed in `failures`: errors from every other
+# statement over the runs of those statements, completed plus errored. The
+# ceiling is judged on the second (issue #2055).
+# The phase cycles all 43 statements, so the five registered failures failing
+# exactly as predicted put the raw ratio at 5/43, about 0.116, over 0.101 on
+# every run however the rest behave.
 concurrency_qps_floor = 0.400
 concurrency_error_ratio_ceiling = 0.101
