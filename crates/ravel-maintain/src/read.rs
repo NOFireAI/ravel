@@ -391,11 +391,11 @@ pub async fn load_input_catalog(
 /// [`InputRecord`] (an L1 compaction or rewrite part, which carries no
 /// writer identity of its own) can still decode a catalog. `created_unix_ns`,
 /// `writer_epoch`, and `writer_seq` stamp every [`RunPlan`]'s provenance
-/// fields exactly as [`load_input_catalog`] does from its `InputRecord`; an
-/// L1-part caller with no meaningful per-run writer identity passes the
-/// record's own `created_unix_ns` and zeros for epoch/seq, the same
-/// nil-writer-identity convention `ravel-catalog`'s `build_l1_segment_ref`
-/// uses for L1-level refs.
+/// fields exactly as [`load_input_catalog`] does from its `InputRecord`. An
+/// L1 part's runs each keep the provenance of the writes they came from,
+/// which no single triple describes, so the erasure rewrite passes zeros and
+/// restamps every run from the part's own stored catalog, per-sample
+/// provenance column included, before it reads any provenance field.
 pub async fn load_catalog_from_object(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,

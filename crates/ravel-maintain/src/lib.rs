@@ -92,7 +92,7 @@ pub use config::{
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{
     ApplicableRequest, BucketErasureCompletion, ErasureAbandon, ErasureMatcher,
-    ErasureRewriteOutcome, PendingErasureRequest, RewriteBuild, RewriteSupersession,
+    ErasureRewriteOutcome, PendingErasureRequest, RewriteBuild, RewriteSupersession, RunProvenance,
     bucket_erasure_completion, bucket_may_overlap, build_rewrite, erasure_rewrite_bucket,
     pending_erasure_requests, publish_rewrite_record,
 };
