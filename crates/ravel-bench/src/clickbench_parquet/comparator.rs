@@ -12,8 +12,7 @@
 //! [`FloatTolerance`] (`suite.toml`'s `float_reason`/`float_max_ulps`), and a
 //! mismatch within that many ULPs (same sign, both finite) is "Explained"
 //! instead: listed, but not fatal. The one expected source is Ravel's
-//! sequential-fold `avg` (ADR-0022), though no statement declares a
-//! tolerance yet.
+//! sequential-fold `avg` (ADR-0022).
 
 use datafusion::arrow::array::{Array, AsArray};
 use datafusion::arrow::datatypes::{
@@ -135,6 +134,20 @@ pub enum ComparatorError {
     NegativeDecimalScale { index: usize, scale: i8 },
     #[error("could not parse JSON reference as an array of row arrays: {0}")]
     JsonReferenceParse(String),
+    #[error(
+        "column_match = \"by-name\": column {column:?} is in the {present} output schema but not \
+         in the {absent} output schema"
+    )]
+    ColumnMatchNameMissing {
+        column: String,
+        present: &'static str,
+        absent: &'static str,
+    },
+    #[error(
+        "column_match = \"by-name\": column {column:?} appears more than once in the {side} \
+         output schema"
+    )]
+    ColumnMatchDuplicateName { column: String, side: &'static str },
 }
 
 /// The tie-breaking key and truncation shape ADR-2040 D7 compares under: the
@@ -809,9 +822,12 @@ fn parse_limit_clause(
     }
 }
 
-/// Resolve `sql`'s `TieSpec`: its ORDER BY key (by D7's textual rules, or
-/// `override_key` when given), its LIMIT, and its OFFSET. `statement_number`
-/// is used only to name the statement in [`ComparatorError::UnresolvedOrderKey`].
+/// Resolve `sql`'s `TieSpec`: its ORDER BY key, its LIMIT, and its OFFSET.
+/// `override_key`, when given, is the key outright: the textual rules are
+/// not consulted, so an override on a statement that also resolves
+/// textually still wins. Without one, the key comes from D7's textual
+/// rules. `statement_number` is used only to name the statement in
+/// [`ComparatorError::UnresolvedOrderKey`].
 ///
 /// `cardinality_reason`, when `Some`, is `suite.toml`'s declared `compare =
 /// "cardinality"` reason for this statement: ORDER BY key resolution is
@@ -849,6 +865,14 @@ pub fn resolve_tie_spec(
             cardinality_reason: Some(reason.to_string()),
         });
     }
+    if let Some(k) = override_key {
+        return Ok(TieSpec {
+            key: k.to_vec(),
+            limit,
+            offset,
+            cardinality_reason: None,
+        });
+    }
     let Some(order_by) = &query.order_by else {
         return Ok(TieSpec {
             key: Vec::new(),
@@ -860,40 +884,27 @@ pub fn resolve_tie_spec(
     let projection = select_projection(&query.body)?;
     let exprs = order_by_exprs(order_by)?;
     let mut key = Vec::with_capacity(exprs.len());
-    let mut all_resolved = true;
     for expr in &exprs {
         match resolve_projection_index(expr, &projection) {
             Some(idx) => key.push(idx),
             None => {
-                all_resolved = false;
-                break;
+                return Err(ComparatorError::UnresolvedOrderKey {
+                    statement_number,
+                    expr: exprs
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
             }
         }
     }
-    if all_resolved {
-        return Ok(TieSpec {
-            key,
-            limit,
-            offset,
-            cardinality_reason: None,
-        });
-    }
-    match override_key {
-        Some(k) => Ok(TieSpec {
-            key: k.to_vec(),
-            limit,
-            offset,
-            cardinality_reason: None,
-        }),
-        None => Err(ComparatorError::UnresolvedOrderKey {
-            statement_number,
-            expr: exprs
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-        }),
-    }
+    Ok(TieSpec {
+        key,
+        limit,
+        offset,
+        cardinality_reason: None,
+    })
 }
 
 /// Resolve `names` (`suite.toml`'s `order_key_columns`) to projection
@@ -952,6 +963,107 @@ pub fn resolve_order_key_columns(
             Ok(subject_index)
         })
         .collect()
+}
+
+/// How a statement's subject columns are paired with the reference's
+/// (`suite.toml`'s `column_match`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ColumnMatch {
+    /// Subject column `i` is compared with reference column `i`.
+    #[default]
+    Positional,
+    /// The subject's columns are reordered to the reference's column order
+    /// by output column name before comparing (`column_match = "by-name"`).
+    ByName,
+}
+
+/// For each reference column, in order, the index of the subject column
+/// with the same name. Both sides must hold exactly the same set of names,
+/// each once: a duplicate on either side, or a name on one side only, is a
+/// typed error naming it.
+fn by_name_permutation(
+    reference_columns: &[String],
+    subject_columns: &[String],
+) -> Result<Vec<usize>, ComparatorError> {
+    for (side, columns) in [
+        ("reference", reference_columns),
+        ("subject", subject_columns),
+    ] {
+        for (i, name) in columns.iter().enumerate() {
+            if columns[..i].contains(name) {
+                return Err(ComparatorError::ColumnMatchDuplicateName {
+                    column: name.clone(),
+                    side,
+                });
+            }
+        }
+    }
+    if let Some(name) = subject_columns
+        .iter()
+        .find(|name| !reference_columns.contains(name))
+    {
+        return Err(ComparatorError::ColumnMatchNameMissing {
+            column: name.clone(),
+            present: "subject",
+            absent: "reference",
+        });
+    }
+    reference_columns
+        .iter()
+        .map(|name| {
+            subject_columns
+                .iter()
+                .position(|c| c == name)
+                .ok_or_else(|| ComparatorError::ColumnMatchNameMissing {
+                    column: name.clone(),
+                    present: "reference",
+                    absent: "subject",
+                })
+        })
+        .collect()
+}
+
+/// [`compare`], after pairing the subject's columns with the reference's
+/// under `column_match`. `reference_columns` and `subject_columns` are each
+/// side's output column names, in result-column order.
+///
+/// Under [`ColumnMatch::ByName`] every subject row is reordered to
+/// `reference_columns`' order first, so `tie.key`, the verdict, and every
+/// listed row and float mismatch use the reference's column positions.
+/// Under [`ColumnMatch::Positional`] the names are not consulted and this is
+/// [`compare`] itself.
+pub fn compare_with_columns(
+    reference: &[Vec<Cell>],
+    reference_columns: &[String],
+    subject: &[Vec<Cell>],
+    subject_columns: &[String],
+    column_match: ColumnMatch,
+    tie: &TieSpec,
+    float_tolerance: Option<&FloatTolerance>,
+) -> Result<ComparisonReport, ComparatorError> {
+    match column_match {
+        ColumnMatch::Positional => compare(reference, subject, tie, float_tolerance),
+        ColumnMatch::ByName => {
+            let permutation = by_name_permutation(reference_columns, subject_columns)?;
+            let reordered = subject
+                .iter()
+                .map(|row| {
+                    permutation
+                        .iter()
+                        .map(|&i| {
+                            row.get(i)
+                                .cloned()
+                                .ok_or(ComparatorError::ColumnCountMismatch {
+                                    reference: reference_columns.len(),
+                                    subject: row.len(),
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            compare(reference, &reordered, tie, float_tolerance)
+        }
+    }
 }
 
 fn project(row: &[Cell], key: &[usize]) -> Vec<Cell> {
@@ -1655,6 +1767,22 @@ mod tests {
         assert!(matches!(err, ComparatorError::UnresolvedOrderKey { .. }));
     }
 
+    /// An `order_key` override wins over textual resolution outright: here
+    /// the textual rules resolve `ORDER BY "a"` to column 0, and the
+    /// override names column 1, so the key is column 1.
+    #[test]
+    fn an_override_wins_over_a_textual_resolution() {
+        let sql = r#"SELECT "a", "b" FROM t ORDER BY "a" DESC LIMIT 5 OFFSET 2"#;
+        let textual = resolve_tie_spec(7, sql, None, None).expect("a resolves textually");
+        assert_eq!(textual.key, vec![0]);
+
+        let overridden = resolve_tie_spec(7, sql, Some(&[1]), None).expect("override applies");
+        assert_eq!(overridden.key, vec![1]);
+        assert_eq!(overridden.limit, Some(5));
+        assert_eq!(overridden.offset, 2);
+        assert_eq!(overridden.cardinality_reason, None);
+    }
+
     /// `resolve_order_key_columns` resolves a name present at the same
     /// position on both sides.
     #[test]
@@ -1699,6 +1827,149 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The same two columns in opposite orders, holding equal values: Pass
+    /// under by-name matching, Fail positionally.
+    #[test]
+    fn by_name_passes_reordered_columns_that_fail_positionally() {
+        let reference_columns = names(&["a", "b"]);
+        let subject_columns = names(&["b", "a"]);
+        let reference = vec![
+            vec![Cell::Int(1), Cell::Str("x".into())],
+            vec![Cell::Int(2), Cell::Str("y".into())],
+        ];
+        let subject = vec![
+            vec![Cell::Str("x".into()), Cell::Int(1)],
+            vec![Cell::Str("y".into()), Cell::Int(2)],
+        ];
+        let tie = tie(vec![], None, 0);
+        let run = |column_match| {
+            compare_with_columns(
+                &reference,
+                &reference_columns,
+                &subject,
+                &subject_columns,
+                column_match,
+                &tie,
+                None,
+            )
+            .expect("comparison runs")
+            .verdict
+        };
+        assert_eq!(run(ColumnMatch::ByName), Verdict::Pass);
+        assert_eq!(run(ColumnMatch::Positional), Verdict::Fail);
+    }
+
+    /// A by-name comparison where either side lacks a column the other has is
+    /// a typed error naming that column and which side holds it.
+    #[test]
+    fn by_name_with_a_column_on_one_side_only_is_refused() {
+        let reference = vec![vec![Cell::Int(1), Cell::Int(2)]];
+        let subject = vec![vec![Cell::Int(1), Cell::Int(2)]];
+        let tie = tie(vec![], None, 0);
+        let err = compare_with_columns(
+            &reference,
+            &names(&["a", "b"]),
+            &subject,
+            &names(&["a", "c"]),
+            ColumnMatch::ByName,
+            &tie,
+            None,
+        )
+        .expect_err("c is not a reference column");
+        assert_eq!(
+            err,
+            ComparatorError::ColumnMatchNameMissing {
+                column: "c".to_string(),
+                present: "subject",
+                absent: "reference",
+            }
+        );
+
+        let reference = vec![vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]];
+        let err = compare_with_columns(
+            &reference,
+            &names(&["a", "b", "c"]),
+            &subject,
+            &names(&["a", "b"]),
+            ColumnMatch::ByName,
+            &tie,
+            None,
+        )
+        .expect_err("c is not a subject column");
+        assert_eq!(
+            err,
+            ComparatorError::ColumnMatchNameMissing {
+                column: "c".to_string(),
+                present: "reference",
+                absent: "subject",
+            }
+        );
+    }
+
+    /// A name appearing twice on either side is a typed error naming it, even
+    /// when both sides hold the same set of names.
+    #[test]
+    fn by_name_with_a_duplicate_column_is_refused() {
+        let rows = vec![vec![Cell::Int(1), Cell::Int(2), Cell::Int(3)]];
+        let tie = tie(vec![], None, 0);
+        let err = compare_with_columns(
+            &rows,
+            &names(&["a", "b", "c"]),
+            &rows,
+            &names(&["a", "b", "b"]),
+            ColumnMatch::ByName,
+            &tie,
+            None,
+        )
+        .expect_err("b appears twice in the subject");
+        assert_eq!(
+            err,
+            ComparatorError::ColumnMatchDuplicateName {
+                column: "b".to_string(),
+                side: "subject",
+            }
+        );
+    }
+
+    /// By-name matching still compares every value: a wrong value fails the
+    /// comparison and is listed, with its row in the reference's column order.
+    #[test]
+    fn by_name_still_lists_a_wrong_value() {
+        let reference_columns = names(&["a", "b"]);
+        let subject_columns = names(&["b", "a"]);
+        let reference = vec![
+            vec![Cell::Int(1), Cell::Str("x".into())],
+            vec![Cell::Int(2), Cell::Str("y".into())],
+        ];
+        let subject = vec![
+            vec![Cell::Str("x".into()), Cell::Int(1)],
+            vec![Cell::Str("z".into()), Cell::Int(2)],
+        ];
+        let report = compare_with_columns(
+            &reference,
+            &reference_columns,
+            &subject,
+            &subject_columns,
+            ColumnMatch::ByName,
+            &tie(vec![], None, 0),
+            None,
+        )
+        .expect("comparison runs");
+        assert_eq!(report.verdict, Verdict::Fail);
+        assert_eq!(
+            report.row_mismatch.missing,
+            vec![vec![Cell::Int(2), Cell::Str("y".into())]]
+        );
+        assert_eq!(
+            report.row_mismatch.extra,
+            vec![vec![Cell::Int(2), Cell::Str("z".into())]]
+        );
     }
 
     /// Required test, and distinguishing test for wrong implementation (c):

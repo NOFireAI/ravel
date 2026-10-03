@@ -2,7 +2,7 @@
 //! queries.sql`), tamper-evidence over it, and the Ravel-side DDL template
 //! and per-statement comparator overrides from `suite.toml`.
 
-use crate::clickbench_parquet::comparator::FloatTolerance;
+use crate::clickbench_parquet::comparator::{ColumnMatch, FloatTolerance};
 use serde::Deserialize;
 
 /// The exact upstream `queries.sql` text, embedded at compile time so the
@@ -84,6 +84,35 @@ pub enum SuiteError {
          \"cardinality\" without a reason"
     )]
     CardinalityWithoutReason { number: u32 },
+    /// A `[[statement]]` override declared `ci_expected_error` with no
+    /// `reason`: an expected failure needs to say what Ravel is missing.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares \
+         ci_expected_error without a reason"
+    )]
+    ExpectedErrorWithoutReason { number: u32 },
+    /// A `[[statement]]` override declared `column_match` as something other
+    /// than `"by-name"`, the only supported value.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares column_match = \
+         {value:?}; the only supported value is \"by-name\""
+    )]
+    UnknownColumnMatch { number: u32, value: String },
+    /// A `[[statement]]` override declared `column_match = "by-name"` with no
+    /// `reason`: comparing columns by name instead of by position needs to
+    /// say why the two engines' column orders legitimately differ.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares column_match = \
+         \"by-name\" without a reason"
+    )]
+    ColumnMatchWithoutReason { number: u32 },
+    /// A `[[statement]]` override names a statement number `queries.sql`
+    /// does not hold, so it would apply to nothing.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: an override names statement {number}, \
+         which queries.sql does not hold (it has {count} statements)"
+    )]
+    UnknownStatement { number: u32, count: usize },
 }
 
 /// `suite.toml`'s `[table]` section: the Ravel DDL template that mounts the
@@ -109,12 +138,13 @@ impl TableTemplate {
 pub struct StatementOverride {
     /// 1-based statement number this override applies to.
     pub number: u32,
-    /// 0-indexed projection columns the comparator ties on, in order, used
-    /// when the statement's ORDER BY clause does not resolve to a
-    /// projection index under the comparator's own textual rules and the
-    /// key cannot be named by [`Self::order_key_columns`] either (e.g. an
-    /// ORDER BY expression with no corresponding output column name, as
-    /// Q43's `DATE_TRUNC('minute', M)` has none under its alias `M`).
+    /// 0-indexed projection columns the comparator ties on, in order. When
+    /// set, this is the key outright: the comparator's textual ORDER BY
+    /// rules are not consulted (`comparator::resolve_tie_spec`). Meant for a
+    /// key the textual rules cannot resolve and [`Self::order_key_columns`]
+    /// cannot name either (e.g. an ORDER BY expression with no corresponding
+    /// output column name, as Q43's `DATE_TRUNC('minute', M)` has none
+    /// under its alias `M`).
     #[serde(default)]
     pub order_key: Option<Vec<usize>>,
     /// Output column names the comparator ties on, in order, resolved at
@@ -134,11 +164,30 @@ pub struct StatementOverride {
     /// typed load error ([`SuiteError::UnknownCompareMode`]).
     #[serde(default)]
     pub compare: Option<String>,
+    /// When set to `"by-name"`, the comparator reorders the subject's columns
+    /// to the reference's column order by output column name before
+    /// comparing ([`ColumnMatch::ByName`]); `reason` is then required and
+    /// explains why the two column orders differ. Absent means positional
+    /// comparison. `"by-name"` is the only supported value; anything else is
+    /// a typed load error ([`SuiteError::UnknownColumnMatch`]).
+    #[serde(default)]
+    pub column_match: Option<String>,
     /// Required alongside `compare = "cardinality"`
-    /// ([`SuiteError::CardinalityWithoutReason`] otherwise); unused
+    /// ([`SuiteError::CardinalityWithoutReason`] otherwise), alongside
+    /// `ci_expected_error` ([`SuiteError::ExpectedErrorWithoutReason`]
+    /// otherwise), and alongside `column_match`
+    /// ([`SuiteError::ColumnMatchWithoutReason`] otherwise); unused
     /// otherwise.
     #[serde(default)]
     pub reason: Option<String>,
+    /// A stable part of the error Ravel returns for this statement, matched
+    /// as a substring because each engine wraps the same failure in its own
+    /// prefix (an HTTP status line, `query failed:`). When set, the statement
+    /// is not compared: the acceptance test asserts that each Ravel arm fails
+    /// with an error containing this text, so the statement starting to
+    /// answer (or failing differently) turns it red.
+    #[serde(default)]
+    pub ci_expected_error: Option<String>,
     /// Why this statement's float cells are allowed to differ by up to
     /// `float_max_ulps` (e.g. a sequential-fold `avg`, ADR-0022). Declaring
     /// one of `float_reason`/`float_max_ulps` without the other is a typed
@@ -172,6 +221,18 @@ impl StatementOverride {
     /// `Some`.
     pub fn is_cardinality_only(&self) -> bool {
         self.compare.as_deref() == Some("cardinality")
+    }
+
+    /// The [`ColumnMatch`] this override declares: [`ColumnMatch::ByName`]
+    /// for `column_match = "by-name"`, [`ColumnMatch::Positional`] when
+    /// `column_match` is absent. `load` already rejects any other value and
+    /// a by-name declaration without a `reason`.
+    pub fn column_match(&self) -> ColumnMatch {
+        if self.column_match.as_deref() == Some("by-name") {
+            ColumnMatch::ByName
+        } else {
+            ColumnMatch::Positional
+        }
     }
 }
 
@@ -239,7 +300,14 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
     }
     let doc: SuiteTomlDoc =
         toml::from_str(suite_toml).map_err(|e| SuiteError::InvalidToml(e.to_string()))?;
+    let statements = parse_statements(queries_sql);
     for over in &doc.statements {
+        if !statements.iter().any(|s| s.number == over.number) {
+            return Err(SuiteError::UnknownStatement {
+                number: over.number,
+                count: statements.len(),
+            });
+        }
         if over.float_reason.is_some() != over.float_max_ulps.is_some() {
             return Err(SuiteError::IncompleteFloatDeclaration {
                 number: over.number,
@@ -258,9 +326,27 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
                 });
             }
         }
+        if over.ci_expected_error.is_some() && over.reason.is_none() {
+            return Err(SuiteError::ExpectedErrorWithoutReason {
+                number: over.number,
+            });
+        }
+        if let Some(mode) = &over.column_match {
+            if mode != "by-name" {
+                return Err(SuiteError::UnknownColumnMatch {
+                    number: over.number,
+                    value: mode.clone(),
+                });
+            }
+            if over.reason.is_none() {
+                return Err(SuiteError::ColumnMatchWithoutReason {
+                    number: over.number,
+                });
+            }
+        }
     }
     Ok(Suite {
-        statements: parse_statements(queries_sql),
+        statements,
         table: doc.table,
         overrides: doc.statements,
     })
@@ -330,9 +416,8 @@ mod tests {
         assert!(rendered.contains("CREATE EXTERNAL TABLE hits"));
     }
 
-    /// `suite.toml`'s one override (statement 43) loads with the exact key
-    /// the comparator consumes, and declares no float tolerance (none of
-    /// the frozen corpus's statements do yet).
+    /// Statement 43's override loads with the exact key the comparator
+    /// consumes, and declares no float tolerance.
     #[test]
     fn statement_43_override_loads() {
         let suite = load_default().expect("pinned corpus loads");
@@ -341,6 +426,168 @@ mod tests {
         assert!(suite.override_for(1).is_none());
         assert_eq!(over.float_tolerance(), None);
         assert!(!over.is_cardinality_only());
+        assert_eq!(over.ci_expected_error, None);
+    }
+
+    /// The checked-in statement 4 override declares the sequential-fold avg
+    /// tolerance at exactly 3 ULPs.
+    #[test]
+    fn statement_4_float_tolerance_loads() {
+        let suite = load_default().expect("pinned corpus loads");
+        let over = suite.override_for(4).expect("Q4 override present");
+        let tolerance = over.float_tolerance().expect("Q4 declares a tolerance");
+        assert_eq!(
+            tolerance.reason,
+            "Ravel sequential-fold avg (ADR-0022); measured 1 and 2 ULPs, plus 1 ULP headroom"
+        );
+        assert_eq!(tolerance.max_ulps, 3);
+    }
+
+    /// The checked-in statement 19 override declares its expected error text
+    /// together with a reason.
+    #[test]
+    fn statement_19_expected_error_loads() {
+        let suite = load_default().expect("pinned corpus loads");
+        let over = suite.override_for(19).expect("Q19 override present");
+        assert_eq!(
+            over.ci_expected_error.as_deref(),
+            Some("This feature is not implemented: Extract not supported by ExprPlanner")
+        );
+        assert_eq!(
+            over.reason.as_deref(),
+            Some(
+                "EXTRACT has no ExprPlanner: datafusion is built without its datetime \
+                 expressions (issue #2458)"
+            )
+        );
+    }
+
+    /// The checked-in statement 24 override compares columns by name, with
+    /// its stated reason, and keeps its by-name ORDER BY key. No other
+    /// statement compares by name.
+    #[test]
+    fn statement_24_column_match_loads() {
+        let suite = load_default().expect("pinned corpus loads");
+        let over = suite.override_for(24).expect("Q24 override present");
+        assert_eq!(over.column_match(), ColumnMatch::ByName);
+        assert_eq!(
+            over.reason.as_deref(),
+            Some(
+                "upstream's view moves EventDate last; Ravel's ravel.cast.EventDate casts it \
+                 in place at its Parquet position"
+            )
+        );
+        assert_eq!(over.order_key_columns, Some(vec!["EventTime".to_string()]));
+        let by_name: Vec<u32> = suite
+            .overrides
+            .iter()
+            .filter(|o| o.column_match() == ColumnMatch::ByName)
+            .map(|o| o.number)
+            .collect();
+        assert_eq!(by_name, vec![24]);
+    }
+
+    /// `column_match = "by-name"` with no `reason` is a typed load error.
+    #[test]
+    fn column_match_without_reason_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 24
+            column_match = "by-name"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("reason-less column_match is refused");
+        assert!(matches!(
+            err,
+            SuiteError::ColumnMatchWithoutReason { number: 24 }
+        ));
+    }
+
+    /// A `column_match` value other than `"by-name"` is a typed load error.
+    #[test]
+    fn unknown_column_match_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 24
+            column_match = "by_name"
+            reason = "typo for by-name"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("unknown column_match is refused");
+        assert!(matches!(
+            err,
+            SuiteError::UnknownColumnMatch { number: 24, .. }
+        ));
+    }
+
+    /// An override without `column_match` compares positionally.
+    #[test]
+    fn absent_column_match_is_positional() {
+        let suite = load_default().expect("pinned corpus loads");
+        let over = suite.override_for(43).expect("Q43 override present");
+        assert_eq!(over.column_match, None);
+        assert_eq!(over.column_match(), ColumnMatch::Positional);
+    }
+
+    /// `ci_expected_error` with no `reason` is a typed load error.
+    #[test]
+    fn expected_error_without_reason_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 19
+            ci_expected_error = "query failed"
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("reason-less expected error is refused");
+        assert!(matches!(
+            err,
+            SuiteError::ExpectedErrorWithoutReason { number: 19 }
+        ));
+    }
+
+    /// An override naming a statement number outside `queries.sql` (0, or
+    /// one past the last statement) is a typed load error naming that
+    /// number, while the last real statement number loads.
+    #[test]
+    fn override_for_unknown_statement_is_refused() {
+        let toml_for = |number: u32| {
+            format!(
+                r#"
+                [table]
+                template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{{location}}'"
+
+                [[statement]]
+                number = {number}
+                order_key = [0]
+                "#
+            )
+        };
+        let past_end = STATEMENT_COUNT as u32 + 1;
+        for number in [0, past_end] {
+            let err = load(QUERIES_SQL, &toml_for(number))
+                .expect_err("an override for a missing statement is refused");
+            assert_eq!(
+                err,
+                SuiteError::UnknownStatement {
+                    number,
+                    count: STATEMENT_COUNT,
+                }
+            );
+            assert!(
+                err.to_string()
+                    .contains(&format!("names statement {number},")),
+                "error must name the number: {err}"
+            );
+        }
+        let suite = load(QUERIES_SQL, &toml_for(STATEMENT_COUNT as u32))
+            .expect("an override for the last statement loads");
+        assert!(suite.override_for(STATEMENT_COUNT as u32).is_some());
     }
 
     /// A `[[statement]]` block declaring only `float_reason` (no
