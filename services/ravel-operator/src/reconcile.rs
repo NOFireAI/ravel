@@ -17,14 +17,15 @@ use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy}
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Affinity, Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
-    KeyToPath, Lifecycle, LifecycleHandler, PodAffinityTerm, PodAntiAffinity, PodSecurityContext,
-    PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile, SecretKeySelector,
-    SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort, ServiceSpec,
-    SleepAction, Volume, VolumeMount, WeightedPodAffinityTerm,
+    KeyToPath, Lifecycle, LifecycleHandler, ObjectFieldSelector, PodAffinityTerm, PodAntiAffinity,
+    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile,
+    SecretKeySelector, SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort,
+    ServiceSpec, SleepAction, Volume, VolumeMount, WeightedPodAffinityTerm,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
-    IngressServiceBackend, IngressSpec, IngressTLS, ServiceBackendPort,
+    IngressServiceBackend, IngressSpec, IngressTLS, NetworkPolicy, NetworkPolicyIngressRule,
+    NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec, ServiceBackendPort,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
@@ -148,6 +149,25 @@ pub enum RenderError {
         /// The refused endpoint, verbatim as the spec wrote it.
         endpoint: String,
     },
+
+    /// `spec.query.distributedQuery.enabled` is true but one or more of its
+    /// Secret references is unset. `ravel-server` refuses
+    /// `--fragment-listener` without all three TLS files and
+    /// `--distributed-query` without a fragment key file, so the operator
+    /// renders none of the distributed-query flags, mounts, or NetworkPolicy
+    /// and the controller degrades the cluster naming each missing field.
+    /// Captured in [`DesiredObjects::distributed_query_render_error`] rather
+    /// than propagated, so the query tier keeps running locally.
+    #[error(
+        "spec.query.distributedQuery.enabled is true but {} {} not set; reference a Secret for \
+         each, or set enabled: false. The query tier runs without distributed query until then",
+        .missing.iter().map(|f| format!("spec.query.distributedQuery.{f}")).collect::<Vec<_>>().join(", "),
+        if .missing.len() == 1 { "is" } else { "are" }
+    )]
+    DistributedQuerySecretRefMissing {
+        /// The camelCase field names that are unset, in schema order.
+        missing: Vec<&'static str>,
+    },
 }
 
 /// HTTP listener port (OTLP/HTTP, query API, and the `/healthz` `/readyz`
@@ -167,6 +187,15 @@ pub const HEALTH_PORT: i32 = 4316;
 /// Container-port name for [`HEALTH_PORT`], alongside the existing `http` and
 /// `grpc` names.
 pub const HEALTH_PORT_NAME: &str = "health";
+
+/// Dedicated TLS fragment listener port on the query tier (ADR-0071
+/// amendment decision 1, ADR-1689 decision 1), rendered only under
+/// `spec.query.distributedQuery.enabled`. Coordinators dial it at the pod IP
+/// each worker advertises, never through a Service.
+pub const FRAGMENT_PORT: i32 = 4319;
+
+/// Container-port name for [`FRAGMENT_PORT`].
+pub const FRAGMENT_PORT_NAME: &str = "fragment";
 
 /// `preStop` sleep, in seconds, on every ravel-server pod.
 ///
@@ -708,6 +737,187 @@ fn deployment_key_volume_mount(spec: &RavelClusterSpec) -> Option<VolumeMount> {
     })
 }
 
+/// Env var the query container reads its own pod IP from (downward API
+/// `status.podIP`), expanded into `--advertise-fragment-endpoint`. The fragment
+/// listener binds a wildcard, which `ravel-server` refuses to advertise.
+pub(crate) const POD_IP_ENV: &str = "RAVEL_POD_IP";
+
+/// Mount directory of `distributedQuery.fragmentTlsSecretRef`.
+pub(crate) const FRAGMENT_TLS_MOUNT_DIR: &str = "/etc/ravel/fragment-tls";
+/// Mount directory of `distributedQuery.fragmentCaSecretRef`.
+pub(crate) const FRAGMENT_CA_MOUNT_DIR: &str = "/etc/ravel/fragment-ca";
+/// Mount directory of `distributedQuery.fragmentKeySecretRef`.
+pub(crate) const FRAGMENT_KEY_MOUNT_DIR: &str = "/etc/ravel/fragment-key";
+/// Mount directory of `distributedQuery.sqlTicketKeySecretRef`.
+pub(crate) const SQL_TICKET_KEY_MOUNT_DIR: &str = "/etc/ravel/sql-ticket-key";
+
+/// Secret key of the fragment certificate (the `kubernetes.io/tls` name).
+pub(crate) const FRAGMENT_TLS_CERT_KEY: &str = "tls.crt";
+/// Secret key of the fragment private key (the `kubernetes.io/tls` name).
+pub(crate) const FRAGMENT_TLS_KEY_KEY: &str = "tls.key";
+/// Secret key of the fragment CA bundle (the cert-manager name).
+pub(crate) const FRAGMENT_CA_KEY: &str = "ca.crt";
+/// Secret key of the fragment and SQL ticket key files.
+pub(crate) const KEY_FILE_SECRET_KEY: &str = "keys";
+
+/// The Secret names `spec.query.distributedQuery` renders from, once every
+/// reference is present.
+struct DistributedQuerySecrets<'a> {
+    tls: &'a str,
+    ca: &'a str,
+    fragment_key: &'a str,
+    sql_ticket_key: &'a str,
+}
+
+/// `Ok(None)` when distributed query is absent or disabled, `Ok(Some(..))`
+/// when it is enabled with every Secret reference set, and
+/// [`RenderError::DistributedQuerySecretRefMissing`] naming each unset
+/// reference otherwise. The one predicate the query Deployment, the
+/// NetworkPolicy, and the controller's condition all read.
+fn distributed_query_secrets(
+    spec: &RavelClusterSpec,
+) -> Result<Option<DistributedQuerySecrets<'_>>, RenderError> {
+    let Some(dq) = spec
+        .query
+        .distributed_query
+        .as_ref()
+        .filter(|dq| dq.enabled)
+    else {
+        return Ok(None);
+    };
+    fn name(r: &Option<LocalSecretRef>) -> Option<&str> {
+        r.as_ref().map(|r| r.name.as_str())
+    }
+    match (
+        name(&dq.fragment_tls_secret_ref),
+        name(&dq.fragment_ca_secret_ref),
+        name(&dq.fragment_key_secret_ref),
+        name(&dq.sql_ticket_key_secret_ref),
+    ) {
+        (Some(tls), Some(ca), Some(fragment_key), Some(sql_ticket_key)) => {
+            Ok(Some(DistributedQuerySecrets {
+                tls,
+                ca,
+                fragment_key,
+                sql_ticket_key,
+            }))
+        }
+        (tls, ca, fragment_key, sql_ticket_key) => {
+            let missing = [
+                ("fragmentTlsSecretRef", tls.is_none()),
+                ("fragmentCaSecretRef", ca.is_none()),
+                ("fragmentKeySecretRef", fragment_key.is_none()),
+                ("sqlTicketKeySecretRef", sql_ticket_key.is_none()),
+            ]
+            .into_iter()
+            .filter_map(|(field, unset)| unset.then_some(field))
+            .collect();
+            Err(RenderError::DistributedQuerySecretRefMissing { missing })
+        }
+    }
+}
+
+/// A read-only Secret volume projecting `keys` and its container mount at
+/// `dir`.
+fn secret_file_volume(
+    volume_name: &str,
+    secret: &str,
+    keys: &[&str],
+    dir: &str,
+) -> (Volume, VolumeMount) {
+    let volume = Volume {
+        name: volume_name.to_string(),
+        secret: Some(SecretVolumeSource {
+            secret_name: Some(secret.to_string()),
+            items: Some(
+                keys.iter()
+                    .map(|key| KeyToPath {
+                        key: key.to_string(),
+                        path: key.to_string(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            optional: Some(false),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mount = VolumeMount {
+        name: volume_name.to_string(),
+        mount_path: dir.to_string(),
+        read_only: Some(true),
+        ..Default::default()
+    };
+    (volume, mount)
+}
+
+/// The distributed-query flags, each file flag pointing into its Secret mount.
+fn distributed_query_args() -> Vec<String> {
+    vec![
+        "--distributed-query".to_string(),
+        "--fragment-key-file".to_string(),
+        format!("{FRAGMENT_KEY_MOUNT_DIR}/{KEY_FILE_SECRET_KEY}"),
+        "--sql-ticket-key-file".to_string(),
+        format!("{SQL_TICKET_KEY_MOUNT_DIR}/{KEY_FILE_SECRET_KEY}"),
+        "--fragment-listener".to_string(),
+        format!("0.0.0.0:{FRAGMENT_PORT}"),
+        "--fragment-tls-cert".to_string(),
+        format!("{FRAGMENT_TLS_MOUNT_DIR}/{FRAGMENT_TLS_CERT_KEY}"),
+        "--fragment-tls-key".to_string(),
+        format!("{FRAGMENT_TLS_MOUNT_DIR}/{FRAGMENT_TLS_KEY_KEY}"),
+        "--fragment-tls-ca".to_string(),
+        format!("{FRAGMENT_CA_MOUNT_DIR}/{FRAGMENT_CA_KEY}"),
+        "--advertise-fragment-endpoint".to_string(),
+        format!("$({POD_IP_ENV})"),
+    ]
+}
+
+/// The four Secret volumes and mounts behind [`distributed_query_args`].
+fn distributed_query_volumes(secrets: &DistributedQuerySecrets<'_>) -> Vec<(Volume, VolumeMount)> {
+    vec![
+        secret_file_volume(
+            "fragment-tls",
+            secrets.tls,
+            &[FRAGMENT_TLS_CERT_KEY, FRAGMENT_TLS_KEY_KEY],
+            FRAGMENT_TLS_MOUNT_DIR,
+        ),
+        secret_file_volume(
+            "fragment-ca",
+            secrets.ca,
+            &[FRAGMENT_CA_KEY],
+            FRAGMENT_CA_MOUNT_DIR,
+        ),
+        secret_file_volume(
+            "fragment-key",
+            secrets.fragment_key,
+            &[KEY_FILE_SECRET_KEY],
+            FRAGMENT_KEY_MOUNT_DIR,
+        ),
+        secret_file_volume(
+            "sql-ticket-key",
+            secrets.sql_ticket_key,
+            &[KEY_FILE_SECRET_KEY],
+            SQL_TICKET_KEY_MOUNT_DIR,
+        ),
+    ]
+}
+
+/// The `RAVEL_POD_IP` env var from the downward API.
+fn pod_ip_env() -> EnvVar {
+    EnvVar {
+        name: POD_IP_ENV.to_string(),
+        value_from: Some(EnvVarSource {
+            field_ref: Some(ObjectFieldSelector {
+                field_path: "status.podIP".to_string(),
+                api_version: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// Convert the CRD resource spec into a Kubernetes `ResourceRequirements`.
 ///
 /// When the spec omits `resources` entirely, renders `default_cpu`/
@@ -918,6 +1128,7 @@ fn deployment(
     default_resources: (&str, &str),
     strategy_type: &str,
     secrets_checksum: &str,
+    extra_volumes: Vec<(Volume, VolumeMount)>,
 ) -> Deployment {
     let labels = labels(instance, component);
     if spec.probes.dedicated_health_port {
@@ -930,8 +1141,13 @@ fn deployment(
         });
     }
     let (liveness, readiness) = probes(spec);
-    let volume_mount = deployment_key_volume_mount(spec);
-    let volume = deployment_key_volume(spec);
+    let mut volume_mounts: Vec<VolumeMount> =
+        deployment_key_volume_mount(spec).into_iter().collect();
+    let mut volumes: Vec<Volume> = deployment_key_volume(spec).into_iter().collect();
+    for (volume, mount) in extra_volumes {
+        volumes.push(volume);
+        volume_mounts.push(mount);
+    }
     let container = Container {
         name: "ravel-server".to_string(),
         image: Some(spec.image.clone()),
@@ -947,7 +1163,7 @@ fn deployment(
             default_resources.0,
             default_resources.1,
         )),
-        volume_mounts: volume_mount.map(|m| vec![m]),
+        volume_mounts: (!volume_mounts.is_empty()).then_some(volume_mounts),
         security_context: Some(container_security_context()),
         ..Default::default()
     };
@@ -980,7 +1196,7 @@ fn deployment(
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
-                    volumes: volume.map(|v| vec![v]),
+                    volumes: (!volumes.is_empty()).then_some(volumes),
                     termination_grace_period_seconds: Some(termination_grace_period_seconds(spec)),
                     security_context: Some(pod_security_context()),
                     affinity: Some(pod_anti_affinity(instance, component)),
@@ -1049,6 +1265,7 @@ pub fn desired_gateway_deployment(
         (GATEWAY_DEFAULT_CPU_REQUEST, GATEWAY_DEFAULT_MEMORY_REQUEST),
         "RollingUpdate",
         &tier_secrets_checksum(spec, ctx, tier_override, None),
+        Vec::new(),
     )
 }
 
@@ -1067,8 +1284,10 @@ fn running_fold_interval_secs(spec: &RavelClusterSpec) -> Option<u64> {
         .and_then(|f| f.interval_secs)
 }
 
-/// The query Deployment: `--mode query`, HTTP listener only, tenant tokens.
-/// RollingUpdate strategy.
+/// The query Deployment: `--mode query`, HTTP listener, tenant tokens, and,
+/// under an enabled and complete `spec.query.distributedQuery`, the
+/// distributed-query flags, the fragment listener port, and the four Secret
+/// mounts. RollingUpdate strategy.
 pub fn desired_query_deployment(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -1098,11 +1317,25 @@ pub fn desired_query_deployment(
         env.push(audit_env);
     }
 
-    let ports = vec![ContainerPort {
+    let mut ports = vec![ContainerPort {
         name: Some("http".to_string()),
         container_port: HTTP_PORT,
         ..Default::default()
     }];
+
+    // An incomplete block renders nothing here; `desired_objects` surfaces
+    // the same result as `distributed_query_render_error`.
+    let mut extra_volumes = Vec::new();
+    if let Ok(Some(secrets)) = distributed_query_secrets(spec) {
+        args.extend(distributed_query_args());
+        env.push(pod_ip_env());
+        ports.push(ContainerPort {
+            name: Some(FRAGMENT_PORT_NAME.to_string()),
+            container_port: FRAGMENT_PORT,
+            ..Default::default()
+        });
+        extra_volumes = distributed_query_volumes(&secrets);
+    }
 
     deployment(
         spec,
@@ -1121,6 +1354,7 @@ pub fn desired_query_deployment(
             tier_override,
             ctx.audit_token_key_resource_version.as_deref(),
         ),
+        extra_volumes,
     )
 }
 
@@ -1240,6 +1474,7 @@ pub fn desired_maintain_deployment(
         ),
         "RollingUpdate",
         &tier_secrets_checksum(spec, ctx, tier_override, None),
+        Vec::new(),
     )))
 }
 
@@ -3060,6 +3295,81 @@ pub fn qualify_job_phase(job: &Job) -> QualifyJobPhase {
     QualifyJobPhase::Running
 }
 
+/// Component name of the query tier's fragment NetworkPolicy.
+const QUERY_FRAGMENT_POLICY_COMPONENT: &str = "query-fragment";
+
+/// The NetworkPolicy guarding the query tier's fragment port, or `None` when
+/// distributed query is absent, disabled, or missing a Secret reference.
+///
+/// It selects the query pods and admits [`FRAGMENT_PORT`] only from query pods
+/// of the same cluster in the same namespace. A NetworkPolicy that selects a
+/// pod for ingress isolates it on every port, so a second rule admits every
+/// other port `query_deployment` declares from any source: the policy narrows
+/// the fragment port and leaves the client and probe ports as they were.
+pub fn desired_query_network_policy(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    query_deployment: &Deployment,
+) -> Option<NetworkPolicy> {
+    distributed_query_secrets(spec).ok().flatten()?;
+    let query_pods = labels(instance, DeploymentTier::Query.component());
+    let tcp = |port: i32| NetworkPolicyPort {
+        port: Some(IntOrString::Int(port)),
+        protocol: Some("TCP".to_string()),
+        end_port: None,
+    };
+    let other_ports: Vec<NetworkPolicyPort> = query_deployment
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .into_iter()
+        .flat_map(|pod| pod.containers.iter())
+        .flat_map(|c| c.ports.iter().flatten())
+        .map(|p| p.container_port)
+        .filter(|port| *port != FRAGMENT_PORT)
+        .map(tcp)
+        .collect();
+    let mut ingress = vec![NetworkPolicyIngressRule {
+        from: Some(vec![NetworkPolicyPeer {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(query_pods.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]),
+        ports: Some(vec![tcp(FRAGMENT_PORT)]),
+    }];
+    if !other_ports.is_empty() {
+        ingress.push(NetworkPolicyIngressRule {
+            from: None,
+            ports: Some(other_ports),
+        });
+    }
+    Some(NetworkPolicy {
+        metadata: ObjectMeta {
+            name: Some(child_name(instance, QUERY_FRAGMENT_POLICY_COMPONENT)),
+            labels: Some(labels(instance, QUERY_FRAGMENT_POLICY_COMPONENT)),
+            ..Default::default()
+        },
+        spec: Some(NetworkPolicySpec {
+            pod_selector: Some(LabelSelector {
+                match_labels: Some(query_pods),
+                ..Default::default()
+            }),
+            policy_types: Some(vec!["Ingress".to_string()]),
+            ingress: Some(ingress),
+            egress: None,
+        }),
+    })
+}
+
+/// Every NetworkPolicy name the render can produce for `instance`. The
+/// controller deletes each one [`desired_query_network_policy`] did not
+/// return, so disabling distributed query removes the policy.
+pub fn possible_network_policy_names(instance: &str) -> Vec<String> {
+    vec![child_name(instance, QUERY_FRAGMENT_POLICY_COMPONENT)]
+}
+
 /// A tier's PodDisruptionBudget (issue #126, deliverable 4), capping how many of
 /// its pods a voluntary disruption (a node drain, a cluster upgrade) may take
 /// down at once.
@@ -3174,6 +3484,14 @@ pub struct DesiredObjects {
     pub query_deployment: Deployment,
     /// The query Service.
     pub query_service: Service,
+    /// The NetworkPolicy guarding the fragment port, or `None` when
+    /// distributed query does not render (the controller deletes it then).
+    pub query_network_policy: Option<NetworkPolicy>,
+    /// `Some` when `spec.query.distributedQuery` is enabled but missing a
+    /// Secret reference. The query Deployment and NetworkPolicy above then
+    /// carry none of the distributed-query rendering, and the controller
+    /// records a `Degraded` condition naming the missing fields.
+    pub distributed_query_render_error: Option<RenderError>,
     /// The maintain Deployment, or `None` when `maintain.enabled` is false (the
     /// controller deletes it in that case).
     pub maintain_deployment: Option<Deployment>,
@@ -3257,6 +3575,9 @@ pub fn desired_objects(
     // the operator's own remedy (create `sys/gc` out of band) unblock the
     // cluster: the Deployments exist, so they become ready once the object does.
     let gc_bootstrap = gc_bootstrap_plan(spec);
+    let query_deployment = desired_query_deployment(spec, instance, ctx);
+    let query_network_policy = desired_query_network_policy(spec, instance, &query_deployment);
+    let distributed_query_render_error = distributed_query_secrets(spec).err();
     Ok(DesiredObjects {
         gateway_deployment: desired_gateway_deployment(spec, instance, ctx),
         gateway_service: desired_gateway_service(spec, instance),
@@ -3268,8 +3589,10 @@ pub fn desired_objects(
         router_role,
         router_role_binding,
         router_render_error,
-        query_deployment: desired_query_deployment(spec, instance, ctx),
+        query_deployment,
         query_service: desired_query_service(spec, instance),
+        query_network_policy,
+        distributed_query_render_error,
         maintain_deployment: desired_maintain_deployment(spec, instance, ctx)?,
         pod_disruption_budgets: desired_pod_disruption_budgets(spec, instance),
         gc_bootstrap,
@@ -3281,10 +3604,10 @@ pub fn desired_objects(
 mod tests {
     use super::*;
     use crate::crd::{
-        AffinityBackend, AffinityKeySpec, DEFAULT_AFFINITY_SUBSET_SIZE, FoldSpec,
-        GatewayApiExposureSpec, GatewayExposureSpec, GatewayReference, GatewaySpec, GcSpec,
-        IngestAffinitySpec, LocalSecretRef, MaintainSpec, ProbesSpec, QuerySpec, RetentionSpec,
-        S3Spec, StorageSpec,
+        AffinityBackend, AffinityKeySpec, DEFAULT_AFFINITY_SUBSET_SIZE, DistributedQuerySpec,
+        FoldSpec, GatewayApiExposureSpec, GatewayExposureSpec, GatewayReference, GatewaySpec,
+        GcSpec, IngestAffinitySpec, LocalSecretRef, MaintainSpec, ProbesSpec, QuerySpec,
+        RetentionSpec, S3Spec, StorageSpec,
     };
     use std::collections::BTreeMap;
 
@@ -3329,6 +3652,7 @@ mod tests {
                 replicas: 2,
                 resources: None,
                 credentials_secret_ref: None,
+                distributed_query: None,
             },
             maintain: MaintainSpec {
                 enabled: true,
@@ -7563,6 +7887,11 @@ mod tests {
                 "verbs: [\"create\", \"patch\", \"delete\"]",
             ),
             (
+                Some("- apiGroups: [\"networking.k8s.io\"]"),
+                "resources: [\"networkpolicies\"]",
+                "verbs: [\"create\", \"patch\", \"delete\"]",
+            ),
+            (
                 Some("- apiGroups: [\"batch\"]"),
                 "resources: [\"jobs\"]",
                 "verbs: [\"create\", \"patch\", \"get\", \"delete\"]",
@@ -8648,5 +8977,269 @@ mod tests {
             QualificationDecision::Proceed,
             "an unchanged resourceVersion must not re-run qualification"
         );
+    }
+
+    fn secret(name: &str) -> Option<LocalSecretRef> {
+        Some(LocalSecretRef {
+            name: name.to_string(),
+        })
+    }
+
+    fn distributed_query_spec(enabled: bool) -> RavelClusterSpec {
+        let mut spec = base_spec();
+        spec.query.distributed_query = Some(DistributedQuerySpec {
+            enabled,
+            fragment_tls_secret_ref: secret("frag-tls"),
+            fragment_ca_secret_ref: secret("frag-ca"),
+            fragment_key_secret_ref: secret("frag-keys"),
+            sql_ticket_key_secret_ref: secret("sql-keys"),
+        });
+        spec
+    }
+
+    fn render(spec: &RavelClusterSpec) -> DesiredObjects {
+        desired_objects(spec, "rc", "ns", &ctx()).expect("spec renders")
+    }
+
+    /// Enabled and complete: the query Deployment is the baseline plus exactly
+    /// the distributed-query flags, the pod-IP env var, the fragment port, and
+    /// the four Secret mounts, and a NetworkPolicy admits the fragment port only
+    /// from the query pods.
+    #[test]
+    fn enabled_distributed_query_renders_exact_flags_mounts_and_network_policy() {
+        let baseline = render(&base_spec()).query_deployment;
+        let desired = render(&distributed_query_spec(true));
+        assert_eq!(desired.distributed_query_render_error, None);
+        let dep = &desired.query_deployment;
+
+        let mut expected_args = args_of(&baseline);
+        expected_args.extend(
+            [
+                "--distributed-query",
+                "--fragment-key-file",
+                "/etc/ravel/fragment-key/keys",
+                "--sql-ticket-key-file",
+                "/etc/ravel/sql-ticket-key/keys",
+                "--fragment-listener",
+                "0.0.0.0:4319",
+                "--fragment-tls-cert",
+                "/etc/ravel/fragment-tls/tls.crt",
+                "--fragment-tls-key",
+                "/etc/ravel/fragment-tls/tls.key",
+                "--fragment-tls-ca",
+                "/etc/ravel/fragment-ca/ca.crt",
+                "--advertise-fragment-endpoint",
+                "$(RAVEL_POD_IP)",
+            ]
+            .map(String::from),
+        );
+        assert_eq!(args_of(dep), expected_args);
+
+        let mut expected_env = container_of(&baseline).env.clone().expect("env");
+        expected_env.push(EnvVar {
+            name: "RAVEL_POD_IP".to_string(),
+            value_from: Some(EnvVarSource {
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: "status.podIP".to_string(),
+                    api_version: None,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(container_of(dep).env, Some(expected_env));
+
+        let ports: Vec<(Option<String>, i32)> = container_of(dep)
+            .ports
+            .iter()
+            .flatten()
+            .map(|p| (p.name.clone(), p.container_port))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                (Some("http".to_string()), 4318),
+                (Some("fragment".to_string()), 4319),
+            ]
+        );
+
+        let volumes = serde_json::to_value(&pod_spec_of(dep).volumes).expect("volumes json");
+        assert_eq!(
+            volumes,
+            serde_json::json!([
+                {"name": "fragment-tls", "secret": {"secretName": "frag-tls", "optional": false,
+                    "items": [{"key": "tls.crt", "path": "tls.crt"},
+                              {"key": "tls.key", "path": "tls.key"}]}},
+                {"name": "fragment-ca", "secret": {"secretName": "frag-ca", "optional": false,
+                    "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+                {"name": "fragment-key", "secret": {"secretName": "frag-keys", "optional": false,
+                    "items": [{"key": "keys", "path": "keys"}]}},
+                {"name": "sql-ticket-key", "secret": {"secretName": "sql-keys", "optional": false,
+                    "items": [{"key": "keys", "path": "keys"}]}},
+            ])
+        );
+        let mounts =
+            serde_json::to_value(&container_of(dep).volume_mounts).expect("volume mounts json");
+        assert_eq!(
+            mounts,
+            serde_json::json!([
+                {"name": "fragment-tls", "mountPath": "/etc/ravel/fragment-tls", "readOnly": true},
+                {"name": "fragment-ca", "mountPath": "/etc/ravel/fragment-ca", "readOnly": true},
+                {"name": "fragment-key", "mountPath": "/etc/ravel/fragment-key", "readOnly": true},
+                {"name": "sql-ticket-key", "mountPath": "/etc/ravel/sql-ticket-key",
+                    "readOnly": true},
+            ])
+        );
+
+        let query_pods = serde_json::json!({
+            "app.kubernetes.io/component": "query",
+            "app.kubernetes.io/instance": "rc",
+            "app.kubernetes.io/managed-by": "ravel-operator",
+            "app.kubernetes.io/name": "ravel",
+        });
+        let policy = serde_json::to_value(
+            desired
+                .query_network_policy
+                .as_ref()
+                .expect("enabled distributed query renders the NetworkPolicy"),
+        )
+        .expect("policy json");
+        assert_eq!(
+            policy,
+            serde_json::json!({
+                "apiVersion": "networking.k8s.io/v1",
+                "kind": "NetworkPolicy",
+                "metadata": {
+                    "name": "rc-query-fragment",
+                    "labels": {
+                        "app.kubernetes.io/component": "query-fragment",
+                        "app.kubernetes.io/instance": "rc",
+                        "app.kubernetes.io/managed-by": "ravel-operator",
+                        "app.kubernetes.io/name": "ravel",
+                    },
+                },
+                "spec": {
+                    "podSelector": {"matchLabels": query_pods},
+                    "policyTypes": ["Ingress"],
+                    "ingress": [
+                        {"from": [{"podSelector": {"matchLabels": query_pods}}],
+                         "ports": [{"port": 4319, "protocol": "TCP"}]},
+                        {"ports": [{"port": 4318, "protocol": "TCP"}]},
+                    ],
+                },
+            })
+        );
+        assert_eq!(
+            possible_network_policy_names("rc"),
+            vec!["rc-query-fragment"]
+        );
+    }
+
+    /// The NetworkPolicy's open rule follows the container's own ports, so the
+    /// dedicated health port stays reachable from the kubelet.
+    #[test]
+    fn network_policy_keeps_the_dedicated_health_port_open() {
+        let mut spec = distributed_query_spec(true);
+        spec.probes.dedicated_health_port = true;
+        let desired = render(&spec);
+        let policy = desired.query_network_policy.expect("policy");
+        let ingress = policy.spec.expect("spec").ingress.expect("ingress");
+        let open: Vec<i32> = ingress[1]
+            .ports
+            .iter()
+            .flatten()
+            .filter_map(|p| match p.port {
+                Some(IntOrString::Int(port)) => Some(port),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(open, vec![HTTP_PORT, HEALTH_PORT]);
+        assert!(ingress[1].from.is_none(), "the open rule admits any source");
+    }
+
+    /// Absent, or present with `enabled: false` and every reference set: the
+    /// render is byte-identical to a spec that never mentions the block, with no
+    /// NetworkPolicy and no error.
+    #[test]
+    fn disabled_distributed_query_renders_none_of_it() {
+        let baseline = render(&base_spec());
+        for spec in [base_spec(), distributed_query_spec(false)] {
+            let desired = render(&spec);
+            assert_eq!(desired.query_deployment, baseline.query_deployment);
+            assert_eq!(desired.query_network_policy, None);
+            assert_eq!(desired.distributed_query_render_error, None);
+            let dep = &desired.query_deployment;
+            for arg in args_of(dep) {
+                assert!(
+                    !(arg.starts_with("--distributed-query")
+                        || arg.starts_with("--fragment-")
+                        || arg.starts_with("--sql-ticket-key-file")
+                        || arg.starts_with("--advertise-fragment-endpoint")),
+                    "disabled distributed query rendered {arg}"
+                );
+            }
+            assert_eq!(pod_spec_of(dep).volumes, None);
+            assert_eq!(container_of(dep).volume_mounts, None);
+        }
+    }
+
+    /// Enabled with references missing: the error names each missing field,
+    /// and the query Deployment and NetworkPolicy render as if the block were
+    /// absent.
+    #[test]
+    fn missing_secret_reference_renders_nothing_and_names_the_field() {
+        let baseline = render(&base_spec());
+        let mut spec = distributed_query_spec(true);
+        if let Some(dq) = spec.query.distributed_query.as_mut() {
+            dq.fragment_tls_secret_ref = None;
+            dq.sql_ticket_key_secret_ref = None;
+        }
+        let desired = render(&spec);
+        let err = desired
+            .distributed_query_render_error
+            .expect("an incomplete block is a render error");
+        assert_eq!(
+            err,
+            RenderError::DistributedQuerySecretRefMissing {
+                missing: vec!["fragmentTlsSecretRef", "sqlTicketKeySecretRef"],
+            }
+        );
+        let message = err.to_string();
+        for field in [
+            "spec.query.distributedQuery.fragmentTlsSecretRef",
+            "spec.query.distributedQuery.sqlTicketKeySecretRef",
+        ] {
+            assert!(message.contains(field), "{message}");
+        }
+        assert!(
+            !message.contains("fragmentCaSecretRef"),
+            "only the missing fields are named: {message}"
+        );
+        assert_eq!(desired.query_deployment, baseline.query_deployment);
+        assert_eq!(desired.query_network_policy, None);
+
+        // Each reference alone is required.
+        for field in [
+            "fragmentTlsSecretRef",
+            "fragmentCaSecretRef",
+            "fragmentKeySecretRef",
+            "sqlTicketKeySecretRef",
+        ] {
+            let mut spec = distributed_query_spec(true);
+            if let Some(dq) = spec.query.distributed_query.as_mut() {
+                match field {
+                    "fragmentTlsSecretRef" => dq.fragment_tls_secret_ref = None,
+                    "fragmentCaSecretRef" => dq.fragment_ca_secret_ref = None,
+                    "fragmentKeySecretRef" => dq.fragment_key_secret_ref = None,
+                    _ => dq.sql_ticket_key_secret_ref = None,
+                }
+            }
+            assert_eq!(
+                render(&spec).distributed_query_render_error,
+                Some(RenderError::DistributedQuerySecretRefMissing {
+                    missing: vec![field],
+                })
+            );
+        }
     }
 }

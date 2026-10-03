@@ -78,7 +78,9 @@ builds on both.
    server, so ravel-sql states what it needs and the server supplies it,
    the same seam `WorkerEndpoints` already uses. `flight_sql_endpoint`
    leaves `QueryWorkerRecord`; the field existed only because the dedicated
-   listener served no Flight service.
+   listener served no Flight service. It leaves in release B, with the
+   plaintext path, not in release A (see the operator-rendering amendment
+   below).
 
 2. **The slice ticket is the capability, under its own key.** No client
    credential is forwarded. The claims are the ticket's existing fields:
@@ -106,7 +108,8 @@ builds on both.
 3. **`PROTOCOL_VERSION` moves 4 to 5**
    (`crates/ravel-query/src/distrib/codec.rs:67`). A v5 worker's public
    listener rejects slice tickets and its record carries no
-   `flight_sql_endpoint`; a v4 coordinator must never dial it. The routing
+   `flight_sql_endpoint` (from release B; see the operator-rendering
+   amendment below); a v4 coordinator must never dial it. The routing
    rule from the ADR-0071 amendment handles both directions at zero round
    trips: a version-skewed worker is dropped at routing time and its slices
    run coordinator-local. No frozen persistent format changes. The ticket
@@ -122,9 +125,10 @@ builds on both.
    warning naming release B and the flags it will require. In the same
    release the operator renders, for every `RavelCluster` with distributed
    query on, the dedicated listener, the certificate Secret mounts, the SQL
-   ticket key mount, and the T10c NetworkPolicy. Release B, the next release
-   after that operator rendering ships, deletes `Combined`: `Cli::validate`
-   refuses `--distributed-query` without `--fragment-listener` and
+   ticket key mount, and the T10c NetworkPolicy (the CRD block that turns
+   this on is in the operator-rendering amendment below). Release B, the
+   next release after that operator rendering ships, deletes `Combined`:
+   `Cli::validate` refuses `--distributed-query` without `--fragment-listener` and
    `--sql-ticket-key-file`, beside the existing pairing checks
    (`services/ravel-server/src/config.rs:4556-4570`); the public gRPC
    listener's fragment role is always `PublicFederation`; and the plaintext
@@ -220,10 +224,12 @@ flowchart LR
      the `SliceOnly` role, dial `fragment_endpoint` over TLS from the SQL
      lane, remove `flight_sql_endpoint`, bump `PROTOCOL_VERSION`, add
      `--sql-ticket-key-file`, log the release A warning, and update the
-     docs named above.
+     docs named above. Removing `flight_sql_endpoint` moved to task 4 (see
+     the operator-rendering amendment below).
   3. ravel-operator: render the dedicated listener, its Secret mounts, and
      the SQL ticket key for every distributed-query `RavelCluster`, after
-     T10c lands.
+     T10c lands. The task renders the NetworkPolicy itself, from the CRD
+     block in the operator-rendering amendment below.
   4. Release B: delete `Combined`, add the `Cli::validate` refusals, and
      delete the plaintext dial path, with the guide's "without the flag"
      paragraph removed in the same commit.
@@ -252,3 +258,54 @@ forged ticket, or one minted under a key this node does not hold, is not
 recognised as a slice ticket: it takes the client path and is refused there
 (`unauthenticated` without a client credential, `invalid_argument` with
 one), uncounted. It reads nothing either way.
+
+## Amendment (2026-10-03): the operator-rendering amendment
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="operator-rendering amendment" -->
+
+Two owner decisions recorded on #1690 change this ADR.
+
+First, `flight_sql_endpoint` leaves `QueryWorkerRecord` in release B, with
+the plaintext path, not in release A as decision 1 said. Release A's
+plaintext path, a coordinator without `--fragment-listener`, still dials
+that field for SQL slices, so removing it in release A would break the
+layout release A still supports. Decision 3's version bump stands: the v5
+record keeps the field until release B, and a version-skewed worker is
+still dropped at routing time. The removal moves from follow-up
+task 2 to task 4.
+
+Second, follow-up task 3 renders distributed query from an explicit block
+on the `RavelCluster` query spec, and renders the fragment NetworkPolicy
+itself rather than waiting on a separate T10c change:
+
+```yaml
+spec:
+  query:
+    distributedQuery:
+      enabled: false              # default; an explicit opt-in
+      fragmentTlsSecretRef:       # keys tls.crt, tls.key
+        name: <secret>
+      fragmentCaSecretRef:        # key ca.crt
+        name: <secret>
+      fragmentKeySecretRef:       # key keys
+        name: <secret>
+      sqlTicketKeySecretRef:      # key keys
+        name: <secret>
+```
+
+Every field is optional in the schema. With `enabled: true` and all four
+references set, the operator renders on the query Deployment
+`--distributed-query`, `--fragment-key-file`, `--sql-ticket-key-file`,
+`--fragment-listener 0.0.0.0:4319`, the three `--fragment-tls-*` flags, and
+`--advertise-fragment-endpoint` set to the pod IP from the downward API,
+with each file flag pointing into a read-only mount of its Secret and the
+fragment port declared on the container. It also applies a NetworkPolicy
+owned by the `RavelCluster` that admits port 4319 on the query pods only
+from the query pods of the same cluster, and admits every other port the
+query container declares from any source, so client and probe traffic is
+unchanged. With `enabled: true` and any reference unset, the reconcile
+renders none of it and records `Degraded` with reason
+`DistributedQuerySecretRefMissing`, naming each unset field. With the block
+absent or disabled, none of it renders and the NetworkPolicy is deleted.
+The operator's ClusterRole gains `create`, `patch`, and `delete` on
+`networkpolicies`.
