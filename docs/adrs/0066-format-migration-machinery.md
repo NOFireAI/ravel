@@ -670,9 +670,12 @@ re-audit. The switch is still off by default. The operator turns it on per
 run with `ravel-cli maintain migrate --reencode-compaction-parts`, whose help
 states item 8's rollout rule, and the command prints one `reencode_blocked`
 line per bucket with its reason and one `not_migrated` line per bucket whose
-rewrite published nothing. It exits nonzero when either is present, unless
-the fresh re-audit raised the floor, in which case another writer carried
-those buckets to the target and the run succeeded.
+rewrite published nothing. A run that drains the walk exits nonzero when
+either is present, unless the fresh re-audit raised the floor, in which case
+another writer carried those buckets to the target and the run succeeded. A
+run that stops on its budget exits zero; each such bucket still holds parts or
+records below the target, so the run that drains the walk fails on it through
+the re-audit's stragglers.
 `migrate --dry-run` runs only the read-only re-audit, because the walk writes
 its cursor and the floor whatever `CompactorConfig::dry_run` says.
 

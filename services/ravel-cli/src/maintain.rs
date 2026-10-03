@@ -2489,10 +2489,27 @@ pub async fn migrate_to(
     .await
     .map_err(|err| anyhow::anyhow!("migrate failed: {err}"))?;
 
+    migrate_verdict(out, tenant, sig, &family, target, budget_records, &report)
+}
+
+/// Print a finished migrate run's report and return its exit verdict. A budget
+/// stop exits zero whatever it left listed: every `reencode_blocked` and
+/// `not_migrated` bucket it names still holds parts or records below the
+/// target, so the run that drains the walk fails on them through its fresh
+/// re-audit's stragglers.
+fn migrate_verdict(
+    out: &mut dyn Write,
+    tenant: &str,
+    sig: Signal,
+    family: &str,
+    target: u32,
+    budget_records: u64,
+    report: &FamilyMigrateReport,
+) -> anyhow::Result<()> {
     write!(
         out,
         "{}",
-        migrate_report_text(tenant, sig, &family, target, budget_records, &report)
+        migrate_report_text(tenant, sig, family, target, budget_records, report)
     )?;
 
     if !report.walk_complete {
@@ -2502,10 +2519,10 @@ pub async fn migrate_to(
              persisted cursor (the floor is not raised until the walk drains and the re-audit is \
              clean)."
         )?;
-        return budget_stop_verdict(&report, tenant, sig, &family);
+        return Ok(());
     }
 
-    match report.verification {
+    match &report.verification {
         // The fresh re-audit found nothing below the target, so the run
         // succeeded whatever the walk left listed: another writer carried each
         // such bucket to the target after the walk passed it.
@@ -2586,41 +2603,6 @@ pub async fn migrate_to(
             anyhow::bail!("migrate completed the walk but produced no verification result")
         }
     }
-}
-
-/// The exit verdict of a run that stopped on its budget: an error when it left
-/// any bucket on [`FamilyMigrateReport::reencode_blocked`] or
-/// [`FamilyMigrateReport::not_migrated`]. A `blocked_bucket` line alone does
-/// not make such a run exit nonzero; the run that drains the walk does, through
-/// its re-audit's stragglers.
-fn budget_stop_verdict(
-    report: &FamilyMigrateReport,
-    tenant: &str,
-    signal: Signal,
-    family: &str,
-) -> anyhow::Result<()> {
-    // A writer_disabled bucket is the default state of every bucket the
-    // re-encode exists for, and only a one-way flag clears it; like a
-    // blocked_bucket, it fails the run that drains the walk through the
-    // re-audit's stragglers instead.
-    let reencode_blocked = report
-        .reencode_blocked
-        .iter()
-        .filter(|bucket| !matches!(bucket.reason, ReencodeBlockedReason::WriterDisabled { .. }))
-        .count();
-    let not_migrated = report.not_migrated.len();
-    if reencode_blocked == 0 && not_migrated == 0 {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "migrate left {reencode_blocked} bucket(s) reencode_blocked by contested_overlap or \
-         multiple_records and {not_migrated} \
-         bucket(s) not_migrated in the {family} family for tenant {tenant} signal {signal:?}. \
-         This run stopped on its budget with the cursor past them, so the next run resumes \
-         after them: the not_migrated buckets are retried by the first run after the walk \
-         drains, which starts over from the beginning. The reencode_blocked lines say what \
-         clears each of the others."
-    )
 }
 
 /// `migrate --dry-run`: the read-only re-audit a real run ends with, run before
@@ -3663,20 +3645,10 @@ mod tests {
         assert_eq!(NotMigratedRetry::of(&refused), NotMigratedRetry::NextRun);
     }
 
-    /// A run that stopped on its budget exits nonzero when it left a
-    /// contested_overlap or multiple_records reencode_blocked bucket or a
-    /// not_migrated bucket, says when the not_migrated ones are retried, and
-    /// exits zero when it left none of them. A writer_disabled bucket alone
-    /// does not fail it.
-    ///
-    /// Non-vacuity: replace the body of `budget_stop_verdict` with `Ok(())` and
-    /// the `is_err` assertions fail; drop the `WriterDisabled` filter and the
-    /// writer_disabled `is_ok` assertion fails.
-    #[test]
-    fn a_budget_stop_leaving_unmigrated_buckets_exits_nonzero() {
-        let clean = FamilyMigrateReport::default();
-        assert!(budget_stop_verdict(&clean, "acme", Signal::Logs, "rlog").is_ok());
-
+    /// Each kind of bucket a migrate run can leave below the target without
+    /// raising the floor: one per `reencode_blocked` reason and a
+    /// `not_migrated` claim skip, with the line it prints.
+    fn unmigrated_buckets() -> Vec<(FamilyMigrateReport, &'static str)> {
         let blocked = |reason| FamilyMigrateReport {
             reencode_blocked: vec![ReencodeBlockedBucket {
                 shard: 0,
@@ -3685,36 +3657,113 @@ mod tests {
             }],
             ..FamilyMigrateReport::default()
         };
-        let writer_disabled = blocked(ReencodeBlockedReason::WriterDisabled { below_target: 1 });
-        assert!(
-            budget_stop_verdict(&writer_disabled, "acme", Signal::Logs, "rlog").is_ok(),
-            "a budget stop leaving only writer_disabled buckets exits zero"
-        );
-        let contested = blocked(ReencodeBlockedReason::ContestedOverlap {
-            largest_component: 2,
-        });
-        assert!(budget_stop_verdict(&contested, "acme", Signal::Logs, "rlog").is_err());
-        let multiple = blocked(ReencodeBlockedReason::MultipleRecords { records: 2 });
-        assert!(budget_stop_verdict(&multiple, "acme", Signal::Logs, "rlog").is_err());
-
-        let not_migrated = FamilyMigrateReport {
-            not_migrated: vec![NotMigratedBucket {
-                shard: 0,
-                ingest_hour: 1,
-                path: MigrationPath::Reencode,
-                reason: NotMigratedReason::PublishAbandoned,
-            }],
-            ..FamilyMigrateReport::default()
-        };
-        let err = budget_stop_verdict(&not_migrated, "acme", Signal::Logs, "rlog")
-            .expect_err("a not_migrated bucket exits nonzero")
-            .to_string();
-        assert!(
-            err.contains(
-                "the not_migrated buckets are retried by the first run after the walk drains"
+        vec![
+            (
+                blocked(ReencodeBlockedReason::WriterDisabled { below_target: 1 }),
+                "reencode_blocked: shard=0 hour=1 reason=writer_disabled below_target=1\n",
             ),
-            "{err}"
-        );
+            (
+                blocked(ReencodeBlockedReason::ContestedOverlap {
+                    largest_component: 2,
+                }),
+                "reencode_blocked: shard=0 hour=1 reason=contested_overlap largest_component=2\n",
+            ),
+            (
+                blocked(ReencodeBlockedReason::MultipleRecords { records: 2 }),
+                "reencode_blocked: shard=0 hour=1 reason=multiple_records records=2\n",
+            ),
+            (
+                FamilyMigrateReport {
+                    not_migrated: vec![NotMigratedBucket {
+                        shard: 0,
+                        ingest_hour: 1,
+                        path: MigrationPath::L0Migration,
+                        reason: NotMigratedReason::ClaimSkipped {
+                            reason: ravel_maintain::ClaimSkipReason::HeldByAnother,
+                        },
+                    }],
+                    ..FamilyMigrateReport::default()
+                },
+                "not_migrated: shard=0 hour=1 path=l0_migration reason=claim_skipped \
+                 claim_reason=held_by_another\n",
+            ),
+        ]
+    }
+
+    /// A run that stopped on its budget exits zero for every reason it can
+    /// leave a bucket below the target, and still prints the bucket's line and
+    /// the budget-stop note; a not_migrated bucket also gets the note saying it
+    /// is retried by the first run after the walk drains.
+    ///
+    /// Non-vacuity: make the `if !report.walk_complete` block of
+    /// `migrate_verdict` return an error when `reencode_blocked` holds a
+    /// contested_overlap or multiple_records bucket or `not_migrated` is
+    /// non-empty, as the earlier budget-stop verdict did, and the `expect`
+    /// fails for those three cases.
+    #[test]
+    fn a_budget_stop_exits_zero_and_prints_every_unmigrated_bucket() {
+        for (mut report, line) in unmigrated_buckets() {
+            report.budget_exhausted = true;
+            report.walk_complete = false;
+            let mut out: Vec<u8> = Vec::new();
+            migrate_verdict(&mut out, "acme", Signal::Logs, "rlog", 2, 1, &report)
+                .unwrap_or_else(|err| panic!("a budget stop exits zero for {line}: {err}"));
+            let text = String::from_utf8(out).expect("utf-8 output");
+            assert!(text.contains(line), "{line} missing from:\n{text}");
+            assert!(
+                text.contains("budget exhausted; the walk did not finish."),
+                "{text}"
+            );
+            if !report.not_migrated.is_empty() {
+                assert!(
+                    text.contains(
+                        "they are retried by the first run after the walk drains, which starts \
+                         over from the beginning."
+                    ),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    /// The run that drains the walk exits nonzero for every one of those
+    /// buckets, because the fresh re-audit counts what each still holds below
+    /// the target: a contested_overlap bucket's compaction parts, a
+    /// not_migrated L0 bucket's commit records.
+    ///
+    /// Non-vacuity: return `Ok(())` from the `Verification::Stragglers` arm of
+    /// `migrate_verdict` in place of its `anyhow::bail!` and the `expect_err`
+    /// fails for every case.
+    #[test]
+    fn the_draining_run_exits_nonzero_while_a_bucket_is_left_below_target() {
+        for (mut report, line) in unmigrated_buckets() {
+            report.walk_complete = true;
+            let (l0, l1) = if report.not_migrated.is_empty() {
+                (0, 2)
+            } else {
+                (2, 0)
+            };
+            report.verification = Some(Verification::Stragglers {
+                l0,
+                l1,
+                rewrite_parts: 0,
+                blocked: Vec::new(),
+            });
+            let mut out: Vec<u8> = Vec::new();
+            let err = migrate_verdict(&mut out, "acme", Signal::Logs, "rlog", 2, 0, &report)
+                .expect_err("the draining run fails while a bucket is below target")
+                .to_string();
+            assert!(err.contains("refused to raise the rlog floor"), "{err}");
+            let text = String::from_utf8(out).expect("utf-8 output");
+            assert!(text.contains(line), "{line} missing from:\n{text}");
+            assert!(
+                text.contains(&format!(
+                    "verification: FOUND STRAGGLERS l0_commit_records={l0} \
+                     l1_compaction_parts={l1} rewrite_record_parts=0\n"
+                )),
+                "{text}"
+            );
+        }
     }
 
     /// A `losing_record_parts` bucket prints its line with the exact count and

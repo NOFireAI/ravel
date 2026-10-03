@@ -890,7 +890,10 @@ target on-object format version. One invocation:
 2. stops early and persists the cursor once `--budget-records` is spent (`0`,
    the default, is unlimited; re-run to resume), or, once the walk drains,
    re-audits fresh and raises the floor only if that re-audit finds zero records
-   below the target.
+   below the target. The budget counts records, not requests: the walk reads
+   the compaction and rewrite records of every sealed, un-tombstoned bucket it
+   passes, and a `reencode_blocked` bucket spends none of the budget, so the
+   budget does not bound how many requests one invocation makes.
 
 A refused raise, reported as "FOUND STRAGGLERS", means the fresh re-audit found
 objects that still exist below the target, some of which queries still read. It
@@ -1129,16 +1132,15 @@ When a `not_migrated` bucket is retried depends on how the run ended, and the
   the bucket to the target after the walk passed it, and nothing is left to
   retry.
 
-The exit code follows the same cases. A run that drains the walk exits nonzero
-when the re-audit finds stragglers, which every `blocked_bucket`,
-`reencode_blocked` and unresolved `not_migrated` bucket leaves behind, and
-exits zero when it raises the floor, even with `not_migrated` lines printed. A
-run that stops on its budget exits nonzero when it leaves any `not_migrated`
-bucket or any `reencode_blocked` bucket with reason `contested_overlap` or
-`multiple_records`, and zero otherwise: `blocked_bucket` and
-`reason=writer_disabled` lines alone do not fail it, since a writer_disabled
-bucket is the default state of every bucket the re-encode exists for and the
-run that drains the walk still fails on it through the re-audit.
+The exit code follows how the run ended. A run that stops on its budget exits
+zero, whatever `blocked_bucket`, `reencode_blocked` and `not_migrated` lines it
+printed, so a loop that re-runs `migrate` until the walk drains is not stopped
+by a bucket a later run retries or that only retention clears. The run that
+drains the walk exits nonzero while any bucket is left below the target: every
+`blocked_bucket`, `reencode_blocked` and unresolved `not_migrated` bucket still
+holds parts or records below the target, and the fresh re-audit counts them as
+stragglers. It exits zero when it raises the floor, even with `not_migrated`
+lines printed.
 
 `--dry-run` does not run the walk. It runs the read-only re-audit, prints the
 three below-target figures and any `blocked_bucket` lines, takes no claim,

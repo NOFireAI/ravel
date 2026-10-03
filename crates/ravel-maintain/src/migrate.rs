@@ -112,7 +112,11 @@ const MIGRATE_CURSOR_LEN: usize = 9;
 /// names, for every rewrite that built its parts and then published, converged,
 /// abandoned at its deadline, or stopped at a changed record set. A budget bounds how much one invocation does before
 /// persisting its cursor and returning control, so a large migration runs
-/// across many invocations without a lock or a long-lived process.
+/// across many invocations without a lock or a long-lived process. It does not
+/// bound request cost: the walk reads the compaction and rewrite records of
+/// every sealed, untombstoned bucket it passes, one with no L0 commit record
+/// included, and a
+/// [`FamilyMigrateReport::reencode_blocked`] bucket spends no budget.
 ///
 /// Because the underlying rewrite is bucket-atomic, the budget is a soft cap: an
 /// invocation always finishes the bucket it is in the middle of (it never

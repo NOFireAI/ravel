@@ -1648,9 +1648,9 @@ const RESOLVED_TENANT: &str = "cli-migrate-resolved";
 /// floor rises. The run succeeded: it exits zero and says another writer
 /// carried the bucket to the target.
 ///
-/// Non-vacuity: make the `Verification::FloorRaised` arm of `migrate_to` return
-/// `budget_stop_verdict(&report, tenant, sig, &family)` in place of `Ok(())`
-/// and the `expect` on the result fails; drop the `FloorRaised` arm of
+/// Non-vacuity: make the `Verification::FloorRaised` arm of `migrate_verdict`
+/// return an error when `not_migrated` is non-empty in place of `Ok(())` and
+/// the `expect` on the result fails; drop the `FloorRaised` arm of
 /// `NotMigratedRetry::of` and the exact-report `assert_eq!` fails on the note.
 #[tokio::test]
 async fn migrate_exits_zero_when_another_writer_resolved_a_not_migrated_bucket() {
