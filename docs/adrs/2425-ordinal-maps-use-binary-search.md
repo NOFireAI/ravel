@@ -14,14 +14,19 @@ drop it before their output is finished:
 |---|---|---|
 | `ravel-logseg` `build_object` | `HashMap<LogStreamId, u32>` | one per record |
 | `ravel-logseg` `build_object_columnar` | same | one per row |
-| `ravel-logseg` `ColumnarBatch::from_records`, `ravel-cli` `build_columnar_batch` | same | one per row |
+| `ravel-logseg` `ColumnarLogBatch::from_records`; `services/ravel-cli` `build_columnar_batch` (`src/load/columnar.rs`) | same | one per row |
 | `ravel-segment` `assemble_v4_body_impl` | `HashMap<[u8; 16], u32>` | one per exemplar |
 
 All five share a shape. The key set is complete, sorted and free of duplicates
 before the map is built, the ordinal is the key's position in that sorted
-order, nothing is inserted or removed afterwards, nothing iterates the map, and
-every probe is for a key that is present. All five use the standard library map
-with its default SipHash-1-3 hasher.
+order, nothing is inserted or removed afterwards, and nothing iterates the map.
+All five use the standard library map with its default SipHash-1-3 hasher.
+
+At the four RLOG sites every probe is for a key that well-formed input always
+contains, because the directory is built from the same records or batches the
+probes come from. The RSEG site is different: an exemplar may name a series the
+segment does not carry, and that miss is a defined outcome,
+`WriteError::ExemplarUnknownSeries`.
 
 The Multitable paper (arXiv 2609.39233) describes a hash table that stores
 entries in fixed-size buckets across a cascade of shrinking levels, with a
@@ -74,8 +79,10 @@ identical across all five iterations.
 The largest sample is a lower bound on the true peak, so each share is an
 upper bound.
 
-Both sets of figures were pre-registered on #2425 before their runs and every
-one landed inside its band.
+Both sets of figures were pre-registered on #2425 before their runs. Every
+median landed inside its band. The 1-stream time share was marginal: its band
+was under 0.5%, its median 0.49%, and one of its five runs read 0.55%. The
+memory figures were inside their bands with margin.
 
 The map is therefore neither a time nor a memory bottleneck of RLOG encode. A
 table that cost nothing would move row-path encode time by about 1% and encode
@@ -89,19 +96,31 @@ index at all) and is indistinguishable from the map in time on this corpus.
 
 2. **The five functions resolve an id to its ordinal by binary search over the
    sorted ids they already hold.** The map and its build loop are removed. The
-   sorted directory stays the single authority for ordinal assignment.
+   sorted directory stays the single authority for ordinal assignment. The
+   RSEG site keeps its refusal: a search that misses returns
+   `WriteError::ExemplarUnknownSeries`, as the map lookup did.
 
 3. **`build_object_columnar` stops resolving per row.** Each row already
    carries a batch-local stream ref. The function resolves each batch's stream
    ids once into a batch-local-to-global remap vector and indexes that vector
-   per row.
+   per row. A batch stream id that is absent from the object's directory is a
+   malformed batch and returns a typed error; it is never resolved to a
+   default ref.
 
-4. **Each change is pinned by an output-equality test and a bench.** The
-   encoded bytes must be identical before and after, across a corpus that
-   includes many streams (or series) so a wrong ordinal cannot hide. The
-   crate's existing encode bench is run interleaved against the parent commit
-   and must not be slower beyond run-to-run spread; a site where it is slower
-   keeps its map and says so on its ticket.
+4. **Each change is pinned by an output-equality test; the row path is also
+   pinned by a bench.** The encoded bytes must be identical before and after,
+   across a corpus that includes many streams (or series) in an order that is
+   not id order, so a wrong ordinal cannot hide. Only one of the five paths
+   has a bench that enters it: `logseg_encode` drives `RlogWriter::push` and
+   `finish`, which is `build_object`. That bench is run interleaved against
+   the parent commit and must not be slower beyond run-to-run spread. The
+   other four have nothing that can run that check: no criterion bench under
+   `crates/ravel-logseg/benches` calls `push_columnar` or `from_records`, the
+   `columnar_load` harness in `ravel-bench` enters the columnar writer with a
+   single stream (where there is nothing to search), `segment_encode` feeds no
+   exemplars, and `services/ravel-cli` has no bench target. Those four
+   changes are gated by output equality alone and their time cost is accepted
+   unmeasured (see Consequences).
 
 5. **Query-side maps get their own measurement before any design.** PromQL
    grouping and vector matching hold large variable-length keys and have
@@ -140,8 +159,10 @@ flowchart LR
   ordinals in the slots, a spill list so a build could not fail. It lost to
   the measurements. Its ceiling is about 1% of encode time and it would still
   allocate 5 bytes per key where a binary search allocates none. The paper's
-  advantage is in negative lookups and SIMD filter scans; these sites have no
-  negative lookups, and the workspace has no `unsafe` to write intrinsics with.
+  advantage is in negative lookups and SIMD filter scans. The four RLOG sites
+  have no negative lookups on well-formed input; the RSEG exemplar site has
+  them only on the error path, where the write is refused and speed does not
+  matter. The workspace has no `unsafe` to write intrinsics with.
 - **Keep the standard map and swap the hasher.** Likely recovers most of the
   probe time, which is 14 to 23 ns per probe and nearly flat across
   cardinality. It keeps the allocation, and the time it would recover is
@@ -157,9 +178,13 @@ flowchart LR
   20,000 streams on the row path today). No measurable change in encode time
   is expected or claimed on the row path.
 - A binary search costs time that grows with the logarithm of the key count,
-  where a map's probe does not. The time measurement covers the row path up to
-  20,000 streams per object. Decision 4's bench is what covers the other sites
-  and any shape where that growth would show.
+  where a map's probe does not. The time measurement and decision 4's bench
+  cover the row path up to 20,000 streams per object. The other four changes
+  have no bench. Their exposure is bounded by how often they search: the
+  columnar writer searches once per stream per batch, not per row; the two
+  batch builders search once per row, the same count the row path was
+  measured at; and the RSEG writer searches once per exemplar. A shape where
+  that growth shows would need a bench arm that does not exist today.
 - Encoded objects do not change.
 - No workspace member and no dependency is added.
 - The Multitable paper and both measurement branches stay as reference
