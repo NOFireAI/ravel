@@ -18,10 +18,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_commit::keys::{
-    commit_key, compaction_record_key, data_key, del_prefix, erasure_completion_key,
-    erasure_request_key, l1_part_key, maint_cursor_key, retention_tombstone_key,
-    rewrite_record_key,
+    commit_key, commit_shard_hour_prefix, commit_shard_prefix, compaction_record_key, data_key,
+    del_prefix, erasure_completion_key, erasure_request_key, l1_part_key, maint_cursor_key,
+    retention_tombstone_key, rewrite_record_key,
 };
+use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
 use ravel_fleet::query_workers::{QUERY_WORKERS_PREFIX, query_worker_key};
 use ravel_fleet::worker_set::heartbeat_key;
 use ravel_object_store::external::probe::PROBE_PREFIX;
@@ -350,7 +351,9 @@ fn constructor_free_tenant_witness_keys() -> Vec<String> {
             "t/{hash}/catalog/{prefix}/snap/0000000000000000.csnap"
         ));
         keys.push(format!("t/{hash}/catalog/{prefix}/idx/name-postings"));
-        keys.push(format!("t/{hash}/{prefix}/prov"));
+        // A full-width tenant hash: the provisioning-record write grants spell
+        // the tenant segment as exactly 32 single-character wildcards.
+        keys.push(format!("t/{}/{prefix}/prov", test_tenant().to_hex()));
         keys.push(format!("t/{hash}/{prefix}/idem/{hash}"));
         keys.push(format!("t/{hash}/{prefix}/admission/writer-0"));
     }
@@ -511,9 +514,9 @@ const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
 /// every other character is literal. This handles both, so a `?` smuggled into
 /// any of those fields is resolved as the wildcard IAM treats it as instead of
 /// being escaped to a literal `\?` that quietly matches nothing. The shipped
-/// templates carry a `?` in exactly two places, gateway's
-/// `GatewayAdmissionDelete` Resource and query's `QueryManifestCreate`
-/// Resource, and in no Action and no `s3:prefix`;
+/// templates carry a `?` only in the Resources of gateway's
+/// `GatewayAdmissionDelete`, query's `QueryManifestCreate` and the five
+/// provisioning-record write statements, and in no Action and no `s3:prefix`;
 /// `every_shipped_template_passes_the_choke_point` asserts that (not assumes
 /// it) over Action, Resource, and the `s3:prefix` values it reads through
 /// `list_prefix_patterns`.
@@ -731,8 +734,8 @@ struct Policy {
 /// Effect, Action, and Resource are read directly (see `statement_actions`,
 /// `statement_resources`, `key_patterns_for`, `kms_statement_resources`, ...);
 /// Condition is read for the `s3:prefix` ListBucket block
-/// (`list_prefix_patterns`) and for the create-only PutObject block
-/// (`create_only_put_patterns`). Nothing else is examined by any guard.
+/// (`list_prefix_patterns`) and for the create-only and CAS-only PutObject
+/// blocks (`conditioned_put_patterns`). Nothing else is examined by any guard.
 ///
 /// This list is the guard's contract: a statement carrying any key outside it
 /// is one no guard reasons about, so it must fail closed at `load_policy`
@@ -741,8 +744,8 @@ const HANDLED_STATEMENT_KEYS: &[&str] = &["Sid", "Effect", "Action", "Resource",
 
 /// The complete set of `Condition` operators any guard in this file reads on a
 /// list statement: `list_prefix_patterns` reads only its `StringLike` block.
-/// (The create-only PutObject Condition has its own one-shape check,
-/// `validate_create_only_put_condition`.) A list statement whose Condition
+/// (The conditioned PutObject Conditions have their own exact-shape check,
+/// `validate_put_condition`.) A list statement whose Condition
 /// names any other operator -- a different comparison such as `StringNotLike`,
 /// or a set-qualified form such as `ForAnyValue:StringLike` -- carries a
 /// constraint no guard reasons about, so it must fail closed at
@@ -760,11 +763,29 @@ const HANDLED_CONDITION_KEYS: &[&str] = &["s3:prefix"];
 /// `If-None-Match: *` header. S3 evaluates `s3:if-none-match` on PutObject, and
 /// a PUT without the header has no value for the key, so `StringEquals` fails
 /// and the PUT is refused: the statement grants create and never overwrite.
-/// `create_only_put_patterns` reads it; any other operator, key, value, Effect
-/// or Action set fails closed in `validate_create_only_put_condition`.
+/// `conditioned_put_patterns` reads it; any other operator, key, value, Effect
+/// or Action set fails closed in `validate_put_condition`.
 const CREATE_ONLY_CONDITION_OPERATOR: &str = "StringEquals";
 const CREATE_ONLY_CONDITION_KEY: &str = "s3:if-none-match";
 const CREATE_ONLY_CONDITION_VALUE: &str = "*";
+
+/// The second Condition shape a PutObject-only `Allow` may carry: the request
+/// must send an `If-Match` header. `PutMode::CasVersion` is sent as `If-Match:
+/// <etag>`, so the statement grants a compare-and-swap and never a create or an
+/// unconditional overwrite (checked against AWS on 2026-10-03). `"true"` would
+/// invert it into "only PUTs without If-Match", so the value is pinned too.
+const CAS_ONLY_CONDITION_OPERATOR: &str = "Null";
+const CAS_ONLY_CONDITION_KEY: &str = "s3:if-match";
+const CAS_ONLY_CONDITION_VALUE: &str = "false";
+
+/// The conditional write a PutObject-only `Allow` statement's Condition admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PutCondition {
+    /// `{"StringEquals": {"s3:if-none-match": "*"}}`: `PutMode::CreateIfAbsent`.
+    CreateOnly,
+    /// `{"Null": {"s3:if-match": "false"}}`: `PutMode::CasVersion`.
+    CasOnly,
+}
 
 /// Keys that describe a statement shape these guards deliberately cannot
 /// reason about: `NotAction`/`NotResource` invert the set the Action/Resource
@@ -806,9 +827,10 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 ///   an object prefix) is accepted because both classes are granted;
 /// - a `Condition` on a list statement, whose sub-shape is the one
 ///   `StringLike`/`s3:prefix` block `list_prefix_patterns` reads; on any other
-///   statement, no `Condition` unless it is the create-only PutObject shape
-///   `create_only_put_patterns` reads (an `Allow` granting exactly
-///   `s3:PutObject`, conditioned on `StringEquals` `s3:if-none-match` `*`).
+///   statement, no `Condition` unless it is one of the two PutObject shapes
+///   `conditioned_put_patterns` reads (an `Allow` granting exactly
+///   `s3:PutObject`, conditioned on `StringEquals` `s3:if-none-match` `*` or
+///   on `Null` `s3:if-match` `false`).
 ///
 /// A helper downstream therefore cannot meet a shape it does not understand.
 /// `object_key_patterns` matches all four `ResourceShape` variants:
@@ -901,7 +923,7 @@ const NEGATED_OR_PRINCIPAL_KEYS: &[&str] =
 /// - a Condition whose presence does not track the ListBucket action: a
 ///   ListBucket statement with no Condition (an unconstrained bucket-wide list),
 ///   or a Condition on any non-ListBucket statement (read by no guard) other
-///   than the exact create-only PutObject shape;
+///   than the exact create-only or CAS-only PutObject shape;
 /// - a `Condition` whose sub-shape is anything other than the one block a guard
 ///   reads: it must be a non-empty JSON object of handled operators
 ///   (`HANDLED_CONDITION_OPERATORS`, today `StringLike`), each a non-empty map of
@@ -1002,12 +1024,12 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
     validate_actions_and_resources(role, sid, index, effect, &actions, &resources)?;
 
     // Two guards read a Condition: `list_prefix_patterns`, on a statement
-    // whose Action grants s3:ListBucket, and `create_only_put_patterns`, on an
+    // whose Action grants s3:ListBucket, and `conditioned_put_patterns`, on an
     // Allow whose every Action is exactly s3:PutObject. So:
     //  - a list statement MUST carry a Condition (an unconstrained bucket-wide
     //    list is rejected, exactly like a missing Resource);
     //  - a PutObject-only statement may carry one, and only the create-only
-    //    shape `validate_create_only_put_condition` accepts; and
+    //    or CAS-only shape `validate_put_condition` accepts; and
     //  - any other statement must carry NONE (a Condition there is read by no
     //    guard: a StringLike/s3:prefix on the protected-delete Deny would pass
     //    validation while, in AWS, a DeleteObject request carries no s3:prefix
@@ -1022,12 +1044,13 @@ fn validate_statement(role: &str, index: usize, stmt: &serde_json::Value) -> Res
             if grants_list {
                 validate_condition(role, sid, index, effect, condition)?;
             } else if is_put_object_only(&actions) {
-                validate_create_only_put_condition(role, sid, index, effect, condition)?;
+                validate_put_condition(role, sid, index, effect, condition)?;
             } else {
                 return Err(format!(
                     "{role}/{sid} (statement #{index}): statement carries a Condition but \
                      its Action does not include s3:ListBucket -- only the ListBucket \
-                     s3:prefix Condition and the create-only s3:PutObject Condition are \
+                     s3:prefix Condition and the create-only and CAS-only s3:PutObject \
+                     Conditions are \
                      read by any guard, so a Condition on any other statement sits \
                      unexamined and must fail closed"
                 ));
@@ -1302,31 +1325,51 @@ fn validate_condition(
 }
 
 /// True when every action names exactly `s3:PutObject`. A wildcard that also
-/// grants it (`s3:Put*`, `s3:*`) is not this shape: the create-only Condition
-/// would then also gate operations no guard here reads it for.
+/// grants it (`s3:Put*`, `s3:*`) is not this shape: a conditioned-write
+/// Condition would then also gate operations no guard here reads it for.
 fn is_put_object_only(actions: &[String]) -> bool {
     actions
         .iter()
         .all(|a| a.eq_ignore_ascii_case("s3:PutObject"))
 }
 
-/// Validate the create-only PutObject Condition: an `Allow` whose Condition is
-/// exactly `{"StringEquals": {"s3:if-none-match": "*"}}` (the value as a bare
-/// string or a one-element array). On a `Deny` the same Condition would
-/// withdraw only the creates and leave overwrites standing, which no guard
-/// reads, so it is refused; so is every other operator, key, or value.
-fn validate_create_only_put_condition(
+/// Validate a PutObject-only statement's Condition: an `Allow` whose Condition
+/// is exactly `{"StringEquals": {"s3:if-none-match": "*"}}` (create-only) or
+/// exactly `{"Null": {"s3:if-match": "false"}}` (CAS-only), the value as a bare
+/// string or a one-element array. A Condition whose one operator is `Null` is
+/// held to the CAS-only shape; every other Condition is held to the create-only
+/// shape, so a refusal names what differs from it. On a `Deny` either Condition
+/// would withdraw one kind of write and leave the others standing, which no
+/// guard reads, so it is refused; so is every other operator, key, or value.
+fn validate_put_condition(
     role: &str,
     sid: &str,
     index: usize,
     effect: &str,
     condition: &serde_json::Value,
 ) -> Result<(), String> {
+    let cas = condition
+        .as_object()
+        .is_some_and(|c| c.len() == 1 && c.contains_key(CAS_ONLY_CONDITION_OPERATOR));
+    let (shape, operator, cond_key, expected) = if cas {
+        (
+            "CAS-only",
+            CAS_ONLY_CONDITION_OPERATOR,
+            CAS_ONLY_CONDITION_KEY,
+            CAS_ONLY_CONDITION_VALUE,
+        )
+    } else {
+        (
+            "create-only",
+            CREATE_ONLY_CONDITION_OPERATOR,
+            CREATE_ONLY_CONDITION_KEY,
+            CREATE_ONLY_CONDITION_VALUE,
+        )
+    };
     let refuse = |why: &str| {
         Err(format!(
             "{role}/{sid} (statement #{index}): s3:PutObject Condition {condition} is not \
-             the create-only shape {{\"{CREATE_ONLY_CONDITION_OPERATOR}\": \
-             {{\"{CREATE_ONLY_CONDITION_KEY}\": \"{CREATE_ONLY_CONDITION_VALUE}\"}}}} on an \
+             the {shape} shape {{\"{operator}\": {{\"{cond_key}\": \"{expected}\"}}}} on an \
              Allow: {why}"
         ))
     };
@@ -1339,39 +1382,77 @@ fn validate_create_only_put_condition(
     if cond_obj.len() != 1 {
         return refuse("it must name exactly one operator");
     }
-    let Some(keys) = cond_obj
-        .get(CREATE_ONLY_CONDITION_OPERATOR)
-        .and_then(|k| k.as_object())
-    else {
-        return refuse("its operator is not StringEquals over a JSON object");
+    let Some(keys) = cond_obj.get(operator).and_then(|k| k.as_object()) else {
+        return refuse(&format!(
+            "its operator is not {operator} over a JSON object"
+        ));
     };
     if keys.len() != 1 {
         return refuse("it must name exactly one condition key");
     }
-    let Some(value) = keys.get(CREATE_ONLY_CONDITION_KEY) else {
-        return refuse("its condition key is not s3:if-none-match");
+    let Some(value) = keys.get(cond_key) else {
+        return refuse(&format!("its condition key is not {cond_key}"));
     };
-    if !is_string_or_string_array(Some(value))
-        || condition_value_strings(value) != [CREATE_ONLY_CONDITION_VALUE]
-    {
-        return refuse("its value is not exactly \"*\"");
+    if !is_string_or_string_array(Some(value)) || condition_value_strings(value) != [expected] {
+        return refuse(&format!("its value is not exactly \"{expected}\""));
     }
     Ok(())
 }
 
+/// The conditioned write an `Allow` PutObject-only statement grants, or `None`
+/// for any other statement. The choke point admits a Condition on such a
+/// statement in the two `validate_put_condition` shapes alone, so the `Null`
+/// operator is what tells them apart.
+fn put_condition_of(stmt: &serde_json::Value) -> Option<PutCondition> {
+    let allow = stmt["Effect"]
+        .as_str()
+        .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
+    if !allow || !is_put_object_only(&statement_actions(stmt)) {
+        return None;
+    }
+    let condition = stmt.get("Condition")?;
+    if condition.get(CAS_ONLY_CONDITION_OPERATOR).is_some() {
+        Some(PutCondition::CasOnly)
+    } else {
+        Some(PutCondition::CreateOnly)
+    }
+}
+
 /// Bucket-relative key patterns from every `Allow` PutObject statement carrying
-/// the create-only Condition. The choke point admits a Condition on a
-/// PutObject-only statement in that one shape alone, so a Condition's presence
-/// on such a statement is what selects it.
+/// the `kind` Condition.
+fn conditioned_put_patterns(policy: &Policy, kind: PutCondition) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        if put_condition_of(stmt) != Some(kind) {
+            continue;
+        }
+        out.extend(object_key_patterns(
+            policy.role,
+            statement_sid(stmt),
+            &statement_resources(stmt),
+        ));
+    }
+    out
+}
+
+/// Bucket-relative key patterns from every `Allow` PutObject statement carrying
+/// the create-only Condition.
 fn create_only_put_patterns(policy: &Policy) -> Vec<String> {
+    conditioned_put_patterns(policy, PutCondition::CreateOnly)
+}
+
+/// Bucket-relative key patterns from every `Allow` statement that grants
+/// `s3:PutObject` with neither conditioned-write Condition, so the PUTs it
+/// allows include an unconditional overwrite.
+fn unconditioned_put_patterns(policy: &Policy) -> Vec<String> {
     let mut out = Vec::new();
     for stmt in policy_statements(policy) {
         let allow = stmt["Effect"]
             .as_str()
             .is_some_and(|e| e.eq_ignore_ascii_case("Allow"));
         if !allow
-            || stmt.get("Condition").is_none()
-            || !is_put_object_only(&statement_actions(stmt))
+            || !any_action_grants_any(&statement_actions(stmt), &["s3:PutObject"])
+            || put_condition_of(stmt).is_some()
         {
             continue;
         }
@@ -2156,7 +2237,6 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/*/idem/*",
             "t/*/*/admission/*",
-            "t/*/*/prov",
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/HEAD",
             "t/*/catalog/*/idx/*",
@@ -2164,8 +2244,13 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/t/*",
             "t/*/enc",
             "t/*/m/meta",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
         ],
-        put_actions: &["s3:PutObject"],
+        // One entry per statement: GatewayWrite, then the create-only
+        // GatewayProvCreate (prov_put_grants_carry_exactly_the_expected_conditions).
+        put_actions: &["s3:PutObject", "s3:PutObject"],
         deletes: &["t/????????????????????????????????/?/admission/*"],
         delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
@@ -2235,6 +2320,9 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/pq-probe/*",
             "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
         ],
+        // QueryWrite, then QueryManifestCreate. No provisioning write: a query
+        // process checks a present record at startup and never adopts
+        // (query_template_writes_no_provisioning_record).
         put_actions: &["s3:PutObject", "s3:PutObject"],
         deletes: &["sys/pq-probe/*"],
         delete_actions: &["s3:DeleteObject"],
@@ -2396,8 +2484,17 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "t/*/catalog/*/HEAD",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
         ],
-        put_actions: &["s3:PutObject"],
+        // MaintainWrite, then MaintainProvCreate (create-only, the maintain
+        // tick's adopt) and MaintainProvCas (CAS-only, the maintain migrate
+        // floor raise): every_prov_write_call_site_has_a_grant_of_its_kind.
+        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
         deletes: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -2445,15 +2542,22 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualify/*",
             "sys/gc",
             "sys/auth",
-            "t/*/*/prov",
             "t/*/*/c/*",
             "t/*/u/*",
             "t/*/*/del/*.dreq",
             "t/*/config",
             "t/*/pq/grants",
             "sys/pq-probe/*",
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
+            PROV_M_PATTERN,
+            PROV_L_PATTERN,
+            PROV_S_PATTERN,
         ],
-        put_actions: &["s3:PutObject"],
+        // AdminWrite, then AdminProvCreate (create-only, provision adopt) and
+        // AdminProvCas (CAS-only, provision reshard).
+        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
         deletes: ADMIN_SCRATCH_DELETES,
         // Narrower than the Deny, which names both operations. Legitimate, and
         // the reason the overlap property is asserted as containment rather than
@@ -2901,7 +3005,7 @@ fn all_signals_is_exhaustive_and_witnessed() {
         let prefix = signal.key_prefix();
         for shape in [
             format!("t/{hash}/catalog/{prefix}/HEAD"),
-            format!("t/{hash}/{prefix}/prov"),
+            format!("t/{}/{prefix}/prov", test_tenant().to_hex()),
             format!("t/{hash}/{prefix}/idem/{hash}"),
             format!("t/{hash}/{prefix}/admission/writer-0"),
         ] {
@@ -5216,7 +5320,7 @@ fn query_manifest_write_is_create_only() {
 #[test]
 fn query_manifest_create_grant_reaches_only_manifest_keys() {
     let query = load_policy("query");
-    let create_only = create_only_put_patterns(&query);
+    let create_only: Vec<String> = create_only_put_patterns(&query);
     assert_eq!(
         create_only,
         ["t/????????????????????????????????/pq/t/*/v/????????????????????.pqm"],
@@ -5398,6 +5502,613 @@ fn create_only_put_condition_shape_fails_closed_on_every_variant() {
         assert!(
             err.contains("its operator is not StringEquals"),
             "{name}: must be refused by the operator check; got {err:?}"
+        );
+    }
+}
+
+/// The CAS-only Condition passes the choke point in its one exact shape and
+/// every variant fails closed. `"true"` is the dangerous one: it admits only a
+/// PUT that sends no `If-Match`, which is every unconditional overwrite.
+#[test]
+fn cas_only_put_condition_shape_fails_closed_on_every_variant() {
+    let stmt = |effect: &str, action: serde_json::Value, condition: serde_json::Value| {
+        serde_json::json!({
+            "Sid": "CasOnly",
+            "Effect": effect,
+            "Action": action,
+            "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+            "Condition": condition,
+        })
+    };
+    let good = serde_json::json!({"Null": {"s3:if-match": "false"}});
+    let put = serde_json::json!("s3:PutObject");
+    for ok in [
+        stmt("Allow", put.clone(), good.clone()),
+        stmt(
+            "Allow",
+            serde_json::json!(["s3:PutObject"]),
+            serde_json::json!({"Null": {"s3:if-match": ["false"]}}),
+        ),
+    ] {
+        assert!(
+            validate_statement("fixture", 0, &ok).is_ok(),
+            "the CAS-only shape must pass: {ok}"
+        );
+        assert_eq!(put_condition_of(&ok), Some(PutCondition::CasOnly));
+    }
+
+    let cases = [
+        (
+            "true value",
+            serde_json::json!({"Null": {"s3:if-match": "true"}}),
+            "its value is not exactly \"false\"",
+        ),
+        (
+            "two values",
+            serde_json::json!({"Null": {"s3:if-match": ["false", "true"]}}),
+            "its value is not exactly \"false\"",
+        ),
+        (
+            "if-none-match key",
+            serde_json::json!({"Null": {"s3:if-none-match": "false"}}),
+            "its condition key is not s3:if-match",
+        ),
+        (
+            "extra key",
+            serde_json::json!({"Null": {"s3:if-match": "false", "aws:SourceIp": "false"}}),
+            "it must name exactly one condition key",
+        ),
+        (
+            "StringLike operator",
+            serde_json::json!({"StringLike": {"s3:if-match": "*"}}),
+            "its operator is not StringEquals",
+        ),
+        (
+            "extra operator",
+            serde_json::json!({
+                "Null": {"s3:if-match": "false"},
+                "StringEquals": {"s3:if-none-match": "*"}
+            }),
+            "it must name exactly one operator",
+        ),
+    ];
+    for (name, condition, why) in &cases {
+        let case = stmt("Allow", put.clone(), condition.clone());
+        let err = validate_statement("fixture", 0, &case)
+            .expect_err(&format!("validate_statement must reject the {name} case"));
+        assert!(
+            err.contains("CasOnly") && err.contains(why),
+            "{name}: rejection must name the Sid and say {why:?}; got {err:?}"
+        );
+    }
+    for (name, case) in [
+        ("on a Deny", stmt("Deny", put.clone(), good.clone())),
+        (
+            "wildcard action",
+            stmt("Allow", serde_json::json!("s3:Put*"), good.clone()),
+        ),
+        (
+            "mixed actions",
+            stmt(
+                "Allow",
+                serde_json::json!(["s3:PutObject", "s3:GetObject"]),
+                good.clone(),
+            ),
+        ),
+    ] {
+        validate_statement("fixture", 0, &case)
+            .expect_err(&format!("validate_statement must reject the {name} case"));
+    }
+}
+
+/// The signals with a provisioning record: `PROVISIONED_SIGNALS` in
+/// `services/ravel-server/src/provisioning.rs`, which the `ravel-cli` provision
+/// and migrate signal arguments match.
+const PROVISIONED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+
+/// The provisioning record's key, `t/<hash>/<signal>/prov`
+/// (`provisioning_key` in `crates/ravel-catalog/src/provisioning.rs`, which
+/// this crate cannot depend on), for each provisioned signal.
+fn prov_witness_keys() -> Vec<String> {
+    let hash = test_tenant().to_hex();
+    PROVISIONED_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{hash}/{}/prov", signal.key_prefix()))
+        .collect()
+}
+
+/// The resources every provisioning-record write statement names, one per
+/// provisioned signal. The tenant hash is 32 single-character wildcards because
+/// IAM's `*` crosses `/`: `t/*/*/prov` would also reach a nested key ending in
+/// `/prov` and the `prov` key of a signal that has no record.
+const PROV_M_PATTERN: &str = "t/????????????????????????????????/m/prov";
+const PROV_L_PATTERN: &str = "t/????????????????????????????????/l/prov";
+const PROV_S_PATTERN: &str = "t/????????????????????????????????/s/prov";
+const PROV_PATTERNS: [&str; 3] = [PROV_M_PATTERN, PROV_L_PATTERN, PROV_S_PATTERN];
+
+/// Keys ending in `/prov` that are not a provisioning record: nested keys under
+/// `c/`, `del/` and `l0/` of a provisioned signal, a provisioned signal's
+/// `prov` key under a tenant segment one character narrower (31) or wider (33)
+/// than a tenant hash, and the `prov` key of every signal that has no record.
+/// No provisioning-record grant may reach one.
+fn prov_lookalike_keys() -> Vec<String> {
+    let hash = test_tenant().to_hex();
+    let narrow = &hash[..hash.len() - 1];
+    let wide = format!("{hash}0");
+    assert_eq!((narrow.len(), wide.len()), (31, 33));
+    let mut keys = Vec::new();
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        keys.push(format!("t/{hash}/{sig}/c/0000/20260101T00/prov"));
+        keys.push(format!("t/{hash}/{sig}/del/prov"));
+        keys.push(format!("t/{hash}/{sig}/l0/0000/prov"));
+        keys.push(format!("t/{narrow}/{sig}/prov"));
+        keys.push(format!("t/{wide}/{sig}/prov"));
+    }
+    for signal in ALL_SIGNALS {
+        if !PROVISIONED_SIGNALS.contains(&signal) {
+            keys.push(format!("t/{hash}/{}/prov", signal.key_prefix()));
+        }
+    }
+    keys
+}
+
+/// The three record patterns are the provisioned signals' key prefixes under a
+/// tenant segment exactly as wide as a tenant hash, and the lookalikes name
+/// every signal without a record.
+#[test]
+fn prov_patterns_follow_the_provisioned_signals() {
+    let width = test_tenant().to_hex().len();
+    let expected: Vec<String> = PROVISIONED_SIGNALS
+        .iter()
+        .map(|signal| format!("t/{}/{}/prov", "?".repeat(width), signal.key_prefix()))
+        .collect();
+    assert_eq!(PROV_PATTERNS.to_vec(), expected);
+    // The 31- and 33-character lookalikes are live: a pattern one `?` narrower
+    // or wider reaches them, so only the width of `PROV_PATTERNS` keeps them out.
+    let hash = test_tenant().to_hex();
+    for (width, key) in [
+        (width - 1, format!("t/{}/m/prov", &hash[..width - 1])),
+        (width + 1, format!("t/{hash}0/m/prov")),
+    ] {
+        let pattern = format!("t/{}/m/prov", "?".repeat(width));
+        assert!(glob_matches(&pattern, &key), "{pattern} reaches {key}");
+        assert!(
+            !glob_matches(PROV_M_PATTERN, &key),
+            "{PROV_M_PATTERN} reaches {key}"
+        );
+        assert!(prov_lookalike_keys().contains(&key), "{key} is a lookalike");
+    }
+    let unprovisioned: Vec<&str> = ALL_SIGNALS
+        .iter()
+        .filter(|s| !PROVISIONED_SIGNALS.contains(s))
+        .map(|s| s.key_prefix())
+        .collect();
+    assert_eq!(unprovisioned, ["p", "a", "u"]);
+}
+
+/// Every production write of the provisioning record, the role whose
+/// credential issues it, and the conditional write it sends. Writes go through
+/// three functions in `crates/ravel-catalog/src/provisioning.rs`:
+/// `write_record_race_safe` (`PutMode::CreateIfAbsent`, reached from
+/// `validate_or_adopt` under `CreateFromConfig` or `AdoptIfData`),
+/// `append_generation` and `raise_format_floor` (both `PutMode::CasVersion`).
+/// No production path writes the record unconditionally. A `query` process
+/// runs the startup check under `RefuseIfCommittedDataHidden`
+/// (`static_absent_policy`), which never writes, and is not a caller.
+const PROV_WRITE_CALL_SITES: &[(&str, &str, PutCondition)] = &[
+    (
+        "ProvisioningRecordWriter::ensure (services/ravel-server/src/provisioning.rs), \
+         validate_or_adopt CreateFromConfig on a tenant's first ingest write",
+        "gateway",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "validate_static_provisioning (services/ravel-server/src/provisioning.rs, \
+         called from main.rs at startup), validate_or_adopt AdoptIfData in gateway \
+         and all mode",
+        "gateway",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "validate_static_provisioning at startup, AdoptIfData in maintain mode",
+        "maintain",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "the maintain tick (services/ravel-server/src/maintain.rs), validate_or_adopt \
+         AdoptIfData per tenant and signal",
+        "maintain",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "ravel-cli maintain migrate, raise_format_floor after a clean re-audit \
+         (crates/ravel-maintain/src/migrate.rs)",
+        "maintain",
+        PutCondition::CasOnly,
+    ),
+    (
+        "ravel-cli provision adopt, validate_or_adopt AdoptIfData",
+        "admin",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "ravel-cli provision reshard, append_generation",
+        "admin",
+        PutCondition::CasOnly,
+    ),
+];
+
+/// Per role, the conditions of the statements that write the provisioning
+/// record, as a multiset: template order is not asserted.
+const EXPECTED_PROV_PUT_CONDITIONS: &[(&str, &[PutCondition])] = &[
+    ("gateway", &[PutCondition::CreateOnly]),
+    ("query", &[]),
+    (
+        "maintain",
+        &[PutCondition::CreateOnly, PutCondition::CasOnly],
+    ),
+    ("admin", &[PutCondition::CreateOnly, PutCondition::CasOnly]),
+];
+
+/// Every conditioned PutObject statement in `policy` that reaches a
+/// provisioning record: its Sid, its condition and its key patterns.
+fn prov_put_statements(policy: &Policy) -> Vec<(String, PutCondition, Vec<String>)> {
+    let keys = prov_witness_keys();
+    let mut out = Vec::new();
+    for stmt in policy_statements(policy) {
+        let Some(kind) = put_condition_of(stmt) else {
+            continue;
+        };
+        let patterns =
+            object_key_patterns(policy.role, statement_sid(stmt), &statement_resources(stmt));
+        if keys
+            .iter()
+            .any(|k| patterns.iter().any(|p| glob_matches(p, k)))
+        {
+            out.push((statement_sid(stmt).to_string(), kind, patterns));
+        }
+    }
+    out
+}
+
+/// Each `(Sid, key)` where a provisioning-record write statement in `policy`
+/// reaches a key in `prov_lookalike_keys()`.
+fn prov_grant_overreach(policy: &Policy) -> Vec<(String, String)> {
+    let lookalikes = prov_lookalike_keys();
+    let mut out = Vec::new();
+    for (sid, _, patterns) in prov_put_statements(policy) {
+        for key in &lookalikes {
+            if patterns.iter().any(|p| glob_matches(p, key)) {
+                out.push((sid.clone(), key.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// Every role writes the provisioning record only through conditioned
+/// statements naming exactly `PROV_PATTERNS`, carrying exactly the conditions
+/// `EXPECTED_PROV_PUT_CONDITIONS` lists in any statement order, and keeps its
+/// deny-delete on it. An unconditioned PutObject reaching the record would let
+/// a compromised credential overwrite or replace any tenant's shard generations
+/// and format floors outright, where CAS-only still has to name the current
+/// version.
+#[test]
+fn prov_put_grants_carry_exactly_the_expected_conditions() {
+    let mut roles: Vec<&str> = EXPECTED_PROV_PUT_CONDITIONS
+        .iter()
+        .map(|(r, _)| *r)
+        .collect();
+    roles.sort_unstable();
+    let mut all_roles: Vec<&str> = ALL_ROLES.to_vec();
+    all_roles.sort_unstable();
+    assert_eq!(
+        roles, all_roles,
+        "one EXPECTED_PROV_PUT_CONDITIONS row per role"
+    );
+
+    let keys = prov_witness_keys();
+    let mut expected_patterns: Vec<&str> = PROV_PATTERNS.to_vec();
+    expected_patterns.sort_unstable();
+    for (role, expected) in EXPECTED_PROV_PUT_CONDITIONS {
+        let policy = load_policy(role);
+        let unconditioned = unconditioned_put_patterns(&policy);
+        for key in &keys {
+            assert!(
+                !unconditioned.iter().any(|p| glob_matches(p, key)),
+                "{role}: an unconditioned PutObject Allow reaches the provisioning \
+                 record {key:?}; every prov write must be create-only or CAS-only. \
+                 Unconditioned patterns: {unconditioned:?}"
+            );
+        }
+
+        let mut conditions = Vec::new();
+        for (sid, kind, mut patterns) in prov_put_statements(&policy) {
+            patterns.sort_unstable();
+            assert_eq!(
+                patterns, expected_patterns,
+                "{role}/{sid}: a conditioned prov statement must name the three \
+                 provisioning record patterns and nothing else"
+            );
+            conditions.push(kind);
+        }
+        conditions.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            conditions, expected,
+            "{role}: the conditioned PutObject statements reaching the provisioning \
+             record are not the expected set"
+        );
+
+        let protected = delete_key_patterns(&policy, "Deny");
+        for key in &keys {
+            assert!(
+                protected.iter().any(|p| glob_matches(p, key)),
+                "{role}: DenyDeleteProtected no longer covers {key:?}"
+            );
+        }
+    }
+}
+
+/// The provisioning-record grants reach the metrics, logs and spans records
+/// and no other key ending in `/prov`: not a nested key under `c/`, `del/` or
+/// `l0/`, and not the `prov` key of alerts, audit or profiles. Fails when any
+/// prov statement is widened back to `t/*/*/prov`
+/// (`a_prov_grant_widened_to_any_signal_reaches_the_lookalikes`).
+#[test]
+fn prov_grants_reach_only_the_provisioned_signals_records() {
+    for role in ALL_ROLES {
+        let policy = load_policy(role);
+        let statements = prov_put_statements(&policy);
+        for (sid, _, patterns) in &statements {
+            for key in prov_witness_keys() {
+                assert!(
+                    patterns.iter().any(|p| glob_matches(p, &key)),
+                    "{role}/{sid}: does not reach the provisioning record {key:?}"
+                );
+            }
+        }
+        let overreach = prov_grant_overreach(&policy);
+        assert!(
+            overreach.is_empty(),
+            "{role}: a provisioning-record grant reaches keys that are not a \
+             provisioning record: {overreach:?}"
+        );
+    }
+}
+
+/// The negative witnesses are live: widening one shipped prov statement to
+/// `t/*/*/prov` makes every lookalike reachable. In-memory; the file on disk
+/// is untouched.
+#[test]
+fn a_prov_grant_widened_to_any_signal_reaches_the_lookalikes() {
+    let path = policy_json_path("maintain");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let target = json["Statement"]
+        .as_array_mut()
+        .expect("maintain.json Statement is an array")
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainProvCas"))
+        .expect("maintain.json carries a MaintainProvCas statement");
+    target["Resource"] = serde_json::json!("arn:aws:s3:::my-ravel-bucket/t/*/*/prov");
+    let widened = build_policy("maintain", &path, &json);
+    let reached: Vec<String> = prov_grant_overreach(&widened)
+        .into_iter()
+        .map(|(sid, key)| {
+            assert_eq!(sid, "MaintainProvCas");
+            key
+        })
+        .collect();
+    assert_eq!(reached, prov_lookalike_keys());
+}
+
+/// The startup check of a `query` process over a tenant with no provisioning
+/// record (`AbsentPolicy::RefuseIfCommittedDataHidden` in `validate_or_adopt`,
+/// `crates/ravel-catalog/src/provisioning.rs`) issues one delimited listing of
+/// `t/<hash>/<sig>/c/` per provisioned signal (`commit_prefix` there) and never
+/// lists `t/<hash>/<sig>/l0/`. `query.json`'s ListBucket grant admits the
+/// first and does not admit the second. The ravel-server test
+/// `query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing`
+/// fails any `l0/` listing the way this template would, so a change to the
+/// check that lists `l0/` fails there unless this grant, and this test, change
+/// with it.
+#[test]
+fn query_template_admits_the_startup_commit_listing_and_not_l0() {
+    let query = load_policy("query");
+    let allowed = list_prefix_patterns(&query, Some("Allow"));
+    let denied = list_prefix_patterns(&query, Some("Deny"));
+    let tenant = test_tenant();
+    let hash = tenant.to_hex();
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        let shard_prefix = commit_shard_prefix(&tenant, signal, 0).expect("shard prefix");
+        let commit = shard_prefix
+            .strip_suffix("0000/")
+            .expect("commit shard prefix ends in the shard directory")
+            .to_string();
+        assert_eq!(commit, format!("t/{hash}/{sig}/c/"));
+        let l0_data =
+            data_key(&tenant, signal, 0, Uuid::from_u128(1), 1, 1, &[0u8; 32]).expect("data_key");
+        let l0_end = l0_data.find("/l0/").expect("data key has an l0 segment") + "/l0/".len();
+        let l0 = l0_data[..l0_end].to_string();
+        assert_eq!(l0, format!("t/{hash}/{sig}/l0/"));
+
+        assert!(
+            allowed.iter().any(|p| glob_matches(p, &commit)),
+            "query: no ListBucket s3:prefix admits {commit:?}, which the Query \
+             startup provisioning check lists. s3:prefix values: {allowed:?}"
+        );
+        assert!(
+            !denied.iter().any(|p| glob_matches(p, &commit)),
+            "query: a ListBucket Deny withdraws {commit:?}"
+        );
+        assert!(
+            !allowed.iter().any(|p| glob_matches(p, &l0)),
+            "query: a ListBucket s3:prefix admits {l0:?}; the Query startup check \
+             is documented and tested as never listing l0/. s3:prefix values: \
+             {allowed:?}"
+        );
+    }
+}
+
+/// A `query` process checks a present provisioning record at startup and never
+/// adopts (`static_absent_policy` in `services/ravel-server/src/provisioning.rs`),
+/// so `query.json` holds no PutObject statement of any kind that reaches a
+/// provisioned signal's record.
+#[test]
+fn query_template_writes_no_provisioning_record() {
+    let query = load_policy("query");
+    let puts = put_resource_key_patterns(&query);
+    for key in prov_witness_keys() {
+        assert!(
+            !puts.iter().any(|p| glob_matches(p, &key)),
+            "query: a PutObject Allow reaches the provisioning record {key:?}. \
+             PutObject patterns: {puts:?}"
+        );
+    }
+    assert!(
+        !PROV_WRITE_CALL_SITES
+            .iter()
+            .any(|(_, role, _)| *role == "query"),
+        "query is not a provisioning-record writer"
+    );
+}
+
+/// Each production write of the provisioning record in `PROV_WRITE_CALL_SITES`
+/// is matched by a grant of its own kind on the role that issues it, for every
+/// provisioned signal. A create-only grant does not cover a `CasVersion` write,
+/// and a CAS-only grant does not cover a `CreateIfAbsent` one.
+#[test]
+fn every_prov_write_call_site_has_a_grant_of_its_kind() {
+    for (call, role, kind) in PROV_WRITE_CALL_SITES {
+        let policy = load_policy(role);
+        let granted = conditioned_put_patterns(&policy, *kind);
+        for key in prov_witness_keys() {
+            assert!(
+                granted.iter().any(|p| glob_matches(p, &key)),
+                "{role}: no {kind:?} PutObject Allow reaches {key:?}, which {call} \
+                 writes. {kind:?} patterns: {granted:?}"
+            );
+        }
+    }
+}
+
+/// `ravel-cli maintain migrate` runs under the Maintain credential (ADR-0066
+/// decision 5). Every object-store call it issues, traced from
+/// `migrate_family` (`crates/ravel-maintain/src/migrate.rs`) through the
+/// rewrite, claim and publish helpers, is reached by a `maintain.json` grant of
+/// the right kind, and no Deny cancels one. The two calls that end a walk are
+/// the cursor delete and the `CasVersion` floor raise on the provisioning
+/// record.
+#[test]
+fn maintain_template_covers_every_maintain_migrate_call() {
+    let maintain = load_policy("maintain");
+    let list_prefixes = list_prefix_patterns(&maintain, Some("Allow"));
+    let gets = key_patterns_for(&maintain, &["s3:GetObject"], Some("Allow"));
+    let unconditioned_puts = unconditioned_put_patterns(&maintain);
+    let deletes = delete_key_patterns(&maintain, "Allow");
+    let denied_deletes = delete_key_patterns(&maintain, "Deny");
+    let put_allowed = |key: &str, kind: PutCondition| {
+        unconditioned_puts.iter().any(|p| glob_matches(p, key))
+            || conditioned_put_patterns(&maintain, kind)
+                .iter()
+                .any(|p| glob_matches(p, key))
+    };
+
+    let tenant = test_tenant();
+    let hash = tenant.to_hex();
+    let writer_id = Uuid::from_u128(1);
+    let hour = 0;
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        let prov = format!("t/{hash}/{sig}/prov");
+        // migrate_cursor_key in crates/ravel-maintain/src/migrate.rs.
+        let cursor = format!("t/{hash}/{sig}/maint/migrate/rseg/cursor");
+        let shard_prefix = commit_shard_prefix(&tenant, signal, 0).expect("shard prefix");
+        let hour_prefix = commit_shard_hour_prefix(&tenant, signal, 0, hour).expect("hour prefix");
+        let l0_commit = commit_key(&tenant, signal, 0, hour, writer_id, 1, 1).expect("commit_key");
+        let compaction = compaction_record_key(&tenant, signal, 0, hour, hash16())
+            .expect("compaction_record_key");
+        let rewrite =
+            rewrite_record_key(&tenant, signal, 0, hour, hash16()).expect("rewrite_record_key");
+        let l0_data = data_key(&tenant, signal, 0, writer_id, 1, 1, &[0u8; 32]).expect("data_key");
+        let l1_part =
+            l1_part_key(&tenant, signal, 0, hour, hash16(), 0, hash16()).expect("l1_part_key");
+
+        // Reads: the record (scan range, floor, raise), the cursor, every
+        // commit, compaction and rewrite record, the L0 inputs, and the L1
+        // parts a converged publish HEADs.
+        for key in [
+            &prov,
+            &cursor,
+            &l0_commit,
+            &compaction,
+            &rewrite,
+            &l0_data,
+            &l1_part,
+        ] {
+            assert!(
+                gets.iter().any(|p| glob_matches(p, key)),
+                "maintain: no GetObject Allow reaches {key:?}, which maintain \
+                 migrate reads. Grants: {gets:?}"
+            );
+        }
+        // Listings: the shard's hours and each hour bucket.
+        for prefix in [&shard_prefix, &hour_prefix] {
+            assert!(
+                list_prefixes.iter().any(|p| glob_matches(p, prefix)),
+                "maintain: no ListBucket s3:prefix admits {prefix:?}, which \
+                 maintain migrate lists. s3:prefix values: {list_prefixes:?}"
+            );
+        }
+        // Writes: the cursor (create, then CAS), the L1 parts and the
+        // compaction record (create), and the floor raise (CAS on the record).
+        for (key, kind) in [
+            (&cursor, PutCondition::CreateOnly),
+            (&cursor, PutCondition::CasOnly),
+            (&l1_part, PutCondition::CreateOnly),
+            (&compaction, PutCondition::CreateOnly),
+            (&prov, PutCondition::CasOnly),
+        ] {
+            assert!(
+                put_allowed(key, kind),
+                "maintain: no PutObject Allow admits a {kind:?} write of {key:?}, \
+                 which maintain migrate issues"
+            );
+        }
+        assert!(
+            !unconditioned_puts.iter().any(|p| glob_matches(p, &prov)),
+            "maintain: the floor raise must be the only kind of record write"
+        );
+        // The cursor delete after every completed walk, which stops the run on
+        // a refusal.
+        assert!(
+            deletes.iter().any(|p| glob_matches(p, &cursor)),
+            "maintain: no delete Allow reaches the migrate cursor {cursor:?}. \
+             Grants: {deletes:?}"
+        );
+        assert!(
+            !denied_deletes.iter().any(|p| glob_matches(p, &cursor)),
+            "maintain: a delete Deny reaches the migrate cursor {cursor:?}"
+        );
+    }
+
+    // Startup and the bucket claim, signal-independent.
+    assert!(gets.iter().any(|p| glob_matches(p, "sys/tenancy")));
+    let claim = format!("{COMPACTION_CLAIMS_PREFIX}{}", "0".repeat(64));
+    assert!(
+        gets.iter().any(|p| glob_matches(p, &claim)),
+        "maintain: no GetObject Allow reaches the compaction claim {claim:?}"
+    );
+    for kind in [PutCondition::CreateOnly, PutCondition::CasOnly] {
+        assert!(
+            put_allowed(&claim, kind),
+            "maintain: no PutObject Allow admits a {kind:?} write of the \
+             compaction claim {claim:?}"
         );
     }
 }
@@ -8006,6 +8717,12 @@ fn empty_routed_write_set_is_not_a_skip() {
     let statements = json["Statement"]
         .as_array_mut()
         .expect("maintain.json Statement is an array");
+    // The two conditioned prov statements route through the tenant key too, so
+    // they go with the narrowing.
+    statements.retain(|stmt| {
+        stmt["Sid"] != serde_json::json!("MaintainProvCreate")
+            && stmt["Sid"] != serde_json::json!("MaintainProvCas")
+    });
     let target = statements
         .iter_mut()
         .find(|stmt| stmt["Sid"] == serde_json::json!("MaintainWrite"))
@@ -8959,6 +9676,10 @@ fn shipped_gateway_write_mutated_to_wildcard_action_fails_closed() {
     let statements = json["Statement"]
         .as_array_mut()
         .expect("gateway.json Statement is an array");
+    // GatewayProvCreate is a second PutObject grant round three would have
+    // read; dropping it leaves GatewayWrite as the only put statement, which is
+    // the shape the reviewer mutated.
+    statements.retain(|stmt| stmt["Sid"] != serde_json::json!("GatewayProvCreate"));
     let target = statements
         .iter_mut()
         .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayWrite"))
@@ -9138,6 +9859,18 @@ fn operation_vocabulary_is_consistent() {
     }
 }
 
+/// The `role/Sid` of every statement whose Resource carries IAM's
+/// single-character `?` wildcard.
+const QUESTION_MARK_RESOURCE_STATEMENTS: [&str; 7] = [
+    "gateway/GatewayAdmissionDelete",
+    "gateway/GatewayProvCreate",
+    "query/QueryManifestCreate",
+    "maintain/MaintainProvCreate",
+    "maintain/MaintainProvCas",
+    "admin/AdminProvCreate",
+    "admin/AdminProvCas",
+];
+
 /// Every shipped template under `deploy/iam` passes the choke point, and the set
 /// this file guards is exactly the set on disk. `ALL_ROLES` is hand-written, so
 /// without this a new template would ship unguarded.
@@ -9192,6 +9925,7 @@ fn every_shipped_template_passes_the_choke_point() {
                      pattern-set expectation in this file must be re-read"
                 );
             }
+            let mut carries_question_mark = false;
             for resource in statement_resources(stmt) {
                 if !resource.contains('?') {
                     continue;
@@ -9202,18 +9936,21 @@ fn every_shipped_template_passes_the_choke_point() {
                 // manifest, whose key has `/pq/t/` at those positions.
                 // The Query manifest create spells the tenant hash the same
                 // way, so the write reaches `t/<32 characters>/pq/t/` and no
-                // deeper `pq/t/` segment of another keyspace.
-                if (role, sid) == ("gateway", "GatewayAdmissionDelete")
-                    || (role, sid) == ("query", "QueryManifestCreate")
-                {
-                    question_mark_resources.push(format!("{role}/{sid}"));
+                // deeper `pq/t/` segment of another keyspace. The
+                // provisioning-record writes do too, so they reach only
+                // `t/<32 characters>/<signal>/prov`.
+                if QUESTION_MARK_RESOURCE_STATEMENTS.contains(&format!("{role}/{sid}").as_str()) {
+                    carries_question_mark = true;
                     continue;
                 }
                 panic!(
                     "{role}/{sid}: Resource {resource:?} carries a `?`, and only \
-                     gateway/GatewayAdmissionDelete and query/QueryManifestCreate \
-                     are allowed one. Same consequence as for Action above"
+                     {QUESTION_MARK_RESOURCE_STATEMENTS:?} are allowed one. Same \
+                     consequence as for Action above"
                 );
+            }
+            if carries_question_mark {
+                question_mark_resources.push(format!("{role}/{sid}"));
             }
         }
 
@@ -9232,13 +9969,12 @@ fn every_shipped_template_passes_the_choke_point() {
             );
         }
     }
+    question_mark_resources.sort();
+    let mut allowlisted: Vec<&str> = QUESTION_MARK_RESOURCE_STATEMENTS.to_vec();
+    allowlisted.sort_unstable();
     assert_eq!(
-        question_mark_resources,
-        [
-            "gateway/GatewayAdmissionDelete",
-            "query/QueryManifestCreate"
-        ],
-        "the two allowlisted `?` Resources must still be the only ones, and must \
+        question_mark_resources, allowlisted,
+        "the allowlisted `?` Resources must still be the only ones, and must \
          still carry their `?`"
     );
 }

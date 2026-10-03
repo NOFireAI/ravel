@@ -536,16 +536,22 @@ Admin gains nothing for them. `ravel-cli` builds no per-tenant KMS routing
 store, so these writes, like every other `ravel-cli` write, land under the
 bucket's default encryption rather than a routed tenant's key.
 
-`maintain migrate` runs under none of the shipped templates. `maintain.json`
-grants its reads, its L1 part and compaction-record writes and its cursor
-write, but not the two calls that end a walk: the delete of its
+`maintain migrate` takes the Maintain credential (ADR-0066 decision 5).
+`maintain.json` grants its reads, its L1 part and compaction-record writes
+and its cursor write. The two calls that end a walk are the delete of its
 `t/<tenant_hash>/<signal>/maint/migrate/<family>/cursor` object, which runs
 after every completed walk and stops the run on a refusal, and the
-`CasVersion` write of `t/<tenant_hash>/<signal>/prov` that raises the
-format floor after a clean re-audit. `admin.json` and `gateway.json` grant
-the `prov` write but not the L1 part writes or the cursor. Until a role is
-given both calls, run `maintain migrate` under a credential that holds the
-`maintain.json` grants plus those two.
+`CasVersion` write of `t/<tenant_hash>/<signal>/prov` that raises the format
+floor after a clean re-audit. The delete falls under `MaintainDelete`
+`t/*/*/maint/*`, since IAM's `*` matches `/`. The floor raise is
+`MaintainProvCas`, a CAS-only grant (see "Provisioning records: conditioned
+writes" below). `maintain_template_covers_every_maintain_migrate_call` in
+`crates/ravel-commit/tests/iam_templates.rs` checks a list of the command's
+calls against this template. That list is written by hand from the code, not
+derived from it, so a new call in `migrate.rs` needs a new entry there; the
+cursor key in it is a format string mirroring `migrate_cursor_key`, which is
+private to `ravel-maintain`. Issue #2359 changes the migrate cursor; the
+grants here are for the cursor as it is today.
 
 ### Parquet table DDL
 
@@ -604,6 +610,98 @@ The manifest listing, manifest reads and grants-record read were already in
 `QueryList` and `QueryRead`. The `LOCATION` listing, HEAD and footer reads and
 both qualification probes' reads go to the external bucket under its own
 credential profile, not under any template here. `DROP` deletes nothing.
+
+## Provisioning records: conditioned writes
+
+The provisioning record `t/<tenant_hash>/<signal>/prov` (ADR-0050 section 5)
+holds a tenant's shard generations and format floors. Nothing writes it
+unconditionally. `crates/ravel-catalog/src/provisioning.rs` writes it in three
+functions: `write_record_race_safe` with `CreateIfAbsent` (reached from
+`validate_or_adopt` under `CreateFromConfig` or `AdoptIfData`), and
+`append_generation` and `raise_format_floor` with `CasVersion`. The S3 backend
+sends `CreateIfAbsent` as `If-None-Match: *` and `CasVersion` as
+`If-Match: <etag>`, and AWS documents both `s3:if-none-match` and
+`s3:if-match` as condition keys IAM evaluates on `PutObject`, so every
+template grants the record through
+conditioned statements only (ADR-0055, prov write conditions amendment):
+
+| Call | Role | Put mode | Grant |
+|---|---|---|---|
+| `ProvisioningRecordWriter::ensure` (`services/ravel-server/src/provisioning.rs`), `validate_or_adopt` with `CreateFromConfig` on a tenant's first ingest write | Gateway | `CreateIfAbsent` | `GatewayProvCreate` |
+| `validate_static_provisioning` (same file, called from `main.rs` at startup), `validate_or_adopt` with `AdoptIfData` for every statically known tenant whose data predates its record, in `gateway`, `maintain` and `all` mode | Gateway, Maintain | `CreateIfAbsent` | `GatewayProvCreate`, `MaintainProvCreate` |
+| The maintain tick (`services/ravel-server/src/maintain.rs`), `validate_or_adopt` with `AdoptIfData` per tenant and signal | Maintain | `CreateIfAbsent` | `MaintainProvCreate` |
+| `ravel-cli maintain migrate`, `raise_format_floor` after a clean re-audit (`crates/ravel-maintain/src/migrate.rs`) | Maintain | `CasVersion` | `MaintainProvCas` |
+| `ravel-cli provision adopt`, `validate_or_adopt` with `AdoptIfData` | Admin | `CreateIfAbsent` | `AdminProvCreate` |
+| `ravel-cli provision reshard`, `append_generation` | Admin | `CasVersion` | `AdminProvCas` |
+
+A `query` process runs the startup check with `RefuseIfCommittedDataHidden`
+(`static_absent_policy` in `services/ravel-server/src/provisioning.rs`) and
+never adopts: it validates a present record and refuses startup on one it
+cannot read. For an absent record it lists only the commit prefix
+`t/<tenant_hash>/<signal>/c/`, which `QueryList` already admits through
+`t/*/*/c/*`, and refuses startup with `AdoptionWouldHideData` when committed
+data sits on a shard index at or above its `--shards`, because it reads such
+a tenant through that shard count and would leave those shards out (ADR-0050
+section 5). Otherwise it passes without writing anything. It never lists
+`l0/`, since Query serves committed data only. Adoption belongs to ingest,
+maintenance and the CLI. The read role therefore holds no provisioning write
+and no `l0/` listing: `QueryList` does not admit `t/*/*/l0/*`, so an
+adopting Query startup would be refused at that listing before it reached the
+write.
+
+Each create-only statement is `s3:PutObject` conditioned on `StringEquals`
+`s3:if-none-match` `*`, the form `QueryManifestCreate` uses. Each CAS-only
+statement is `s3:PutObject` conditioned on `Null` `s3:if-match` `false`: a PUT
+that sends `If-Match` passes, and an unconditional PUT or a create-if-absent
+PUT that sends no `If-Match` is refused. Every one of them names exactly three
+resources, one per provisioned signal:
+
+```
+t/????????????????????????????????/m/prov
+t/????????????????????????????????/l/prov
+t/????????????????????????????????/s/prov
+```
+
+IAM's `*` matches `/`, so `t/*/*/prov` would also reach nested keys that end
+in `/prov` (for example `t/<tenant_hash>/m/c/<shard>/<hour>/prov` or
+`t/<tenant_hash>/m/del/prov`) and the `prov` key of the alerts, audit and
+profiles signals, none of which has a provisioning record. The tenant hash is
+spelled as 32 `?`, the way `QueryManifestCreate` spells it, so the statements
+name the record keys of metrics, logs and spans. An IAM `?` also matches `/`,
+so the patterns are not a proof that no other string matches, but no real key
+of another shape does: a tenant segment of 31 or 33 characters, a nested key
+ending in `/prov` and an unprovisioned signal's `prov` key all fall outside
+them.
+`DenyDeleteProtected` keeps the broader `t/*/*/prov`, since a broad deny is
+the safe direction.
+
+Gateway holds the create-only grant alone, because no path under its
+credential appends a generation or raises a floor. The operator's reshard
+calls `append_generation` too, under the shared credential named by
+`spec.storage.s3.credentials_secret_ref` rather than any template here.
+`ravel-cli load` creates the record too, with `CreateFromConfig`, so a
+create-only grant covers it.
+
+Without the create grant, a Maintain process with a statically known tenant
+whose data predates its record fails at startup with `AccessDenied`, and the
+maintain tick skips that tenant's signal on every tick. Without the CAS grant,
+`maintain migrate` finishes its rewrite and cannot raise the floor.
+
+What the conditions buy, for the metrics, logs and spans records: a
+compromised Gateway credential can create a missing record and cannot replace
+an existing one, and a compromised Query credential cannot write one at all. A
+compromised Maintain or Admin credential can still rewrite a record through a
+CAS PUT, since it can read the current ETag first; that is the overwrite gap
+ADR-0055 section 3 already names. `DenyDeleteProtected` still denies delete
+on `t/*/*/prov` in all four templates, so no role can delete a record and
+recreate it.
+
+One key outside those three is still writable: `t/<tenant_hash>/u/prov`, the
+`prov` key of the audit signal, falls under the unconditioned `t/*/u/*`
+PutObject that `QueryWrite` and `AdminWrite` grant for audit records. The
+audit signal has no provisioning record, so nothing legitimate is there to
+replace; a planted one could widen the shard range an audit scan reads or make
+audit reads fail, and cannot hide any record.
 
 ## Bucket-configuration reads: granted by no template
 

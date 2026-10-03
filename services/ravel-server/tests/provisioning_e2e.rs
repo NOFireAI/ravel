@@ -283,6 +283,7 @@ async fn startup_tolerates_shard_count_drift() {
         store.as_ref(),
         &static_tenants,
         RESTART_SHARDS,
+        Mode::All,
         now_ns(),
     )
     .await
@@ -361,6 +362,7 @@ async fn fresh_tenant_with_no_prior_data_starts_cleanly() {
         store.as_ref(),
         &static_tenants,
         INGEST_SHARDS,
+        Mode::All,
         now_ns(),
     )
     .await
