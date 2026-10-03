@@ -12955,6 +12955,46 @@ mod tests {
         Cli::try_parse_from(argv).expect("flags parse")
     }
 
+    /// `--sql-spill` parses `auto` (the default) and `off`, refuses every
+    /// other word, and reaches [`QueryBudgets::sql_spill`] beside the
+    /// resolved memory budget the `--cache-dir` ceiling is capped against
+    /// (ADR-0954, amended by issue #2416).
+    ///
+    /// Prove-the-test: write `off: false` in `Cli::query_budgets` and the `off`
+    /// row reads `false`; pass `resolved.memory_remainder_bytes` instead of
+    /// `memory_budget_bytes` and the budget reads 22,548,578,304 against
+    /// 30,064,771,072.
+    #[test]
+    fn sql_spill_flag_parses_auto_and_off_and_reaches_query_budgets() {
+        assert_eq!(cli(&[]).sql_spill, SqlSpillArg::Auto);
+        assert_eq!(cli(&["--sql-spill", "auto"]).sql_spill, SqlSpillArg::Auto);
+        assert_eq!(cli(&["--sql-spill", "off"]).sql_spill, SqlSpillArg::Off);
+        for word in ["on", "true", "false", "disabled", "OFF", ""] {
+            assert!(
+                Cli::try_parse_from(["ravel-server", "--sql-spill", word]).is_err(),
+                "--sql-spill {word:?} must be refused"
+            );
+        }
+
+        for (args, off) in [
+            (&[][..], false),
+            (&["--sql-spill", "auto"][..], false),
+            (&["--sql-spill", "off"][..], true),
+        ] {
+            let parsed = cli(args);
+            let resolved = resolved_from(&parsed);
+            let budgets = parsed.query_budgets(&resolved).expect("budgets resolve");
+            assert_eq!(
+                budgets.sql_spill,
+                SqlSpillSettings {
+                    off,
+                    memory_budget_bytes: 30_064_771_072,
+                },
+                "{args:?}"
+            );
+        }
+    }
+
     /// `--alert-retention` defaults to 90 days, accepts `0` as the opt-out,
     /// parses a humantime window, and refuses an unparseable one (ADR-1688
     /// decision 5).

@@ -2654,4 +2654,533 @@ mod tests {
         );
         assert_ne!(16_106_127_360, DEFAULT_MAX_TENANT_BYTES);
     }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const INSTANCE: &str = "inst-self";
+
+    fn settings(off: bool, memory_budget_bytes: u64) -> crate::config::SqlSpillSettings {
+        crate::config::SqlSpillSettings {
+            off,
+            memory_budget_bytes,
+        }
+    }
+
+    fn os(value: &str) -> Option<&std::ffi::OsStr> {
+        Some(std::ffi::OsStr::new(value))
+    }
+
+    /// `prepare_sql_spill_with` with the env pair and the measured free bytes
+    /// injected, so no test reads this process's environment or volume.
+    fn prepare(
+        cache_dir: Option<&std::path::Path>,
+        spill: crate::config::SqlSpillSettings,
+        env_dir: Option<&std::ffi::OsStr>,
+        env_quota: Option<&std::ffi::OsStr>,
+        free_bytes: u64,
+    ) -> anyhow::Result<SqlSpillStartup> {
+        prepare_sql_spill_with(cache_dir, spill, INSTANCE, env_dir, env_quota, |_| {
+            Ok(free_bytes)
+        })
+    }
+
+    /// A sibling spill root whose owner has exited: its lock file exists and
+    /// nobody holds it.
+    fn dead_sibling(cache_dir: &std::path::Path, id: &str) -> PathBuf {
+        let owner = ravel_sql::spill::SpillRootOwner::acquire(cache_dir, id).expect("acquire");
+        let dir = owner.dir().to_path_buf();
+        drop(owner);
+        dir
+    }
+
+    /// The process environment must not configure spill for the tests that
+    /// build an executor: `SqlConfig::with_spill_resolved` reads it directly.
+    fn assert_spill_env_unset() {
+        for var in [ravel_sql::ENV_SPILL_DIR, ravel_sql::ENV_SPILL_MAX_BYTES] {
+            assert!(
+                std::env::var_os(var).is_none(),
+                "{var} is set in the test environment; these tests pin the unset case"
+            );
+        }
+    }
+
+    /// Every INFO event, as `message=... name=value...`, the shape
+    /// `config::tests::capture_events` records.
+    #[derive(Clone, Default)]
+    struct InfoCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for InfoCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            #[derive(Default)]
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value}", field.name());
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            self.0.lock().push(visitor.0);
+        }
+    }
+
+    fn capture_info() -> (InfoCapture, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let capture = InfoCapture::default();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(capture.clone()),
+        );
+        (capture, guard)
+    }
+
+    /// The one `performance default resolved` line for `setting`.
+    fn resolved_line(lines: &[String], setting: &str) -> String {
+        let key = format!(" setting=\"{setting}\"");
+        let matching: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("performance default resolved") && line.contains(&key))
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one {setting} line: {lines:?}");
+        matching[0].clone()
+    }
+
+    /// `--cache-dir` alone derives the ceiling from the free bytes measured at
+    /// startup and the memory budget `--sql-spill`'s settings carry: half the
+    /// free space, capped at four times the budget, floored at 1 GiB. One case
+    /// per clause, each pinned to the byte, through the same
+    /// `prepare_sql_spill_with` `start` runs, so the measured figure and the
+    /// budget are the ones that reach the derivation.
+    ///
+    /// Prove-the-test: pass `memory_budget_bytes: u64::MAX` instead of
+    /// `settings.memory_budget_bytes` into `CacheDirSpillInputs` and the cap
+    /// row reads 53,687,091,200 against 8,589,934,592; pass `free_bytes * 2`
+    /// (a figure larger than what is free) and the half row reads
+    /// 6,442,450,944 against 3,221,225,472.
+    #[test]
+    fn cache_dir_alone_derives_the_ceiling_one_case_per_clause() {
+        for (label, free_bytes, memory_budget_bytes, expected) in [
+            ("half of free binds", 6 * GIB, 2 * GIB, 3 * GIB),
+            ("four times the budget binds", 100 * GIB, 2 * GIB, 8 * GIB),
+            ("the 1 GiB floor binds", GIB, GIB / 8, GIB),
+        ] {
+            let cache = tempfile::tempdir().expect("cache dir");
+            let startup = prepare(
+                Some(cache.path()),
+                settings(false, memory_budget_bytes),
+                None,
+                None,
+                free_bytes,
+            )
+            .expect("cache-dir spill resolves");
+            assert_eq!(
+                startup.resolved.config,
+                Some(ravel_sql::SpillConfig {
+                    dir: cache.path().join("sql-spill").join(INSTANCE),
+                    max_bytes: expected,
+                }),
+                "{label}"
+            );
+            assert_eq!(
+                (
+                    startup.resolved.dir_source,
+                    startup.resolved.max_bytes_source
+                ),
+                (SQL_SPILL_SOURCE_CACHE_DIR, SQL_SPILL_SOURCE_DERIVED),
+                "{label}"
+            );
+        }
+    }
+
+    /// The production measurement is the volume's FREE space, not its size:
+    /// with no budget cap in play, the derived ceiling is half of what
+    /// `ravel_sql::measure_free_bytes` reports for `<cache-dir>/sql-spill`,
+    /// within 256 MiB of drift between the two readings.
+    ///
+    /// Prove-the-test: measure with `fs4::statvfs(path)?.total_space()` in
+    /// `prepare_sql_spill` and the ceiling is half the volume's size, off by
+    /// half its used bytes.
+    #[test]
+    fn the_derived_ceiling_is_half_the_measured_free_space() {
+        assert_spill_env_unset();
+        let cache = tempfile::tempdir().expect("cache dir");
+        let startup = prepare_sql_spill(Some(cache.path()), settings(false, u64::MAX), INSTANCE)
+            .expect("cache-dir spill resolves");
+        let free = ravel_sql::measure_free_bytes(&cache.path().join("sql-spill"))
+            .expect("free space is measurable");
+        let half_free = (free / 2).max(GIB);
+        let ceiling = startup
+            .resolved
+            .config
+            .expect("cache-dir spill is enabled")
+            .max_bytes;
+        assert!(
+            ceiling.abs_diff(half_free) <= 256 * 1024 * 1024,
+            "ceiling {ceiling} must be half the free bytes, {half_free}"
+        );
+    }
+
+    /// The source precedence: the full env pair wins over `--cache-dir` (and
+    /// nothing under the cache dir is swept); `RAVEL_SQL_SPILL_MAX_BYTES` alone
+    /// keeps the cache-dir root under the env ceiling; `--sql-spill off` wins
+    /// over both; neither source disables spill; a half-set pair that no
+    /// cache dir completes is an error naming the missing variable.
+    ///
+    /// Prove-the-test: move the `inputs.off` early return in
+    /// `resolve_sql_spill` below the `SpillConfig::resolve` call and keep
+    /// the env result, and the off row reads the env pair's directory; check
+    /// `cache_dir` before the env pair and the env row reads the cache-dir
+    /// root.
+    #[test]
+    fn spill_sources_resolve_in_precedence_order() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let explicit = cache.path().join("explicit");
+        let dead = dead_sibling(cache.path(), "inst-dead");
+
+        let env = prepare(
+            Some(cache.path()),
+            settings(false, 2 * GIB),
+            os(explicit.to_str().expect("utf-8 temp path")),
+            os("4096"),
+            100 * GIB,
+        )
+        .expect("the env pair resolves");
+        assert_eq!(
+            env.resolved,
+            ResolvedSqlSpill {
+                config: Some(ravel_sql::SpillConfig {
+                    dir: explicit.clone(),
+                    max_bytes: 4096,
+                }),
+                dir_source: SQL_SPILL_SOURCE_ENV,
+                max_bytes_source: SQL_SPILL_SOURCE_ENV,
+            }
+        );
+        assert!(env.inputs.cache_dir.is_none() && env.owner.is_none());
+        assert!(dead.is_dir(), "an env-rooted spill never sweeps the cache dir");
+
+        let off = prepare(
+            Some(cache.path()),
+            settings(true, 2 * GIB),
+            os(explicit.to_str().expect("utf-8 temp path")),
+            os("4096"),
+            100 * GIB,
+        )
+        .expect("off never errors");
+        assert_eq!(
+            off.resolved,
+            ResolvedSqlSpill {
+                config: None,
+                dir_source: SQL_SPILL_SOURCE_FLAG_OFF,
+                max_bytes_source: SQL_SPILL_SOURCE_FLAG_OFF,
+            }
+        );
+        assert!(off.inputs.off && off.inputs.cache_dir.is_none() && off.owner.is_none());
+        assert!(dead.is_dir(), "a disabled spill never sweeps");
+
+        let half_set_off = prepare(Some(cache.path()), settings(true, GIB), None, os("x"), GIB)
+            .expect("off ignores even an unparseable env half");
+        assert_eq!(half_set_off.resolved.config, None);
+
+        let neither = prepare(None, settings(false, 2 * GIB), None, None, 100 * GIB)
+            .expect("no source resolves");
+        assert_eq!(
+            neither.resolved,
+            ResolvedSqlSpill {
+                config: None,
+                dir_source: SQL_SPILL_SOURCE_UNSET,
+                max_bytes_source: SQL_SPILL_SOURCE_UNSET,
+            }
+        );
+
+        let quota_alone = prepare(
+            Some(cache.path()),
+            settings(false, 2 * GIB),
+            None,
+            os("777"),
+            100 * GIB,
+        )
+        .expect("a dir-less quota under --cache-dir resolves");
+        assert_eq!(
+            quota_alone.resolved,
+            ResolvedSqlSpill {
+                config: Some(ravel_sql::SpillConfig {
+                    dir: cache.path().join("sql-spill").join(INSTANCE),
+                    max_bytes: 777,
+                }),
+                dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
+                max_bytes_source: SQL_SPILL_SOURCE_ENV_OVERRIDE,
+            }
+        );
+        drop(quota_alone);
+
+        for cache_dir in [Some(cache.path()), None] {
+            let err = prepare(
+                cache_dir,
+                settings(false, 2 * GIB),
+                os("/explicit"),
+                None,
+                100 * GIB,
+            )
+            .err()
+            .expect("a directory with no quota is refused");
+            assert!(
+                err.to_string()
+                    .starts_with("RAVEL_SQL_SPILL_MAX_BYTES is not set but RAVEL_SQL_SPILL_DIR is"),
+                "{err}"
+            );
+        }
+        let err = prepare(None, settings(false, 2 * GIB), None, os("777"), 100 * GIB)
+            .err()
+            .expect("a quota with no directory and no --cache-dir is refused");
+        assert!(
+            err.to_string()
+                .starts_with("RAVEL_SQL_SPILL_DIR is not set but RAVEL_SQL_SPILL_MAX_BYTES is"),
+            "{err}"
+        );
+    }
+
+    /// `--sql-spill` and `--cache-dir` reach the `SqlConfig` the server's SQL
+    /// executor runs with, traced from the parsed command line through
+    /// `query_budgets`, `prepare_sql_spill_with`, and
+    /// `build_sql_state_with_parquet`. On the injected reference host
+    /// (`memory_budget_bytes` 30,064,771,072) with 300 GiB free, the cap binds:
+    /// 120,259,084,288.
+    ///
+    /// Prove-the-test: call `.with_spill_from_env()` in
+    /// `build_sql_state_inner` instead of `.with_spill_resolved(...)` and the
+    /// auto row reads `None`; pass `false` instead of `spill.off` and the off
+    /// row reads the cache-dir config.
+    #[test]
+    fn sql_spill_and_cache_dir_reach_the_executor_from_cli() {
+        use clap::Parser;
+
+        assert_spill_env_unset();
+        let state_for = |args: &[&str], cache_dir: &std::path::Path| {
+            let mut argv = vec!["ravel-server", "--cache-dir"];
+            let cache_arg = cache_dir.to_str().expect("utf-8 temp path");
+            argv.push(cache_arg);
+            argv.extend_from_slice(args);
+            let cli = crate::Cli::try_parse_from(argv).expect("flags parse");
+            let resolved = cli
+                .resolve_performance(crate::config::HostProfile::new(16, Some(32_212_254_720)))
+                .expect("performance defaults resolve");
+            let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
+            let startup = prepare(
+                cli.cache_dir.as_deref(),
+                budgets.sql_spill,
+                None,
+                None,
+                300 * GIB,
+            )
+            .expect("spill resolves");
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let catalog = build_catalog(
+                store.clone(),
+                1,
+                false,
+                ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+                None,
+                None,
+                None,
+                Duration::from_secs(2),
+            )
+            .expect("catalog");
+            let state = build_sql_state_with_parquet(
+                catalog,
+                store,
+                Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+                None,
+                EngineConfig::default(),
+                Arc::new(GetLimiter::new(1).expect("nonzero permits")),
+                ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+                DEFAULT_MAX_TENANT_BYTES,
+                false,
+                Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                    std::collections::HashSet::new(),
+                )),
+                QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+                None,
+                Arc::new(ravel_memory::MemoryBudget::unlimited()),
+                None,
+                ravel_sql::DEFAULT_MIN_GRACE_MS,
+                &startup.inputs,
+            )
+            .expect("sql state builds");
+            state.executor.config().spill.clone()
+        };
+
+        let cache = tempfile::tempdir().expect("cache dir");
+        assert_eq!(
+            state_for(&[], cache.path()),
+            Some(ravel_sql::SpillConfig {
+                dir: cache.path().join("sql-spill").join(INSTANCE),
+                max_bytes: 120_259_084_288,
+            })
+        );
+        let cache = tempfile::tempdir().expect("cache dir");
+        assert_eq!(state_for(&["--sql-spill", "off"], cache.path()), None);
+    }
+
+    /// The startup lines: `sql_spill_dir` and `sql_spill_max_bytes` each
+    /// appear exactly once, on the `performance default resolved` layout, with
+    /// the value and source of the cache-dir, env and off cases.
+    ///
+    /// Prove-the-test: label the cache-dir ceiling `SQL_SPILL_SOURCE_ENV` in
+    /// `resolve_sql_spill` and the cache-dir row reads `source="env"`; drop
+    /// the `None` arm's two lines in `ResolvedSqlSpill::emit` and the off row
+    /// finds no line.
+    #[test]
+    fn startup_lines_carry_the_spill_dir_and_ceiling_with_their_sources() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let explicit = cache.path().join("explicit");
+        let root = cache.path().join("sql-spill").join(INSTANCE);
+        let cases: [(&str, bool, Option<&std::ffi::OsStr>, Option<&std::ffi::OsStr>, String, String); 3] = [
+            (
+                "cache-dir",
+                false,
+                None,
+                None,
+                format!(" value={:?} source=\"cache-dir\"", root.display().to_string()),
+                format!(" value={} source=\"derived\"", 8 * GIB),
+            ),
+            (
+                "env",
+                false,
+                os(explicit.to_str().expect("utf-8 temp path")),
+                os("4096"),
+                format!(" value={:?} source=\"env\"", explicit.display().to_string()),
+                " value=4096 source=\"env\"".to_string(),
+            ),
+            (
+                "off",
+                true,
+                os(explicit.to_str().expect("utf-8 temp path")),
+                os("4096"),
+                " value=\"none\" source=\"flag-off\"".to_string(),
+                " value=\"none\" source=\"flag-off\"".to_string(),
+            ),
+        ];
+        for (label, off, env_dir, env_quota, dir_fields, max_fields) in cases {
+            let (capture, guard) = capture_info();
+            let startup = prepare(
+                Some(cache.path()),
+                settings(off, 2 * GIB),
+                env_dir,
+                env_quota,
+                100 * GIB,
+            )
+            .expect("spill resolves");
+            drop(guard);
+            drop(startup);
+            let lines = capture.0.lock().clone();
+            let dir_line = resolved_line(&lines, "sql_spill_dir");
+            assert!(dir_line.contains(&dir_fields), "{label}: {dir_line}");
+            let max_line = resolved_line(&lines, "sql_spill_max_bytes");
+            assert!(max_line.contains(&max_fields), "{label}: {max_line}");
+        }
+    }
+
+    /// Requirement 7's startup sweep, as `start` runs it: of two sibling roots
+    /// under one cache dir, the one whose owner lock a live holder has (taken
+    /// here, and made a day old) survives and is logged at INFO with its path,
+    /// and the one whose lock nobody holds (made just now) is removed. This
+    /// process's own root survives and stays locked.
+    ///
+    /// Prove-the-test: replace `owner.sweep_orphaned_spill_roots()` in
+    /// `sweep_spill_roots` with a removal of every sibling older than an hour
+    /// and the live root is gone while the dead one stays; with a removal of
+    /// every sibling that is not `owner.dir()` the live root is gone.
+    #[test]
+    fn startup_sweep_removes_only_roots_whose_owner_lock_is_free() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let live =
+            ravel_sql::spill::SpillRootOwner::acquire(cache.path(), "inst-live").expect("acquire");
+        let day_ago = std::time::SystemTime::now() - Duration::from_secs(24 * 60 * 60);
+        std::fs::File::open(live.dir())
+            .expect("open the live root")
+            .set_modified(day_ago)
+            .expect("age the live root");
+        let dead = dead_sibling(cache.path(), "inst-dead");
+
+        let (capture, guard) = capture_info();
+        let startup = prepare(
+            Some(cache.path()),
+            settings(false, 2 * GIB),
+            None,
+            None,
+            100 * GIB,
+        )
+        .expect("spill resolves");
+        drop(guard);
+
+        assert!(live.dir().is_dir(), "a root with a live owner must survive");
+        assert!(!dead.exists(), "a root whose owner is gone must be removed");
+        assert_eq!(startup.left_in_place, vec![live.dir().to_path_buf()]);
+        let own = startup.owner.as_ref().expect("this process owns its root");
+        assert_eq!(own.dir(), cache.path().join("sql-spill").join(INSTANCE));
+        assert!(own.dir().is_dir());
+        assert!(
+            ravel_sql::spill::SpillRootOwner::acquire(cache.path(), INSTANCE).is_err(),
+            "the startup owner must still hold its own root's lock"
+        );
+        let lines = capture.0.lock().clone();
+        let path = format!(" dir={}", live.dir().display());
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("left in place") && line.contains(&path))
+                .count(),
+            1,
+            "the live root is logged once with its path: {lines:?}"
+        );
+    }
+
+    /// Startup refuses, naming the path, when its own root's lock is already
+    /// held, and sweeps nothing first.
+    ///
+    /// Prove-the-test: make the `SpillRootOwner::acquire` failure in
+    /// `prepare_sql_spill_with` non-fatal (`.ok()`, sweeping with a fresh
+    /// owner only when one was taken) and startup returns `Ok`.
+    #[test]
+    fn startup_refuses_when_its_own_spill_root_is_locked() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let _holder =
+            ravel_sql::spill::SpillRootOwner::acquire(cache.path(), INSTANCE).expect("acquire");
+        let dead = dead_sibling(cache.path(), "inst-dead");
+
+        let err = prepare(
+            Some(cache.path()),
+            settings(false, 2 * GIB),
+            None,
+            None,
+            100 * GIB,
+        )
+        .err()
+        .expect("a held own root refuses startup");
+        let own = cache.path().join("sql-spill").join(INSTANCE);
+        assert!(
+            err.to_string().contains(&own.display().to_string()),
+            "the refusal names the root: {err}"
+        );
+        assert!(dead.is_dir(), "a refused startup sweeps nothing");
+    }
 }
