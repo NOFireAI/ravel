@@ -249,16 +249,19 @@ const FIXTURE_SEED: u64 = 2055;
 
 /// Statements the comparator can only check by row and column count: Q18 has
 /// a LIMIT and no ORDER BY, and suite.toml declares Q25 and Q27
-/// `compare = "cardinality"`. Every other statement must Pass.
+/// `compare = "cardinality"`. Every other statement must Pass, except one
+/// declaring `ci_expected_error`, which [`check_statement`] never compares.
 fn expected_verdict(suite: &Suite, number: u32) -> Verdict {
     match number {
         18 => Verdict::CardinalityOnly(None),
-        25 | 27 => Verdict::CardinalityOnly(
+        25 | 27 => Verdict::CardinalityOnly(Some(
             suite
                 .override_for(number)
                 .and_then(|o| o.reason.clone())
-                .or_else(|| panic!("Q{number} declares compare = \"cardinality\" with a reason")),
-        ),
+                .unwrap_or_else(|| {
+                    panic!("Q{number} must declare compare = \"cardinality\" with a reason")
+                }),
+        )),
         _ => Verdict::Pass,
     }
 }
@@ -341,6 +344,31 @@ fn check_statement(
 ) -> (String, Option<String>) {
     let number = statement.number;
     let over = suite.override_for(number);
+    if let Some(prefix) = over.and_then(|o| o.ci_expected_error.as_deref()) {
+        let reference = reference
+            .as_ref()
+            .map_or_else(ToString::to_string, |_| "ok".to_string());
+        return match subject {
+            Err(e) if e.to_string().starts_with(prefix) => (
+                format!("Q{number} arm {arm}: expected error (reference: {reference})"),
+                None,
+            ),
+            Err(e) => (
+                format!("Q{number} arm {arm}: ERROR"),
+                Some(format!(
+                    "Q{number} arm {arm}: ravel error {e} does not start with the declared \
+                     ci_expected_error {prefix:?}; reference: {reference}"
+                )),
+            ),
+            Ok(_) => (
+                format!("Q{number} arm {arm}: ok"),
+                Some(format!(
+                    "Q{number} arm {arm}: ravel answered, but suite.toml declares \
+                     ci_expected_error {prefix:?}; reference: {reference}"
+                )),
+            ),
+        };
+    }
     let expected = expected_verdict(suite, number);
     match judge(statement, over, reference, subject) {
         Err(problem) => (
