@@ -2745,6 +2745,15 @@ mod tests {
 
     fn capture_info() -> (InfoCapture, tracing::subscriber::DefaultGuard) {
         use tracing_subscriber::layer::SubscriberExt as _;
+        // While exactly one dispatcher is registered, tracing computes a
+        // callsite's cached interest from the registering thread's own default,
+        // so another test's thread with no subscriber caches "never" for the
+        // lines this one captures. A second dispatcher kept alive for the whole
+        // process keeps every interest computed across all live dispatchers.
+        static KEEP_TWO_DISPATCHERS: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
         let capture = InfoCapture::default();
         let guard = tracing::subscriber::set_default(
             tracing_subscriber::registry().with(capture.clone()),
