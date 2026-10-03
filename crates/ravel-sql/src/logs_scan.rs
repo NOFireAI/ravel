@@ -3079,8 +3079,8 @@ struct OwnedSeg {
     /// partition's share. A row-ref addresses a block by its position in this
     /// list ([`RowRefRange`]), not by its whole-object index, so the scan
     /// resolves each block's row-ref through it. `None` on the whole-segment
-    /// fast path, where `indices` is empty and the cursor position already is
-    /// the surviving-block position.
+    /// fast path, where every block survives and a block's whole-object index
+    /// already is its surviving-block position.
     survivors: Option<Arc<Vec<usize>>>,
     /// The plan-phase footer for this segment (#693 part 3, deliverable 2),
     /// carried to the subset open so it skips its own suffix probe. `None` on the
@@ -3607,8 +3607,9 @@ struct RowRefRange {
 /// The surviving-block index of a just-decoded block, or `None` when the scan
 /// emits no row refs (ADR-0774).
 ///
-/// `decoded_block` is the whole-object block index the scan itself just
-/// decoded ([`LogSegmentScan::next_block_index`]), not a position into a
+/// `decoded_block` is the whole-object block index the scan itself named as the
+/// next block to decode, read before the decode
+/// ([`LogSegmentScan::next_block_index`]), not a position into a
 /// separately-tracked owned-block list: resolving a row-ref from the scan's
 /// own drain order, rather than from a cursor counted alongside it, means a
 /// list that has drifted out of step with the scan's actual blocks cannot
@@ -3735,11 +3736,10 @@ struct LogScanStream {
     /// fully emitted, i.e. the position within [`Self::current_indices`] of the
     /// block being drained. Advanced by both the columnar path and the row
     /// path, so it stays correct across an `attrs_raw` fallback's `Columnar` ->
-    /// `RowFallbackBlock` -> `Columnar` round trip: it is both what turns a
-    /// cursor position into a stable surviving-block index
-    /// ([`Self::current_block`]) and the `skip` count a later fallback's
-    /// [`LogScanState::ReopenRows`] re-derives from. Reset when a new segment
-    /// starts.
+    /// `RowFallbackBlock` -> `Columnar` round trip: it is the `skip` count a
+    /// later fallback's [`LogScanState::ReopenRows`] re-derives from. A
+    /// row-ref's block comes from the scan's own next block, not from this
+    /// count ([`Self::current_block`]). Reset when a new segment starts.
     block_cursor: usize,
     /// Count of `attrs_raw`-overflow fallbacks (issue #1769) since the last
     /// clean columnar block in the current segment, reset to 0 at
@@ -3850,8 +3850,9 @@ impl LogScanStream {
 
     /// The surviving-block index of the block just decoded, or `None` when
     /// this scan emits no row refs. `decoded_block` is that block's
-    /// whole-object index ([`LogSegmentScan::next_block_index`]), not the
-    /// cursor's position in [`Self::current_indices`] (issue #2417).
+    /// whole-object index, read from the scan before it decoded the block
+    /// ([`LogSegmentScan::next_block_index`]), not the cursor's position in
+    /// [`Self::current_indices`] (issue #2417).
     fn current_block(&self, decoded_block: Option<usize>) -> DFResult<Option<usize>> {
         block_index(
             self.row_refs,
