@@ -156,6 +156,46 @@ pub struct SegmentDirectories {
     open_decompressed_bytes: u64,
 }
 
+impl SegmentDirectories {
+    /// The object's decoded PAGE_DIR, through which a raw whole-object block
+    /// index resolves to its row group (ADR-2414 decision A1): a caller
+    /// dealing whole row groups to partitions (`ravel_sql::logs_scan::owned_work`)
+    /// needs this before any reader is built over the segment.
+    pub fn page_dir(&self) -> &Arc<PageDir> {
+        &self.page_dir
+    }
+
+    /// The object's decoded SKIP_IDX, for a caller that needs
+    /// [`SkipIndex::candidate_blocks`] without placing BLOCKS/BLOOM/POSTINGS
+    /// bytes a full [`RlogReader::scan_blocks`] would need (ADR-2414 decision
+    /// A1's plan-phase skip-decidable branch, `ravel_query::log_fetcher`).
+    pub fn skip_index(&self) -> &SkipIndex {
+        &self.skip
+    }
+
+    /// The object's decoded STREAM_DIR, for resolving stream-attribute
+    /// equalities without decoding the section again on every open.
+    pub fn stream_dir(&self) -> &StreamDir {
+        &self.stream_dir
+    }
+
+    /// The object's decoded FIELD_DIR, for resolving
+    /// [`FieldDir::numeric_range_arms`] against a prune channel without a
+    /// full reader (same caller as [`Self::skip_index`]).
+    pub fn field_dir(&self) -> &FieldDir {
+        &self.field_dir
+    }
+
+    /// Bytes zstd produced decoding STREAM_DIR, FIELD_DIR, SKIP_IDX, and
+    /// PAGE_DIR for this segment. A caller that decodes these once per
+    /// (query, segment) and reuses them across every partition that opens
+    /// the segment (ADR-2414 decision A1) charges this exactly once, at the
+    /// point the decode actually happened, rather than once per open.
+    pub fn open_decompressed_bytes(&self) -> u64 {
+        self.open_decompressed_bytes
+    }
+}
+
 impl<'a> RlogReader<'a> {
     /// Opens and validates the object, decoding the directories and the skip
     /// index. The skip index carries the block framing, so a corrupt SKIP_IDX
@@ -173,7 +213,10 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// within one query calls this once and passes the result to
     /// [`RlogReader::from_decoded`] for every subsequent open, instead of
     /// paying this decode again (ADR-2414 decision A1).
-    pub fn decode_directories(source: &S, cfg: &RlogConfig) -> Result<SegmentDirectories, LogSegError> {
+    pub fn decode_directories(
+        source: &S,
+        cfg: &RlogConfig,
+    ) -> Result<SegmentDirectories, LogSegError> {
         let footer = open_source(source)?;
         let mut open_decompressed_bytes = 0u64;
         let stream_desc = *section(&footer, kind::STREAM_DIR)?;
@@ -228,6 +271,12 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// [`crate::SparseObject`] over the same segment, holding only that
     /// partition's own ranged extents) -- only the directory CONTENT is
     /// shared, never the placed bytes.
+    ///
+    /// The reader's scans do NOT seed [`ScanStats::decompressed_bytes`] with
+    /// the directories' decode: that decode happened once, in
+    /// [`RlogReader::decode_directories`], and whoever ran it charges
+    /// [`SegmentDirectories::open_decompressed_bytes`] there. Seeding it here
+    /// too would charge the same decode once per reader built from `dirs`.
     pub fn from_decoded(source: &'a S, dirs: &SegmentDirectories) -> Self {
         RlogReader {
             source,
@@ -238,7 +287,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             page_dir: Arc::clone(&dirs.page_dir),
             bloom: dirs.bloom,
             postings: dirs.postings,
-            open_decompressed_bytes: dirs.open_decompressed_bytes,
+            open_decompressed_bytes: 0,
         }
     }
 
@@ -255,7 +304,26 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// reader with [`RlogReader::from_decoded`] (ADR-2414 decision A1).
     pub fn from_source(source: &'a S, cfg: &RlogConfig) -> Result<Self, LogSegError> {
         let dirs = Self::decode_directories(source, cfg)?;
-        Ok(Self::from_decoded(source, &dirs))
+        let mut reader = Self::from_decoded(source, &dirs);
+        reader.open_decompressed_bytes = dirs.open_decompressed_bytes;
+        Ok(reader)
+    }
+
+    /// This reader's already-decoded directories, as a [`SegmentDirectories`]
+    /// a later open of the same (immutable) object can reuse via
+    /// [`RlogReader::from_decoded`] (ADR-2414 decision A1). A clone of fields
+    /// decoded once at construction, never a re-decode.
+    pub fn directories(&self) -> SegmentDirectories {
+        SegmentDirectories {
+            stream_dir: self.stream_dir.clone(),
+            field_dir: self.field_dir.clone(),
+            skip: self.skip.clone(),
+            blocks_offset: self.blocks_offset,
+            page_dir: Arc::clone(&self.page_dir),
+            bloom: self.bloom,
+            postings: self.postings,
+            open_decompressed_bytes: self.open_decompressed_bytes,
+        }
     }
 
     /// The byte extent in BLOCKS of one `(row group, column)` column chunk,
@@ -648,7 +716,8 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     ) -> Result<BlockScan, LogSegError> {
         let mut scan = self.scan_blocks(content, prune, columns)?;
         let wanted: std::collections::HashSet<usize> = wanted.iter().copied().collect();
-        scan.blocks.retain(|b| wanted.contains(&(b.block_index as usize)));
+        scan.blocks
+            .retain(|b| wanted.contains(&(b.block_index as usize)));
         scan.next = 0;
         Ok(scan)
     }
