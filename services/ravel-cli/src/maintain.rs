@@ -12,16 +12,13 @@ use std::time::Duration;
 use clap::ValueEnum;
 use ravel_commit::keys;
 use ravel_ingest::Clock as _;
-use ravel_maintain::migrate::{
-    MigrationPath, NotMigratedBucket, NotMigratedReason, ReencodeBlockedBucket,
-    ReencodeBlockedReason,
-};
 use ravel_maintain::{
     BlockedBucket, BlockedReason, Bucket, ClaimParticipant, ClaimSkip, ClaimedCompaction,
     CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
-    L1PartMemoryTargetSource, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, PublishOutcome,
-    ResolvedL1PartMemoryTarget, SweepReport, Verification, census_family, compact_bucket_claimed,
-    count_below_target, migrate_family, sweep_shard,
+    L1PartMemoryTargetSource, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, MigrationPath,
+    NotMigratedBucket, NotMigratedReason, PublishOutcome, ReencodeBlockedBucket,
+    ReencodeBlockedReason, ResolvedL1PartMemoryTarget, SweepReport, Verification, census_family,
+    compact_bucket_claimed, count_below_target, migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -2602,13 +2599,22 @@ fn budget_stop_verdict(
     signal: Signal,
     family: &str,
 ) -> anyhow::Result<()> {
-    let reencode_blocked = report.reencode_blocked.len();
+    // A writer_disabled bucket is the default state of every bucket the
+    // re-encode exists for, and only a one-way flag clears it; like a
+    // blocked_bucket, it fails the run that drains the walk through the
+    // re-audit's stragglers instead.
+    let reencode_blocked = report
+        .reencode_blocked
+        .iter()
+        .filter(|bucket| !matches!(bucket.reason, ReencodeBlockedReason::WriterDisabled { .. }))
+        .count();
     let not_migrated = report.not_migrated.len();
     if reencode_blocked == 0 && not_migrated == 0 {
         return Ok(());
     }
     anyhow::bail!(
-        "migrate left {reencode_blocked} bucket(s) reencode_blocked and {not_migrated} \
+        "migrate left {reencode_blocked} bucket(s) reencode_blocked by contested_overlap or \
+         multiple_records and {not_migrated} \
          bucket(s) not_migrated in the {family} family for tenant {tenant} signal {signal:?}. \
          This run stopped on its budget with the cursor past them, so the next run resumes \
          after them: the not_migrated buckets are retried by the first run after the walk \
@@ -3658,25 +3664,38 @@ mod tests {
     }
 
     /// A run that stopped on its budget exits nonzero when it left a
-    /// reencode_blocked or a not_migrated bucket, says when the not_migrated
-    /// ones are retried, and exits zero when it left neither.
+    /// contested_overlap or multiple_records reencode_blocked bucket or a
+    /// not_migrated bucket, says when the not_migrated ones are retried, and
+    /// exits zero when it left none of them. A writer_disabled bucket alone
+    /// does not fail it.
     ///
     /// Non-vacuity: replace the body of `budget_stop_verdict` with `Ok(())` and
-    /// both `is_err` assertions fail.
+    /// the `is_err` assertions fail; drop the `WriterDisabled` filter and the
+    /// writer_disabled `is_ok` assertion fails.
     #[test]
     fn a_budget_stop_leaving_unmigrated_buckets_exits_nonzero() {
         let clean = FamilyMigrateReport::default();
         assert!(budget_stop_verdict(&clean, "acme", Signal::Logs, "rlog").is_ok());
 
-        let reencode_blocked = FamilyMigrateReport {
+        let blocked = |reason| FamilyMigrateReport {
             reencode_blocked: vec![ReencodeBlockedBucket {
                 shard: 0,
                 ingest_hour: 1,
-                reason: ReencodeBlockedReason::WriterDisabled { below_target: 1 },
+                reason,
             }],
             ..FamilyMigrateReport::default()
         };
-        assert!(budget_stop_verdict(&reencode_blocked, "acme", Signal::Logs, "rlog").is_err());
+        let writer_disabled = blocked(ReencodeBlockedReason::WriterDisabled { below_target: 1 });
+        assert!(
+            budget_stop_verdict(&writer_disabled, "acme", Signal::Logs, "rlog").is_ok(),
+            "a budget stop leaving only writer_disabled buckets exits zero"
+        );
+        let contested = blocked(ReencodeBlockedReason::ContestedOverlap {
+            largest_component: 2,
+        });
+        assert!(budget_stop_verdict(&contested, "acme", Signal::Logs, "rlog").is_err());
+        let multiple = blocked(ReencodeBlockedReason::MultipleRecords { records: 2 });
+        assert!(budget_stop_verdict(&multiple, "acme", Signal::Logs, "rlog").is_err());
 
         let not_migrated = FamilyMigrateReport {
             not_migrated: vec![NotMigratedBucket {

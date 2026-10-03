@@ -909,7 +909,12 @@ listed as `not_migrated` (see below). Of the other two:
   record survives supersession (see
   [re-encoding compaction parts](#re-encoding-compaction-parts)). Without the
   flag, re-running `migrate` reports the same `l1_compaction_parts` figure and
-  names the bucket on a `reencode_blocked` line. No `blocked_bucket` line is
+  names the bucket on a `reencode_blocked` line. The exception is a
+  `--target-version` above the version the running build writes: a part
+  recorded at the version this build writes still counts in the figure, but a
+  bucket whose below-target parts are all at that version gets no
+  `reencode_blocked` line, because a re-encode by this build cannot carry them
+  further. Such a part needs a newer build, not the flag. No `blocked_bucket` line is
   printed for one, except when the bucket's authoritative compaction records
   are all at the target and the below-target parts belong to records that lost
   their overlap (see `losing_record_parts` below). The figure is over listed
@@ -1100,8 +1105,8 @@ the bucket out, subject to the format-version hold.
 A `not_migrated` line names the path the bucket was dispatched to
 (`l0_migration` or `reencode`) and why its rewrite published nothing:
 
-- `claim_skipped claim_reason=<reason>`: the bucket's claim was not available,
-  with the same reasons `compact-bucket` prints (`held_by_another`,
+- `claim_skipped claim_reason=<reason>`: the run could not take the bucket's
+  claim, with the same reasons `compact-bucket` prints (`held_by_another`,
   `steal_lost`, `unreadable_claim`, `vanished_twice`);
 - `cancelled checkpoint=<point>`: the run took the claim, lost it, and stopped
   at `<point>` (`input_set`, `merge_loop`, `part_boundary` or `publish`) before
@@ -1128,9 +1133,12 @@ The exit code follows the same cases. A run that drains the walk exits nonzero
 when the re-audit finds stragglers, which every `blocked_bucket`,
 `reencode_blocked` and unresolved `not_migrated` bucket leaves behind, and
 exits zero when it raises the floor, even with `not_migrated` lines printed. A
-run that stops on its budget exits nonzero when it leaves any
-`reencode_blocked` or `not_migrated` bucket, and zero otherwise:
-`blocked_bucket` lines alone do not fail it.
+run that stops on its budget exits nonzero when it leaves any `not_migrated`
+bucket or any `reencode_blocked` bucket with reason `contested_overlap` or
+`multiple_records`, and zero otherwise: `blocked_bucket` and
+`reason=writer_disabled` lines alone do not fail it, since a writer_disabled
+bucket is the default state of every bucket the re-encode exists for and the
+run that drains the walk still fails on it through the re-audit.
 
 `--dry-run` does not run the walk. It runs the read-only re-audit, prints the
 three below-target figures and any `blocked_bucket` lines, takes no claim,

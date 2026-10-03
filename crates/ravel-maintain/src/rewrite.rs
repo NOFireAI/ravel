@@ -927,14 +927,8 @@ async fn reencode_compaction_parts_scoped(
     let ledger = config.request_ledger.as_ref();
 
     let listing = list_bucket_with_ledger(store, bucket, ledger).await?;
-    if listing.tombstone_key.is_some() {
-        return Ok(ReencodeOutcome::Tombstoned);
-    }
-    if !listing.rewrite_record_keys.is_empty() {
-        return Ok(ReencodeOutcome::RewritePresent);
-    }
-    if listing.compaction_record_keys.is_empty() {
-        return Ok(ReencodeOutcome::NoCompactionRecord);
+    if let Some(refused) = reencode_listing_gate(&listing) {
+        return Ok(refused);
     }
 
     let records = read_compaction_records(store, &listing.compaction_record_keys, ledger).await?;
@@ -1040,11 +1034,29 @@ async fn reencode_compaction_parts_scoped(
             parts: outcome.parts,
             publish: outcome.publish,
         }),
-        Some(FencedRewrite::RecordSetChanged(_)) => Ok(ReencodeOutcome::RecordSetChanged),
+        Some(FencedRewrite::RecordSetChanged(now)) => {
+            Ok(reencode_listing_gate(&now).unwrap_or(ReencodeOutcome::RecordSetChanged))
+        }
         None => Err(MaintainError::Invariant(
             "a re-encode lost its claim but its guard names no checkpoint".to_string(),
         )),
     }
+}
+
+/// The listing gates a re-encode applies to the listing it plans from, and
+/// again to its pre-publish re-list: `Some` is the reason the bucket is not
+/// re-encoded.
+fn reencode_listing_gate(listing: &BucketListing) -> Option<ReencodeOutcome> {
+    if listing.tombstone_key.is_some() {
+        return Some(ReencodeOutcome::Tombstoned);
+    }
+    if !listing.rewrite_record_keys.is_empty() {
+        return Some(ReencodeOutcome::RewritePresent);
+    }
+    if listing.compaction_record_keys.is_empty() {
+        return Some(ReencodeOutcome::NoCompactionRecord);
+    }
+    None
 }
 
 /// GET and decode each compaction record in `record_keys`, checking each one

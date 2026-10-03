@@ -9,7 +9,8 @@
 //! RSEG version is writable today. The record is overwritten in place to do
 //! that, which only a fixture may do.
 //!
-//! Every test drives `migrate_family` end to end. A refusal test runs over a
+//! Every test drives `migrate_family` end to end, except one that needs the
+//! re-encode's own outcome, which the report does not carry. A refusal test runs over a
 //! `FaultStore` that fails every PUT, so it proves it wrote nothing by the fault
 //! counter staying at 0. Interleavings are driven by `FaultStore` hold gates and
 //! `FixedClock`s; nothing sleeps. Each test's doc comment names the line whose
@@ -29,6 +30,7 @@ use ravel_maintain::migrate::{
     MigrationPath, NotMigratedBucket, NotMigratedReason, ReencodeBlockedBucket,
     ReencodeBlockedReason,
 };
+use ravel_maintain::rewrite::{ReencodeOutcome, reencode_compaction_parts};
 use ravel_maintain::{
     ClaimParticipant, ClaimSkipReason, Clock, CompactionOutcome, CompactorConfig, Coordination,
     ErasureRewriteOutcome, FamilyMigrateReport, FixedClock, MaintainMemo, MigrateBudget, NoLeases,
@@ -770,29 +772,20 @@ async fn parked_part_put(gate: &GateHandle) -> u64 {
     *id
 }
 
-/// The re-encode is parked at its first part PUT while an erasure rewrite
-/// publishes over the same bucket. The re-encode's pre-publish re-list finds
-/// the rewrite record, so it publishes nothing, and the report names the
-/// bucket on the re-encode path with the changed record set.
-///
-/// Replacing the `ReencodeOutcome::RecordSetChanged` arm of `record_reencode`
-/// with one that records nothing leaves `not_migrated` empty.
-#[tokio::test]
-async fn a_record_set_changed_under_the_reencode_is_named() {
-    let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
-    provision(store.inner()).await;
-    seed_compacted(store.inner()).await;
-    stamp_parts_below_target(store.inner()).await;
+/// Run `run` with an erasure rewrite publishing over the bucket while `run` is
+/// parked at its first part PUT, and return `run`'s result once the rewrite has
+/// published.
+async fn under_an_erasure_rewrite<T>(
+    store: &FaultStore<MemoryStore>,
+    run: impl std::future::Future<Output = T>,
+) -> T {
     let clock = FixedClock::new(sealed_now_ns());
     let gate = store.hold(Op::Put, Some(PART_KEYS.to_string()), Occurrence::Nth(1));
-
-    let config = reencode_cfg();
-    let m = migrate(store.as_ref(), &config, target());
     let e = async {
         let id = parked_part_put(&gate).await;
         let mut memo = MaintainMemo::with_default_interval();
         let outcome = erasure_rewrite_bucket(
-            store.as_ref(),
+            store,
             &clock,
             &CompactorConfig::default(),
             &NoLeases,
@@ -805,8 +798,7 @@ async fn a_record_set_changed_under_the_reencode_is_named() {
         assert!(gate.release(id), "the parked part PUT was released");
         outcome
     };
-    let (report, e_outcome) = tokio::join!(m, e);
-
+    let (out, e_outcome) = tokio::join!(run, e);
     assert!(
         matches!(
             e_outcome,
@@ -817,10 +809,56 @@ async fn a_record_set_changed_under_the_reencode_is_named() {
         ),
         "the erasure rewrite publishes: {e_outcome:?}"
     );
-    assert_eq!(
-        report.not_migrated,
-        not_migrated(MigrationPath::Reencode, NotMigratedReason::RecordSetChanged)
-    );
+    out
+}
+
+/// The re-encode is parked at its first part PUT while an erasure rewrite
+/// publishes over the same bucket. The re-encode's pre-publish re-list finds
+/// the rewrite record, so it publishes nothing and reports `RewritePresent`,
+/// not `RecordSetChanged`: no later walk re-encodes a bucket holding a rewrite
+/// record, so a retry note would promise a run that never comes.
+///
+/// This one calls `reencode_compaction_parts` directly, since the report does
+/// not carry the outcome. Replacing
+/// `reencode_listing_gate(&now).unwrap_or(ReencodeOutcome::RecordSetChanged)`
+/// with `Ok(ReencodeOutcome::RecordSetChanged)` fails the outcome assertion.
+#[tokio::test]
+async fn a_rewrite_record_under_the_reencode_reports_rewrite_present() {
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    provision(store.inner()).await;
+    seed_compacted(store.inner()).await;
+    stamp_parts_below_target(store.inner()).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let config = reencode_cfg();
+
+    let outcome = under_an_erasure_rewrite(
+        store.as_ref(),
+        reencode_compaction_parts(store.as_ref(), &clock, &config, &bucket()),
+    )
+    .await
+    .expect("re-encode");
+
+    assert_eq!(outcome, ReencodeOutcome::RewritePresent);
+}
+
+/// The same race under `migrate`: the bucket is named on no `not_migrated`
+/// line, and the re-audit still counts the predecessor's part.
+///
+/// Replacing `reencode_listing_gate(&now).unwrap_or(ReencodeOutcome::RecordSetChanged)`
+/// with `Ok(ReencodeOutcome::RecordSetChanged)` names the bucket
+/// `record_set_changed` and the `not_migrated` assertion fails.
+#[tokio::test]
+async fn a_rewrite_record_under_the_reencode_is_not_named_for_a_retry() {
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    provision(store.inner()).await;
+    seed_compacted(store.inner()).await;
+    stamp_parts_below_target(store.inner()).await;
+    let config = reencode_cfg();
+
+    let report =
+        under_an_erasure_rewrite(store.as_ref(), migrate(store.as_ref(), &config, target())).await;
+
+    assert_eq!(report.not_migrated, Vec::new());
     assert_eq!(report.buckets_migrated, 0);
     assert_eq!(report.records_migrated, 0);
     assert_eq!(report.reencode_blocked, Vec::new());
