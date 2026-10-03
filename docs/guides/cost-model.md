@@ -65,6 +65,7 @@ Either condition is enough, and the two share one threshold:
   that window loses it. The graceful-drain residue a shutdown timeout cuts
   short can hold up to an hour of such a tenant's rows for the same reason.
   Strict mode is unaffected, since a strict waiter keeps the priority
+  threshold, and so is the flush deferral cap, which is derived from that
   threshold. `ravel_ingest_flushes_by_age_floor_total` counts the flushes
   this band opened.
 

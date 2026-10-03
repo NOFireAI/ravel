@@ -1039,6 +1039,10 @@ pub struct IngestPipelineSnapshot {
     /// back untouched and the next tick re-fires, so a rise means flush
     /// latency slipped past `--max-flush-delay`, not that anything was shed.
     pub flush_trigger_deferred_total: u64,
+    /// Writes refused because a shard they route to had a flush deferred for
+    /// the whole flush deferral cap, by the router before enqueue or by the
+    /// shard on a strict append. Cumulative, carried for every signal.
+    pub deferral_cap_refused_total: u64,
     /// Tenants a `DrainIntent::Teardown` flush left with buffered rows still
     /// unflushed, summed across shards (issue #1742). Those rows were already
     /// acknowledged in buffered mode (docs/consistency-model.md), so a
@@ -1170,6 +1174,7 @@ impl IngestPipelineSnapshot {
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
+            deferral_cap_refused_total: snapshot.deferral_cap_refused,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
             clock_lag_refused: snapshot.clock_lag_refused,
             clock_lag_unchecked: snapshot.clock_lag_unchecked,
@@ -1217,6 +1222,7 @@ impl IngestPipelineSnapshot {
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
+            deferral_cap_refused_total: snapshot.deferral_cap_refused,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
             clock_lag_refused: snapshot.clock_lag_refused,
             clock_lag_unchecked: snapshot.clock_lag_unchecked,
@@ -1255,6 +1261,7 @@ impl IngestPipelineSnapshot {
             flush_permit_wait_ns_total: snapshot.flush_permit_wait_ns_total,
             flushes_queued_total: snapshot.flushes_queued_total,
             flush_trigger_deferred_total: snapshot.flush_trigger_deferred_total,
+            deferral_cap_refused_total: snapshot.deferral_cap_refused,
             flush_all_residue_tenants: snapshot.flush_all_residue_tenants,
             clock_lag_refused: snapshot.clock_lag_refused,
             clock_lag_unchecked: snapshot.clock_lag_unchecked,
@@ -1807,6 +1814,25 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_flush_trigger_deferred_total",
             &labels(mode, pipeline.signal),
             pipeline.flush_trigger_deferred_total,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_deferral_cap_refused_total",
+        "Writes refused with a retryable 429 / RESOURCE_EXHAUSTED because a shard they route \
+         to had a flush deferred at --max-queued-flushes for the whole flush deferral cap, by \
+         signal. Nothing of a refused write is buffered. A rise means a shard's flushes have \
+         been stalled for most of the read-side slack, and the shard accepts again once they \
+         open.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_deferral_cap_refused_total",
+            &labels(mode, pipeline.signal),
+            pipeline.deferral_cap_refused_total,
         );
     }
 
@@ -13122,6 +13148,49 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         );
     }
 
+    /// Each pipeline's deferral cap refusal count renders under its own
+    /// signal label, once, as a counter.
+    #[test]
+    fn deferral_cap_refusals_render_by_signal() {
+        let mut body = String::new();
+        render_ingest_family(
+            &mut body,
+            Mode::Gateway,
+            &[
+                IngestPipelineSnapshot::from_metrics(ravel_ingest::IngestMetricsSnapshot {
+                    deferral_cap_refused: 1,
+                    ..Default::default()
+                }),
+                IngestPipelineSnapshot::from_log_metrics(ravel_ingest::LogIngestMetricsSnapshot {
+                    deferral_cap_refused: 2,
+                    ..Default::default()
+                }),
+                IngestPipelineSnapshot::from_span_metrics(
+                    ravel_ingest::SpanIngestMetricsSnapshot {
+                        deferral_cap_refused: 3,
+                        ..Default::default()
+                    },
+                ),
+            ],
+        );
+        assert_eq!(
+            body.matches("# TYPE ravel_ingest_deferral_cap_refused_total counter")
+                .count(),
+            1,
+            "{body}"
+        );
+        for (signal, count) in [("metrics", 1), ("logs", 2), ("spans", 3)] {
+            let sample = format!(
+                "ravel_ingest_deferral_cap_refused_total{{mode=\"gateway\",signal=\"{signal}\"}} {count}\n"
+            );
+            assert_eq!(
+                body.matches(&sample).count(),
+                1,
+                "missing `{sample}`:\n{body}"
+            );
+        }
+    }
+
     /// A trigger the queued-flush cap really refused reaches the rendered
     /// `/metrics` body as a nonzero
     /// `ravel_ingest_flush_trigger_deferred_total`.
@@ -13140,8 +13209,10 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
     /// that one pins what a deferral does to the data, this one pins that an
     /// operator can see the deferral happen. The second matters because of
     /// what the first records. A deferral moves the ingest hour the rows land
-    /// in, past what the read-side scan slack covers, and this counter is the
-    /// only signal an operator has that it is happening (issue #1916).
+    /// in, and the flush deferral cap is what keeps that inside the read-side
+    /// scan slack for acknowledged strict writes: this counter rising is the
+    /// early signal, and `ravel_ingest_deferral_cap_refused_total` rising
+    /// means a shard has reached the cap and is refusing writes.
     #[tokio::test]
     async fn a_real_deferral_renders_on_the_metrics_body() {
         use std::future::Future;

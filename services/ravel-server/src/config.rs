@@ -1587,7 +1587,15 @@ pub struct Cli {
     /// `/metrics` carries that counter and the depth it bounds,
     /// `ravel_ingest_queued_flushes`, both by `{mode, signal}`.
     /// Nothing is acked and nothing is dropped, so a refusal is a deferral,
-    /// not a shed. Drains (`FlushNow`, shutdown) are never refused, and
+    /// not a shed. A deferral is bounded by the flush deferral cap, the 2 h
+    /// read-side scan slack less `max_flush_lifetime`, `--max-flush-delay`
+    /// (the adaptive corridor's widest ceiling under `--adaptive-flush-delay`)
+    /// and one flush tick (3597.8 s at the defaults): once a shard's oldest
+    /// deferred flush reaches it, the shard refuses every new write, in both
+    /// write modes, with a retryable 429 / `RESOURCE_EXHAUSTED` counted on
+    /// `ravel_ingest_deferral_cap_refused_total`, and a strict write already
+    /// waiting on that flush is answered 503 with its rows still buffered,
+    /// until the deferred flushes open. Drains (`FlushNow`, shutdown) are never refused, and
     /// neither is a tenant buffer that has crossed its per-(shard, tenant)
     /// memory backstop, so THE QUEUE CAN EXCEED THIS CAP under memory
     /// pressure: the backstop is the only bound on one buffer's resident
@@ -1709,9 +1717,12 @@ pub struct Cli {
     /// BUFFERED-MODE LOSS WINDOW for such a tenant: an acknowledged
     /// buffered-mode row in a buffer below the floor may sit in process memory
     /// for up to one hour (`max_flush_lifetime`)
-    /// before its flush even opens, and a crash in that window loses it.
+    /// before its flush even opens, and a crash in that window loses it. A
+    /// flush `--max-queued-flushes` defers adds its deferral on top of that
+    /// hour, so such a row can then land past the read-side scan slack; the
+    /// flush deferral cap bounds acknowledged strict-mode rows, not these.
     /// Strict mode is unaffected: a strict waiter keeps the fast clock, so
-    /// acknowledged-write latency does not move. The graceful-drain residue a
+    /// acknowledged-write latency and the flush deferral cap do not move. The graceful-drain residue a
     /// `--shutdown-timeout` cuts short can likewise now hold up to an hour of
     /// a near-empty tenant's rows instead of 40 seconds' worth. Unlike the
     /// ADR-0076 cadence trio this knob moves on its own, and it must be below
@@ -6160,17 +6171,17 @@ impl Cli {
         //
         // Issue #1740's queued-flush cap adds a third term this check does NOT
         // carry: a deferred trigger leaves the rows buffered while the flush's
-        // ingest-hour bucket is pinned after the refusal, and one deferral
-        // round under a stalled store costs up to max_flush_lifetime. Adding it
-        // here would refuse the shipped defaults (40s + 3600s + 3600s against a
-        // 7200s slack), which is a decision about ingest's deferral policy and
-        // about a frozen read-side constant, not one to take in this check.
-        // Recorded beside ravel_catalog::FLUSH_BOUND_SLACK_HOURS and measured
-        // by ravel-ingest's a_deferred_flush_can_overrun_the_flush_bound_slack.
+        // ingest-hour bucket is pinned after the refusal. Ingest bounds that
+        // term itself, with the flush deferral cap
+        // (ravel_ingest::IngestConfig::flush_deferral_cap_ns, the ADR-1642
+        // deferral cap amendment): it is what the slack leaves an acknowledged
+        // strict-mode row, and a shard at the cap refuses new writes in both
+        // modes. ravel-ingest's
+        // a_deferred_flush_is_never_acked_past_the_flush_bound_slack holds it.
         // Pinning the bucket before the cap check instead does not resolve it:
         // that spends the deferral out of the catalog's sealed-hour margin,
         // where a late record is never read again rather than missed by one
-        // generation of a shard-count decrease. Open on issue #1916.
+        // generation of a shard-count decrease.
         let flush_bound_ns = duration_nanos_saturating(flush_cadence.max_flush_delay_idle)
             .saturating_add(duration_nanos_saturating(
                 ravel_ingest::IngestConfig::default().max_flush_lifetime,

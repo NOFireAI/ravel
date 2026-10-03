@@ -36,6 +36,12 @@ pub enum WriteError {
     /// exhausted its retry budget, or `max_flush_lifetime` elapsed first.
     /// Per docs/consistency-model.md, nothing in this flush was acknowledged
     /// so retrying the whole write is safe.
+    ///
+    /// Also the outcome-unknown answer for a waiter taken off a buffer whose
+    /// rows stay buffered: a flush the clock checks refused at flush open
+    /// (ADR-1307, ADR-1685), and a strict waiter on a buffer whose deferral
+    /// reached the flush deferral cap (ADR-1642 deferral cap amendment). Those
+    /// rows are written by a later flush, so a retry stores them twice.
     #[error("flush abandoned: {0}")]
     Abandoned(String),
     /// Building the RSEG segment failed (a deterministic input problem, e.g.
@@ -69,9 +75,23 @@ pub enum WriteError {
     /// shed before any buffering, with no shard touched and no commit token
     /// issued. Retryable: a buffer slot frees as soon as any in-flight flush
     /// completes. The gateway maps this to HTTP 429 with `Retry-After` / gRPC
-    /// `RESOURCE_EXHAUSTED`, not the 503 the other write failures take.
+    /// `RESOURCE_EXHAUSTED`, not the 503 the other write failures take. The
+    /// byte budget is the only cause: a shard at the flush deferral cap answers
+    /// with [`Self::DeferralCapReached`] instead.
     #[error("ingest buffer byte budget reached")]
     BufferBudgetExceeded,
+    /// A shard this write routes to has a flush that has stayed deferred at the
+    /// queued-flush cap for the whole flush deferral cap
+    /// ([`crate::IngestConfig::flush_deferral_cap_ns`], ADR-1642 deferral cap
+    /// amendment), so the write is refused before anything is buffered: no
+    /// row is stored and no commit token issued, in either write mode. The
+    /// router refuses before enqueue, and the shard refuses a strict append
+    /// that reaches it at the cap. Retryable: the shard accepts again once its
+    /// deferred flushes have opened. The gateway maps it the same way as
+    /// [`Self::BufferBudgetExceeded`], HTTP 429 with `Retry-After` / gRPC
+    /// `RESOURCE_EXHAUSTED`.
+    #[error("ingest shard flush deferral cap reached")]
+    DeferralCapReached,
     /// A multi-shard Strict write in which at least one shard failed *after*
     /// one or more sibling shards had already acked their commit durably in
     /// the same [`IngestRouter::write`](crate::IngestRouter::write) call
@@ -112,7 +132,8 @@ impl WriteError {
             | WriteError::AckTimeout
             | WriteError::Abandoned(_)
             | WriteError::StaleProvisioningView
-            | WriteError::BufferBudgetExceeded => true,
+            | WriteError::BufferBudgetExceeded
+            | WriteError::DeferralCapReached => true,
             WriteError::SegmentBuild(_)
             | WriteError::SeriesIdCollision(_)
             | WriteError::SeriesValueKindMismatch(_) => false,
@@ -160,6 +181,16 @@ mod tests {
         assert!(WriteError::Abandoned("x".into()).is_retryable());
         assert!(WriteError::AckTimeout.is_retryable());
         assert!(WriteError::ShardUnavailable.is_retryable());
+    }
+
+    #[test]
+    fn deferral_cap_reached_is_retryable_and_names_the_cap() {
+        assert!(WriteError::DeferralCapReached.is_retryable());
+        assert!(
+            WriteError::DeferralCapReached
+                .to_string()
+                .contains("deferral cap")
+        );
     }
 
     #[test]

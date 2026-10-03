@@ -40,6 +40,20 @@ Strict mode (default):
 - After a strict ack, no crash of any Ravel process may lose that data.
   Object-store durability is the floor: data survives anything the object
   store survives.
+- A strict write is never acknowledged from a flush the queued-flush cap
+  deferred for longer than the flush deferral cap (ADR-1642 deferral cap
+  amendment): `FLUSH_BOUND_SLACK_HOURS` (2 h) less `max_flush_lifetime`, less
+  `max_flush_delay` (or, with adaptive flush delay on, the corridor's widest
+  ceiling) and one `flush_tick`, 3597.8 s at the defaults. This keeps every
+  acknowledged strict row inside the read-side scan slack. A strict waiter on a
+  buffer whose deferral reached the cap is answered with the retryable
+  `Abandoned` (503), which here means outcome unknown: its rows stay buffered
+  and a later flush stores them. While a shard's oldest deferral is at the cap,
+  every new write routed to it, strict or buffered, is refused before
+  buffering with the retryable `DeferralCapReached` (HTTP 429 with
+  `Retry-After`, gRPC `RESOURCE_EXHAUSTED`), until its deferred flushes open.
+  A multi-shard write whose capped shard fails after a sibling committed
+  answers the partial multi-shard commit error instead, which takes 503.
 
 Buffered mode (opt-in per request, named "buffered"):
 - Acknowledged after admission and enqueue to a shard actor. A crash between
@@ -113,9 +127,12 @@ Buffered mode (opt-in per request, named "buffered"):
   prefix stayed healthy.
 - Never described as durable. No commit token is returned.
 
-Rejection: admission failures (limits, auth, quota) reject before buffering
-in both modes. Partial success uses the OTLP partial-success message with
-rejected point counts and reasons.
+Rejection: admission failures (limits, auth, quota, the ingest byte budget)
+and a shard at the flush deferral cap reject before buffering in both modes,
+so nothing of a rejected request is stored. A strict waiter answered
+`Abandoned` at the deferral cap is not a rejection: its rows were buffered
+before the answer and a later flush stores them. Partial success uses the OTLP
+partial-success message with rejected point counts and reasons.
 
 ## Visibility semantics
 
@@ -204,6 +221,12 @@ durable-sibling count at `warn` with the tenant hash instead, and the bulk
   ack is *user-visible* duplication (extra rows / spans). The
   "identical duplicates are harmless" framing above is true for metrics only
   and must not be over-read to cover logs and spans (ADR-0051 §5).
+- A strict write answered `Abandoned` because its buffer's deferral reached
+  the flush deferral cap (see Strict mode above) has its rows stored anyway,
+  by a later flush, so a client retry stores them twice. Metrics collapse the
+  copy at query time by `(series_id, ts)`; for logs and spans it is
+  user-visible duplication, and an idempotency key does not prevent it, since
+  no marker is written for a write that was never acknowledged.
 - Writer-side retries of the same flush are idempotent by construction:
   same commit key, content-hash-verified (ADR-0002).
 - The `ravel-cli load` bulk path is an instance of this at-least-once logs

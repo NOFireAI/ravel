@@ -395,54 +395,84 @@ whether or not a deferral reached the pin, which is how this shipped green.
 <!-- amendment-supersedes: phrase="`a_deferred_flush_can_overrun_the_flush_bound_slack`" pointer="deferral cap amendment" -->
 
 The queued-flush cap's deferral is now bounded. A refused trigger may stay
-deferred for at most the deferral cap, and a shard whose oldest deferral reaches
-it stops taking strict-mode writes until that flush opens, instead of deferring
-another round with new work piling in behind it.
+deferred for at most the deferral cap. No strict-mode write is acknowledged
+from a flush that opens past it, and a shard whose oldest deferral reaches it
+refuses every new write, in both write modes, until that flush opens, instead
+of deferring another round with new work piling in behind it.
 
 **The cap.** `IngestConfig::flush_deferral_cap_ns()` is what the read-side
-slack has left once its own derivation is paid for:
+slack leaves a strict-mode row once the rest of that row's span is paid for:
 
 ```
-cap = FLUSH_BOUND_SLACK_HOURS * 1h - max_flush_lifetime - routing_to_pin_bound
-routing_to_pin_bound = max(max_flush_delay, max_flush_delay_idle, sub-floor hold) + flush_tick
+cap = FLUSH_BOUND_SLACK_HOURS * 1h - max_flush_lifetime - strict_ack_age_bound
+strict_ack_age_bound = max(max_flush_delay, widest adaptive ceiling) + flush_tick
+widest adaptive ceiling = strict_visibility_budget_ns - put_retry_base_delay
+                          (only with adaptive_flush_delay on)
 ```
 
-`FLUSH_BOUND_SLACK_HOURS` (2h) was derived as the worst buffer age at flush
-open plus `max_flush_lifetime` (ADR-0052 section 3; the derivation is recorded
-on the constant in `ravel-catalog`). The deferral sits between a trigger firing
-and its flush opening, so it is a third term, and it gets what the other two
-leave: a buffer whose deferral stays inside the cap opens with its oldest row
-younger than `routing_to_pin_bound + cap = slack - max_flush_lifetime`, the same
-worst age the frozen derivation assumed. At the shipped defaults that is
-`7200s - 3600s - (40s + 0.2s) = 3559.8s`. The cap saturates at 0: with a
-non-zero `idle_flush_byte_floor` the sub-floor hold is one tick short of
-`max_flush_lifetime`, so the hold already spends the slack, and there a
-deferral reaches the cap on its first refusal. The constant itself is
-unchanged.
+The derivation follows the rows the cap protects. A strict-mode waiter puts its
+buffer on the fast clock in all three actors (`age_threshold_ns`), so a buffer
+holding one triggers no later than `max_flush_delay` after its oldest row, or,
+on the metrics actor with adaptive delay on, the corridor ceiling, whose widest
+value is the visibility budget less the retry headroom at a zero PUT round
+trip. The age check runs on a tick, so add one `flush_tick`. That is
+`strict_ack_age_bound`: a strict row has waited at most that long when its
+buffer's deferral starts, or none at all if it arrived after the deferral
+started. A strict waiter is acknowledged only from a flush that opens less
+than the cap after the deferral's start, and the flush then has its
+`max_flush_lifetime`. So an acknowledged strict row's routing-to-pin span plus
+the flush lifetime is below `strict_ack_age_bound + cap + max_flush_lifetime =
+FLUSH_BOUND_SLACK_HOURS`, the span ADR-0052 section 3 sized the slack for. At
+the shipped defaults that is `7200s - 3600s - (2s + 0.2s) = 3597.8s`. A
+non-zero `idle_flush_byte_floor` leaves it at 3597.8s: the sub-floor hold of
+ADR-1737 applies only to a buffer with no strict waiter, so it is not a term.
+(The first cut subtracted the longest age threshold of any buffer, which made
+the cap 0 whenever the floor was set and refused every strict write on the
+first full queue.) With adaptive delay on at the defaults the bound is 2.6s
+and the cap 3597.4s. The log and span actors use the same cap; the adaptive
+term only ever lowers it. It saturates at 0 for a configuration whose own
+bounds already spend the slack. The constant is unchanged.
 
 **What is tracked.** Each tenant buffer carries the time of its first refusal
-across every later one, and each shard keeps the oldest of those. Both live on
-the actor; nothing new is persisted.
+across every later one, and each shard keeps the oldest of those and publishes
+it to the router through a per-shard at-cap flag, which the actor sets on a
+refusal and clears once every deferred buffer has opened. Nothing new is
+persisted.
 
 **The backpressure.** When the oldest deferral on a shard reaches the cap:
 
-- Every new strict-mode write to that shard, from any tenant, is answered with
-  `BufferBudgetExceeded` (`WriteError`, `LogWriteError`, `SpanWriteError`) and
-  nothing is buffered; its ADR-0069 byte charge is refunded. That error is
-  reused rather than a new one added because it is already the admission
-  backpressure signal: the ingest HTTP handlers map it to 429 with
-  `Retry-After` and the gRPC handlers to `RESOURCE_EXHAUSTED`, and
-  `is_retryable()` is true. Its message names the byte budget, which is not
-  the cause here; the gateway response is the right one.
+- The router refuses every new write routed to that shard before enqueue,
+  from any tenant and in both write modes, with a dedicated retryable error,
+  `DeferralCapReached` (`WriteError`, `LogWriteError`, `SpanWriteError`), whose
+  message names the deferral cap. Nothing is buffered and its ADR-0069 byte
+  charge is refunded. This is the only place a buffered-mode write can be
+  refused, since the router acknowledges it at enqueue, before the shard actor
+  sees it. The flag carries the deferral start rather than a bare bit, so the
+  router compares it with its own clock reading and sees the cap the instant it
+  is reached, not at the actor's next tick. The shard actor refuses a
+  strict-mode append that was enqueued just before the cap the same way.
+  Every gateway that maps ingest errors maps it like `BufferBudgetExceeded`:
+  HTTP 429 with `Retry-After`, gRPC `RESOURCE_EXHAUSTED`. `BufferBudgetExceeded`
+  is not reused, because its contract is a shed by the byte budget with no
+  shard touched.
 - The strict-mode waiters already riding a buffer whose deferral has reached the
-  cap are answered with the same error, at the refusal or flush open that finds
-  it there. No strict write is therefore acknowledged from a flush that opened
-  past the cap. The rows stay buffered and flush later without an
-  acknowledgement, as on the ADR-1307 regression arm, so a client retry writes
-  them twice. For metrics the query-time dedup by `(series_id, ts)` collapses
-  the copy; logs and spans have no query-time dedup, so there the retry is the
-  same at-least-once duplication a lost acknowledgement already produces
+  cap are answered at the refusal or flush open that finds it there, with the
+  existing outcome-unknown `Abandoned` (503), not with a refusal. Their rows
+  stay buffered and a later flush stores them unacknowledged, as on the
+  ADR-1307 clock-refusal arm, so a client retry writes them twice. For metrics
+  the query-time dedup by `(series_id, ts)` collapses the copy; logs and spans
+  have no query-time dedup, so there the retry is the same at-least-once
+  duplication a lost acknowledgement already produces
   (docs/consistency-model.md "Duplicates and idempotency").
+- A multi-shard strict write whose capped shard fails after a sibling shard
+  committed answers `PartialWrite` carrying the siblings' tokens, which the
+  gateways map to 503 like every partial multi-shard commit. The router's
+  pre-enqueue check refuses the whole write before any shard is sent anything,
+  so this arises only from the shard-side refusal or a stripped waiter.
+- `ravel_ingest_deferral_cap_refused_total`, by `{mode, signal}`, counts the
+  refused writes, fed from each pipeline's ingest metrics the way the other
+  ingest counters are. The first refusal of each cap episode logs once at WARN
+  with the signal, shard and cap.
 - The shard accepts again once every buffer that reached the cap has opened.
   That needs a queue slot, so in practice it is when the queue drains below
   `max_queued_flushes`. The oldest deferral is recomputed on every age tick and
@@ -451,24 +481,26 @@ the actor; nothing new is persisted.
 
 **Oldest first.** `flush_aged` used to retry due buffers in `HashMap` order, so
 a freed slot went to an arbitrary tenant and a deferred buffer could lose every
-round. Deferred buffers now go first, oldest deferral first, then the rest by
-oldest row. A deferred buffer is also always due: answering its waiters can
-raise its age threshold from `max_flush_delay` to the idle tier, and it must not
-wait that out while holding the shard at the cap.
+round. Deferred buffers now go first, ordered by deferral start rather than by
+oldest row, then the rest by oldest row. A deferred buffer is also always due,
+whatever its own age threshold: a size trigger can be refused on a buffer still
+far below its age threshold, and answering its waiters can raise its threshold
+from `max_flush_delay` to the idle tier, and it must not wait either out while
+holding the shard at the cap.
 
 **What this does not bound.** Two things, stated so the guarantee is not read
 wider than it is:
 
-- Buffered-mode writes. The router acknowledges a buffered write at enqueue,
-  before the shard actor sees it, so the actor cannot refuse it, and it merges
-  as before. A buffered row in a buffer deferred past the cap still pins late
-  and can still be invisible to the retiring generation of a shard-count
-  decrease. Refusing those needs an admission check on the router side reading
-  the shard's state, which this amendment does not add. Under a `Bounded` byte
-  budget the ceiling still bounds how much of it accumulates.
+- Buffered-mode rows acknowledged before the shard reached the cap. Their
+  buffer still waits for a queue slot, so such a row can pin late and be
+  invisible to the retiring generation of a shard-count decrease; with a
+  non-zero `idle_flush_byte_floor` a sub-floor buffer has spent the whole slack
+  on its hold before any deferral. What the cap adds for buffered mode is that
+  no new buffered write joins a shard at the cap. Under a `Bounded` byte budget
+  the ceiling still bounds how much of it accumulates.
 - The wall-clock length of a deferral. A buffer at the cap still waits for a
   queue slot. What the cap bounds is what gets acknowledged, and how much new
-  strict work joins the queue behind a stall.
+  work joins the queue behind a stall.
 
 **Rejected: forcing the flush past the queue cap.** Spawning the capped buffer
 regardless of `max_queued_flushes` would pin its bucket in time, but it is the
@@ -487,13 +519,19 @@ a version bump. It would not help in any case: without a cap no fixed value
 bounds an unbounded number of rounds.
 
 **Tests.** In `ravel_ingest::shard::tests`, the overrun test is renamed
-`a_deferred_flush_is_never_acked_past_the_flush_bound_slack` and inverted: the
-same three-hour deferral on a live shard actor is now answered with
-`BufferBudgetExceeded`, and the test asserts the cap is exactly what the slack
-leaves at the shipped defaults.
-`a_shard_at_the_deferral_cap_refuses_appends_until_it_drains` and
-`deferred_flushes_retry_oldest_first` cover the backpressure and the ordering,
-and `crates/ravel-ingest/tests/flush_deferral_cap.rs` repeats both for the log
-and span actors. `a_deferred_flush_takes_the_ingest_hour_it_opened_in` and
+`a_deferred_flush_is_never_acked_past_the_flush_bound_slack` and inverted: on a
+live shard actor with a 90 minute lifetime, whose cap is a nonzero 1799.94s,
+a one-hour deferral is answered `Abandoned` rather than acknowledged, and a
+deferral just inside the cap is acknowledged with its routing-to-pin span plus
+the lifetime inside the slack. `config::tests` pins the cap at the defaults,
+with a non-zero idle floor, and with adaptive delay on.
+`a_shard_at_the_deferral_cap_refuses_appends_until_it_drains` covers the
+router-side refusal in both modes and the acceptance after drain;
+`a_write_one_tick_before_the_deferral_cap_is_accepted_and_one_at_it_refused`
+the boundary; `a_deferred_buffer_below_its_age_threshold_is_still_due` and
+`deferred_flushes_retry_by_deferral_age_not_row_age` the retry order, beside
+`deferred_flushes_retry_oldest_first`. `crates/ravel-ingest/tests/flush_deferral_cap.rs`
+repeats the refusal and the ordering for the log and span routers.
+`a_deferred_flush_takes_the_ingest_hour_it_opened_in` and
 `carrying_a_pre_deferral_pin_would_write_into_a_sealed_hour` stand as before:
 the pin is still taken at flush open.

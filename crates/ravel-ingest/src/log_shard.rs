@@ -67,6 +67,7 @@ use crate::config::{
     MAX_FLUSH_ALL_PASSES, MAX_FLUSH_CLOCK_HOLD_NS, StoreClockLag, checked_ingest_hour_bucket,
     idle_age_threshold, memory_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
+use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
@@ -1050,13 +1051,18 @@ pub(crate) struct LogShardActor {
     /// Read at trigger time rather than resolved once, because the router
     /// installs the budget after the actors are spawned.
     backstop_ceiling: BufferBudgetCeiling,
-    /// [`IngestConfig::flush_deferral_cap_ns`], resolved once (issue #1916).
+    /// [`IngestConfig::flush_deferral_cap_ns`], resolved once.
     deferral_cap_ns: i64,
     /// The earliest `deferred_since_ns` across `tenants`, `None` when no buffer
     /// is deferred. Lowered on every refusal and recomputed after each age
     /// tick and drain, so between those it can only read older than the
     /// truth, which errs toward refusing an append rather than accepting one.
+    /// Published to `cap_flag` on every change.
     oldest_deferral_ns: Option<i64>,
+    /// This shard's at-cap flag, shared with the router's `LogShardHandle` so
+    /// the router refuses a write to a shard at the deferral cap before
+    /// enqueue, buffered mode included.
+    cap_flag: DeferralCapFlag,
 }
 
 impl LogShardActor {
@@ -1073,8 +1079,10 @@ impl LogShardActor {
         rx: mpsc::Receiver<LogShardMsg>,
         indexed_fields: Arc<IndexedFieldsOverlay>,
         backstop_ceiling: BufferBudgetCeiling,
+        cap_flag: DeferralCapFlag,
         #[cfg(feature = "stage-timing")] stage_timings: Arc<LogStageTimings>,
     ) -> Self {
+        cap_flag.publish(None, clock.now_ns());
         let ctx = Arc::new(LogFlushCtx {
             shard,
             writer_id,
@@ -1105,6 +1113,7 @@ impl LogShardActor {
             backstop_ceiling,
             deferral_cap_ns: config.flush_deferral_cap_ns(),
             oldest_deferral_ns: None,
+            cap_flag,
         }
     }
 
@@ -1364,8 +1373,7 @@ impl LogShardActor {
     }
 
     /// Fires every due age trigger, deferred buffers first and oldest deferral
-    /// first, exactly as [`crate::shard`]'s `ShardActor::flush_aged` does
-    /// (issue #1916).
+    /// first, exactly as [`crate::shard`]'s `ShardActor::flush_aged` does.
     async fn flush_aged(&mut self) {
         let now = self.clock.now_ns();
         let mut due: Vec<(i64, i64, TenantId, FlushTrigger)> = self
@@ -1391,19 +1399,23 @@ impl LogShardActor {
         self.refresh_oldest_deferral();
     }
 
-    /// Answers a strict-mode write with the retryable overload error, taking
-    /// its ack, when a deferred flush on this shard has reached the deferral
-    /// cap (issue #1916). The caller returns on `true`, dropping the write's
-    /// charge, which refunds it. A buffered-mode write carries no ack because
-    /// the router already acknowledged it, so it is never refused here.
+    /// Answers a strict-mode write with [`LogWriteError::DeferralCapReached`],
+    /// taking its ack, when a deferred flush on this shard has reached the
+    /// deferral cap; the router refuses such a write before enqueue, and this
+    /// catches one enqueued before the shard reached the cap. The caller
+    /// returns on `true`, dropping the write's charge, which refunds it. A
+    /// buffered-mode write carries no ack because the router already
+    /// acknowledged it, so it is never refused here.
     fn refuse_at_deferral_cap(&self, ack: &mut Option<LogAck>, now_ns: i64) -> bool {
         let reached = self
             .oldest_deferral_ns
-            .is_some_and(|since| now_ns.saturating_sub(since) >= self.deferral_cap_ns);
+            .is_some_and(|since| deferral_cap_reached(since, now_ns, self.deferral_cap_ns));
         match ack.take() {
             Some(ack) if reached => {
+                self.metrics.record_deferral_cap_refused();
+                self.cap_flag.note_refusal(Signal::Logs, self.shard);
                 self.ctx
-                    .ack_waiters(vec![ack], Err(LogWriteError::BufferBudgetExceeded));
+                    .ack_waiters(vec![ack], Err(LogWriteError::DeferralCapReached));
                 true
             }
             other => {
@@ -1414,13 +1426,15 @@ impl LogShardActor {
     }
 
     /// Recomputes `oldest_deferral_ns` from the buffers, clearing it once every
-    /// deferred flush has opened.
+    /// deferred flush has opened, and publishes it to the router.
     fn refresh_oldest_deferral(&mut self) {
         self.oldest_deferral_ns = self
             .tenants
             .values()
             .filter_map(|buf| buf.deferred_since_ns)
             .min();
+        self.cap_flag
+            .publish(self.oldest_deferral_ns, self.clock.now_ns());
     }
 
     /// Returns `(tenant_count, buffered_record_count)` across every buffered
@@ -1717,18 +1731,20 @@ impl LogShardActor {
         }
         if buf
             .deferred_since_ns
-            .is_some_and(|since| raw_ns.saturating_sub(since) >= self.deferral_cap_ns)
+            .is_some_and(|since| deferral_cap_reached(since, raw_ns, self.deferral_cap_ns))
             && !buf.waiters.is_empty()
         {
-            // Issue #1916: deferred for the whole deferral cap, so a flush
-            // opening from here on pins past the read-side slack for this
-            // buffer's oldest rows. Its strict-mode waiters get the retryable
-            // overload error instead of an ack from that flush; the rows stay
-            // buffered and flush unacknowledged, so a client retry stores them
-            // twice: logs and spans have no query-time dedup.
+            // Deferred for the whole deferral cap, so a flush opening from here
+            // on pins past the read-side slack for this buffer's strict
+            // records. Its strict-mode waiters are not acknowledged from that
+            // flush; the records stay buffered and a later flush writes them,
+            // so the answer is the outcome-unknown `Abandoned` (503), and a
+            // client retry stores them twice: logs have no query-time dedup.
             let waiters = std::mem::take(&mut buf.waiters);
-            self.ctx
-                .ack_waiters(waiters, Err(LogWriteError::BufferBudgetExceeded));
+            self.ctx.ack_waiters(
+                waiters,
+                Err(LogWriteError::Abandoned(DEFERRAL_CAP_ABANDONED.into())),
+            );
         }
         if refused {
             // Issue #1740: this shard is already holding `max_queued_flushes`
@@ -1744,12 +1760,12 @@ impl LogShardActor {
             //
             // The rows carry no ingest-hour bucket across the deferral, and
             // `deferred_since_ns` dates the first refusal so the deferral cap
-            // (issue #1916) bounds it; see `shard::ShardActor::flush_tenant`
-            // for why moving that pin ahead of this check is not the fix it
-            // looks like.
+            // bounds it; see `shard::ShardActor::flush_tenant` for why moving
+            // that pin ahead of this check is not the fix it looks like.
             self.metrics.record_shard_flush_trigger_deferred(self.shard);
             let since = buf.deferred_since_ns.unwrap_or(raw_ns);
             self.oldest_deferral_ns = Some(self.oldest_deferral_ns.map_or(since, |o| o.min(since)));
+            self.cap_flag.publish(self.oldest_deferral_ns, raw_ns);
             self.tenants.insert(tenant, buf);
             return;
         }
@@ -2122,6 +2138,7 @@ mod tests {
                     crate::log_router::NoIndexedFields,
                 ))),
                 BufferBudgetCeiling::unlimited(),
+                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             );
@@ -2982,6 +2999,7 @@ mod tests {
                 crate::log_router::NoIndexedFields,
             ))),
             BufferBudgetCeiling::unlimited(),
+            DeferralCapFlag::new(exhaustion_config(4).flush_deferral_cap_ns()),
             #[cfg(feature = "stage-timing")]
             Arc::new(LogStageTimings::new()),
         );

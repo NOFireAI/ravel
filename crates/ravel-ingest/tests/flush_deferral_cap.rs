@@ -1,12 +1,14 @@
 //! The flush deferral cap (issue #1916, ADR-1642 deferral cap amendment) on
-//! the log and span shard actors. The metrics actor's copies live in
+//! the log and span shard actors and routers. The metrics actor's copies live in
 //! `ravel_ingest::shard::tests`, beside the read-side slack tests they extend.
 //!
 //! Each pipeline repeats the deferral bookkeeping rather than sharing it with
 //! `shard.rs`, so each gets its own proof that it is wired in: a shard whose
 //! oldest deferred flush reaches the cap answers the deferred strict-mode
-//! write and any new one with the retryable `BufferBudgetExceeded`, accepts
-//! again once its queue drains, and retries deferred flushes oldest first.
+//! write with the outcome-unknown `Abandoned`, its router refuses any new
+//! write to it before enqueue with the retryable `DeferralCapReached` in both
+//! write modes, it accepts again once its queue drains, and it retries
+//! deferred flushes oldest first.
 //!
 //! Every wait here is a cooperative poll on a metric or a task plus an
 //! injected-clock advance. No wall-clock sleep, no `tokio::time::timeout`, no
@@ -39,10 +41,10 @@ const BASE_NS: i64 = 1_700_000_000_000_000_000;
 const TICK_ADVANCE_NS: i64 = 100_000_000;
 
 /// One permit and one queue slot, so one parked flush puts the shard at its
-/// queued-flush cap. The lifetime is the shipped 3600 s, which leaves a
-/// deferral cap of 7200 s less 3600 s less the 40 s idle ceiling and one
-/// 10 ms tick; a jump to the cap stays inside the parked flush's lifetime, so
-/// abandonment never frees the slot early.
+/// queued-flush cap. A 4000 s lifetime leaves a deferral cap of 7200 s less
+/// 4000 s less the 50 ms strict delay and one 10 ms tick; a jump to the cap
+/// stays inside the parked flush's lifetime, so abandonment never frees the
+/// slot early.
 fn one_slot_config() -> IngestConfig {
     IngestConfig {
         shard_count: 1,
@@ -51,6 +53,7 @@ fn one_slot_config() -> IngestConfig {
         flush_tick: Duration::from_millis(10),
         max_inflight_flushes: 1,
         max_queued_flushes: 1,
+        max_flush_lifetime: Duration::from_secs(4000),
         ..IngestConfig::default()
     }
 }
@@ -68,8 +71,9 @@ async fn until(mut probe: impl FnMut() -> bool) {
 }
 
 /// The two tests, generated once per pipeline: `$router` is the router type,
-/// `$err` its write error type, `$spawn` a strict-mode single-item writer, and
-/// `$buffered` the cumulative buffered-item counter on its metrics snapshot.
+/// `$err` its write error type, `$spawn` a single-item writer taking a write
+/// mode, and `$buffered` the cumulative buffered-item counter on its metrics
+/// snapshot.
 macro_rules! deferral_cap_tests {
     ($refuse:ident, $oldest_first:ident, $router:ty, $err:ident, $spawn:ident, $buffered:ident) => {
         #[tokio::test]
@@ -79,7 +83,7 @@ macro_rules! deferral_cap_tests {
             let clock = TestClock::new(BASE_NS);
             let config = one_slot_config();
             let cap_ns = config.flush_deferral_cap_ns();
-            assert_eq!(cap_ns, 3_559_990_000_000);
+            assert_eq!(cap_ns, 3_199_940_000_000);
             let router = Arc::new(
                 <$router>::new(config, Arc::clone(&store), clock.clone()).with_budget(unlimited()),
             );
@@ -112,13 +116,15 @@ macro_rules! deferral_cap_tests {
                     .sum()
             };
 
-            let parked = $spawn(&router, &acme, 0);
+            let refusals = || router.metrics().snapshot().deferral_cap_refused;
+
+            let parked = $spawn(&router, &acme, 0, WriteMode::Strict);
             until(|| buffered() >= 1).await;
             clock.advance_ns(TICK_ADVANCE_NS);
             until(|| in_flight() == 1).await;
             gate.wait_until_held(1).await;
 
-            let deferred = $spawn(&router, &acme, 1);
+            let deferred = $spawn(&router, &acme, 1, WriteMode::Strict);
             until(|| buffered() >= 2).await;
             clock.advance_ns(TICK_ADVANCE_NS);
             until(|| deferred_triggers() >= 1).await;
@@ -129,23 +135,31 @@ macro_rules! deferral_cap_tests {
 
             clock.advance_ns(cap_ns);
             until(|| deferred_triggers() >= 2).await;
-            let refused = deferred.await.expect("deferred write task");
+            let stripped = deferred.await.expect("deferred write task");
             assert!(
-                matches!(refused, Err($err::BufferBudgetExceeded)),
-                "the deferred write is answered with the overload error at the \
-                 cap, got {refused:?}"
+                matches!(&stripped, Err($err::Abandoned(msg)) if msg.contains("deferral cap")),
+                "the deferred write is answered outcome-unknown at the cap, got \
+                 {stripped:?}"
             );
-            assert!($err::BufferBudgetExceeded.is_retryable());
 
             let before = buffered();
-            let shed = $spawn(&router, &globex, 2)
+            let shed = $spawn(&router, &globex, 2, WriteMode::Strict)
                 .await
                 .expect("globex write task");
             assert!(
-                matches!(shed, Err($err::BufferBudgetExceeded)),
-                "a shard at the deferral cap refuses a new append, got {shed:?}"
+                matches!(shed, Err($err::DeferralCapReached)),
+                "a shard at the deferral cap refuses a strict write, got {shed:?}"
             );
-            assert_eq!(buffered(), before, "a refused append buffers nothing");
+            let shed = $spawn(&router, &globex, 4, WriteMode::Buffered)
+                .await
+                .expect("globex write task");
+            assert!(
+                matches!(shed, Err($err::DeferralCapReached)),
+                "a shard at the deferral cap refuses a buffered write, got {shed:?}"
+            );
+            assert!($err::DeferralCapReached.is_retryable());
+            assert_eq!(buffered(), before, "a refused write buffers nothing");
+            assert_eq!(refusals(), 2);
 
             for id in gate.held() {
                 assert!(gate.release(id));
@@ -164,8 +178,15 @@ macro_rules! deferral_cap_tests {
             })
             .await;
 
-            let accepted = $spawn(&router, &globex, 3);
-            until(|| accepted.is_finished() || buffered() > before).await;
+            let receipt = $spawn(&router, &globex, 5, WriteMode::Buffered)
+                .await
+                .expect("buffered write task")
+                .expect("the shard accepts a buffered write once its deferred flush opened");
+            assert!(receipt.tokens.is_empty());
+            until(|| buffered() == before + 1).await;
+
+            let accepted = $spawn(&router, &globex, 3, WriteMode::Strict);
+            until(|| accepted.is_finished() || buffered() > before + 1).await;
             clock.advance_ns(TICK_ADVANCE_NS);
             let receipt = accepted
                 .await
@@ -211,7 +232,7 @@ macro_rules! deferral_cap_tests {
                     .sum()
             };
 
-            let parked = $spawn(&router, &tenant("parked"), 0);
+            let parked = $spawn(&router, &tenant("parked"), 0, WriteMode::Strict);
             until(|| buffered() >= 1).await;
             clock.advance_ns(TICK_ADVANCE_NS);
             until(|| !idle()).await;
@@ -222,7 +243,12 @@ macro_rules! deferral_cap_tests {
             let mut writes = Vec::new();
             let mut refusals = 0u64;
             for i in 0..TENANTS {
-                writes.push($spawn(&router, &tenant(&format!("t{i}")), i + 1));
+                writes.push($spawn(
+                    &router,
+                    &tenant(&format!("t{i}")),
+                    i + 1,
+                    WriteMode::Strict,
+                ));
                 let want = (i + 2) as u64;
                 until(|| buffered() >= want).await;
                 clock.advance_ns(TICK_ADVANCE_NS);
@@ -285,17 +311,13 @@ fn spawn_log_write(
     router: &Arc<LogIngestRouter>,
     tenant: &TenantId,
     i: usize,
+    mode: WriteMode,
 ) -> tokio::task::JoinHandle<Result<ravel_ingest::LogWriteReceipt, LogWriteError>> {
     let router = Arc::clone(router);
     let tenant = tenant.clone();
     tokio::spawn(async move {
         router
-            .write(
-                tenant,
-                vec![log_record(i)],
-                WriteMode::Strict,
-                Duration::from_secs(60),
-            )
+            .write(tenant, vec![log_record(i)], mode, Duration::from_secs(60))
             .await
     })
 }
@@ -329,17 +351,13 @@ fn spawn_span_write(
     router: &Arc<SpanIngestRouter>,
     tenant: &TenantId,
     i: usize,
+    mode: WriteMode,
 ) -> tokio::task::JoinHandle<Result<ravel_ingest::SpanWriteReceipt, SpanWriteError>> {
     let router = Arc::clone(router);
     let tenant = tenant.clone();
     tokio::spawn(async move {
         router
-            .write(
-                tenant,
-                vec![span_fixture(i)],
-                WriteMode::Strict,
-                Duration::from_secs(60),
-            )
+            .write(tenant, vec![span_fixture(i)], mode, Duration::from_secs(60))
             .await
     })
 }

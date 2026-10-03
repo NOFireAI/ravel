@@ -587,6 +587,19 @@ fn ingest_buffer_budget_shed_response() -> Response {
     response
 }
 
+/// 429 for a write refused because a shard it routes to has a flush deferred
+/// for the whole flush deferral cap: refused before any buffering, like the
+/// budget shed above, and answered with the same shape. `message` is the
+/// write error's own text, which names the cap.
+fn ingest_deferral_cap_response(message: String) -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, message).into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_BUFFER_BUDGET_RETRY_AFTER_SECONDS.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
 /// Attaches the encoded protobuf `body` as an OTLP response, plus the
 /// commit-token header `commit_token` when present. Shared by all three
 /// endpoints: the header name is the same for either signal, and a client
@@ -746,6 +759,9 @@ async fn export_metrics(
         Err(IngestRequestError::Write(WriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
+        Err(IngestRequestError::Write(err @ WriteError::DeferralCapReached)) => {
+            ingest_deferral_cap_response(err.to_string())
+        }
         // Retryable at the client: the same replica or a healthy one can
         // succeed on the identical request later.
         Err(IngestRequestError::Write(write_err)) if write_err.is_retryable() => {
@@ -827,6 +843,9 @@ async fn export_logs(
         Err(LogIngestRequestError::Write(LogWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
+        Err(LogIngestRequestError::Write(err @ LogWriteError::DeferralCapReached)) => {
+            ingest_deferral_cap_response(err.to_string())
+        }
         // Retryable at the client: the same replica or a healthy one can
         // succeed on the identical request later.
         Err(LogIngestRequestError::Write(write_err)) if write_err.is_retryable() => {
@@ -906,6 +925,9 @@ async fn export_traces(
         }
         Err(SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
+        }
+        Err(SpanIngestRequestError::Write(err @ SpanWriteError::DeferralCapReached)) => {
+            ingest_deferral_cap_response(err.to_string())
         }
         // Retryable at the client: the same replica or a healthy one can
         // succeed on the identical request later.
@@ -1722,6 +1744,25 @@ pub(crate) mod tests {
             traces_response.status(),
             StatusCode::TOO_MANY_REQUESTS,
             "a zero span buffer budget must shed as 429, not 503"
+        );
+    }
+
+    /// A write refused at the flush deferral cap is a 429 with `Retry-After`
+    /// whose body is the write error's text, which names the cap.
+    #[test]
+    fn a_deferral_cap_refusal_is_429_with_retry_after() {
+        let response = ingest_deferral_cap_response(WriteError::DeferralCapReached.to_string());
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        assert!(
+            LogWriteError::DeferralCapReached
+                .to_string()
+                .contains("deferral cap")
+        );
+        assert!(
+            SpanWriteError::DeferralCapReached
+                .to_string()
+                .contains("deferral cap")
         );
     }
 
