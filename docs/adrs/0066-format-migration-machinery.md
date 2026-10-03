@@ -647,6 +647,35 @@ provenance and per-sample provenance column kept); RLOG and RSPAN parts go
 through their codec's compaction merge, so their part split can differ from the
 predecessor's.
 
+Note (2026-10-03, T6): the `migrate` walk calls the T5 writer for a sealed,
+untombstoned bucket that serves no below-target L0 record raw, holds no rewrite
+record, and whose authoritative compaction records carry parts below the target.
+Item 4 refuses only a contested component, but T5 also refuses a bucket where
+more than one compaction record survives supersession, each in its own
+component, because it re-encodes a bucket's one record only. Without a reason of
+its own that bucket would hold the floor down with nothing in the report, so
+`migrate` names it with a third blocked reason beside item 4's and the one for a
+writer switch that is off: `ReencodeBlockedReason::MultipleRecords`, alongside
+`ContestedOverlap` and `WriterDisabled`, on
+`FamilyMigrateReport::reencode_blocked`. A bucket counts as migrated only when
+this run published its version 2 record. The predecessor's parts keep counting
+toward the below-target figure until `sweep` reclaims it (item 6), which takes
+two passes under the ADR-1133 unnamed-since marker gate: the first pass that
+finds the predecessor past the protection horizon and unnamed by HEAD only
+writes its marker, and a pass at least the pinned-query window later
+(`max_query_duration + head_cache_ttl + 4 * clock_skew_allowance`, 1 h 20 min
+30 s at the defaults) deletes it with its parts. The floor is raised by the
+first `migrate` run after that second pass, through the existing fresh
+re-audit. The switch is still off by default. The operator turns it on per
+run with `ravel-cli maintain migrate --reencode-compaction-parts`, whose help
+states item 8's rollout rule, and the command prints one `reencode_blocked`
+line per bucket with its reason and one `not_migrated` line per bucket whose
+rewrite published nothing. It exits nonzero when either is present, unless
+the fresh re-audit raised the floor, in which case another writer carried
+those buckets to the target and the run succeeded.
+`migrate --dry-run` runs only the read-only re-audit, because the walk writes
+its cursor and the floor whatever `CompactorConfig::dry_run` says.
+
 ## Amendment (2026-10-03, #2271): a below-floor HEAD is rebuilt, not refused as newer
 
 <!-- amendment-applies: sections="2. Fail-closed-on-newer, everywhere, typed" pointer="below-floor HEAD amendment" -->

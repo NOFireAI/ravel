@@ -489,7 +489,9 @@ erasure of the same bucket the only check left is the re-list each run makes
 just before it publishes, which leaves a short window, so avoid `--no-claim`
 while an erasure request for the tenant is pending. `maintain migrate` takes
 the same claims, prints the same `claims:` line, and accepts the same
-`--no-claim`.
+`--no-claim`. Its `--dry-run` also takes no claims, but it is not compaction's
+plan report: it skips the walk and runs only the read-only re-audit (see
+[Re-encoding compaction parts](#re-encoding-compaction-parts)).
 
 ### Compaction claim metrics
 
@@ -867,7 +869,8 @@ role's write grant already names. Enabling it requires no storage-policy change.
 
 ```sh
 ravel-cli maintain migrate --tenant <t> --signal <metrics|logs|spans> \
-  [--shards <n>] [--target-version <n>] [--family <name>] [--budget-records <n>]
+  [--shards <n>] [--target-version <n>] [--family <name>] [--budget-records <n>] \
+  [--no-claim] [--dry-run] [--reencode-compaction-parts]
 ```
 
 `migrate` raises a `(tenant, signal, format family)`'s recorded format floor to a
@@ -879,7 +882,11 @@ target on-object format version. One invocation:
    or rewrite record is visited too, because a record can leave an input served
    raw. This reuses the compaction rewrite
    primitive, so the rewrite is bucket-atomic and produces a compaction record
-   exactly as compaction does;
+   exactly as compaction does. A bucket that serves nothing below the target
+   raw, carries no rewrite record, and whose compaction records hold parts
+   below the target is re-encoded when `--reencode-compaction-parts` is given
+   (see [re-encoding compaction parts](#re-encoding-compaction-parts)) and
+   reported as `reencode_blocked` otherwise;
 2. stops early and persists the cursor once `--budget-records` is spent (`0`,
    the default, is unlimited; re-run to resume), or, once the walk drains,
    re-audits fresh and raises the floor only if that re-audit finds zero records
@@ -893,23 +900,28 @@ reports three counts, because they are blocked for different reasons:
 the parts of every record a bucket still LISTS, which includes records the
 resolver no longer serves and a `sweep` deletes (see `rewrite_parts` below).
 
-Only `l0_commit_records` can move on a re-run, and only the part of it that was
-merely not yet sealed when the walk passed, or that landed after it. Nothing
-migrates the other two:
+`l0_commit_records` moves on a re-run for the part of it that was merely not
+yet sealed when the walk passed, or that landed after it, and for any bucket
+listed as `not_migrated` (see below). Of the other two:
 
-- a **below-target compaction part** is not migrated by anything today. The
-  design intends compaction to converge these opportunistically, by treating a
-  below-target part as compaction-eligible, but no build does it yet: both
-  compaction and the migration rewrite refuse a bucket that already carries a
-  compaction record, and the walk never reaches such a bucket's parts.
-  Re-running `migrate` reports the same `l1_compaction_parts` figure. No
-  `blocked_bucket` line is printed for one, except when the bucket's
-  authoritative compaction records are all at the target and the below-target
-  parts belong to records that lost their overlap (see `losing_record_parts`
-  below). The figure is over listed records,
-  so it can still fall without a `migrate` run: a compaction record that a later
-  rewrite record superseded stays listed until a `sweep` deletes it and its
-  parts, the same way a superseded predecessor rewrite does;
+- a **below-target compaction part** is re-encoded only by a run with
+  `--reencode-compaction-parts`, and only in a bucket whose one compaction
+  record survives supersession (see
+  [re-encoding compaction parts](#re-encoding-compaction-parts)). Without the
+  flag, re-running `migrate` reports the same `l1_compaction_parts` figure and
+  names the bucket on a `reencode_blocked` line. The exception is a
+  `--target-version` above the version the running build writes: a part
+  recorded at the version this build writes still counts in the figure, but a
+  bucket whose below-target parts are all at that version gets no
+  `reencode_blocked` line, because a re-encode by this build cannot carry them
+  further. Such a part needs a newer build, not the flag. No `blocked_bucket` line is
+  printed for one, except when the bucket's authoritative compaction records
+  are all at the target and the below-target parts belong to records that lost
+  their overlap (see `losing_record_parts` below). The figure is over listed
+  records, so it can also fall without a `migrate` run: a compaction record
+  that a later rewrite record or a re-encode superseded stays listed until a
+  `sweep` deletes it and its parts, the same way a superseded predecessor
+  rewrite does;
 - a **below-target rewrite part** is never migrated by design (see
   `rewrite_parts` below);
 - a **below-target L0 input only a losing compaction record names** is served
@@ -1032,6 +1044,117 @@ raises the floor in one invocation, and running `sweep` in between is never
 required for it to converge. The sweeper's superseded-input rule still deletes
 those records on its own schedule, which is storage reclamation, not a
 correctness precondition.
+
+### Re-encoding compaction parts
+
+A bucket whose one compaction record holds parts below the target is converged
+by re-encoding: `migrate --reencode-compaction-parts` reads those parts, writes
+them again at the current version, and publishes a version 2 compaction record
+that supersedes the old one. The flag is off by default, and turning it on is a
+rollout decision, not a tuning knob:
+
+- every reader and maintainer in the fleet must already run a build that reads
+  version 2 compaction records. A build that cannot read one fails every
+  resolve of that bucket's records, for queries and maintenance alike;
+- the release before the one you are running must read version 2 compaction
+  records too, so a one-release rollback stays safe. Once a version 2 record is
+  written there is no rollback past a build that reads them. The record is
+  immutable, and leaving the flag off afterwards only stops new ones;
+- the superseded record and its parts stay listed, and keep counting in
+  `l1_compaction_parts`, until `sweep` deletes them. That takes two sweep
+  passes: the first pass that finds the superseded record past the protection
+  horizon and unnamed by HEAD only writes its unnamed-since marker, and a pass
+  at least the pinned-query window later (1 h 20 min 30 s at the defaults; see
+  [The pinned-query window](#the-pinned-query-window)) deletes it. The run that
+  re-encodes a bucket therefore still reports "FOUND STRAGGLERS" for it, and the
+  format floor rises on the first `migrate` run after that second pass.
+
+Re-encoding takes the bucket's claim exactly as a migration does, and
+`--no-claim` takes none.
+
+The report counts the buckets the walk did not re-encode and the buckets whose
+rewrite published nothing, each with one line per bucket and a `# ` line saying
+what clears them:
+
+```
+records_migrated: 0
+buckets_reencode_blocked: 2
+reencode_blocked: shard=0 hour=100 reason=writer_disabled below_target=1
+reencode_blocked: shard=2 hour=9 reason=contested_overlap largest_component=2
+# A writer_disabled bucket's one compaction record holds below_target parts under the target. ...
+# A contested_overlap or multiple_records bucket is not re-encoded by any run, ...
+buckets_not_migrated: 1
+not_migrated: shard=1 hour=100 path=reencode reason=claim_skipped claim_reason=held_by_another
+# Each not_migrated bucket published nothing this run. This run drained the walk and cleared its cursor, ...
+```
+
+A `reencode_blocked` line has one of three reasons:
+
+- `writer_disabled below_target=<n>`: the bucket can be re-encoded, and `<n>`
+  of its record's parts are below the target, but the run did not have
+  `--reencode-compaction-parts`;
+- `contested_overlap largest_component=<n>`: an overlap component of the bucket
+  holds `<n>` compaction records, so it is not re-encoded;
+- `multiple_records records=<n>`: `<n>` compaction records survive
+  supersession, each alone in its overlap, and a re-encode rewrites a bucket's
+  one record only.
+
+The last two are not cleared by any run; retention clears them when it ages
+the bucket out, subject to the format-version hold.
+
+A `not_migrated` line names the path the bucket was dispatched to
+(`l0_migration` or `reencode`) and why its rewrite published nothing:
+
+- `claim_skipped claim_reason=<reason>`: the run could not take the bucket's
+  claim, with the same reasons `compact-bucket` prints (`held_by_another`,
+  `steal_lost`, `unreadable_claim`, `vanished_twice`);
+- `cancelled checkpoint=<point>`: the run took the claim, lost it, and stopped
+  at `<point>` (`input_set`, `merge_loop`, `part_boundary` or `publish`) before
+  publishing;
+- `record_set_changed`: the bucket's records changed before the publish;
+- `publish_abandoned`: the run passed its compaction deadline before the
+  publish.
+
+When a `not_migrated` bucket is retried depends on how the run ended, and the
+`# ` line under the list says which case applies:
+
+- the walk drained and the re-audit found stragglers: the run cleared its
+  cursor, so the next `migrate` run starts over and retries every one;
+- the run stopped on its budget: its cursor is saved past every bucket it
+  examined, so the next run resumes after them, and a `not_migrated` bucket is
+  retried by the first run after the walk drains, which starts over from the
+  beginning. Holding the cursor back instead would let a bucket another process
+  holds stop the walk from reaching the buckets after it;
+- the walk drained and the re-audit raised the floor: another writer carried
+  the bucket to the target after the walk passed it, and nothing is left to
+  retry.
+
+The exit code follows the same cases. A run that drains the walk exits nonzero
+when the re-audit finds stragglers, which every `blocked_bucket`,
+`reencode_blocked` and unresolved `not_migrated` bucket leaves behind, and
+exits zero when it raises the floor, even with `not_migrated` lines printed. A
+run that stops on its budget exits nonzero when it leaves any `not_migrated`
+bucket or any `reencode_blocked` bucket with reason `contested_overlap` or
+`multiple_records`, and zero otherwise: `blocked_bucket` and
+`reason=writer_disabled` lines alone do not fail it, since a writer_disabled
+bucket is the default state of every bucket the re-encode exists for and the
+run that drains the walk still fails on it through the re-audit.
+
+`--dry-run` does not run the walk. It runs the read-only re-audit, prints the
+three below-target figures and any `blocked_bucket` lines, takes no claim,
+writes nothing (no part, record, cursor or floor), and exits zero:
+
+```
+claims: off (--dry-run)
+dry_run: true
+reencode_compaction_parts: true
+...
+l0_commit_records: 0
+l1_compaction_parts: 1
+rewrite_record_parts: 0
+buckets_blocked: 0
+# Dry run: the walk did not run and nothing was written. ...
+```
 
 ### Auditing what versions are live
 

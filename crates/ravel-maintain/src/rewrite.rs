@@ -60,8 +60,10 @@
 //! amendment): a bucket whose one compaction record has parts below the
 //! current segment format version gets those parts re-encoded at the current
 //! version and a version 2 compaction record that supersedes the old one. It
-//! sits behind [`CompactorConfig::reencode_writer_enabled`], off by default,
-//! and has no production caller yet.
+//! sits behind [`CompactorConfig::reencode_writer_enabled`], off by default.
+//! Its caller is the `migrate` walk ([`crate::migrate::migrate_family`]), and
+//! `ravel-cli maintain migrate --reencode-compaction-parts` turns the switch on
+//! for one run.
 
 use std::collections::BTreeMap;
 
@@ -525,6 +527,14 @@ pub enum MigrateOutcome {
     /// The migration took the bucket's claim and lost it before its record PUT,
     /// and cancelled at `at` with nothing published.
     Cancelled { at: Checkpoint },
+    /// The pre-publish re-list found a record set other than the one this run
+    /// planned from, and the new listing holds no tombstone, compaction record
+    /// or rewrite record (an L0 commit record came or went), so the run
+    /// published nothing (ADR-1029, the 2026-10-03 amendment). A later run
+    /// plans again. A new listing that holds one of those is reported as
+    /// [`Self::Tombstoned`], [`Self::AlreadyCompacted`] or
+    /// [`Self::RewritePresent`].
+    RecordSetChanged,
 }
 
 /// EM's compaction-variant caller of the shared primitive: migrate a sealed
@@ -685,10 +695,7 @@ async fn migrate_bucket_format_scoped(
         // from, so it published nothing: report the gate the new listing
         // fails, an erasure rewrite record above all.
         FencedRewrite::RecordSetChanged(now) => {
-            migrate_listing_gate(&now).unwrap_or(MigrateOutcome::Rewritten {
-                parts: 0,
-                publish: PublishOutcome::Abandoned,
-            })
+            migrate_listing_gate(&now).unwrap_or(MigrateOutcome::RecordSetChanged)
         }
     })
 }
@@ -837,7 +844,7 @@ pub enum ReencodeOutcome {
 
 /// The segment format version the current writer emits for `signal`'s
 /// compaction parts.
-fn current_part_version(signal: Signal) -> Result<u32> {
+pub(crate) fn current_part_version(signal: Signal) -> Result<u32> {
     match signal {
         Signal::Metrics => Ok(crate::build::OUTPUT_FORMAT_VERSION),
         Signal::Logs => Ok(crate::rlog::OUTPUT_FORMAT_VERSION),
@@ -882,8 +889,9 @@ fn current_part_version(signal: Signal) -> Result<u32> {
 /// publishes nothing if the record set changed (ADR-1029, the 2026-10-03
 /// amendment), the same fence compaction and the erasure rewrite use.
 ///
-/// Nothing in production calls this yet: `migrate` wiring is ADR-0066 force 2
-/// task T6.
+/// The `migrate` walk calls this for a bucket held below its target only by
+/// its one compaction record's parts (ADR-0066 force 2 task T6,
+/// [`crate::migrate::migrate_family`]).
 pub async fn reencode_compaction_parts(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -919,14 +927,8 @@ async fn reencode_compaction_parts_scoped(
     let ledger = config.request_ledger.as_ref();
 
     let listing = list_bucket_with_ledger(store, bucket, ledger).await?;
-    if listing.tombstone_key.is_some() {
-        return Ok(ReencodeOutcome::Tombstoned);
-    }
-    if !listing.rewrite_record_keys.is_empty() {
-        return Ok(ReencodeOutcome::RewritePresent);
-    }
-    if listing.compaction_record_keys.is_empty() {
-        return Ok(ReencodeOutcome::NoCompactionRecord);
+    if let Some(refused) = reencode_listing_gate(&listing) {
+        return Ok(refused);
     }
 
     let records = read_compaction_records(store, &listing.compaction_record_keys, ledger).await?;
@@ -1032,11 +1034,29 @@ async fn reencode_compaction_parts_scoped(
             parts: outcome.parts,
             publish: outcome.publish,
         }),
-        Some(FencedRewrite::RecordSetChanged(_)) => Ok(ReencodeOutcome::RecordSetChanged),
+        Some(FencedRewrite::RecordSetChanged(now)) => {
+            Ok(reencode_listing_gate(&now).unwrap_or(ReencodeOutcome::RecordSetChanged))
+        }
         None => Err(MaintainError::Invariant(
             "a re-encode lost its claim but its guard names no checkpoint".to_string(),
         )),
     }
+}
+
+/// The listing gates a re-encode applies to the listing it plans from, and
+/// again to its pre-publish re-list: `Some` is the reason the bucket is not
+/// re-encoded.
+fn reencode_listing_gate(listing: &BucketListing) -> Option<ReencodeOutcome> {
+    if listing.tombstone_key.is_some() {
+        return Some(ReencodeOutcome::Tombstoned);
+    }
+    if !listing.rewrite_record_keys.is_empty() {
+        return Some(ReencodeOutcome::RewritePresent);
+    }
+    if listing.compaction_record_keys.is_empty() {
+        return Some(ReencodeOutcome::NoCompactionRecord);
+    }
+    None
 }
 
 /// GET and decode each compaction record in `record_keys`, checking each one

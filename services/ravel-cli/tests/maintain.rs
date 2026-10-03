@@ -12,7 +12,7 @@ use bytes::Bytes;
 use prost::Message;
 use ravel_cli::hold;
 use ravel_cli::maintain::{
-    ClaimOptions, SignalArg, audit_versions, compact, decode_compaction_record,
+    ClaimOptions, MigrateSwitches, SignalArg, audit_versions, compact, decode_compaction_record,
     decode_retention_tombstone, migrate, status, sweep, verify_custody,
 };
 use ravel_cli::store::{StoreKind, StoreSelection};
@@ -814,6 +814,7 @@ async fn migrate_raises_floor_on_a_clean_tenant() {
         None,
         None,
         0,
+        MigrateSwitches::default(),
         &ClaimOptions::fresh(),
     )
     .await
@@ -872,6 +873,7 @@ async fn migrate_exits_nonzero_and_holds_the_floor_when_a_straggler_survives() {
         None,
         None,
         0,
+        MigrateSwitches::default(),
         &ClaimOptions::fresh(),
     )
     .await
@@ -1241,5 +1243,554 @@ async fn sweep_holds_a_superseded_input_on_the_stored_horizon() {
     assert!(
         control.get(&control_key, GetRange::Full).await.is_err(),
         "control: once the marker has aged past the window the same input is deleted"
+    );
+}
+
+/// The tenant, shard and hour of the force 2 `migrate` fixture below.
+const REENCODE_TENANT: &str = "cli-migrate-reencode";
+const REENCODE_SHARD: u32 = 0;
+const REENCODE_HOUR: u32 = 100;
+
+/// Every object in the store with its bytes, so a run that must write nothing
+/// is checked against the whole store rather than a handful of keys.
+async fn all_objects(store: &dyn ObjectStoreBackend) -> std::collections::BTreeMap<String, Bytes> {
+    let mut objects = std::collections::BTreeMap::new();
+    for meta in list_all(store, "").await.expect("list the store") {
+        let got = store.get(&meta.key, GetRange::Full).await.expect("get");
+        objects.insert(meta.key, got.data);
+    }
+    objects
+}
+
+/// The fixture bucket's compaction records, decoded, by key.
+async fn reencode_bucket_records(
+    store: &dyn ObjectStoreBackend,
+) -> Vec<(String, CompactionRecord)> {
+    let bucket = ravel_maintain::Bucket::new(
+        TenantId::new(REENCODE_TENANT).hash(),
+        Signal::Logs,
+        REENCODE_SHARD,
+        REENCODE_HOUR,
+    );
+    let listing = ravel_maintain::read::list_bucket(store, &bucket)
+        .await
+        .expect("list bucket");
+    let mut records = Vec::new();
+    for key in listing.compaction_record_keys {
+        let got = store.get(&key, GetRange::Full).await.expect("get record");
+        records.push((
+            key,
+            record::decode_compaction(&got.data).expect("decode record"),
+        ));
+    }
+    records
+}
+
+/// A provisioned logs tenant with one sealed bucket compacted into one
+/// compaction record whose one part is recorded a version below the target,
+/// which is the bucket the force 2 re-encode exists for. The part bytes stay
+/// at the current version, because only the current RLOG version is writable;
+/// the record is overwritten in place to say otherwise, which only a fixture
+/// may do. The store's clock is the wall clock, which is what the CLI's claim
+/// participant reads a claim's expiry against.
+async fn seed_below_target_compaction() -> Arc<MemoryStore> {
+    let mem = MemoryStore::new();
+    let wall_ms = ravel_cli::now_ns().expect("wall clock") / 1_000_000;
+    mem.set_clock_ms(u64::try_from(wall_ms).expect("positive wall clock"));
+    let tenant_hash = TenantId::new(REENCODE_TENANT).hash();
+    ravel_catalog::validate_or_adopt(
+        &mem,
+        &tenant_hash,
+        Signal::Logs,
+        4,
+        0,
+        ravel_catalog::AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("provision");
+    seed_two_l0_logs(&mem, REENCODE_TENANT, REENCODE_SHARD, REENCODE_HOUR).await;
+    let bucket =
+        ravel_maintain::Bucket::new(tenant_hash, Signal::Logs, REENCODE_SHARD, REENCODE_HOUR);
+    let outcome = ravel_maintain::compact_bucket(
+        &mem,
+        &ravel_maintain::FixedClock::new(ravel_cli::now_ns().expect("wall clock")),
+        &ravel_maintain::CompactorConfig::default(),
+        &bucket,
+    )
+    .await
+    .expect("compact");
+    assert!(
+        matches!(outcome, ravel_maintain::CompactionOutcome::Compacted { .. }),
+        "the fixture compacts: {outcome:?}"
+    );
+    let mut records = reencode_bucket_records(&mem).await;
+    assert_eq!(records.len(), 1, "one compaction record to stamp");
+    let (key, mut rec) = records.remove(0);
+    assert_eq!(rec.parts.len(), 1, "the record has one part");
+    for part in &mut rec.parts {
+        assert_eq!(
+            part.segment_format_version,
+            u32::from(ravel_logseg::footer::VERSION),
+            "the part is written at the target the CLI migrates logs to"
+        );
+        part.segment_format_version -= 1;
+    }
+    mem.put(&key, record::encode_compaction(&rec), PutOptions::default())
+        .await
+        .expect("overwrite the fixture record");
+    Arc::new(mem)
+}
+
+/// Run `maintain migrate` over the fixture tenant with the default target and
+/// family, returning its result and everything it printed after the store
+/// header.
+async fn run_reencode_migrate(
+    store: Arc<dyn ObjectStoreBackend>,
+    switches: MigrateSwitches,
+    claims: &ClaimOptions,
+) -> (anyhow::Result<()>, String) {
+    let mut out: Vec<u8> = Vec::new();
+    let result = ravel_cli::maintain::migrate_to(
+        &mut out,
+        store,
+        MEMORY,
+        REENCODE_TENANT,
+        SignalArg::Logs,
+        4,
+        None,
+        None,
+        0,
+        switches,
+        claims,
+    )
+    .await;
+    (result, String::from_utf8(out).expect("utf-8 output"))
+}
+
+/// The report lines every fixture run prints after the claims line.
+fn reencode_report_head(dry_run: bool, reencode: bool) -> String {
+    format!(
+        "dry_run: {dry_run}\n\
+         reencode_compaction_parts: {reencode}\n\
+         tenant: {REENCODE_TENANT}\n\
+         signal: Logs\n\
+         family: rlog\n\
+         target_version: {}\n",
+        ravel_logseg::footer::VERSION
+    )
+}
+
+/// The output after the claims line, which carries a fresh process id, and
+/// that line itself.
+fn split_claims_line(text: &str) -> (&str, &str) {
+    text.split_once('\n').expect("a claims line and a report")
+}
+
+/// With `--reencode-compaction-parts` off, a bucket whose one compaction record
+/// holds a part below the target is reported as reencode_blocked with the
+/// switch reason and its count, nothing is written, and the run exits nonzero.
+///
+/// Non-vacuity: delete `out.push_str(&reencode_blocked_report(&report.reencode_blocked));`
+/// in `migrate_report_text` and the exact-report `assert_eq!` fails with the
+/// `reencode_blocked:` line and its comment missing. Set
+/// `reencode_writer_enabled: true` in `migrate_to` in place of
+/// `reencode_writer_enabled: switches.reencode_compaction_parts,` and the
+/// same assertion fails (`buckets_migrated: 1`, no reencode_blocked line), as
+/// does the write-nothing assertion.
+#[tokio::test]
+async fn migrate_without_the_reencode_flag_reports_the_bucket_blocked_and_writes_nothing() {
+    let mem = seed_below_target_compaction().await;
+    let before = all_objects(mem.as_ref()).await;
+
+    let (result, text) = run_reencode_migrate(
+        mem.clone(),
+        MigrateSwitches::default(),
+        &ClaimOptions::fresh(),
+    )
+    .await;
+
+    let (claims_line, report) = split_claims_line(&text);
+    assert!(
+        claims_line.starts_with("claims: on process_id="),
+        "{claims_line}"
+    );
+    assert_eq!(
+        report,
+        format!(
+            "{}budget_records: 0 (0 = unlimited)\n\
+             buckets_examined: 1\n\
+             buckets_migrated: 0\n\
+             buckets_blocked: 0\n\
+             records_migrated: 0\n\
+             buckets_reencode_blocked: 1\n\
+             reencode_blocked: shard=0 hour=100 reason=writer_disabled below_target=1\n\
+             # A writer_disabled bucket's one compaction record holds below_target parts under \
+             the target. A run with --reencode-compaction-parts re-encodes it, once every reader \
+             and maintainer runs a build that reads version 2 compaction records.\n\
+             buckets_not_migrated: 0\n\
+             walk_complete: true\n\
+             verification: FOUND STRAGGLERS l0_commit_records=0 l1_compaction_parts=1 \
+             rewrite_record_parts=0\n",
+            reencode_report_head(false, false)
+        )
+    );
+    let err = result.expect_err("a reencode_blocked bucket makes migrate exit nonzero");
+    let err = err.to_string();
+    assert!(err.contains("refused to raise the rlog floor"), "{err}");
+    assert!(
+        err.contains("The 1 reencode_blocked line(s) name the buckets"),
+        "{err}"
+    );
+    assert_eq!(
+        all_objects(mem.as_ref()).await,
+        before,
+        "the switch off writes nothing"
+    );
+}
+
+/// With `--reencode-compaction-parts` on, the same bucket is re-encoded: a
+/// version 2 compaction record superseding the stamped one is published, the
+/// bucket is reported migrated with the record's two inputs, and the superseded
+/// record's part still refuses the floor until sweep deletes it.
+///
+/// Non-vacuity: delete `reencode_writer_enabled: switches.reencode_compaction_parts,`
+/// in `migrate_to` and the exact-report `assert_eq!` fails with
+/// `buckets_migrated: 0` and a `reencode_blocked: ... reason=writer_disabled`
+/// line, and the bucket keeps one record.
+#[tokio::test]
+async fn migrate_with_the_reencode_flag_reencodes_the_bucket_and_reports_it_migrated() {
+    let mem = seed_below_target_compaction().await;
+    let (stamped_key, _) = reencode_bucket_records(mem.as_ref()).await.remove(0);
+
+    let (result, text) = run_reencode_migrate(
+        mem.clone(),
+        MigrateSwitches {
+            dry_run: false,
+            reencode_compaction_parts: true,
+        },
+        &ClaimOptions::fresh(),
+    )
+    .await;
+
+    let (_, report) = split_claims_line(&text);
+    assert_eq!(
+        report,
+        format!(
+            "{}budget_records: 0 (0 = unlimited)\n\
+             buckets_examined: 1\n\
+             buckets_migrated: 1\n\
+             buckets_blocked: 0\n\
+             records_migrated: 2\n\
+             buckets_reencode_blocked: 0\n\
+             buckets_not_migrated: 0\n\
+             walk_complete: true\n\
+             verification: FOUND STRAGGLERS l0_commit_records=0 l1_compaction_parts=1 \
+             rewrite_record_parts=0\n",
+            reencode_report_head(false, true)
+        )
+    );
+    let err = result
+        .expect_err("the superseded record's part keeps the floor down until sweep")
+        .to_string();
+    assert!(
+        err.contains(
+            "the first sweep pass after that writes its unnamed-since marker, a pass at least \
+             the pinned-query window later deletes the record and its parts, and the floor is \
+             raised by the first migrate run after that"
+        ),
+        "{err}"
+    );
+
+    let records = reencode_bucket_records(mem.as_ref()).await;
+    assert_eq!(records.len(), 2, "the old record and its successor");
+    let successor = records
+        .iter()
+        .find(|(key, _)| *key != stamped_key)
+        .map(|(_, rec)| rec)
+        .expect("a new record");
+    assert_eq!(successor.superseded_record_key, stamped_key);
+    assert!(
+        successor
+            .parts
+            .iter()
+            .all(|p| p.segment_format_version == u32::from(ravel_logseg::footer::VERSION)),
+        "the successor's parts are at the target: {successor:?}"
+    );
+}
+
+/// With the flag on and another process holding the bucket's claim, the
+/// re-encode builds nothing and the bucket is printed as not_migrated with the
+/// claim's reason and the note that the next run, which starts over because
+/// this one drained the walk, retries it; the run exits nonzero.
+///
+/// Non-vacuity: delete `out.push_str(&not_migrated_report(..));`
+/// in `migrate_report_text` and the exact-report `assert_eq!` fails with the
+/// `not_migrated:` line and its comment missing.
+#[tokio::test]
+async fn migrate_prints_a_bucket_whose_claim_another_process_holds() {
+    let mem = seed_below_target_compaction().await;
+    let acquired = ravel_fleet::claim::acquire(
+        mem.as_ref(),
+        &WorkIdentity::new(
+            TenantId::new(REENCODE_TENANT).hash(),
+            Signal::Logs,
+            REENCODE_SHARD,
+            REENCODE_HOUR,
+        ),
+        &ravel_fleet::claim::ClaimOwner::new(Uuid::new_v4(), Uuid::new_v4(), 0),
+        &ravel_fleet::claim::ClaimConfig::default(),
+    )
+    .await
+    .expect("foreign acquire");
+    assert!(
+        matches!(acquired, ravel_fleet::claim::Acquisition::Acquired { .. }),
+        "the foreign claim must be fresh: {acquired:?}"
+    );
+
+    let (result, text) = run_reencode_migrate(
+        mem.clone(),
+        MigrateSwitches {
+            dry_run: false,
+            reencode_compaction_parts: true,
+        },
+        &ClaimOptions::fresh(),
+    )
+    .await;
+
+    let (_, report) = split_claims_line(&text);
+    assert_eq!(
+        report,
+        format!(
+            "{}budget_records: 0 (0 = unlimited)\n\
+             buckets_examined: 1\n\
+             buckets_migrated: 0\n\
+             buckets_blocked: 0\n\
+             records_migrated: 0\n\
+             buckets_reencode_blocked: 0\n\
+             buckets_not_migrated: 1\n\
+             not_migrated: shard=0 hour=100 path=reencode reason=claim_skipped \
+             claim_reason=held_by_another\n\
+             # Each not_migrated bucket published nothing this run. This run drained the walk \
+             and cleared its cursor, so the next migrate run starts over and retries every one \
+             of them.\n\
+             walk_complete: true\n\
+             verification: FOUND STRAGGLERS l0_commit_records=0 l1_compaction_parts=1 \
+             rewrite_record_parts=0\n",
+            reencode_report_head(false, true)
+        )
+    );
+    let err = result
+        .expect_err("a not_migrated bucket makes migrate exit nonzero")
+        .to_string();
+    assert!(
+        err.contains("the 1 not_migrated line(s) the buckets the next migrate run retries"),
+        "{err}"
+    );
+    assert_eq!(
+        reencode_bucket_records(mem.as_ref()).await.len(),
+        1,
+        "nothing was published"
+    );
+}
+
+/// `--dry-run` with the flag on runs the read-only re-audit, prints what is
+/// below the target, takes no claim and writes nothing.
+///
+/// Non-vacuity: delete the `if switches.dry_run { return migrate_dry_run(..) }`
+/// block in `migrate_to` and the walk runs with the switch on, re-encodes the
+/// bucket, and refuses the floor over the superseded record's part, so
+/// `result.expect` fails on the straggler error.
+#[tokio::test]
+async fn migrate_dry_run_with_the_reencode_flag_writes_nothing() {
+    let mem = seed_below_target_compaction().await;
+    let before = all_objects(mem.as_ref()).await;
+
+    let (result, text) = run_reencode_migrate(
+        mem.clone(),
+        MigrateSwitches {
+            dry_run: true,
+            reencode_compaction_parts: true,
+        },
+        &ClaimOptions::fresh(),
+    )
+    .await;
+
+    result.expect("a dry run reports and exits zero");
+    assert_eq!(
+        text,
+        format!(
+            "claims: off (--dry-run)\n\
+             {}l0_commit_records: 0\n\
+             l1_compaction_parts: 1\n\
+             rewrite_record_parts: 0\n\
+             buckets_blocked: 0\n\
+             # Dry run: the walk did not run and nothing was written. The figures above are \
+             what is below the target now; a run without --dry-run migrates what it can and \
+             re-audits.\n",
+            reencode_report_head(true, true)
+        )
+    );
+    assert_eq!(
+        all_objects(mem.as_ref()).await,
+        before,
+        "a dry run writes nothing"
+    );
+}
+
+/// The tenant of the raised-floor fixture below.
+const RESOLVED_TENANT: &str = "cli-migrate-resolved";
+
+/// A compaction holds the claim on a bucket whose two L0 records are recorded
+/// a version below the target, parked at its first part PUT. `migrate` skips
+/// the bucket on the claim and names it not_migrated, then parks at its cursor
+/// delete, after the walk and before the fresh re-audit. The compaction is
+/// released and publishes at the target, so the re-audit is clean and the
+/// floor rises. The run succeeded: it exits zero and says another writer
+/// carried the bucket to the target.
+///
+/// Non-vacuity: make the `Verification::FloorRaised` arm of `migrate_to` return
+/// `budget_stop_verdict(&report, tenant, sig, &family)` in place of `Ok(())`
+/// and the `expect` on the result fails; drop the `FloorRaised` arm of
+/// `NotMigratedRetry::of` and the exact-report `assert_eq!` fails on the note.
+#[tokio::test]
+async fn migrate_exits_zero_when_another_writer_resolved_a_not_migrated_bucket() {
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+
+    let mem = MemoryStore::new();
+    let wall_ms = ravel_cli::now_ns().expect("wall clock") / 1_000_000;
+    mem.set_clock_ms(u64::try_from(wall_ms).expect("positive wall clock"));
+    let tenant_hash = TenantId::new(RESOLVED_TENANT).hash();
+    ravel_catalog::validate_or_adopt(
+        &mem,
+        &tenant_hash,
+        Signal::Logs,
+        4,
+        0,
+        ravel_catalog::AbsentPolicy::CreateFromConfig,
+    )
+    .await
+    .expect("provision");
+    seed_two_l0_logs(&mem, RESOLVED_TENANT, REENCODE_SHARD, REENCODE_HOUR).await;
+    let bucket =
+        ravel_maintain::Bucket::new(tenant_hash, Signal::Logs, REENCODE_SHARD, REENCODE_HOUR);
+    let listing = ravel_maintain::read::list_bucket(&mem, &bucket)
+        .await
+        .expect("list bucket");
+    assert_eq!(listing.commit_keys.len(), 2, "two L0 records to stamp");
+    for key in &listing.commit_keys {
+        let got = mem.get(key, GetRange::Full).await.expect("get record");
+        let mut rec = record::decode(&got.data).expect("decode record");
+        rec.segment_format_version -= 1;
+        mem.put(key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("overwrite the fixture record");
+    }
+
+    let faults = Arc::new(FaultStore::new(mem, FaultPlan::empty()));
+    let part_gate = faults.hold(Op::Put, Some("/l1/".to_string()), Occurrence::Nth(1));
+    let cursor_gate = faults.hold(
+        Op::Delete,
+        Some("/migrate/".to_string()),
+        Occurrence::Nth(1),
+    );
+    let store: Arc<dyn ObjectStoreBackend> = faults.clone();
+
+    let (compacted_tx, compacted_rx) = tokio::sync::oneshot::channel();
+    let compaction = async {
+        let result = compact(
+            store.clone(),
+            MEMORY,
+            RESOLVED_TENANT,
+            SignalArg::Logs,
+            REENCODE_SHARD,
+            REENCODE_HOUR,
+            false,
+            None,
+            None,
+            &ClaimOptions::fresh(),
+        )
+        .await;
+        compacted_tx
+            .send(())
+            .expect("the driver waits for the compaction");
+        result
+    };
+    let mut out: Vec<u8> = Vec::new();
+    let migration = async {
+        part_gate.wait_until_held(1).await;
+        ravel_cli::maintain::migrate_to(
+            &mut out,
+            store.clone(),
+            MEMORY,
+            RESOLVED_TENANT,
+            SignalArg::Logs,
+            4,
+            None,
+            None,
+            0,
+            MigrateSwitches::default(),
+            &ClaimOptions::fresh(),
+        )
+        .await
+    };
+    // Both gates park into the store's one registry, so the second held call
+    // is the migrate run's cursor delete.
+    let driver = async {
+        cursor_gate.wait_until_held(2).await;
+        let parked = cursor_gate.held_details();
+        let id_of = |op: Op| {
+            let ids: Vec<u64> = parked
+                .iter()
+                .filter(|(_, held_op, _)| *held_op == op)
+                .map(|(id, ..)| *id)
+                .collect();
+            assert_eq!(ids.len(), 1, "one parked {op:?}: {parked:?}");
+            ids[0]
+        };
+        let (part, cursor) = (id_of(Op::Put), id_of(Op::Delete));
+        assert!(part_gate.release(part), "release the compaction");
+        compacted_rx.await.expect("the compaction finished");
+        assert!(cursor_gate.release(cursor), "release the migrate run");
+    };
+    let (compacted, result, ()) = tokio::join!(compaction, migration, driver);
+    compacted.expect("the compaction publishes");
+    result.expect("a raised floor exits zero");
+    let listing = ravel_maintain::read::list_bucket(store.as_ref(), &bucket)
+        .await
+        .expect("list bucket");
+    assert_eq!(
+        listing.compaction_record_keys.len(),
+        1,
+        "the compaction's record, and none from migrate"
+    );
+
+    let text = String::from_utf8(out).expect("utf-8 output");
+    let (_, report) = split_claims_line(&text);
+    let version = ravel_logseg::footer::VERSION;
+    assert_eq!(
+        report,
+        format!(
+            "dry_run: false\n\
+             reencode_compaction_parts: false\n\
+             tenant: {RESOLVED_TENANT}\n\
+             signal: Logs\n\
+             family: rlog\n\
+             target_version: {version}\n\
+             budget_records: 0 (0 = unlimited)\n\
+             buckets_examined: 1\n\
+             buckets_migrated: 0\n\
+             buckets_blocked: 0\n\
+             records_migrated: 0\n\
+             buckets_reencode_blocked: 0\n\
+             buckets_not_migrated: 1\n\
+             not_migrated: shard={REENCODE_SHARD} hour={REENCODE_HOUR} path=l0_migration \
+             reason=claim_skipped claim_reason=held_by_another\n\
+             # Each not_migrated bucket published nothing this run, and the fresh re-audit \
+             found nothing below the target: another writer carried it to the target after \
+             this run passed it. Nothing is left to retry.\n\
+             walk_complete: true\n\
+             verification: clean (no records below target)\n\
+             floor_raised_to: {version}\n"
+        )
     );
 }
