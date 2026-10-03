@@ -225,6 +225,15 @@ pub enum SqlError {
     #[error("corrupt stream_attrs blob: {0}")]
     CorruptStreamAttrs(String),
 
+    /// A fetched run contradicts an invariant the merge relies on, such as a
+    /// per-sample dedup priority column not parallel to its samples
+    /// (`ravel_query::QueryError::PrioritySampleCountMismatch`). The PromQL
+    /// path answers the same fault as a retryable unavailable, so this takes
+    /// [`ErrorClass::Unavailable`] and [`MSG_UNAVAILABLE`]; the detail carries
+    /// only counts and is logged server-side.
+    #[error("fetched run violates a merge invariant: {0}")]
+    RunInvariant(ravel_query::QueryError),
+
     /// A statement over Parquet tables (ADR-2040) was refused, or one of its
     /// reads failed. [`crate::ParquetQueryError`] decides its own class and
     /// what of its text a client may see.
@@ -474,6 +483,7 @@ impl SqlError {
             | SqlError::LogFetch(_)
             | SqlError::SpanFetch(_)
             | SqlError::CorruptStreamAttrs(_)
+            | SqlError::RunInvariant(_)
             | SqlError::SnapshotInvalidated => ErrorClass::Unavailable,
             SqlError::Parquet(parquet) => parquet.class(),
             SqlError::DeadlineExceeded { .. } => ErrorClass::Timeout,
@@ -592,7 +602,9 @@ impl SqlError {
             },
             SqlError::CorruptStreamAttrs(_) => MSG_CORRUPT.to_string(),
             SqlError::Parquet(parquet) => parquet.client_message(),
-            SqlError::SnapshotInvalidated => MSG_UNAVAILABLE.to_string(),
+            SqlError::RunInvariant(_) | SqlError::SnapshotInvalidated => {
+                MSG_UNAVAILABLE.to_string()
+            }
             SqlError::DeadlineExceeded { .. }
             | SqlError::TooManySamples { .. }
             | SqlError::TooManySegments { .. }
@@ -1548,6 +1560,10 @@ mod tests {
                     limit: 2048,
                 },
             )),
+            SqlError::RunInvariant(ravel_query::QueryError::PrioritySampleCountMismatch {
+                priorities: 2,
+                samples: 3,
+            }),
             SqlError::SnapshotInvalidated,
         ];
         for err in &transient {
