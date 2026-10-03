@@ -809,9 +809,12 @@ fn parse_limit_clause(
     }
 }
 
-/// Resolve `sql`'s `TieSpec`: its ORDER BY key (by D7's textual rules, or
-/// `override_key` when given), its LIMIT, and its OFFSET. `statement_number`
-/// is used only to name the statement in [`ComparatorError::UnresolvedOrderKey`].
+/// Resolve `sql`'s `TieSpec`: its ORDER BY key, its LIMIT, and its OFFSET.
+/// `override_key`, when given, is the key outright: the textual rules are
+/// not consulted, so an override on a statement that also resolves
+/// textually still wins. Without one, the key comes from D7's textual
+/// rules. `statement_number` is used only to name the statement in
+/// [`ComparatorError::UnresolvedOrderKey`].
 ///
 /// `cardinality_reason`, when `Some`, is `suite.toml`'s declared `compare =
 /// "cardinality"` reason for this statement: ORDER BY key resolution is
@@ -849,6 +852,14 @@ pub fn resolve_tie_spec(
             cardinality_reason: Some(reason.to_string()),
         });
     }
+    if let Some(k) = override_key {
+        return Ok(TieSpec {
+            key: k.to_vec(),
+            limit,
+            offset,
+            cardinality_reason: None,
+        });
+    }
     let Some(order_by) = &query.order_by else {
         return Ok(TieSpec {
             key: Vec::new(),
@@ -860,40 +871,27 @@ pub fn resolve_tie_spec(
     let projection = select_projection(&query.body)?;
     let exprs = order_by_exprs(order_by)?;
     let mut key = Vec::with_capacity(exprs.len());
-    let mut all_resolved = true;
     for expr in &exprs {
         match resolve_projection_index(expr, &projection) {
             Some(idx) => key.push(idx),
             None => {
-                all_resolved = false;
-                break;
+                return Err(ComparatorError::UnresolvedOrderKey {
+                    statement_number,
+                    expr: exprs
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
             }
         }
     }
-    if all_resolved {
-        return Ok(TieSpec {
-            key,
-            limit,
-            offset,
-            cardinality_reason: None,
-        });
-    }
-    match override_key {
-        Some(k) => Ok(TieSpec {
-            key: k.to_vec(),
-            limit,
-            offset,
-            cardinality_reason: None,
-        }),
-        None => Err(ComparatorError::UnresolvedOrderKey {
-            statement_number,
-            expr: exprs
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-        }),
-    }
+    Ok(TieSpec {
+        key,
+        limit,
+        offset,
+        cardinality_reason: None,
+    })
 }
 
 /// Resolve `names` (`suite.toml`'s `order_key_columns`) to projection
@@ -1653,6 +1651,22 @@ mod tests {
         let err =
             resolve_tie_spec(999, sql, None, None).expect_err("c is neither selected nor aliased");
         assert!(matches!(err, ComparatorError::UnresolvedOrderKey { .. }));
+    }
+
+    /// An `order_key` override wins over textual resolution outright: here
+    /// the textual rules resolve `ORDER BY "a"` to column 0, and the
+    /// override names column 1, so the key is column 1.
+    #[test]
+    fn an_override_wins_over_a_textual_resolution() {
+        let sql = r#"SELECT "a", "b" FROM t ORDER BY "a" DESC LIMIT 5 OFFSET 2"#;
+        let textual = resolve_tie_spec(7, sql, None, None).expect("a resolves textually");
+        assert_eq!(textual.key, vec![0]);
+
+        let overridden = resolve_tie_spec(7, sql, Some(&[1]), None).expect("override applies");
+        assert_eq!(overridden.key, vec![1]);
+        assert_eq!(overridden.limit, Some(5));
+        assert_eq!(overridden.offset, 2);
+        assert_eq!(overridden.cardinality_reason, None);
     }
 
     /// `resolve_order_key_columns` resolves a name present at the same

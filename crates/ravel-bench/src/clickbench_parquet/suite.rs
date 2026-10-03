@@ -109,12 +109,13 @@ impl TableTemplate {
 pub struct StatementOverride {
     /// 1-based statement number this override applies to.
     pub number: u32,
-    /// 0-indexed projection columns the comparator ties on, in order, used
-    /// when the statement's ORDER BY clause does not resolve to a
-    /// projection index under the comparator's own textual rules and the
-    /// key cannot be named by [`Self::order_key_columns`] either (e.g. an
-    /// ORDER BY expression with no corresponding output column name, as
-    /// Q43's `DATE_TRUNC('minute', M)` has none under its alias `M`).
+    /// 0-indexed projection columns the comparator ties on, in order. When
+    /// set, this is the key outright: the comparator's textual ORDER BY
+    /// rules are not consulted (`comparator::resolve_tie_spec`). Meant for a
+    /// key the textual rules cannot resolve and [`Self::order_key_columns`]
+    /// cannot name either (e.g. an ORDER BY expression with no corresponding
+    /// output column name, as Q43's `DATE_TRUNC('minute', M)` has none
+    /// under its alias `M`).
     #[serde(default)]
     pub order_key: Option<Vec<usize>>,
     /// Output column names the comparator ties on, in order, resolved at
