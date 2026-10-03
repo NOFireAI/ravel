@@ -190,3 +190,27 @@ pub static POST_FANOUT_NS: AtomicU64 = AtomicU64::new(0);
 /// Number of regions folded into `POST_FANOUT_NS` (two per attempt: see
 /// above).
 pub static POST_FANOUT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Selected-entry split: nanoseconds building the `scalar`/`histogram`
+/// `Vec<&SeriesEntryV4>` slices in `SegmentFetcher::fetch_runs_and_histograms`
+/// (two `selected.iter().filter(..).collect()` passes over the segment's
+/// matched catalog entries), between `decode_selected` returning and
+/// `fetch_pages` starting. Found during remainder investigation: both passes
+/// were previously inside `FUTURE_NS` but outside every named step.
+pub static SELECTED_SPLIT_NS: AtomicU64 = AtomicU64::new(0);
+/// Number of split passes folded into `SELECTED_SPLIT_NS` (two per
+/// `fetch_runs_and_histograms` call: one scalar pass, one histogram pass).
+pub static SELECTED_SPLIT_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// SoA conversion: nanoseconds inside
+/// `SegmentFetcher::fetch_soa_and_histograms_phase_accounted`'s
+/// `runs.into_iter().map(RunDecode::into_soa).collect()` and
+/// `hist_runs.into_iter().map(RunHistogramDecode::into_fetched).collect()`,
+/// run after `fetch_runs_and_histograms` returns but still inside the
+/// `FUTURE_NS` span (that span wraps the whole phase-accounted call, not just
+/// `fetch_runs_and_histograms`). Found during remainder investigation: this
+/// was the other previously-untimed per-series pass inside the future.
+pub static SOA_CONVERT_NS: AtomicU64 = AtomicU64::new(0);
+/// Number of conversion passes folded into `SOA_CONVERT_NS` (two per call:
+/// one scalar `into_soa` pass, one histogram `into_fetched` pass).
+pub static SOA_CONVERT_CALLS: AtomicU64 = AtomicU64::new(0);

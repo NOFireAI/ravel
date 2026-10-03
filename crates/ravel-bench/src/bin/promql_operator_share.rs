@@ -238,6 +238,18 @@ struct QueryInstantSample {
     pre_fanout_calls: u64,
     post_fanout_ns: u64,
     post_fanout_calls: u64,
+    /// Found during remainder investigation (issue #2479): the
+    /// `scalar`/`histogram` filter-collect pair in
+    /// `fetch_runs_and_histograms`, between `decode_selected` returning and
+    /// `fetch_pages` starting.
+    selected_split_ns: u64,
+    selected_split_calls: u64,
+    /// Found during remainder investigation (issue #2479): the
+    /// `into_soa`/`into_fetched` conversion pair in
+    /// `fetch_soa_and_histograms_phase_accounted`, after
+    /// `fetch_runs_and_histograms` returns but still inside `FUTURE_NS`.
+    soa_convert_ns: u64,
+    soa_convert_calls: u64,
     /// Engine-cumulative `SegmentFetcher::label_sets_materialized` diff
     /// across this one query (catalog-decode-time materialisation, distinct
     /// from `label_clone_calls`'s later per-run clone -- see the multiplier
@@ -289,6 +301,10 @@ async fn run_instant(
     let pre_fanout_calls_before = phase_timers::PRE_FANOUT_CALLS.load(Ordering::Relaxed);
     let post_fanout_ns_before = phase_timers::POST_FANOUT_NS.load(Ordering::Relaxed);
     let post_fanout_calls_before = phase_timers::POST_FANOUT_CALLS.load(Ordering::Relaxed);
+    let selected_split_ns_before = phase_timers::SELECTED_SPLIT_NS.load(Ordering::Relaxed);
+    let selected_split_calls_before = phase_timers::SELECTED_SPLIT_CALLS.load(Ordering::Relaxed);
+    let soa_convert_ns_before = phase_timers::SOA_CONVERT_NS.load(Ordering::Relaxed);
+    let soa_convert_calls_before = phase_timers::SOA_CONVERT_CALLS.load(Ordering::Relaxed);
     let label_sets_materialized_before = engine.label_sets_materialized();
 
     let start = Instant::now();
@@ -394,6 +410,13 @@ async fn run_instant(
             - post_fanout_ns_before,
         post_fanout_calls: phase_timers::POST_FANOUT_CALLS.load(Ordering::Relaxed)
             - post_fanout_calls_before,
+        selected_split_ns: phase_timers::SELECTED_SPLIT_NS.load(Ordering::Relaxed)
+            - selected_split_ns_before,
+        selected_split_calls: phase_timers::SELECTED_SPLIT_CALLS.load(Ordering::Relaxed)
+            - selected_split_calls_before,
+        soa_convert_ns: phase_timers::SOA_CONVERT_NS.load(Ordering::Relaxed) - soa_convert_ns_before,
+        soa_convert_calls: phase_timers::SOA_CONVERT_CALLS.load(Ordering::Relaxed)
+            - soa_convert_calls_before,
         label_sets_materialized: engine.label_sets_materialized() - label_sets_materialized_before,
     }
 }
@@ -579,6 +602,14 @@ fn print_stage0b_fanout(
         &fanout_step(samples, &future_means, |s| s.catalog_retain_ns, None),
     );
     print_phase(
+        "selected_split (share of future, not pre-registered; found during remainder investigation)",
+        &fanout_step(samples, &future_means, |s| s.selected_split_ns, None),
+    );
+    print_phase(
+        "soa_convert (share of future, not pre-registered; found during remainder investigation)",
+        &fanout_step(samples, &future_means, |s| s.soa_convert_ns, None),
+    );
+    print_phase(
         "remainder_inside_futures (share of future)",
         &fanout_step(
             samples,
@@ -591,6 +622,8 @@ fn print_stage0b_fanout(
                     + s.run_plan_lookup_ns
                     + s.label_clone_ns
                     + s.sample_assembly_ns
+                    + s.selected_split_ns
+                    + s.soa_convert_ns
                     + s.fetch_ns
                     + s.decode_ns;
                 s.future_ns.saturating_sub(steps)
@@ -848,19 +881,43 @@ async fn main() {
     // `run_plan_lookup`/`label_clone`/`sample_assembly` all fire once per
     // (series, run) pair in the same per-series loop, so their call counts
     // must agree with each other exactly.
+    // Q_MATCH (`promql_op_share_a + promql_op_share_b`) has two distinct
+    // matcher sets (one per metric), so the OUTER per-distinct-matcher-set
+    // fan-out in `prefetch_metric_plans` runs the entire INNER per-segment
+    // fan-out once per matcher set: `FUTURE_CALLS`/`CATALOG_RETAIN_CALLS`
+    // legitimately equal `segments_fetched * matcher_set_count`, not
+    // `segments_fetched` alone. `stats.segments_fetched` itself reports the
+    // distinct segment count, not multiplied by matcher-set passes. Q_AGG
+    // has one matcher set (single metric), so its multiplier is 1 and this
+    // reduces to the original exact-equality check.
+    let matcher_set_count = |label: &str| -> u64 {
+        match label {
+            "Q_AGG" => 1,
+            "Q_MATCH" => 2,
+            other => panic!("unknown query label {other}"),
+        }
+    };
     for (label, samples) in [("Q_AGG", &agg_samples), ("Q_MATCH", &match_samples)] {
+        let want_multiplier = matcher_set_count(label);
         for s in samples.iter() {
-            if s.future_calls != s.segments_fetched {
+            let want_future_calls = s.segments_fetched * want_multiplier;
+            if s.future_calls != want_future_calls {
                 failures.push(format!(
-                    "{label}: FUTURE_CALLS was {} (want exactly segments_fetched={})",
+                    "{label}: FUTURE_CALLS was {} (want exactly segments_fetched={} * matcher_set_count={want_multiplier} = {want_future_calls})",
                     s.future_calls, s.segments_fetched
                 ));
             }
-            if s.catalog_retain_calls != s.segments_fetched {
+            if s.catalog_retain_calls != want_future_calls {
                 failures.push(format!(
-                    "{label}: CATALOG_RETAIN_CALLS was {} (want exactly segments_fetched={})",
+                    "{label}: CATALOG_RETAIN_CALLS was {} (want exactly segments_fetched={} * matcher_set_count={want_multiplier} = {want_future_calls})",
                     s.catalog_retain_calls, s.segments_fetched
                 ));
+            }
+            if s.selected_split_calls < 1 {
+                failures.push(format!("{label}: SELECTED_SPLIT_CALLS did not fire"));
+            }
+            if s.soa_convert_calls < 1 {
+                failures.push(format!("{label}: SOA_CONVERT_CALLS did not fire"));
             }
             if s.limiter_wait_calls < 1 {
                 failures.push(format!("{label}: LIMITER_WAIT_CALLS did not fire"));
@@ -913,6 +970,8 @@ async fn main() {
                 + s.run_plan_lookup_ns
                 + s.label_clone_ns
                 + s.sample_assembly_ns
+                + s.selected_split_ns
+                + s.soa_convert_ns
                 + s.fetch_ns
                 + s.decode_ns;
             if s.future_ns > 0 {

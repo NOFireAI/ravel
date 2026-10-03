@@ -2781,6 +2781,7 @@ impl SegmentFetcher {
                 accounting.probe(),
             )
             .await?;
+        let split_start = std::time::Instant::now();
         let scalar: Vec<&SeriesEntryV4> = selected
             .iter()
             .filter(|e| e.entry.value_kind == ValueKind::Scalar)
@@ -2789,6 +2790,9 @@ impl SegmentFetcher {
             .iter()
             .filter(|e| e.entry.value_kind == ValueKind::Histogram)
             .collect();
+        crate::phase_timers::SELECTED_SPLIT_NS
+            .fetch_add(split_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::phase_timers::SELECTED_SPLIT_CALLS.fetch_add(2, Ordering::Relaxed);
 
         let (scalar_planned, histogram_planned) = if scalar.is_empty() && histogram.is_empty() {
             (Vec::new(), Vec::new())
@@ -3111,14 +3115,19 @@ impl SegmentFetcher {
         let (runs, stats, hist_runs) = self
             .fetch_runs_and_histograms(tenant_hash, seg_ref, matchers, true, accounting)
             .await?;
-        Ok((
+        let convert_start = std::time::Instant::now();
+        let out = (
             runs.into_iter().map(RunDecode::into_soa).collect(),
             stats,
             hist_runs
                 .into_iter()
                 .map(RunHistogramDecode::into_fetched)
                 .collect(),
-        ))
+        );
+        crate::phase_timers::SOA_CONVERT_NS
+            .fetch_add(convert_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        crate::phase_timers::SOA_CONVERT_CALLS.fetch_add(2, Ordering::Relaxed);
+        Ok(out)
     }
 }
 
