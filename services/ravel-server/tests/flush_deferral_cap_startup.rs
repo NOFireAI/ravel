@@ -6,7 +6,7 @@
 //! flush deferral cap at 0, and a shard whose flush queue filled would then
 //! refuse every write from the first trigger it defers. `start` refuses that
 //! cadence for a `ServerConfig` built in code, in every mode, with the same
-//! typed error `Cli::validate` returns; one tick below the limit starts.
+//! typed error `Cli::validate` returns; one second below the limit starts.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -23,6 +23,17 @@ const TOKEN: &str = "testtoken";
 /// A `ServerConfig` with a 1 s `max_flush_delay`, `max_flush_delay_idle` set
 /// to `idle`, and everything else at the shipped cadence.
 fn config_with_idle(mode: Mode, idle: Duration) -> ServerConfig {
+    config_with_cadence(mode, Duration::from_secs(1), idle, false)
+}
+
+/// A `ServerConfig` with the given flush cadence and everything else at the
+/// shipped defaults.
+fn config_with_cadence(
+    mode: Mode,
+    fast: Duration,
+    idle: Duration,
+    adaptive_flush_delay: bool,
+) -> ServerConfig {
     let mut tokens = HashMap::new();
     tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
@@ -32,8 +43,8 @@ fn config_with_idle(mode: Mode, idle: Duration) -> ServerConfig {
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         max_queued_flushes: 8,
-        adaptive_flush_delay: false,
-        max_flush_delay: Duration::from_secs(1),
+        adaptive_flush_delay,
+        max_flush_delay: fast,
         max_flush_delay_idle: idle,
         min_flush_bytes: 256 * 1024,
         idle_flush_byte_floor: 0,
@@ -87,9 +98,13 @@ fn config_with_idle(mode: Mode, idle: Duration) -> ServerConfig {
 }
 
 async fn start_with_idle(mode: Mode, idle: Duration) -> anyhow::Result<ravel_server::Running> {
+    start_config(config_with_idle(mode, idle)).await
+}
+
+async fn start_config(config: ServerConfig) -> anyhow::Result<ravel_server::Running> {
     let store = Arc::new(MemoryStore::new());
     ravel_server::start(
-        config_with_idle(mode, idle),
+        config,
         store.clone(),
         store.clone(),
         Arc::new(ravel_object_store::StoreMetrics::default()),
@@ -99,8 +114,8 @@ async fn start_with_idle(mode: Mode, idle: Duration) -> anyhow::Result<ravel_ser
 }
 
 /// A 3600 s idle delay plus the 3600 s flush lifetime is exactly the 7200 s
-/// slack, which the slack check admits at equality; the trigger bound's one
-/// flush tick takes the deferral cap to 0. Refused in a writing mode and in a
+/// slack, which the slack check admits at equality, and leaves a deferral cap
+/// of 0 even before the trigger bound adds its flush tick. Refused in a writing mode and in a
 /// mode that builds no ingest router, since the CLI refuses the flags in every
 /// mode.
 #[tokio::test]
@@ -129,9 +144,10 @@ async fn a_cadence_leaving_no_deferral_cap_refuses_startup() {
     }
 }
 
-/// One second below the limit leaves 0.8 s of cap and starts.
+/// One second below the limit leaves 0.8 s of cap (1 s less the 200 ms flush
+/// tick) and starts.
 #[tokio::test]
-async fn a_cadence_one_tick_below_the_limit_starts() {
+async fn a_cadence_one_second_below_the_limit_starts() {
     let running = start_with_idle(Mode::All, Duration::from_secs(3599))
         .await
         .expect("a cadence leaving a positive deferral cap must start");
@@ -158,4 +174,38 @@ async fn an_idle_delay_past_the_scan_slack_refuses_startup() {
         msg.contains("--max-flush-delay-idle") && msg.contains("FLUSH_BOUND_SLACK_HOURS"),
         "expected the slack error naming the flag and the slack, got: {msg}"
     );
+}
+
+/// The adaptive corridor's widest threshold, `max_flush_delay` plus
+/// `STRICT_VISIBILITY_RESERVE_NS` (0.5 s) less `put_retry_base_delay` (0.1 s),
+/// enters the trigger bound only with `adaptive_flush_delay` on. With fast =
+/// idle = 3599.5 s that threshold is 3599.9 s, plus the 0.2 s flush tick is
+/// 3600.1 s against the 3600 s the slack leaves after the flush lifetime: cap
+/// 0, refused. With adaptive off the bound is 3599.7 s and the 0.3 s cap
+/// starts. Without the reserve the widest threshold, 3599.4 s, falls below
+/// fast and the adaptive case starts too, so this pins both terms. The CLI
+/// cannot reach this cadence: its `MAX_STRICT_VISIBILITY_BUDGET_NS` check
+/// refuses a 3599.5 s `--max-flush-delay` first.
+#[tokio::test]
+async fn the_adaptive_corridor_counts_against_the_deferral_cap() {
+    let delay = Duration::from_millis(3_599_500);
+    let err = start_config(config_with_cadence(Mode::All, delay, delay, true))
+        .await
+        .err()
+        .expect("an adaptive cadence leaving no deferral cap must refuse startup");
+    assert!(
+        matches!(
+            err.downcast_ref::<FlushCadenceError>(),
+            Some(FlushCadenceError::ZeroFlushDeferralCap {
+                adaptive_flush_delay: true,
+                ..
+            })
+        ),
+        "expected FlushCadenceError::ZeroFlushDeferralCap with the adaptive flag, got: {err:#}"
+    );
+
+    let running = start_config(config_with_cadence(Mode::All, delay, delay, false))
+        .await
+        .expect("the same cadence with adaptive off leaves a positive cap and must start");
+    running.shutdown().await.expect("clean shutdown");
 }

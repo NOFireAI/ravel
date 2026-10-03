@@ -3987,7 +3987,8 @@ pub struct FlushConcurrency {
 /// compensate -- a straggler flush pinned under a retiring generation could
 /// then land outside the window the read side still scans, an invisibility
 /// hazard. `ravel_ingest::IngestConfig::max_flush_lifetime` is not itself an
-/// operator-facing flag in this ADR's scope, so [`Cli::validate`] uses its
+/// operator-facing flag in this ADR's scope, so `validate_flush_bound_slack`
+/// in `lib.rs`, called by both [`Cli::validate`] and `start`, uses its
 /// compiled-in default (1h) as the fixed half of the sum. That two-term sum is
 /// not the whole worst case: issue #1740's queued-flush cap adds a deferral
 /// term to it, which [`Cli::validate`] explains it does not carry and
@@ -11887,8 +11888,11 @@ mod tests {
             "startup must reject --max-flush-delay-idle 3601s: exceeds FLUSH_BOUND_SLACK_HOURS",
         );
         assert!(
-            err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
-            "expected a FLUSH_BOUND_SLACK_HOURS error, got: {err}"
+            matches!(
+                err.downcast_ref::<crate::FlushCadenceError>(),
+                Some(crate::FlushCadenceError::FlushBoundExceedsSlack { .. })
+            ),
+            "expected FlushCadenceError::FlushBoundExceedsSlack, got: {err:#}"
         );
     }
 
@@ -11915,8 +11919,11 @@ mod tests {
             "startup must reject --max-flush-delay-idle 5h: exceeds FLUSH_BOUND_SLACK_HOURS",
         );
         assert!(
-            err.to_string().contains("FLUSH_BOUND_SLACK_HOURS"),
-            "expected a FLUSH_BOUND_SLACK_HOURS error, got: {err}"
+            matches!(
+                err.downcast_ref::<crate::FlushCadenceError>(),
+                Some(crate::FlushCadenceError::FlushBoundExceedsSlack { .. })
+            ),
+            "expected FlushCadenceError::FlushBoundExceedsSlack, got: {err:#}"
         );
     }
 
@@ -12030,8 +12037,9 @@ mod tests {
     /// deferral cap at 0 must fail startup even where the
     /// FLUSH_BOUND_SLACK_HOURS check admits it. A 3600s idle delay plus the
     /// 3600s flush lifetime is exactly the 7200s slack, which that check
-    /// accepts at equality, and the trigger bound's one flush tick takes the
-    /// cap below zero. 3599s leaves 0.8s of cap and is accepted. Deleting the
+    /// accepts at equality, and leaves a cap of exactly 0 before the trigger
+    /// bound adds its flush tick. 3599s leaves 0.8s of cap (1s less the 200ms
+    /// tick) and is accepted. Deleting the
     /// `crate::validate_flush_deferral_cap` call in `Cli::validate`, or the
     /// `flush_deferral_cap_ns() == 0` refusal inside it, fails the first half.
     /// `tests/flush_deferral_cap_startup.rs` pins the same refusal through

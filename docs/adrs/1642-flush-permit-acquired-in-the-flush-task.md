@@ -781,11 +781,19 @@ at its `IngestConfig` default. Its error is the typed
 and the terms. The arithmetic and the cap's value are unchanged. The
 `FLUSH_BOUND_SLACK_HOURS` check beside it was CLI-only for the same reason and
 moves the same way, as `validate_flush_bound_slack` returning
-`FlushCadenceError::FlushBoundExceedsSlack`; every configuration it refuses the
-cap check also refuses, so it changes which message a library caller sees, not
-which configurations start.
+`FlushCadenceError::FlushBoundExceedsSlack`. Through the library entry it now
+refuses cadences that entry did not refuse before: the cap check does not cover
+every configuration the slack check refuses, because
+`IngestConfig::flush_trigger_age_bound_ns` truncates the delays with an `as
+i64` cast, so an idle delay past `i64::MAX` nanoseconds (a 1000-year one, say)
+wraps negative and leaves a positive cap, and only the slack check refuses it.
+Refusing more configurations at startup is the safer direction.
 
 **Tests.** `services/ravel-server/tests/flush_deferral_cap_startup.rs` builds
 a `ServerConfig` in code: a 3600 s idle delay is refused by `start` with the
 typed variant in `Mode::All` and `Mode::Query`, 3599 s starts, and 3601 s is
-refused with the slack variant.
+refused with the slack variant. With `max_flush_delay` and
+`max_flush_delay_idle` both 3599.5 s, `adaptive_flush_delay` on is refused with
+the cap variant and off starts, which pins the adaptive flag and the strict
+visibility reserve in the cap computation; the CLI refuses that cadence earlier,
+by `MAX_STRICT_VISIBILITY_BUDGET_NS`.
