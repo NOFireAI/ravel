@@ -61,7 +61,8 @@ Verified against the tree at `4e5c0ea8`.
   (`config.rs:1762-1865`), over `HostProfile { cores, mem_total_bytes }`, where
   `mem_total_bytes` is already capped by cgroup v2 `memory.max` or v1
   `memory.limit_in_bytes` (`config.rs:1467-1513`). Shares: fetch cache 25%,
-  catalog cache 5%, SQL per-query 25%, SQL per-tenant 50%, with exact-integer
+  catalog cache 5%, SQL per-query 25% (now 50%, see the per-query SQL share
+  amendment below), SQL per-tenant 50%, with exact-integer
   tests (`config.rs:4896-4904`). The per-query share nests inside the
   per-tenant share (`crates/ravel-sql/src/memory.rs:321-336` charges the same
   bytes to both), so the sum for one tenant is 80%, not 135%. The per-tenant
@@ -850,3 +851,20 @@ in place of the four budget figures. `ravel_memory_budget_bytes` on a gateway's
 `/metrics` reads `u64::MAX`, the unlimited value, since nothing reserves there.
 Every other mode derives, carves and refuses exactly as decision 3 and the
 amendments above describe, with the same message.
+
+## Amendment (2026-10-03, ADR-2414 decision B1): the per-query SQL share is the tenant's share
+
+<!-- amendment-applies: sections="What the code does today" pointer="per-query SQL share amendment" -->
+<!-- amendment-supersedes: phrase="SQL per-query 25%" pointer="per-query SQL share amendment" -->
+
+The derived per-query SQL pool is now 50% of `MemTotal`, equal to the
+per-tenant share, so a lone statement may use the tenant's whole SQL share
+(`SQL_QUERY_MEMORY_PERCENT` in `services/ravel-server/src/config.rs`; 16,106,127,360
+bytes each on the 30 GiB reference host). The per-query pool still nests
+inside the per-tenant pool, so the per-tenant total and the 80% sum for one
+tenant are unchanged. A second concurrent statement no longer has a guaranteed
+quarter of memory; it gets what the first left. An explicit
+`--sql-max-query-bytes` still wins and is still clamped to the tenant ceiling.
+An operator who wants the earlier four-way split sets the flag to a quarter of
+the tenant ceiling. The reasoning and the measured statement that motivated it
+are in ADR-2414.

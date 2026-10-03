@@ -1259,8 +1259,16 @@ is a 16-core, 30 GB host, the shape the published ClickBench run used.
 | `--sql-partition-count` | derived: `max(8, 2 x cores)` | 32 | DataFusion `target_partitions` for every SQL session the server builds. Host cores and query parallelism vs. per-partition overhead. |
 | `--promql-fetch-fanout` | derived: `max(8, 2 x cores)` | 32 | PromQL/analytics per-query segment fetch fan-out. Host cores and the store's request budget. |
 | `--max-segments` | fixed: 1,000,000 (host-independent) | 1,000,000 | How many sealed objects a wide scan touches. Only the recent set, roughly the last two hours, is exempt, so a tenant with a lot of sealed history hits this before you expect. Lower it to bound plan width on a host you share with something else. |
-| `--sql-max-query-bytes` | derived: 25% of MemTotal, 256 MiB if memory is unknown | 8,053,063,680 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. Held at or below `--sql-tenant-max-bytes`: an explicit value here raises a non-explicit (derived or fallback) tenant ceiling to fit, but an explicit tenant ceiling clamps this down and warns. |
+| `--sql-max-query-bytes` | derived: 50% of MemTotal, 256 MiB if memory is unknown | 16,106,127,360 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. The derived value equals the tenant's whole SQL share, so a lone statement may use all of it; concurrent statements still share the per-tenant ceiling. To keep a four-way split, set this flag to a quarter of `--sql-tenant-max-bytes`. Held at or below `--sql-tenant-max-bytes`: an explicit value here raises a non-explicit (derived or fallback) tenant ceiling to fit, but an explicit tenant ceiling clamps this down and warns. |
 | `--sql-tenant-max-bytes` | derived: 50% of MemTotal, 1 GiB if memory is unknown | 16,106,127,360 | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
+
+The two SQL ceilings derive to the same 50% share of `MemTotal`. The per-query
+pool nests inside the per-tenant pool, so the tenant's total is unchanged by the
+per-query share: statements running together share the tenant ceiling, and a
+statement that arrives while another holds most of it gets what is left, not a
+reserved quarter. One tenant's SQL memory is therefore still at most 50% of
+`MemTotal`, and with the 25% fetcher cache and 5% catalog cache the budget
+shares sum to 80%.
 
 A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
 `--sql-partition-count`, or `--promql-fetch-fanout` is a startup error naming
@@ -1385,7 +1393,7 @@ INFO performance default resolved setting="memory_budget_bytes" value=3006477107
 INFO performance default resolved setting="memory_overhead_reserve_bytes" value=2147483648 source="derived"
 INFO performance default resolved setting="memory_hard_caps_bytes" value=9019431321 source="derived"
 INFO performance default resolved setting="memory_remainder_bytes" value=21045339751 source="derived"
-INFO performance default resolved setting="sql_max_query_bytes" value=8053063680 source="derived" clamped=false
+INFO performance default resolved setting="sql_max_query_bytes" value=16106127360 source="derived" clamped=false
 INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived" raised=false
 INFO performance default resolved setting="gc_max_query_duration" value_ms=660000 source="derived"
 ```
