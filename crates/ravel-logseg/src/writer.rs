@@ -419,10 +419,6 @@ impl RlogWriter {
             }
         }
         let sorted_ids: Vec<LogStreamId> = streams.keys().copied().collect();
-        let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(sorted_ids.len());
-        for (i, id) in sorted_ids.iter().enumerate() {
-            ref_of.insert(*id, i as u32);
-        }
 
         // Each clustering key's value per record, in push order, read off the
         // per-record layer only (ADR-2135 decision 1).
@@ -595,7 +591,7 @@ impl RlogWriter {
         for r in &self.records {
             rows.push(resolve_row(
                 r,
-                &ref_of,
+                &sorted_ids,
                 &column_of,
                 &tracked_slot,
                 &stamp_index,
@@ -1014,10 +1010,6 @@ impl RlogWriter {
             }
         }
         let sorted_ids: Vec<LogStreamId> = streams.keys().copied().collect();
-        let mut ref_of: HashMap<LogStreamId, u32> = HashMap::with_capacity(sorted_ids.len());
-        for (i, id) in sorted_ids.iter().enumerate() {
-            ref_of.insert(*id, i as u32);
-        }
 
         // Each clustering key's value per global row, read from the same
         // first per-record occurrence the row path reads.
@@ -1122,6 +1114,14 @@ impl RlogWriter {
         let mut g_batch: Vec<u32> = Vec::with_capacity(total_rows);
 
         for (bi, b) in batches.iter().enumerate() {
+            // This batch's stream ids resolved to the object's global ref once
+            // per batch-local id, not once per row: a binary search of
+            // `sorted_ids` per entry here instead of per record.
+            let batch_remap: Vec<u32> = b
+                .stream_ids
+                .iter()
+                .map(|sid| sorted_ids.binary_search(sid).map(|i| i as u32).unwrap_or(0))
+                .collect();
             let mut trace_slot = 0usize;
             let mut span_slot = 0usize;
             for row in 0..b.num_rows {
@@ -1144,9 +1144,9 @@ impl RlogWriter {
                 } else {
                     g_span.push(None);
                 }
-                let sid = b.stream_ids[b.stream_refs[row] as usize];
-                g_stream_id.push(sid);
-                g_stream_ref.push(ref_of[&sid]);
+                let local_ref = b.stream_refs[row] as usize;
+                g_stream_id.push(b.stream_ids[local_ref]);
+                g_stream_ref.push(batch_remap[local_ref]);
             }
         }
 
@@ -1880,14 +1880,17 @@ fn stream_level_column_eligible(
 /// the two paths cannot drift.
 fn resolve_row(
     r: &LogRecord,
-    ref_of: &HashMap<LogStreamId, u32>,
+    sorted_ids: &[LogStreamId],
     column_of: &ColumnIndex,
     slot_of: &HashMap<&str, u32>,
     index: &StampIndex,
     stream_seeds: &HashMap<LogStreamId, StreamSeed>,
     stamp: &mut StampScratch,
 ) -> ResolvedRow {
-    let stream_ref = ref_of.get(&r.stream_id).copied().unwrap_or(0);
+    let stream_ref = sorted_ids
+        .binary_search(&r.stream_id)
+        .map(|i| i as u32)
+        .unwrap_or(0);
     let mut cols: BTreeMap<u32, ColumnValue> = BTreeMap::new();
     let mut overflow: Vec<(String, ravel_types::logstream::AttrValue)> = Vec::new();
     // Each *tracked* name this record carries -- indexed (POSTINGS) or
@@ -5339,6 +5342,87 @@ mod tests {
             let col_counts: Vec<u32> = col_l0.iter().map(|e| e.record_count).collect();
             assert!(row_counts.len() > 1, "expected multiple blocks");
             assert_eq!(row_counts, col_counts);
+        }
+
+        /// A distinct stream id per `n` (beyond the outer module's `id(u8)`,
+        /// which tops out at 256 streams), with the ordering of `n` matching
+        /// `LogStreamId`'s own `Ord`, so a stream's sorted position is `n`.
+        fn wide_id(n: u32) -> LogStreamId {
+            let mut a = [0u8; 16];
+            a[0..4].copy_from_slice(&n.to_be_bytes());
+            LogStreamId(a)
+        }
+
+        fn wide_record(n: u32, ts_ns: i64) -> LogRecord {
+            let blob = stream_attrs_bytes(
+                &[("service.name".into(), AttrValue::Str(format!("svc{n}")))],
+                "scope",
+                "1.0",
+                &[("lib".into(), AttrValue::I64(i64::from(n)))],
+            );
+            LogRecord {
+                stream_id: wide_id(n),
+                stream_attrs: blob,
+                ts_ns,
+                observed_ts_ns: ts_ns,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: "hello world".into(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: Vec::new(),
+            }
+        }
+
+        /// The issue #2440 acceptance test. Resolving a record's stream ref by
+        /// binary search over `sorted_ids` instead of the deleted `ref_of` hash
+        /// map must still resolve every record to its true stream, on both the
+        /// row and columnar paths.
+        ///
+        /// 300 distinct streams, pushed in the reverse of id order, so push
+        /// order and sorted order genuinely disagree (a fixture with one
+        /// stream, or streams pushed in id order, cannot tell a push-order
+        /// resolution from a sorted one). Split into two columnar batches along
+        /// the push-order midpoint, which (because push order is the reverse
+        /// of id order) gives the two batches disjoint, non-overlapping stream
+        /// sets: a remap reused across batches, or indexed by the wrong
+        /// (global vs batch-local) ref, resolves the second batch's rows to
+        /// the first batch's streams instead of their own.
+        #[test]
+        fn stream_refs_equal_sorted_position_across_many_streams() {
+            const STREAM_COUNT: u32 = 300;
+            let records: Vec<LogRecord> = (0..STREAM_COUNT)
+                .rev()
+                .enumerate()
+                .flat_map(|(i, n)| {
+                    let base = i as i64 * 2;
+                    (0..2i64).map(move |k| wide_record(n, base + k))
+                })
+                .collect();
+            let expected: std::collections::HashMap<i64, LogStreamId> =
+                records.iter().map(|r| (r.ts_ns, r.stream_id)).collect();
+
+            let cfg = RlogConfig::default();
+            let (rb, _) = row_object(cfg, &records);
+            let (cb, _) = columnar_object(cfg, &records, 2);
+            assert_eq!(rb, cb, "row and columnar builds must stay byte-identical");
+
+            for (label, obj) in [("row", &rb), ("columnar", &cb)] {
+                let reader = crate::reader::RlogReader::new(obj, &cfg).expect("open reader");
+                let (rows, _) = reader
+                    .scan(&crate::record::Predicate::And(Vec::new()))
+                    .expect("scan");
+                assert_eq!(rows.len(), records.len(), "{label}: row count");
+                for row in &rows {
+                    assert_eq!(
+                        expected.get(&row.ts_ns),
+                        Some(&row.stream_id),
+                        "{label}: row at ts_ns={} decoded to the wrong stream id",
+                        row.ts_ns
+                    );
+                }
+            }
         }
     }
 
