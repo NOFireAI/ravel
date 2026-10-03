@@ -2975,7 +2975,8 @@ impl HostProfile {
 }
 
 /// A `/proc/meminfo` field (`MemTotal:` or `MemAvailable:`) in bytes. A
-/// missing line, a non-numeric count, or a unit other than `kB` is `None`.
+/// missing line, a non-numeric count, or a unit other than `kB` (or `KB`,
+/// which `ravel_maintain`'s `MemTotal` parser also accepts) is `None`.
 /// `#[cfg(test)]` builds parse it on every target (not only Linux) so the
 /// fixture-string tests run on the CI host that builds this crate.
 #[cfg(any(target_os = "linux", test))]
@@ -2984,7 +2985,7 @@ fn parse_meminfo_field_bytes(meminfo: &str, prefix: &str) -> Option<u64> {
     let mut fields = line.split_whitespace().skip(1);
     let value: u64 = fields.next()?.parse().ok()?;
     match fields.next() {
-        Some("kB") => value.checked_mul(1024),
+        Some("kB") | Some("KB") => value.checked_mul(1024),
         None => Some(value),
         Some(_) => None,
     }
@@ -3893,7 +3894,7 @@ pub fn resolve_performance_defaults(
     } else {
         unclamped_query_bytes
     };
-    let sql_pools_remainder_capped = tenant_remainder_capped || query_remainder_capped;
+    let mut tenant_remainder_capped = tenant_remainder_capped;
 
     // Reconcile the per-query pool with the per-tenant ceiling, keeping the
     // invariant sql_max_query_bytes <= sql_tenant_max_bytes. An EXPLICIT
@@ -3907,11 +3908,15 @@ pub fn resolve_performance_defaults(
         if query_bytes_explicit && !tenant_explicit {
             sql_tenant_max_bytes = unclamped_query_bytes;
             sql_tenant_max_bytes_raised = true;
+            // The raise lifts the tenant ceiling past the cap, so the ceiling
+            // it reports is no longer the capped one.
+            tenant_remainder_capped = false;
         } else {
             sql_max_query_bytes = sql_tenant_max_bytes;
             sql_max_query_bytes_clamped = true;
         }
     }
+    let sql_pools_remainder_capped = tenant_remainder_capped || query_remainder_capped;
 
     let (query_deadline, deadline_source) = match flags.query_deadline {
         Some(d) => (d, PERF_SOURCE_FLAG),
@@ -16520,6 +16525,34 @@ mod tests {
 
         assert_eq!(resolved.sql_tenant_max_bytes, 20_000_000_000);
         assert_eq!(resolved.sources.sql_tenant_max_bytes, PERF_SOURCE_FLAG);
+        assert!(!resolved.sql_pools_remainder_capped);
+    }
+
+    /// A derived tenant ceiling that the cap lowered and an explicit
+    /// `--sql-max-query-bytes` then raised past the cap is not reported as
+    /// capped: the logged value is the raised one.
+    ///
+    /// Prove-the-test: drop the `tenant_remainder_capped = false` in the
+    /// raise arm and both capped flags read `true` beside a 20,000,000,000
+    /// tenant ceiling.
+    #[test]
+    fn a_tenant_ceiling_raised_past_the_cap_is_not_reported_capped() {
+        let host = adr_reference_host_no_cgroup();
+        let loopback = cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--sql-max-query-bytes",
+            "20000000000",
+        ]);
+        let resolved = loopback
+            .resolve_performance(host)
+            .expect("performance defaults resolve");
+
+        assert_eq!(resolved.sql_tenant_max_bytes, 20_000_000_000);
+        assert!(resolved.sql_tenant_max_bytes_raised);
+        assert!(!resolved.sql_tenant_max_bytes_remainder_capped);
         assert!(!resolved.sql_pools_remainder_capped);
     }
 
