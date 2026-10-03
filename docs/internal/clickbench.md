@@ -1110,9 +1110,12 @@ Add `--concurrency-seconds 600` to an arm's command for D7's phase: ten
 connections (`--concurrency-tasks`, default 10), each its own HTTP client,
 cycling the 43 statements, task `i` starting `4i` statements into the suite.
 The report's
-`concurrency` block holds queries per second (completed queries over the
-phase's length), two error ratios, and per-statement counts, nearest-rank
-p50 and p95, and the first error. `error_ratio` is every error over
+`concurrency` block holds the configured `duration_s` and the measured
+`elapsed_s`, queries per second, two error ratios, and per-statement counts,
+nearest-rank p50 and p95, and the first error. No task starts a statement
+after `duration_s`, but one already running finishes and counts, so
+`elapsed_s` runs from the phase's start to the last statement returning and
+is at least `duration_s`; `qps` is completed queries over `elapsed_s`. `error_ratio` is every error over
 completed plus errors, the figure comparable with the RLOG entry.
 `unregistered_error_ratio` is the same ratio over the statements not in
 `failures` only, and it is the one judged against

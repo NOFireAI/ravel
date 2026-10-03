@@ -81,11 +81,17 @@ pub struct ConcurrencyStatement {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConcurrencyFigures {
     pub tasks: usize,
+    /// The configured duration: no task starts a statement past it.
     pub duration_s: f64,
+    /// The measured window, on the tasks' clocks: from the earliest task
+    /// start to the last statement returning, answered or errored. A
+    /// statement still running at the deadline finishes, so this is at
+    /// least `duration_s`.
+    pub elapsed_s: f64,
     pub queries_completed: u64,
     pub errors: u64,
-    /// `queries_completed / duration_s`. A statement still running at the
-    /// deadline finishes and counts.
+    /// `queries_completed / elapsed_s`. A statement still running at the
+    /// deadline finishes and counts, and the window runs until it returns.
     pub qps: f64,
     /// `errors / (queries_completed + errors)`, 0 when nothing ran.
     pub error_ratio: f64,
@@ -135,30 +141,47 @@ struct Outcome {
     result: Result<Duration, String>,
 }
 
+/// One task's outcomes and when, on its clock, it began and its last
+/// statement returned.
+struct TaskRun {
+    outcomes: Vec<Outcome>,
+    began: Duration,
+    ended: Duration,
+}
+
 async fn run_task(
     task: PhaseTask,
     task_index: usize,
     statements: Arc<Vec<Statement>>,
     duration: Duration,
-) -> Vec<Outcome> {
+) -> TaskRun {
     let len = statements.len();
     let offset = (task_index * TASK_OFFSET_STRIDE) % len;
-    let deadline = task.clock.now() + duration;
+    let began = task.clock.now();
+    let deadline = began + duration;
+    // Each return's reading is the next statement's start, so the loop ends
+    // only once `ended` reaches the deadline.
+    let mut ended = began;
     let mut outcomes = Vec::new();
     for k in 0.. {
-        let started = task.clock.now();
+        let started = ended;
         if started >= deadline {
             break;
         }
         let index = (offset + k) % len;
         let result = task.engine.query(&statements[index].sql).await;
-        let latency = task.clock.now().saturating_sub(started);
+        ended = task.clock.now();
+        let latency = ended.saturating_sub(started);
         outcomes.push(Outcome {
             index,
             result: result.map(|_| latency).map_err(|e| e.to_string()),
         });
     }
-    outcomes
+    TaskRun {
+        outcomes,
+        began,
+        ended,
+    }
 }
 
 /// Nearest-rank percentile: the value at rank `ceil(p * n)` of the sorted
@@ -215,17 +238,25 @@ pub async fn run(
             )
         });
     }
-    let mut per_task: Vec<(usize, Vec<Outcome>)> = Vec::with_capacity(task_count);
+    let mut per_task: Vec<(usize, TaskRun)> = Vec::with_capacity(task_count);
     while let Some(joined) = set.join_next().await {
         per_task.push(joined.map_err(|e| ConcurrencyError::TaskFailed(e.to_string()))?);
     }
     per_task.sort_by_key(|(task_index, _)| *task_index);
+    // Every task's `ended` is at least its `began` plus `duration`, so the
+    // window is at least `duration`, which check_shape keeps above zero.
+    let phase_start = per_task.iter().map(|(_, r)| r.began).min();
+    let last_return = per_task.iter().map(|(_, r)| r.ended).max();
+    let elapsed = match (phase_start, last_return) {
+        (Some(start), Some(end)) => end.saturating_sub(start),
+        _ => duration,
+    };
 
     let mut latencies: Vec<Vec<f64>> = vec![Vec::new(); statements.len()];
     let mut errors = vec![0u64; statements.len()];
     let mut first_errors: Vec<Option<String>> = vec![None; statements.len()];
-    for (_, outcomes) in per_task {
-        for outcome in outcomes {
+    for (_, task_run) in per_task {
+        for outcome in task_run.outcomes {
             match outcome.result {
                 Ok(latency) => latencies[outcome.index].push(latency.as_secs_f64()),
                 Err(error) => {
@@ -255,9 +286,10 @@ pub async fn run(
     let mut phase = ConcurrencyFigures {
         tasks: task_count,
         duration_s: duration.as_secs_f64(),
+        elapsed_s: elapsed.as_secs_f64(),
         queries_completed,
         errors: error_total,
-        qps: queries_completed as f64 / duration.as_secs_f64(),
+        qps: queries_completed as f64 / elapsed.as_secs_f64(),
         error_ratio: if attempted == 0 {
             0.0
         } else {
@@ -379,6 +411,7 @@ mod tests {
         // Task 0 starts at s1, task 1 at s5 (offset 4 of 5). Over 6 s:
         //   task 0: s1 0-1, s2 1-3, s3 errors 3-6, then the deadline.
         //   task 1: s5 0-2, s1 2-5, s2 5-7 (started before 6 s, so it counts).
+        // The last return is task 1's s2 at 7 s, so the window is 7 s.
         let rest = [
             ("s2", 2, false),
             ("s3", 3, true),
@@ -397,10 +430,11 @@ mod tests {
         .expect("phase runs");
 
         assert_eq!(figures.tasks, 2);
-        assert_eq!(figures.duration_s, 6.0);
+        assert_eq!(figures.duration_s.to_bits(), 6.0f64.to_bits());
+        assert_eq!(figures.elapsed_s.to_bits(), 7.0f64.to_bits());
         assert_eq!(figures.queries_completed, 5);
         assert_eq!(figures.errors, 1);
-        assert_eq!(figures.qps.to_bits(), (5.0f64 / 6.0).to_bits());
+        assert_eq!(figures.qps.to_bits(), (5.0f64 / 7.0).to_bits());
         assert_eq!(figures.error_ratio.to_bits(), (1.0f64 / 6.0).to_bits());
         assert_eq!(
             figures.unregistered_error_ratio.to_bits(),
@@ -435,6 +469,10 @@ mod tests {
         // The run started at 8 s finishes at 12 s and counts; none starts at 12 s.
         assert_eq!(starts, vec![0, 4, 8]);
         assert_eq!(figures.queries_completed, 3);
+        // qps is over the 12 s the three runs took, not the 10 s configured.
+        assert_eq!(figures.duration_s.to_bits(), 10.0f64.to_bits());
+        assert_eq!(figures.elapsed_s.to_bits(), 12.0f64.to_bits());
+        assert_eq!(figures.qps.to_bits(), 0.25f64.to_bits());
     }
 
     #[tokio::test]
