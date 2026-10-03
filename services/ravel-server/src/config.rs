@@ -10601,6 +10601,38 @@ mod tests {
         );
     }
 
+    /// An explicit `--memory-budget-bytes` on a host with no readable
+    /// `MemTotal` (the non-Linux shape) must still carve real caches from
+    /// that flag-derived budget, not fall back to
+    /// [`DEFAULT_CACHE_MAX_BYTES`] (536,870,912): a flag-derived budget is
+    /// known even though `host.mem_total_bytes` is `None` (issue #2483,
+    /// finding 3). Before the fix this also caused a spurious startup
+    /// refusal: the 536,870,912-byte fallback caches exceed the 500,000,000-
+    /// byte flagged budget, so `check_memory_budget` refused a budget that
+    /// was never actually overcommitted.
+    ///
+    /// Prove-the-test: key the cache matches on `host.mem_total_bytes` again
+    /// instead of `memory_budget_known` and `resolve_performance` returns
+    /// `Err` (the resolved 536,870,912-byte fallback caches exceed the
+    /// 500,000,000-byte flagged budget) instead of `Ok`.
+    #[test]
+    fn explicit_memory_budget_flag_carves_caches_on_a_non_linux_shaped_host() {
+        let cli = cli(&["--memory-budget-bytes", "500000000"]);
+        let resolved = cli
+            .resolve_performance(HostProfile::new(16, None, None, None, None, None))
+            .expect("a flag-derived budget must not spuriously refuse to start");
+
+        assert_eq!(resolved.memory_budget_bytes, 500_000_000);
+        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(resolved.cache_max_bytes, 125_000_000);
+        assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
+        assert_eq!(resolved.catalog_cache_max_bytes, 25_000_000);
+        assert_eq!(
+            resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+    }
+
     /// Issue #1141 clamp rule: an EXPLICIT per-query pool RAISES a non-explicit
     /// (derived or fallback) per-tenant ceiling to fit rather than being cut to
     /// it. An operator who typed `--sql-max-query-bytes` on a host whose
@@ -13028,6 +13060,117 @@ mod tests {
             .expect("fallback");
         assert_eq!(target.bytes, 268_435_456);
         assert_eq!(target.source_name(), "fallback");
+    }
+
+    /// `resolve_l1_part_memory_target` must treat every real memory-budget
+    /// source as a known budget, not only the legacy `PERF_SOURCE_DERIVED`
+    /// (MemTotal-only, no `MemAvailable`) path: the available-memory
+    /// derivation (`derived-available`), the cgroup derivation
+    /// (`derived-cgroup`), and an explicit `--memory-budget-bytes` flag
+    /// (`flag`) must all reach `L1PartMemoryTargetSource::Derived` (named
+    /// "derived" by `source_name`), carrying the merge-cursor-adjusted
+    /// budget, rather than silently falling back to
+    /// `L1PartMemoryTargetSource::Fallback` (issue #2483, finding 1).
+    /// `source_name`, not the byte value, is what distinguishes the two: the
+    /// reference host's share floors to the same 256 MiB the fallback also
+    /// uses, so a numeric comparison alone would not catch this bug.
+    ///
+    /// Prove-the-test: restore the `== PERF_SOURCE_DERIVED` comparison and
+    /// all three `source_name()` assertions below read "fallback" instead of
+    /// "derived".
+    #[test]
+    fn resolve_l1_part_memory_target_accepts_every_real_budget_source() {
+        let resolve = |performance: &ResolvedPerformanceDefaults| {
+            cli(&[])
+                .resolve_l1_part_memory_target(
+                    performance,
+                    ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION,
+                    ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+                )
+                .expect("resolves")
+        };
+
+        // Available-memory host: source is PERF_SOURCE_DERIVED_AVAILABLE, not
+        // PERF_SOURCE_DERIVED.
+        let available_host = adr_reference_host_no_cgroup();
+        let performance = cli(&[])
+            .resolve_performance(available_host)
+            .expect("performance defaults resolve");
+        assert_eq!(
+            performance.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_AVAILABLE
+        );
+        assert_eq!(resolve(&performance).source_name(), "derived");
+
+        // Cgroup host: source is PERF_SOURCE_DERIVED_CGROUP.
+        let cgroup_host = HostProfile::new(
+            4,
+            Some(4 * 1024 * 1024 * 1024),
+            Some(AVAILABLE_ADR_MEM_TOTAL_BYTES),
+            Some(4 * 1024 * 1024 * 1024),
+            Some(1_073_741_824),
+            Some(0),
+        );
+        let performance = cli(&[])
+            .resolve_performance(cgroup_host)
+            .expect("performance defaults resolve");
+        assert_eq!(
+            performance.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_CGROUP
+        );
+        assert_eq!(resolve(&performance).source_name(), "derived");
+
+        // Flag-set budget on a host with no readable MemTotal: source is
+        // PERF_SOURCE_FLAG. A 32 GiB flagged budget less the 20 GiB merge
+        // cursor share, /8/4 concurrent merges, derives 402653184 -- above
+        // the 256 MiB floor, so this arm also proves the byte value moved.
+        let flagged = cli(&["--memory-budget-bytes", "34359738368"]); // 32 GiB
+        let performance = flagged
+            .resolve_performance(HostProfile::new(16, None, None, None, None, None))
+            .expect("performance defaults resolve");
+        assert_eq!(performance.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
+        let target = flagged
+            .resolve_l1_part_memory_target(
+                &performance,
+                ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION,
+                ravel_maintain::config::DEFAULT_MERGE_CURSOR_BUDGET_BYTES,
+            )
+            .expect("resolves");
+        assert_eq!(target.source_name(), "derived");
+        assert_eq!(target.bytes, 402_653_184);
+    }
+
+    /// The available-memory `memory_budget_bytes` derivation sums
+    /// `MemAvailable` with this process's own resident set before
+    /// subtracting the overhead reserve (ADR-1170, amended 2026-10-03 by
+    /// issue #2367): MemTotal 32 GiB, MemAvailable 10 GiB, own_rss 2 GiB
+    /// derives `(10 + 2 - 2) GiB = 10 GiB`, not `(10 - 2) GiB = 8 GiB`
+    /// (issue #2483, finding 2).
+    ///
+    /// Prove-the-test: drop `own_rss` from the sum in the derivation and this
+    /// reads 8589934592 instead of 10737418240.
+    #[test]
+    fn available_memory_budget_derivation_adds_own_rss() {
+        const MEM_TOTAL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+        const MEM_AVAILABLE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+        const OWN_RSS_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+        const EXPECTED_BUDGET_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+        let host = HostProfile::new(
+            REFERENCE_CORES,
+            Some(MEM_TOTAL_BYTES),
+            Some(MEM_TOTAL_BYTES),
+            None,
+            Some(MEM_AVAILABLE_BYTES),
+            Some(OWN_RSS_BYTES),
+        );
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+        assert_eq!(resolved.memory_budget_bytes, EXPECTED_BUDGET_BYTES);
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_DERIVED_AVAILABLE
+        );
+        assert!(!resolved.memory_budget_floor_bound);
     }
 
     /// The startup lease check must not warn at the derived defaults: with the
