@@ -130,19 +130,22 @@ with one array per row under `data.rows`. A non-finite float comes back as a
 string: `NaN`, `+Inf`, and `-Inf`. Other column types are encoded as follows:
 
 - every integer width is a JSON number;
-- a timestamp of any unit is an integer count of nanoseconds since the epoch,
-  with its time zone dropped (a value past 2^53 needs a client that parses
-  JSON integers exactly, which a JavaScript `JSON.parse` does not);
+- a timestamp of any unit is an integer count of nanoseconds since the
+  epoch, with its time zone dropped (a value past 2^53 needs a client that
+  parses JSON integers exactly, which a JavaScript `JSON.parse` does not);
 - `Date32` and `Date64` are `YYYY-MM-DD` strings;
 - `Decimal128` is a string holding its exact decimal text;
 - binary columns are lowercase hex strings.
 
-A column type with no JSON encoding fails the query with an error naming the
-type. Sending `Accept: application/vnd.apache.arrow.stream` yields an Arrow IPC
-stream instead, which is bit-exact for every type. The SQL surface registers exactly five tables, one
-per signal: `samples` (metrics), `logs`, `spans` (traces), `alerts` (alert
-state transitions), and `audit` (audit records, including the query-audit
-trail).
+A column whose type or value has no JSON encoding (a type with no rule above,
+a timestamp past the i64 nanosecond range, a date outside years 0000 to 9999,
+or a `Date64` that is not a whole day) fails the query with 500 `internal` and
+the fixed internal message; the server logs the column type and value at
+`warn`. Sending `Accept: application/vnd.apache.arrow.stream` yields an Arrow
+IPC stream instead, which is bit-exact for every type. The SQL surface
+registers exactly five tables, one per signal: `samples` (metrics), `logs`,
+`spans` (traces), `alerts` (alert state transitions), and `audit` (audit
+records, including the query-audit trail).
 
 `/mcp` is behind the `mcp` cargo feature and `--mcp`: a build carrying the
 feature serves no MCP route until an operator passes the flag. It is the only
@@ -170,8 +173,9 @@ For the query routes, the status codes come from one shared error mapping:
   the lowest this build supports, a supersession chain of compaction or
   rewrite records that is cyclic, deeper than the resolver's fixed bound, or
   names a predecessor with a different input set, a segment decode job that
-  panicked, a non-monotonic run). It is not retryable, and its message is
-  fixed so no object key or tenant hash leaks.
+  panicked, a non-monotonic run), or an SQL result column the JSON encoding
+  cannot represent (see `/api/v1/sql` above). It is not retryable, and its
+  message is fixed so no object key or tenant hash leaks.
 - 503 `unavailable`: a transient storage fault, an invalidated snapshot, a
   catalog object (commit, compaction or rewrite record, erasure request, HEAD,
   snapshot part or postings) written in a format version above the highest
