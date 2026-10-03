@@ -585,6 +585,10 @@ above the threshold, otherwise 1), and the multipart path keeps no more parts
 in flight than the permits held. A class with no spare permit uploads the
 parts one at a time
 (`s3_http_faults::scheduled_large_put_keeps_requests_within_its_permits`).
+The fan-out is read from the inner store's `upload_checksum` capability: a
+store declaring it (`S3Store` with upload integrity on, which sends every put
+as one PUT, and `MemoryStore`) gets one permit per put at every size
+(`s3_http_faults::scheduled_large_put_with_integrity_takes_one_permit`).
 
 **Checksum coverage.** `put_part`'s optional `UploadChecksum` is verified
 per part, before the part is sent, with exactly the reach `PutOptions::checksum`

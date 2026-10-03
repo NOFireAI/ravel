@@ -53,8 +53,14 @@
 //! [`MULTIPART_THRESHOLD`](crate::s3::MULTIPART_THRESHOLD) is one op but
 //! several requests, because its parts go out concurrently. The handle's `put`
 //! therefore takes its first permit as usual, then up to the store's fan-out
-//! for that payload ([`crate::s3::put_fan_out`]) in extra permits, taking only
-//! the ones admission would grant right now and never waiting for one. A put
+//! for that payload (`put_permits_wanted`) in extra permits, taking only
+//! the ones admission would grant right now and never waiting for one. The
+//! fan-out is read from the inner store's [`Capabilities::upload_checksum`]:
+//! [`S3Store`] declares it exactly when upload integrity is on, which keeps
+//! every put on the single-PUT path, and [`MemoryStore`](crate::memory::MemoryStore)
+//! declares it and never splits a put, so a store declaring it wants one
+//! permit per put. A store that does not declare it is sized for the multipart
+//! fan-out, which a store that never splits a put leaves unused. A put
 //! that waited for its extras while holding its first permit could deadlock
 //! against another large put doing the same, and no put holds more permits
 //! than its class has. The number held is installed as a task-local request
@@ -64,6 +70,7 @@
 //! them forwarding a new method.
 //!
 //! [`S3Store::put`]: crate::s3::S3Store
+//! [`S3Store`]: crate::s3::S3Store
 //!
 //! # Off by default (ADR-0070 decision 2)
 //!
@@ -91,7 +98,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use crate::instrument::{InstantClock, MonotonicClock, StoreMetrics, StoreOp};
 use crate::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, UploadChecksum,
+    ObjectStoreBackend, PageToken, PutMode, PutOptions, PutOutcome, StoreError, UploadChecksum,
 };
 
 tokio::task_local! {
@@ -105,6 +112,18 @@ tokio::task_local! {
 /// call path, so the store applies its own bound.
 pub(crate) fn request_budget() -> Option<usize> {
     REQUEST_BUDGET.try_with(|budget| *budget).ok()
+}
+
+/// How many requests one `put` of `len` bytes under `mode` can have in flight
+/// on a store declaring `caps`: one when the store declares `upload_checksum`,
+/// otherwise the S3 multipart fan-out. See "Ops that fan out" in the
+/// [module docs](self).
+fn put_permits_wanted(caps: &Capabilities, len: usize, mode: &PutMode) -> usize {
+    if caps.upload_checksum {
+        1
+    } else {
+        crate::s3::put_fan_out(len, mode)
+    }
 }
 
 /// The class a store handle belongs to. Attached to the handle at construction,
@@ -605,7 +624,7 @@ impl ObjectStoreBackend for ScheduledHandle {
         // Payload length is read before the move, and counted whether or not
         // the backend accepts the write (mirrors `InstrumentedStore`).
         let bytes = data.len() as u64;
-        let want = crate::s3::put_fan_out(data.len(), &opts.mode);
+        let want = put_permits_wanted(&self.inner.capabilities(), data.len(), &opts.mode);
         let permits = self.scheduler.acquire_up_to(self.class, want).await;
         let start = self.clock.now_nanos();
         let result = REQUEST_BUDGET
@@ -868,6 +887,8 @@ mod tests {
         deletes: AtomicU64,
         /// The request budget each `put` ran under, in call order.
         put_budgets: parking_lot::Mutex<Vec<Option<usize>>>,
+        /// Declared as [`Capabilities::upload_checksum`].
+        upload_checksum: bool,
     }
 
     #[async_trait::async_trait]
@@ -924,7 +945,10 @@ mod tests {
         }
 
         fn capabilities(&self) -> Capabilities {
-            Capabilities::mandatory()
+            Capabilities {
+                upload_checksum: self.upload_checksum,
+                ..Capabilities::mandatory()
+            }
         }
     }
 
@@ -1543,11 +1567,12 @@ mod tests {
     }
 
     /// A `put` runs under a request budget equal to the permits its handle
-    /// holds (issue #2327): the store's fan-out for a large overwrite when the
+    /// holds (issue #2327): for a store that does not declare
+    /// `upload_checksum`, the multipart fan-out for a large overwrite when the
     /// class has that many free, fewer when it has fewer, and one for a
-    /// payload or mode the store sends as a single request. Every permit comes
-    /// back afterwards, background floor slots included, and passthrough sets
-    /// no budget.
+    /// payload or mode sent as a single request; for a store that declares it,
+    /// one at every size. Every permit comes back afterwards, background floor
+    /// slots included, and passthrough sets no budget.
     #[tokio::test]
     async fn a_put_runs_under_a_budget_of_the_permits_it_holds() {
         let large = Bytes::from(vec![0u8; 4 * crate::s3::MULTIPART_PART_SIZE + 1]);
@@ -1613,6 +1638,29 @@ mod tests {
             .expect("put");
         assert_eq!(*counting.put_budgets.lock(), vec![Some(1), Some(1)]);
 
+        // A store declaring `upload_checksum` sends a large overwrite as one
+        // request, so the same puts that took four and two above take one.
+        let counting = Arc::new(CountingStore {
+            upload_checksum: true,
+            ..CountingStore::default()
+        });
+        let cs = ClassedStore::scheduled(
+            Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>,
+            SchedulerConfig::new(8, 2, 1),
+        );
+        cs.foreground()
+            .put("i", large.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        cs.background()
+            .put("j", large.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        assert_eq!(*counting.put_budgets.lock(), vec![Some(1), Some(1)]);
+        let sched = scheduler(&cs);
+        assert_eq!(sched.global.available_permits(), 8);
+        assert_eq!(sched.bg_sem.available_permits(), 2);
+
         let counting = Arc::new(CountingStore::default());
         let cs = ClassedStore::passthrough(Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>);
         cs.foreground()
@@ -1620,6 +1668,38 @@ mod tests {
             .await
             .expect("put");
         assert_eq!(*counting.put_budgets.lock(), vec![None]);
+    }
+
+    /// A large overwrite over a `MemoryStore`, which never splits a put, holds
+    /// exactly one permit of either class while it is in flight.
+    #[tokio::test]
+    async fn a_large_memory_store_put_holds_one_permit() {
+        let inner = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = inner.hold(Op::Put, None, Occurrence::Always);
+        let cs = ClassedStore::scheduled(
+            Arc::clone(&inner) as Arc<dyn ObjectStoreBackend>,
+            SchedulerConfig::new(8, 8, 1),
+        );
+        let large = Bytes::from(vec![0u8; 4 * crate::s3::MULTIPART_PART_SIZE + 1]);
+        let sched = scheduler(&cs);
+        for (handle, bg_free) in [(cs.foreground(), 8), (cs.background(), 7)] {
+            let data = large.clone();
+            let put =
+                tokio::spawn(async move { handle.put("big", data, PutOptions::default()).await });
+            gate.wait_until_held(1).await;
+            assert_eq!(
+                sched.global.available_permits(),
+                7,
+                "the put holds one permit"
+            );
+            assert_eq!(sched.bg_sem.available_permits(), bg_free);
+            for id in gate.held() {
+                gate.release(id);
+            }
+            put.await.expect("the put task completes").expect("put");
+            assert_eq!(sched.global.available_permits(), 8);
+            assert_eq!(sched.bg_sem.available_permits(), 8);
+        }
     }
 
     /// The extra permits a large put takes are only ones nobody is waiting
