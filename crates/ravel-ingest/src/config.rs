@@ -756,6 +756,40 @@ impl IngestConfig {
     pub(crate) fn queued_flush_cap(&self) -> usize {
         self.max_queued_flushes.max(1)
     }
+
+    /// The worst-case span between a record being routed and its flush opening
+    /// when no deferral intervenes: the longest age threshold a buffer can wait
+    /// out (`max_flush_delay`, `max_flush_delay_idle`, or with a non-zero
+    /// `idle_flush_byte_floor` the sub-floor hold of ADR-1737) plus one
+    /// `flush_tick`, since the age check runs on a tick rather than at the
+    /// instant the threshold is crossed.
+    pub fn routing_to_pin_bound_ns(&self) -> i64 {
+        let strict_ns = self.max_flush_delay.as_nanos() as i64;
+        let idle_ns = self.max_flush_delay_idle.as_nanos() as i64;
+        let (floored_ns, _) = idle_age_threshold(0, self);
+        strict_ns
+            .max(idle_ns)
+            .max(floored_ns)
+            .saturating_add(self.flush_tick.as_nanos() as i64)
+    }
+
+    /// How long a refused flush trigger may stay deferred before its shard
+    /// refuses new strict-mode appends (issue #1916, ADR-1642 deferral cap
+    /// amendment). It is what the read-side slack
+    /// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` has left once its own
+    /// derivation is paid for: the slack less `max_flush_lifetime` (the term
+    /// the frozen derivation reserves for the flush itself) less
+    /// [`Self::routing_to_pin_bound_ns`]. A deferral within it keeps a
+    /// record's routing-to-pin span inside the slack. 3559.8 s at the shipped
+    /// defaults; it saturates at 0 for a configuration whose own bounds
+    /// already spend the slack, so there a first refusal reaches the cap.
+    pub fn flush_deferral_cap_ns(&self) -> i64 {
+        let slack_ns = i64::from(ravel_catalog::FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR;
+        slack_ns
+            .saturating_sub(self.max_flush_lifetime.as_nanos() as i64)
+            .saturating_sub(self.routing_to_pin_bound_ns())
+            .max(0)
+    }
 }
 
 #[cfg(test)]
@@ -982,6 +1016,27 @@ mod tests {
             ..IngestConfig::default()
         };
         assert_eq!(three.queued_flush_cap(), 3);
+    }
+
+    /// The deferral cap is the slack's remainder: at the shipped defaults
+    /// 7200 s less the 3600 s lifetime less the 40 s idle ceiling and one
+    /// 200 ms tick, and 0 once the sub-floor hold spends the rest.
+    #[test]
+    fn flush_deferral_cap_is_what_the_slack_leaves() {
+        let shipped = IngestConfig::default();
+        assert_eq!(shipped.routing_to_pin_bound_ns(), 40_200_000_000);
+        assert_eq!(shipped.flush_deferral_cap_ns(), 3_559_800_000_000);
+        assert_eq!(
+            shipped.flush_deferral_cap_ns()
+                + shipped.routing_to_pin_bound_ns()
+                + shipped.max_flush_lifetime.as_nanos() as i64,
+            i64::from(ravel_catalog::FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
+        );
+        let floored = IngestConfig {
+            idle_flush_byte_floor: 1,
+            ..shipped
+        };
+        assert_eq!(floored.flush_deferral_cap_ns(), 0);
     }
 
     #[test]
