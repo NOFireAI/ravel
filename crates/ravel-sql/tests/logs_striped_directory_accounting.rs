@@ -279,6 +279,26 @@ fn whole_object_fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher
         .with_read_gate(gate)
 }
 
+/// [`fetcher`] without the zero coalesce gap: the default gap bridges every
+/// hole these objects have.
+fn default_gap_fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
+    // A probe far shorter than the object, so every block page is a separate
+    // ranged read rather than part of the probe.
+    let block_range = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_suffix_len(512)
+        .with_whole_object_threshold(0);
+    let cache_bytes = 64u64 << 20;
+    let cache: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(CacheLimits::new(
+        cache_bytes,
+        (cache_bytes / 4096) as usize,
+        cache_bytes,
+    )));
+    LogSegmentFetcher::new(store)
+        .with_block_range(block_range)
+        .with_cache(cache)
+        .with_block_range_threshold(0)
+}
+
 fn sum_metric(plan: &Arc<dyn ExecutionPlan>, name: &str) -> usize {
     fn find(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
         if plan.name() == "LogsScanExec" {
@@ -362,6 +382,8 @@ struct Fixture {
     pages: u64,
     /// The objects' lengths, summed.
     object_bytes: u64,
+    /// Each segment's object bytes, in snapshot order.
+    objects: Vec<Vec<u8>>,
 }
 
 async fn fixture() -> Fixture {
@@ -369,6 +391,7 @@ async fn fixture() -> Fixture {
     let mut segments = Vec::new();
     let (mut directories, mut fetch_side, mut page_dir, mut pages) = (0u64, 0u64, 0u64, 0u64);
     let mut object_bytes = 0u64;
+    let mut objects = Vec::new();
     for s in 0..SEGMENTS {
         let (seg_ref, obj) = write_segment(base.as_ref(), s).await;
         directories += directory_bytes(&obj);
@@ -391,6 +414,7 @@ async fn fixture() -> Fixture {
             "the {SUFFIX_LEN}-byte suffix probe must cover PAGE_DIR in segment {s}"
         );
         segments.push(seg_ref);
+        objects.push(obj);
     }
     let store: Arc<dyn ObjectStoreBackend> = base;
     Fixture {
@@ -405,6 +429,7 @@ async fn fixture() -> Fixture {
         page_dir,
         pages,
         object_bytes,
+        objects,
     }
 }
 
@@ -530,4 +555,76 @@ async fn whole_object_route_decompresses_once_per_segment() {
         fx.directories + fx.pages,
         "the total is one whole-object decode of the projection"
     );
+}
+
+/// One segment of three row groups scanned by two partitions: the round-robin
+/// deal gives the first partition groups 0 and 2 and the second group 1. With
+/// the fetcher's default coalesce gap, wider than the hole between groups 0 and
+/// 2, each partition's ranged read must still stay inside its own groups, so
+/// the scan phase issues one GET per owned group and moves exactly each group's
+/// projected span: wire bytes across both partitions are the three spans, within
+/// the object's length, with no span overlapping another.
+///
+/// Fails against a plan that bridges over the whole candidate set's holes: the
+/// first partition's one run then spans group 1 (two GETs in all, one of them
+/// moving group 1's bytes a second time), and against a plan that never bridges
+/// for a partition (one GET per column chunk, not one per group).
+#[tokio::test]
+async fn interleaved_groups_move_each_groups_span_once() {
+    let fx = fixture().await;
+    let seg = fx.snapshot.segments[0].clone();
+    let obj = fx.objects[0].clone();
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    let run = run_with(
+        &fx.store,
+        &snapshot,
+        2,
+        default_gap_fetcher(Arc::clone(&fx.store)),
+    )
+    .await;
+    assert_eq!(run.rows, BLOCKS_PER_SEG);
+
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(&obj[..], &cfg).expect("open");
+    assert_eq!(reader.row_group_count(), GROUPS);
+    let dirs = RlogReader::decode_directories(&obj[..], &cfg).expect("directories");
+    let selected = ColumnSelection::fixed_only()
+        .with_body()
+        .resolve(dirs.field_dir())
+        .expect("a narrow projection resolves to a column set");
+    let spans: Vec<u64> = (0..GROUPS)
+        .map(|g| {
+            let chunks: Vec<(u64, u64)> = selected
+                .iter()
+                .filter_map(|c| reader.column_chunk_range(g, *c))
+                .collect();
+            let start = chunks.iter().map(|c| c.0).min().expect("a chunk");
+            let end = chunks.iter().map(|c| c.0 + c.1).max().expect("a chunk");
+            end - start
+        })
+        .collect();
+    let get = ravel_types::accounting::AccountedOp::Get.index();
+    // Besides the group spans, each partition places BLOOM (the probe is too
+    // short to cover it), one range both partitions ask for and the cache
+    // serves with one GET.
+    let bloom = ravel_logseg::footer::open(&obj[..])
+        .expect("footer")
+        .section(kind::BLOOM)
+        .expect("BLOOM")
+        .len;
+    assert_eq!(
+        run.phases.scan.s3_requests[get],
+        GROUPS as u64 + 1,
+        "one GET per owned group, and the shared BLOOM range"
+    );
+    assert_eq!(
+        run.phases.scan.s3_bytes[get],
+        spans.iter().sum::<u64>() + bloom,
+        "each group's projected span is moved once"
+    );
+    assert!(run.phases.scan.s3_bytes[get] <= obj.len() as u64);
 }
