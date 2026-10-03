@@ -6,6 +6,256 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-10-03
+
+### Changed
+
+- **An ingest shard whose flushes stay deferred up to the read-side slack now
+  also refuses new writes with a retryable overload error** (issue #1916). The
+  refusal comes in addition to the deferral, not in place of it: the deferred
+  flush still waits for a queue slot for as long as the stall lasts. The
+  deferral cap is the 2 h flush slack less `max_flush_lifetime`, less the
+  slowest flush trigger (the largest of `--max-flush-delay`,
+  `--max-flush-delay-idle` and the adaptive corridor's widest ceiling) and one
+  flush tick: 3559.8 s at the defaults, with or without an idle flush byte
+  floor. Once a flush deferred at the queued-flush cap has waited that long,
+  the router refuses every write to the shard before enqueue, in strict and
+  buffered mode alike, with the new `DeferralCapReached` error (HTTP 429 with
+  `Retry-After`, gRPC `RESOURCE_EXHAUSTED`), until the deferred flushes open.
+  The cap stops new writes; it does not force the deferred flush open, so
+  buffered rows already acknowledged in that buffer, buffered rows held under
+  a non-zero `--idle-flush-byte-floor`, and the rows of a strict write that
+  already timed out can still land past the slack. A strict write already waiting on the capped flush is
+  answered 503 (outcome unknown): its rows are still written by the flush that
+  opens past the cap, so retrying it duplicates logs and spans. A multi-shard
+  write whose capped shard fails after a sibling committed answers the
+  partial-write 503. A shard whose actor died while a flush was deferred
+  answers the dead-shard error rather than refusing at the cap. Refusals are
+  counted on `ravel_ingest_deferral_cap_refused_total` by signal, and deferred
+  flushes now retry oldest deferral first.
+- **The L1 memory split target of log compaction is derived from host memory
+  when unset** (issue #2351). For RLOG merges `l1_part_memory_target_bytes`
+  now defaults to the smallest of the memory budget divided by 8 and by the
+  number of concurrent merges, the part size the claim lease supports
+  (`lease * 10 MiB/s / 2`, 1500 MiB at the default 300 s) and 8 GiB, lifted to
+  a 256 MiB floor, instead of a fixed 256 MiB that closed wide-schema parts at
+  about 2 MB stored. The memory budget is host memory (capped by a cgroup
+  limit) less a 2 GiB overhead reserve and less the 20 GiB merge cursor
+  budget: a 32 GiB host under `compact-bucket` derives 1.25 GiB. The log
+  merge's stored-size cap follows the derived target, so the memory target
+  closes every part and no exact-encode probe runs; an explicit
+  `--max-l1-part-bytes` sets the log and metrics caps together. Span merges
+  keep the fixed 256 MiB, since span parts have no stored-size cap.
+  `ravel-server` derives it from its memory budget and
+  `--maintain-unit-concurrency` and takes the new
+  `--maintain-l1-part-memory-target-bytes` flag; `ravel-cli maintain` derives
+  it from the host's memory and `--bucket-concurrency`, and `compact-bucket`
+  gains `--l1-part-memory-target-bytes` and `--max-l1-part-bytes`. An explicit
+  flag still wins for both log and span merges, an unknown budget falls back
+  to 256 MiB, and both binaries report the values they resolved, where they
+  came from and which term bound them. The CLI report prints one line per
+  codec: `rlog_l1_part_memory_target_bytes`, `rlog_max_l1_part_bytes`,
+  `rspan_l1_part_memory_target_bytes` and `max_l1_part_bytes`, and the
+  server's startup log carries the same fields; the unprefixed
+  `l1_part_memory_target_bytes` line is gone. The server's startup lease check
+  now sizes the largest part as the larger of the two stored-size caps.
+  `ravel-server` and `ravel-cli` share one host memory parser; the server still
+  treats memory as unknown outside Linux (ADR-0088). The error for a
+  converged compaction whose winning part is missing now names the settings a
+  rebuild must reproduce and says that no shipped command performs the rebuild
+  today (a rerun returns `AlreadyCompacted`, issue #2370), so the bucket's L0
+  inputs should be held with `ravel-cli hold set` meanwhile.
+- **Parquet table names that equal a key segment an IAM template grants after
+  a wildcard are refused** (issue #2362). `l0`, `c`, `l1`, `idem`, `maint`,
+  `admission`, `u`, `catalog`, `del` and `a` are reserved alongside the
+  built-in table and signal names, because IAM's `*` matches across `/` and
+  would put such a table's manifests under another role's grants; the refusal
+  names the reserved word.
+
+### Fixed
+
+- **Retention and superseded-input sweeps no longer delete objects a pinned
+  query can still read (ADR-1133).** A query that pinned a HEAD just before
+  the fold dropped an object could fail with `SnapshotInvalidated` when the
+  next sweep deleted it. The sweeps now write an unnamed-since marker under
+  `t/<tenant_hash>/<signal>/maint/unn/` the first time they find a candidate
+  unnamed, and delete it only once `max_query_duration + head_cache_ttl +
+  4 * clock_skew_allowance` has passed, holding it until then under the new
+  `pinned_window` reason. The maintain IAM template gains delete and list on
+  `t/*/*/maint/*`, an erasure request's `.dreq` lives longer by the same
+  window, and `gc-config set` and maintain startup refuse a protection
+  horizon below `max_compaction_lifetime + 4 * clock_skew_allowance`.
+- **The server's catalog read decodes on the read CPU gate** (issue #1702).
+  The snapshot part, postings and column-statistics decodes a query resolve
+  runs now run on the read CPU gate the server builds, as ADR-1702 decision 3
+  specifies, instead of on the resolving task. Fold and scrub decodes are
+  unchanged.
+- **A catalog decode that the decoded caches cannot make room for no longer
+  empties them** (issue #2108). The eviction pass a refused decode runs before
+  retrying is now skipped, with no retry counted, when the bytes the cached
+  entries' reservations hold could not admit the charge
+  (`reserved - held + want > limit`), as it already was for a decode larger
+  than the budget's whole limit. The cached entries survive and the first
+  refusal stands, instead of every tenant's decoded entries being flushed for
+  a retry that is refused anyway. The metadata cache's serve read stays on the
+  bare budget, since it has no catalog caches to evict. The server does not yet
+  pass a finite budget to the catalog, so no deployment sees the pass today.
+- **A compaction is fenced against publishing over a bucket an erasure
+  rewrite has already rewritten, which served erased rows again** (issue
+  #2199). The
+  compaction and the erasure rewrite of a bucket now take the same bucket claim
+  before they build and hold it through their publish, whatever the bucket's
+  size, and each re-lists the bucket before it publishes and publishes nothing
+  if the bucket's records changed. A pass refused the claim backs off and
+  retries on a later pass; an unreadable claim object now holds its bucket
+  until an operator removes it. A claimed pass that stalls past its claim's
+  lease between its re-list and its publish is not caught.
+  `ravel-cli maintain migrate` is fenced the same way, and takes `--no-claim`.
+  The `claim_min_input_bytes` setting (`--maintain-claim-min-input-bytes`) no
+  longer has any effect and will be removed.
+- **The catalog fold now rebuilds a HEAD stamped below the supported format
+  version instead of refusing it as newer** (issue #2271). A HEAD with
+  `format_version` 0, or any other value below the version this build reads,
+  is rebuilt like a HEAD that fails to decode, with a log line saying it is
+  below the supported version. A HEAD above the supported version is still
+  refused and left untouched (ADR-0066 decision 2).
+- **A server started through its library API refuses a zero store-probe,
+  admission-reconcile or scrub interval, and a zero fold-lag interval, at
+  startup** (issue #2330). A zero store-probe or admission-reconcile interval
+  used to start a loop that issued store requests back to back, a zero scrub
+  period ticked the scrubber about every millisecond, and a zero fold-lag
+  interval made a maintain process that is keeping up read as lagging.
+  `ravel_server::start` now returns a typed error naming the flag
+  (`--store-probe-interval`, `--admission-reconcile-interval`,
+  `--scrub-period`, `--fold-lag-interval-secs`), checked before
+  `start_with_heartbeat` spawns any loop task, matching the refusals the
+  command line already applied. `store_probe::spawn`,
+  `store_probe::spawn_with_clock`, `admission_reconcile::spawn`,
+  `query_admission_reconcile::spawn` and `scrub::spawn` now return a `Result`
+  carrying that error rather than the task handle directly.
+- **The shipped IAM templates grant the Parquet table keys, the Parquet bucket
+  probe and the gateway's admission-snapshot reap** (issue #2350). Admin gains
+  `s3:PutObject` on `t/*/pq/grants`, so `ravel-cli tenant parquet-grant add`
+  and `remove` can write the location grants record, and `s3:PutObject` and
+  `s3:DeleteObject` on `sys/pq-probe/*`, so the bucket probe `add` runs can
+  write and remove its object. Query gains list and read on the table
+  manifests `t/*/pq/t/*` and read on `t/*/pq/grants`, so Parquet table queries
+  resolve. Maintain gains list and delete on `t/*/pq/t/*` for `ravel-cli
+  parquet sweep`. Gateway gains `s3:DeleteObject` on
+  `t/????????????????????????????????/?/admission/*` only, so dead processes'
+  admission snapshots are reaped instead of accumulating; the pattern spells
+  the 32-character tenant hash and the one-character signal with `?`, so its
+  fixed length and literal slashes keep it off every Parquet table manifest,
+  and the gateway still deletes no durable object. `t/*/pq/grants`
+  joins the deny-delete set in every template. `ravel-cli parquet sweep`,
+  `maintain compact-bucket` and `maintain compact-tenant` run under the
+  Maintain credential: the sweep through the grants Maintain gains here, the
+  two compaction commands through grants it already held. The KMS section of
+  the configuration guide now says Query holds encrypt, generate-data-key and
+  decrypt, as `query.json` does, and that `ravel-cli` writes land under the
+  bucket's default encryption rather than a tenant's key.
+- **S3 range and throttle classes no longer read echoed request text**
+  (issue #2365). A bucket or key spelled with "range" and "satisfiable",
+  in the request URI or echoed in an S3 error body, no longer turns a
+  transient read failure into a permanent `InvalidRange`, and an error body
+  that echoes a key containing "slowdown" or "timeout" no longer picks the
+  throttle or timeout class: when the body carries an S3 error code, the
+  class comes from the status line and the code, and any code starting with
+  `SlowDown`, MinIO's `SlowDownRead` and `SlowDownWrite` included, reads
+  throttled.
+- **The HEAD cache TTL runs on a monotonic clock, and PromQL log selector
+  fetches stop at the query's deadline (ADR-1133).** A cached catalog HEAD now
+  ages on a monotonic clock from a reading taken before its GET, so a
+  wall-clock step no longer serves it past `head_cache_ttl`. A log selector
+  fetch now stops at the query's deadline instead of a deadline read partway
+  through the query.
+- **The shipped Maintain IAM template grants the catalog writes the
+  maintain-tier scheduled fold publishes** (issue #2382). `MaintainWrite` gains
+  `s3:PutObject` on `t/*/catalog/*/snap/*`, `t/*/catalog/*/idx/*` and
+  `t/*/catalog/*/HEAD`; before, a per-role deployment's scheduled fold failed
+  at its first catalog write and the catalog stopped advancing.
+- **Distributed PromQL fragment reads and federated reads stop at the query's
+  own deadline (ADR-1133).** A fragment capability now expires at request
+  entry plus the request's deadline instead of the engine's configured
+  deadline, so a shorter `timeout` also ends the workers' reads. A worker
+  re-checks the expiry once a request is admitted, refusing one that expired
+  while it queued before any store request, and stops an admitted slice at
+  the expiry, issuing no store request once its timer fires (which can be up
+  to the timer's resolution late, as the engine's own deadline can). Both end
+  in-band with a `TIMEOUT` status carrying what the slice spent, and the
+  coordinator fails the query with `DeadlineExceeded` instead of
+  quarantining the worker, re-dispatching the slice, and re-reading it
+  locally past the deadline, once its own monotonic deadline has passed (a
+  `TIMEOUT` before it, from a worker or peer whose clock runs ahead, is
+  re-dispatched or treated as an unavailable remote, and an older worker's
+  `Unauthenticated` refusal of an expired capability no longer quarantines
+  it). Federated requests now carry the query's
+  deadline too, and a peer cluster applies the same bounds to its reads.
+  Every `match[]` selector of one `labels`, `label_values`, or `series`
+  request sends the same deadline, request entry plus the request's
+  deadline, rather than one counted from that selector's start, so a later
+  selector is not refused once earlier ones have spent half the budget. A
+  worker counts each slice it stops mid-run at the deadline in
+  `ravel_distrib_fragment_deadline_stops_total{class}`. Alert rules evaluated in one tick each count their deadline from their
+  own engine call rather than from the start of the tick.
+- **Store wrappers forward pinned reads to their inner store** (issue
+  #2391). The bench and simulator wrappers `DelayedGetStore`,
+  `CountingBackend` and `SharedStore` did not: through each, `get_pinned`
+  failed with `Unsupported`, and `get_with_pin` and `pin_of` returned an
+  ETag-only pin that dropped the inner store's version selector, so a bench
+  or simulator run could not read a Parquet table by pin. The server's
+  `--tenant-kms-config` store wrapper gains the same forwards, plus
+  `list_after`; nothing reads it by pin today.
+- **A metrics erasure rewrite keeps the dedup provenance of every sample it
+  keeps** (issue #2409). Rewriting a compacted bucket used to stamp every run
+  with the compaction record's own timestamp and a zero writer epoch and
+  sequence, and to drop the per-sample provenance column of a run that
+  compaction had merged from several writes. A query could then answer wrong
+  when the same series and timestamp was also written in another ingest-hour
+  bucket, such as by a retried write or a late sample inside the ingest lag (no
+  commit can land in a sealed bucket itself): the duplicate resolved against
+  the rewritten sample by the wrong key, so a newer write could lose to an
+  older rewritten sample. A second erasure over a bucket that was never
+  compacted also changed winners inside the bucket, because it gave every run
+  of the first rewrite the same key. Each rewritten run now keeps the
+  provenance its part stored and its per-sample column, filtered to the samples
+  that survive, and a filtered merged run takes the lowest surviving sample key
+  as its run-wide key, as compaction would. A run with no column that loses
+  samples to the erasure gets one holding each survivor's original position, so
+  a duplicate decided by that position resolves as before. Parts rewritten by
+  0.20.0 or earlier are not repaired, and a later rewrite of them carries their
+  keys forward as stored. During a mixed-version rollout an older maintainer
+  can still publish a rewrite without provenance, so upgrade every maintainer
+  before running erasures.
+
+### Added
+
+- **The operator renders distributed query from `spec.query.distributedQuery`**
+  (issue #1690). With `enabled: true` and Secret references for the fragment
+  TLS certificate and key, the CA, the fragment key file and the SQL ticket key
+  file, the query Deployment runs `--distributed-query` on the dedicated TLS
+  fragment listener (port 4319) with those Secrets mounted, and a NetworkPolicy
+  admits that port only from the query pods; an unset reference renders none of
+  it and degrades the cluster with reason `DistributedQuerySecretRefMissing`.
+  This turns on PromQL fan-out; SQL fan-out needs a Flight SQL client path the
+  operator does not expose yet. Apply `deploy/k8s/operator/rbac.yaml` before the
+  new operator image: the operator now deletes the NetworkPolicy on every
+  reconcile of a cluster without the block, once the query Deployment is applied.
+- **`POST /api/v1/sql` runs `CREATE [OR REPLACE] EXTERNAL TABLE ... STORED AS
+  PARQUET LOCATION ...` and `DROP TABLE`** (issue #2054). A caller needs the
+  `ddl` capability: a bearer token whose tenant is written `TENANT;ddl`, or an
+  OIDC token carrying the claim named by `--oidc-ddl-claim` as `true`. The
+  capability is absent by default, and a caller without it is refused with 403
+  `forbidden`. Every DDL statement is audited: a 403 refusal writes one
+  `error` record; a statement that runs writes an `attempted` record before
+  any store call and an `ok` or `error` record after.
+- **The ADR-0066 force 2 re-encode primitive exists behind a writer switch that
+  is off by default** (issue #2093). `rewrite::reencode_compaction_parts`
+  re-encodes a bucket's one below-target compaction record at the current
+  segment format version and publishes a version 2 record superseding it, under
+  the bucket's compaction claim and pre-publish re-list, only when
+  `CompactorConfig::reencode_writer_enabled` is on; nothing calls it yet.
+
 ## [0.20.0] - 2026-10-02
 
 ### Changed
