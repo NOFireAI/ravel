@@ -937,6 +937,22 @@ Spans fold and are queryable the same way logs are:
 `spans` SQL table on `POST /api/v1/sql` reads them back. Ingest durability
 never depended on this fold either way.
 
+### Idempotency keys (logs and spans)
+
+A log or span request carrying `x-ravel-idempotency-key` is looked up before
+any other work: `read_marker` (`crates/ravel-ingest/src/idempotency.rs`) lists
+`t/<tenant_hash>/<signal>/idem/<keyhash32>.` and GETs the newest marker inside
+the dedup window. A hit replays the stored receipt; a miss, or a corrupt
+marker, proceeds to the normal write, and the marker is written after the
+commit and before the ack. If the store refuses the lookup (`AccessDenied` or
+any other store error, as opposed to finding no marker), the request is not
+acknowledged: `handle_export_logs` and `handle_export_traces` fail it with the
+retryable `Abandoned` write error (HTTP 503 / gRPC `UNAVAILABLE`), naming the
+refused LIST, before anything is written, so the client's retry is safe.
+Writing anyway would store a duplicate whenever the marker exists but could
+not be seen. Metrics take no key. The full contract is
+[consistency-model.md](consistency-model.md#opt-in-client-idempotency-key-logs-and-spans).
+
 ## Admission control (ADR-0051)
 
 `ravel-server` builds one `AdmissionController` (`crates/ravel-ingest/src/

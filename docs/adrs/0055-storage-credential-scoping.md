@@ -201,6 +201,10 @@ role's reads of `sys/tenancy`, `sys/qualification`, `sys/gc` and the other keys
 whose absence is a normal state therefore also need a list grant on exactly
 those keys; the bootstrap-key list amendment below adds it.
 
+The Gateway row's `idem/<key>` (dedup lookup) is not a read of one key: the
+lookup lists the key's marker prefix, and the marker lookup amendment below
+grants that listing.
+
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
 runs inside the same `Mode::Maintain` process as compaction and retention
@@ -1681,3 +1685,56 @@ prefix is added on the exact key, and the control-plane key amendment's "so no
 
 Recorded as an appended amendment, with an inline pointer added to §1, §4, the
 `t/<hash>/enc` key-epoch amendment and the control-plane key amendment.
+
+## Amendment (2026-10-03): the keyed-ingest marker lookup is a prefix listing
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries" pointer="marker lookup amendment" -->
+
+Issue #2462. §1 lists Gateway's dedup lookup as a read of `idem/<key>`. The
+code does not read one key. A keyed log or span write (one carrying
+`x-ravel-idempotency-key`) finds its marker by listing
+`t/<hash>/<sig>/idem/<keyhash32>.` (`read_marker` and `marker_prefix` in
+`crates/ravel-ingest/src/idempotency.rs`), because the marker key ends in the
+ingest hour the original write pinned, which a retry cannot know; it then GETs
+the newest in-window marker the listing returned. `GatewayList` admitted no
+prefix covering that listing, so on AWS S3 every keyed lookup was refused. The
+log and span ingest paths caught the refusal, logged a warning and wrote
+anyway, so under the shipped template keyed ingest was at-least-once: a retry
+of an acknowledged keyed write stored its data twice and nothing failed.
+
+Decisions, made by the owner:
+
+1. `GatewayList` gains one `s3:prefix` per signal that writes markers:
+   `t/????????????????????????????????/l/idem/????????????????????????????????.`
+   and the same pattern with `s`. The tenant hash and the keyhash are each
+   spelled as 32 single-character wildcards, followed by the literal `.` the
+   lookup's prefix ends in. The keyhash is fixed-width hex, so wildcards
+   rather than a `*` admit exactly the lookup's prefix and not a listing of a
+   tenant's whole `idem/` directory. Only logs and spans write markers;
+   metrics ingest dedups by `(series_id, ts)` and does no lookup. No other
+   statement changes and every `Deny` stays. The marker GET was already
+   granted by `GatewayRead`'s `t/*/*/idem/*`.
+2. A keyed write whose marker lookup fails with a store error (`AccessDenied`
+   or any other failure; a missing marker is a miss, not an error) is not
+   acknowledged. It fails with the retryable error a failed flush already
+   returns (HTTP 503, gRPC `UNAVAILABLE`), naming the refused LIST, and writes
+   nothing, so the client's retry is safe. A write without a key looks no
+   marker up and is unaffected.
+
+`crates/ravel-commit/tests/iam_templates.rs` builds the lookup's prefix the
+way `marker_prefix` does, pinned to the same literal a test beside
+`marker_prefix` pins, and checks that `GatewayList` admits it for both
+signals, that no `Deny` withdraws it, and that no gateway list grant admits a
+sibling: the lookup under any other signal letter or a letter no signal uses,
+a tenant segment 31 or 33 characters wide, the `idem/` directory listed
+whole, a keyhash one character short or long, or the keyhash without its
+trailing `.`. The ingest tests in `services/ravel-server/src/logs_ingest.rs`
+and `traces_ingest.rs` refuse the listing with `FaultStore` and assert that
+the keyed write fails retryably with zero PUTs.
+
+Net effect on §1: Gateway's dedup lookup is a prefix listing granted by
+`GatewayList`, followed by a GET granted by `GatewayRead`. The bootstrap-key
+list amendment's note that the markers are found by a prefix listing still
+holds; this amendment grants that listing.
+
+Recorded as an appended amendment, with an inline pointer added to §1.

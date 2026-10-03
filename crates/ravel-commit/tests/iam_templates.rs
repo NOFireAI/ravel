@@ -517,7 +517,8 @@ const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
 /// templates carry a `?` only in the Resources of gateway's
 /// `GatewayAdmissionDelete`, query's `QueryManifestCreate` and the five
 /// provisioning-record write statements, in the `s3:prefix` values of the three
-/// `*ListTenantBootstrapKeys` statements, and in no Action;
+/// `*ListTenantBootstrapKeys` statements and of gateway's `GatewayList`
+/// marker-lookup prefixes, and in no Action;
 /// `every_shipped_template_passes_the_choke_point` asserts that (not assumes
 /// it) over Action, Resource, and the `s3:prefix` values it reads through
 /// `list_prefix_patterns`.
@@ -2251,6 +2252,10 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/*/c/*",
             "t/*/*/admission/*",
             "t/*/catalog/*/*",
+            // The keyed-ingest marker lookup
+            // (gateway_template_admits_exactly_the_idempotency_marker_lookup).
+            IDEM_LOOKUP_L_PATTERN,
+            IDEM_LOOKUP_S_PATTERN,
             // GatewayListBootstrapKeys and GatewayListTenantBootstrapKeys
             // (bootstrap_list_grants_carry_exactly_the_expected_conditions).
             "sys/tenancy",
@@ -5984,6 +5989,180 @@ fn a_prov_grant_widened_to_any_signal_reaches_the_lookalikes() {
         })
         .collect();
     assert_eq!(reached, prov_lookalike_keys());
+}
+
+/// The signals whose ingest path looks up an idempotency marker:
+/// `services/ravel-server/src/logs_ingest.rs` (logs) and `traces_ingest.rs`
+/// (spans). Metrics ingest has no marker; it dedups by `(series_id, ts)`.
+const IDEM_SIGNALS: [Signal; 2] = [Signal::Logs, Signal::Spans];
+
+/// Mirrored from `crates/ravel-ingest/src/idempotency.rs` (`KEYHASH_DOMAIN`,
+/// `IDEM_DIR`), which this crate cannot depend on: `ravel-ingest` depends on
+/// `ravel-commit`.
+const IDEM_KEYHASH_DOMAIN: &[u8] = b"ravel-idem-v1";
+const IDEM_DIR: &str = "idem";
+
+/// The `s3:prefix` patterns GatewayList carries for the marker lookup, one
+/// per signal in `IDEM_SIGNALS`: the tenant hash and the keyhash each spelled
+/// as 32 single-character wildcards, then the literal `.` the lookup's prefix
+/// ends in, so the grant admits that exact prefix and no shorter or longer
+/// one (IAM's `*` would also admit the whole `idem/` directory).
+const IDEM_LOOKUP_L_PATTERN: &str =
+    "t/????????????????????????????????/l/idem/????????????????????????????????.";
+const IDEM_LOOKUP_S_PATTERN: &str =
+    "t/????????????????????????????????/s/idem/????????????????????????????????.";
+
+/// `keyhash32` in `idempotency.rs`:
+/// `hex(blake3("ravel-idem-v1" || tenant_id || client_key)[0..16])`.
+fn idem_keyhash32(tenant_id: &str, client_key: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(IDEM_KEYHASH_DOMAIN);
+    hasher.update(tenant_id.as_bytes());
+    hasher.update(client_key);
+    hex::encode(&hasher.finalize().as_bytes()[..16])
+}
+
+/// `marker_prefix` in `idempotency.rs`: the prefix `read_marker` lists,
+/// `t/<tenant_hash>/<signal>/idem/<keyhash32>.`.
+fn idem_lookup_prefix(tenant_id: &str, signal: Signal, client_key: &[u8]) -> String {
+    format!(
+        "t/{}/{}/{IDEM_DIR}/{}.",
+        ravel_types::TenantId::new(tenant_id).hash().to_hex(),
+        signal.key_prefix(),
+        idem_keyhash32(tenant_id, client_key),
+    )
+}
+
+/// Prefixes next to the marker lookup that no gateway list grant may admit:
+/// the lookup under every signal letter that does no lookup and under one
+/// that is no signal at all, under a 31- and a 33-character tenant segment,
+/// and the `idem/` directory listed whole, by a 31- or 33-character keyhash,
+/// or without the keyhash's trailing `.`.
+fn idem_lookup_lookalike_prefixes() -> Vec<String> {
+    let prefix = idem_lookup_prefix("acme", Signal::Logs, b"client-key-1");
+    let (_, keyhash_dot) = prefix
+        .rsplit_once('/')
+        .expect("the lookup prefix has a keyhash segment");
+    let keyhash = keyhash_dot
+        .strip_suffix('.')
+        .expect("the lookup prefix ends in `.`");
+    let hash = ravel_types::TenantId::new("acme").hash().to_hex();
+    let narrow = &hash[..hash.len() - 1];
+    let wide = format!("{hash}0");
+    assert_eq!((narrow.len(), wide.len(), keyhash.len()), (31, 33, 32));
+
+    let mut out = Vec::new();
+    for signal in ALL_SIGNALS {
+        if !IDEM_SIGNALS.contains(&signal) {
+            out.push(format!("t/{hash}/{}/idem/{keyhash}.", signal.key_prefix()));
+        }
+    }
+    out.push(format!("t/{hash}/x/idem/{keyhash}."));
+    for sig in IDEM_SIGNALS.map(Signal::key_prefix) {
+        out.push(format!("t/{narrow}/{sig}/idem/{keyhash}."));
+        out.push(format!("t/{wide}/{sig}/idem/{keyhash}."));
+        out.push(format!("t/{hash}/{sig}/idem/"));
+        out.push(format!("t/{hash}/{sig}/idem/{}.", &keyhash[1..]));
+        out.push(format!("t/{hash}/{sig}/idem/{keyhash}0."));
+        out.push(format!("t/{hash}/{sig}/idem/{keyhash}"));
+    }
+    out
+}
+
+/// The lookalike prefixes an `Allow` list grant of `policy` admits.
+fn idem_lookup_overreach(policy: &Policy) -> Vec<String> {
+    let allowed = list_prefix_patterns(policy, Some("Allow"));
+    idem_lookup_lookalike_prefixes()
+        .into_iter()
+        .filter(|p| allowed.iter().any(|a| glob_matches(a, p)))
+        .collect()
+}
+
+/// A keyed log or span write looks up its marker by listing exactly
+/// `marker_prefix` (`read_marker` in `crates/ravel-ingest/src/idempotency.rs`).
+/// GatewayList admits that prefix for both marker signals, no Deny withdraws
+/// it, and no gateway list grant admits a sibling of it.
+#[test]
+fn gateway_template_admits_exactly_the_idempotency_marker_lookup() {
+    // The same literal `marker_prefix_is_the_shape_the_gateway_template_grants`
+    // in idempotency.rs pins for `marker_prefix` itself, so the mirror above
+    // cannot drift from the code without one of the two failing.
+    assert_eq!(
+        idem_lookup_prefix("acme", Signal::Logs, b"client-key-1"),
+        "t/86bc967f6b7c19288226b362b9a7b013/l/idem/2fc38ed8fb3f5e9c1ed3eb38b4e0d1bc."
+    );
+
+    let gateway = load_policy("gateway");
+    let allowed = list_prefix_patterns(&gateway, Some("Allow"));
+    let denied = list_prefix_patterns(&gateway, Some("Deny"));
+    let gateway_list = policy_statements(&gateway)
+        .iter()
+        .find(|s| statement_sid(s) == "GatewayList")
+        .expect("gateway.json carries a GatewayList statement");
+    let gateway_list_prefixes: Vec<&str> =
+        condition_value_strings(&gateway_list["Condition"]["StringLike"]["s3:prefix"]);
+    for (signal, pattern) in IDEM_SIGNALS
+        .into_iter()
+        .zip([IDEM_LOOKUP_L_PATTERN, IDEM_LOOKUP_S_PATTERN])
+    {
+        assert!(
+            gateway_list_prefixes.contains(&pattern),
+            "GatewayList does not carry {pattern:?}: {gateway_list_prefixes:?}"
+        );
+        for (tenant, key) in [("acme", &b"client-key-1"[..]), ("other", &b""[..])] {
+            let prefix = idem_lookup_prefix(tenant, signal, key);
+            assert!(
+                glob_matches(pattern, &prefix),
+                "{pattern:?} does not admit the marker lookup {prefix:?}"
+            );
+            assert!(
+                allowed.iter().any(|p| glob_matches(p, &prefix)),
+                "gateway: no ListBucket s3:prefix admits {prefix:?}, which a keyed \
+                 {signal:?} write lists. s3:prefix values: {allowed:?}"
+            );
+            assert!(
+                !denied.iter().any(|p| glob_matches(p, &prefix)),
+                "gateway: a ListBucket Deny withdraws {prefix:?}"
+            );
+        }
+    }
+    let overreach = idem_lookup_overreach(&gateway);
+    assert!(
+        overreach.is_empty(),
+        "gateway: a list grant admits prefixes beside the marker lookup: {overreach:?}"
+    );
+}
+
+/// The negative witnesses are live: widening the two marker-lookup patterns in
+/// GatewayList to `t/*/*/idem/*` admits every lookalike. In-memory; the file
+/// on disk is untouched.
+#[test]
+fn an_idempotency_lookup_grant_widened_to_any_idem_prefix_reaches_the_lookalikes() {
+    let path = policy_json_path("gateway");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let mut json: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {path}: {e}"));
+    let target = json["Statement"]
+        .as_array_mut()
+        .expect("gateway.json Statement is an array")
+        .iter_mut()
+        .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayList"))
+        .expect("gateway.json carries a GatewayList statement");
+    let prefixes = target["Condition"]["StringLike"]["s3:prefix"]
+        .as_array_mut()
+        .expect("GatewayList s3:prefix is an array");
+    let before = prefixes.len();
+    prefixes.retain(|p| {
+        p.as_str()
+            .is_some_and(|p| p != IDEM_LOOKUP_L_PATTERN && p != IDEM_LOOKUP_S_PATTERN)
+    });
+    assert_eq!(prefixes.len(), before - 2);
+    prefixes.push(serde_json::json!("t/*/*/idem/*"));
+    let widened = build_policy("gateway", &path, &json);
+    assert_eq!(
+        idem_lookup_overreach(&widened),
+        idem_lookup_lookalike_prefixes()
+    );
 }
 
 /// The startup check of a `query` process over a tenant with no provisioning
@@ -9953,7 +10132,8 @@ const QUESTION_MARK_RESOURCE_STATEMENTS: [&str; 7] = [
 
 /// The `role/Sid` of every list statement whose `s3:prefix` carries IAM's
 /// single-character `?` wildcard.
-const QUESTION_MARK_PREFIX_STATEMENTS: [&str; 3] = [
+const QUESTION_MARK_PREFIX_STATEMENTS: [&str; 4] = [
+    "gateway/GatewayList",
     "gateway/GatewayListTenantBootstrapKeys",
     "query/QueryListTenantBootstrapKeys",
     "maintain/MaintainListTenantBootstrapKeys",
@@ -10050,6 +10230,8 @@ fn every_shipped_template_passes_the_choke_point() {
         // glob_to_regex doc's citation of this test would overstate its scope.
         // The bootstrap-key statements spell the tenant hash as 32 `?`, so the
         // listing they admit reaches one key shape and no deeper segment.
+        // GatewayList's marker-lookup prefixes spell the tenant hash and the
+        // keyhash that way, so they admit exactly the lookup's prefix.
         for stmt in policy_statements(&policy) {
             let sid = statement_sid(stmt);
             let single = Policy {
