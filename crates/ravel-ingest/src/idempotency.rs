@@ -30,8 +30,8 @@
 
 use blake3::Hasher;
 use bytes::Bytes;
-use ravel_commit::keys::{ingest_hour_string, parse_ingest_hour_string};
-use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError, UploadChecksum, list_all};
+use ravel_commit::keys::ingest_hour_string;
+use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError, UploadChecksum};
 use ravel_types::{Signal, TenantId};
 
 /// Domain-separation prefix for the keyhash, distinct from `TenantId::hash`'s
@@ -101,8 +101,19 @@ pub enum MarkerWriteError {
     Codec(#[from] MarkerError),
 }
 
-/// Outcome of a marker lookup, whether reached via [`read_marker`]'s prefix
-/// LIST or via [`write_marker`] losing a `CreateIfAbsent` race. An enum, not
+/// A [`read_marker`] probe failed with a store error other than `NotFound`.
+/// Carries the key whose GET failed, for the caller's server-side log; it is
+/// not meant for a client-facing message.
+#[derive(Debug, thiserror::Error)]
+#[error("idempotency marker GET {key} failed: {source}")]
+pub struct MarkerLookupError {
+    pub key: String,
+    #[source]
+    pub source: StoreError,
+}
+
+/// Outcome of a marker lookup, whether reached via [`read_marker`]'s
+/// per-hour probes or via [`write_marker`] losing a `CreateIfAbsent` race. An enum, not
 /// a `bool` or `Option`, so a corrupt marker is distinguishable from a clean
 /// miss for the caller's corruption counter (ADR-0051 section 5).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,25 +154,13 @@ pub fn keyhash32(tenant_id: &TenantId, client_key: &[u8]) -> String {
     hex::encode(&digest.as_bytes()[..16])
 }
 
-/// Prefix covering every marker for one (tenant, signal, client_key) pair,
-/// across all ingest hours: `t/<tenant_hash>/<signal>/idem/<keyhash32>.`.
-/// This is the one-prefix LIST [`read_marker`] performs.
-fn marker_prefix(tenant_id: &TenantId, signal: Signal, client_key: &[u8]) -> String {
-    format!(
-        "t/{}/{}/{IDEM_DIR}/{}.",
-        tenant_id.hash().to_hex(),
-        signal.key_prefix(),
-        keyhash32(tenant_id, client_key),
-    )
-}
-
 /// Build the exact marker key for a pinned ingest-hour bucket
 /// (`t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm`).
 /// [`write_marker`] always knows this hour (pinned at request receive, from
 /// the receiver's admission-time clock, not the commit record's flush-open
 /// hour); [`read_marker`] does not, because a retry's request can land in a
-/// different hour than the original, which is why lookup instead LISTs
-/// [`marker_prefix`] over a window.
+/// different hour than the original, which is why lookup probes this key for
+/// every hour of a window.
 pub fn marker_key(
     tenant_id: &TenantId,
     signal: Signal,
@@ -169,8 +168,10 @@ pub fn marker_key(
     ingest_hour_bucket: u32,
 ) -> String {
     format!(
-        "{}{}.{MARKER_SUFFIX}",
-        marker_prefix(tenant_id, signal, client_key),
+        "t/{}/{}/{IDEM_DIR}/{}.{}.{MARKER_SUFFIX}",
+        tenant_id.hash().to_hex(),
+        signal.key_prefix(),
+        keyhash32(tenant_id, client_key),
         ingest_hour_string(ingest_hour_bucket),
     )
 }
@@ -321,22 +322,25 @@ pub async fn write_marker(
     }
 }
 
-/// Look up a marker for a retried request via the one-prefix LIST ADR-0051
-/// section 5 describes. The exact ingest hour a retry would land in is not
-/// known in advance (a retry's flush can pin a different hour than the
-/// original request pinned), so this lists every marker under
-/// [`marker_prefix`] and considers only those whose `ingest_hour` falls in
-/// the closed window `[now_ingest_hour_bucket - dedup_window_hours,
+/// Look up a marker for a retried request by probing the exact marker key
+/// for each ingest hour of the closed window
+/// `[now_ingest_hour_bucket - dedup_window_hours,
 /// now_ingest_hour_bucket + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS]`,
-/// picking the most recent in-window hit. The forward tolerance absorbs the
-/// original writer's clock running slightly ahead of the reader's across an
-/// hour boundary; a marker further in the future than that is never
-/// in-window and is left for the sweep.
+/// newest first, stopping at the first object found (ADR-0051 section 5 and
+/// its 2026-10-03 probe amendment). A retry cannot know the hour the original
+/// request pinned, so every hour of the window is a candidate. The forward
+/// tolerance absorbs the original writer's clock running slightly ahead of
+/// the reader's across an hour boundary; a marker further in the future than
+/// that is never probed and is left for the sweep.
 ///
-/// Returns [`LookupOutcome::Miss`] if nothing in-window is found (or
-/// everything found there has already been swept), and
-/// [`LookupOutcome::Corrupt`] if the best in-window candidate exists but
-/// fails to decode.
+/// The probes are GETs, not a listing of the key's `<keyhash32>.` prefix: the
+/// S3 adapter appends `/` to every list prefix, so that listing finds no
+/// marker on S3.
+///
+/// Returns [`LookupOutcome::Miss`] when every probe answers `NotFound`, and
+/// [`LookupOutcome::Corrupt`] when the newest marker found fails to decode.
+/// Any other store error on any probe fails the whole lookup, since the
+/// lookup cannot tell a marker it could not read from none.
 pub async fn read_marker(
     store: &dyn ObjectStoreBackend,
     tenant_id: &TenantId,
@@ -344,42 +348,18 @@ pub async fn read_marker(
     client_key: &[u8],
     now_ingest_hour_bucket: u32,
     dedup_window_hours: u32,
-) -> Result<LookupOutcome, StoreError> {
-    let prefix = marker_prefix(tenant_id, signal, client_key);
-    let min_hour = now_ingest_hour_bucket.saturating_sub(dedup_window_hours);
-    let candidates = list_all(store, &prefix).await?;
-
-    let mut best: Option<(u32, String)> = None;
-    for meta in candidates {
-        let Some(basename) = meta.key.strip_prefix(&prefix) else {
-            continue;
-        };
-        let Some(hour_text) = basename.strip_suffix(&format!(".{MARKER_SUFFIX}")) else {
-            continue;
-        };
-        let Ok(hour) = parse_ingest_hour_string(hour_text) else {
-            continue;
-        };
-        // Upper bound tolerates IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS of
-        // forward clock skew (a writer whose clock ran slightly ahead across
-        // an hour boundary), while still bounding the LIST window: this is
-        // not the sweep-safety bound itself, just enough slack that a marker
-        // isn't dropped for having been pinned ahead of this reader's clock.
-        if hour < min_hour
-            || hour
-                > now_ingest_hour_bucket.saturating_add(IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS)
-        {
-            continue;
-        }
-        if best.as_ref().is_none_or(|(best_hour, _)| hour > *best_hour) {
-            best = Some((hour, meta.key));
+) -> Result<LookupOutcome, MarkerLookupError> {
+    let oldest = now_ingest_hour_bucket.saturating_sub(dedup_window_hours);
+    let newest = now_ingest_hour_bucket.saturating_add(IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS);
+    for hour in (oldest..=newest).rev() {
+        let key = marker_key(tenant_id, signal, client_key, hour);
+        match read_marker_at(store, &key).await {
+            Ok(LookupOutcome::Miss) => {}
+            Ok(found) => return Ok(found),
+            Err(source) => return Err(MarkerLookupError { key, source }),
         }
     }
-
-    match best {
-        None => Ok(LookupOutcome::Miss),
-        Some((_, key)) => read_marker_at(store, &key).await,
-    }
+    Ok(LookupOutcome::Miss)
 }
 
 #[cfg(test)]
@@ -399,6 +379,282 @@ mod tests {
             written_count,
             commit_token: commit_token.to_string(),
         }
+    }
+
+    /// The exact key `read_marker` probes, as one literal.
+    /// `gateway_template_reads_the_idempotency_marker_by_exact_key` in
+    /// `crates/ravel-commit/tests/iam_templates.rs` pins its own mirror of
+    /// `marker_key` to this same literal.
+    #[test]
+    fn marker_key_is_the_shape_the_gateway_template_reads() {
+        assert_eq!(
+            marker_key(&tenant("acme"), Signal::Logs, b"client-key-1", 495_972),
+            "t/86bc967f6b7c19288226b362b9a7b013/l/idem/\
+             2fc38ed8fb3f5e9c1ed3eb38b4e0d1bc.20260731T12.idm"
+        );
+    }
+
+    /// A `MemoryStore` that lists the way `S3Store` does
+    /// (`crates/ravel-object-store/src/s3.rs`, "Prefix listing is
+    /// segment-based"): `object_store` appends the path delimiter to every
+    /// non-empty prefix, so a prefix that does not end in `/` matches only keys
+    /// one segment below it. It also records the key of every GET, in order.
+    struct SegmentAlignedStore {
+        inner: MemoryStore,
+        gets: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SegmentAlignedStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryStore::new(),
+                gets: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn take_gets(&self) -> Vec<String> {
+            std::mem::take(&mut *self.gets.lock().expect("gets lock"))
+        }
+    }
+
+    fn segment_aligned(prefix: &str) -> String {
+        let trimmed = prefix.trim_end_matches('/');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}/")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for SegmentAlignedStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.gets.lock().expect("gets lock").push(key.to_string());
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(&segment_aligned(prefix), page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(&segment_aligned(prefix)).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The wrapper lists the way the S3 adapter does: a prefix ending mid
+    /// segment matches nothing, the same prefix's directory matches the key.
+    #[tokio::test]
+    async fn segment_aligned_store_lists_by_whole_segment() {
+        let store = SegmentAlignedStore::new();
+        store
+            .put(
+                "a/b.c",
+                Bytes::from_static(b"x"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put");
+        let keys = |page: ravel_object_store::ListPage| -> Vec<String> {
+            page.objects.into_iter().map(|m| m.key).collect()
+        };
+        assert!(
+            keys(store.list("a/b.", None).await.expect("list"))
+                .into_iter()
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            keys(store.list("a", None).await.expect("list")),
+            vec!["a/b.c".to_string()]
+        );
+    }
+
+    /// The lookup finds a marker written at hour `H` for every reader hour
+    /// `now` in `[H - skew, H + window]`, and for none outside it, on a store
+    /// that lists the way S3 does. A lookup that lists the marker's
+    /// `<keyhash32>.` prefix finds nothing there at any hour, because the
+    /// store appends `/` to that prefix.
+    #[tokio::test]
+    async fn marker_is_found_across_the_window_on_a_segment_aligned_store() {
+        let store = SegmentAlignedStore::new();
+        let tenant = tenant("acme");
+        let written_at = 495_972u32;
+        let window = 24u32;
+        let skew = IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS;
+        let stored = receipt(3, "v2:token-window");
+        write_marker(
+            &store,
+            &tenant,
+            Signal::Logs,
+            b"window-key",
+            written_at,
+            &stored,
+        )
+        .await
+        .expect("write");
+
+        for now in (written_at - skew - 3)..=(written_at + window + 3) {
+            let looked_up = read_marker(&store, &tenant, Signal::Logs, b"window-key", now, window)
+                .await
+                .expect("lookup");
+            let in_window = now + skew >= written_at && now <= written_at + window;
+            let expected = if in_window {
+                LookupOutcome::Hit(stored.clone())
+            } else {
+                LookupOutcome::Miss
+            };
+            assert_eq!(
+                looked_up, expected,
+                "reader hour {now}, marker hour {written_at}, window {window}, skew {skew}"
+            );
+        }
+    }
+
+    /// The probes run newest first and stop at the first hit: with markers at
+    /// two hours the newer receipt is returned, and nothing below its hour is
+    /// read.
+    #[tokio::test]
+    async fn probes_stop_at_the_newest_hit() {
+        let store = SegmentAlignedStore::new();
+        let tenant = tenant("acme");
+        let now = 495_972u32;
+        let older = receipt(1, "v2:token-older");
+        let newer = receipt(2, "v2:token-newer");
+        for (hour, receipt) in [(now - 3, &older), (now - 1, &newer)] {
+            write_marker(&store, &tenant, Signal::Spans, b"two-hours", hour, receipt)
+                .await
+                .expect("write");
+        }
+        store.take_gets();
+
+        let looked_up = read_marker(&store, &tenant, Signal::Spans, b"two-hours", now, 24)
+            .await
+            .expect("lookup");
+
+        assert_eq!(looked_up, LookupOutcome::Hit(newer));
+        let probe = |hour| marker_key(&tenant, Signal::Spans, b"two-hours", hour);
+        assert_eq!(
+            store.take_gets(),
+            vec![
+                probe(now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS),
+                probe(now),
+                probe(now - 1),
+            ]
+        );
+    }
+
+    /// A miss probes every hour of the window exactly once, newest first:
+    /// `dedup_window_hours + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS + 1`
+    /// GETs, 26 at the 24-hour default.
+    #[tokio::test]
+    async fn a_miss_probes_each_hour_of_the_window_once() {
+        let store = SegmentAlignedStore::new();
+        let tenant = tenant("acme");
+        let now = 495_972u32;
+
+        let looked_up = read_marker(&store, &tenant, Signal::Logs, b"absent", now, 24)
+            .await
+            .expect("lookup");
+
+        assert_eq!(looked_up, LookupOutcome::Miss);
+        let expected: Vec<String> = (now - 24..=now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS)
+            .rev()
+            .map(|hour| marker_key(&tenant, Signal::Logs, b"absent", hour))
+            .collect();
+        assert_eq!(expected.len(), 26);
+        assert_eq!(store.take_gets(), expected);
+    }
+
+    /// A probe that fails with anything but `NotFound` fails the lookup, even
+    /// when an older hour holds a marker: the lookup cannot tell a newer
+    /// marker from none at the hour it could not read. The error names the
+    /// key whose GET failed and carries the store error.
+    #[tokio::test]
+    async fn a_failed_probe_fails_the_lookup() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+
+        let tenant = tenant("acme");
+        let now = 495_972u32;
+        let failing = marker_key(&tenant, Signal::Logs, b"faulted", now - 2);
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Permanent("AccessDenied".into()))
+                .with_key_contains(failing.clone()),
+        );
+        let store = FaultStore::new(SegmentAlignedStore::new(), plan);
+        write_marker(
+            &store,
+            &tenant,
+            Signal::Logs,
+            b"faulted",
+            now - 5,
+            &receipt(9, "v2:token-below"),
+        )
+        .await
+        .expect("write");
+
+        let err = read_marker(&store, &tenant, Signal::Logs, b"faulted", now, 24)
+            .await
+            .expect_err("a failed probe must fail the lookup");
+
+        assert_eq!(err.key, failing);
+        assert!(
+            matches!(&err.source, StoreError::Permanent(text) if text == "AccessDenied"),
+            "the store error must propagate untouched, got {err:?}"
+        );
+        assert_eq!(store.fault_count(Op::Get, FaultKind::Permanent), 1);
+        // The fault answers the failed probe before the wrapped store sees it,
+        // so the wrapped store saw exactly the hours above it and none below.
+        let probe = |hour| marker_key(&tenant, Signal::Logs, b"faulted", hour);
+        assert_eq!(
+            store.inner().take_gets(),
+            vec![
+                probe(now + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS),
+                probe(now),
+                probe(now - 1),
+            ]
+        );
     }
 
     #[tokio::test]

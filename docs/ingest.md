@@ -937,6 +937,30 @@ Spans fold and are queryable the same way logs are:
 `spans` SQL table on `POST /api/v1/sql` reads them back. Ingest durability
 never depended on this fold either way.
 
+### Idempotency keys (logs and spans)
+
+A log or span request carrying `x-ravel-idempotency-key` is looked up before
+its own data is written: `read_marker` (`crates/ravel-ingest/src/idempotency.rs`)
+GETs the exact marker key `t/<tenant_hash>/<signal>/idem/<keyhash32>.<ingest_hour>.idm`
+for each ingest hour of the dedup window, newest first, from one hour ahead of
+the request's hour back 24 hours, and stops at the first marker it finds; a
+miss costs 26 GETs. It does not list the key's `<keyhash32>.` prefix, because
+the S3 adapter appends `/` to every list prefix and that listing would find
+nothing. A hit replays the stored receipt; a miss, or a corrupt marker,
+proceeds to the normal write, and the marker is written after the commit and
+before the ack. If a probe fails with a store error (`AccessDenied` or any
+other failure, as opposed to `NotFound`), the request is not acknowledged:
+`handle_export_logs` and `handle_export_traces` fail it with the retryable
+`Abandoned` write error (HTTP 503 / gRPC `UNAVAILABLE`) before the request's
+own data is written, so the client's retry is safe. Writing anyway would store
+a duplicate whenever the marker exists but could not be read. The response
+says that the idempotency marker lookup failed and the write is safe to
+retry, and nothing about the store; the GET, the key and the
+store error go to a WARN log line and the
+`ravel_ingest_idempotency_lookup_failures_total` counter. Metrics take no key.
+The full contract is
+[consistency-model.md](consistency-model.md#opt-in-client-idempotency-key-logs-and-spans).
+
 ## Admission control (ADR-0051)
 
 `ravel-server` builds one `AdmissionController` (`crates/ravel-ingest/src/

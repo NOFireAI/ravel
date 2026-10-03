@@ -53,8 +53,8 @@ pub use error::WriteError;
 pub use generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed};
 pub use idempotency::{
     IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, IdempotencyReceipt, LookupOutcome, MARKER_SUFFIX,
-    MarkerError, MarkerWriteError, WriteOutcome, decode_marker, keyhash32, marker_key, read_marker,
-    write_marker,
+    MarkerError, MarkerLookupError, MarkerWriteError, WriteOutcome, decode_marker, keyhash32,
+    marker_key, read_marker, write_marker,
 };
 pub use indexed_fields::{DEFAULT_INDEXED_FIELDS_REREAD_BACKOFF_NS, IndexedFieldsOverlay};
 pub use lifecycle::{
