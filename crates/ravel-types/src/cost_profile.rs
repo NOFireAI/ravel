@@ -31,6 +31,10 @@ use crate::accounting::AccountedOp;
 /// Bytes in one GiB, the unit both per-GiB prices are quoted in.
 const BYTES_PER_GIB: u128 = 1 << 30;
 
+/// Microseconds in one second, the unit conversion between
+/// [`StoreCostProfile::request_latency_micros`] and a per-second throughput.
+const MICROS_PER_SECOND: u128 = 1_000_000;
+
 /// The billing class a store operation falls under. S3 prices requests in two
 /// tiers plus a free tier, and the profile carries one price per tier rather
 /// than one field per operation (ADR-0996 decision 1): a new operation kind
@@ -133,12 +137,28 @@ pub struct StoreCostProfile {
     #[serde(default)]
     pub delete_class_nanodollars: u64,
     /// Nanodollars per GiB transferred out. `0` on an intra-region deployment,
-    /// which is what makes request-minimal fetching the cost-preferring shape
-    /// there.
+    /// where the price term of the cost-based rate saturates and the rate
+    /// comes from the two timings below when the profile records them
+    /// (ADR-2414 decision A3).
     pub transfer_nanodollars_per_gib: u64,
     /// Nanodollars per GiB retrieved, for storage classes that bill retrieval
     /// separately from transfer. `0` on the standard class.
     pub retrieval_nanodollars_per_gib: u64,
+    /// One request's latency from the measuring host to the store, in
+    /// microseconds: a measured constant, not a price (ADR-2414 decision A3).
+    /// Set together with [`Self::per_connection_throughput_bytes_per_s`] or
+    /// not at all; a profile carrying one without the other fails to load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_latency_micros: Option<u64>,
+    /// The bytes one connection transfers per second from the same host, a
+    /// measured constant like [`Self::request_latency_micros`] and set with
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_connection_throughput_bytes_per_s: Option<u64>,
+    /// When and where the two timings were measured, e.g. a date and a host
+    /// description. Provenance only: nothing derives a figure from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timings_measured: Option<String>,
 }
 
 /// Prices of the reference profile, carrying an empty name: a `String` cannot
@@ -153,7 +173,14 @@ const S3_INTRA_REGION_2026_PRICES: StoreCostProfile = StoreCostProfile {
     delete_class_nanodollars: 0,
     transfer_nanodollars_per_gib: 0,
     retrieval_nanodollars_per_gib: 0,
+    request_latency_micros: Some(70_000),
+    per_connection_throughput_bytes_per_s: Some(90_000_000),
+    timings_measured: None,
 };
+
+/// Where the reference profile's two timings were measured.
+const S3_INTRA_REGION_2026_TIMINGS_MEASURED: &str =
+    "2026-10-03, the 32 GB reference box of the reference suite, intra-region against S3";
 
 impl StoreCostProfile {
     /// Name of the reference profile, as it appears in a provenance stamp.
@@ -162,10 +189,14 @@ impl StoreCostProfile {
     /// The reference profile: S3 standard, intra-region, 2026 list prices.
     /// PUT-class $5.00 per million requests (`5_000` nanodollars), GET-class
     /// $0.40 per million (`400`), transfer and retrieval free. One PUT costs
-    /// 12.5 GETs, the ratio ADR-0996 reasons from.
+    /// 12.5 GETs, the ratio ADR-0996 reasons from. The timings are the ones
+    /// ADR-2414 decision A3 records from the reference box: 70 ms per request
+    /// and 90 MB/s per connection, so one request costs 6,300,000 bytes
+    /// ([`Self::request_cost_bytes_from_timings`]).
     pub fn reference() -> StoreCostProfile {
         StoreCostProfile {
             name: StoreCostProfile::S3_INTRA_REGION_2026.to_string(),
+            timings_measured: Some(S3_INTRA_REGION_2026_TIMINGS_MEASURED.to_string()),
             ..S3_INTRA_REGION_2026_PRICES
         }
     }
@@ -180,6 +211,7 @@ impl StoreCostProfile {
     pub fn from_toml_str(toml_str: &str) -> Result<StoreCostProfile, CostProfileError> {
         let profile: StoreCostProfile = toml::from_str(toml_str)?;
         profile.validate_name()?;
+        profile.validate_timings()?;
         Ok(profile)
     }
 
@@ -190,6 +222,7 @@ impl StoreCostProfile {
     /// legally be stamped into provenance.
     pub fn to_toml_string(&self) -> Result<String, CostProfileError> {
         self.validate_name()?;
+        self.validate_timings()?;
         Ok(toml::to_string(self)?)
     }
 
@@ -199,6 +232,36 @@ impl StoreCostProfile {
             return Err(CostProfileError::EmptyName);
         }
         Ok(())
+    }
+
+    /// The timings rule both directions share: both set or neither. One
+    /// timing alone cannot form a request cost, and accepting it would leave
+    /// the profile pricing as if the operator had written neither.
+    fn validate_timings(&self) -> Result<(), CostProfileError> {
+        match (
+            self.request_latency_micros,
+            self.per_connection_throughput_bytes_per_s,
+        ) {
+            (Some(_), None) => Err(CostProfileError::IncompleteTimings {
+                missing: "per_connection_throughput_bytes_per_s",
+            }),
+            (None, Some(_)) => Err(CostProfileError::IncompleteTimings {
+                missing: "request_latency_micros",
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// One request's cost in bytes from the two timings: the bytes one
+    /// connection transfers during one request's latency,
+    /// `request_latency * per_connection_throughput` (ADR-2414 decision A3).
+    /// Computed in `u128` and saturated at `u64::MAX`; `None` when the profile
+    /// records no timings. 6,300,000 on the reference profile.
+    pub fn request_cost_bytes_from_timings(&self) -> Option<u64> {
+        let latency = self.request_latency_micros?;
+        let throughput = self.per_connection_throughput_bytes_per_s?;
+        let bytes = u128::from(latency) * u128::from(throughput) / MICROS_PER_SECOND;
+        Some(u64::try_from(bytes).unwrap_or(u64::MAX))
     }
 
     /// Nanodollars per request under `class`.
@@ -277,6 +340,16 @@ pub enum CostProfileError {
     /// provenance stamp.
     #[error("store cost profile name must not be empty")]
     EmptyName,
+    /// The profile sets one of the two request timings without the other.
+    #[error(
+        "store cost profile sets one request timing without the other: {missing} is missing \
+         (request_latency_micros and per_connection_throughput_bytes_per_s are set together \
+         or not at all)"
+    )]
+    IncompleteTimings {
+        /// The timing field the document left out.
+        missing: &'static str,
+    },
     /// The profile could not be rendered back to TOML.
     #[error("could not render store cost profile as TOML: {0}")]
     Render(#[from] toml::ser::Error),
@@ -424,6 +497,9 @@ mod tests {
             delete_class_nanodollars: 0,
             transfer_nanodollars_per_gib: 90_000_000, // $0.09/GiB
             retrieval_nanodollars_per_gib: 10_000_000,
+            request_latency_micros: None,
+            per_connection_throughput_bytes_per_s: None,
+            timings_measured: None,
         };
         // 3 PUTs + 7 GETs + exactly 2 GiB transferred.
         let two_gib = 2 * 1024 * 1024 * 1024;
@@ -443,6 +519,9 @@ mod tests {
             delete_class_nanodollars: 0,
             transfer_nanodollars_per_gib: 1_000_000_000, // $1/GiB
             retrieval_nanodollars_per_gib: 0,
+            request_latency_micros: None,
+            per_connection_throughput_bytes_per_s: None,
+            timings_measured: None,
         };
         // Half a GiB is half a dollar, exactly.
         assert_eq!(p.modeled_nanodollars(0, 0, 512 * 1024 * 1024), 500_000_000);
@@ -462,6 +541,9 @@ mod tests {
             delete_class_nanodollars: u64::MAX,
             transfer_nanodollars_per_gib: u64::MAX,
             retrieval_nanodollars_per_gib: u64::MAX,
+            request_latency_micros: Some(u64::MAX),
+            per_connection_throughput_bytes_per_s: Some(u64::MAX),
+            timings_measured: None,
         };
         assert_eq!(
             p.modeled_nanodollars(u64::MAX, u64::MAX, u64::MAX),
@@ -469,6 +551,11 @@ mod tests {
             "a saturated modeled cost reads as at-least, never wrapping to cheap"
         );
         assert_eq!(p.retrieval_nanodollars(u64::MAX), u64::MAX);
+        assert_eq!(
+            p.request_cost_bytes_from_timings(),
+            Some(u64::MAX),
+            "a saturated timing product reads as at-least, never wrapping to a small request"
+        );
     }
 
     #[test]
@@ -480,6 +567,9 @@ mod tests {
             delete_class_nanodollars: 0,
             transfer_nanodollars_per_gib: 20_000_000,
             retrieval_nanodollars_per_gib: 1_234,
+            request_latency_micros: Some(12_345),
+            per_connection_throughput_bytes_per_s: Some(67_890_000),
+            timings_measured: Some("a test host".to_string()),
         };
         let rendered = original.to_toml_string().expect("render");
         let parsed = StoreCostProfile::from_toml_str(&rendered).expect("parse");
@@ -494,9 +584,113 @@ put_class_nanodollars = 5000
 get_class_nanodollars = 400
 transfer_nanodollars_per_gib = 0
 retrieval_nanodollars_per_gib = 0
+request_latency_micros = 70000
+per_connection_throughput_bytes_per_s = 90000000
+timings_measured = "2026-10-03, the 32 GB reference box of the reference suite, intra-region against S3"
 "#;
         let parsed = StoreCostProfile::from_toml_str(doc).expect("parse");
         assert_eq!(parsed, StoreCostProfile::reference());
+    }
+
+    #[test]
+    fn reference_profile_timings_are_pinned_exactly() {
+        // The two measured constants ADR-2414 decision A3 records, and the
+        // request cost they make: 0.070 s * 90,000,000 B/s = 6,300,000 B.
+        let p = StoreCostProfile::reference();
+        assert_eq!(p.request_latency_micros, Some(70_000));
+        assert_eq!(p.per_connection_throughput_bytes_per_s, Some(90_000_000));
+        assert_eq!(
+            p.timings_measured.as_deref(),
+            Some(
+                "2026-10-03, the 32 GB reference box of the reference suite, \
+                 intra-region against S3"
+            )
+        );
+        assert_eq!(p.request_cost_bytes_from_timings(), Some(6_300_000));
+    }
+
+    #[test]
+    fn request_cost_from_timings_is_latency_times_throughput() {
+        let with = |latency, throughput| StoreCostProfile {
+            request_latency_micros: latency,
+            per_connection_throughput_bytes_per_s: throughput,
+            ..StoreCostProfile::reference()
+        };
+        // 1 ms at 1 MB/s is 1,000 bytes: the unit conversion is per second,
+        // not per millisecond or per microsecond.
+        assert_eq!(
+            with(Some(1_000), Some(1_000_000)).request_cost_bytes_from_timings(),
+            Some(1_000)
+        );
+        // Truncated toward zero: 1 us at 999,999 B/s is 0.999999 bytes.
+        assert_eq!(
+            with(Some(1), Some(999_999)).request_cost_bytes_from_timings(),
+            Some(0)
+        );
+        assert_eq!(with(None, None).request_cost_bytes_from_timings(), None);
+    }
+
+    #[test]
+    fn a_profile_with_one_timing_fails_to_load_naming_the_other() {
+        let prices = "name = \"one-timing\"\nput_class_nanodollars = 5000\n\
+                      get_class_nanodollars = 400\ntransfer_nanodollars_per_gib = 0\n\
+                      retrieval_nanodollars_per_gib = 0\n";
+
+        let latency_only = format!("{prices}request_latency_micros = 70000\n");
+        let err = StoreCostProfile::from_toml_str(&latency_only)
+            .expect_err("a latency without a throughput must be refused");
+        assert!(
+            matches!(
+                err,
+                CostProfileError::IncompleteTimings {
+                    missing: "per_connection_throughput_bytes_per_s"
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("per_connection_throughput_bytes_per_s is missing"),
+            "the error names the missing field: {err}"
+        );
+
+        let throughput_only =
+            format!("{prices}per_connection_throughput_bytes_per_s = 90000000\n");
+        let err = StoreCostProfile::from_toml_str(&throughput_only)
+            .expect_err("a throughput without a latency must be refused");
+        assert!(
+            matches!(
+                err,
+                CostProfileError::IncompleteTimings {
+                    missing: "request_latency_micros"
+                }
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("request_latency_micros is missing"),
+            "the error names the missing field: {err}"
+        );
+
+        // Neither timing loads, with both absent and no request cost from them.
+        let neither = StoreCostProfile::from_toml_str(prices).expect("prices alone load");
+        assert_eq!(neither.request_latency_micros, None);
+        assert_eq!(neither.per_connection_throughput_bytes_per_s, None);
+        assert_eq!(neither.timings_measured, None);
+        assert_eq!(neither.request_cost_bytes_from_timings(), None);
+
+        // The renderer shares the rule, so a half-timed profile cannot be
+        // written out for the loader to refuse later.
+        let half = StoreCostProfile {
+            per_connection_throughput_bytes_per_s: None,
+            ..StoreCostProfile::reference()
+        };
+        assert!(matches!(
+            half.to_toml_string(),
+            Err(CostProfileError::IncompleteTimings {
+                missing: "per_connection_throughput_bytes_per_s"
+            })
+        ));
     }
 
     #[test]

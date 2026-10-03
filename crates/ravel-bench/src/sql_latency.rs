@@ -5667,6 +5667,9 @@ mod tests {
             delete_class_nanodollars: 0,
             transfer_nanodollars_per_gib: 90_000_000,
             retrieval_nanodollars_per_gib: 10_000_000,
+            request_latency_micros: None,
+            per_connection_throughput_bytes_per_s: None,
+            timings_measured: None,
         };
 
         let flight = model_pass_cost(true, &profile, &entries);
