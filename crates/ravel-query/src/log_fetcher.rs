@@ -3178,6 +3178,7 @@ impl LogSegmentFetcher {
     /// phase's own survivor list. `expected_survivors` is that list; see
     /// [`RlogReader::scan_blocks_raw_subset`] for the fail-closed check against
     /// this open's own (expected-identical) pruning result.
+    #[allow(clippy::too_many_arguments)]
     fn open_scan_raw_subset(
         &self,
         key: &str,
@@ -3201,6 +3202,7 @@ impl LogSegmentFetcher {
     /// instead of decoding STREAM_DIR, FIELD_DIR, SKIP_IDX, and PAGE_DIR again
     /// from `bytes` (ADR-2414 decision A1): the striped route's per-partition
     /// open of a segment the plan phase already opened once.
+    #[allow(clippy::too_many_arguments)]
     fn open_scan_raw_subset_with_decoded(
         &self,
         key: &str,
