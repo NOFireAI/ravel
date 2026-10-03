@@ -11390,6 +11390,54 @@ mod tests {
         }
     }
 
+    /// The "host profile detected" startup line gained six fields this issue
+    /// (`mem_total_raw_bytes`, `cgroup_memory_limit_bytes` and its
+    /// `_known` companion, `mem_available_bytes` and its `_known` companion,
+    /// `own_rss_bytes`) when the available-memory derivation needed them as
+    /// inputs (issue #2483, finding 7). Pin each one actually reaches the
+    /// line with a host whose six fields are all distinct, non-zero values,
+    /// not only the three fields the line already carried before this issue.
+    ///
+    /// Prove-the-test: drop any one field from the `tracing::info!` call in
+    /// `emit` and the matching assertion below fails to find it in the line.
+    #[test]
+    fn host_profile_detected_logs_every_new_field() {
+        let host = HostProfile::new(
+            REFERENCE_CORES,
+            Some(4 * 1024 * 1024 * 1024),
+            Some(32 * 1024 * 1024 * 1024),
+            Some(4 * 1024 * 1024 * 1024),
+            Some(10 * 1024 * 1024 * 1024),
+            Some(2 * 1024 * 1024 * 1024),
+        );
+        let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
+        let (captured, _guard) = capture_events(tracing::Level::INFO);
+
+        resolved.emit(host);
+
+        let lines = captured.lock();
+        let line = lines
+            .iter()
+            .find(|l| l.contains("host profile detected"))
+            .expect("the host profile detected line must be logged");
+
+        for expected in [
+            "mem_total_bytes=4294967296",
+            "mem_total_known=true",
+            "mem_total_raw_bytes=34359738368",
+            "cgroup_memory_limit_bytes=4294967296",
+            "cgroup_memory_limit_known=true",
+            "mem_available_bytes=10737418240",
+            "mem_available_known=true",
+            "own_rss_bytes=2147483648",
+        ] {
+            assert!(
+                line.contains(expected),
+                "host profile detected line missing {expected}, line: {line}"
+            );
+        }
+    }
+
     /// `--gc-max-query-duration` reachability under the derived default: unset,
     /// the resolved deadline is 11 minutes and it is the value the `sys/gc`
     /// validation runs on (and passes, against the durable 1h default). Set, the
