@@ -95,6 +95,14 @@ ravel-parquet = { workspace = true }
 # upgrade adds a new one (ADR-0097).
 datafusion = { version = "54", default-features = false, features = ["sql"] }
 
+# Cache-dir-derived spill (ADR-0954 amendment, issue #2416) needs the host
+# volume's free bytes and an advisory lock an orphan sweep can test for
+# liveness without reading a pid. The workspace forbids `unsafe_code`
+# (including in dependencies this crate itself would otherwise have to write),
+# so this has to come from a dependency rather than a direct syscall; fs4 is a
+# new external crate, not yet in the lockfile under any other dependency.
+fs4 = "1"
+
 # `url::Url` appears in the `ObjectStoreRegistry` trait signature, which
 # ravel-sql implements to install a registry that holds no stores at all in
 # every session that reads no Parquet table (ADR-0013 security invariant 1, as
