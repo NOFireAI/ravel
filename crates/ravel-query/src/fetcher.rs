@@ -655,8 +655,10 @@ pub(crate) mod ram_recheck_seam {
 /// This type exists for the shape those fields cannot express: a run that
 /// merged several inputs' samples, where each sample keeps the provenance of
 /// the write it came from and array position no longer reconstructs the fourth
-/// element (ADR-0092 "Why 11.46 is not the target", decision 1). Nothing
-/// produces that shape yet; issue #315 makes L1 compaction emit it.
+/// element (ADR-0092 "Why 11.46 is not the target", decision 1). Issue #315
+/// makes L1 compaction emit it. The scan-time erasure mask also gives a
+/// run-wide run this shape when it drops samples, so every survivor keeps the
+/// key its original position implied (`erasure::compact_parallel`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SamplePriority {
     pub created_unix_ns: i64,
@@ -686,14 +688,15 @@ pub struct FetchedSeries {
     pub series_id: SeriesId,
     pub labels: LabelSet,
     /// On-disk order, including any duplicate timestamps within this
-    /// segment; index in this vec is the "in-page index" tiebreak.
+    /// segment; index in this vec is the "in-page index" tiebreak unless
+    /// `per_sample_priorities` is `Some`.
     pub samples: Vec<Sample>,
     pub created_unix_ns: i64,
     pub writer_epoch: u64,
     pub writer_seq: u64,
     /// Per-sample dedup keys, parallel to `samples`, for a run that merged
-    /// several writes' samples. `None` (the default and, today, the only shape
-    /// any object produces) means the run-wide fields above plus array
+    /// several writes' samples, or that a pending erasure mask dropped
+    /// samples from. `None` means the run-wide fields above plus array
     /// position give every sample's key. When `Some`, its length must equal
     /// `samples.len()`; the merge rejects a disagreement as
     /// `QueryError::PrioritySampleCountMismatch` rather than truncating.
@@ -715,8 +718,7 @@ pub struct FetchedSeriesSoa {
     pub writer_epoch: u64,
     pub writer_seq: u64,
     /// Per-sample dedup keys, parallel to `timestamps`/`values`; see
-    /// [`FetchedSeries::per_sample_priorities`]. `None` for every run the
-    /// fetcher emits today.
+    /// [`FetchedSeries::per_sample_priorities`].
     pub per_sample_priorities: Option<Vec<SamplePriority>>,
 }
 
@@ -737,8 +739,7 @@ pub struct FetchedHistogramSeries {
     pub writer_epoch: u64,
     pub writer_seq: u64,
     /// Per-sample dedup keys, parallel to `timestamps`/`values`; see
-    /// [`FetchedSeries::per_sample_priorities`]. `None` for every run the
-    /// fetcher emits today.
+    /// [`FetchedSeries::per_sample_priorities`].
     pub per_sample_priorities: Option<Vec<SamplePriority>>,
 }
 
