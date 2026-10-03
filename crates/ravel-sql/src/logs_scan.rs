@@ -3615,9 +3615,16 @@ struct RowRefRange {
 /// list that has drifted out of step with the scan's actual blocks cannot
 /// silently stamp the wrong row-ref (issue #2417). `survivors` is the
 /// segment's whole surviving-block list; a row-ref carries a block's position
-/// in it, not its whole-object index. The whole-segment fast path passes
-/// `None` because there every block survives and the whole-object index
-/// already IS the row-ref address.
+/// in it, not its whole-object index.
+///
+/// The whole-segment fast path passes `None`: it has no plan-phase survivor
+/// list, and late materialization resolves the row-ref as a position among the
+/// blocks its own reopen keeps. The two agree only while the open has pruned
+/// no block before this one, so the decoded block must equal `cursor`, the
+/// block's position in this scan's drain. A block that follows one the open
+/// pruned (its skip index disagreeing with the catalog's bounds) fails with a
+/// typed `Corrupted` error naming `key` rather than stamping a row-ref that
+/// would resolve to another block.
 ///
 /// A free function rather than a method because the columnar drain calls it
 /// while the block cursor holds a mutable borrow of the stream's state field.
@@ -3625,6 +3632,8 @@ fn block_index(
     row_refs: bool,
     survivors: Option<&[usize]>,
     decoded_block: Option<usize>,
+    cursor: usize,
+    key: &str,
 ) -> DFResult<Option<usize>> {
     if !row_refs {
         return Ok(None);
@@ -3635,6 +3644,16 @@ fn block_index(
         )
     })?;
     let Some(survivors) = survivors else {
+        if owned != cursor {
+            return Err(SqlError::from(LogFetchError::Corrupt {
+                key: key.to_string(),
+                source: LogSegError::Corrupted(format!(
+                    "segment survivor mismatch: whole-segment open decoded block {owned} \
+                     at drain position {cursor}"
+                )),
+            })
+            .into());
+        }
         return Ok(Some(owned));
     };
     survivors.binary_search(&owned).map(Some).map_err(|_| {
@@ -3858,6 +3877,10 @@ impl LogScanStream {
             self.row_refs,
             self.current_survivors.as_deref().map(Vec::as_slice),
             decoded_block,
+            self.block_cursor,
+            self.current_seg
+                .as_ref()
+                .map_or("", |s| s.data_object_key.as_str()),
         )
     }
 
@@ -4272,6 +4295,10 @@ impl LogScanStream {
                                     this.row_refs,
                                     this.current_survivors.as_deref().map(Vec::as_slice),
                                     decoded_block,
+                                    this.block_cursor,
+                                    this.current_seg
+                                        .as_ref()
+                                        .map_or("", |s| s.data_object_key.as_str()),
                                 )
                                 .and_then(|block| {
                                     build_columnar_batches(

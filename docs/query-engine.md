@@ -530,7 +530,15 @@ partition:
   carry (the BLOOM section, in the fixtures above) come on top.
 - A row-ref names a block by its position in the segment's surviving-block
   list, not by its whole-object index; the scan resolves the position through
-  that list, so late materialization reopens the block the scan decoded.
+  that list, so late materialization reopens the block the scan decoded. The
+  whole-segment fast path has no plan-phase list: it stamps the decoded block's
+  whole-object index only when that index equals the block's position in the
+  scan's own drain, which holds while the open has pruned no earlier block.
+  When the skip index prunes a block the catalog's bounds said was inside the
+  window, the first block after it to be stamped fails the statement with a
+  typed `Corrupted` survivor-mismatch error rather than stamping a row-ref that
+  would resolve to another block
+  (`a_fast_path_open_that_prunes_a_block_refuses_to_stamp_a_row_ref`).
 
 ## Selective (predicated) logs scan: request count
 
