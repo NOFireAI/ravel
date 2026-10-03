@@ -756,6 +756,57 @@ impl IngestConfig {
     pub(crate) fn queued_flush_cap(&self) -> usize {
         self.max_queued_flushes.max(1)
     }
+
+    /// The largest age any buffer reaches before its flush trigger fires when
+    /// no deferral intervenes, leaving out the sub-floor hold, plus one
+    /// `flush_tick`: the largest of `max_flush_delay` (the fast clock),
+    /// `max_flush_delay_idle` (the idle clock of a buffered-mode buffer with no
+    /// strict waiter), and, with `adaptive_flush_delay` on, the metrics actor's
+    /// adaptive corridor ceiling at its widest (`strict_visibility_budget_ns`
+    /// less one `put_retry_base_delay`, the ceiling at a zero PUT round trip).
+    /// The tick is added because the age check runs on a tick rather than at
+    /// the instant the threshold is crossed. The sub-floor hold of ADR-1737 is
+    /// left out on purpose: it already spends `max_flush_lifetime`, so counting
+    /// it would drive [`Self::flush_deferral_cap_ns`] to 0 for any non-zero
+    /// `idle_flush_byte_floor`, and a buffer held under that floor is not
+    /// bounded by the cap.
+    pub fn flush_trigger_age_bound_ns(&self) -> i64 {
+        let fast_ns = self.max_flush_delay.as_nanos() as i64;
+        let idle_ns = self.max_flush_delay_idle.as_nanos() as i64;
+        let mut threshold_ns = fast_ns.max(idle_ns);
+        if self.adaptive_flush_delay {
+            let widest_ns = self
+                .strict_visibility_budget_ns
+                .saturating_sub(self.put_retry_base_delay.as_nanos() as i64);
+            threshold_ns = threshold_ns.max(widest_ns);
+        }
+        threshold_ns.saturating_add(self.flush_tick.as_nanos() as i64)
+    }
+
+    /// How long a refused flush trigger may stay deferred before its shard
+    /// refuses new appends (ADR-1642 deferral cap amendment). It is what the
+    /// read-side slack `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` has left for a
+    /// row once the rest of its span is paid for: the slack less
+    /// `max_flush_lifetime` (the term the frozen derivation reserves for the
+    /// flush itself) less [`Self::flush_trigger_age_bound_ns`]. A row has
+    /// waited at most that bound when its buffer's deferral starts, unless it
+    /// is held under a non-zero `idle_flush_byte_floor`. A strict waiter is
+    /// only acknowledged from a flush that opens inside the cap, so an
+    /// acknowledged strict row's routing-to-pin span plus the flush lifetime
+    /// stays inside the slack, and the shard starts refusing new writes while
+    /// a flush opening then would still fit every buffered row outside the
+    /// sub-floor hold inside it. Rows held under the floor, and rows of a
+    /// strict write that already timed out, are not bounded by the cap.
+    /// 3559.8 s at the shipped defaults, whatever `idle_flush_byte_floor`
+    /// holds; it saturates at 0 for a configuration whose own bounds already
+    /// spend the slack.
+    pub fn flush_deferral_cap_ns(&self) -> i64 {
+        let slack_ns = i64::from(ravel_catalog::FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR;
+        slack_ns
+            .saturating_sub(self.max_flush_lifetime.as_nanos() as i64)
+            .saturating_sub(self.flush_trigger_age_bound_ns())
+            .max(0)
+    }
 }
 
 #[cfg(test)]
@@ -982,6 +1033,54 @@ mod tests {
             ..IngestConfig::default()
         };
         assert_eq!(three.queued_flush_cap(), 3);
+    }
+
+    /// The deferral cap is what the slack leaves a row: at the shipped
+    /// defaults 7200 s less the 3600 s lifetime less the 40 s
+    /// `max_flush_delay_idle` and one 200 ms tick. A non-zero idle flush byte
+    /// floor leaves it unchanged, since the sub-floor hold is not counted. The
+    /// adaptive corridor's 2.4 s ceiling sits under the idle clock at the
+    /// defaults, so it changes the bound only once its budget passes 40 s.
+    #[test]
+    fn flush_deferral_cap_is_what_the_slack_leaves_a_row() {
+        let shipped = IngestConfig::default();
+        assert_eq!(shipped.flush_trigger_age_bound_ns(), 40_200_000_000);
+        assert_eq!(shipped.flush_deferral_cap_ns(), 3_559_800_000_000);
+        assert_eq!(
+            shipped.flush_deferral_cap_ns()
+                + shipped.flush_trigger_age_bound_ns()
+                + shipped.max_flush_lifetime.as_nanos() as i64,
+            i64::from(ravel_catalog::FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR
+        );
+        let floored = IngestConfig {
+            idle_flush_byte_floor: 64 * 1024,
+            ..shipped
+        };
+        assert_eq!(floored.validate(), Ok(()));
+        assert_eq!(floored.flush_trigger_age_bound_ns(), 40_200_000_000);
+        assert_eq!(floored.flush_deferral_cap_ns(), 3_559_800_000_000);
+        let adaptive = IngestConfig {
+            adaptive_flush_delay: true,
+            ..shipped
+        };
+        assert_eq!(adaptive.flush_trigger_age_bound_ns(), 40_200_000_000);
+        assert_eq!(adaptive.flush_deferral_cap_ns(), 3_559_800_000_000);
+        let wide_adaptive = IngestConfig {
+            strict_visibility_budget_ns: 60_000_000_000,
+            ..adaptive
+        };
+        assert_eq!(wide_adaptive.flush_trigger_age_bound_ns(), 60_100_000_000);
+        assert_eq!(wide_adaptive.flush_deferral_cap_ns(), 3_539_900_000_000);
+        let slow_fast_clock = IngestConfig {
+            max_flush_delay: Duration::from_secs(50),
+            ..shipped
+        };
+        assert_eq!(slow_fast_clock.flush_trigger_age_bound_ns(), 50_200_000_000);
+        let spent = IngestConfig {
+            max_flush_lifetime: Duration::from_secs(7200),
+            ..shipped
+        };
+        assert_eq!(spent.flush_deferral_cap_ns(), 0);
     }
 
     #[test]

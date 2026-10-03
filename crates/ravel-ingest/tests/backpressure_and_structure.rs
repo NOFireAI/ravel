@@ -46,7 +46,11 @@ async fn stalled_flush_sheds_via_byte_budget_without_blocking_the_producer() {
         // then waits on the one permit the stalled flush holds, pinning that
         // write's charge in flight.
         target_bytes: 8,
-        max_flush_delay: Duration::from_secs(3600),
+        // Long enough that no age trigger fires on the unadvanced clock, and
+        // short enough to leave a nonzero flush deferral cap: at 3600 s the
+        // strict delay plus the lifetime spend the slack, the cap is 0, and a
+        // full queue refuses writes before the budget can shed them.
+        max_flush_delay: Duration::from_secs(1800),
         flush_tick: Duration::from_millis(20),
         max_inflight_flushes: 1,
         // A shallow mailbox is what makes the timeout below discriminating.

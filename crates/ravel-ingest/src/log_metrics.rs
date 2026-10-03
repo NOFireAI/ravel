@@ -167,6 +167,10 @@ pub struct LogIngestMetrics {
     /// docs/consistency-model.md). The metrics and span pipelines keep the
     /// same counter.
     partial_writes: AtomicU64,
+    /// Writes refused at the flush deferral cap
+    /// ([`crate::LogWriteError::DeferralCapReached`]), the log-side copy of
+    /// [`crate::IngestMetrics`]'s counter of the same name.
+    deferral_cap_refused: AtomicU64,
     /// Distinct log shard actors observed dead by the router: its send half
     /// or a strict-mode ack found the shard channel closed, meaning the actor
     /// task ended (e.g. panicked) without the router shutting it down.
@@ -346,6 +350,9 @@ pub struct LogIngestMetricsSnapshot {
     /// [`crate::LogWriteError::PartialWrite`] (issue #1130): a partial
     /// multi-shard commit. Exported as `ravel_ingest_partial_writes_total`.
     pub partial_writes: u64,
+    /// Writes refused at the flush deferral cap. Exported as
+    /// `ravel_ingest_deferral_cap_refused_total`.
+    pub deferral_cap_refused: u64,
     pub shard_deaths: u64,
     /// Shards condemned on their first death (issue #1691; docs/ingest.md, Log
     /// pipeline). Exported as `ravel_ingest_shards_condemned_total`.
@@ -648,6 +655,11 @@ impl LogIngestMetrics {
         self.partial_writes.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One write refused at the flush deferral cap.
+    pub(crate) fn record_deferral_cap_refused(&self) {
+        self.deferral_cap_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_shard_death(&self) {
         self.shard_deaths.fetch_add(1, Ordering::Relaxed);
     }
@@ -806,6 +818,7 @@ impl LogIngestMetrics {
                 .load(Ordering::Relaxed),
             flush_all_residue_tenants: self.flush_all_residue_tenants.load(Ordering::Relaxed),
             partial_writes: self.partial_writes.load(Ordering::Relaxed),
+            deferral_cap_refused: self.deferral_cap_refused.load(Ordering::Relaxed),
             shard_deaths: self.shard_deaths.load(Ordering::Relaxed),
             shards_condemned: self.shards_condemned.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
@@ -1003,6 +1016,13 @@ mod tests {
             LogIngestMetrics::record_partial_write,
             LogIngestMetricsSnapshot {
                 partial_writes: 1,
+                ..Default::default()
+            },
+        );
+        assert_only(
+            LogIngestMetrics::record_deferral_cap_refused,
+            LogIngestMetricsSnapshot {
+                deferral_cap_refused: 1,
                 ..Default::default()
             },
         );
