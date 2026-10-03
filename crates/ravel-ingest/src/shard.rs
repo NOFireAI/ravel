@@ -195,6 +195,10 @@ struct TenantBuf {
     /// corridor floor in `adaptive_age_threshold_ns` with no special case.
     last_arrival_ns: Option<i64>,
     avg_gap_ns: i64,
+    /// When this buffer's flush trigger was first refused at the queued-flush
+    /// cap, carried across every later refusal so the deferral is measured
+    /// from its start (issue #1916). `None` for a buffer never refused.
+    deferred_since_ns: Option<i64>,
 }
 
 impl TenantBuf {
@@ -970,6 +974,13 @@ pub(crate) struct ShardActor {
     /// Read at trigger time rather than resolved once, because the router
     /// installs the budget after the actors are spawned.
     backstop_ceiling: BufferBudgetCeiling,
+    /// [`IngestConfig::flush_deferral_cap_ns`], resolved once (issue #1916).
+    deferral_cap_ns: i64,
+    /// The earliest `deferred_since_ns` across `tenants`, `None` when no buffer
+    /// is deferred. Lowered on every refusal and recomputed after each age
+    /// tick and drain, so between those it can only read older than the
+    /// truth, which errs toward refusing an append rather than accepting one.
+    oldest_deferral_ns: Option<i64>,
 }
 
 impl ShardActor {
@@ -1020,6 +1031,8 @@ impl ShardActor {
             rx,
             tenants: HashMap::new(),
             backstop_ceiling,
+            deferral_cap_ns: config.flush_deferral_cap_ns(),
+            oldest_deferral_ns: None,
         }
     }
 
@@ -1123,7 +1136,7 @@ impl ShardActor {
         tenant: TenantId,
         points: Vec<IngestPoint>,
         exemplars: Vec<IngestExemplar>,
-        ack: Option<Ack>,
+        mut ack: Option<Ack>,
         charge: Option<Arc<IngestByteCharge>>,
     ) {
         if points.is_empty() && exemplars.is_empty() && ack.is_none() {
@@ -1132,6 +1145,9 @@ impl ShardActor {
             return;
         }
         let arrival_ns = self.clock.now_ns();
+        if self.refuse_at_deferral_cap(&mut ack, arrival_ns) {
+            return;
+        }
         let points_len = points.len() as u64;
         // Grab the timing handle before the mutable buffer borrow so recording
         // `merge` does not clash with the `&mut self.tenants` borrow held below.
@@ -1240,27 +1256,68 @@ impl ShardActor {
         (threshold_ns, trigger)
     }
 
+    /// Fires every due age trigger. A deferred buffer is always due, since its
+    /// trigger already fired once; stripping its waiters at the deferral cap
+    /// can raise its threshold, and it must not wait that out. Deferred
+    /// buffers go first, oldest deferral first, then the rest by oldest row,
+    /// so a freed queue slot goes to the flush that has waited longest rather
+    /// than to whichever tenant `HashMap` order yields (issue #1916).
     async fn flush_aged(&mut self) {
         let now = self.clock.now_ns();
-        let due: Vec<(TenantId, FlushTrigger)> = self
+        let mut due: Vec<(i64, i64, TenantId, FlushTrigger)> = self
             .tenants
             .iter()
             .filter_map(|(tenant, buf)| {
                 let oldest = buf.oldest_arrival_ns?;
                 let (threshold_ns, trigger) = self.age_threshold_ns(buf);
-                if now.saturating_sub(oldest) >= threshold_ns {
-                    Some((tenant.clone(), trigger))
-                } else {
-                    None
-                }
+                (buf.deferred_since_ns.is_some() || now.saturating_sub(oldest) >= threshold_ns)
+                    .then(|| {
+                        let since = buf.deferred_since_ns.unwrap_or(i64::MAX);
+                        (since, oldest, tenant.clone(), trigger)
+                    })
             })
             .collect();
-        for (tenant, trigger) in due {
+        due.sort_unstable_by_key(|(since, oldest, ..)| (*since, *oldest));
+        for (_, _, tenant, trigger) in due {
             if let Some(buf) = self.tenants.remove(&tenant) {
                 self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
                     .await;
             }
         }
+        self.refresh_oldest_deferral();
+    }
+
+    /// Answers a strict-mode write with the retryable overload error, taking
+    /// its ack, when a deferred flush on this shard has been deferred for at
+    /// least the deferral cap at `now_ns` (issue #1916). The caller returns on
+    /// `true`, dropping the write's charge, which refunds it (ADR-0069). A
+    /// buffered-mode write carries no ack because the router already
+    /// acknowledged it, so it is never refused here and merges as usual.
+    fn refuse_at_deferral_cap(&self, ack: &mut Option<Ack>, now_ns: i64) -> bool {
+        let reached = self
+            .oldest_deferral_ns
+            .is_some_and(|since| now_ns.saturating_sub(since) >= self.deferral_cap_ns);
+        match ack.take() {
+            Some(ack) if reached => {
+                self.ctx
+                    .ack_waiters(vec![ack], Err(WriteError::BufferBudgetExceeded));
+                true
+            }
+            other => {
+                *ack = other;
+                false
+            }
+        }
+    }
+
+    /// Recomputes `oldest_deferral_ns` from the buffers, clearing it once every
+    /// deferred flush has opened.
+    fn refresh_oldest_deferral(&mut self) {
+        self.oldest_deferral_ns = self
+            .tenants
+            .values()
+            .filter_map(|buf| buf.deferred_since_ns)
+            .min();
     }
 
     /// Returns `(tenant_count, buffered_point_count)` across every currently
@@ -1350,6 +1407,7 @@ impl ShardActor {
             }
         }
         self.join_all_flushes().await;
+        self.refresh_oldest_deferral();
     }
 
     /// One drain pass: a fresh snapshot of the buffered tenant keys, each
@@ -1570,7 +1628,28 @@ impl ShardActor {
             debug_assert!(buf.waiters.is_empty());
             return;
         }
-        if self.queued_flush_cap_reached(trigger, &buf) {
+        let raw_ns = self.clock.now_ns();
+        let refused = self.queued_flush_cap_reached(trigger, &buf);
+        if refused {
+            buf.deferred_since_ns.get_or_insert(raw_ns);
+        }
+        if buf
+            .deferred_since_ns
+            .is_some_and(|since| raw_ns.saturating_sub(since) >= self.deferral_cap_ns)
+            && !buf.waiters.is_empty()
+        {
+            // Issue #1916: this buffer has been deferred for the whole
+            // deferral cap, so a flush opening from here on pins an ingest
+            // hour past what the read-side slack covers for its oldest rows.
+            // Answer its strict-mode waiters with the retryable overload error
+            // rather than acknowledge them from that flush. The rows stay
+            // buffered and flush later unacknowledged; a client retry writes
+            // them again and query-time dedup collapses the copy.
+            let waiters = std::mem::take(&mut buf.waiters);
+            self.ctx
+                .ack_waiters(waiters, Err(WriteError::BufferBudgetExceeded));
+        }
+        if refused {
             // Issue #1740: this shard is already holding `max_queued_flushes`
             // flush windows, and this buffer is still under its memory
             // backstop. Refuse the trigger rather than spawn another task
@@ -1585,19 +1664,20 @@ impl ShardActor {
             // The rows carry no ingest-hour bucket across the deferral. The
             // bucket is pinned below, from the reading taken by the flush that
             // finally opens, so a deferral adds its own length to the gap
-            // between a record's routing and its bucket, and can overrun the
-            // `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` the read side allows
-            // for that gap. Pinning before this check instead would move the
-            // overrun to the other side of the flush, past the catalog's
+            // between a record's routing and its bucket. What keeps that gap
+            // inside `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` is the deferral
+            // cap (issue #1916): `deferred_since_ns` dates the first refusal,
+            // and once the oldest deferral on this shard reaches the cap the
+            // shard refuses strict-mode appends until it opens. Pinning before
+            // this check instead would move the overrun past the catalog's
             // sealed-hour watermark, where it is unrecoverable rather than
-            // bounded; both overruns are measured in this module's tests.
-            // Issue #1916 owns the redesign that bounds the deferral itself,
-            // which is what closes either one.
+            // bounded; this module's tests hold both.
             self.metrics.record_shard_flush_trigger_deferred(self.shard);
+            let since = buf.deferred_since_ns.unwrap_or(raw_ns);
+            self.oldest_deferral_ns = Some(self.oldest_deferral_ns.map_or(since, |o| o.min(since)));
             self.tenants.insert(tenant, buf);
             return;
         }
-        let raw_ns = self.clock.now_ns();
         // The flush-open stamp is decided before the buffer is consumed and
         // before `record_flush`: a refused flush never touched the store, so it
         // must not be counted as a flush that happened, and (on the retryable
