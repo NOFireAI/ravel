@@ -1826,20 +1826,24 @@ pub struct Cli {
 
     /// Explicit override for the process-wide memory budget
     /// (`memory_budget_bytes`, ADR-1170, amended 2026-10-03 by issue #2367)
-    /// that `--cache-max-bytes`, `--catalog-cache-max-bytes`,
-    /// `--sql-max-query-bytes`, and `--sql-tenant-max-bytes` derive their
-    /// shares from when THOSE are unset. Wins over every derivation,
-    /// including the cgroup-memory-limit branch and the available-memory
-    /// branch, and is still subject to the same startup refusal as a derived
-    /// budget: a value that, together with the resolved cache ceilings,
-    /// reaches or exceeds this budget is refused, not clamped.
+    /// that `--cache-max-bytes` and `--catalog-cache-max-bytes` derive their
+    /// shares from when THOSE are unset. `--sql-max-query-bytes` and
+    /// `--sql-tenant-max-bytes` derive from `MemTotal`, not from this budget;
+    /// this only caps them to the budget's unclaimed remainder. Wins over
+    /// every derivation, including the cgroup-memory-limit branch and the
+    /// available-memory branch (gateway mode is the one exception: a gateway
+    /// has no local cache or SQL pool to size, and keeps running uncapped
+    /// even with this flag set), and is still subject to the same startup
+    /// refusal as a derived budget: a value that, together with the resolved
+    /// cache ceilings, reaches or exceeds this budget is refused, not
+    /// clamped.
     ///
     /// The escape hatch for a co-resident process this one cannot see: the
     /// available-memory derivation reads `MemAvailable` once at startup, so
     /// it cannot anticipate memory a sibling process claims afterward. An
     /// operator who knows the host's real split sets this directly. Read at
     /// startup only; there is no live resize.
-    #[arg(long, value_name = "BYTES", env = "RAVEL_MEMORY_BUDGET_BYTES")]
+    #[arg(long, value_name = "BYTES")]
     pub memory_budget_bytes: Option<u64>,
 
     /// Maximum resident bytes for the query fetcher cache's RAM tier
@@ -3229,10 +3233,10 @@ pub const SQL_TENANT_MEMORY_PERCENT: u64 = 50;
 /// MEMORY_OVERHEAD_RESERVE_BYTES)`, 1 GiB. A co-resident process can leave
 /// `MemAvailable` arbitrarily small; the floor keeps the derivation from
 /// collapsing the budget toward `0` on that host, while
-/// [`Self::memory_budget_bytes`]'s own `min` against `MemTotal -
-/// MEMORY_OVERHEAD_RESERVE_BYTES` still lets a genuinely tiny host (less
-/// memory than the floor plus the reserve) derive a budget below it, which
-/// `check_memory_budget` can still refuse.
+/// [`ResolvedPerformanceDefaults::memory_budget_bytes`]'s own `min` against
+/// `MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES` still lets a genuinely tiny
+/// host (less memory than the floor plus the reserve) derive a budget below
+/// it, which `check_memory_budget` can still refuse.
 pub const MEMORY_BUDGET_FLOOR_BYTES: u64 = 1 << 30;
 
 /// Cap on the derived (non-explicit-flag) `sql_tenant_max_bytes` and
@@ -3504,16 +3508,27 @@ pub struct ResolvedPerformanceDefaults {
     /// (`source == PERF_SOURCE_DERIVED_AVAILABLE`) was held at
     /// [`MEMORY_BUDGET_FLOOR_BYTES`]: `MemAvailable + own_rss -
     /// MEMORY_OVERHEAD_RESERVE_BYTES`, before the subsequent `min` against
-    /// `MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES`, fell at or below the
+    /// `MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES`, fell below the
     /// floor. Set independent of whether that `min` then clips the budget
     /// even lower on a genuinely tiny host: the floor is what the WARN names,
     /// not the final figure. Always `false` on every other source.
     pub memory_budget_floor_bound: bool,
-    /// Whether [`Self::sql_tenant_max_bytes`] or [`Self::sql_max_query_bytes`]
-    /// was reduced to [`SQL_POOL_REMAINDER_CAP_PERCENT`] of
-    /// [`Self::memory_remainder_bytes`] (ADR-1170, amended 2026-10-03 by
-    /// issue #2367, item 3). Never set for a pool whose flag was explicit:
-    /// the cap applies only to a derived or fallback value.
+    /// Whether [`Self::sql_tenant_max_bytes`] was reduced to
+    /// [`SQL_POOL_REMAINDER_CAP_PERCENT`] of [`Self::memory_remainder_bytes`]
+    /// (ADR-1170, amended 2026-10-03 by issue #2367, item 3). Never set when
+    /// `--sql-tenant-max-bytes` was explicit: the cap applies only to a
+    /// derived or fallback value.
+    pub sql_tenant_max_bytes_remainder_capped: bool,
+    /// Whether [`Self::sql_max_query_bytes`] was reduced to
+    /// [`SQL_POOL_REMAINDER_CAP_PERCENT`] of [`Self::memory_remainder_bytes`]
+    /// (ADR-1170, amended 2026-10-03 by issue #2367, item 3). Never set when
+    /// `--sql-max-query-bytes` was explicit: the cap applies only to a
+    /// derived or fallback value.
+    pub sql_max_query_bytes_remainder_capped: bool,
+    /// Whether EITHER SQL pool was remainder-capped: the OR of
+    /// [`Self::sql_tenant_max_bytes_remainder_capped`] and
+    /// [`Self::sql_max_query_bytes_remainder_capped`], kept for callers that
+    /// only need to know whether the remainder cap fired at all.
     pub sql_pools_remainder_capped: bool,
 }
 
@@ -3743,10 +3758,10 @@ pub fn resolve_performance_defaults(
     // call a process's resident pages "available", yet they are memory this
     // process may reuse rather than a competing claim against it.
     let (memory_budget_bytes, memory_budget_source, memory_budget_floor_bound) =
-        if let Some(explicit) = flags.memory_budget_bytes {
-            (explicit, PERF_SOURCE_FLAG, false)
-        } else if flags.memory_budget_not_applicable {
+        if flags.memory_budget_not_applicable {
             (u64::MAX, PERF_SOURCE_NOT_APPLICABLE, false)
+        } else if let Some(explicit) = flags.memory_budget_bytes {
+            (explicit, PERF_SOURCE_FLAG, false)
         } else {
             match host.mem_total_bytes {
                 None => (u64::MAX, PERF_SOURCE_FALLBACK, false),
@@ -3763,7 +3778,7 @@ pub fn resolve_performance_defaults(
                         let raw_available_term = available
                             .saturating_add(own_rss)
                             .saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES);
-                        let floor_bound = raw_available_term <= MEMORY_BUDGET_FLOOR_BYTES;
+                        let floor_bound = raw_available_term < MEMORY_BUDGET_FLOOR_BYTES;
                         let available_term = raw_available_term.max(MEMORY_BUDGET_FLOOR_BYTES);
                         (
                             mem_total_minus_reserve.min(available_term),
@@ -3780,39 +3795,44 @@ pub fn resolve_performance_defaults(
             }
         };
 
+    // Caches carve their share from `memory_budget_bytes` whenever that budget
+    // is itself known -- a flag-derived budget on a host with no readable
+    // MemTotal (non-Linux) still carves real caches, it must not fall back to
+    // `DEFAULT_CACHE_MAX_BYTES` just because `host.mem_total_bytes` is `None`.
+    let memory_budget_known = memory_budget_source != PERF_SOURCE_FALLBACK;
+
     // ADR-2023: a loopback store's cache miss still costs a local disk round
     // trip, not a network one, so the fetcher cache affords a larger share of
     // the budget there. `--cache-max-bytes` always wins verbatim when set;
     // the loopback share applies only in the derived (unset-flag,
-    // known-memory) arm, and only when `flags.store_is_loopback` is true.
-    let (cache_max_bytes, cache_source) = match (flags.cache_max_bytes, host.mem_total_bytes) {
-        (Some(n), _) => (n, PERF_SOURCE_FLAG),
-        (None, _) if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
-        (None, Some(_)) if flags.store_is_loopback => (
+    // known-budget) arm, and only when `flags.store_is_loopback` is true.
+    let (cache_max_bytes, cache_source) = match flags.cache_max_bytes {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
+        None if memory_budget_known && flags.store_is_loopback => (
             percent_of(memory_budget_bytes, LOOPBACK_CACHE_MEMORY_PERCENT),
             PERF_SOURCE_BUDGET_CARVE_LOOPBACK,
         ),
-        (None, Some(_)) => (
+        None if memory_budget_known => (
             percent_of(memory_budget_bytes, CACHE_MEMORY_PERCENT),
             PERF_SOURCE_BUDGET_CARVE,
         ),
-        (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
+        None => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
     };
 
     // The catalog byte cache is a SEPARATE LRU from the fetcher cache, resolved
     // from its own `--catalog-cache-max-bytes` flag: `--cache-max-bytes` no
     // longer reaches it (ADR-2023), and its derived share never varies with
     // `flags.store_is_loopback` -- only the fetcher cache's does.
-    let (catalog_cache_max_bytes, catalog_cache_source) =
-        match (flags.catalog_cache_max_bytes, host.mem_total_bytes) {
-            (Some(n), _) => (n, PERF_SOURCE_FLAG),
-            (None, _) if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
-            (None, Some(_)) => (
-                percent_of(memory_budget_bytes, CATALOG_CACHE_MEMORY_PERCENT),
-                PERF_SOURCE_BUDGET_CARVE,
-            ),
-            (None, None) => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
-        };
+    let (catalog_cache_max_bytes, catalog_cache_source) = match flags.catalog_cache_max_bytes {
+        Some(n) => (n, PERF_SOURCE_FLAG),
+        None if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
+        None if memory_budget_known => (
+            percent_of(memory_budget_bytes, CATALOG_CACHE_MEMORY_PERCENT),
+            PERF_SOURCE_BUDGET_CARVE,
+        ),
+        None => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
+    };
 
     // `--disable-cache` builds neither cache: `store::build_cache` returns
     // `None` and `query::build_catalog` forces the byte cache's `0` disabled
@@ -3937,6 +3957,8 @@ pub fn resolve_performance_defaults(
         sql_max_query_bytes_clamped,
         sql_tenant_max_bytes_raised,
         memory_budget_floor_bound,
+        sql_tenant_max_bytes_remainder_capped: tenant_remainder_capped,
+        sql_max_query_bytes_remainder_capped: query_remainder_capped,
         sql_pools_remainder_capped,
     }
 }
@@ -4077,6 +4099,12 @@ impl ResolvedPerformanceDefaults {
             cores = host.cores,
             mem_total_bytes = host.mem_total_bytes.unwrap_or(0),
             mem_total_known = host.mem_total_bytes.is_some(),
+            mem_total_raw_bytes = host.mem_total_raw_bytes.unwrap_or(0),
+            cgroup_memory_limit_bytes = host.cgroup_memory_limit_bytes.unwrap_or(0),
+            cgroup_memory_limit_known = host.cgroup_memory_limit_bytes.is_some(),
+            mem_available_bytes = host.mem_available_bytes.unwrap_or(0),
+            mem_available_known = host.mem_available_bytes.is_some(),
+            own_rss_bytes = host.own_rss_bytes.unwrap_or(0),
             "host profile detected"
         );
         tracing::info!(
@@ -4207,7 +4235,9 @@ impl ResolvedPerformanceDefaults {
                 own_rss_bytes = host.own_rss_bytes.unwrap_or(0),
                 "memory_budget_bytes was held at MEMORY_BUDGET_FLOOR_BYTES: MemAvailable plus \
                  this process's own resident set left little or no room after the overhead \
-                 reserve, most likely a co-resident process claiming most of the host; set \
+                 reserve, most likely a co-resident process claiming most of the host; the \
+                 subsequent min against MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES can still clip \
+                 memory_budget_bytes below this floor, down to 0 on a genuinely tiny host; set \
                  --memory-budget-bytes to size the budget explicitly"
             );
         }
@@ -4235,7 +4265,7 @@ impl ResolvedPerformanceDefaults {
             value = self.sql_max_query_bytes,
             source = self.sources.sql_max_query_bytes,
             clamped = self.sql_max_query_bytes_clamped,
-            remainder_capped = self.sql_pools_remainder_capped,
+            remainder_capped = self.sql_max_query_bytes_remainder_capped,
             "performance default resolved"
         );
         // `raised` rides on the info line for the same reason `clamped` does
@@ -4247,7 +4277,7 @@ impl ResolvedPerformanceDefaults {
             value = self.sql_tenant_max_bytes,
             source = self.sources.sql_tenant_max_bytes,
             raised = self.sql_tenant_max_bytes_raised,
-            remainder_capped = self.sql_pools_remainder_capped,
+            remainder_capped = self.sql_tenant_max_bytes_remainder_capped,
             "performance default resolved"
         );
         // Milliseconds, not seconds: an explicit sub-second deadline would
@@ -6193,7 +6223,7 @@ impl Cli {
                  before any record is buffered"
             );
         }
-        let budget = (performance.sources.memory_budget_bytes == PERF_SOURCE_DERIVED
+        let budget = (performance.sources.memory_budget_bytes != PERF_SOURCE_FALLBACK
             && !performance.memory_budget_not_applicable)
             .then_some(ravel_maintain::merge_memory_budget_bytes(
                 performance.memory_budget_bytes,
@@ -16163,16 +16193,22 @@ mod tests {
             .expect_err("a 0-byte derived budget must still refuse to start");
     }
 
-    /// `--memory-budget-bytes` wins unconditionally: over the no-cgroup
-    /// available-memory derivation, over the cgroup-limit derivation, over
-    /// the pre-amendment fallback when memory is wholly unknown, and over
-    /// `memory_budget_not_applicable` (the gateway path).
+    /// `--memory-budget-bytes` wins unconditionally over every derivation
+    /// branch that can still claim a budget: the no-cgroup available-memory
+    /// derivation, the cgroup-limit derivation, and the pre-amendment
+    /// fallback when memory is wholly unknown. It does NOT win over
+    /// `memory_budget_not_applicable` (the gateway path): gateway mode has no
+    /// local cache or SQL pool to size, so it keeps `u64::MAX` /
+    /// [`PERF_SOURCE_NOT_APPLICABLE`] even with the flag set, which is
+    /// covered by [`memory_budget_not_applicable_wins_over_the_explicit_flag`]
+    /// below.
     ///
-    /// Prove-the-test: move the `flags.memory_budget_bytes` check below the
-    /// `memory_budget_not_applicable` branch and the last case's assertion
-    /// reads `u64::MAX` against the expected explicit value.
+    /// Prove-the-test: move the `flags.memory_budget_bytes` check above the
+    /// `memory_budget_not_applicable` branch and the first case's assertion
+    /// reads the explicit value against `PERF_SOURCE_FLAG` instead of
+    /// deriving.
     #[test]
-    fn explicit_memory_budget_flag_wins_in_every_branch() {
+    fn explicit_memory_budget_flag_wins_in_every_derivable_branch() {
         const EXPLICIT_BUDGET_BYTES: u64 = 123_456_789;
         let flags_with_flag = PerformanceFlags {
             memory_budget_bytes: Some(EXPLICIT_BUDGET_BYTES),
@@ -16204,16 +16240,33 @@ mod tests {
         let resolved = resolve_performance_defaults(unknown_host, flags_with_flag);
         assert_eq!(resolved.memory_budget_bytes, EXPLICIT_BUDGET_BYTES);
         assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
+    }
 
-        // Gateway mode: memory_budget_not_applicable would otherwise win.
+    /// Gateway mode (`memory_budget_not_applicable`) wins over an explicit
+    /// `--memory-budget-bytes`: a gateway has no local cache or SQL pool to
+    /// size, so the flag must not claim a budget, must not change the
+    /// logged source away from [`PERF_SOURCE_NOT_APPLICABLE`], and must not
+    /// cap the gateway's (unused) SQL pools.
+    ///
+    /// Prove-the-test: swap the branch order back (flag checked before
+    /// `memory_budget_not_applicable`) and the first assertion reads the
+    /// explicit value instead of `u64::MAX`.
+    #[test]
+    fn memory_budget_not_applicable_wins_over_the_explicit_flag() {
+        const EXPLICIT_BUDGET_BYTES: u64 = 123_456_789;
+        let available_host = adr_reference_host_no_cgroup();
         let flags_gateway = PerformanceFlags {
             memory_budget_bytes: Some(EXPLICIT_BUDGET_BYTES),
             memory_budget_not_applicable: true,
             ..PerformanceFlags::default()
         };
         let resolved = resolve_performance_defaults(available_host, flags_gateway);
-        assert_eq!(resolved.memory_budget_bytes, EXPLICIT_BUDGET_BYTES);
-        assert_eq!(resolved.sources.memory_budget_bytes, PERF_SOURCE_FLAG);
+        assert_eq!(resolved.memory_budget_bytes, u64::MAX);
+        assert_eq!(
+            resolved.sources.memory_budget_bytes,
+            PERF_SOURCE_NOT_APPLICABLE
+        );
+        assert!(!resolved.sql_pools_remainder_capped);
     }
 
     /// `check_memory_budget` still refuses against an explicit
