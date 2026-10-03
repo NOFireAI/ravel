@@ -278,6 +278,11 @@ path = "src/bin/segment_alloc_profile.rs"
 bench = false
 
 [[bin]]
+name = "logseg_ref_of_alloc"
+path = "src/bin/logseg_ref_of_alloc.rs"
+bench = false
+
+[[bin]]
 name = "histogram_size"
 path = "src/bin/histogram_size.rs"
 bench = false

@@ -420,6 +420,7 @@ impl RlogWriter {
         }
         let sorted_ids: Vec<LogStreamId> = streams.keys().copied().collect();
         let stage0_mode = stage0::MODE.load(std::sync::atomic::Ordering::Relaxed);
+        stage0::fire(stage0_mode, "before_index");
         let ref_of: Option<HashMap<LogStreamId, u32>> = if stage0_mode == 2 {
             None
         } else {
@@ -441,6 +442,7 @@ impl RlogWriter {
             }
             Some(m)
         };
+        stage0::fire(stage0_mode, "after_index");
 
         // Each clustering key's value per record, in push order, read off the
         // per-record layer only (ADR-2135 decision 1).
@@ -581,6 +583,7 @@ impl RlogWriter {
         let (tracked_names, tracked_slot) = intern_tracked_names(&indexed_names, &numstat_names);
         let stamp_index =
             StampIndex::build(&tracked_names, &indexed_names, &numstat_names, &column_of);
+        stage0::fire(stage0_mode, "after_columns");
 
         // Each stream's resource and scope pairs, restricted to the tracked names
         // (`indexed_names` union `numstat_names`) and resolved to
@@ -635,6 +638,7 @@ impl RlogWriter {
                 rows = permute(rows, &perm)?;
             }
         }
+        stage0::fire(stage0_mode, "after_resolve_rows");
 
         // Chunk into blocks by record target and an estimated byte cap.
         let block_spans = chunk_blocks(&rows, &self.cfg);
@@ -797,6 +801,7 @@ impl RlogWriter {
 
             blocks.push(out);
         }
+        stage0::fire(stage0_mode, "after_blocks");
 
         // STREAM_DIR.
         let total_blocks = block_spans.len() as u32;
@@ -924,6 +929,7 @@ impl RlogWriter {
                 &Stored::raw(postings_bytes),
             );
         }
+        stage0::fire(stage0_mode, "after_sections");
 
         let footer = LogFooter {
             tenant_hash: self.identity.tenant_hash,
@@ -950,6 +956,7 @@ impl RlogWriter {
             clustering_generation: self.clustering_generation,
         };
         write_footer_and_trailer(&mut object, &footer);
+        stage0::fire(stage0_mode, "before_return");
         Ok((
             object,
             WriteStats {
@@ -6000,13 +6007,30 @@ mod row_order_tests {
     }
 }
 
-/// Stage 0 measurement scaffolding (issue #2426); never merged.
+/// Stage 0 measurement scaffolding (issue #2426, #2428); never merged.
 #[doc(hidden)]
 pub mod stage0 {
+    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicU8, AtomicU64};
     pub static MODE: AtomicU8 = AtomicU8::new(0);
     pub static BUILD_NS: AtomicU64 = AtomicU64::new(0);
     pub static REPLAY_NS: AtomicU64 = AtomicU64::new(0);
     pub static LOOKUPS: AtomicU64 = AtomicU64::new(0);
     pub static ENTRIES: AtomicU64 = AtomicU64::new(0);
+
+    /// Stage 0b memory-measurement hook (issue #2428). A driver sets this
+    /// once; `build_object` fires it at fixed labels in modes 0 and 2 only.
+    /// Unset cost is one `OnceLock::get` load.
+    pub static HOOK: OnceLock<fn(&'static str)> = OnceLock::new();
+
+    /// Calls the hook, if set, with `label`, except in mode 1 (whose own
+    /// timing instrumentation above is the stage 0 measurement instead).
+    pub fn fire(mode: u8, label: &'static str) {
+        if mode == 1 {
+            return;
+        }
+        if let Some(f) = HOOK.get() {
+            f(label);
+        }
+    }
 }
