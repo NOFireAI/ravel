@@ -73,11 +73,16 @@ from there; the read gate's job size comes from the already-decoded
 `PageDir` rather than a third decode. Striping deals whole row groups, not
 single blocks, so a row group's dictionaries are decoded once per partition
 that owns it. Pinned by an accounting test on a multi-row-group fixture
-scanned with more partitions than segments: the striped route's scan-phase
-`decompressed_bytes` for a 1-of-N projection equals the whole-object fast
-path's figure for the same projection plus exactly one fetch-side
-SKIP_IDX + PAGE_DIR + FIELD_DIR; today that assertion fails by
-(blocks - 1) times the directory total.
+scanned with more partitions than segments: for a 1-of-N projection the
+plan phase charges each segment's four directories exactly once (their
+`uncomp_len` read off the footer), the scan phase charges only the
+projected pages (what a whole-object reader reports for the same
+projection), and the two together equal one whole-object decode; today the
+striped scan phase alone exceeds that by (blocks - 1) times the directory
+total. The route also applies to every predicated statement the
+whole-segment fast path refuses (block predicates, pending erasure, a
+window the segment does not contain), not only when partitions exceed
+segments.
 
 A2. **A partition's ranged reads are pipelined across its segments.** The
 whole-segment fast path prefetches the ranges of its next segments while the
