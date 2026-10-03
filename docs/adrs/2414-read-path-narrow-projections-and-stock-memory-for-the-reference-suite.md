@@ -2,10 +2,10 @@
 
 Status: Proposed. Issue #2414.
 Amends ADR-2023 (the cost-based fetch policy's rate and the projection
-break-even) and ADR-0954 (the spill eligibility predicate); both are
-Accepted and carry an amendment section pointing here, added together with
-this document. ADR-1170 (the derived per-query SQL share) is still Proposed,
-so task B1 edits its share in place and cites this ADR there. No persistent
+break-even); it is Accepted and carries an amendment section pointing here,
+added together with this document. ADR-1170 (the derived per-query SQL
+share) is still Proposed, so task B1 edits its share in place and cites this
+ADR there. ADR-0954 (spill) is not amended: see decision B2. No persistent
 format changes.
 
 ## Context
@@ -108,9 +108,19 @@ threshold and five request costs as its break-even whenever the rate is
 finite: a 35 MB object at a 3% projection saves 34 MB against a 31 MB
 break-even and reads ranged; a 3 MB L0 object saves under 3 MB and reads
 whole; an explicit `--logs-block-range-threshold` still bounds the
-block-range routing it was written for. The startup line names which term
-produced the rate and the break-even in force. The partition count is
-unchanged (derived from cores); with A2 that is enough.
+block-range routing it was written for. The rate drives a third decision
+too: the coalescing gap, `max(request_cost_bytes, DEFAULT_LOG_COALESCE_GAP)`,
+which no caller pins, so on the reference profile it becomes about 6.3 MB
+instead of the byte-minimal rate's 1.9 MB. That is the same trade stated
+once (fetching up to one request cost of unwanted bytes to save one
+request), so it stands, but it means the ranged bytes of a narrow
+projection under the default will sit above the 2.5% measured under
+`latency-first`; the A3 acceptance pins the coalesced byte count at the
+reference profile's gap on a fixture with ranges spaced on both sides of
+it, and the measurement wave reports the figure beside the wall time. The
+startup line names which term produced the rate and the break-even in
+force. The partition count is unchanged (derived from cores); with A2 that
+is enough.
 
 Expected on the reference box after A1 to A3 (pre-registered on #1248
 before A3's run): the one-column statement under 2 s cold at 32 partitions,
@@ -132,12 +142,19 @@ because the tenant pool bounds the sum. An explicit `--sql-max-query-bytes`
 still wins and is still clamped to the tenant ceiling. On the reference box q33 then runs inside
 16,451,897,344 against its 10.86 GB peak.
 
-B2. **Spill eligibility admits `Sort` over a spill-exact aggregate.**
-`plan_nodes_are_spill_classifiable` admits `LogicalPlan::Sort` (with or
-without a fetch), so a configured spill (ADR-0954, environment-gated as
-today) applies to q33's plan shape on hosts whose tenant share is below its
-peak. A float group key still refuses, and a `Sort` over a non-aggregate
-plan is still not spill-eligible (no operator in it spills exactly).
+B2. **Spill eligibility for the `Sort` node is not changed here.** ADR-0954
+excludes `Sort` for a recorded reason this ADR cannot answer: an external
+merge sort returns the same rows, but there is no proof its tie order
+equals the in-memory sort's, and row order is part of an `ORDER BY` result
+(`executor.rs`, the classifier's own comment). q33's `ORDER BY c DESC
+LIMIT 10` has ties by construction (most groups count 1), so admitting the
+node on the aggregate's exactness alone would let a spilled run return a
+different top ten. Admitting it needs a tie-order proof: a sort key the
+plan proves total, or the group keys appended as a deterministic tiebreak
+before the sort when spill is on. That belongs with the spill default work
+on issue #2416, which this ADR leaves to its own decision. On hosts whose
+tenant share is below q33's peak the statement therefore still refuses
+after this ADR; the reference box is covered by B1.
 
 B3. **q33 is a measured statement.** The reference-suite registration on
 #1248 carries q33 in the stock arm with a pre-registered band (about 11 s
@@ -148,7 +165,8 @@ cold, 10 s warm from Stage 0); a null for it is a miss.
 - **Enable spill by default.** Needs a scratch location and a scratch
   ceiling the server has no derivation for, and the statement fits in memory
   on the reference box once the per-query share is right. Spill stays the
-  operator's lever for smaller hosts (B2 makes it apply).
+  operator's lever for smaller hosts, and the `Sort` admission it needs for
+  this statement is decided with it on issue #2416.
 - **A streaming top-k for q33.** The running `COUNT` is a lower bound on a
   group's final count and not monotone with the final order, so no exact
   short-cut exists over an unsorted scan (noted on #837).
@@ -179,7 +197,8 @@ cold, 10 s warm from Stage 0); a null for it is a miss.
 - A lone statement can use the tenant's whole SQL share; the operator who
   wants the old four-way split sets `--sql-max-query-bytes` to a quarter of
   the tenant ceiling.
-- Spill, where configured, covers the top-k-over-aggregate shape.
+- Spill eligibility is unchanged; a `Sort` over an aggregate still refuses
+  spill until the tie-order question is answered on issue #2416.
 - The store cost profile gains two measured constants per profile (request
   latency, per-connection throughput) with the date and host they were
   measured on; a profile without them keeps the price-only rate.
@@ -189,7 +208,7 @@ flowchart LR
     Q[statement, projection f] --> P{partitions vs segments}
     P -->|partitions <= segments| F[whole-segment fast path]
     P -->|partitions > segments| S[striped path]
-    F --> R{ranged_projection_pays?<br/>saved bytes > 5 x request cost}
+    F --> R{ranged_projection_pays?<br/>saved bytes > max(routing threshold, 5 x request cost)}
     R -->|yes, A3 time term| RG[ranged column reads<br/>A2: pipelined per partition]
     R -->|no| W[whole-object GET]
     S --> D[A1: directories decoded once per segment<br/>row groups dealt whole]
