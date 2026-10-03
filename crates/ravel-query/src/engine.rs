@@ -3376,6 +3376,7 @@ impl QueryDeadline {
                 unix_ns: now_ns
                     .saturating_add(i64::try_from(deadline.as_nanos()).unwrap_or(i64::MAX)),
                 request: deadline,
+                instant: tokio::time::Instant::now() + remaining,
             },
         }
     }
@@ -7405,14 +7406,18 @@ mod prefetch_tests {
 
     /// Issue #2385: a slice stopped at the query's deadline fails the query
     /// with `DeadlineExceeded` carrying the request's own deadline, the error
-    /// the engine's own timer raises, on the distributed instant path and the
-    /// federated discovery path.
+    /// the engine's own timer raises, on the distributed instant path. On the
+    /// federated discovery path the same `TIMEOUT` arrives while this
+    /// coordinator's own deadline is 5 s away, so it is the remote's clock
+    /// running ahead: under `skip_unavailable` discovery answers from the
+    /// local cluster and reports the remote skipped.
     ///
     /// Mutation proof: deleting the `Timeout` arm from `Distributed::fetch`
-    /// (`distrib/mod.rs`) fails the instant query with `Distrib`; deleting it
-    /// from `Federation::fetch` fails discovery with `Federation`.
+    /// (`distrib/mod.rs`) fails the instant query with `Distrib`; making a
+    /// remote `TIMEOUT` in `Federation::fetch` terminal whatever this
+    /// coordinator's deadline says fails discovery with `DeadlineExceeded`.
     #[tokio::test]
-    async fn a_slice_stopped_at_the_deadline_fails_the_query_with_its_deadline() {
+    async fn a_stopped_slice_ends_the_query_and_an_early_remote_timeout_is_skipped() {
         let store = Arc::new(MemoryStore::new());
         let tenant_hash = TenantId::new("acme").hash();
         publish_metric(
@@ -7457,15 +7462,13 @@ mod prefetch_tests {
                 name: "eu-west".to_string(),
                 fetcher: Arc::new(StoppedAtDeadline { spend_bytes: 4_096 }),
                 tenant: None,
-                // A remote that stopped at the deadline is not an unavailable
-                // remote to skip: the query is over either way.
                 skip_unavailable: true,
                 soft_timeout: Duration::from_secs(60),
             },
         ]));
         let eng = engine_with_config(Arc::clone(&store), EngineConfig::default())
             .with_federation(federation);
-        let err = eng
+        let outcome = eng
             .resolve_series(
                 tenant_hash,
                 &[name_matcher("metric_a")],
@@ -7477,11 +7480,18 @@ mod prefetch_tests {
                 BASE_NS,
                 request_deadline,
             )
-            .await
-            .expect_err("a remote stopped at the deadline fails discovery");
-        assert!(
-            matches!(err, QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
-            "federated discovery: {err:?}"
+            .await;
+        let (series, coverage) = outcome.unwrap_or_else(|err| {
+            panic!("a remote TIMEOUT before this coordinator's deadline is skipped: {err:?}")
+        });
+        assert_eq!(series.len(), 1, "the local cluster's one series");
+        assert_eq!(
+            coverage,
+            Coverage::Partial {
+                skipped: vec![
+                    "remote cluster eu-west unavailable; results are partial".to_string()
+                ]
+            }
         );
     }
 
@@ -10523,6 +10533,7 @@ mod log_prefetch_deadline_tests {
                     wall: WallDeadline {
                         unix_ns: i64::MAX,
                         request: Duration::MAX,
+                        instant: tokio::time::Instant::from_std(eval_deadline),
                     },
                 },
             )

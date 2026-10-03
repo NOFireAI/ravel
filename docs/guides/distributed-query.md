@@ -738,8 +738,10 @@ distribute, so its presence is itself the signal that fan-out happened.
   whole query, and an error response carries no stats block, so only `ok` and
   `fallback` entries ever reach a client.
 - `status`: `ok` or `fallback` (the slice ran on the coordinator after a remote
-  attempt failed). An `error` entry is recorded internally, but a slice that
-  ends in a hard error fails the query, so no response body renders one.
+  attempt failed). `error` (a hard error or a `Corrupt` summary) and `timeout`
+  (the slice ended `TIMEOUT` at the query's deadline) entries are recorded
+  internally, but a slice that ends either way fails the query, so no response
+  body renders one.
 
 A `fallback` entry is the single most useful diagnostic here: it means a peer
 was unreachable or reported itself unavailable, the query still returned a

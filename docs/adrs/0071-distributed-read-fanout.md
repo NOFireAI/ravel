@@ -432,18 +432,39 @@ a MAC-authenticated claim set naming exactly what it authorizes.
   or after admission, and a slice stopped at the expiry both end in-band
   with the fetch status `TIMEOUT`, not a gRPC error; a stopped slice's
   summary carries the accounting it spent before the stop, and a refusal
-  carries zero. The coordinator treats `TIMEOUT` as terminal for the
-  query: it does not quarantine the worker, re-dispatch the slice, or run
-  it locally, since every other attempt would run past the same deadline.
-  It folds the attempt's spend into the query's accounting and fails the
-  query with `DeadlineExceeded`, the error the engine's own timer raises.
+  carries zero. Only the coordinator's own deadline, on its monotonic
+  clock, decides that a query is over. A `TIMEOUT` that arrives after it
+  is terminal for the query: the coordinator does not quarantine the
+  worker, re-dispatch the slice, or run it locally, since every other
+  attempt would run past the same deadline. It folds the attempt's spend
+  into the query's accounting and fails the query with `DeadlineExceeded`,
+  the error the engine's own timer raises. A `TIMEOUT` that arrives before
+  it means the worker compared the deadline on a wall clock running ahead
+  of the coordinator's: the worker is alive and is not quarantined, its
+  spend is carried, and the slice goes to the next rendezvous worker and
+  then to a local read, as for an `Unavailable` answer, bounded by the
+  coordinator's own deadline.
+- Mixed versions. A worker that predates the in-band `TIMEOUT` refuses an
+  expired capability with `Unauthenticated`. When the slice's deadline
+  has passed on the coordinator's wall clock, the coordinator reads that
+  refusal as an expired capability, not a dead worker, and does not
+  quarantine the worker: during a rolling upgrade an older worker is no
+  longer quarantined until its next restart for answering a query that
+  ran out of time. The slice ends `TIMEOUT` if the coordinator's
+  monotonic deadline has passed, and otherwise goes to the next worker and
+  then to a local read. Any other transport failure still quarantines the
+  worker.
 - A federated Resolve request carries no capability, so it carries the
   query's deadline in `deadline_unix_ns` (issue #2385), and the peer
   cluster applies the same three bounds: a request past the deadline is
   refused on arrival and again after admission, and an admitted run stops
   at it, each ending in-band with `TIMEOUT`. The requesting coordinator
-  fails the query with `DeadlineExceeded` on a `TIMEOUT` whatever the
-  remote's `skip_unavailable` says. The peer compares the coordinator's
+  fails the query with `DeadlineExceeded` on a `TIMEOUT` that arrives
+  after its own monotonic deadline, whatever the remote's
+  `skip_unavailable` says. A `TIMEOUT` before that deadline is the peer's
+  clock running ahead, and the remote is treated as unavailable: skipped
+  with a partial-coverage warning under `skip_unavailable`, a failure
+  naming the cluster otherwise. The peer compares the coordinator's
   deadline against its own wall clock: the same skew shape a Flight SQL
   slice ticket's `deadline_ns` has when a worker redeems it (ADR-1689),
   here across a cluster boundary. A request with no deadline (`0`, from a
