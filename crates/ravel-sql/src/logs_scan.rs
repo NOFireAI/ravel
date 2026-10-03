@@ -8199,6 +8199,23 @@ mod carried_directory_reservation_tests {
         );
         drop(counts);
         assert_eq!(budget.reserved(), 0, "released when the plan counts drop");
+
+        // A budget one byte short of the two segments' directories refuses the
+        // statement with the fetch memory error a refused whole-object
+        // reservation reports.
+        let tight = Arc::new(ravel_memory::MemoryBudget::new(with_survivors.1 - 1));
+        let ctx = PartitionCtx {
+            fetcher: ctx.fetcher.clone().with_memory_budget(tight),
+            ..ctx
+        };
+        let refused = compute_plan_counts(&ctx, &segments, 4).await;
+        let err = refused
+            .err()
+            .expect("a budget too small for the directories refuses");
+        assert!(
+            err.to_string().contains("memory"),
+            "typed fetch memory error, got: {err}"
+        );
     }
     /// A segment's rows through a scan whose plan counts are seeded with
     /// `plan_indices` as the survivor list, over a ts window that keeps blocks
