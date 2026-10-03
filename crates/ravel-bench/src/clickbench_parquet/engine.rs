@@ -612,6 +612,8 @@ mod reference {
     use datafusion::datasource::listing::{
         ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
     };
+    use datafusion::functions::datetime::planner::DatetimeFunctionPlanner;
+    use datafusion::logical_expr::registry::FunctionRegistry;
     use datafusion::prelude::{SessionConfig, SessionContext};
     use datafusion_datasource_parquet::ParquetFormat;
 
@@ -653,9 +655,13 @@ mod reference {
         /// `create.sql`'s `CREATE VIEW hits` statement on top of it. The
         /// session runs at [`PLAN_PARTITIONS`] target partitions.
         pub async fn new(location: &Path) -> Result<Self, EngineError> {
-            let ctx = SessionContext::new_with_config(
+            let mut ctx = SessionContext::new_with_config(
                 SessionConfig::new().with_target_partitions(PLAN_PARTITIONS),
             );
+            // The same `EXTRACT` planner Ravel's session registers (#2458);
+            // this build leaves DataFusion's default registration of it off.
+            ctx.register_expr_planner(Arc::new(DatetimeFunctionPlanner))
+                .map_err(|e| EngineError::Unreachable(format!("expr planner: {e}")))?;
             let format = Arc::new(ParquetFormat::default().with_binary_as_string(true));
             let options = ListingOptions::new(format);
             let url = ListingTableUrl::parse(location.to_string_lossy())
