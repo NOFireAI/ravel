@@ -272,14 +272,14 @@ async fn try_reconstruct_one(
 /// Turn the `CreateIfAbsent` put result for a reconstructed commit record into
 /// an [`Outcome`] or a typed error.
 ///
-/// The `AccessDenied` arm exists so ADR-0055's deliberate operational
-/// limitation is loud at the point an operator hits it, not silent behind a
-/// generic write failure: the Admin role is granted `kms:Decrypt` only, so a
-/// `commit reconstruct` write against a `--tenant-kms-config` tenant routes
-/// through the per-tenant key and is denied unless `kms:GenerateDataKey*` is
-/// also granted to that role. The original store `msg` is preserved so an
-/// operator debugging a genuinely different `AccessDenied` cause still sees the
-/// real S3/KMS error text. Every other error variant keeps the generic message.
+/// The `AccessDenied` arm names the two grants the write actually needs, so an
+/// operator does not go looking for a per-tenant key: `commit reconstruct`
+/// runs under the Admin credential on a store with no KMS routing, so the
+/// record is written under the bucket's default encryption even for a tenant
+/// named in ravel-server's `--tenant-kms-config`, and the Admin role's
+/// Decrypt-only tenant-key grant (ADR-0055) never comes into it. The original
+/// store `msg` is preserved so the real S3/KMS error text is still there.
+/// Every other error variant keeps the generic message.
 fn classify_put_result(
     put_result: Result<(), StoreError>,
     data_key: &str,
@@ -296,18 +296,18 @@ fn classify_put_result(
             data_key: data_key.to_string(),
             commit_key,
         }),
-        // A KMS-permission denial on the PutObject surfaces here as a distinct
-        // variant (crates/ravel-object-store, S3 403 -> AccessDenied). This is
-        // the visible failure point of ADR-0055's Decrypt-only Admin posture,
-        // so name it explicitly while preserving the underlying message.
+        // An S3 or KMS permission denial on the PutObject (crates/ravel-object-store,
+        // S3 403 -> AccessDenied).
         Err(StoreError::AccessDenied(msg)) => Err(anyhow::anyhow!(
-            "failed to write commit record {commit_key}: access denied: {msg}. This may be \
-             ADR-0055's known limitation: the Admin role is granted kms:Decrypt only, so a \
-             `commit reconstruct` write against a --tenant-kms-config tenant can be denied here \
-             because it routes through the per-tenant KMS key and needs kms:GenerateDataKey* \
-             granted to the Admin role. See the \"Per-tenant SSE-KMS routing\" section of \
-             docs/guides/operations.md (the Admin GetObject-only KMS grant) for the manual \
-             workaround."
+            "failed to write commit record {commit_key}: access denied: {msg}. commit \
+             reconstruct writes under the Admin credential with the bucket's default \
+             encryption, never a tenant's --tenant-kms-config key, so a tenant key's grants \
+             are not the cause. The write needs s3:PutObject on t/*/*/c/* (AdminWrite in \
+             deploy/iam/admin.json) and, when the bucket's default encryption is a \
+             customer-managed KMS key, kms:GenerateDataKey on that key. verify-custody reads \
+             write times, not encryption keys, so it reports such a record as neither an \
+             anomaly nor a tenant-key object. See \"Encrypting objects with SSE-KMS\" in \
+             docs/guides/operations/configuration.md."
         )),
         Err(err) => Err(anyhow::anyhow!(
             "failed to write commit record {commit_key}: {err}"
@@ -646,15 +646,21 @@ mod tests {
         record::build(input).expect("valid record");
     }
 
-    /// A KMS-permission `AccessDenied` on the commit-record PUT is surfaced with
-    /// ADR-0055's known-limitation pointer AND the original store message, so an
-    /// operator hitting the Decrypt-only Admin limitation is sent straight to
-    /// docs/guides/operations.md instead of a generic write failure. This is the
-    /// exact arm a pre-fix generic catch-all swallowed: with only the catch-all,
-    /// the text was `failed to write commit record <key>: <msg>` and carried no
-    /// ADR-0055 pointer, so the `contains("ADR-0055")` assertion below failed.
+    /// An `AccessDenied` on the commit-record PUT says what is true of the write
+    /// (issue #2363): it goes out under the bucket's default encryption, never a
+    /// tenant key, so the two grants it needs are the Admin `c/` write and, on a
+    /// bucket whose default encryption is a customer-managed KMS key,
+    /// `kms:GenerateDataKey` on that key; verify-custody does not report it as a
+    /// tenant-key object; and the guide section it names exists. The original
+    /// store message is preserved.
+    ///
+    /// Non-vacuity: against the previous text, which said the write routes
+    /// through the per-tenant KMS key and pointed at a nonexistent
+    /// docs/guides/operations.md section, the `bucket's default encryption`,
+    /// `verify-custody` and section-pointer assertions fail, and so does the
+    /// `!contains("routes through the per-tenant KMS key")` one.
     #[test]
-    fn access_denied_put_names_adr_0055_and_preserves_message() {
+    fn access_denied_put_says_the_write_is_bucket_default_encrypted() {
         let original = "User: arn:aws:sts::111122223333:assumed-role/ravel-admin/session is not \
                         authorized to perform: kms:GenerateDataKey on resource: \
                         arn:aws:kms:us-east-1:111122223333:key/abcd because no identity-based \
@@ -673,31 +679,55 @@ mod tests {
             text.contains(original),
             "must preserve the original AccessDenied message: {text}"
         );
-        // The ADR-0055 / operations.md pointer is present.
-        assert!(text.contains("ADR-0055"), "must name ADR-0055: {text}");
         assert!(
-            text.contains("kms:GenerateDataKey*"),
-            "must name the grant the write needs: {text}"
+            text.contains(
+                "commit reconstruct writes under the Admin credential with the bucket's default \
+                 encryption, never a tenant's --tenant-kms-config key"
+            ),
+            "must say the write is bucket-default encrypted: {text}"
         );
         assert!(
-            text.contains("kms:Decrypt only"),
-            "must name the Decrypt-only Admin posture: {text}"
+            !text.contains("routes through the per-tenant KMS key"),
+            "must not claim the write routes through a tenant key: {text}"
         );
         assert!(
-            text.contains("Per-tenant SSE-KMS routing"),
-            "must point at the operations.md section heading by name: {text}"
+            text.contains("s3:PutObject on t/*/*/c/* (AdminWrite in deploy/iam/admin.json)"),
+            "must name the S3 grant the write needs: {text}"
         );
         assert!(
-            text.contains("docs/guides/operations.md"),
-            "must point at the operations guide: {text}"
+            text.contains(
+                "when the bucket's default encryption is a customer-managed KMS key, \
+                 kms:GenerateDataKey on that key"
+            ),
+            "must name the KMS grant the write can need: {text}"
+        );
+        assert!(
+            text.contains(
+                "verify-custody reads write times, not encryption keys, so it reports such a \
+                 record as neither an anomaly nor a tenant-key object"
+            ),
+            "must say what verify-custody reports: {text}"
+        );
+        let section = "Encrypting objects with SSE-KMS";
+        assert!(
+            text.contains(&format!(
+                "See \"{section}\" in docs/guides/operations/configuration.md."
+            )),
+            "must point at the guide section by name: {text}"
+        );
+        let guide = include_str!("../../../docs/guides/operations/configuration.md");
+        assert!(
+            guide.contains(&format!("\n## {section}\n")),
+            "the section the error points at must exist in the guide"
         );
     }
 
     /// Every non-AccessDenied write error keeps the generic message and does NOT
-    /// carry the ADR-0055 pointer, so the two arms stay distinguishable and an
-    /// unrelated failure is never mislabeled as the KMS limitation.
+    /// carry the access-denied explanation, so the two arms stay
+    /// distinguishable and an unrelated failure is never mislabeled as a grant
+    /// problem.
     #[test]
-    fn generic_put_error_omits_adr_0055_pointer() {
+    fn generic_put_error_omits_the_access_denied_explanation() {
         let err = classify_put_result(
             Err(StoreError::Permanent(
                 "bucket policy forbids overwrite".to_string(),
@@ -717,11 +747,11 @@ mod tests {
             "keeps the underlying error text: {text}"
         );
         assert!(
-            !text.contains("ADR-0055"),
-            "a generic error must NOT carry the ADR-0055 pointer: {text}"
+            !text.contains("bucket's default encryption"),
+            "a generic error must NOT carry the access-denied explanation: {text}"
         );
         assert!(
-            !text.contains("Per-tenant SSE-KMS routing"),
+            !text.contains("Encrypting objects with SSE-KMS"),
             "a generic error must NOT point at the KMS section: {text}"
         );
     }

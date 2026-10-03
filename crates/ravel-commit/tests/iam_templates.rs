@@ -1864,14 +1864,19 @@ const ALL_ROLES: [&str; 4] = ["gateway", "query", "maintain", "admin"];
 /// `admin`: ADR-0055 keeps it `GetObject`-only for routine data and forbids it
 /// `kms:GenerateDataKey*` (see `admin_has_no_kms_generate_data_key`) so a
 /// leaked Admin credential cannot mint ciphertext under tenant keys it has no
-/// write role for. Admin's narrow routed PUTs (`t/*/*/c/*` via
-/// `ravel-cli commit reconstruct`, the `t/*/u/*` audit prefix) therefore fail
-/// closed under `--tenant-kms-config` -- a known operational gap documented in
-/// docs/guides/operations.md, not a bug this test should paper over by
-/// demanding the grant. Listing the role here (rather than skipping the whole
-/// admin policy) keeps the exemption explicit and load-bearing: the test still
-/// asserts an exempt role actually writes routed objects, so the exemption
-/// cannot rot into masking a future regression.
+/// write role for. Admin's PUTs under `t/<hash>/` (`t/*/*/c/*` via
+/// `ravel-cli commit reconstruct`, the `t/*/u/*` legal holds, the tenant config
+/// and Parquet grants records, erasure requests and provisioning records) are
+/// keys the routing predicate WOULD route, but no Admin command builds a
+/// routing store: `--tenant-kms-config` is taken only by the ravel-cli commands
+/// that write tenant data under the Maintain credential (issue #2363), so
+/// Admin's writes go out under the bucket's default encryption and never ask
+/// for a tenant key. That is the documented posture ("Encrypting objects with
+/// SSE-KMS" in docs/guides/operations/configuration.md), not a bug this test
+/// should paper over by demanding the grant. Listing the role here (rather than
+/// skipping the whole admin policy) keeps the exemption explicit and
+/// load-bearing: the test still asserts an exempt role actually writes routed
+/// objects, so the exemption cannot rot into masking a future regression.
 const ROUTED_WRITE_EXEMPT_ROLES: [&str; 1] = ["admin"];
 
 /// Roles whose IAM policy writes tenant data through `KmsRoutingStore`:
@@ -6191,6 +6196,76 @@ fn maintain_template_covers_every_maintain_migrate_call() {
              compaction claim {claim:?}"
         );
     }
+}
+
+/// Issue #2363: under `--tenant-kms-config`, `ravel-cli maintain
+/// compact-bucket`, `compact-tenant`, `migrate` and `catalog fold` route their
+/// tenant writes through the tenant's KMS key, under the Maintain credential.
+/// Each key class they write is one the real routing predicate routes, one
+/// `maintain.json` grants a PUT of the kind the command sends, and Maintain
+/// holds both `kms:Encrypt` and `kms:GenerateDataKey*`, so a routed write
+/// reaches the key rather than failing closed. The key-epoch record the
+/// command bootstraps first is checked the same way.
+#[test]
+fn maintain_cli_data_writes_are_routed_and_maintain_can_encrypt_them() {
+    let maintain = load_policy("maintain");
+    let unconditioned_puts = unconditioned_put_patterns(&maintain);
+    let put_allowed = |key: &str, kind: PutCondition| {
+        unconditioned_puts.iter().any(|p| glob_matches(p, key))
+            || conditioned_put_patterns(&maintain, kind)
+                .iter()
+                .any(|p| glob_matches(p, key))
+    };
+
+    let tenant = test_tenant();
+    let hash = tenant.to_hex();
+    let mut writes = vec![
+        (format!("t/{hash}/enc"), PutCondition::CreateOnly),
+        (format!("t/{hash}/enc"), PutCondition::CasOnly),
+    ];
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        writes.push((
+            l1_part_key(&tenant, signal, 0, 0, hash16(), 0, hash16()).expect("l1_part_key"),
+            PutCondition::CreateOnly,
+        ));
+        writes.push((
+            compaction_record_key(&tenant, signal, 0, 0, hash16()).expect("compaction_record_key"),
+            PutCondition::CreateOnly,
+        ));
+        writes.push((
+            format!("t/{hash}/catalog/{sig}/snap/part.csnap"),
+            PutCondition::CreateOnly,
+        ));
+        writes.push((
+            format!("t/{hash}/catalog/{sig}/HEAD"),
+            PutCondition::CasOnly,
+        ));
+    }
+    for (key, kind) in &writes {
+        assert!(
+            ravel_object_store::routes_through_tenant_key(key),
+            "{key:?} must route through the tenant key, or --tenant-kms-config would not \
+             reach it"
+        );
+        assert!(
+            put_allowed(key, *kind),
+            "maintain: no PutObject Allow admits a {kind:?} write of {key:?}, which a \
+             Maintain-credential ravel-cli command issues"
+        );
+    }
+
+    let actions = kms_actions(&maintain);
+    assert!(
+        actions
+            .iter()
+            .any(|a| action_grants_any(a, &KMS_DATA_KEY_OPERATIONS)),
+        "maintain: the routed ravel-cli writes need kms:GenerateDataKey*. Found {actions:?}"
+    );
+    assert!(
+        actions.iter().any(|a| action_grants(a, "kms:Encrypt")),
+        "maintain: the routed ravel-cli writes need kms:Encrypt. Found {actions:?}"
+    );
 }
 
 /// `ravel-cli parquet sweep` (`services/ravel-cli/src/parquet.rs`) runs under

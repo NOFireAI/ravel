@@ -533,9 +533,25 @@ issue and `admin.json` does not:
   catalog snapshot parts, `HEAD` and index objects, the same keys the
   scheduled fold in maintain mode writes. `query.json` also grants all of it.
 
-Admin gains nothing for them. `ravel-cli` builds no per-tenant KMS routing
-store, so these writes, like every other `ravel-cli` write, land under the
-bucket's default encryption rather than a routed tenant's key.
+Admin gains nothing for them.
+
+Under `--tenant-kms-config`, the Maintain-credential commands that write
+tenant data take the same flag as the servers and route the same way:
+`maintain compact-bucket`, `maintain compact-tenant`, `maintain migrate` and
+`catalog fold`. Each builds the servers' KMS routing store, bootstraps its own
+tenant's `t/<tenant_hash>/enc` epoch record first (`MaintainWrite` `t/*/enc`),
+then writes that tenant's L1 segments, compaction records and catalog objects
+under the tenant's key (`MaintainTenantKms`, which already grants
+`kms:Encrypt` and `kms:GenerateDataKey*`). No grant changes for it.
+`maintain_cli_data_writes_are_routed_and_maintain_can_encrypt_them` in
+`crates/ravel-commit/tests/iam_templates.rs` checks those key classes against
+this template. `parquet sweep` writes nothing, and `maintain sweep` writes
+only its unnamed-since markers under `t/`, so neither takes the flag. No Admin
+command takes it: Admin is decrypt-only on the tenant keys, so its control
+records (provisioning records, legal holds, reconstructed commit records,
+erasure requests, the tenant config record and the Parquet grants record)
+land under the bucket's default encryption whatever the file says. That is
+why `admin` is the one role in `ROUTED_WRITE_EXEMPT_ROLES`.
 
 `maintain migrate` takes the Maintain credential (ADR-0066 decision 5).
 `maintain.json` grants its reads, its L1 part and compaction-record writes

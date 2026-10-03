@@ -12,8 +12,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{
     S3AuthMode, S3Config, S3HttpConfig, S3Store, UploadIntegrity, resolve_s3_allow_http,
 };
-use ravel_object_store::{GetRange, ObjectStoreBackend};
-use ravel_types::TenantHash;
+use ravel_object_store::{GetRange, KmsRoutingStore, ObjectStoreBackend, StoreMetrics};
+use ravel_types::{TenantHash, TenantId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum StoreKind {
@@ -473,6 +473,175 @@ impl BuiltStore {
     }
 }
 
+/// The `S3Config` `--store s3` builds its store from. `kms_key_id` is `None`:
+/// the default store is written under the bucket's default encryption, and
+/// only [`build_tenant_data_store`] overrides it, per tenant.
+fn s3_config(args: &StoreArgs) -> anyhow::Result<S3Config> {
+    let bucket = args
+        .s3_bucket
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--store s3 requires RAVEL_S3_BUCKET"))?;
+    let region = args
+        .s3_region
+        .clone()
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let auth = args.s3_auth.mode();
+    let (access_key_id, secret_access_key, session_token, credentials_file) = match auth {
+        S3AuthMode::Static => (
+            args.s3_access_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--store s3 requires RAVEL_S3_ACCESS_KEY"))?,
+            args.s3_secret_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("--store s3 requires RAVEL_S3_SECRET_KEY"))?,
+            args.s3_session_token.clone(),
+            args.s3_credentials_file.clone(),
+        ),
+        S3AuthMode::InstanceRole => {
+            if let Some(conflict) = instance_role_credential_conflict(args) {
+                return Err(conflict);
+            }
+            (String::new(), String::new(), None, None)
+        }
+    };
+    let endpoint = args.s3_endpoint.clone();
+    let allow_http = resolve_s3_allow_http(endpoint.as_deref(), args.s3_allow_http)?;
+    Ok(S3Config {
+        bucket,
+        region,
+        endpoint,
+        access_key_id,
+        secret_access_key,
+        allow_http,
+        force_path_style: true,
+        kms_key_id: None,
+        session_token,
+        credentials_file,
+        auth,
+        instance_metadata_endpoint: args.s3_instance_metadata_endpoint.clone(),
+    })
+}
+
+// `--tenant-kms-config`, taken by the commands that write tenant data under
+// the Maintain credential: `maintain compact-bucket`, `maintain
+// compact-tenant`, `maintain migrate` and `catalog fold`. No other command
+// takes it, so the control records Admin writes stay under the bucket's
+// default encryption.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct TenantKmsArgs {
+    /// Path to the per-tenant SSE-KMS file ravel-server reads from its own
+    /// `--tenant-kms-config` (ADR-0062 decision 1): a TOML `[tenants]` table
+    /// mapping tenant name to KMS key ARN. When the file names the command's
+    /// `--tenant`, every object this command writes under that tenant's
+    /// `t/<tenant_hash>/` prefix is encrypted under that key, and its key-epoch
+    /// record `t/<tenant_hash>/enc` is created or extended first, exactly as
+    /// ravel-server's startup does. A tenant the file does not name is written
+    /// under the bucket's default encryption, as ravel-server writes it.
+    /// Requires `--store s3`. A dry run reads and validates the file and
+    /// writes nothing. Absent (the default): every write uses the bucket's
+    /// default encryption.
+    #[arg(
+        long = "tenant-kms-config",
+        env = "RAVEL_TENANT_KMS_CONFIG",
+        value_name = "PATH"
+    )]
+    pub tenant_kms_config: Option<PathBuf>,
+}
+
+/// Read and validate `--tenant-kms-config`, with ravel-server's refusals and
+/// messages: the flag needs `--store s3`, and an unreadable or invalid file is
+/// an error naming the path.
+fn load_tenant_kms_config(
+    args: &StoreArgs,
+    path: &Path,
+) -> anyhow::Result<ravel_catalog::tenant_kms::TenantKmsConfig> {
+    if args.store_kind() != StoreKind::S3 {
+        anyhow::bail!(
+            "--tenant-kms-config requires --store s3: KmsRoutingStore's per-tenant builder \
+             always constructs a real S3Store, which --store memory has no S3Config to build \
+             one from."
+        );
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("could not read --tenant-kms-config {path:?}: {e}"))?;
+    ravel_catalog::tenant_kms::parse_tenant_kms_config(&text)
+        .map_err(|e| anyhow::anyhow!("invalid --tenant-kms-config {}: {e}", path.display()))
+}
+
+/// The store a command that writes `tenant`'s data under the Maintain
+/// credential runs against.
+///
+/// Without `--tenant-kms-config` this is [`build_store`], unchanged. With it,
+/// the S3 store is wrapped in a [`KmsRoutingStore`] the way ravel-server's
+/// `build_store` wraps its own, and the file's entry for `tenant` is applied
+/// with [`configure_tenant_kms`](ravel_catalog::tenant_kms::configure_tenant_kms):
+/// the key-epoch record is bootstrapped, then the key registered, so every
+/// later write under `t/<tenant_hash>/` is encrypted under it. Only `tenant`'s
+/// entry is applied: this command writes no other tenant's data, and applying
+/// another entry could append a rotation epoch for a tenant it never touches.
+/// A tenant the file does not name routes nowhere, exactly as in ravel-server:
+/// its writes go to the default store.
+///
+/// `writes` is false for a dry run: the file is still read and validated, so a
+/// bad one fails before the real run, but nothing is bootstrapped and the
+/// plain store is returned.
+///
+/// Must run after the tenant-hash scheme is installed, since it hashes
+/// `tenant`.
+pub async fn build_tenant_data_store(
+    args: &StoreArgs,
+    kms_args: &TenantKmsArgs,
+    tenant: &str,
+    writes: bool,
+    now_ns: i64,
+) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
+    let Some(path) = kms_args.tenant_kms_config.as_deref() else {
+        return build_store(args);
+    };
+    let config = load_tenant_kms_config(args, path)?;
+    let tenant_id = TenantId::new(tenant);
+    let key_arn = config.key_for(&tenant_id).map(str::to_string);
+    if !writes {
+        return build_store(args);
+    }
+
+    let s3 = s3_config(args)?;
+    let http = args.s3_http_config();
+    let metrics = Arc::new(StoreMetrics::default());
+    let base =
+        S3Store::with_http_config_and_metrics(s3.clone(), http.clone(), Arc::clone(&metrics))
+            .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
+    let kms = Arc::new(KmsRoutingStore::new(
+        Arc::new(base) as Arc<dyn ObjectStoreBackend>,
+        s3,
+        http,
+        metrics,
+    ));
+    match key_arn {
+        Some(key_arn) => {
+            let only_this_tenant = config.restricted_to(&tenant_id);
+            ravel_catalog::tenant_kms::configure_tenant_kms(
+                kms.as_ref(),
+                kms.as_ref(),
+                &only_this_tenant,
+                now_ns,
+            )
+            .await
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): {err}"
+                )
+            })?;
+            eprintln!("tenant-kms: tenant {tenant:?} writes are encrypted under {key_arn}");
+        }
+        None => eprintln!(
+            "tenant-kms: --tenant-kms-config names no key for tenant {tenant:?}; its writes use \
+             the bucket's default encryption, as ravel-server's do"
+        ),
+    }
+    Ok(kms)
+}
+
 /// [`build_store_with_list_page_size`], keeping the concrete S3 store
 /// ([`BuiltStore`]).
 pub fn build_store_handle(
@@ -485,49 +654,7 @@ pub fn build_store_handle(
             None => MemoryStore::new(),
         }))),
         StoreKind::S3 => {
-            let bucket = args
-                .s3_bucket
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("--store s3 requires RAVEL_S3_BUCKET"))?;
-            let region = args
-                .s3_region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_string());
-            let auth = args.s3_auth.mode();
-            let (access_key_id, secret_access_key, session_token, credentials_file) = match auth {
-                S3AuthMode::Static => (
-                    args.s3_access_key.clone().ok_or_else(|| {
-                        anyhow::anyhow!("--store s3 requires RAVEL_S3_ACCESS_KEY")
-                    })?,
-                    args.s3_secret_key.clone().ok_or_else(|| {
-                        anyhow::anyhow!("--store s3 requires RAVEL_S3_SECRET_KEY")
-                    })?,
-                    args.s3_session_token.clone(),
-                    args.s3_credentials_file.clone(),
-                ),
-                S3AuthMode::InstanceRole => {
-                    if let Some(conflict) = instance_role_credential_conflict(args) {
-                        return Err(conflict);
-                    }
-                    (String::new(), String::new(), None, None)
-                }
-            };
-            let endpoint = args.s3_endpoint.clone();
-            let allow_http = resolve_s3_allow_http(endpoint.as_deref(), args.s3_allow_http)?;
-            let config = S3Config {
-                bucket,
-                region,
-                endpoint,
-                access_key_id,
-                secret_access_key,
-                allow_http,
-                force_path_style: true,
-                kms_key_id: None,
-                session_token,
-                credentials_file,
-                auth,
-                instance_metadata_endpoint: args.s3_instance_metadata_endpoint.clone(),
-            };
+            let config = s3_config(args)?;
             let http = args.s3_http_config();
             let store = match page_size {
                 None => S3Store::with_http_config(config, http.clone()),

@@ -42,6 +42,9 @@ pub(crate) struct SeenPut {
     pub key: String,
     /// Every `x-amz-checksum-*` request header, name and value.
     pub checksum_headers: Vec<(String, String)>,
+    /// The `x-amz-server-side-encryption-aws-kms-key-id` header: the KMS key
+    /// the PUT asked to be encrypted under, `None` for the bucket default.
+    pub sse_kms_key_id: Option<String>,
 }
 
 /// One `ListObjectsV2` request as the endpoint received it.
@@ -289,6 +292,10 @@ fn put_object(state: &FakeS3, key: &str, headers: &HeaderMap, body: Bytes) -> Re
     state.puts.lock().expect("puts lock").push(SeenPut {
         key: key.to_string(),
         checksum_headers,
+        sse_kms_key_id: headers
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
     });
     let header_text = |name: header::HeaderName| {
         headers
@@ -347,6 +354,13 @@ fn get_object(state: &FakeS3, key: &str, headers: &HeaderMap) -> Response {
         .and_then(|spec| spec.strip_prefix("bytes=")?.split_once('-'))
         .map(|(start, end)| {
             let len = data.len();
+            // A suffix range, `bytes=-N`: the last N bytes, as a footer-first
+            // segment read asks for.
+            if start.trim().is_empty() {
+                let suffix: usize = end.trim().parse().ok()?;
+                let last = len.checked_sub(1)?;
+                return (suffix > 0).then_some((len.saturating_sub(suffix), last));
+            }
             let start: usize = start.trim().parse().ok()?;
             let end = match end.trim() {
                 "" => len.checked_sub(1)?,
