@@ -1803,6 +1803,15 @@ pub struct CompactorConfig {
     /// by hand claims nothing, because the acquisition happens in the driver.
     /// Default `None`, which makes every checkpoint a single `Option` check.
     pub claim_guard: Option<crate::claim_guard::ClaimGuard>,
+    /// Whether this process may write a version 2 (superseding) compaction
+    /// record: ADR-0066's force 2 re-encode of a below-target compaction part
+    /// set ([`crate::rewrite::reencode_compaction_parts`]). Default `false`.
+    /// The force 2 amendment's rollout rule (item 8) applies: a build that
+    /// cannot read version 2 records fails every resolve over a bucket holding
+    /// one, and the record is immutable, so this is turned on only once every
+    /// node and the release before the running one read version 2. Turning it
+    /// off stops new version 2 records and leaves existing ones in place.
+    pub reencode_writer_enabled: bool,
 }
 
 impl Default for CompactorConfig {
@@ -1842,6 +1851,7 @@ impl Default for CompactorConfig {
             claim_lease_duration: DEFAULT_CLAIM_LEASE_DURATION,
             claim_participant: None,
             claim_guard: None,
+            reencode_writer_enabled: false,
         }
     }
 }

@@ -634,6 +634,18 @@ primitive in `rewrite.rs`, writer switch off by default; T6 `migrate` wiring;
 T7 (optional) background low-priority re-encode. T2 to T4 release before T5 to
 T7 are switched on.
 
+Note (2026-10-03, T5): item 2's "the compactor's call site,
+`ravel_maintain::read::input_set_hash`, selects it for a v2 record" does not
+describe the code. `read::input_set_hash` computes the version 1 hash only. The
+T5 writer, `rewrite::reencode_compaction_parts`, and the publish path it calls
+take the version 2 hash from
+`ravel_commit::erasure::compute_superseding_compaction_input_set_hash`
+directly, so the writer and the decode-time check still share one preimage. T5
+re-encodes an RSEG record part for part (same part indexes, every run's
+provenance and per-sample provenance column kept); RLOG and RSPAN parts go
+through their codec's compaction merge, so their part split can differ from the
+predecessor's.
+
 ## Amendment (2026-10-03, #2271): a below-floor HEAD is rebuilt, not refused as newer
 
 <!-- amendment-applies: sections="2. Fail-closed-on-newer, everywhere, typed" pointer="below-floor HEAD amendment" -->
