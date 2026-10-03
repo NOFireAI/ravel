@@ -876,9 +876,9 @@ impl FragmentService {
     ///
     /// Expiry is the one check that does not refuse with a `tonic::Status`: a
     /// MAC-valid capability past its expiry returns [`CapabilityCheck::Expired`],
-    /// which the handler counts and answers in-band with a `TIMEOUT` summary,
-    /// so the coordinator reads it as the query's deadline rather than as a
-    /// worker to route around. A live capability returns its `expires_unix_ns`, which the
+    /// which the handler counts and answers in-band with a `TIMEOUT` summary
+    /// rather than an error, so the coordinator never quarantines the worker
+    /// for it and ends the query only once its own deadline has passed. A live capability returns its `expires_unix_ns`, which the
     /// handler checks again once admitted and bounds the slice's run by.
     fn verify_capability(
         &self,
@@ -973,8 +973,9 @@ impl FragmentService {
     /// the timer fires (which, like the engine's own deadline, can be up to
     /// the timer's resolution late) and returns no result, and counts the stop
     /// under `class`. The slice then ends in-band with a `TIMEOUT` summary
-    /// carrying what it spent before the stop, which the coordinator treats as
-    /// terminal for the query: no re-dispatch and no local read.
+    /// carrying what it spent before the stop. The coordinator ends the query
+    /// on it once its own deadline has passed; before that it treats the stop
+    /// as clock skew and re-dispatches or reads locally, without quarantine.
     async fn run_until_deadline(
         &self,
         request: pb::FetchRequest,
@@ -1981,7 +1982,10 @@ impl RoutingSliceFetcher {
             // A worker that predates the in-band `TIMEOUT` refuses an expired
             // capability `Unauthenticated`. Once the capability's expiry has
             // passed on this coordinator's clock that refusal says nothing
-            // about the worker's health, so it is never quarantined for it.
+            // about the worker's health, so it is not quarantined for it. A
+            // refusal that arrives before then, from an older worker whose
+            // clock runs ahead, cannot be told from a bad key and still takes
+            // the quarantine path below (ADR-0071, mixed versions).
             Err(DistribError::Transport(message))
                 if unauthenticated && self.wall_deadline_passed(request) =>
             {
