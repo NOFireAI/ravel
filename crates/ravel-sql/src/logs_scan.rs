@@ -8014,3 +8014,188 @@ mod owned_work_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod carried_directory_reservation_tests {
+    //! ADR-2414 decision A1: the plan phase's carried directories are charged to
+    //! the fetch memory budget a carried whole object is charged to, for the
+    //! segments a partition will open and no others, until the plan counts drop.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::footer::kind;
+    use ravel_logseg::record::stream_attrs_bytes;
+    use ravel_logseg::{ObjectIdentity, RlogConfig, RlogReader, RlogWriter};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_query::BlockRangeFetcher;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const BLOCKS: usize = 12;
+    /// Spacing of the timestamps of the sparse object, wider than the query
+    /// window below, so no block of it can hold a row in the window.
+    const SPARSE_STEP: i64 = 10;
+
+    /// One-record blocks with timestamps `ts_step * i`.
+    fn object(seq: u64, ts_step: i64) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            group_target_blocks: 4,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: seq,
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let mut writer = RlogWriter::new(cfg, identity);
+        for i in 0..BLOCKS as i64 {
+            let ts = ts_step * i;
+            writer
+                .push(ravel_logseg::LogRecord {
+                    stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                    stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                    ts_ns: ts,
+                    observed_ts_ns: ts,
+                    severity_num: 9,
+                    severity_text: "INFO".into(),
+                    body: format!("row {ts} {}", "payload ".repeat(32)),
+                    trace_id: None,
+                    span_id: None,
+                    flags: 0,
+                    attrs: Vec::new(),
+                })
+                .expect("push");
+        }
+        writer.finish().expect("finish")
+    }
+
+    /// `(stored, decoded)` bytes of the four directory sections of `obj`.
+    fn directory_bytes(obj: &[u8]) -> (u64, u64) {
+        let footer = ravel_logseg::footer::open(obj).expect("footer");
+        [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ]
+        .iter()
+        .map(|k| footer.section(*k).expect("section"))
+        .fold((0, 0), |(stored, decoded), d| {
+            (stored + d.len, decoded + d.uncomp_len)
+        })
+    }
+
+    fn seg_ref(key: &str, obj: &[u8], ts_step: i64, seq: u64) -> SegmentRef {
+        SegmentRef {
+            data_object_key: key.to_string(),
+            object_size: obj.len() as u64,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: ts_step * (BLOCKS as i64 - 1),
+            ingest_hour_bucket: 0,
+            sample_count: BLOCKS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [seq as u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: seq,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    /// Two segments with a surviving block and one that overlaps the query
+    /// window but has none: the budget holds exactly the first two segments'
+    /// decoded directory bytes while the plan counts live, and nothing once
+    /// they drop.
+    ///
+    /// Fails against no reservation (`reserved` is 0), against reserving for
+    /// every relevant segment (the zero-survivor segment's bytes are added),
+    /// and against reserving the stored section lengths (the fixture's
+    /// sections compress, so stored and decoded totals differ).
+    #[tokio::test]
+    async fn carried_directories_reserve_decoded_bytes_for_segments_with_survivors() {
+        let store = Arc::new(MemoryStore::new());
+        let dense = [object(1, 1), object(2, 1)];
+        let sparse = object(3, SPARSE_STEP);
+        let mut segments = Vec::new();
+        for (i, obj) in dense.iter().enumerate() {
+            let key = format!("t/dense{i}.rlog");
+            store
+                .put(&key, bytes::Bytes::from(obj.clone()), PutOptions::default())
+                .await
+                .expect("put");
+            segments.push(seg_ref(&key, obj, 1, i as u64 + 1));
+        }
+        store
+            .put(
+                "t/sparse.rlog",
+                bytes::Bytes::from(sparse.clone()),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        segments.push(seg_ref("t/sparse.rlog", &sparse, SPARSE_STEP, 3));
+
+        let with_survivors: (u64, u64) = dense
+            .iter()
+            .map(|o| directory_bytes(o))
+            .fold((0, 0), |a, d| (a.0 + d.0, a.1 + d.1));
+        let sparse_decoded = directory_bytes(&sparse).1;
+        assert_ne!(
+            with_survivors.0, with_survivors.1,
+            "the fixture's sections compress, so stored and decoded totals differ"
+        );
+        assert!(sparse_decoded > 0);
+
+        // The window is inside every segment's catalog range and inside a gap
+        // of the sparse object's timestamps: it keeps block 11 of each dense
+        // object (ts 11) and no block of the sparse one.
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let fetcher = LogSegmentFetcher::new(store.clone())
+            .with_memory_budget(Arc::clone(&budget))
+            .with_block_range(
+                BlockRangeFetcher::new(store)
+                    .with_suffix_len(256)
+                    .with_whole_object_threshold(0),
+            )
+            .with_block_range_threshold(0);
+        let ctx = PartitionCtx {
+            fetcher,
+            tenant_hash: TENANT,
+            query: LogQuery::new(11, 19),
+            columns: ColumnSelection::all(),
+            projected_fraction: 1.0,
+            phase_accounting: PhaseAccounting::new(),
+        };
+        assert_eq!(budget.reserved(), 0);
+        let counts = compute_plan_counts(&ctx, &segments, 4)
+            .await
+            .expect("plan counts");
+        assert_eq!(
+            counts.segs[0].as_ref().map(|s| s.planned.is_some()),
+            Some(true)
+        );
+        assert_eq!(
+            counts.segs[2].as_ref().map(|s| s.planned.is_some()),
+            Some(false),
+            "the zero-survivor segment carries no directories"
+        );
+        assert_eq!(
+            budget.reserved(),
+            with_survivors.1,
+            "the decoded directory bytes of the segments with survivors, nothing for the other"
+        );
+        drop(counts);
+        assert_eq!(budget.reserved(), 0, "released when the plan counts drop");
+    }
+}
