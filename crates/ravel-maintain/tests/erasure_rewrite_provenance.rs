@@ -291,6 +291,8 @@ fn original_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> 
                 ),
                 scalar("beta", "b", &[(1_000, NAN_PAYLOAD)]),
                 histogram("hist", "h", &[(1_000, 10)]),
+                // Only W1 writes `solo`: compaction copies its run verbatim.
+                scalar("solo", "s", &[(1_000, bits(4.0)), (2_000, bits(-0.0))]),
                 scalar("victim", "v", &[(1_000, bits(9.0))]),
             ],
         ),
@@ -311,8 +313,6 @@ fn original_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> 
                     &[(1_000, bits(2.0)), (2_000, NAN_PAYLOAD), (3_000, bits(0.5))],
                 ),
                 scalar("beta", "b", &[(2_000, bits(-0.0))]),
-                // Only W2 writes `solo`: compaction copies its run verbatim.
-                scalar("solo", "s", &[(1_000, bits(4.0)), (2_000, bits(-0.0))]),
                 histogram("hist", "h", &[(1_000, 20), (2_000, 30)]),
                 scalar("victim", "v", &[(1_000, bits(10.0))]),
             ],
@@ -322,7 +322,7 @@ fn original_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> 
 
 /// The later commits: W5 adds one more duplicate on a merged scalar run, a
 /// verbatim single-writer run, and a merged histogram run, and wins each; W6
-/// duplicates three contested timestamps and loses each.
+/// duplicates a timestamp on each of those runs and on `beta`, and loses each.
 fn later_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> {
     vec![
         (
@@ -338,6 +338,7 @@ fn later_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> {
             vec![
                 scalar("alpha", "a", &[(2_000, bits(13.0))]),
                 scalar("beta", "b", &[(2_000, bits(14.0))]),
+                scalar("solo", "s", &[(2_000, bits(15.0))]),
                 histogram("hist", "h", &[(2_000, 60)]),
             ],
         ),
@@ -582,6 +583,7 @@ fn assert_later_winners(r: &Resolution) {
     assert_eq!(at("hist", "h", 1_000), Resolved::Histogram(50));
     assert_eq!(at("alpha", "a", 2_000), Resolved::Scalar(bits(-0.0)));
     assert_eq!(at("beta", "b", 2_000), Resolved::Scalar(bits(0.0)));
+    assert_eq!(at("solo", "s", 2_000), Resolved::Scalar(bits(-0.0)));
     assert_eq!(at("hist", "h", 2_000), Resolved::Histogram(40));
 }
 
@@ -709,4 +711,54 @@ async fn erasing_part_of_a_raw_l0_bucket_keeps_every_dedup_winner() {
         false,
     )
     .await;
+}
+
+/// Two writers whose commits tie on `(created_unix_ns, writer_epoch,
+/// writer_seq)`, which the provenance order allows across writer ids: the
+/// in-page index decides their duplicate. Erasing samples ahead of the
+/// contested one in its run must not move it to a lower index.
+#[tokio::test]
+async fn erasing_ahead_of_a_tied_duplicate_keeps_its_in_page_index() {
+    let ta = Writer { id: 7, ..W1 };
+    let tb = Writer { id: 8, ..W1 };
+    let flushes = || {
+        vec![
+            (
+                ta,
+                vec![scalar(
+                    "tie",
+                    "t",
+                    &[(100, bits(1.0)), (200, bits(2.0)), (5_000, bits(3.0))],
+                )],
+            ),
+            (tb, vec![scalar("tie", "t", &[(5_000, bits(4.0))])]),
+        ]
+    };
+    let clock = FixedClock::new(sealed_now_ns());
+
+    let world_a = MemoryStore::new();
+    let mut l0 = Vec::new();
+    for (w, batch) in flushes() {
+        let key = seed_l0(&world_a, w, batch).await;
+        l0.push((Level::L0(w), get_full(&world_a, &key).await));
+    }
+    let from_a = resolve(&l0);
+    let contested = (id("tie", "t"), 5_000);
+    assert_eq!(
+        from_a[&contested],
+        Resolved::Scalar(bits(3.0)),
+        "index 2 beats index 0 at a full provenance tie"
+    );
+
+    let world_b = MemoryStore::new();
+    for (w, batch) in flushes() {
+        seed_l0(&world_b, w, batch).await;
+    }
+    let parts = erase(&world_b, &clock, &erasure_request("tie", 100, 300)).await;
+    let from_b = resolve(&l1_segments(&world_b, &parts).await);
+    assert_eq!(
+        from_b,
+        without(&from_a, |(_, ts)| *ts < 300),
+        "the rewrite erased the window and kept the winner"
+    );
 }
