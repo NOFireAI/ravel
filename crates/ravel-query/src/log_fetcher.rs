@@ -12534,8 +12534,18 @@ mod owned_block_plan_tests {
     const GROUP_BLOCKS: usize = 4;
     const BLOCKS: usize = 3 * GROUP_BLOCKS;
 
-    fn record(ts: i64) -> LogRecord {
-        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+    /// With `two_streams`, even timestamps belong to one stream and odd ones to
+    /// another, so a stream-attribute filter has something to select; the
+    /// writer then lays each stream's records out in its own blocks.
+    fn record(ts: i64, two_streams: bool) -> LogRecord {
+        let service = if two_streams && ts % 2 == 0 {
+            "even"
+        } else if two_streams {
+            "odd"
+        } else {
+            "svc"
+        };
+        let resource = vec![("service.name".to_string(), AttrValue::Str(service.into()))];
         LogRecord {
             stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
             stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
@@ -12558,6 +12568,10 @@ mod owned_block_plan_tests {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with(false).await
+    }
+
+    async fn fixture_with(two_streams: bool) -> Fixture {
         let cfg = RlogConfig {
             block_target_records: 1,
             group_target_blocks: GROUP_BLOCKS,
@@ -12572,7 +12586,7 @@ mod owned_block_plan_tests {
         };
         let mut writer = RlogWriter::new(cfg, identity);
         for ts in 0..BLOCKS as i64 {
-            writer.push(record(ts)).expect("push");
+            writer.push(record(ts, two_streams)).expect("push");
         }
         let object = writer.finish().expect("finish");
         let store = Arc::new(MemoryStore::new());
@@ -12782,5 +12796,55 @@ mod owned_block_plan_tests {
         )
         .await;
         assert_eq!(front_placed(&without), [true, true]);
+    }
+
+    /// A stream-attribute filter resolves against the carried STREAM_DIR: the
+    /// open's ranged fetch places no front section, so reading STREAM_DIR out
+    /// of the fetched buffer would fail, and the rows must still be exactly
+    /// the matching stream's.
+    ///
+    /// Fails against a subset open that resolves the filter from the buffer
+    /// (`Unplaced` on STREAM_DIR) rather than from the carried directories.
+    #[tokio::test]
+    async fn a_stream_filter_resolves_from_the_carried_directories() {
+        let fx = fixture_with(true).await;
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_stream_attr(StreamAttrEquals::new(
+            "service.name",
+            AttrValue::Str("even".into()),
+        ));
+        let acc = QueryAccounting::new();
+        let (indices, dirs, _stats, _footer, _carried) = fx
+            .fetcher
+            .plan_segment(&fx.seg, TENANT, &query, &acc)
+            .await
+            .expect("plan")
+            .expect("relevant segment");
+        assert_eq!(
+            indices,
+            vec![0, 1, 2, 3, 4, 5],
+            "the matching stream's records fill the first six blocks"
+        );
+
+        let mut scan = fx
+            .fetcher
+            .scan_accounted_with_tenant_subset_raw(
+                &fx.seg,
+                TENANT,
+                &query,
+                &ColumnSelection::all(),
+                &indices,
+                None,
+                None,
+                Some(&dirs),
+                &acc,
+            )
+            .await
+            .expect("open")
+            .expect("relevant segment");
+        let mut ts = Vec::new();
+        while let Some(rows) = scan.next_block().expect("block") {
+            ts.extend(rows.iter().map(|r| r.ts_ns));
+        }
+        assert_eq!(ts, vec![0, 2, 4, 6, 8, 10]);
     }
 }
