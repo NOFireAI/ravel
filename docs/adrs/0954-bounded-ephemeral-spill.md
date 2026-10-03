@@ -215,7 +215,9 @@ drops the reason drops the requirement.
    path an operator chose for ephemeral storage, with its own capacity
    understood, never the OS temp directory and never the 100 GB default
    ceiling. An unset directory is a configuration error, not a fall-through
-   to the OS default.
+   to the OS default (amended: see the cache-dir spill default amendment
+   below, which derives the directory and its ceiling from `--cache-dir` when
+   no spill environment names one, and keeps spill off when neither does).
 
 4. **Exactness-aware eligibility, not an operator-name allowlist.**
    Eligibility is decided by whether spilling an operator yields the
@@ -236,6 +238,12 @@ drops the reason drops the requirement.
    max over non-float always exact, avg/mean over float never, any float
    GROUP BY key disqualifies, fail-closed on classification error), reused
    as the eligibility gate rather than duplicated.
+
+   The classifier implementing this gate also refused every `Sort` node,
+   because nothing proved a spilled run ties rows with equal sort keys in the
+   same order as the in-memory run. The cache-dir spill default amendment
+   below admits a `Sort` over a spill-exact aggregate once its sort key is
+   made total over the aggregate's group keys.
 
 5. **Typed `spill_budget_exhausted`, `spill_unavailable`, and cleanup
    errors.** The invariant's three failure modes (scratch budget exceeded,
@@ -328,7 +336,9 @@ drops the reason drops the requirement.
      process per volume as requirement 2's reclaim note assumes) is an
      implementation open question;
      the invariant fixed here is that no sweep ever deletes a file a live
-     process owns.
+     process owns. The cache-dir spill default amendment below settles the
+     mechanism for a `--cache-dir` spill root: a per-process subdirectory
+     plus an advisory lock on an owner file inside it.
 
 8. **Isolation and protection of spilled tenant data.** Spill holds a
    tenant's query state on a shared multi-tenant node's disk. One tenant's
@@ -526,3 +536,75 @@ flowchart TB
     ErrQuota --> Clean
     ErrSpill --> Clean
 ```
+
+## Amendment (2026-10-03): spill under --cache-dir by default, and a tie-ordered Sort (issue #2416)
+
+<!-- amendment-applies: sections="Normative implementation requirements" pointer="cache-dir spill default amendment" -->
+
+This is the cache-dir spill default amendment. It changes requirements 3, 4
+and 7 as follows; everything else in the Decision stands.
+
+**Requirement 3: where the spill directory and its ceiling come from.** A
+deployment no longer has to name a spill directory for spill to be on.
+`ravel-server` resolves the spill configuration once at startup, first
+source wins:
+
+1. `--sql-spill off`: spill is disabled, whatever the environment or
+   `--cache-dir` says. This is requirement 9's no-spill profile as a flag.
+   The flag's other value, `auto`, is the default.
+2. `RAVEL_SQL_SPILL_DIR` and `RAVEL_SQL_SPILL_MAX_BYTES` both set: that
+   directory and that per-query ceiling, as before this amendment.
+3. `--cache-dir` set and `RAVEL_SQL_SPILL_DIR` unset: the directory is
+   `<cache-dir>/sql-spill/<instance-id>`. The ceiling is
+   `RAVEL_SQL_SPILL_MAX_BYTES` when it is set alone, and otherwise
+   `derive_spill_max_bytes`: half the free bytes measured once at startup on
+   the volume backing `<cache-dir>/sql-spill`, capped at four times
+   `memory_budget_bytes`, floored at 1 GiB. With the host's memory unknown
+   the budget is unbounded and only the half-of-free and floor clauses
+   apply.
+4. Otherwise spill is disabled.
+
+`RAVEL_SQL_SPILL_DIR` set without `RAVEL_SQL_SPILL_MAX_BYTES`, or
+`RAVEL_SQL_SPILL_MAX_BYTES` set alone with no `--cache-dir`, still refuses
+startup, now with an error that names the missing variable. Requirement 3's
+purpose is kept: the directory is never the OS temp directory and the
+ceiling is never DataFusion's 100 GB default; a derived directory sits under
+the path the operator already chose for ephemeral local storage. The
+instance identity is the `process_id` of the process's `WorkerSet`, the
+identity its `sys/maintain/workers/<process_id>` heartbeat carries, drawn
+fresh at each process start; no second identity is minted for spill.
+Startup logs the outcome as two `performance default resolved` lines,
+`sql_spill_dir` and `sql_spill_max_bytes`, each with a `source` of `env`,
+`cache-dir`, `env-override`, `derived`, `flag-off` or `unset`.
+
+The derived figure is the per-query ceiling (`SpillConfig::max_bytes`).
+Requirement 2's per-tenant and node-wide quotas are not implemented by this
+amendment, so several queries spilling at once, or several processes
+sharing one cache volume, can together hold more than one derived ceiling.
+
+**Requirement 4: a `Sort` over a spill-exact aggregate is eligible.** Before
+planning, `rewrite_sort_group_key_tie_order` appends to every `Sort` whose
+input is an `Aggregate`, or a `Projection` directly over one, the
+aggregate's group-by expressions that are not already sort terms, in group
+order, ascending with nulls last, as trailing sort terms; `fetch` is
+unchanged. Group keys are unique per aggregate output row, so the sort key
+becomes total and a run that spills and a run that stays in memory order
+tied rows identically. The rewrite is applied to the executed plan only when
+the query's spill decision is enabled. A `Sort` the rewrite cannot resolve
+this way (a grouping set, or a group key a projection renamed) is left
+unchanged and stays ineligible.
+
+**Requirement 7: the ownership mechanism.** A process whose spill resolved
+under `--cache-dir` creates `<cache-dir>/sql-spill/<instance-id>` and takes
+an exclusive `flock` on an owner file inside it before it serves any query,
+and holds that lock until its shutdown completes; the kernel releases it on
+any exit, including a crash. It then sweeps once: a sibling root under
+`<cache-dir>/sql-spill` is removed only when this process can take that
+root's lock itself. A sibling whose lock is held, or whose ownership cannot
+be settled (no owner file, any other lock error), is left in place and
+logged at INFO with its path. Nothing outside `<cache-dir>/sql-spill` is
+read or removed, and a process whose spill is disabled or rooted by the
+environment elsewhere does not sweep. A process that cannot take its own
+root's lock refuses startup with an error naming the path. Orphans live
+until the next process start on that cache directory, as requirement 7's
+orphan-lifetime rule already allows.
