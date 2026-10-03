@@ -555,8 +555,10 @@ partition:
   the projected page extents and the coverage crossover are computed, so a
   partition fetches the pages of its own row groups only
   (`owned_block_plan_tests`). The coverage crossover therefore weighs the
-  partition's own footprint. A partition that owns every row group of an
-  object keeps the whole-object crossover. A partition sharing the object
+  partition's own footprint. A partition that owns every row group holding a
+  surviving block of an object keeps the whole-object crossover, also when a
+  row group whose blocks were all pruned belongs to nobody
+  (`a_wholly_pruned_row_group_leaves_a_sole_reader_a_full_share`). A partition sharing the object
   never reads it whole: it weighs its runs against its own span, from its first
   wanted page to its last, and on crossing joins every gap between its runs
   that holds no fence (below) into one range, so a share whose span holds no
@@ -694,6 +696,12 @@ ADR-2066 decision 1) on an L0 object and unbounded on an L1 segment, plus
 front-section ranges (STREAM_DIR and FIELD_DIR together, in one GET, when the
 query carries numeric arms or projects fewer than every column) only when the
 probe's cached suffix does not already cover them.**
+That law is per open. On the striped route an object's row groups are dealt to
+several partitions, each open bounds only its own chunk runs, and a run never
+bridges another partition's row group even where the cap would have bridged
+it, so a partition's runs can exceed the cap and an object's request count is
+the sum over the partitions that open it (see
+[the striped route](#the-striped-route-directories-once-per-segment-row-groups-whole)).
 For a typical narrow projection over a small L0 object that is one to seven
 GETs: the probe, a SKIP_IDX/PAGE_DIR chase when the probe falls short, the
 front sections, and up to 4 chunk-run GETs. The count excludes the tail
