@@ -456,7 +456,9 @@ flag combination whose hard caps alone exceed it (the 2026-09-07 amendment
 below exempts `--disable-cache` from this refusal). On a loopback store the
 fetch cache takes a larger share, and `--cache-max-bytes` no longer sizes the
 catalog cache: see the loopback amendment below. A gateway derives no budget
-and is not refused: see the gateway amendment below.
+and is not refused: see the gateway amendment below. The budget no longer
+starts from all of `MemTotal` on a host without a cgroup limit: see the
+available-memory amendment below.
 
 The overhead reserve is a measured number, not a guess, and it is measured in
 a calibration run that is separate from, and frozen before, the acceptance
@@ -868,4 +870,70 @@ quarter of memory; it gets what the first left. An explicit
 it is clamped to that ceiling, and over a derived or fallback tenant ceiling it
 raises the ceiling to match, as before. An operator who wants the earlier
 split sets the flag to half the tenant ceiling, 25% of `MemTotal`. The reasoning and the measured statement that motivated it
-are in ADR-2414.
+are in ADR-2414. The derived SQL pools are now also capped by the budget's
+shared remainder: see the available-memory amendment below.
+
+## Amendment (2026-10-03, issue #2367): the budget starts from available memory
+
+<!-- amendment-applies: sections="3. A static carve under one number|Amendment (2026-10-03, ADR-2414 decision B1): the per-query SQL share is the tenant's share" pointer="available-memory amendment" -->
+
+**What was measured.** On the 32 GB reference host, at `v0.21.0`, ten
+concurrent connections running ClickBench's statement mix got the server
+OOM-killed three times in 600 s, each time at 28.86 to 28.96 GB anonymous RSS.
+The full result is on issue #2367. The derived budget there was 30,756,311,040
+bytes: `MemTotal` (32,903,794,688) minus the 2 GiB overhead reserve. The same
+host ran two object stores (minio and the ClickBench entry's RustFS) holding
+2.0 to 2.4 GB between them. The upstream ClickBench entry runs RustFS on the
+host it benchmarks, so a store on the same box is a shipping configuration,
+not a test artefact. Budget plus co-resident memory came to 32.8 to 33.2 GB on
+a 32.9 GB host, before the kernel. Decision 3 derives the budget as if the
+server were alone on the host, and on that host it was not.
+
+**Decision.**
+
+1. On a host with no cgroup memory limit, `memory_budget_bytes` is derived
+   from what is free when the server starts:
+   `MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES - (MemTotal - MemAvailable - own_rss)`.
+   That is `MemAvailable` plus the server's own resident set at the moment of
+   derivation, less the reserve, and never more than the old figure. Under a
+   cgroup limit nothing changes: the limit is already the server's share, and
+   memory outside the cgroup does not count against it. `MemAvailable` counts
+   reclaimable page cache as available, so a host whose page cache is merely
+   warm does not shrink the budget.
+2. `--memory-budget-bytes` sets the budget explicitly and wins over both
+   derivations. It is the escape hatch for a co-resident process that starts
+   after the server, which a startup reading cannot see. Its resolved value is
+   logged with `source="flag"`, like every other performance flag.
+3. The derived SQL pools (`sql_tenant_max_bytes` and `sql_max_query_bytes`,
+   50% of `MemTotal` each since the B1 amendment) are capped by the budget's
+   shared remainder after the cache carve. An explicit flag is not capped.
+   The derivation logs whether the cap applied, as `clamped` does today.
+
+On the reference host this gives, with `MemAvailable` at 29,922,488,320 bytes
+read with no Ravel process running:
+- a budget of about 27,775,004,672 bytes;
+- a fetcher cache of about 6.94 GB and a catalog cache of about 1.39 GB;
+- a shared remainder of about 19.44 GB.
+
+The derived SQL pools stay at 16,451,897,344 bytes, above q33's measured peak
+reservation of 10,855,811,936 bytes. The ClickBench claim of 43 of 43 statements
+in the stock configuration therefore still holds by derivation. It is re-measured
+stock on that host before this lands, and the derived figures in
+`docs/internal/clickbench.md`, the configuration guide and the reference runbook
+move with it.
+
+**What this does not fix.** The same run measured live jemalloc allocations
+at least 9.25 GB above everything the ledgers reserved, even with both cache
+ceilings counted as full. No memory refusal was logged, so the accounted total
+never reached its ceiling before the kernel acted. A budget that fits the host
+is a floor: it removes the case where perfect accounting would still overcommit
+the host. It does not bound memory the ledgers never see. That remains issue
+#2367, which stays open on attributing those allocation sites and charging them
+to a ledger.
+
+**Rejected.** Measuring co-resident processes by name (rustfs, minio) was
+rejected: it is a list that is wrong on the next host. Re-deriving the budget
+periodically while the server runs was also rejected: a budget that shrinks
+under reservations already granted would have to revoke them, and this
+decision keeps the budget fixed for the life of the process, as decision 3
+does.
