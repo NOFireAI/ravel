@@ -1168,7 +1168,8 @@ impl SpanShardActor {
             // opening from here on pins past the read-side slack for this
             // buffer's oldest spans. Its strict-mode waiters get the retryable
             // overload error instead of an ack from that flush; the spans stay
-            // buffered, as in `shard::ShardActor::flush_tenant`.
+            // buffered and flush unacknowledged, so a client retry stores them
+            // twice: logs and spans have no query-time dedup.
             let waiters = std::mem::take(&mut buf.waiters);
             self.ctx
                 .ack_waiters(waiters, Err(SpanWriteError::BufferBudgetExceeded));
