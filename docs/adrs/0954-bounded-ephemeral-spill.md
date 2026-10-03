@@ -624,3 +624,17 @@ environment elsewhere does not sweep. A process that cannot take its own
 root's lock refuses startup with an error naming the path. Orphans live
 until the next process start on that cache directory, as requirement 7's
 orphan-lifetime rule already allows.
+
+The ownership check and the removal happen under one hold of the orphan's
+lock. Holding it, the sweep checks that the root's lock path still names
+the file it locked, renames the root aside to a `.swept-` name in the same
+directory, releases the lock, and only then deletes the renamed tree. A
+process starting at the same moment under the same instance id may have
+opened the old lock file; after taking its own lock it checks that the lock
+path still names the file it locked (same device and inode), and when it
+does not, creates its root again and locks that, refusing startup if this
+happens twice. The lock is the kernel's advisory `flock`, which only proves
+ownership among processes on one host: on a network mount whose lock calls
+are local to each client (NFS mounted `nolock` or `local_lock`), a sweep
+on one host can take, and delete, another host's live root. The cache
+directory of a spilling process must be on a local volume.

@@ -343,6 +343,57 @@ impl Drop for SpillScratch {
 /// pid liveness.
 const OWNER_LOCK_FILE_NAME: &str = ".owner.lock";
 
+/// How long [`lock_in_place`] keeps retrying a lock that is held while the
+/// lock file is still in place: a sweep holds it only from its lock to its
+/// rename, so contention that outlasts this is a live owner.
+const OWNER_LOCK_WAIT_ROUNDS: u32 = 20;
+const OWNER_LOCK_WAIT: Duration = Duration::from_millis(10);
+
+/// Whether `path` still names the file `file` was opened from: same device,
+/// same inode. A root a sweep moved away, or a lock file created again in its
+/// place, no longer matches.
+#[cfg(unix)]
+fn still_names(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(held), Ok(current)) => held.dev() == current.dev() && held.ino() == current.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn still_names(_file: &std::fs::File, path: &Path) -> bool {
+    path.exists()
+}
+
+/// Take the exclusive lock on `lock_file`, opened from `lock_path` in the
+/// root `dir`. `Ok(true)`: locked, and the path still names the locked file.
+/// `Ok(false)`: a sweep moved the root away, so the lock (if taken) is on a
+/// root nobody can reach; the caller builds the root again. An error of kind
+/// `WouldBlock`: a live process owns the root.
+fn lock_in_place(lock_file: &std::fs::File, lock_path: &Path, dir: &Path) -> std::io::Result<bool> {
+    for _ in 0..OWNER_LOCK_WAIT_ROUNDS {
+        match lock_file.try_lock() {
+            Ok(()) => return Ok(still_names(lock_file, lock_path)),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if !still_names(lock_file, lock_path) {
+                    return Ok(false);
+                }
+                std::thread::sleep(OWNER_LOCK_WAIT);
+            }
+            Err(std::fs::TryLockError::Error(err)) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::WouldBlock,
+        format!(
+            "SQL spill root {} is locked by another live process: two processes share \
+             one instance id under this cache directory",
+            dir.display()
+        ),
+    ))
+}
+
 /// This process's exclusive hold on its `--cache-dir` spill root
 /// (ADR-0954 requirement 7, issue #2416):
 /// `<cache_dir>/sql-spill/<instance_id>`, created owner-only, with an
@@ -363,32 +414,62 @@ impl SpillRootOwner {
     /// not mint one.
     ///
     /// Fails only on an I/O error: the directory could not be created (or
-    /// found existing), or its lock file could not be opened or locked. A
-    /// `WouldBlock` here means another live process already holds this exact
+    /// found existing), or its lock file could not be opened or locked. An
+    /// error of kind `WouldBlock` means another live process holds this exact
     /// `(cache_dir, instance_id)` pair -- an instance identity collision, not
-    /// the expected startup path -- and is surfaced as an ordinary
-    /// [`std::io::Error`] via `TryLockError`'s conversion.
+    /// the expected startup path.
+    ///
+    /// A peer's startup sweep can move this root away between the open and
+    /// the lock (ADR-0954 requirement 7, issue #2416). The lock is therefore
+    /// kept only once the lock file's path still names the file locked; when
+    /// it does not, the root is created again and locked once more, and a
+    /// second such loss is an error.
     pub fn acquire(cache_dir: &Path, instance_id: &str) -> std::io::Result<SpillRootOwner> {
+        Self::acquire_with(cache_dir, instance_id, &mut || {})
+    }
+
+    /// [`Self::acquire`], running `before_lock` between opening the lock file
+    /// and locking it, which is where a test puts a peer's sweep.
+    fn acquire_with(
+        cache_dir: &Path,
+        instance_id: &str,
+        before_lock: &mut dyn FnMut(),
+    ) -> std::io::Result<SpillRootOwner> {
         let sql_spill_root = cache_dir.join(crate::config::SQL_SPILL_SUBDIR);
-        std::fs::create_dir_all(&sql_spill_root)?;
         let dir = crate::config::cache_spill_dir(cache_dir, instance_id);
-        match create_scratch_dir(&dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err),
-        }
         let lock_path = dir.join(OWNER_LOCK_FILE_NAME);
-        let lock_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        lock_file.try_lock()?;
-        Ok(SpillRootOwner {
-            dir,
-            _lock: lock_file,
-        })
+        for _ in 0..2 {
+            std::fs::create_dir_all(&sql_spill_root)?;
+            match create_scratch_dir(&dir) {
+                Ok(()) => {}
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(err) => return Err(err),
+            }
+            let lock_file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+            {
+                Ok(file) => file,
+                // The root was moved away between its creation and the open.
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            before_lock();
+            if lock_in_place(&lock_file, &lock_path, &dir)? {
+                return Ok(SpillRootOwner {
+                    dir,
+                    _lock: lock_file,
+                });
+            }
+        }
+        Err(std::io::Error::other(format!(
+            "SQL spill root {} was moved away by another process's startup sweep twice \
+             while this process was taking its lock",
+            dir.display()
+        )))
     }
 
     /// This process's own spill root, `<cache_dir>/sql-spill/<instance_id>`.
@@ -448,6 +529,24 @@ impl SpillRootOwner {
 
     /// Settle, and act on, one sibling spill root's ownership.
     fn sweep_one(&self, candidate: &Path) {
+        self.sweep_one_with(candidate, &mut || {}, &mut || {});
+    }
+
+    /// [`Self::sweep_one`], running `after_lock` once the orphan's lock is
+    /// held and before the root is moved away, and `after_release` once the
+    /// lock is released and before the moved tree is deleted: the two points
+    /// where a test puts a peer's `acquire` of the same root.
+    ///
+    /// Ownership is settled and the root removed under one lock hold: the
+    /// root is renamed aside while the lock is held, so its path is free (and
+    /// any `acquire` that opened the old lock file sees it moved) before the
+    /// lock is released, and the renamed tree is deleted afterwards.
+    fn sweep_one_with(
+        &self,
+        candidate: &Path,
+        after_lock: &mut dyn FnMut(),
+        after_release: &mut dyn FnMut(),
+    ) {
         let lock_path = candidate.join(OWNER_LOCK_FILE_NAME);
         let lock_file = match std::fs::OpenOptions::new()
             .read(true)
@@ -467,8 +566,33 @@ impl SpillRootOwner {
         };
         match lock_file.try_lock() {
             Ok(()) => {
+                // A new owner re-created the root after this sweep opened the
+                // old lock file: that root is live, not this one.
+                if !still_names(&lock_file, &lock_path) {
+                    return;
+                }
+                after_lock();
+                let Some(parent) = candidate.parent() else {
+                    return;
+                };
+                let swept = parent.join(format!(
+                    ".swept-{}-{:016x}-{}",
+                    std::process::id(),
+                    scratch_nonce(),
+                    SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                ));
+                if let Err(err) = std::fs::rename(candidate, &swept) {
+                    tracing::warn!(
+                        dir = %candidate.display(),
+                        error = %err,
+                        "owner of this SQL spill root is gone, but it could not be moved aside \
+                         for removal; leaving it in place"
+                    );
+                    return;
+                }
                 drop(lock_file);
-                match std::fs::remove_dir_all(candidate) {
+                after_release();
+                match std::fs::remove_dir_all(&swept) {
                     Ok(()) => {
                         tracing::info!(
                             dir = %candidate.display(),
@@ -477,7 +601,7 @@ impl SpillRootOwner {
                     }
                     Err(err) => {
                         tracing::warn!(
-                            dir = %candidate.display(),
+                            dir = %swept.display(),
                             error = %err,
                             "owner of this SQL spill root is gone, but it could not be removed"
                         );
@@ -999,5 +1123,118 @@ mod tests {
             owner.dir().is_dir(),
             "the sweep must never remove its own root"
         );
+    }
+
+    /// An orphaned root under `root`, with an owner lock nobody holds.
+    fn orphan(root: &Path, instance_id: &str) -> PathBuf {
+        let dir = crate::config::cache_spill_dir(root, instance_id);
+        std::fs::create_dir_all(&dir).expect("orphan dir");
+        std::fs::write(dir.join(OWNER_LOCK_FILE_NAME), b"").expect("orphan lock file");
+        dir
+    }
+
+    /// The owner holds the lock on the file its root's lock path names, the
+    /// root is writable, and nobody else can take the root.
+    fn assert_usable(owner: &SpillRootOwner, root: &Path, instance_id: &str) {
+        let lock_path = owner.dir().join(OWNER_LOCK_FILE_NAME);
+        assert!(
+            still_names(&owner._lock, &lock_path),
+            "the owner's lock must be on the lock file its root names, not a removed one"
+        );
+        std::fs::write(owner.dir().join("probe"), b"x").expect("the root is writable");
+        let contender = std::fs::File::open(&lock_path).expect("the lock file exists");
+        assert!(
+            matches!(contender.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the owner's lock is held"
+        );
+        let entries: Vec<_> = std::fs::read_dir(root.join(crate::config::SQL_SPILL_SUBDIR))
+            .expect("readable")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert!(
+            entries.iter().any(|name| name == instance_id)
+                && entries
+                    .iter()
+                    .all(|name| !name.to_string_lossy().starts_with(".swept-")),
+            "the root is in place and the swept tree is gone: {entries:?}"
+        );
+    }
+
+    /// ADR-0954 requirement 7 (issue #2416), the peer starting while the sweep
+    /// holds the orphan's lock: the peer opens the orphan's lock file while
+    /// the sweep holds it, then the sweep moves the root away and removes it.
+    /// The peer must end up owning a usable root, not a lock on the removed
+    /// file and not a refusal.
+    #[test]
+    fn an_acquire_racing_the_sweeps_lock_gets_a_usable_root() {
+        let root = tempfile::tempdir().expect("temp root");
+        let sweeper = SpillRootOwner::acquire(root.path(), "inst-1").expect("sweeper");
+        let candidate = orphan(root.path(), "inst-dead");
+
+        let mut peer = None;
+        sweeper.sweep_one_with(
+            &candidate,
+            &mut || {
+                let (opened, wait) = std::sync::mpsc::channel();
+                let cache_dir = root.path().to_path_buf();
+                peer = Some(std::thread::spawn(move || {
+                    SpillRootOwner::acquire_with(&cache_dir, "inst-dead", &mut || {
+                        let _ = opened.send(());
+                    })
+                }));
+                wait.recv().expect("the peer opened the orphan's lock file");
+            },
+            &mut || {},
+        );
+
+        let owner = peer
+            .expect("the sweep reached its lock")
+            .join()
+            .expect("the peer thread")
+            .expect("the peer gets a root");
+        assert_usable(&owner, root.path(), "inst-dead");
+    }
+
+    /// The peer starting after the sweep released the orphan's lock and
+    /// before it deleted anything: the sweep's removal must not reach the
+    /// root the peer now owns, which is what deciding ownership and removing
+    /// the root under one lock hold means.
+    #[test]
+    fn an_acquire_between_the_sweeps_release_and_its_removal_keeps_its_root() {
+        let root = tempfile::tempdir().expect("temp root");
+        let sweeper = SpillRootOwner::acquire(root.path(), "inst-1").expect("sweeper");
+        let candidate = orphan(root.path(), "inst-dead");
+
+        let mut peer = None;
+        sweeper.sweep_one_with(&candidate, &mut || {}, &mut || {
+            peer = Some(SpillRootOwner::acquire(root.path(), "inst-dead"));
+        });
+
+        let owner = peer
+            .expect("the sweep released the lock")
+            .expect("the peer gets a root");
+        assert_usable(&owner, root.path(), "inst-dead");
+    }
+
+    /// The same race from the other side: the peer has opened its root's lock
+    /// file but not locked it when a sweep takes the lock and removes the
+    /// root. The peer's lock is then on a removed file, which it must notice
+    /// and replace with a usable root.
+    #[test]
+    fn an_acquire_whose_root_is_swept_before_it_locks_gets_a_usable_root() {
+        let root = tempfile::tempdir().expect("temp root");
+        let sweeper = SpillRootOwner::acquire(root.path(), "inst-1").expect("sweeper");
+        orphan(root.path(), "inst-dead");
+
+        let mut swept = false;
+        let owner = SpillRootOwner::acquire_with(root.path(), "inst-dead", &mut || {
+            if !swept {
+                swept = true;
+                sweeper.sweep_orphaned_spill_roots();
+            }
+        })
+        .expect("the peer gets a root");
+        assert!(swept);
+        assert_usable(&owner, root.path(), "inst-dead");
     }
 }

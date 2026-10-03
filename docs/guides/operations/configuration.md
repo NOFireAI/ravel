@@ -744,6 +744,13 @@ in place and logged at INFO with its path. The sweep touches nothing outside
 `<cache-dir>/sql-spill`, and a process whose spill is off or set by the
 environment does not sweep at all.
 
+Put `--cache-dir` on a local volume when spill uses it. The lock only
+proves ownership between processes on the same host. On a network mount
+whose locks are local to each client (NFS mounted with `nolock` or
+`local_lock`), a process on one host can take the lock of a directory a
+process on another host is still using, and its sweep then deletes that
+live directory.
+
 Unlike the read cache, the spill directory is checked at startup: with
 `--cache-dir` set and spill resolving there, the server refuses to start if it
 cannot create `<cache-dir>/sql-spill`, measure its free space, or take its own
