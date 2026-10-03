@@ -49,11 +49,12 @@ pub trait SuiteEngine: Send + Sync {
 }
 
 /// DataFusion `target_partitions` for both [`InProcessEngine`] and
-/// [`ReferenceEngine`]. The partial/final aggregation split combines one
-/// partial per partition, so this fixes the floating-point accumulation
-/// order the comparator's ULP tolerances and exact totals are measured
-/// under; left to DataFusion's default, the reference would follow the
-/// host's available parallelism. 8 is what `SqlConfig::default()` already
+/// [`ReferenceEngine`]. It fixes how many partial aggregates a
+/// floating-point sum is combined from; left to DataFusion's default, the
+/// reference would follow the host's available parallelism. It does not fix
+/// the order the final aggregate merges those partials in, which follows
+/// stream arrival, so a float result can still move in its last bits between
+/// runs and the comparator's ULP tolerance has to cover that. 8 is what `SqlConfig::default()` already
 /// resolves to (`ravel_query::DEFAULT_FETCH_CONCURRENCY`), so pinning it
 /// leaves Ravel's plan the shape its default configuration produces.
 pub const PLAN_PARTITIONS: usize = 8;
