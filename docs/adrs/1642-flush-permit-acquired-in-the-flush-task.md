@@ -607,12 +607,17 @@ shrink the scan set of an hour already pinned.
 The check fails closed as routing does. A tenant with no cached view (never
 resolved by this router, or evicted as idle) or a view past its horizon does
 not open the flush: the buffer stays exactly as it was, rows, waiters, charges
-and trigger bookkeeping, the refusal counts on the pipeline's
-`stale_provisioning_flushes`, and the actor starts one background re-read of
-the tenant's provisioning record, at most one in flight per tenant per router.
-A successful re-read is stamped with the time it was issued, and the next
-trigger retries against it. Nothing is written on an unknown view, except at
-teardown (below).
+and trigger bookkeeping, the episode counts once per buffer on the pipeline's
+`stale_provisioning_flushes` however many triggers retry it, and the actor
+starts one background re-read of the tenant's provisioning record, at most one
+in flight per tenant per router. A successful re-read is stamped with the time
+it was issued, and the next trigger retries against it. A drain (`flush_all`,
+`FlushNow`, shutdown, channel close) waits for the re-read instead of leaving
+it to the next trigger: once per tenant per drain it joins the read in flight
+or starts one, waits at most `max_flush_lifetime`, and applies the check again
+on what it installed, so one drain flushes every buffer the re-read confirms.
+Only a re-read that fails or times out keeps the buffer. Nothing is written on
+an unknown view, except at teardown (below).
 
 **What happens to the rows.** When the check fails, nothing is written under
 that shard index. The actor routes the buffer's rows under the tenant's
@@ -627,9 +632,13 @@ A hand-back skips what a new write passes on the router, admission with its
 ADR-0069 charge and the deferral-cap refusal, because these rows were admitted
 and charged once already. It does not skip the dead-shard check: a target whose
 actor is gone or whose mailbox is closed is sent nothing, and the whole buffer
-stays where it is for the next trigger to retry. A dead metrics shard is
-respawned by the next write that observes it; a dead log or span shard is
-condemned, and its rows wait for the teardown below.
+stays where it is for the next trigger to retry. A target whose mailbox closes
+after that check fails its send, which returns the message: its rows and a
+clone of each charge go back into the source buffer, once however many sends
+failed, and the next flush attempt hands them back again. Their strict
+waiters were already answered, so nothing is acknowledged twice. A dead
+metrics shard is respawned by the next write that observes it; a dead log or
+span shard is condemned, and its rows wait for the teardown below.
 
 **Strict waiters.** A strict waiter still on a handed-back buffer is answered
 with the existing outcome-unknown `Abandoned` (503), since its rows are written
@@ -660,19 +669,31 @@ target's mailbox without a wait cycle.
 
 **Drains.** The router's `flush_all` repeats its fan-out while a pass handed
 rows back, and `shutdown` drains the sets in descending shard count, waiting
-for each set before signalling the next, so rows handed back during a drain
-land in a set that has not drained yet. A teardown (shutdown or channel close)
-that cannot confirm the view or reach a target within its enforced passes
-writes the buffer in place on its bypass passes and logs a WARN: the choice
-the ADR-1685 teardown bypass makes for the clock-lag check, since a row
-written where the read side may not scan it can still be found, and a row
-dropped at shutdown cannot.
+for each set before signalling the next and listing the sets again after each
+one, since a hand-back can construct the current generation's set mid-drain,
+so rows handed back during a drain land in a set that has not drained yet. A
+teardown (shutdown or channel close) first makes the drain's re-read above.
+One that still cannot confirm the view writes the buffer in place on its
+bypass passes and logs a WARN: the choice the ADR-1685 teardown bypass makes
+for the clock-lag check, since a row written where the read side may not scan
+it can still be found, and a row dropped at shutdown cannot. One whose view
+puts the rows outside the scan set but finds no live target writes rows known
+to be invisible: that write logs an ERROR with the tenant, shard and hour and
+counts on `teardown_unscanned_writes`.
 
 **Observability.** Each pipeline's metrics (`IngestMetrics`,
 `LogIngestMetrics`, `SpanIngestMetrics`) count handed-back flushes as
-`rerouted_flushes`, which is the counter by signal. The first hand-back of an
+`rerouted_flushes`, hand-backs that found a target not live or whose send
+failed as `hand_back_failures` (once per buffer until a hand-back from it
+delivers), and teardown writes outside the scan set as
+`teardown_unscanned_writes`. `ravel-server` exports them on `/metrics` by
+signal as `ravel_ingest_rerouted_flushes_total`,
+`ravel_ingest_hand_back_failures_total` and
+`ravel_ingest_teardown_unscanned_writes_total`. The first hand-back of an
 episode on a shard logs once at WARN with the signal, shard, pinned hour and
-scan count; the episode ends when that shard next opens a flush in place.
+scan count; the episode ends when that shard next opens a flush in place. The
+first failed hand-back of a buffer logs once, at WARN for metrics and at ERROR
+for logs and spans, whose dead target stays condemned.
 
 **What this supersedes.** The deferral cap amendment's "What this does not
 bound" entries for buffered rows held under a non-zero `idle_flush_byte_floor`,
@@ -686,14 +707,15 @@ no reader looks. Neither of that amendment's rejected alternatives is revived.
 - The wall-clock length of a deferral, as before. Rows not yet flushed are
   invisible to every reader until their flush lands; that is buffered latency,
   not this defect.
-- Teardown residue written in place, above, when the view cannot be confirmed
-  or no target is reachable during a shutdown or channel-close drain.
+- Teardown residue written in place, above, when the drain's re-read cannot
+  confirm the view or no target is live during a shutdown or channel-close
+  drain; the second case is counted.
 - A writer or reshard-append clock skewed beyond `TOLERATED_CLOCK_SKEW_HOURS`,
   the assumption ADR-0052's degraded-grace amendment already records.
-- A target actor that dies between the liveness check and the send: the
-  message dies with it, as the dead actor's own buffer does.
-- `rerouted_flushes` is on the pipeline metrics snapshots only; exporting it on
-  `ravel-server`'s `/metrics` is a follow-up.
+- Rows a condemned log or span target leaves in a source buffer wait there
+  until the process shuts down, then take the teardown write above.
+- A drain's synchronous re-read waits up to `max_flush_lifetime` per tenant
+  per shard against a stalled store.
 
 **Rejected: deciding at route time.** The router cannot know when a buffer's
 flush will open, which is the whole problem; only the actor at flush open
@@ -720,9 +742,16 @@ the retired index deferred to `S` hours past the activation writes nothing
 under that index and the scan rule finds every row once; one opening inside
 the window, and one on an index the successor still covers however late,
 write in place; a held re-read keeps the flush closed with nothing written or
-lost until it completes; the deferred rows' exact byte charge is held while
-they wait in the successor and returns to zero after; and a strict waiter on a
-handed-back buffer gets `Abandoned`. `generation::tests` pins the check's
+lost until it completes, counting the episode once; the deferred rows' exact
+byte charge is held while one successor's flush has landed and another's is
+still held, and returns to zero after; a strict waiter on a handed-back buffer
+gets `Abandoned`; one drain re-reads a stale view, hands back, and flushes the
+rows on its second pass; and shutdown drains the larger set first and also
+drains a set a hand-back constructed during it. Unit tests on each actor
+(`shard`, `log_shard`, `span_shard`) drive a scripted scope: a target closed
+after the liveness check returns every row and one charge to the source
+buffer, a dead target keeps the whole buffer, and a teardown with a dead
+target writes in place and counts it. `generation::tests` pins the check's
 verdicts at the window and horizon edges. `ravel-server`'s
 `a_flush_cadence_leaving_no_deferral_cap_is_rejected_at_startup` pins the
 startup refusal.

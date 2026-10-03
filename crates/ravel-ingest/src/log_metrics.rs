@@ -200,6 +200,10 @@ pub struct LogIngestMetrics {
     /// they pinned (ADR-1642 scan-set amendment), the log-pipeline counterpart
     /// of `IngestMetrics::rerouted_flushes`.
     rerouted_flushes: AtomicU64,
+    /// The counterpart of `IngestMetrics::hand_back_failures`.
+    hand_back_failures: AtomicU64,
+    /// The counterpart of `IngestMetrics::teardown_unscanned_writes`.
+    teardown_unscanned_writes: AtomicU64,
     /// Flushes whose per-tenant indexed-field list resolved from a stale cached
     /// value or a failed-re-read/validation fallback rather than a fresh durable
     /// `TenantConfig` read this tick (ADR-0079 deliverable 6). Degraded, not
@@ -366,6 +370,13 @@ pub struct LogIngestMetricsSnapshot {
     /// Flushes handed back instead of written outside the scan set (ADR-1642
     /// scan-set amendment).
     pub rerouted_flushes: u64,
+    /// Hand-back episodes that left rows in the source buffer because a
+    /// target shard was not live. Exported as
+    /// `ravel_ingest_hand_back_failures_total`.
+    pub hand_back_failures: u64,
+    /// Teardown flushes written in place outside the scan set. Exported as
+    /// `ravel_ingest_teardown_unscanned_writes_total`.
+    pub teardown_unscanned_writes: u64,
     pub indexed_fields_stale_fallbacks: u64,
     pub postings_objects: u64,
     pub postings_bytes_total: u64,
@@ -749,6 +760,18 @@ impl LogIngestMetrics {
         self.rerouted_flushes.load(Ordering::Relaxed)
     }
 
+    /// One hand-back episode that kept rows in the source buffer because a
+    /// target shard was not live.
+    pub(crate) fn record_hand_back_failure(&self) {
+        self.hand_back_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One teardown flush written in place outside the scan set.
+    pub(crate) fn record_teardown_unscanned_write(&self) {
+        self.teardown_unscanned_writes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One flush resolved its indexed-field list from a stale cached value or a
     /// failed-re-read/validation fallback rather than a fresh durable read
     /// (ADR-0079 deliverable 6). Called from `run_flush` on the overlay's
@@ -842,6 +865,8 @@ impl LogIngestMetrics {
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
             rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
+            hand_back_failures: self.hand_back_failures.load(Ordering::Relaxed),
+            teardown_unscanned_writes: self.teardown_unscanned_writes.load(Ordering::Relaxed),
             indexed_fields_stale_fallbacks: self
                 .indexed_fields_stale_fallbacks
                 .load(Ordering::Relaxed),

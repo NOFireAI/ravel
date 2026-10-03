@@ -863,9 +863,12 @@ impl IngestRouter {
     /// Sets drain largest first, each finished before the next is signalled:
     /// a retiring set's drain may hand rows back (ADR-1642 scan-set
     /// amendment), always to a smaller set, which must still be running to
-    /// take them.
+    /// take them. The sets are listed again after each one, since a hand-back
+    /// can construct the current generation's set during the drain.
     pub async fn shutdown(self) {
-        for set in self.switch.all_sets_largest_first() {
+        let mut drained = Vec::new();
+        while let Some((count, set)) = self.switch.largest_undrained_set(&drained) {
+            drained.push(count);
             let mut dones = Vec::new();
             for shard in set.iter() {
                 let (done_tx, done_rx) = oneshot::channel();
