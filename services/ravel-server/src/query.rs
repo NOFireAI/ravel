@@ -564,6 +564,7 @@ pub fn build_sql_state(
         process_memory_budget,
         None,
         ravel_sql::DEFAULT_MIN_GRACE_MS,
+        &SqlSpillInputs::default(),
     )
 }
 
@@ -597,6 +598,326 @@ pub(crate) fn ddl_min_grace_ms(max_query_duration_ns: i64) -> anyhow::Result<u64
     Ok(grace_ms)
 }
 
+/// `source` of a `sql_spill_dir`/`sql_spill_max_bytes` line whose value came
+/// from the `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` pair.
+pub const SQL_SPILL_SOURCE_ENV: &str = "env";
+/// `source` of a `sql_spill_dir` line whose directory derives from
+/// `--cache-dir`.
+pub const SQL_SPILL_SOURCE_CACHE_DIR: &str = "cache-dir";
+/// `source` of a `sql_spill_max_bytes` line whose ceiling is
+/// `RAVEL_SQL_SPILL_MAX_BYTES` set alone, replacing the `--cache-dir`-derived
+/// ceiling.
+pub const SQL_SPILL_SOURCE_ENV_OVERRIDE: &str = "env-override";
+/// `source` of a `sql_spill_max_bytes` line whose ceiling is
+/// [`ravel_sql::derive_spill_max_bytes`]'s.
+pub const SQL_SPILL_SOURCE_DERIVED: &str = "derived";
+/// `source` of both spill lines under `--sql-spill off`.
+pub const SQL_SPILL_SOURCE_FLAG_OFF: &str = "flag-off";
+/// `source` of both spill lines when no source configures spill.
+pub const SQL_SPILL_SOURCE_UNSET: &str = "unset";
+
+/// The owned form of [`ravel_sql::CacheDirSpill`]: what a `--cache-dir`
+/// deployment resolves its SQL spill root and ceiling from (ADR-0954, amended
+/// by issue #2416).
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheDirSpillInputs {
+    /// The configured `--cache-dir`.
+    pub cache_dir: PathBuf,
+    /// This process's instance identity: the `process_id` of its
+    /// `ravel_maintain::WorkerSet`, the identity its
+    /// `sys/maintain/workers/<process_id>` heartbeat and live-set entry carry.
+    /// `start` builds that `WorkerSet` in every mode, so this is never a
+    /// second identity minted for spill.
+    pub instance_id: String,
+    /// Free bytes on the volume backing `<cache_dir>/sql-spill`, measured once
+    /// at startup with [`ravel_sql::measure_free_bytes`].
+    pub free_bytes: u64,
+    /// [`crate::config::SqlSpillSettings::memory_budget_bytes`].
+    pub memory_budget_bytes: u64,
+}
+
+#[cfg(feature = "sql")]
+impl CacheDirSpillInputs {
+    fn as_cache_dir_spill(&self) -> ravel_sql::CacheDirSpill<'_> {
+        ravel_sql::CacheDirSpill {
+            cache_dir: &self.cache_dir,
+            instance_id: &self.instance_id,
+            free_bytes: self.free_bytes,
+            memory_budget_bytes: self.memory_budget_bytes,
+        }
+    }
+}
+
+/// The two arguments [`build_sql_state_with_parquet`] hands
+/// `SqlConfig::with_spill_resolved`.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SqlSpillInputs {
+    /// `--sql-spill off`.
+    pub off: bool,
+    /// `Some` when `--cache-dir` is set, `--sql-spill` is `auto`, and
+    /// `RAVEL_SQL_SPILL_DIR` is unset: the only case in which
+    /// [`ravel_sql::SpillConfig::resolve`] reads a cache directory at all.
+    pub cache_dir: Option<CacheDirSpillInputs>,
+}
+
+/// The spill configuration startup resolved, and where each half came from.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSqlSpill {
+    /// `None` is spill disabled.
+    pub config: Option<ravel_sql::SpillConfig>,
+    /// One of the `SQL_SPILL_SOURCE_*` constants.
+    pub dir_source: &'static str,
+    /// One of the `SQL_SPILL_SOURCE_*` constants.
+    pub max_bytes_source: &'static str,
+}
+
+#[cfg(feature = "sql")]
+impl ResolvedSqlSpill {
+    /// The `sql_spill_dir` and `sql_spill_max_bytes` startup lines, in the
+    /// `performance default resolved` layout
+    /// [`crate::config::ResolvedPerformanceDefaults::emit`] uses. Both lines
+    /// are written whether or not spill is enabled; a disabled spill reads
+    /// `value="none"` with the reason as its source.
+    pub fn emit(&self) {
+        match &self.config {
+            Some(config) => {
+                let dir = config.dir.display().to_string();
+                tracing::info!(
+                    setting = "sql_spill_dir",
+                    value = dir.as_str(),
+                    source = self.dir_source,
+                    "performance default resolved"
+                );
+                tracing::info!(
+                    setting = "sql_spill_max_bytes",
+                    value = config.max_bytes,
+                    source = self.max_bytes_source,
+                    "performance default resolved"
+                );
+            }
+            None => {
+                tracing::info!(
+                    setting = "sql_spill_dir",
+                    value = "none",
+                    source = self.dir_source,
+                    "performance default resolved"
+                );
+                tracing::info!(
+                    setting = "sql_spill_max_bytes",
+                    value = "none",
+                    source = self.max_bytes_source,
+                    "performance default resolved"
+                );
+            }
+        }
+    }
+}
+
+/// Resolve the SQL spill configuration from `--sql-spill`, the
+/// `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` values passed in, and
+/// `--cache-dir` (ADR-0954, amended by issue #2416), with the same
+/// [`ravel_sql::SpillConfig::resolve`] precedence
+/// `SqlConfig::with_spill_resolved` applies: `--sql-spill off` first, then the
+/// full env pair, then the cache directory (with `RAVEL_SQL_SPILL_MAX_BYTES`
+/// alone replacing the derived ceiling), else disabled.
+///
+/// A half-set env pair that no cache directory completes is an error naming
+/// the variable that is missing.
+#[cfg(feature = "sql")]
+pub fn resolve_sql_spill(
+    inputs: &SqlSpillInputs,
+    env_dir: Option<&std::ffi::OsStr>,
+    env_quota: Option<&std::ffi::OsStr>,
+) -> anyhow::Result<ResolvedSqlSpill> {
+    use ravel_sql::{ENV_SPILL_DIR, ENV_SPILL_MAX_BYTES, SpillConfig, SpillConfigError};
+
+    if inputs.off {
+        return Ok(ResolvedSqlSpill {
+            config: None,
+            dir_source: SQL_SPILL_SOURCE_FLAG_OFF,
+            max_bytes_source: SQL_SPILL_SOURCE_FLAG_OFF,
+        });
+    }
+    let cache_dir = inputs
+        .cache_dir
+        .as_ref()
+        .map(CacheDirSpillInputs::as_cache_dir_spill);
+    let config = SpillConfig::resolve(env_dir, env_quota, cache_dir).map_err(|err| match err {
+        SpillConfigError::Incomplete if env_dir.is_some() => anyhow::anyhow!(
+            "{ENV_SPILL_MAX_BYTES} is not set but {ENV_SPILL_DIR} is: set both to spill to \
+             that directory, or unset {ENV_SPILL_DIR} (with --cache-dir set, spill then goes \
+             under it)"
+        ),
+        SpillConfigError::Incomplete => anyhow::anyhow!(
+            "{ENV_SPILL_DIR} is not set but {ENV_SPILL_MAX_BYTES} is, and there is no \
+             --cache-dir to place the spill directory under: set {ENV_SPILL_DIR}, set \
+             --cache-dir, or unset {ENV_SPILL_MAX_BYTES}"
+        ),
+        other => anyhow::Error::new(other),
+    })?;
+    let (dir_source, max_bytes_source) = match (&config, env_dir.is_some(), env_quota.is_some()) {
+        (None, _, _) => (SQL_SPILL_SOURCE_UNSET, SQL_SPILL_SOURCE_UNSET),
+        (Some(_), true, _) => (SQL_SPILL_SOURCE_ENV, SQL_SPILL_SOURCE_ENV),
+        (Some(_), false, true) => (SQL_SPILL_SOURCE_CACHE_DIR, SQL_SPILL_SOURCE_ENV_OVERRIDE),
+        (Some(_), false, false) => (SQL_SPILL_SOURCE_CACHE_DIR, SQL_SPILL_SOURCE_DERIVED),
+    };
+    Ok(ResolvedSqlSpill {
+        config,
+        dir_source,
+        max_bytes_source,
+    })
+}
+
+/// What [`prepare_sql_spill`] settled before the SQL surface is built.
+#[cfg(feature = "sql")]
+pub struct SqlSpillStartup {
+    /// For [`build_sql_state_with_parquet`].
+    pub inputs: SqlSpillInputs,
+    /// What the startup lines reported.
+    pub resolved: ResolvedSqlSpill,
+    /// This process's hold on `<cache-dir>/sql-spill/<instance-id>`, when
+    /// spill resolved there. Its lock is the proof of liveness every other
+    /// process's sweep tests, so the caller keeps it for the process lifetime.
+    pub owner: Option<ravel_sql::spill::SpillRootOwner>,
+    /// Sibling roots the startup sweep left in place, each logged at INFO.
+    pub left_in_place: Vec<PathBuf>,
+}
+
+/// Resolve SQL spill at startup from the process environment (ADR-0954,
+/// amended by issue #2416), log the `sql_spill_dir` and `sql_spill_max_bytes`
+/// lines, and, when spill resolved under `--cache-dir`, take ownership of
+/// `<cache-dir>/sql-spill/<instance_id>` and sweep sibling roots whose owner
+/// is gone (requirement 7). Call before serving any query.
+///
+/// Fails, refusing startup, on a spill configuration error, when the free
+/// space under `--cache-dir` cannot be measured, or when this process cannot
+/// take its own root's lock; every message names the path involved.
+#[cfg(feature = "sql")]
+pub fn prepare_sql_spill(
+    cache_dir: Option<&std::path::Path>,
+    settings: crate::config::SqlSpillSettings,
+    instance_id: &str,
+) -> anyhow::Result<SqlSpillStartup> {
+    let env_dir = std::env::var_os(ravel_sql::ENV_SPILL_DIR);
+    let env_quota = std::env::var_os(ravel_sql::ENV_SPILL_MAX_BYTES);
+    prepare_sql_spill_with(
+        cache_dir,
+        settings,
+        instance_id,
+        env_dir.as_deref(),
+        env_quota.as_deref(),
+        ravel_sql::measure_free_bytes,
+    )
+}
+
+#[cfg(feature = "sql")]
+fn prepare_sql_spill_with(
+    cache_dir: Option<&std::path::Path>,
+    settings: crate::config::SqlSpillSettings,
+    instance_id: &str,
+    env_dir: Option<&std::ffi::OsStr>,
+    env_quota: Option<&std::ffi::OsStr>,
+    measure_free_bytes: impl FnOnce(&std::path::Path) -> std::io::Result<u64>,
+) -> anyhow::Result<SqlSpillStartup> {
+    use anyhow::Context as _;
+    use ravel_sql::spill::SpillRootOwner;
+
+    let cache_dir_inputs = match cache_dir {
+        Some(cache_dir) if !settings.off && env_dir.is_none() => {
+            let spill_root = cache_dir.join(ravel_sql::SQL_SPILL_SUBDIR);
+            std::fs::create_dir_all(&spill_root).with_context(|| {
+                format!(
+                    "could not create the SQL spill root {}",
+                    spill_root.display()
+                )
+            })?;
+            let free_bytes = measure_free_bytes(&spill_root).with_context(|| {
+                format!(
+                    "could not measure the free space under the SQL spill root {}",
+                    spill_root.display()
+                )
+            })?;
+            Some(CacheDirSpillInputs {
+                cache_dir: cache_dir.to_path_buf(),
+                instance_id: instance_id.to_string(),
+                free_bytes,
+                memory_budget_bytes: settings.memory_budget_bytes,
+            })
+        }
+        _ => None,
+    };
+    let inputs = SqlSpillInputs {
+        off: settings.off,
+        cache_dir: cache_dir_inputs,
+    };
+    let resolved = resolve_sql_spill(&inputs, env_dir, env_quota)?;
+    resolved.emit();
+
+    let mut owner = None;
+    let mut left_in_place = Vec::new();
+    if let (Some(cache), Some(config)) = (&inputs.cache_dir, &resolved.config)
+        && config.dir == ravel_sql::cache_spill_dir(&cache.cache_dir, &cache.instance_id)
+    {
+        let acquired =
+            SpillRootOwner::acquire(&cache.cache_dir, &cache.instance_id).with_context(|| {
+                format!(
+                    "could not take ownership of the SQL spill root {} (another live process \
+                     holds its owner lock, or the directory is not writable)",
+                    config.dir.display()
+                )
+            })?;
+        left_in_place = sweep_spill_roots(&acquired);
+        owner = Some(acquired);
+    }
+    Ok(SqlSpillStartup {
+        inputs,
+        resolved,
+        owner,
+        left_in_place,
+    })
+}
+
+/// Run `owner`'s orphan sweep, then log at INFO, and return, every sibling
+/// root it left: one whose owner lock a live process holds, or whose
+/// ownership could not be settled. Reads nothing outside
+/// `<cache-dir>/sql-spill`.
+#[cfg(feature = "sql")]
+fn sweep_spill_roots(owner: &ravel_sql::spill::SpillRootOwner) -> Vec<PathBuf> {
+    owner.sweep_orphaned_spill_roots();
+    let Some(spill_root) = owner.dir().parent() else {
+        return Vec::new();
+    };
+    let entries = match std::fs::read_dir(spill_root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(
+                dir = %spill_root.display(),
+                error = %err,
+                "could not list the SQL spill roots the startup sweep left"
+            );
+            return Vec::new();
+        }
+    };
+    let mut left: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .filter(|path| path != owner.dir())
+        .collect();
+    left.sort();
+    for dir in &left {
+        tracing::info!(
+            dir = %dir.display(),
+            "SQL spill root left in place by the startup sweep: a live process holds its \
+             owner lock, or its ownership could not be settled"
+        );
+    }
+    left
+}
+
 /// [`build_sql_state`] with Parquet tables queryable (ADR-2040): the executor
 /// resolves a tenant's Parquet manifests and grants from `store`, and reads
 /// their files through one read-only external store per (credential profile,
@@ -618,6 +939,10 @@ pub(crate) fn ddl_min_grace_ms(max_query_duration_ns: i64) -> anyhow::Result<u64
 /// running query: DDL never deletes a manifest version, only `ravel-cli
 /// parquet sweep` does. The caller derives it from the already-bootstrapped
 /// `GcConfigValues` rather than this function re-reading `sys/gc`.
+///
+/// `spill` is what [`prepare_sql_spill`] settled: the executor's
+/// `SqlConfig::spill` comes from `SqlConfig::with_spill_resolved(spill.off,
+/// spill.cache_dir)`.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -636,6 +961,7 @@ pub fn build_sql_state_with_parquet(
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet_profiles: Option<crate::config::ParquetProfiles>,
     ddl_min_grace_ms: u64,
+    spill: &SqlSpillInputs,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -672,6 +998,7 @@ pub fn build_sql_state_with_parquet(
         process_memory_budget,
         Some(sources),
         ddl_min_grace_ms,
+        spill,
     )
 }
 
@@ -693,6 +1020,7 @@ fn build_sql_state_inner(
     process_memory_budget: Arc<ravel_memory::MemoryBudget>,
     parquet: Option<ravel_sql::ParquetSources>,
     ddl_min_grace_ms: u64,
+    spill: &SqlSpillInputs,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -722,11 +1050,10 @@ fn build_sql_state_inner(
         // field is an in-process escape hatch and the tests' rule-off side,
         // not a server-level knob.
         bounded_topk_max_limit: SqlConfig::default().bounded_topk_max_limit,
-        // ADR-0954: bounded ephemeral spill is off by default (requirement 9's
-        // no-spill deployment profile). `with_spill_from_env` below fills this
-        // from `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` when both are
-        // set, so a deployment can arm spill without a code change; unset leaves
-        // it `None` and the memory budget refuses as before.
+        // ADR-0954, amended by issue #2416: `with_spill_resolved` below fills
+        // this from `--sql-spill`, the `RAVEL_SQL_SPILL_DIR`/
+        // `RAVEL_SQL_SPILL_MAX_BYTES` pair, and `--cache-dir`, in that order;
+        // none of them leaves it `None` and the memory budget refuses as before.
         spill: None,
         // Issue #913: the per-segment scan timeline is a bench-reporter-only
         // knob, with no flag, for the same reason as the lines above. Off by
@@ -734,7 +1061,13 @@ fn build_sql_state_inner(
         // metric registrations.
         segment_timing: SqlConfig::default().segment_timing,
     }
-    .with_spill_from_env()?;
+    .with_spill_resolved(
+        spill.off,
+        spill
+            .cache_dir
+            .as_ref()
+            .map(CacheDirSpillInputs::as_cache_dir_spill),
+    )?;
     let max_deadline = config.engine.deadline;
     let mut metrics_fetcher = SegmentFetcher::new(store.clone())
         .with_get_limiter(get_limiter.clone())
@@ -1957,6 +2290,7 @@ mod tests {
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             None,
             7_000,
+            &SqlSpillInputs::default(),
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
@@ -2009,6 +2343,7 @@ mod tests {
             Arc::new(ravel_memory::MemoryBudget::unlimited()),
             None,
             expected_ms,
+            &SqlSpillInputs::default(),
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), expected_ms);
@@ -2136,6 +2471,7 @@ mod tests {
                 Arc::new(ravel_memory::MemoryBudget::unlimited()),
                 profiles,
                 ravel_sql::DEFAULT_MIN_GRACE_MS,
+                &SqlSpillInputs::default(),
             )
             .expect("sql state builds")
         };

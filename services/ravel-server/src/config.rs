@@ -255,6 +255,42 @@ impl LogsFetchPolicyArg {
     }
 }
 
+/// The `--sql-spill` values (ADR-0954, amended by issue #2416).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum SqlSpillArg {
+    /// Spill wherever a source configures it: the
+    /// `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` pair, else
+    /// `--cache-dir`.
+    #[default]
+    Auto,
+    /// ADR-0954 requirement 9's no-spill profile: spill is disabled whatever
+    /// the environment or `--cache-dir` says.
+    Off,
+}
+
+/// The SQL spill inputs `start` resolves at startup (ADR-0954, amended by
+/// issue #2416), carried on [`QueryBudgets`] because they come from the
+/// command line and the resolved performance defaults, which `start` does
+/// not otherwise see. The spill directory itself comes from
+/// [`crate::ServerConfig::cache_dir`] and the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SqlSpillSettings {
+    /// `--sql-spill off`.
+    pub off: bool,
+    /// [`ResolvedPerformanceDefaults::memory_budget_bytes`], the input that
+    /// caps a `--cache-dir`-derived spill ceiling at four times its value.
+    pub memory_budget_bytes: u64,
+}
+
+impl Default for SqlSpillSettings {
+    fn default() -> Self {
+        SqlSpillSettings {
+            off: false,
+            memory_budget_bytes: u64::MAX,
+        }
+    }
+}
+
 /// The `--audit-mode` values (ADR-0062 decision 2b). The CLI-facing mirror of
 /// [`ravel_maintain::AuditMode`], which lives in a crate that does not depend
 /// on clap.
@@ -1237,6 +1273,20 @@ pub struct Cli {
         action = clap::ArgAction::Set,
     )]
     pub sql_parallel_final_aggregation: bool,
+
+    /// Bounded ephemeral SQL spill (ADR-0954, amended by issue #2416). `auto`
+    /// (default) spills an exactness-eligible query that exceeds its memory
+    /// pool to the first configured source: the
+    /// `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` pair; else, with
+    /// `--cache-dir` set, `<cache-dir>/sql-spill/<instance-id>` under a ceiling
+    /// of half the volume's free bytes at startup, capped at four times the
+    /// memory budget and floored at 1 GiB (`RAVEL_SQL_SPILL_MAX_BYTES` alone
+    /// replaces that ceiling); else no spill. `off` disables spill whatever the
+    /// environment or `--cache-dir` says. The startup log's
+    /// `sql_spill_dir` and `sql_spill_max_bytes` lines report the outcome.
+    /// Meaningful only in a build with the `sql` feature; inert otherwise.
+    #[arg(long = "sql-spill", value_enum, default_value = "auto")]
+    pub sql_spill: SqlSpillArg,
 
     /// Object size above which a logs scan reads only the pruning-relevant
     /// blocks of an RLOG object (a suffix probe plus coalesced block-range GETs)
@@ -2529,6 +2579,9 @@ pub struct QueryBudgets {
     /// `None` when the flag was not set. Like [`Self::mcp`], it rides here as
     /// query-surface configuration; it reaches no fold.
     pub fold_lag_interval: Option<Duration>,
+    /// `--sql-spill` and the memory budget a `--cache-dir`-derived spill
+    /// ceiling is capped against (ADR-0954, amended by issue #2416).
+    pub sql_spill: SqlSpillSettings,
 }
 
 impl Default for QueryBudgets {
@@ -2550,6 +2603,7 @@ impl Default for QueryBudgets {
             logs_max_fetch_run_bytes: ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
             mcp: McpConfig::default(),
             fold_lag_interval: None,
+            sql_spill: SqlSpillSettings::default(),
         }
     }
 }
@@ -5668,6 +5722,10 @@ impl Cli {
                 max_body_bytes: self.mcp_max_body_bytes,
             },
             fold_lag_interval: self.fold_lag_interval_secs.map(Duration::from_secs),
+            sql_spill: SqlSpillSettings {
+                off: self.sql_spill == SqlSpillArg::Off,
+                memory_budget_bytes: resolved.memory_budget_bytes,
+            },
         })
     }
 
