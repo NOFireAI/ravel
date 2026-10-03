@@ -452,6 +452,17 @@ the reference box) holds q33's 10,855,811,936-byte peak, where the earlier
 8 GiB pin did not. Assert the measured and failed identities instead, as step
 9 does; a non-zero exit is a statement to name, not a known cost.
 
+`--sql-tenant-max-bytes`/`--sql-max-query-bytes` are passed explicitly above,
+so they are exempt from the 90%-of-remainder cap ADR-1170 (amended
+2026-10-03 by issue #2367) places on a derived pool: an unset run on this
+same box would instead resolve `memory_budget_bytes` from `MemAvailable`
+(`source="derived-available"`), and the two SQL pools would then be
+`16,451,897,344` each only if that leaves them under 90% of the remaining
+budget -- see
+[`docs/internal/clickbench.md`](clickbench.md#deriving-the-reference-sizes)
+for the worked S3 and loopback figures and how they move with
+`MemAvailable`.
+
 ## 9. Check the report before reading the headline
 
 A number printed and not asserted on is decoration. Write the expected figures
