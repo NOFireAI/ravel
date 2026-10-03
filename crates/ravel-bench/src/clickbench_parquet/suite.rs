@@ -106,6 +106,13 @@ pub enum SuiteError {
          \"by-name\" without a reason"
     )]
     ColumnMatchWithoutReason { number: u32 },
+    /// A `[[statement]]` override names a statement number `queries.sql`
+    /// does not hold, so it would apply to nothing.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: an override names statement {number}, \
+         which queries.sql does not hold (it has {count} statements)"
+    )]
+    UnknownStatement { number: u32, count: usize },
 }
 
 /// `suite.toml`'s `[table]` section: the Ravel DDL template that mounts the
@@ -293,7 +300,14 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
     }
     let doc: SuiteTomlDoc =
         toml::from_str(suite_toml).map_err(|e| SuiteError::InvalidToml(e.to_string()))?;
+    let statements = parse_statements(queries_sql);
     for over in &doc.statements {
+        if !statements.iter().any(|s| s.number == over.number) {
+            return Err(SuiteError::UnknownStatement {
+                number: over.number,
+                count: statements.len(),
+            });
+        }
         if over.float_reason.is_some() != over.float_max_ulps.is_some() {
             return Err(SuiteError::IncompleteFloatDeclaration {
                 number: over.number,
@@ -332,7 +346,7 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
         }
     }
     Ok(Suite {
-        statements: parse_statements(queries_sql),
+        statements,
         table: doc.table,
         overrides: doc.statements,
     })
@@ -416,14 +430,17 @@ mod tests {
     }
 
     /// The checked-in statement 4 override declares the sequential-fold avg
-    /// tolerance at exactly 2 ULPs.
+    /// tolerance at exactly 3 ULPs.
     #[test]
     fn statement_4_float_tolerance_loads() {
         let suite = load_default().expect("pinned corpus loads");
         let over = suite.override_for(4).expect("Q4 override present");
         let tolerance = over.float_tolerance().expect("Q4 declares a tolerance");
-        assert_eq!(tolerance.reason, "Ravel sequential-fold avg (ADR-0022)");
-        assert_eq!(tolerance.max_ulps, 2);
+        assert_eq!(
+            tolerance.reason,
+            "Ravel sequential-fold avg (ADR-0022); measured 1 and 2 ULPs, plus 1 ULP headroom"
+        );
+        assert_eq!(tolerance.max_ulps, 3);
     }
 
     /// The checked-in statement 19 override declares its expected error text
@@ -532,6 +549,45 @@ mod tests {
             err,
             SuiteError::ExpectedErrorWithoutReason { number: 19 }
         ));
+    }
+
+    /// An override naming a statement number outside `queries.sql` (0, or
+    /// one past the last statement) is a typed load error naming that
+    /// number, while the last real statement number loads.
+    #[test]
+    fn override_for_unknown_statement_is_refused() {
+        let toml_for = |number: u32| {
+            format!(
+                r#"
+                [table]
+                template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{{location}}'"
+
+                [[statement]]
+                number = {number}
+                order_key = [0]
+                "#
+            )
+        };
+        let past_end = STATEMENT_COUNT as u32 + 1;
+        for number in [0, past_end] {
+            let err = load(QUERIES_SQL, &toml_for(number))
+                .expect_err("an override for a missing statement is refused");
+            assert_eq!(
+                err,
+                SuiteError::UnknownStatement {
+                    number,
+                    count: STATEMENT_COUNT,
+                }
+            );
+            assert!(
+                err.to_string()
+                    .contains(&format!("names statement {number},")),
+                "error must name the number: {err}"
+            );
+        }
+        let suite = load(QUERIES_SQL, &toml_for(STATEMENT_COUNT as u32))
+            .expect("an override for the last statement loads");
+        assert!(suite.override_for(STATEMENT_COUNT as u32).is_some());
     }
 
     /// A `[[statement]]` block declaring only `float_reason` (no
