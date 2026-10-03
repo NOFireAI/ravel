@@ -1843,12 +1843,12 @@ async fn probe_covers_the_plan_sections_on_a_wide_row_group_object() {
         ..seg_ref(bytes.len() as u64, &[record(0)])
     };
     let acc = QueryAccounting::new();
-    let (_footer, _skip, _fd, stats) = BlockRangeFetcher::new(store)
+    let (_footer, _dirs, stats) = BlockRangeFetcher::new(store)
         .with_whole_object_threshold(0)
         .with_suffix_len(ravel_query::DEFAULT_LOG_SUFFIX_LEN)
-        .fetch_plan_sections(&seg, TENANT, &acc)
+        .fetch_plan_directories(&seg, TENANT, &acc)
         .await
-        .expect("plan sections");
+        .expect("plan directories");
     assert_eq!(stats.probe_gets, 1, "one probe");
     assert_eq!(
         stats.probe_misses, 0,
@@ -1856,8 +1856,8 @@ async fn probe_covers_the_plan_sections_on_a_wide_row_group_object() {
     );
     assert!(
         recording.ranges().len() <= 1,
-        "at most one section GET beyond the probe, and only ever FIELD_DIR at \
-         the object front: {:?}",
+        "at most one section GET beyond the probe, and only ever the front pair \
+         (STREAM_DIR and FIELD_DIR) at the object front: {:?}",
         recording.ranges()
     );
 }
@@ -2076,8 +2076,8 @@ async fn a_carried_footer_that_counted_nothing_leaves_the_scan_to_count() {
 }
 
 /// A scan handed a footer whose plan read ALREADY counted the tail sections
-/// counts nothing: `fetch_plan_sections` runs `ensure_tail_plan_sections`, which
-/// counted both, and counting them again here would report one object's
+/// counts nothing: `fetch_plan_directories` runs `ensure_tail_plan_sections`,
+/// which counted both, and counting them again here would report one object's
 /// too-short probe as two.
 ///
 /// This is case 2. The sum across the two phases is the assertion that matters:
@@ -2099,10 +2099,10 @@ async fn a_carried_footer_that_already_counted_is_not_counted_again() {
     let fetcher = BlockRangeFetcher::new(store)
         .with_whole_object_threshold(0)
         .with_suffix_len(suffix);
-    let (footer, _skip, _fd, plan_stats) = fetcher
-        .fetch_plan_sections(&seg, TENANT, &acc)
+    let (footer, _dirs, plan_stats) = fetcher
+        .fetch_plan_directories(&seg, TENANT, &acc)
         .await
-        .expect("plan sections");
+        .expect("plan directories");
     assert_eq!(
         plan_stats.probe_misses, 2,
         "the plan read located both tail sections through a window that reached \

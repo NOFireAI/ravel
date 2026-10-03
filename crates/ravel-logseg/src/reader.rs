@@ -202,9 +202,12 @@ impl SegmentDirectories {
         self.open_decompressed_bytes
     }
 
-    /// Decoded length of STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR
-    /// together: what a holder of these directories keeps resident, and so the
-    /// figure to reserve against a memory budget while it holds them.
+    /// Decompressed length of STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR
+    /// together (each section's `uncomp_len`). It is a proxy for the heap a
+    /// holder of the decoded directories keeps resident, not a measurement of
+    /// it: the decoded structures differ from the section bytes in layout and
+    /// allocation overhead. It is the figure reserved against a memory budget
+    /// while the directories are held.
     /// [`Self::open_decompressed_bytes`] differs for a section stored raw,
     /// which it does not count because nothing was decompressed.
     pub fn decoded_bytes(&self) -> u64 {

@@ -8346,23 +8346,76 @@ mod carried_directory_reservation_tests {
         drop(counts);
         assert_eq!(budget.reserved(), 0, "released when the plan counts drop");
 
-        // A budget one byte short of the two segments' directories refuses the
-        // statement with the fetch memory error a refused whole-object
-        // reservation reports.
-        let tight = Arc::new(ravel_memory::MemoryBudget::new(with_survivors.1 - 1));
-        let ctx = PartitionCtx {
-            fetcher: ctx.fetcher.clone().with_memory_budget(tight),
-            ..ctx
+        // The refusal, on objects whose directories are much larger than what a
+        // plan read buffers (a long repetitive attribute value decodes to far
+        // more than its compressed section): a budget of exactly the two
+        // segments' decoded directories admits their plan, and one byte less
+        // refuses it with the typed fetch memory error a refused whole-object
+        // reservation reports, on the reservation that completes the
+        // directories. The reads run one at a time, so each reads with only the
+        // earlier segments' directories held. On the fixture above a plan
+        // read's buffers outweigh a segment's directories, so any limit that
+        // refuses there refuses a read's buffer first, with the same error, and
+        // a smaller limit here does the same: neither shows that the
+        // directories are what trips.
+        let store = Arc::new(MemoryStore::new());
+        let objects = [overflow_object(1), overflow_object(2)];
+        let mut segments = Vec::new();
+        for (i, obj) in objects.iter().enumerate() {
+            let key = format!("t/large{i}.rlog");
+            store
+                .put(&key, bytes::Bytes::from(obj.clone()), PutOptions::default())
+                .await
+                .expect("put");
+            segments.push(seg_ref(&key, obj, 1, i as u64 + 1));
+        }
+        let per_segment: Vec<u64> = objects.iter().map(|o| directory_bytes(o).1).collect();
+        let total: u64 = per_segment.iter().sum();
+        let with_limit = |limit: u64| PartitionCtx {
+            fetcher: LogSegmentFetcher::new(store.clone())
+                .with_memory_budget(Arc::new(ravel_memory::MemoryBudget::new(limit)))
+                .with_block_range(
+                    BlockRangeFetcher::new(store.clone())
+                        .with_suffix_len(256)
+                        .with_whole_object_threshold(0),
+                )
+                .with_block_range_threshold(0),
+            tenant_hash: TENANT,
+            query: LogQuery::new(11, 19),
+            columns: ColumnSelection::all(),
+            projected_fraction: 1.0,
+            phase_accounting: PhaseAccounting::new(),
         };
-        let refused = compute_plan_counts(&ctx, &segments, 4, true).await;
-        let err = refused
-            .err()
-            .expect("a budget too small for the directories refuses");
+        let exact = compute_plan_counts(&with_limit(total), &segments, 1, true).await;
         assert!(
-            err.to_string().contains("memory"),
-            "typed fetch memory error, got: {err}"
+            exact.is_ok(),
+            "the directories fit a budget of exactly their size: {:?}",
+            exact.as_ref().err()
+        );
+        drop(exact);
+        let err = compute_plan_counts(&with_limit(total - 1), &segments, 1, true)
+            .await
+            .err()
+            .expect("a budget one byte short of the directories refuses");
+        let typed = match &err {
+            DataFusionError::External(e) => e.downcast_ref::<SqlError>(),
+            _ => None,
+        };
+        let Some(SqlError::LogFetch(LogFetchError::FetchMemoryExhausted {
+            requested,
+            reserved,
+            limit,
+        })) = typed
+        else {
+            panic!("expected the typed fetch memory error, got: {err:?}");
+        };
+        assert_eq!(
+            (*requested, *reserved, *limit),
+            (per_segment[1], per_segment[0], total - 1),
+            "the second segment's directories are refused with the first's held"
         );
     }
+
     /// A segment's rows through a scan whose plan counts are seeded with
     /// `plan_indices` as the survivor list, over a ts window that keeps blocks
     /// 6..12 of the object. Returns the rows' timestamps, or the stream's error.
