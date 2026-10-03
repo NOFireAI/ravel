@@ -731,9 +731,9 @@ concurrency is CPU-derived and also matches on this box: 32, two per core on
 `MemTotal` (capped by the cgroup limit when the server runs in a container,
 which the reference box does not), which Linux reports as
 32,909,025,280 bytes here, so they land within 2.2% of the published figures
-rather than on them: a 25% read cache and a 25% per-query SQL pool, each
-8,227,256,320 bytes here against the published 8,053,063,680, and a 50%
-per-tenant pool of 16,454,512,640 against 16,106,127,360. The catalog byte
+rather than on them: a 25% read cache of 8,227,256,320 bytes here against
+the published 8,053,063,680, and 50% per-query and per-tenant SQL pools of
+16,454,512,640 each against 16,106,127,360. The catalog byte
 cache derives to a separate 5% ceiling,
 1,645,451,264 bytes (#1141). Do not assume the resolved values: record the
 server's own startup log lines (below) with the entry. Both of the two settings
@@ -796,7 +796,7 @@ cargo run -p ravel-bench --features sql-latency,flight-lane --bin sql_latency_be
   --tenant clickbench --store s3 --flight 127.0.0.1:4317 \
   --corpus benchmarks/clickbench/hits.corpus.json \
   --runs 3 --compaction pre --window-hours 200000 \
-  --fetch-concurrency 32 --sql-max-query-bytes 8053063680
+  --fetch-concurrency 32 --sql-max-query-bytes 16106127360
 ```
 
 The two bench-side values are the reference host's resolved defaults, so the
