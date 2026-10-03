@@ -2767,6 +2767,14 @@ impl ExecutionPlan for LogsScanExec {
                 (VecDeque::new(), false, LogScanState::Planning(counts_fut))
             }
         };
+        // ADR-2414 decision A2: the fast path pipelines its ranged opens at
+        // its share of the GET permits, which `get_limiter_permits` reads off
+        // the process-shared limiter the server wires into the fetcher.
+        let prefetch_share = if fast_whole_segment && self.fetch.is_none() {
+            fast_path_prefetch_share(self.fetcher.get_limiter_permits(), self.target_partitions)
+        } else {
+            1
+        };
 
         Ok(Box::pin(LogScanStream {
             schema: Arc::clone(&self.schema),
@@ -2788,6 +2796,9 @@ impl ExecutionPlan for LogsScanExec {
             partition,
             stripe_blocks: self.stripe_blocks,
             fast_whole_segment,
+            prefetch_share,
+            prefetched: VecDeque::new(),
+            current_by_chunk: false,
             segments: Arc::clone(&self.segments),
             work,
             reservation,
@@ -3608,6 +3619,38 @@ fn open_segment_fast(ctx: Arc<PartitionCtx>, seg: SegmentRef, by_column_chunk: b
     }
 }
 
+/// How many of one partition's ranged fast-path segment opens may be held at
+/// once, counting the segment being drained (ADR-2414 decision A2): the
+/// partition's share of the process's GET permits, `store_get_concurrency /
+/// partitions`, and at least 2 so the next segment's round trips always
+/// overlap the current one's decode.
+fn fast_path_prefetch_share(store_get_concurrency: usize, partitions: usize) -> usize {
+    (store_get_concurrency / partitions.max(1)).max(2)
+}
+
+/// A ranged fast-path open issued ahead of this partition's turn to drain
+/// its segment (ADR-2414 decision A2). It is the same [`open_segment_fast`]
+/// future the sequential open would build, polled from
+/// [`LogScanStream::drive_prefetches`] until it resolves; the resolved open
+/// is kept, error included, until the segment's turn comes, so an error is
+/// reported for the segment that produced it and only once the segments
+/// before it have been emitted.
+struct Prefetch {
+    seg: SegmentRef,
+    ordinal: usize,
+    /// When the open was issued: the start of this segment's `open_elapsed`.
+    issued: Instant,
+    open: PrefetchOpen,
+}
+
+enum PrefetchOpen {
+    InFlight(OpenFuture),
+    Ready {
+        opened: DFResult<Option<LogSegmentScan>>,
+        at: Instant,
+    },
+}
+
 /// Consecutive `attrs_raw`-overflow fallbacks (see
 /// [`LogScanStream::consecutive_fallbacks`]) tolerated within one segment
 /// before the rest of this partition's block list is committed to the row
@@ -3838,6 +3881,30 @@ struct LogScanStream {
     /// totals are recorded per segment at exhaustion (each segment has one owner,
     /// so no double count) instead of by partition 0 during planning.
     fast_whole_segment: bool,
+    /// The pipeline depth of the ranged fast path (ADR-2414 decision A2,
+    /// [`fast_path_prefetch_share`]): how many of this partition's owned
+    /// segments may be open at once, counting the one being opened or drained.
+    /// While that segment is a ranged open, [`Self::top_up_prefetch`] issues the
+    /// next owned segments' ranged opens up to this bound, and they are consumed
+    /// in owned order, so rows, per-segment counters and per-query accounting
+    /// are those of the sequential walk. A prefetched open holds the fetched
+    /// column-chunk bytes of its segment, reserved against the fetcher's memory
+    /// budget like any open's, so the bytes this partition holds for opened
+    /// segments are bounded by this share times one segment's projected bytes.
+    ///
+    /// `1`, no prefetch, everywhere else: on the striped route, and under a
+    /// pushed `fetch`, which may stop the partition before segments it would
+    /// have prefetched. A whole-object fast-path open is never prefetched and
+    /// stops the pipeline at its turn, because an in-flight whole-object open
+    /// holds a full object per slot; the `attrs_raw` fallback reopen also stays
+    /// sequential, with the prefetches behind it left in flight.
+    prefetch_share: usize,
+    /// The issued opens of the owned segments after the current one, in owned
+    /// order. Empty unless [`Self::prefetch_share`] exceeds 1.
+    prefetched: VecDeque<Prefetch>,
+    /// Whether the current fast-path segment was opened ranged, the
+    /// precondition for prefetching behind it.
+    current_by_chunk: bool,
     /// Every segment in the snapshot, snapshot order, shared with the exec. The
     /// owned-work computation indexes this by segment position.
     segments: Arc<Vec<SegmentRef>>,
@@ -3969,13 +4036,73 @@ impl LogScanStream {
     /// current offset from the exec's origin, labelled with the segment's
     /// snapshot ordinal so a reader can line the partitions up on one clock.
     fn mark_segment(&self, name: &'static str) {
+        self.mark_segment_at(self.current_seg_ordinal, name);
+    }
+
+    /// [`Self::mark_segment`] for the segment at snapshot ordinal `ordinal`,
+    /// which a prefetched open reaches before it is the current segment.
+    fn mark_segment_at(&self, ordinal: usize, name: &'static str) {
         if !self.segment_timing {
             return;
         }
         MetricBuilder::new(&self.metrics)
-            .with_new_label("segment", self.current_seg_ordinal.to_string())
+            .with_new_label("segment", ordinal.to_string())
             .subset_time(name, self.partition)
             .add_elapsed(self.origin);
+    }
+
+    /// Issue the ranged opens of this partition's next owned segments, in
+    /// owned order, until [`Self::prefetch_share`] opens are held counting the
+    /// current one (ADR-2414 decision A2). Only behind a ranged current
+    /// segment, and only while the next owned segment is itself a ranged
+    /// open: the first whole-object segment stays in `work` and opens
+    /// sequentially at its turn.
+    fn top_up_prefetch(&mut self, cx: &mut Context<'_>) {
+        if !self.current_by_chunk {
+            return;
+        }
+        while self.prefetched.len() + 1 < self.prefetch_share {
+            let ranged = self
+                .work
+                .front()
+                .is_some_and(|next| self.ctx.open_by_column_chunk(&next.seg));
+            if !ranged {
+                break;
+            }
+            let Some(next) = self.work.pop_front() else {
+                break;
+            };
+            self.mark_segment_at(next.ordinal, "seg_open_start_offset");
+            let open = open_segment_fast(Arc::clone(&self.ctx), next.seg.clone(), true);
+            self.prefetched.push_back(Prefetch {
+                seg: next.seg,
+                ordinal: next.ordinal,
+                issued: Instant::now(),
+                open: PrefetchOpen::InFlight(open),
+            });
+        }
+        self.drive_prefetches(cx);
+    }
+
+    /// Poll every in-flight prefetched open once, keeping each result until
+    /// its segment's turn. A pending open has registered `cx`'s waker, so the
+    /// stream is polled again when it can make progress.
+    fn drive_prefetches(&mut self, cx: &mut Context<'_>) {
+        let mut ready = Vec::new();
+        for prefetch in self.prefetched.iter_mut() {
+            if let PrefetchOpen::InFlight(fut) = &mut prefetch.open
+                && let Poll::Ready(opened) = fut.as_mut().poll(cx)
+            {
+                prefetch.open = PrefetchOpen::Ready {
+                    opened,
+                    at: Instant::now(),
+                };
+                ready.push(prefetch.ordinal);
+            }
+        }
+        for ordinal in ready {
+            self.mark_segment_at(ordinal, "seg_open_ready_offset");
+        }
     }
 
     /// The surviving-block index of the block just decoded, or `None` when
@@ -4129,6 +4256,7 @@ impl LogScanStream {
         self.state = LogScanState::Done;
         self.current_dirs = None;
         self.work.clear();
+        self.prefetched.clear();
         self.release_block();
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         Poll::Ready(Some(Err(e)))
@@ -4175,6 +4303,7 @@ impl Stream for LogScanStream {
 impl LogScanStream {
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<DFResult<RecordBatch>>> {
         let this = self;
+        this.drive_prefetches(cx);
         loop {
             // Anything buffered from the current block goes out first.
             if this.has_pending() {
@@ -4243,7 +4372,61 @@ impl LogScanStream {
                     // remains), and never a truncation of what is already
                     // buffered (`has_pending` above always runs first).
                     this.work.clear();
+                    this.prefetched.clear();
                     this.state = LogScanState::Done;
+                }
+                // The next owned segment's open was issued ahead of its turn
+                // (ADR-2414 decision A2). Everything the sequential walk
+                // records for a fast-path segment is recorded here, at its
+                // turn and in owned order; every prefetch is a ranged open.
+                LogScanState::NextSegment if !this.prefetched.is_empty() => {
+                    let Some(Prefetch {
+                        seg,
+                        ordinal,
+                        issued,
+                        open,
+                    }) = this.prefetched.pop_front()
+                    else {
+                        continue;
+                    };
+                    this.current_seg = Some(seg);
+                    this.current_seg_ordinal = ordinal;
+                    this.current_indices = Vec::new();
+                    this.current_survivors = None;
+                    this.current_footer = None;
+                    this.current_dirs = None;
+                    this.current_whole_object = None;
+                    this.current_by_chunk = true;
+                    this.block_cursor = 0;
+                    this.consecutive_fallbacks = 0;
+                    this.blocks.segments_opened.add(1);
+                    this.blocks.record_fast_path_route(true);
+                    this.ctx.record_open_shape(true);
+                    this.ctx.record_data_object_touched();
+                    match open {
+                        PrefetchOpen::InFlight(fut) => {
+                            this.open_started = Some(issued);
+                            this.state = LogScanState::Opening(fut);
+                        }
+                        PrefetchOpen::Ready { opened, at } => {
+                            this.open_started = None;
+                            this.blocks
+                                .open_elapsed
+                                .add_duration(at.saturating_duration_since(issued));
+                            match opened {
+                                Ok(Some(scan)) => {
+                                    this.state = if this.columnar_eligible {
+                                        LogScanState::Columnar(Box::new(scan))
+                                    } else {
+                                        LogScanState::Rows(Box::new(scan))
+                                    };
+                                }
+                                Ok(None) => this.finish_segment(),
+                                Err(e) => return this.fail(e),
+                            }
+                        }
+                    }
+                    this.top_up_prefetch(cx);
                 }
                 LogScanState::NextSegment => match this.work.pop_front() {
                     Some(OwnedSeg {
@@ -4282,6 +4465,7 @@ impl LogScanStream {
                         // subset, reusing the plan footer if any.
                         this.state = if this.fast_whole_segment {
                             let by_chunk = this.ctx.open_by_column_chunk(&seg);
+                            this.current_by_chunk = by_chunk;
                             this.blocks.record_fast_path_route(by_chunk);
                             this.ctx.record_open_shape(by_chunk);
                             // The fast path's owning-partition recorder for
@@ -4312,6 +4496,7 @@ impl LogScanStream {
                                 open_dirs,
                             ))
                         };
+                        this.top_up_prefetch(cx);
                     }
                     None => {
                         this.state = LogScanState::Done;
