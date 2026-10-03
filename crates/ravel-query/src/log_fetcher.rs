@@ -3844,14 +3844,16 @@ impl ProbeMissCounts {
 /// object, carried into a scan read so it can skip its own suffix probe (#693
 /// part 3), together with what that plan read already counted.
 ///
-/// `tail_misses_counted` exists because the plan phase has TWO footer-carrying
-/// reads and they differ in exactly that. [`BlockRangeFetcher::fetch_plan_sections`]
-/// runs `ensure_tail_plan_sections`, which counts this object's tail-section
-/// probe misses into the plan phase's own [`BlockRangeStats`];
-/// [`BlockRangeFetcher::fetch_footer`] reads the footer alone and counts nothing
-/// about SKIP_IDX or PAGE_DIR. A scan handed a bare footer cannot tell the two
-/// apart, so it either counts the first object twice or drops the second
-/// object's real miss (#883, issue #885 review).
+/// `tail_misses_counted` exists because footer-carrying reads differ in exactly
+/// that. [`BlockRangeFetcher::fetch_plan_directories`], which both of
+/// `plan_segment`'s footer-carrying branches read through, runs
+/// `ensure_tail_plan_sections` and counts this object's SKIP_IDX and PAGE_DIR
+/// probe misses into the plan phase's own [`BlockRangeStats`], so the scan path
+/// always carries its footer with `true`. [`BlockRangeFetcher::fetch_footer`]
+/// reads the footer alone and counts nothing about SKIP_IDX or PAGE_DIR, so a
+/// caller carrying its footer passes `false`. A scan handed a bare footer could
+/// not tell the two apart, and would either count the first object twice or
+/// drop the second object's real miss (#883, issue #885 review).
 #[derive(Clone, Copy, Debug)]
 pub struct CarriedFooter<'a> {
     /// The footer the plan read parsed, valid for this exact object.
@@ -4805,10 +4807,13 @@ impl BlockRangeFetcher {
     /// in [`LogSegmentFetcher::tenant_bytes`] does for its one key. Without a
     /// cache every call is a live GET, as before.
     ///
-    /// This is what keeps ADR-0102 decision 1's premise true above the
-    /// block-range threshold: the partitions striping one segment resolve the
-    /// same extents and coalesce onto one real request each instead of one per
-    /// partition.
+    /// Partitions striping one segment above the block-range threshold share
+    /// the extents they all need this way (the probe, and a section such as
+    /// BLOOM), with one real request each instead of one per partition
+    /// (ADR-0102 decision 1). Their chunk runs are no longer such extents: each
+    /// partition fetches only its own row groups' runs, fenced off from every
+    /// other partition's (ADR-2414 decision A1), so no two partitions ask for
+    /// the same run.
     ///
     /// `range` is passed alongside `[start, len)` rather than derived from it
     /// because the etag-establishing probe must stay a [`GetRange::Suffix`]
@@ -5149,7 +5154,7 @@ impl BlockRangeFetcher {
         // SKIP_IDX only: this entry point's caller
         // (`plan_segment_block_stats`) reads the index's own per-block figures
         // and no page, so warming PAGE_DIR here would move bytes nothing goes on
-        // to use. `fetch_plan_sections`, whose caller IS followed by a scan,
+        // to use. `fetch_plan_directories`, whose caller IS followed by a scan,
         // brings the pair.
         self.ensure_tail_plan_sections(
             seg_ref,
@@ -5243,8 +5248,8 @@ impl BlockRangeFetcher {
     /// Decode one whole-compressed directory section from a region the probe
     /// already left resident, or a cache-routed range GET when it did not.
     /// Section-kind agnostic, so [`fetch_skip_index`](Self::fetch_skip_index)
-    /// and [`fetch_plan_sections`](Self::fetch_plan_sections) pull SKIP_IDX and
-    /// FIELD_DIR through the same path without an object-sized buffer, unlike
+    /// and [`fetch_stream_dir`](Self::fetch_stream_dir) pull SKIP_IDX and
+    /// STREAM_DIR through the same path without an object-sized buffer, unlike
     /// [`place_section`](Self::place_section), which needs an
     /// [`ObjectAssembler`] to place into.
     #[allow(clippy::too_many_arguments)]
@@ -5291,98 +5296,12 @@ impl BlockRangeFetcher {
             .await
     }
 
-    /// Read the footer, SKIP_IDX, and FIELD_DIR for one segment and decode all
-    /// three, fetching no BLOCKS byte (#761): the plan phase's counterpart of
-    /// [`fetch_skip_index`](Self::fetch_skip_index) for a query carrying
-    /// prune-only NumRange arms. The footer is returned so the caller can carry
-    /// it to each per-partition subset open (they then skip re-probing, #693 part
-    /// 3), the SKIP_IDX drives the survivor count, and the FIELD_DIR resolves the
-    /// arms to this object's column ids so that count is computed with the same
-    /// pruning the scan will apply.
-    ///
-    /// One ADR-0107 suffix probe plus, where the probe did not already cover
-    /// them, one range GET per section: SKIP_IDX (near the tail, usually covered
-    /// by a production-sized probe) and FIELD_DIR (a front section, generally its
-    /// own GET). No whole-object crossover, so the caller must guarantee
-    /// `object_size > block_range_threshold` for the reason
-    /// [`fetch_footer`](Self::fetch_footer) documents.
-    pub async fn fetch_plan_sections(
-        &self,
-        seg_ref: &SegmentRef,
-        tenant_hash: TenantHash,
-        accounting: &QueryAccounting,
-    ) -> Result<(footer::LogFooter, SkipIndex, FieldDir, BlockRangeStats), LogFetchError> {
-        let key = seg_ref.data_object_key.as_str();
-        let mut stats = BlockRangeStats::default();
-        let pin = EtagPin::default();
-        let phase = ReadPhases::PLAN.metadata;
-        let (footer, mut resident) = self
-            .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
-            .await?;
-
-        let skip_desc = *footer
-            .section(kind::SKIP_IDX)
-            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing SKIP_IDX".into())))?;
-        // SKIP_IDX and, on a version-4 object, PAGE_DIR: the pair is adjacent, so
-        // a probe too short for both costs one coalesced GET rather than two.
-        // PAGE_DIR is brought here even though the survivor count does not need
-        // it, because the scan this plan feeds locates its pages through it,
-        // fetches it under this same extent key, and would otherwise pay a
-        // second round trip for bytes the probe already had.
-        self.ensure_tail_plan_sections(
-            seg_ref,
-            tenant_hash,
-            &footer,
-            &[kind::SKIP_IDX, kind::PAGE_DIR],
-            phase,
-            &mut resident,
-            &pin,
-            accounting,
-            &mut stats,
-        )
-        .await?;
-        let skip_raw = self
-            .plan_section_raw(
-                seg_ref,
-                tenant_hash,
-                &skip_desc,
-                &resident,
-                phase,
-                &pin,
-                accounting,
-                &mut stats,
-            )
-            .await?;
-        let skip =
-            SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
-
-        let field_desc = *footer
-            .section(kind::FIELD_DIR)
-            .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing FIELD_DIR".into())))?;
-        let field_raw = self
-            .plan_section_raw(
-                seg_ref,
-                tenant_hash,
-                &field_desc,
-                &resident,
-                phase,
-                &pin,
-                accounting,
-                &mut stats,
-            )
-            .await?;
-        let field_dir =
-            FieldDir::decode(&field_raw, MAX_FIELDS).map_err(|source| corrupt(key, source))?;
-
-        Ok((footer, skip, field_dir, stats))
-    }
-
     /// Read and decode all four footer directories (STREAM_DIR, FIELD_DIR,
     /// SKIP_IDX, PAGE_DIR) for one segment, fetching no BLOCKS byte: the plan
-    /// phase's counterpart of [`RlogReader::from_source`] for a query whose
-    /// plan needs the full directory set (ADR-2414 decision A1), not just the
-    /// SKIP_IDX/FIELD_DIR pair [`fetch_plan_sections`](Self::fetch_plan_sections)
-    /// brings for prune-only arms.
+    /// phase's counterpart of [`RlogReader::from_source`] (ADR-2414 decision
+    /// A1). Both footer-carrying plan branches read through it: the
+    /// predicate-free fast path and the skip-decidable branch for prune-only
+    /// NumRange arms.
     ///
     /// One ADR-0107 suffix probe plus, where the probe did not already cover
     /// them, coalesced range GETs for the missing sections. The returned
@@ -5405,11 +5324,10 @@ impl BlockRangeFetcher {
             .await?;
 
         // SKIP_IDX and PAGE_DIR are the tail sections whose probe misses the
-        // plan phase counts (the same pair `fetch_plan_sections` counts). The
-        // front pair is brought through a scratch stats value: a front section
-        // is never inside the suffix probe, so counting it would add two
-        // misses per object that report a property of the section order, not
-        // of the probe length.
+        // plan phase counts. The front pair is brought through a scratch stats
+        // value: a front section is never inside the suffix probe, so counting
+        // it would add two misses per object that report a property of the
+        // section order, not of the probe length.
         self.ensure_tail_plan_sections(
             seg_ref,
             tenant_hash,
@@ -5642,15 +5560,15 @@ impl BlockRangeFetcher {
         // actually issued the probe. This read issued it when no footer was
         // carried, so it counts its own. A carried footer names a plan read that
         // issued the probe instead, and `tail_misses_counted` says whether that
-        // read already counted the tail sections (`fetch_plan_sections`, via
+        // read already counted the tail sections (`fetch_plan_directories`, via
         // `ensure_tail_plan_sections`) or read the footer alone and counted
         // nothing (`fetch_footer`). Both directions are real defects and they do
-        // not cancel: counting a `fetch_plan_sections` object again double-reports
-        // it, and skipping a `fetch_footer` object drops a miss that costs this
-        // read a real extra request. Under-reporting is the worse of the two,
-        // because `probe_misses` is the figure that gates any future tightening
-        // of the derived probe floor and a metric that hides misses makes the
-        // probe look safer than it is.
+        // not cancel: counting a `fetch_plan_directories` object again
+        // double-reports it, and skipping a `fetch_footer` object drops a miss
+        // that costs this read a real extra request. Under-reporting is the
+        // worse of the two, because `probe_misses` is the figure that gates any
+        // future tightening of the derived probe floor and a metric that hides
+        // misses makes the probe look safer than it is.
         let count_tail_misses = !plan_footer.is_some_and(|carried| carried.tail_misses_counted);
 
         // An object whose commit record carries no size cannot be range-planned
@@ -9554,7 +9472,7 @@ mod whole_segment_projection_tests {
 mod plan_skip_decidable_span_tests {
     //! Pins #782: `plan_segment`'s skip-decidable branch (a query whose only
     //! block-level predicate is a prune-only `NumRange` arm, #761) opens a
-    //! `page_fetch` span around its `fetch_plan_sections` read and records
+    //! `page_fetch` span around its `fetch_plan_directories` read and records
     //! that read's real request/byte counts on it, mirroring the pattern
     //! `plan_segment_fast` and `plan_segment_block_stats` already carry.
     //! Before the fix this branch's read was invisible to tracing: no span
@@ -9658,7 +9576,7 @@ mod plan_skip_decidable_span_tests {
     }
 
     /// `block_range_threshold(0)` routes every object through the block-range
-    /// fetcher (`fetch_plan_sections`'s real path) rather than the small-object
+    /// fetcher (`fetch_plan_directories`'s real path) rather than the small-object
     /// whole-read shortcut, so the skip-decidable branch's own read is the one
     /// under test.
     fn fetcher(store: Arc<MemoryStore>) -> LogSegmentFetcher {
@@ -9755,13 +9673,13 @@ mod plan_skip_decidable_span_tests {
     /// takes `plan_segment`'s skip-decidable branch (`Self::plan_skip_decidable`:
     /// `content` and `stream_attrs` empty, `prune` nonempty and every arm a
     /// `NumRange`), which must open a `page_fetch` span around its
-    /// `fetch_plan_sections` read and record that read's real request/byte
+    /// `fetch_plan_directories` read and record that read's real request/byte
     /// counts on it -- not zero, not absent, the read this branch actually
     /// issued.
     ///
     /// Non-vacuity: with the `fetch_span`/`.instrument(fetch_span.clone())`
     /// wrapping removed from `plan_segment`'s skip-decidable branch (reverting
-    /// #782, i.e. calling `fetch_plan_sections` bare the way this branch did
+    /// #782, i.e. calling `fetch_plan_directories` bare, as this branch called its read
     /// before the fix), no span named `page_fetch` closes during this call at
     /// all, `closed.len()` comes out `0`, and the `expect("plan_segment's \
     /// skip-decidable branch opened exactly one page_fetch span")` below panics
@@ -9837,7 +9755,7 @@ mod plan_skip_decidable_span_tests {
         assert_eq!(span.signal.as_deref(), Some("logs"));
         assert!(
             span.s3_requests.is_some_and(|n| n > 0),
-            "the span must carry the real request count fetch_plan_sections issued, got {:?}",
+            "the span must carry the real request count fetch_plan_directories issued, got {:?}",
             span.s3_requests
         );
         assert!(
@@ -9909,7 +9827,7 @@ mod plan_skip_decidable_span_tests {
         // (query, plan-phase misses, scan-phase misses). The predicate-free
         // query takes `plan_segment_fast`, whose `fetch_plan_directories` reads
         // and counts both tail sections. The NumRange query takes the
-        // skip-decidable branch, whose `fetch_plan_sections` does the same. The
+        // skip-decidable branch, whose `fetch_plan_directories` does the same. The
         // scan must count neither. Either way the total is 2.
         let cases = [
             (LogQuery::new(i64::MIN, i64::MAX), 2u64, 0u64),
