@@ -1407,8 +1407,10 @@ pub struct FragmentStatEntry {
     /// `bytes_reported`, which is store bytes the worker says it read.
     pub wire_bytes_consumed: u64,
     /// The slice's outcome: `"ok"` (ran to completion, local or remote),
-    /// `"fallback"` (remote dispatch failed at transport and the coordinator
-    /// re-ran it locally), or `"error"` (the fetch returned a hard error).
+    /// `"fallback"` (remote dispatch failed and the coordinator re-ran it
+    /// locally), `"timeout"` (the slice ended `TIMEOUT` at the query's
+    /// deadline), or `"error"` (the fetch returned a hard error or a `Corrupt`
+    /// summary).
     pub status: &'static str,
 }
 
@@ -1475,7 +1477,12 @@ fn record_fragment_stat(
     let (bytes_reported, status) = match result {
         Ok(response) => (
             response.accounting.total_s3_bytes(),
-            if fell_back { "fallback" } else { "ok" },
+            match response.status {
+                pb::status::Code::Timeout => "timeout",
+                pb::status::Code::Corrupt => "error",
+                _ if fell_back => "fallback",
+                _ => "ok",
+            },
         ),
         Err(err) => (
             err.spend().map_or(0, |spend| spend.total_s3_bytes()),
@@ -1595,6 +1602,25 @@ impl AttemptSpend {
     }
 }
 
+/// The in-band `TIMEOUT` a current worker answers an expired capability with,
+/// standing in for an older worker's `Unauthenticated` refusal of one once the
+/// query's deadline has passed on this coordinator, so the query fails with
+/// `DeadlineExceeded` rather than as a transport error. `spend` is what the
+/// refused attempt reported.
+fn expired_capability_timeout(spend: AttemptSpend) -> SliceResponse {
+    SliceResponse {
+        scalar: Vec::new(),
+        histogram: Vec::new(),
+        partials: Vec::new(),
+        accounting: spend.accounting,
+        stats: spend.stats,
+        series_returned: 0,
+        samples_returned: 0,
+        status: pb::status::Code::Timeout,
+        status_message: "fragment slice refused: its capability expired".to_string(),
+    }
+}
+
 /// The classification of one remote dispatch attempt (ADR-0071 deliverable 1).
 enum Attempt {
     /// A terminal outcome: a decoded response with a non-`Unavailable` status,
@@ -1611,6 +1637,12 @@ enum Attempt {
     /// observed from here at all. Boxed to keep the variant small beside
     /// `Keep`.
     Retry(Box<AttemptSpend>),
+    /// Re-dispatchable like [`Retry`](Self::Retry), from a worker that is
+    /// alive: it refused the slice for its query's deadline while this
+    /// coordinator's monotonic deadline had not passed. That is clock skew
+    /// between the two processes, or an older worker answering an expired
+    /// capability `Unauthenticated`, so the worker is not quarantined.
+    Reroute(Box<AttemptSpend>),
 }
 
 /// The coordinator's [`SliceFetcher`] (ADR-0071 deliverable 3). Rendezvous-maps
@@ -1880,6 +1912,15 @@ impl RoutingSliceFetcher {
     /// `TIMEOUT` summary, or a hard decode/framing error, is [`Attempt::Keep`]
     /// and terminal.
     ///
+    /// Only `deadline`, the query's own deadline on this coordinator's
+    /// monotonic clock, decides that the query is over (`None`: every
+    /// `TIMEOUT` is taken as its end). Before it, a `TIMEOUT` summary, or an
+    /// `Unauthenticated` refusal of a slice whose wall-clock deadline has
+    /// passed on this coordinator's clock (an older worker's answer to an
+    /// expired capability), is [`Attempt::Reroute`]: re-dispatched without
+    /// quarantining a worker that is alive. After it, that refusal ends the
+    /// slice as `TIMEOUT`.
+    ///
     /// Retrying drops the attempt's RESULT, never its COST (issue #1723): an
     /// `Unavailable` summary carries what that worker spent before it gave up,
     /// and [`Attempt::Retry`] carries it forward so `dispatch` can fold it into
@@ -1889,10 +1930,19 @@ impl RoutingSliceFetcher {
         endpoint: &str,
         request: &pb::FetchRequest,
         wire_bytes: &AtomicU64,
+        deadline: Option<tokio::time::Instant>,
     ) -> Attempt {
         let mut salvaged = None;
+        let mut unauthenticated = false;
+        let query_over = || deadline.is_none_or(|d| tokio::time::Instant::now() >= d);
         match self
-            .remote_fetch(endpoint, request.clone(), wire_bytes, &mut salvaged)
+            .remote_fetch(
+                endpoint,
+                request.clone(),
+                wire_bytes,
+                &mut salvaged,
+                &mut unauthenticated,
+            )
             .await
         {
             Ok(response) if response.status == pb::status::Code::Unavailable => {
@@ -1905,13 +1955,48 @@ impl RoutingSliceFetcher {
                     stats: response.stats,
                 }))
             }
-            // Every other summary is terminal, `TIMEOUT` included: the worker
-            // stopped the slice at the query's deadline, or refused it because
-            // that deadline had already passed. The worker is healthy and any
-            // other attempt, this coordinator's own included, would run past
-            // the same deadline, so no quarantine, no re-dispatch, no local
-            // read. The spend it made before the stop rides on the response.
+            // The worker compared the query's wall-clock deadline on its own
+            // clock and stopped or refused the slice while this coordinator's
+            // own deadline is still ahead: its clock runs ahead of this one.
+            // The worker is alive, so it is not quarantined; the slice goes to
+            // the next worker or runs here, bounded by this coordinator's own
+            // deadline. What the worker spent rides forward.
+            Ok(response) if response.status == pb::status::Code::Timeout && !query_over() => {
+                tracing::warn!(
+                    %endpoint,
+                    "remote slice answered TIMEOUT before this query's deadline; \
+                     its clock runs ahead of this coordinator's, re-dispatching without quarantine"
+                );
+                Attempt::Reroute(Box::new(AttemptSpend {
+                    accounting: response.accounting,
+                    stats: response.stats,
+                }))
+            }
+            // Every other summary is terminal, `TIMEOUT` included once the
+            // query's deadline has passed here: any other attempt, this
+            // coordinator's own included, would run past it, so no
+            // quarantine, no re-dispatch, no local read. The spend the worker
+            // made before the stop rides on the response.
             Ok(response) => Attempt::Keep(Box::new(Ok(response))),
+            // A worker that predates the in-band `TIMEOUT` refuses an expired
+            // capability `Unauthenticated`. Once the capability's expiry has
+            // passed on this coordinator's clock that refusal says nothing
+            // about the worker's health, so it is never quarantined for it.
+            Err(DistribError::Transport(message))
+                if unauthenticated && self.wall_deadline_passed(request) =>
+            {
+                let spend = salvaged.unwrap_or_default();
+                if query_over() {
+                    return Attempt::Keep(Box::new(Ok(expired_capability_timeout(spend))));
+                }
+                tracing::warn!(
+                    %endpoint,
+                    error = %message,
+                    "remote slice refused an expired capability before this query's deadline; \
+                     re-dispatching without quarantine"
+                );
+                Attempt::Reroute(Box::new(spend))
+            }
             Err(DistribError::Transport(message)) => {
                 tracing::warn!(
                     %endpoint,
@@ -2001,12 +2086,16 @@ impl RoutingSliceFetcher {
     /// the attempt failed, and is left `None` otherwise (issue #1723). It is an
     /// out-parameter because it is meaningful only on the `Err` return, where
     /// there is no `SliceResponse` to put it on.
+    ///
+    /// `unauthenticated` is set when the worker refused the request with gRPC
+    /// `Unauthenticated` before streaming anything.
     async fn remote_fetch(
         &self,
         endpoint: &str,
         mut request: pb::FetchRequest,
         wire_bytes: &AtomicU64,
         salvaged: &mut Option<AttemptSpend>,
+        unauthenticated: &mut bool,
     ) -> Result<SliceResponse, DistribError> {
         let channel = self.channel(endpoint).await?;
         // Mint and attach the per-query capability (ADR-0071 amendment, decision
@@ -2019,10 +2108,10 @@ impl RoutingSliceFetcher {
         let tonic_request = tonic::Request::new(request);
         let mut client = SeriesFetchClient::new(channel)
             .max_decoding_message_size(MAX_FRAGMENT_DECODING_MESSAGE_BYTES);
-        let response = client
-            .fetch(tonic_request)
-            .await
-            .map_err(|s| DistribError::Transport(s.to_string()))?;
+        let response = client.fetch(tonic_request).await.map_err(|s| {
+            *unauthenticated = s.code() == tonic::Code::Unauthenticated;
+            DistribError::Transport(s.to_string())
+        })?;
         let mut decoder = SliceStreamDecoder::new(&self.local.engine)
             .with_max_frames(self.max_slice_frames)
             .with_max_bytes(self.max_slice_bytes);
@@ -2083,6 +2172,24 @@ impl RoutingSliceFetcher {
 #[async_trait]
 impl SliceFetcher for RoutingSliceFetcher {
     async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        self.fetch_routed(request, None).await
+    }
+
+    async fn fetch_within(
+        &self,
+        request: pb::FetchRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<SliceResponse, DistribError> {
+        self.fetch_routed(request, Some(deadline)).await
+    }
+}
+
+impl RoutingSliceFetcher {
+    async fn fetch_routed(
+        &self,
+        request: pb::FetchRequest,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<SliceResponse, DistribError> {
         let start = Instant::now();
         let segment_count = pinned_segment_count(&request);
         let ranked = self.ranked_owners(&request);
@@ -2092,7 +2199,7 @@ impl SliceFetcher for RoutingSliceFetcher {
         // does not read as zero for the case the caps exist for.
         let wire_bytes = AtomicU64::new(0);
         let (result, worker_endpoint, fell_back) =
-            self.dispatch(ranked, request, &wire_bytes).await;
+            self.dispatch(ranked, request, &wire_bytes, deadline).await;
         self.metrics.observe_slice_fetch(start.elapsed());
         record_fragment_stat(
             &result,
@@ -2103,18 +2210,24 @@ impl SliceFetcher for RoutingSliceFetcher {
         );
         result
     }
-}
 
-impl RoutingSliceFetcher {
+    /// Whether the slice's wall-clock deadline, its capability's expiry, has
+    /// passed on this coordinator's clock.
+    fn wall_deadline_passed(&self, request: &pb::FetchRequest) -> bool {
+        request.deadline_unix_ns > 0 && request.deadline_unix_ns <= self.local.inner.clock.now_ns()
+    }
+
     /// Execute one slice against its rendezvous-ranked owners, applying the
     /// ADR-0071 failure sequence exactly (deliverable 1):
     ///
     /// * The top owner is this coordinator (or the unit is unroutable / has no
     ///   version-matched worker): run local, no hop, no fallback needed.
     /// * The top owner is remote: dispatch to it. On a terminal outcome
-    ///   (success, a hard decode/corruption error, or a `TIMEOUT` summary from
-    ///   a worker that stopped at the query's deadline) return it. On transport
-    ///   loss or an `Unavailable` summary, re-dispatch EXACTLY once to the next
+    ///   (success, a hard decode/corruption error, or a `TIMEOUT` summary once
+    ///   `deadline` has passed) return it. On transport loss, an `Unavailable`
+    ///   summary, or a refusal for the query's deadline that arrived before
+    ///   `deadline` ([`Attempt::Reroute`], which quarantines no worker),
+    ///   re-dispatch EXACTLY once to the next
     ///   rendezvous worker (skipping the failed one). If that next worker is
     ///   this coordinator, or is absent, or also fails re-dispatchably, execute
     ///   the slice coordinator-local. A typed failure surfaces only if local
@@ -2138,6 +2251,7 @@ impl RoutingSliceFetcher {
         ranked: Vec<Owner>,
         request: pb::FetchRequest,
         wire_bytes: &AtomicU64,
+        deadline: Option<tokio::time::Instant>,
     ) -> (Result<SliceResponse, DistribError>, String, bool) {
         let primary = match ranked.first() {
             // Self-mapped or unroutable: local, the normal no-hop path.
@@ -2157,7 +2271,10 @@ impl RoutingSliceFetcher {
         let mut carried = AttemptSpend::default();
 
         // First remote attempt against the top owner.
-        match self.try_remote(&primary, &request, wire_bytes).await {
+        match self
+            .try_remote(&primary, &request, wire_bytes, deadline)
+            .await
+        {
             Attempt::Keep(result) => {
                 self.metrics.record_slice_remote();
                 return (*result, primary, false);
@@ -2170,6 +2287,7 @@ impl RoutingSliceFetcher {
                 carried.merge(&spend);
                 self.mark_quarantine(&primary);
             }
+            Attempt::Reroute(spend) => carried.merge(&spend),
         }
 
         // The primary was lost or Unavailable. Re-dispatch EXACTLY once to the
@@ -2183,7 +2301,7 @@ impl RoutingSliceFetcher {
             && *next != primary
         {
             self.metrics.record_slice_redispatched();
-            match self.try_remote(next, &request, wire_bytes).await {
+            match self.try_remote(next, &request, wire_bytes, deadline).await {
                 Attempt::Keep(result) => {
                     self.metrics.record_slice_remote();
                     return (carried.fold_into(*result), next.clone(), false);
@@ -2194,6 +2312,7 @@ impl RoutingSliceFetcher {
                     carried.merge(&spend);
                     self.mark_quarantine(next);
                 }
+                Attempt::Reroute(spend) => carried.merge(&spend),
             }
         }
 
@@ -6192,6 +6311,10 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         /// `SliceStreamDecoder::finish` rather than out of `push`, after the
         /// summary's accounting was already accepted.
         UnknownStatusSummary,
+        /// The call is refused `Unauthenticated` before any frame: how a
+        /// worker that predates the in-band `TIMEOUT` refuses an expired
+        /// capability.
+        RefuseUnauthenticated,
     }
 
     /// The per-slice wire cap the two scripted flood endings are refused under,
@@ -6224,6 +6347,11 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             _request: tonic::Request<pb::FetchRequest>,
         ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
             self.attempts.fetch_add(1, Ordering::Relaxed);
+            if self.ending == Ending::RefuseUnauthenticated {
+                return Err(tonic::Status::unauthenticated(
+                    "fragment capability rejected: expired",
+                ));
+            }
             let summary = || Ok(self.spend.summary(self.code));
             let broke = || Err(tonic::Status::unavailable("worker went away mid-stream"));
             let flood = || (0..FLOOD_FRAMES).map(|i| Ok(flood_series_frame(i)));
@@ -6239,6 +6367,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 Ending::UnknownStatusSummary => {
                     vec![Ok(self.spend.summary_with_raw_status(UNKNOWN_STATUS_CODE))]
                 }
+                Ending::RefuseUnauthenticated => Vec::new(),
             };
             Ok(tonic::Response::new(Box::pin(futures::stream::iter(items))))
         }
@@ -6384,6 +6513,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 ],
                 request,
                 &wire_bytes,
+                None,
             )
             .await;
         let response = result.expect("the coordinator-local third attempt answers");
@@ -6465,7 +6595,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let fetcher = coordinator_over(store, now);
         let wire_bytes = AtomicU64::new(0);
         let (result, _endpoint, fell_back) = fetcher
-            .dispatch(vec![Owner::Remote(endpoint)], request, &wire_bytes)
+            .dispatch(vec![Owner::Remote(endpoint)], request, &wire_bytes, None)
             .await;
         let response = result.expect("the local fallback answers");
 
@@ -6522,7 +6652,12 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let fetcher = coordinator_over(store, now);
         let wire_bytes = AtomicU64::new(0);
         let (result, _endpoint, fell_back) = fetcher
-            .dispatch(vec![Owner::Remote(endpoint)], request.clone(), &wire_bytes)
+            .dispatch(
+                vec![Owner::Remote(endpoint)],
+                request.clone(),
+                &wire_bytes,
+                None,
+            )
             .await;
         let response = result.expect("the local fallback answers");
         assert_eq!(tries.load(Ordering::Relaxed), 1);
@@ -6550,7 +6685,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let fetcher = coordinator_over(store, now);
         let wire_bytes = AtomicU64::new(0);
         let (result, _endpoint, fell_back) = fetcher
-            .dispatch(vec![Owner::Remote(endpoint)], request, &wire_bytes)
+            .dispatch(vec![Owner::Remote(endpoint)], request, &wire_bytes, None)
             .await;
         let response = result.expect("the local fallback answers");
         assert_eq!(tries.load(Ordering::Relaxed), 1);
@@ -6609,6 +6744,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 vec![Owner::Remote(endpoint_a), Owner::Remote(endpoint_b.clone())],
                 request,
                 &wire_bytes,
+                None,
             )
             .await;
         let response = result.expect("the re-dispatch target answers");
@@ -6689,7 +6825,12 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let fetcher = coordinator_over(store, now);
         let wire_bytes = AtomicU64::new(0);
         let (result, named, fell_back) = fetcher
-            .dispatch(vec![Owner::Remote(endpoint.clone())], request, &wire_bytes)
+            .dispatch(
+                vec![Owner::Remote(endpoint.clone())],
+                request,
+                &wire_bytes,
+                None,
+            )
             .await;
         let err = result.expect_err("an empty frame ends the slice typed");
 
@@ -6753,7 +6894,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let fetcher = coordinator_over(store, now).with_max_slice_bytes(CAP_UNDER_TEST);
         let wire_bytes = AtomicU64::new(0);
         let (result, _named, fell_back) = fetcher
-            .dispatch(vec![Owner::Remote(endpoint)], request, &wire_bytes)
+            .dispatch(vec![Owner::Remote(endpoint)], request, &wire_bytes, None)
             .await;
         let err = result.expect_err("a slice past the byte cap is refused");
         assert_eq!(tries.load(Ordering::Relaxed), 1);
@@ -6787,7 +6928,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let fetcher = coordinator_over(store, now).with_max_slice_bytes(CAP_UNDER_TEST);
         let wire_bytes = AtomicU64::new(0);
         let (result, _named, fell_back) = fetcher
-            .dispatch(vec![Owner::Remote(endpoint)], request, &wire_bytes)
+            .dispatch(vec![Owner::Remote(endpoint)], request, &wire_bytes, None)
             .await;
         let err = result.expect_err("a slice past the byte cap is refused");
         assert_eq!(tries.load(Ordering::Relaxed), 1);
@@ -6859,6 +7000,7 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
                 vec![Owner::Remote(endpoint_a), Owner::Remote(endpoint_b.clone())],
                 request,
                 &wire_bytes,
+                None,
             )
             .await;
         let err = result.expect_err("the re-dispatched slice is refused by the byte cap");
@@ -6936,7 +7078,12 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         let fetcher = coordinator_over(store, now);
         let wire_bytes = AtomicU64::new(0);
         let (result, named, fell_back) = fetcher
-            .dispatch(vec![Owner::Remote(endpoint.clone())], request, &wire_bytes)
+            .dispatch(
+                vec![Owner::Remote(endpoint.clone())],
+                request,
+                &wire_bytes,
+                None,
+            )
             .await;
         let err = result.expect_err("an unknown status code ends the slice typed");
 
@@ -7729,23 +7876,24 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         assert_eq!(outcome.series.len(), 1, "the peer's one series");
     }
 
-    /// Issue #2385, the coordinator half: a remote worker that ends a slice
-    /// `TIMEOUT` (it stopped at the query's deadline) ends the query.
+    /// Issue #2385, the coordinator half: a remote worker that answers a slice
+    /// `TIMEOUT` while the coordinator's own deadline is still ahead compared
+    /// the query's wall-clock deadline on a clock running ahead. That does not
+    /// end the query: the worker is not quarantined, and the slice is
+    /// re-dispatched and then read locally, bounded by the coordinator's own
+    /// deadline.
     ///
     /// Both live workers answer the same way, so the total attempt count is
     /// the re-dispatch check whichever of them ranks first. The coordinator's
-    /// local fragment service reads through its own call counter, so zero
-    /// there means no local read of the slice; the quarantine map and the
-    /// re-dispatch and fallback counters say the worker was not treated as
-    /// dead. The fragment stats entry carries the stopped attempt's spend, and
-    /// the query fails `DeadlineExceeded` with its own request deadline.
+    /// local fragment service reads through its own call counter, so a
+    /// nonzero count there is the local read of the slice. The fragment stats
+    /// entry carries both stopped attempts' spend plus the local read's.
     ///
-    /// Mutation proof: classifying a `TIMEOUT` summary as `Attempt::Retry` in
-    /// `try_remote`, which is how a transport loss is handled, sends the slice
-    /// down the re-dispatch ladder to a local read that answers the query, so
-    /// the `expect_err` below fails.
+    /// Mutation proof: keeping every `TIMEOUT` summary `Attempt::Keep` in
+    /// `try_remote`, whatever the coordinator's deadline, ends the query with
+    /// `DeadlineExceeded` and the `unwrap_or_else` below panics.
     #[tokio::test]
-    async fn a_worker_stopped_at_the_deadline_ends_the_query_without_a_retry() {
+    async fn a_worker_timeout_before_the_coordinators_deadline_is_rerouted_without_quarantine() {
         const PAID: Spend = Spend {
             get_requests: 2,
             get_bytes: 6_144,
@@ -7807,33 +7955,224 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
         )
         .await;
 
-        let err = outcome.expect_err("a slice stopped at the deadline ends the query");
+        let outcome = outcome.unwrap_or_else(|err| panic!("the slice is read elsewhere: {err:?}"));
         assert!(
-            matches!(err, ravel_query::QueryError::DeadlineExceeded { deadline } if deadline == request_deadline),
-            "{err:?}"
+            matches!(&outcome.0, ravel_promql::Value::Vector(samples) if samples.len() == 1),
+            "the local read answers the one series: {:?}",
+            outcome.0
         );
         assert_eq!(
             tries_a.load(Ordering::Relaxed) + tries_b.load(Ordering::Relaxed),
-            1,
-            "dispatched once and never re-dispatched"
+            2,
+            "dispatched, then re-dispatched once"
         );
-        assert_eq!(
-            local_store.issued(),
-            0,
-            "the coordinator issued no local read for the slice"
+        assert!(
+            local_store.issued() > 0,
+            "the coordinator read the slice itself"
         );
         assert!(
             routing.quarantine.lock().is_empty(),
-            "a worker that stopped at the deadline is healthy, not quarantined"
+            "a worker whose clock runs ahead is alive, not quarantined"
         );
-        assert_eq!(metrics.quarantine_current(), 0);
-        assert_eq!(metrics.slices_redispatched_total(), 0);
-        assert_eq!(metrics.slices_fallback_total(), 0);
+        assert_eq!(metrics.quarantine_marks_total(), 0);
+        assert_eq!(metrics.slices_redispatched_total(), 1);
+        assert_eq!(metrics.slices_fallback_total(), 1);
         let recorded = sink.take();
         assert_eq!(recorded.len(), 1, "one slice, one entry: {recorded:?}");
-        assert_eq!(
-            recorded[0].bytes_reported, PAID.get_bytes,
-            "the stopped attempt's spend is reported"
+        assert_eq!(recorded[0].status, "fallback");
+        assert!(
+            recorded[0].bytes_reported > 2 * PAID.get_bytes,
+            "both stopped attempts' spend rides on the local answer, plus its own: {}",
+            recorded[0].bytes_reported
         );
+    }
+
+    /// A routing coordinator over `store` whose live worker set holds
+    /// `endpoints` (and not itself), so every slice routes to them and a
+    /// quarantine mark has a heartbeat stamp to record.
+    fn coordinator_with_live(
+        store: Arc<dyn ObjectStoreBackend>,
+        now_ns: i64,
+        endpoints: &[&str],
+    ) -> RoutingSliceFetcher {
+        let live = endpoints
+            .iter()
+            .enumerate()
+            .map(|(i, endpoint)| QueryWorkerRecord {
+                process_id: uuid::Uuid::from_u128(100 + i as u128).to_string(),
+                fragment_endpoint: endpoint.to_string(),
+                flight_sql_endpoint: endpoint.to_string(),
+                protocol_version: codec::PROTOCOL_VERSION,
+                started_unix_ns: 0,
+            })
+            .collect();
+        RoutingSliceFetcher::new(
+            Arc::new(OnceLock::new()),
+            Arc::new(RwLock::new(Arc::new(live))),
+            test_keys(),
+            pinned_service(store, now_ns),
+            Arc::new(FragmentMetrics::new()),
+        )
+    }
+
+    /// A deadline on the coordinator's monotonic clock a year away.
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600)
+    }
+
+    /// Issue #2385: once the coordinator's own deadline has passed, a
+    /// worker's `TIMEOUT` ends the slice. It is not re-dispatched, not read
+    /// locally, and the worker is not quarantined; the slice's `fragments[]`
+    /// entry says `timeout` and carries what the worker spent.
+    ///
+    /// Mutation proof: treating the deadline as never passed in `try_remote`
+    /// sends the slice to a local read that answers `Ok`, so the response
+    /// status assertion fails; recording `"ok"` for a `TIMEOUT` response in
+    /// `record_fragment_stat` fails the entry's status assertion.
+    #[tokio::test]
+    async fn a_worker_timeout_after_the_coordinators_deadline_ends_the_slice() {
+        const PAID: Spend = Spend {
+            get_requests: 2,
+            get_bytes: 6_144,
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        };
+        let (store, now, request, _local_only) = one_slice_corpus("timeout-after-deadline").await;
+        let (endpoint, tries, _keep) =
+            spawn_scripted(PAID, pb::status::Code::Timeout, Ending::Summary).await;
+        let routing = coordinator_with_live(store, now, &[&endpoint]);
+
+        let sink = FragmentStatsSink::new();
+        let result = with_fragment_stats(
+            sink.clone(),
+            routing.fetch_within(request, tokio::time::Instant::now()),
+        )
+        .await;
+
+        let response = result.expect("the worker's TIMEOUT summary is the slice's answer");
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert_eq!(tries.load(Ordering::Relaxed), 1);
+        assert!(routing.quarantine.lock().is_empty());
+        assert_eq!(routing.metrics.slices_redispatched_total(), 0);
+        assert_eq!(routing.metrics.slices_fallback_total(), 0);
+        let recorded = sink.take();
+        assert_eq!(recorded.len(), 1, "{recorded:?}");
+        assert_eq!(recorded[0].status, "timeout");
+        assert_eq!(recorded[0].bytes_reported, PAID.get_bytes);
+    }
+
+    /// Issue #2385, mixed versions: a worker that predates the in-band
+    /// `TIMEOUT` refuses a capability that has expired on the coordinator's
+    /// clock with `Unauthenticated`. That says nothing about the worker's
+    /// health, so it is never quarantined for it. Before the coordinator's
+    /// own deadline the slice falls back to a local read; after it, the slice
+    /// ends `TIMEOUT`.
+    ///
+    /// Mutation proof: deleting the expired-capability arm in `try_remote`
+    /// classifies the refusal as a transport loss, which quarantines the
+    /// worker, and the first half's quarantine assertion fails. Treating the
+    /// coordinator's deadline as never passed reads the second half locally,
+    /// and its status assertion fails.
+    #[tokio::test]
+    async fn an_older_workers_expired_capability_refusal_does_not_quarantine_it() {
+        const NOTHING: Spend = Spend {
+            get_requests: 0,
+            get_bytes: 0,
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        };
+
+        // Before the coordinator's deadline: read locally.
+        let (store, now, mut request, _local_only) = one_slice_corpus("expired-cap-early").await;
+        request.deadline_unix_ns = now;
+        let (endpoint, tries, _keep) =
+            spawn_scripted(NOTHING, pb::status::Code::Ok, Ending::RefuseUnauthenticated).await;
+        let routing = coordinator_with_live(store, now, &[&endpoint]);
+        let wire_bytes = AtomicU64::new(0);
+        let (result, _endpoint, fell_back) = routing
+            .dispatch(
+                vec![Owner::Remote(endpoint)],
+                request,
+                &wire_bytes,
+                Some(far_deadline()),
+            )
+            .await;
+        let response = result.expect("the local read answers");
+        assert_eq!(response.status, pb::status::Code::Ok);
+        assert!(fell_back);
+        assert_eq!(tries.load(Ordering::Relaxed), 1);
+        assert!(
+            routing.quarantine.lock().is_empty(),
+            "an expired capability is not a dead worker"
+        );
+        assert_eq!(routing.metrics.quarantine_marks_total(), 0);
+
+        // After it: the slice ends TIMEOUT, so the query fails as a deadline.
+        let (store, now, mut request, _local_only) = one_slice_corpus("expired-cap-late").await;
+        request.deadline_unix_ns = now;
+        let (endpoint, tries, _keep) =
+            spawn_scripted(NOTHING, pb::status::Code::Ok, Ending::RefuseUnauthenticated).await;
+        let routing = coordinator_with_live(store, now, &[&endpoint]);
+        let wire_bytes = AtomicU64::new(0);
+        let (result, _endpoint, fell_back) = routing
+            .dispatch(
+                vec![Owner::Remote(endpoint)],
+                request,
+                &wire_bytes,
+                Some(tokio::time::Instant::now()),
+            )
+            .await;
+        let response = result.expect("the refusal ends the slice in-band");
+        assert_eq!(response.status, pb::status::Code::Timeout);
+        assert!(!fell_back);
+        assert_eq!(tries.load(Ordering::Relaxed), 1);
+        assert!(routing.quarantine.lock().is_empty());
+        assert_eq!(routing.metrics.quarantine_marks_total(), 0);
+    }
+
+    /// The control for the test above: a worker that fails a slice whose
+    /// deadline has not passed on the coordinator's clock is still
+    /// quarantined, whether it refused the call `Unauthenticated` or the
+    /// stream broke.
+    ///
+    /// Mutation proof: dropping the wall-clock check from the expired-
+    /// capability arm in `try_remote` stops quarantining the `Unauthenticated`
+    /// worker, and the first half fails.
+    #[tokio::test]
+    async fn a_failing_worker_before_the_wall_deadline_is_still_quarantined() {
+        const NOTHING: Spend = Spend {
+            get_requests: 0,
+            get_bytes: 0,
+            raw_f64_pages: 0,
+            raw_f64_bytes: 0,
+        };
+        for (name, ending) in [
+            ("refused-live-cap", Ending::RefuseUnauthenticated),
+            ("broken-stream", Ending::BreakOnly),
+        ] {
+            let (store, now, mut request, _local_only) = one_slice_corpus(name).await;
+            request.deadline_unix_ns = now + HOUR_NS;
+            let (endpoint, tries, _keep) =
+                spawn_scripted(NOTHING, pb::status::Code::Ok, ending).await;
+            let routing = coordinator_with_live(store, now, &[&endpoint]);
+            let wire_bytes = AtomicU64::new(0);
+            let (result, _endpoint, fell_back) = routing
+                .dispatch(
+                    vec![Owner::Remote(endpoint.clone())],
+                    request,
+                    &wire_bytes,
+                    Some(far_deadline()),
+                )
+                .await;
+            result.unwrap_or_else(|err| panic!("{name}: the local read answers: {err:?}"));
+            assert!(fell_back, "{name}");
+            assert_eq!(tries.load(Ordering::Relaxed), 1, "{name}");
+            assert_eq!(
+                routing.quarantine.lock().get(&endpoint).copied(),
+                Some(0),
+                "{name}: the failing worker is quarantined at its stamp"
+            );
+            assert_eq!(routing.metrics.quarantine_marks_total(), 1, "{name}");
+        }
     }
 }
