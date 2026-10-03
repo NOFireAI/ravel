@@ -453,7 +453,13 @@ a MAC-authenticated claim set naming exactly what it authorizes.
   ran out of time. The slice ends `TIMEOUT` if the coordinator's
   monotonic deadline has passed, and otherwise goes to the next worker and
   then to a local read. Any other transport failure still quarantines the
-  worker.
+  worker. One window is left: an older worker enforces the expiry on its
+  own clock, so if that clock runs ahead of the coordinator's by s, it
+  refuses `Unauthenticated` up to s before the deadline passes on the
+  coordinator's clock, and in that window the coordinator cannot tell the
+  refusal from a bad key or tenant mismatch and quarantines the worker
+  until its restart. Upgrading workers before coordinators closes it, since
+  an upgraded worker answers expiry in-band with `TIMEOUT`.
 - A federated Resolve request carries no capability, so it carries the
   query's deadline in `deadline_unix_ns` (issue #2385), and the peer
   cluster applies the same three bounds: a request past the deadline is

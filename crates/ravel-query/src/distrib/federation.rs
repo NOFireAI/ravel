@@ -61,9 +61,13 @@
 //! succeed once the remote has room, exactly as on the intra-cluster path.
 //!
 //! Every request carries the query's own deadline, and a remote stops
-//! reading for the query when it passes. A remote that answers `TIMEOUT`
-//! stopped there: the query is over, so it fails with
-//! [`QueryError::DeadlineExceeded`] whatever `skip_unavailable` says.
+//! reading for the query when it passes on the remote's clock. A remote that
+//! answers `TIMEOUT` after this coordinator's own deadline has passed fails
+//! the query with [`QueryError::DeadlineExceeded`] whatever
+//! `skip_unavailable` says. One that answers `TIMEOUT` earlier is clock skew
+//! between the two clusters: it goes through the unavailable path, so it is
+//! skipped under `skip_unavailable` and fails the query as unavailable
+//! otherwise.
 //!
 //! # Merge semantics and the cross-cluster tie-break limitation
 //!
