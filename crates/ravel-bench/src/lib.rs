@@ -20,6 +20,8 @@ queue_deadline={queue_deadline} input_rejected={input_rejected}"
 
 pub mod allocator;
 pub mod bench_env;
+#[cfg(feature = "sql-latency")]
+pub mod clickbench_parquet;
 pub mod codecs;
 #[cfg(feature = "parquet-baseline")]
 pub mod columnar_load;

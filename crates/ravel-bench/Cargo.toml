@@ -60,7 +60,7 @@ rand = { workspace = true }
 uuid = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 # The cost-regression gate (ADR-0996 task 996-7) loads its per-figure bands from
 # a checked-in TOML document (`cost_regression_bands.toml`). `toml` is not in the
 # workspace `[workspace.dependencies]`; it is named by version here exactly as
@@ -115,6 +115,20 @@ arrow-flight = { workspace = true, optional = true }
 # links datafusion 54 with the same version/features, so feature unification
 # resolves this to that same instance rather than a second copy.
 datafusion = { version = "54", default-features = false, features = ["sql"], optional = true }
+# Gated behind `sql-latency`. The ClickBench Parquet fixture writer
+# (`src/clickbench_parquet/fixture.rs`) writes the synthetic corpus with
+# parquet's own `ArrowWriter`, independent of any table-read path. Named
+# `parquet58` (not `parquet`) because the crate already has a `parquet`
+# optional dependency pinned to major 59 under `parquet-baseline`; Cargo does
+# not allow two dependency entries on the same package name, and the two
+# majors serve different lanes. Pinned to major 58 so its arrow types unify
+# with the one `datafusion` 54 (and so `sql-latency`) already links, rather
+# than pulling a second arrow instance into this feature. Not a new external
+# crate: `parquet` 58.4.0 already resolves in the workspace lockfile via
+# `datafusion-datasource-parquet`.
+parquet58 = { package = "parquet", version = "58", default-features = false, features = [
+    "arrow",
+], optional = true }
 # Gated behind `sql-latency`. The logs scan-partitioning scaling bench
 # (`logs_scan_scaling`) wires ADR-0046's read cache into `LogSegmentFetcher` so
 # it can report the object-store request count with and without the cache's
@@ -175,7 +189,7 @@ stage-timing = ["ravel-ingest/stage-timing"]
 # corpus gate reads `ravel_sql::conformance::registry()`, so it activates the
 # same optional `ravel-sql` entry `flight-egress` uses (no second entry, so no
 # second datafusion/arrow activation) and the plain gates never compile it.
-sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures"]
+sql-latency = ["dep:ravel-sql", "dep:datafusion", "dep:ravel-cache", "dep:ravel-rspan", "dep:futures", "dep:parquet58"]
 # The `sql_latency_bench --flight` lane (issue #680): the same corpus executed
 # through a running `ravel-server`'s Flight SQL endpoint instead of an
 # in-process executor. Off by default. No new external crate: `arrow-flight`
