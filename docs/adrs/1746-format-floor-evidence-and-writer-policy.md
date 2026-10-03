@@ -133,11 +133,13 @@ change, and this ADR follows the same rule.
    `ravel_format_floor_writes_below_total{family}`. A write under the override
    is a live record below the floor, so the next `audit-versions` classifies
    that floor as `Contradicted` and the reader-deletion step refuses. Floors
-   are never lowered (`raise_format_floor` refuses a non-increasing raise,
-   `provisioning.rs:1861-1869`); the way back is to roll forward and run
+   are never lowered (`raise_format_floor` in
+   `crates/ravel-catalog/src/provisioning.rs` refuses a non-increasing
+   raise); the way back is to roll forward and run
    `migrate`, whose re-audit raises the floor again over a clean enumeration
-   with a fresh basis. The override exists for the operator who must keep
-   ingesting on a rolled-back binary and accepts a later migration.
+   with a fresh basis (same-version re-raise amendment below: not at the
+   version it already holds). The override exists for the operator who must
+   keep ingesting on a rolled-back binary and accepts a later migration.
 
 6. **Version and rollout.** `PROVISIONING_FORMAT_VERSION` goes from 2 to 3
    (`provisioning.rs:55`) in two releases, exactly as R1 and R2 did:
@@ -220,7 +222,8 @@ flowchart TD
 - Reader deletion has a mechanical precondition: `audit-versions` reports
   `Current` for the family on every bucket. A floor with no basis, or one
   raised before this ADR, is `Unknown` and must be re-raised by `migrate`
-  before it counts.
+  before it counts (same-version re-raise amendment below: only by the next
+  version raise).
 - The three new fields land in two releases. Nothing is rewritten; nothing is
   migrated. `ravel-cli` inspectors print the basis fields; the sys-proto
   classification test pins the read set at {1, 2, 3}.
@@ -264,3 +267,41 @@ record below the floor proves the floor false whatever evidence the raise
 recorded, so the classification needs no basis. Only `Current` and `Stale`
 depend on the basis, and until Release B a floor that is not contradicted is
 `Unknown`.
+
+## Amendment (2026-10-03, #2222): the same-version re-raise amendment, a floor at its target waits for the next raise
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="same-version re-raise amendment" -->
+<!-- amendment-supersedes: phrase="raises the floor again over a clean enumeration" pointer="same-version re-raise amendment" -->
+<!-- amendment-supersedes: phrase="must be re-raised by `migrate`" pointer="same-version re-raise amendment" -->
+
+Decision 5's way back and the Consequences' remedy for an `Unknown` floor
+both assumed a floor can be raised again at the version it already holds, to
+record a fresh basis. It cannot, and it will not be made to. A floor already
+at its target is not re-raised with a fresh basis. The remedy is to wait for
+the next version raise of that family, which appends a new floor entry
+(with its basis from the audit that justified it once Release B records
+one; `raise_format_floor` on main still writes no basis); until then the floor
+classifies from the basis it has (`Unknown` when it has none), or as
+`Contradicted` while a live record sits below it. `migrate` already behaves
+this way: when the current floor is at or past the target it reports the
+floor as raised and writes nothing (`migrate_family`'s verify step in
+`crates/ravel-maintain/src/migrate.rs`).
+
+Two ways of recording a fresh basis at the same version were considered and
+are refused:
+
+- **Append a second entry at the same version.** Deployed readers, v0.20.0
+  among them, cannot read the result. `read_floors` in
+  `crates/ravel-catalog/src/provisioning.rs` rejects an entry whose
+  `floor_version` is not strictly above the previous entry for its family
+  as `FloorDefect::NotIncreasing`, so every deployed floor reader
+  (`raise_format_floor`, `migrate` and `ravel-cli maintain audit-versions`)
+  would refuse the record's floor history, and `raise_format_floor` refuses `floor_version <= current` with
+  `FloorNotAboveCurrent` before it appends. Allowing an equal repeat would
+  need a provisioning format bump and a release-A/release-B rollout for a
+  basis refresh.
+- **Refresh the top entry's basis in place.** That rewrites a recorded floor,
+  and ADR-0066 decision 3 makes the floor list append-only: version facts are
+  appended under CAS and never rewritten. A basis that can be replaced after
+  the fact also stops being the record of the audit that justified the raise,
+  which is what decision 1 requires it to be.

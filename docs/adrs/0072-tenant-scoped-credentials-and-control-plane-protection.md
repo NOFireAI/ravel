@@ -180,7 +180,9 @@ breaks a real key shape fails CI instead of a production deployment.
 
 - A leaked single-role credential in a KMS-routed deployment yields
   ciphertext for other tenants' data objects; control-plane rollback
-  and deletion require defeating bucket versioning/Object Lock, which
+  and deletion require defeating bucket versioning/Object Lock
+  (control-plane rollback amendment below: they do not; what survives is
+  the locked prior version), which
   `--require-bucket-protection` guarantees is configured on fleets
   that opt in. The residual risk is a leaked Admin credential plus KMS
   grants, which is the platform-operator trust boundary, not a Ravel
@@ -407,3 +409,39 @@ in front of every writer, no code path should ever again attempt to
 persist two entries sharing a hash, but the guard remains the backstop
 that turns a future writer's oversight into a typed decode-time refusal
 instead of a silent brick.
+
+## Amendment (2026-10-03, #2258): the control-plane rollback amendment
+
+<!-- amendment-applies: sections="Consequences" pointer="control-plane rollback amendment" -->
+<!-- amendment-supersedes: phrase="require defeating bucket versioning/Object Lock" pointer="control-plane rollback amendment" -->
+
+The first Consequences bullet says that with a leaked credential, rolling
+back or deleting control-plane state requires defeating bucket versioning
+or Object Lock. It does not. On a versioned bucket with compliance-mode
+Object Lock on `sys/*` and `t/*/*/prov`, a credential with write access can
+PUT an older or forged body to a control-plane key, and that PUT becomes the
+key's current version: every reader, Ravel included, reads the rolled-back
+state. That PUT does not defeat versioning or Object Lock; it is an ordinary
+versioned-bucket write that compliance mode does not refuse. Deletion is
+different for a leaked role credential: every shipped role template denies
+`s3:DeleteObject` and `s3:DeleteObjectVersion` on `sys/tenancy`,
+`sys/qualification`, `sys/gc` and `t/*/*/prov` (ADR-0055 §3), so IAM
+refuses those deletes. The catalog family is the exception: `maintain.json`
+narrows its catalog deny to `catalog/<signal>/HEAD`, because Maintain's
+sweep deletes snapshot parts and index objects, so a leaked Maintain
+credential can delete those with no version id. A credential outside the
+templates can delete any of them that way. Such a delete inserts a delete
+marker, which Object Lock does not refuse either.
+
+What survives is the locked prior version. Compliance mode refuses a delete
+naming that version id and any lifecycle expiration of it for the retention
+period, so the state the key held before the rollback stays in the bucket
+and is recoverable by restoring that version as the current one (the
+disaster-recovery guide's "Restore one overwritten key from its locked prior
+version"). `--require-bucket-protection` does not prove this recovery path
+exists: it confirms Object Lock is enabled on the bucket, but no shipping
+caller samples whether any protected version carries retention (the
+`object-retention` condition is never counted), and an `Unknown` result
+only warns. It does not prevent the rollback either. This matches
+`docs/object-store-contract.md`, "Required bucket configuration". The
+residual-risk sentence that follows in the bullet is unchanged.
