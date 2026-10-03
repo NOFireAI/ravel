@@ -1414,6 +1414,13 @@ impl RlogWriter {
         let mut blk_stat: Vec<(u32, ColumnValue)> = Vec::new();
         let mut blk_stat_ends: Vec<u32> = Vec::new();
         let block_sample = stage0::block_sample_enabled();
+        // Stage 0d (#2477): carries the previous iteration's bsamp[7] (taken
+        // right after `blocks.push`) across the loop boundary, so the drop of
+        // that iteration's per-row scratch (`ts_v`/`values_v`/`stat_v`/`plans`
+        // and friends), which Rust runs when the loop body's block closes, is
+        // bracketed by the next iteration's bsamp[0] instead of falling
+        // between two samples with nothing attributing it.
+        let mut block_prev_tail: Option<(i64, u64)> = None;
 
         for (blk_idx, span) in spans.iter().enumerate() {
             let block_rows = &perm[span.clone()];
@@ -1426,6 +1433,9 @@ impl RlogWriter {
             let mut bsamp: [Option<(i64, u64)>; 8] = [None; 8];
             if block_sample {
                 bsamp[0] = Some(stage0::sample());
+                if let Some(prev) = block_prev_tail {
+                    stage0::record_block_iteration_teardown(prev, bsamp[0].unwrap());
+                }
             }
 
             // Materialize only this block's rows from source: each row's
@@ -1757,7 +1767,13 @@ impl RlogWriter {
                         bsamp[7].unwrap(),
                     ],
                 );
+                block_prev_tail = bsamp[7];
             }
+        }
+        if block_sample
+            && let Some(prev) = block_prev_tail
+        {
+            stage0::record_block_iteration_teardown(prev, stage0::sample());
         }
         stage0::fire(stage0_mode, "after_blocks");
 
@@ -6462,6 +6478,22 @@ pub mod stage0 {
     /// that label samples alone cannot see.
     pub static BLOCK_TRANSIENT_HIGH_WATER: AtomicI64 = AtomicI64::new(0);
 
+    /// Stage 0d (#2477): the per-iteration scratch (`ts_v`/`obs_v`/
+    /// `values_v`/`stat_v`/`plans` and the other block-row-count-sized
+    /// `Vec`s built fresh each loop pass) is dropped when the loop body's
+    /// block closes, after the last in-iteration sample (`bsamp[7]`, taken
+    /// right after `blocks.push`) and before the next iteration's first
+    /// sample. Without a bracket spanning that teardown, its (large,
+    /// negative) delta falls in no bucket, so the bucket sum exceeds the
+    /// stage delta by roughly the total freed there. This bucket is that
+    /// gap: `(next iteration's bsamp[0]) - (this iteration's bsamp[7])`,
+    /// or, for the last iteration, `(sample taken right after the loop) -
+    /// bsamp[7]`. It mixes several scratch structures' final frees and
+    /// cannot be split further without restructuring the loop to scope
+    /// each one separately.
+    pub static BLOCK_ITERATION_TEARDOWN_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static BLOCK_ITERATION_TEARDOWN_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
     pub fn record_block_materialize(before: (i64, u64), after: (i64, u64)) {
         BLOCK_MATERIALIZE_BYTES.fetch_add(after.0 - before.0, Relaxed);
         BLOCK_MATERIALIZE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
@@ -6509,6 +6541,11 @@ pub mod stage0 {
             return;
         };
         BLOCK_TRANSIENT_HIGH_WATER.fetch_max(peak - start.0, Relaxed);
+    }
+
+    pub fn record_block_iteration_teardown(before: (i64, u64), after: (i64, u64)) {
+        BLOCK_ITERATION_TEARDOWN_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        BLOCK_ITERATION_TEARDOWN_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
     }
 
     // --- Trailing sections (between `after_blocks` and `after_sections`) ---
@@ -6625,6 +6662,8 @@ pub mod stage0 {
         BLOCK_ASSEMBLY_ENCODED_BYTES.store(0, Relaxed);
         BLOCK_ASSEMBLY_ENCODED_ALLOCS.store(0, Relaxed);
         BLOCK_TRANSIENT_HIGH_WATER.store(0, Relaxed);
+        BLOCK_ITERATION_TEARDOWN_BYTES.store(0, Relaxed);
+        BLOCK_ITERATION_TEARDOWN_ALLOCS.store(0, Relaxed);
         SECTION_STREAM_DIR_BUILD_BYTES.store(0, Relaxed);
         SECTION_STREAM_DIR_BUILD_ALLOCS.store(0, Relaxed);
         SECTION_FIELD_DIR_BUILD_BYTES.store(0, Relaxed);

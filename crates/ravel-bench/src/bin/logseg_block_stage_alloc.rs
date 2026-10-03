@@ -210,6 +210,12 @@ fn block_buckets() -> Vec<Bucket> {
             allocs: BLOCK_ASSEMBLY_ENCODED_ALLOCS.load(Relaxed),
             category: Some("encoded block bytes held before the object is assembled"),
         },
+        Bucket {
+            name: "BLOCK_ITERATION_TEARDOWN (per-row scratch Vecs dropped at loop body close, between one iteration's tail sample and the next iteration's start sample; mixes several structures' frees, not separable without restructuring the loop)",
+            bytes: BLOCK_ITERATION_TEARDOWN_BYTES.load(Relaxed),
+            allocs: BLOCK_ITERATION_TEARDOWN_ALLOCS.load(Relaxed),
+            category: None,
+        },
     ]
 }
 
