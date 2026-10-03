@@ -86,7 +86,7 @@ use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::error::ArrowError;
 use datafusion::catalog::TableProvider;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchema, ScalarValue, TableReference};
+use datafusion::common::{Column, DFSchema, DFSchemaRef, ScalarValue, TableReference};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::empty::EmptyTable;
 use datafusion::error::DataFusionError;
@@ -94,7 +94,7 @@ use datafusion::execution::SendableRecordBatchStream;
 use datafusion::execution::disk_manager::DiskManager;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
 use datafusion::logical_expr::{
-    Aggregate, Distinct, Expr, ExprSchemable, Filter, LogicalPlan, Sort, SortExpr, lit,
+    Aggregate, Distinct, Expr, ExprSchemable, Filter, LogicalPlan, Projection, Sort, SortExpr, lit,
 };
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
@@ -3967,9 +3967,12 @@ fn plan_is_exact_typed(plan: &LogicalPlan) -> bool {
 ///   can: it appends the aggregate's own GROUP BY expressions, in group
 ///   order, ascending with nulls last, as trailing sort terms, unless they
 ///   are already present, to every `Sort` whose input is that `Aggregate` (or
-///   a `Projection` over it). A `Sort` the rewrite cannot reach this way --
-///   its input is not that shape, or a group key cannot be resolved by name
-///   in the sort's own input schema -- is left unchanged and stays
+///   a `Projection` directly over it). Each group key is matched to the
+///   aggregate's own qualified output column, never to a projected column
+///   that merely shares its name, and a key the `Projection` drops is
+///   projected through it. A `Sort` the rewrite cannot reach this way -- its
+///   input is any other shape (a `HAVING` filter, a nested projection), or
+///   the aggregate groups by grouping sets -- is left unchanged and stays
 ///   ineligible. `Join` and `Window` are outside the allowlist for the
 ///   original reason, one level up: nothing here has classified their spill
 ///   behavior.
@@ -4035,9 +4038,7 @@ fn plan_is_spill_eligible_ignoring_sort_order(plan: &LogicalPlan) -> bool {
 /// a total order.
 fn plan_nodes_are_spill_classifiable(plan: &LogicalPlan) -> bool {
     plan_nodes_are_spill_classifiable_with(plan, &|sort| {
-        sort_input_aggregate(sort.input.as_ref())
-            .and_then(|aggregate| missing_group_key_tiebreak_terms(aggregate, sort))
-            .is_some_and(|missing| missing.is_empty())
+        matches!(tie_order_edit(sort), Some(TieOrderEdit::AlreadyTotal))
     })
 }
 
@@ -4099,35 +4100,83 @@ fn plan_nodes_are_spill_classifiable_with(
     true
 }
 
-/// The `Aggregate` a `Sort` orders, when its input is that `Aggregate`
-/// directly or a `Projection` sitting over one (the `SELECT a, b, COUNT(*) ...
-/// GROUP BY a, b ORDER BY ...` shape). Any other input shape returns `None`:
-/// there is no aggregate here for a tie order to protect.
-fn sort_input_aggregate(input: &LogicalPlan) -> Option<&Aggregate> {
-    match input {
-        LogicalPlan::Aggregate(aggregate) => Some(aggregate),
-        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
-            LogicalPlan::Aggregate(aggregate) => Some(aggregate),
-            _ => None,
-        },
-        _ => None,
-    }
+/// Name prefix of the column a group key the `Projection` under a `Sort` drops
+/// is projected through as, suffixed with the key's index in the GROUP BY
+/// list. The restoring `Projection` above the `Sort` drops it again, so it
+/// never reaches a result. A user column already carrying the name makes
+/// `Projection::try_new` fail, which the callers of
+/// [`rewrite_sort_group_key_tie_order`] treat as "leave the plan as it was".
+const TIEBREAK_COLUMN_PREFIX: &str = "__ravel_tiebreak_";
+
+/// What [`rewrite_sort_group_key_tie_order`] does to one `Sort` whose input is
+/// an `Aggregate` or a `Projection` directly over one.
+#[derive(Debug)]
+enum TieOrderEdit {
+    /// Every GROUP BY key already has a sort term: nothing to append.
+    AlreadyTotal,
+    /// The `Sort`'s input exposes every missing key; append these terms.
+    Extend(Vec<SortExpr>),
+    /// The `Projection` under the `Sort` drops at least one key. Rebuild it
+    /// with `projected` (its own expressions plus each dropped key, aliased
+    /// to a [`TIEBREAK_COLUMN_PREFIX`] name) over `aggregate`, append `terms`,
+    /// and put a `Projection` back to `restore` (the original projection's
+    /// schema) on top, so the statement's schema is unchanged.
+    ProjectThrough {
+        terms: Vec<SortExpr>,
+        projected: Vec<Expr>,
+        aggregate: Arc<LogicalPlan>,
+        restore: DFSchemaRef,
+    },
 }
 
-/// The trailing [`SortExpr`] terms [`rewrite_sort_group_key_tie_order`] needs
-/// to append to `sort` so its key is total over `aggregate`'s GROUP BY
-/// expressions, in group order, ascending with nulls last -- or `None` when
-/// that cannot be proven.
-///
-/// An empty `Some` means the key is already total (every group expression has
-/// a matching sort term already): both the rewrite and
-/// [`plan_nodes_are_spill_classifiable`] treat that as "nothing to do",
-/// `Sort` admitted as it stands. `None` means a group key's output column
-/// could not be resolved, by name, in `sort`'s own input schema -- a grouping
-/// set (whose synthetic columns this does not attempt to match) or a
-/// `Projection` that renamed the column -- and fails closed: the `Sort` stays
-/// ineligible rather than guessing.
-fn missing_group_key_tiebreak_terms(aggregate: &Aggregate, sort: &Sort) -> Option<Vec<SortExpr>> {
+/// An ascending, nulls-last tiebreak term on `column`.
+fn tiebreak_term(column: Column) -> SortExpr {
+    SortExpr::new(Expr::Column(column), true, false)
+}
+
+/// Whether some term of `sort` is exactly `column`, qualifier included.
+fn sort_has_column_term(sort: &Sort, column: &Column) -> bool {
+    sort.expr
+        .iter()
+        .any(|term| matches!(&term.expr, Expr::Column(term_column) if term_column == column))
+}
+
+/// The output column under which `projection` exposes `key`, the aggregate's
+/// own qualified output column for one GROUP BY key: the first projected
+/// expression that IS `key`, bare or under one alias. A projected column that
+/// only shares `key`'s unqualified name (`sum(x) AS a` over `GROUP BY t.a`) is
+/// a different column and does not count.
+fn projected_group_key(projection: &Projection, key: &Column) -> Option<Column> {
+    projection
+        .expr
+        .iter()
+        .enumerate()
+        .find_map(|(index, expr)| {
+            let inner = match expr {
+                Expr::Alias(alias) => alias.expr.as_ref(),
+                other => other,
+            };
+            matches!(inner, Expr::Column(column) if column == key).then(|| {
+                let (qualifier, field) = projection.schema.qualified_field(index);
+                Column::new(qualifier.cloned(), field.name().clone())
+            })
+        })
+}
+
+/// The edit that makes `sort`'s key total over the GROUP BY keys of the
+/// aggregate it orders, or `None` when no edit can: its input is not an
+/// `Aggregate` or a `Projection` directly over one, or the aggregate groups by
+/// grouping sets (whose per-row null group columns this does not attempt to
+/// order).
+fn tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
+    let (projection, aggregate_plan) = match sort.input.as_ref() {
+        LogicalPlan::Aggregate(_) => (None, &sort.input),
+        LogicalPlan::Projection(projection) => (Some(projection), &projection.input),
+        _ => return None,
+    };
+    let LogicalPlan::Aggregate(aggregate) = aggregate_plan.as_ref() else {
+        return None;
+    };
     if aggregate
         .group_expr
         .iter()
@@ -4135,62 +4184,109 @@ fn missing_group_key_tiebreak_terms(aggregate: &Aggregate, sort: &Sort) -> Optio
     {
         return None;
     }
-    let input_schema = sort.input.schema();
-    let mut missing = Vec::new();
-    for index in 0..aggregate.group_expr.len() {
-        let (_, field) = aggregate.schema.qualified_field(index);
-        let already_present = sort
-            .expr
-            .iter()
-            .any(|term| matches!(&term.expr, Expr::Column(column) if column.name == *field.name()));
-        if already_present {
-            continue;
+    let group_keys = (0..aggregate.group_expr.len()).map(|index| {
+        let (qualifier, field) = aggregate.schema.qualified_field(index);
+        (index, Column::new(qualifier.cloned(), field.name().clone()))
+    });
+    let mut terms = Vec::new();
+    let Some(projection) = projection else {
+        for (_, key) in group_keys {
+            if !sort_has_column_term(sort, &key) {
+                terms.push(tiebreak_term(key));
+            }
         }
-        let (qualifier, _) = input_schema
-            .qualified_field_with_unqualified_name(field.name())
-            .ok()?;
-        missing.push(SortExpr::new(
-            Expr::Column(Column::new(qualifier.cloned(), field.name().clone())),
-            true,
-            false,
-        ));
+        return Some(if terms.is_empty() {
+            TieOrderEdit::AlreadyTotal
+        } else {
+            TieOrderEdit::Extend(terms)
+        });
+    };
+    let mut dropped = Vec::new();
+    for (index, key) in group_keys {
+        match projected_group_key(projection, &key) {
+            Some(column) => {
+                if !sort_has_column_term(sort, &column) {
+                    terms.push(tiebreak_term(column));
+                }
+            }
+            None => {
+                let name = format!("{TIEBREAK_COLUMN_PREFIX}{index}");
+                terms.push(tiebreak_term(Column::new_unqualified(name.clone())));
+                dropped.push(Expr::Column(key).alias(name));
+            }
+        }
     }
-    Some(missing)
+    Some(if terms.is_empty() {
+        TieOrderEdit::AlreadyTotal
+    } else if dropped.is_empty() {
+        TieOrderEdit::Extend(terms)
+    } else {
+        let mut projected = projection.expr.clone();
+        projected.extend(dropped);
+        TieOrderEdit::ProjectThrough {
+            terms,
+            projected,
+            aggregate: Arc::clone(&projection.input),
+            restore: Arc::clone(&projection.schema),
+        }
+    })
 }
 
-/// Rewrites every `Sort` whose input is an `Aggregate` (or a `Projection` over
-/// one) to append that aggregate's missing GROUP BY tiebreak terms
-/// ([`missing_group_key_tiebreak_terms`]), leaving `fetch` unchanged. A `Sort`
-/// the helper cannot resolve, or whose key is already total, is returned
-/// unchanged.
-///
-/// Infallible in practice: the closure below never returns `Err`, so neither
-/// does `transform_down`. The `Result` stays in the signature because
-/// `TreeNode::transform_down` requires it; callers propagate it exactly like
-/// any other DataFusion planning error rather than unwrapping a result that
-/// cannot fail today but is not provably unable to in a later DataFusion
-/// release.
-fn rewrite_sort_group_key_tie_order(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
-    Ok(plan
-        .transform_down(|node| {
-            let missing = match &node {
-                LogicalPlan::Sort(sort) => sort_input_aggregate(sort.input.as_ref())
-                    .and_then(|aggregate| missing_group_key_tiebreak_terms(aggregate, sort)),
-                _ => None,
-            };
-            let Some(missing) = missing.filter(|missing| !missing.is_empty()) else {
-                return Ok(Transformed::no(node));
-            };
-            let LogicalPlan::Sort(sort) = node else {
-                unreachable!("matched LogicalPlan::Sort above")
-            };
+/// Apply `edit` to `sort`, leaving `fetch` unchanged.
+fn apply_tie_order_edit(
+    sort: Sort,
+    edit: TieOrderEdit,
+) -> Result<Transformed<LogicalPlan>, DataFusionError> {
+    match edit {
+        TieOrderEdit::AlreadyTotal => Ok(Transformed::no(LogicalPlan::Sort(sort))),
+        TieOrderEdit::Extend(terms) => {
             let mut expr = sort.expr;
-            expr.extend(missing);
+            expr.extend(terms);
             Ok(Transformed::yes(LogicalPlan::Sort(Sort {
                 expr,
                 input: sort.input,
                 fetch: sort.fetch,
             })))
+        }
+        TieOrderEdit::ProjectThrough {
+            terms,
+            projected,
+            aggregate,
+            restore,
+        } => {
+            let inner = Projection::try_new(projected, aggregate)?;
+            let mut expr = sort.expr;
+            expr.extend(terms);
+            let sorted = LogicalPlan::Sort(Sort {
+                expr,
+                input: Arc::new(LogicalPlan::Projection(inner)),
+                fetch: sort.fetch,
+            });
+            let restored = Projection::new_from_schema(Arc::new(sorted), restore);
+            Ok(Transformed::yes(LogicalPlan::Projection(restored)))
+        }
+    }
+}
+
+/// Rewrites every `Sort` whose input is an `Aggregate` (or a `Projection`
+/// directly over one) so its key is total over that aggregate's GROUP BY keys
+/// ([`tie_order_edit`]): each key without a sort term is appended, in group
+/// order, ascending with nulls last, and `fetch` is unchanged. A `Sort` no
+/// edit applies to is returned unchanged. Does not reach into subquery plans.
+///
+/// Errors only when a rebuilt `Projection` does not validate (a user column
+/// already named like a [`TIEBREAK_COLUMN_PREFIX`] column). Every caller then
+/// keeps the plan it had, which leaves a `Sort` that needed the edit
+/// spill-ineligible; the rewrite exists to admit spill and never fails a
+/// query.
+fn rewrite_sort_group_key_tie_order(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
+    Ok(plan
+        .transform_down(|node| match node {
+            LogicalPlan::Sort(sort) => match tie_order_edit(&sort) {
+                Some(edit) => apply_tie_order_edit(sort, edit),
+                None => Ok(Transformed::no(LogicalPlan::Sort(sort))),
+            },
+            other => Ok(Transformed::no(other)),
         })?
         .data)
 }
@@ -5797,9 +5893,9 @@ mod tests {
     }
 
     /// A `GROUP BY GROUPING SETS` aggregate is excluded outright
-    /// ([`missing_group_key_tiebreak_terms`]'s synthetic-column arm): the
-    /// rewrite cannot resolve a grouping set's per-row-null group columns by
-    /// name, so it leaves the Sort unchanged and the plan stays ineligible.
+    /// ([`tie_order_edit`] returns `None`): the rewrite does not order a
+    /// grouping set's per-row null group columns, so it leaves the Sort
+    /// unchanged and the plan stays ineligible.
     #[tokio::test]
     async fn a_grouping_set_sort_stays_ineligible_after_the_rewrite() {
         let executor = eviction_test_executor();
@@ -5820,28 +5916,166 @@ mod tests {
         );
     }
 
-    /// A `Projection` that renames a group key (`a AS a2`) hides it from
-    /// [`missing_group_key_tiebreak_terms`]'s by-name lookup in the Sort's
-    /// input schema: the rewrite cannot find a column named `a` to append, so
-    /// it fails closed and the Sort stays ineligible.
-    #[tokio::test]
-    async fn a_renamed_group_key_stays_ineligible_after_the_rewrite() {
-        let executor = eviction_test_executor();
-        let tenant = TenantHash([105u8; 16]);
+    /// Every term of the first `Sort` in `plan`, as `(qualifier, name, asc,
+    /// nulls_first)`, so a test can pin the exact key including which
+    /// relation each column belongs to.
+    fn sort_terms(plan: &LogicalPlan) -> Vec<(Option<String>, String, bool, bool)> {
+        let sort = find_sort(plan).expect("the plan has a Sort node");
+        sort.expr
+            .iter()
+            .map(|term| match &term.expr {
+                Expr::Column(column) => (
+                    column.relation.as_ref().map(ToString::to_string),
+                    column.name.clone(),
+                    term.asc,
+                    term.nulls_first,
+                ),
+                other => panic!("expected a bare column reference, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A sort term with SQL's default null placement for its direction (nulls
+    /// first descending, last ascending), which is also what every appended
+    /// ascending tiebreak term carries.
+    fn term(
+        qualifier: Option<&str>,
+        name: &str,
+        asc: bool,
+    ) -> (Option<String>, String, bool, bool) {
+        (qualifier.map(str::to_string), name.to_string(), asc, !asc)
+    }
+
+    /// The expressions of the `Projection` directly under the first `Sort`.
+    fn projection_under_sort(plan: &LogicalPlan) -> Vec<Expr> {
+        let sort = find_sort(plan).expect("the plan has a Sort node");
+        let LogicalPlan::Projection(projection) = sort.input.as_ref() else {
+            panic!("expected a Projection under the Sort, got {:?}", sort.input);
+        };
+        projection.expr.clone()
+    }
+
+    async fn q33_plan(sql: &str) -> LogicalPlan {
         let schemas = vec![("q33".to_string(), q33_schema())];
-        let sql = "SELECT a AS a2, b, count(*) AS c FROM q33 \
-                   GROUP BY a, b ORDER BY c DESC LIMIT 10";
-        let plan = executor
-            .analyzed_classification_plan(tenant, sql, &[], Some(&schemas))
+        eviction_test_executor()
+            .analyzed_classification_plan(TenantHash([105u8; 16]), sql, &[], Some(&schemas))
             .await
-            .expect("the renamed-key shape plans");
+            .expect("the statement plans")
+    }
+
+    /// A `Projection` that renames a group key (`a AS a2`) still exposes it:
+    /// [`projected_group_key`] matches the projected expression to the
+    /// aggregate's qualified group column `q33.a`, so the rewrite appends the
+    /// renamed column `a2`, then `q33.b`, and the plan becomes eligible.
+    #[tokio::test]
+    async fn a_renamed_group_key_is_appended_under_its_new_name() {
+        let plan = q33_plan(
+            "SELECT a AS a2, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC LIMIT 10",
+        )
+        .await;
         assert!(!plan_is_spill_eligible(&plan));
 
-        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite never errors");
-        assert!(
-            !plan_is_spill_eligible(&rewritten),
-            "a renamed group key must fail closed rather than being skipped silently"
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "c", false),
+                term(None, "a2", true),
+                term(Some("q33"), "b", true),
+            ]
         );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// Issue #2416 counterexample: the projection alias `a` is `sum(x)`, not
+    /// the group key `q33.a`, which the projection drops. The rewrite projects
+    /// `q33.a` through under a tiebreak name and sorts on it, so the key is
+    /// total over `(q33.a, q33.b)`; the restoring projection keeps the
+    /// statement's four output columns.
+    #[tokio::test]
+    async fn an_alias_named_like_a_group_key_is_not_taken_for_it() {
+        let plan = q33_plan(
+            "SELECT sum(x) AS a, b, count(*) AS c, avg(y) AS ay FROM q33 \
+             GROUP BY q33.a, b ORDER BY c DESC LIMIT 10",
+        )
+        .await;
+        let schema = Arc::clone(plan.schema());
+        assert!(!plan_is_spill_eligible(&plan));
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+        let tiebreak = format!("{TIEBREAK_COLUMN_PREFIX}0");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "c", false),
+                term(None, &tiebreak, true),
+                term(Some("q33"), "b", true),
+            ]
+        );
+        let projected = projection_under_sort(&rewritten);
+        assert_eq!(
+            projected.last(),
+            Some(&Expr::Column(Column::new(Some("q33"), "a")).alias(tiebreak.as_str())),
+            "the tiebreak column is the aggregate's own q33.a"
+        );
+        assert_eq!(
+            rewritten.schema(),
+            &schema,
+            "the output schema is unchanged"
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// The same counterexample on the already-present check: the sort term
+    /// `a` is the `count(*)` alias, so it does not cover the group key
+    /// `q33.a`, which the rewrite still projects through and appends.
+    #[tokio::test]
+    async fn an_order_by_alias_named_like_a_group_key_does_not_cover_it() {
+        let plan = q33_plan(
+            "SELECT b, count(*) AS a, avg(y) AS ay FROM q33 \
+             GROUP BY q33.a, b ORDER BY a DESC LIMIT 10",
+        )
+        .await;
+        assert!(!plan_is_spill_eligible(&plan));
+
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![
+                term(None, "a", false),
+                term(None, &format!("{TIEBREAK_COLUMN_PREFIX}0"), true),
+                term(Some("q33"), "b", true),
+            ]
+        );
+        assert!(plan_is_spill_eligible(&rewritten));
+    }
+
+    /// A `HAVING` filter sits between the `Sort`'s projection and the
+    /// aggregate, which is not a shape [`tie_order_edit`] reaches: the Sort is
+    /// left as it is and the plan stays ineligible.
+    #[tokio::test]
+    async fn a_having_filter_keeps_the_sort_ineligible() {
+        let plan = q33_plan(
+            "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b HAVING count(*) > 1 \
+             ORDER BY c DESC LIMIT 10",
+        )
+        .await;
+        let rewritten = rewrite_sort_group_key_tie_order(plan.clone()).expect("nothing to do");
+        assert_eq!(rewritten, plan);
+        assert!(!plan_is_spill_eligible(&rewritten));
+    }
+
+    /// A user column already named like the tiebreak column makes the rebuilt
+    /// projection invalid. The rewrite reports that as an error, which every
+    /// caller treats as "keep the plan, not eligible", rather than panicking.
+    #[tokio::test]
+    async fn a_tiebreak_name_collision_is_an_error_not_a_panic() {
+        let plan = q33_plan(&format!(
+            "SELECT b, count(*) AS c, sum(x) AS {TIEBREAK_COLUMN_PREFIX}0 FROM q33 \
+             GROUP BY a, b ORDER BY c DESC LIMIT 10"
+        ))
+        .await;
+        assert!(rewrite_sort_group_key_tie_order(plan).is_err());
     }
 
     fn eviction_test_executor() -> SqlExecutor {

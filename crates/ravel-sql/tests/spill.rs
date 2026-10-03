@@ -1076,3 +1076,309 @@ async fn the_spilling_aggregation_holds_its_pool_accounted_peak_under_the_cap() 
         "the pool-accounted peak must be observed, not left at zero"
     );
 }
+
+/// Distinct `(a, b)` groups in the q33 fixture, and how many of them (the
+/// lowest group numbers) appear three times rather than once. Those
+/// [`Q33_TOP_GROUPS`] groups share the top count, so `ORDER BY c DESC LIMIT
+/// 10` picks ten of them, and which ten is decided by the tie order alone.
+const Q33_GROUPS: u64 = 200_000;
+const Q33_TOP_GROUPS: u64 = 500;
+const Q33_ROWS: u64 = Q33_GROUPS + 2 * Q33_TOP_GROUPS;
+
+/// The rows of group `g`: `a = "a<g>"` (zero padded, so string order is
+/// group order), `b = "b<g mod 3>"`, `x = 1`, `y = g`. `x` is constant so
+/// `sum(x)` equals the count and decides no tie, and `avg(y)` is the group's
+/// own number, which shows which groups won.
+fn q33_row(g: u64) -> (String, String, i64, i64) {
+    let y = i64::try_from(g).expect("small");
+    (format!("a{g:07}"), format!("b{}", g % 3), 1, y)
+}
+
+/// The q33 table as one Parquet object of 8,192-row row groups. Groups are
+/// written in a scrambled order (a stride coprime to [`Q33_GROUPS`]), and the
+/// two extra rows of each top group are appended at the end, so neither the
+/// arrival order nor a hash order coincides with the sorted order.
+fn q33_parquet() -> bytes::Bytes {
+    use datafusion::arrow::array::{ArrayRef, StringArray};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
+
+    let mut groups: Vec<u64> = (0..Q33_GROUPS).map(|i| (i * 7_919) % Q33_GROUPS).collect();
+    groups.extend((0..Q33_TOP_GROUPS).rev());
+    groups.extend(0..Q33_TOP_GROUPS);
+    let rows: Vec<_> = groups.into_iter().map(q33_row).collect();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Utf8, false),
+        Field::new("b", DataType::Utf8, false),
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| &r.0))) as ArrayRef,
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| &r.1))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
+        ],
+    )
+    .expect("batch");
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_max_row_group_row_count(Some(8_192))
+        .build();
+    let mut out = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties)).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    bytes::Bytes::from(out)
+}
+
+/// An executor over `config` whose tenant [`q33_tenant`] has one Parquet
+/// table, `q33`, made of `file`.
+///
+/// Parquet, not RSEG: an RSEG scan holds each decoded segment as one
+/// non-spillable reservation in the query's own pool (see the module note), so
+/// on a scanned `samples` table the scan rather than the aggregate is what
+/// meets the budget. The Parquet scan leaves the pool to the aggregate, whose
+/// string group keys are accounted at their real size, so a budget below the
+/// aggregate's demand makes the aggregate the operator that spills.
+async fn q33_executor(config: SqlConfig, file: &bytes::Bytes) -> Arc<ravel_sql::SqlExecutor> {
+    use std::collections::{BTreeMap, HashMap};
+
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_pqtable::clock::FixedClock;
+    use ravel_pqtable::manifest::ParquetFile;
+    use ravel_pqtable::writer::{self, Intent};
+    use ravel_query::{GetLimiter, LogSegmentFetcher, SegmentFetcher};
+    use ravel_sql::{
+        DEFAULT_PARQUET_METADATA_CACHE_BYTES, ExternalStoreMap, ParquetSources, SpanSegmentFetcher,
+        SqlExecutor,
+    };
+
+    const PROFILE: &str = "lake";
+    const GRANT: &str = "s3://lake/t";
+    const NOW: i64 = 1_700_000_000_000_000_000;
+    let tenant = q33_tenant();
+    let ravel: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let lake = Arc::new(MemoryStore::new());
+    let key = "t/q33/0.parquet";
+    let put = lake
+        .put(key, file.clone(), PutOptions::default())
+        .await
+        .expect("put");
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&file[file.len() - 8..file.len() - 4]);
+    let parquet_file = ParquetFile {
+        profile: PROFILE.to_string(),
+        bucket: "lake".to_string(),
+        key: key.as_bytes().to_vec(),
+        size: file.len() as u64,
+        etag: put.etag.0,
+        version: String::new(),
+        row_count: Q33_ROWS,
+        footer_len: u32::from_le_bytes(word),
+    };
+    ravel_pqtable::grants::add(
+        ravel.as_ref(),
+        &tenant,
+        PROFILE,
+        GRANT,
+        "test",
+        &FixedClock::new(NOW),
+    )
+    .await
+    .expect("grant");
+    writer::apply(
+        ravel.as_ref(),
+        &tenant,
+        "q33",
+        Intent::Create {
+            if_not_exists: false,
+            location: format!("{GRANT}/q33/"),
+            grant: GRANT.to_string(),
+            files: vec![parquet_file],
+            options: BTreeMap::new(),
+            created_by: "test".to_string(),
+            statement: "CREATE EXTERNAL TABLE q33 ...".to_string(),
+        },
+        &FixedClock::new(NOW),
+        60_000,
+    )
+    .await
+    .expect("create");
+    let external = Arc::new(ExternalStoreMap::new(HashMap::from([(
+        PROFILE.to_string(),
+        lake as Arc<dyn ObjectStoreBackend>,
+    )]))) as Arc<dyn ravel_sql::ExternalStores>;
+    let sources = ParquetSources::new(
+        Arc::clone(&ravel),
+        Some(external),
+        Arc::new(GetLimiter::new(8).expect("limiter")),
+        None,
+        DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let catalog = Arc::new(
+        ravel_catalog::Catalog::new(Arc::clone(&ravel), ravel_catalog::CatalogConfig::default())
+            .expect("catalog"),
+    );
+    Arc::new(
+        SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(Arc::clone(&ravel)),
+            LogSegmentFetcher::new(Arc::clone(&ravel)),
+            SpanSegmentFetcher::new(Arc::clone(&ravel)),
+            config,
+            1 << 40,
+        )
+        .with_parquet_sources(sources),
+    )
+}
+
+fn q33_tenant() -> ravel_types::TenantHash {
+    tenant_id("q33").hash()
+}
+
+/// One executed top-ten statement: each row rendered as `col|col|...` in
+/// result order, and what the query reported about spill and memory.
+struct TopTen {
+    rows: Vec<String>,
+    spill_files: u64,
+    spill_rows_written: u64,
+    peak_pool_bytes: u64,
+}
+
+impl TopTen {
+    /// Column `index` of every row, parsed as a number.
+    fn column_f64(&self, index: usize) -> Vec<f64> {
+        self.rows
+            .iter()
+            .map(|row| {
+                row.split('|')
+                    .nth(index)
+                    .expect("the row has the column")
+                    .parse()
+                    .expect("the column is a number")
+            })
+            .collect()
+    }
+}
+
+async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
+    use datafusion::arrow::util::display::array_value_to_string;
+
+    let outcome = executor
+        .execute(q33_tenant(), &request(sql))
+        .await
+        .expect("the top-ten statement completes");
+    let mut rows = Vec::new();
+    for batch in outcome.output.batches() {
+        for row in 0..batch.num_rows() {
+            let cells: Vec<String> = batch
+                .columns()
+                .iter()
+                .map(|column| array_value_to_string(column, row).expect("renderable"))
+                .collect();
+            rows.push(cells.join("|"));
+        }
+    }
+    TopTen {
+        rows,
+        spill_files: outcome.stats.spill.files,
+        spill_rows_written: outcome.stats.spill.rows_written,
+        peak_pool_bytes: outcome.accounting.peak_intermediate_bytes,
+    }
+}
+
+/// Run `sql` over the q33 table twice: in memory under
+/// [`AMPLE_QUERY_BYTES`], and with spill forced by a per-query pool of a
+/// quarter of the in-memory run's measured peak. Asserts that the first run
+/// did not spill and the second did, and returns `(spilled, in_memory)`.
+async fn spilled_and_in_memory(sql: &str) -> (TopTen, TopTen) {
+    let file = q33_parquet();
+    let scratch = tempfile::tempdir().expect("scratch root");
+    let config = |query_bytes| {
+        spill_config(
+            scratch.path().to_path_buf(),
+            AMPLE_SCRATCH_BYTES,
+            query_bytes,
+        )
+    };
+    let in_memory = run_top_ten(&*q33_executor(config(AMPLE_QUERY_BYTES), &file).await, sql).await;
+    let budget = usize::try_from(in_memory.peak_pool_bytes / 4).expect("fits");
+    let spilled = run_top_ten(&*q33_executor(config(budget), &file).await, sql).await;
+
+    eprintln!(
+        "q33 top ten: in-memory peak={} budget={budget} spill files={} rows_written={} \
+         of {Q33_GROUPS} groups",
+        in_memory.peak_pool_bytes, spilled.spill_files, spilled.spill_rows_written
+    );
+    assert_eq!(
+        (in_memory.spill_files, in_memory.spill_rows_written),
+        (0, 0),
+        "the ample-budget run must not spill"
+    );
+    // The aggregate writes at most one state row per input row while it
+    // consumes its input, and the merge of its spill files may write each of
+    // those once more (measured: 6 files, 364,250 rows).
+    assert!(
+        spilled.spill_files >= 1
+            && spilled.spill_rows_written >= Q33_GROUPS / 2
+            && spilled.spill_rows_written <= 2 * Q33_ROWS,
+        "under a quarter of its in-memory peak the aggregate must spill at least half of \
+         its {Q33_GROUPS} groups' state, and at most two state rows per input row: \
+         files={} rows_written={}",
+        spilled.spill_files,
+        spilled.spill_rows_written
+    );
+    assert!(
+        spilled.peak_pool_bytes <= budget as u64,
+        "the spilled run stays inside its pool"
+    );
+    (spilled, in_memory)
+}
+
+/// The group numbers of the ten groups a total `(c DESC, a, b)` order puts
+/// first: the ten lowest of the [`Q33_TOP_GROUPS`] groups that share the top
+/// count.
+fn q33_expected_top_ten() -> Vec<f64> {
+    (0..10).map(|g| g as f64).collect()
+}
+
+/// Issue #2416: the q33 shape over a table where 500 groups share the top
+/// count returns the same ten rows, in the same order, with spill forced and
+/// in memory, and those rows are the ten lowest `(a, b)` among the tied
+/// groups: the tiebreak is the group keys, ascending.
+#[tokio::test]
+async fn the_q33_top_ten_is_identical_spilled_and_in_memory() {
+    let sql = "SELECT a, b, count(*) AS c, sum(x) AS sx, avg(y) AS ay FROM q33 \
+               GROUP BY a, b ORDER BY c DESC LIMIT 10";
+    let (spilled, in_memory) = spilled_and_in_memory(sql).await;
+    assert_eq!(spilled.rows, in_memory.rows, "row for row");
+    assert_eq!(spilled.column_f64(4), q33_expected_top_ten());
+    assert_eq!(spilled.rows[0], "a0000000|b0|3|3|0.0");
+}
+
+/// Issue #2416: the projection alias `a` is `sum(x)`, not the group key
+/// `q33.a`, which the projection drops. `sum(x)` equals the count, so a sort
+/// key that took the alias for the key would tie across every top group with
+/// the same `b`, and the ten picked would depend on the run.
+#[tokio::test]
+async fn an_alias_named_like_a_group_key_gives_the_same_top_ten_spilled_or_not() {
+    let sql = "SELECT sum(x) AS a, b, count(*) AS c, avg(y) AS ay FROM q33 \
+               GROUP BY q33.a, b ORDER BY c DESC LIMIT 10";
+    let (spilled, in_memory) = spilled_and_in_memory(sql).await;
+    assert_eq!(spilled.rows, in_memory.rows, "row for row");
+    assert_eq!(spilled.column_f64(3), q33_expected_top_ten());
+}
+
+/// The same on the already-present check: the sort term `a` is the
+/// `count(*)` alias, which covers no group key.
+#[tokio::test]
+async fn an_order_by_alias_named_like_a_group_key_gives_the_same_top_ten_spilled_or_not() {
+    let sql = "SELECT b, count(*) AS a, avg(y) AS ay FROM q33 \
+               GROUP BY q33.a, b ORDER BY a DESC LIMIT 10";
+    let (spilled, in_memory) = spilled_and_in_memory(sql).await;
+    assert_eq!(spilled.rows, in_memory.rows, "row for row");
+    assert_eq!(spilled.column_f64(2), q33_expected_top_ten());
+}
