@@ -787,8 +787,8 @@ or substitute for it.
 
 ADR-2414 decision A3 changes the `cost-based` derivation in decision 2. The
 store cost profile now records two measured constants beside its prices, a
-request latency and a per-connection throughput, with the date and host they
-were measured on, set together or not at all. Their product, the bytes one
+request latency and a per-connection throughput, optionally with the date
+and host they were measured on, the two set together or not at all. Their product, the bytes one
 connection moves during one request's latency, is a time term, and the
 resolved rate is the larger of the price term above and that time term. A
 saturated price term (both byte prices zero, or a quotient at `u64::MAX`)

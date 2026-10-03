@@ -215,8 +215,8 @@ projection break-even (`ranged_projection_pays`) takes the larger of that
 threshold and five request costs, so a 3 MB L0 object still reads whole and
 a 35 MB compacted object at a narrow projection reads ranged. The loopback
 measurement in decision 4 was reasoned about, not re-run, and the result is
-this. A loopback deployment has no profile of its own, so it resolves the
-reference profile's 31,500,000-byte break-even. Decision 4 states no object
+this. Unless `--store-cost-profile` names another profile, a loopback
+deployment resolves the reference profile and its 31,500,000-byte break-even. Decision 4 states no object
 size; ADR-2414 puts the L0 objects of that layout at about 3 MB, and its
 11.24 GB corpus would have to sit in fewer than 357 objects for their average
 to reach the break-even. So on the reference profile those objects' blocks

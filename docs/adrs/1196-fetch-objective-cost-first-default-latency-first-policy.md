@@ -180,8 +180,8 @@ The rejected alternative "give `cost-based` a time term" is superseded by
 ADR-2414 decision A3. The objection was that bandwidth and latency are
 properties of the instance, not of the store, and that putting them into a
 profile of store prices is a category error. ADR-2414 records them as measured
-constants instead: each profile that carries them names the date and host they
-were measured on (the reference profile: 70 ms per request and 90 MB/s per
+constants instead, with an optional note of the date and host they were
+measured on (the reference profile: 70 ms per request and 90 MB/s per
 connection, measured on 2026-10-03 from the 32 GB reference box, intra-region
 against S3), and a profile without them keeps the price-only rate. The
 `cost-based` rate is the larger of the price term and the time term, and the
