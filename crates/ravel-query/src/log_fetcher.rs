@@ -12506,3 +12506,281 @@ mod late_serve_accounting_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod owned_block_plan_tests {
+    //! ADR-2414 decision A1, deliverables 1 and 3: a per-partition open's ranged
+    //! plan covers only the partition's own blocks, and with the plan phase's
+    //! decoded directories in hand it fetches no front directory section.
+    //!
+    //! The object has three row groups of four one-record blocks. The projection
+    //! is the fixed columns only (`ts` and the stream reference), so the ranged
+    //! plan stays below the coverage crossover and every fetched byte is a page
+    //! of a named block. What was fetched is read back off the returned buffer:
+    //! a page the plan did not place is [`LogSegError::Unplaced`] there.
+
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const KEY: &str = "t/owned.rlog";
+    const GROUP_BLOCKS: usize = 4;
+    const BLOCKS: usize = 3 * GROUP_BLOCKS;
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("body {ts} {}", "x".repeat(256)),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    struct Fixture {
+        fetcher: LogSegmentFetcher,
+        seg: SegmentRef,
+        object: Vec<u8>,
+    }
+
+    async fn fixture() -> Fixture {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            group_target_blocks: GROUP_BLOCKS,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer = RlogWriter::new(cfg, identity);
+        for ts in 0..BLOCKS as i64 {
+            writer.push(record(ts)).expect("push");
+        }
+        let object = writer.finish().expect("finish");
+        let store = Arc::new(MemoryStore::new());
+        store
+            .put(KEY, Bytes::from(object.clone()), PutOptions::default())
+            .await
+            .expect("put");
+        let seg = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: object.len() as u64,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: BLOCKS as i64 - 1,
+            ingest_hour_bucket: 0,
+            sample_count: BLOCKS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [9u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        // A probe reaching the whole tail, so SKIP_IDX and PAGE_DIR arrive with
+        // it and only the front sections and block pages are separate reads.
+        let parsed = footer::open(&object).expect("footer");
+        let blocks = parsed.section(kind::BLOCKS).expect("BLOCKS");
+        let tail = object.len() as u64 - (blocks.offset + blocks.len);
+        let fetcher = LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(
+                BlockRangeFetcher::new(store)
+                    .with_suffix_len(tail)
+                    .with_coalesce_gap(0)
+                    .with_whole_object_threshold(0),
+            );
+        Fixture {
+            fetcher,
+            seg,
+            object,
+        }
+    }
+
+    /// Whether every page of `block` the projection reads is in `bytes`.
+    fn block_is_placed(fx: &Fixture, bytes: &LogObjectBytes, block: usize) -> bool {
+        let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
+            .expect("directories");
+        let selected = ColumnSelection::fixed_only()
+            .resolve(dirs.field_dir())
+            .expect("a narrow projection resolves to a column set");
+        let blocks_offset = footer::open(&fx.object)
+            .expect("footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS")
+            .offset;
+        let pages: Vec<_> = dirs
+            .page_dir()
+            .block_pages(block as u32)
+            .expect("block in the directory")
+            .into_iter()
+            .filter(|p| selected.contains(&p.desc.column_id))
+            .collect();
+        assert!(
+            !pages.is_empty(),
+            "the projection reads pages of every block"
+        );
+        let placed = pages
+            .iter()
+            .map(|p| bytes.read(blocks_offset + p.offset, p.desc.len).is_ok())
+            .collect::<Vec<_>>();
+        assert!(
+            placed.iter().all(|&p| p) || placed.iter().all(|&p| !p),
+            "block {block}'s pages are placed together or not at all: {placed:?}"
+        );
+        placed[0]
+    }
+
+    async fn plan(
+        fx: &Fixture,
+        ts_min_ns: i64,
+        owned: Option<OwnedBlocks<'_>>,
+    ) -> (LogObjectBytes, BlockRangeStats) {
+        fx.fetcher
+            .block_range
+            .fetch_object_with_footer_subset(
+                &fx.seg,
+                TENANT,
+                ts_min_ns,
+                i64::MAX,
+                &[],
+                &ColumnSelection::fixed_only(),
+                None,
+                ReadPhases::SCAN,
+                owned,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("fetch")
+    }
+
+    fn placed_blocks(fx: &Fixture, bytes: &LogObjectBytes) -> Vec<usize> {
+        (0..BLOCKS)
+            .filter(|&b| block_is_placed(fx, bytes, b))
+            .collect()
+    }
+
+    /// A partition owning the middle row group places exactly that group's four
+    /// blocks, and fetches fewer bytes than the plan over every block.
+    ///
+    /// Fails against a plan keyed on the ts bounds alone (all twelve blocks are
+    /// candidates and placed).
+    #[tokio::test]
+    async fn the_ranged_plan_covers_only_the_partitions_blocks() {
+        let fx = fixture().await;
+        let owned = [4usize, 5, 6, 7];
+        let (bytes, stats) = plan(
+            &fx,
+            i64::MIN,
+            Some(OwnedBlocks {
+                blocks: &owned,
+                dirs: None,
+            }),
+        )
+        .await;
+        assert_eq!(stats.candidate_blocks, 4, "only the owned blocks");
+        assert_eq!(placed_blocks(&fx, &bytes), vec![4, 5, 6, 7]);
+
+        let (all_bytes, all_stats) = plan(&fx, i64::MIN, None).await;
+        assert_eq!(all_stats.candidate_blocks, BLOCKS as u64);
+        assert_eq!(
+            placed_blocks(&fx, &all_bytes),
+            (0..BLOCKS).collect::<Vec<_>>()
+        );
+        assert!(
+            stats.block_bytes_fetched * 2 < all_stats.block_bytes_fetched,
+            "one row group of three fetches under half the bytes: {} vs {}",
+            stats.block_bytes_fetched,
+            all_stats.block_bytes_fetched
+        );
+    }
+
+    /// The owned list names whole-object block indices, so it intersects the
+    /// ts candidate set by value. With the ts window starting at block 2 the
+    /// candidates are blocks 2..12; owning blocks 4..8 places those four, not
+    /// the four at positions 4..8 of the candidate list (blocks 6..10).
+    ///
+    /// Fails against an implementation that reads the owned list as positions
+    /// into the candidate list.
+    #[tokio::test]
+    async fn the_owned_list_is_whole_object_block_indices() {
+        let fx = fixture().await;
+        let owned = [4usize, 5, 6, 7];
+        let (bytes, stats) = plan(
+            &fx,
+            2,
+            Some(OwnedBlocks {
+                blocks: &owned,
+                dirs: None,
+            }),
+        )
+        .await;
+        assert_eq!(stats.candidate_blocks, 4);
+        assert_eq!(placed_blocks(&fx, &bytes), vec![4, 5, 6, 7]);
+    }
+
+    /// With the plan phase's directories in hand the open fetches no front
+    /// directory section: STREAM_DIR and FIELD_DIR are not placed, where
+    /// without them both are.
+    ///
+    /// Fails against an open that ignores the carried directories and fetches
+    /// the sections again.
+    #[tokio::test]
+    async fn carried_directories_fetch_no_front_section() {
+        let fx = fixture().await;
+        let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
+            .expect("directories");
+        let owned = [4usize, 5, 6, 7];
+        let parsed = footer::open(&fx.object).expect("footer");
+        let front_placed = |bytes: &LogObjectBytes| {
+            [kind::STREAM_DIR, kind::FIELD_DIR].map(|k| {
+                let desc = parsed.section(k).expect("front section");
+                bytes.read(desc.offset, desc.len).is_ok()
+            })
+        };
+
+        let (with, _) = plan(
+            &fx,
+            i64::MIN,
+            Some(OwnedBlocks {
+                blocks: &owned,
+                dirs: Some(&dirs),
+            }),
+        )
+        .await;
+        assert_eq!(front_placed(&with), [false, false]);
+        assert_eq!(placed_blocks(&fx, &with), vec![4, 5, 6, 7]);
+
+        let (without, _) = plan(
+            &fx,
+            i64::MIN,
+            Some(OwnedBlocks {
+                blocks: &owned,
+                dirs: None,
+            }),
+        )
+        .await;
+        assert_eq!(front_placed(&without), [true, true]);
+    }
+}
