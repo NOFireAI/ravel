@@ -4414,6 +4414,166 @@ mod tests {
         assert_eq!(converge_events(None, None).await, vec!["deployments"]);
     }
 
+    /// Disabling while the applied query Deployment still runs pods on the old
+    /// spec: the policy stays, under each of the three status conditions that
+    /// mark the rollout incomplete.
+    #[tokio::test]
+    async fn fragment_policy_is_kept_until_the_query_rollout_completes() {
+        use crate::reconcile::{FRAGMENT_PORT, HTTP_PORT};
+        let ports = [HTTP_PORT, FRAGMENT_PORT];
+        let incomplete = [
+            (
+                "controller has not observed the new generation",
+                query_rollout(3, Some(2), 3, 3, None, &ports),
+            ),
+            (
+                "status not reported yet",
+                Deployment {
+                    status: None,
+                    ..query_rollout(3, None, 0, 0, None, &ports)
+                },
+            ),
+            (
+                "an old-spec replica is still running",
+                query_rollout(3, Some(3), 4, 3, None, &ports),
+            ),
+            (
+                "a replica is unavailable",
+                query_rollout(3, Some(3), 3, 3, Some(1), &ports),
+            ),
+        ];
+        for (why, applied) in incomplete {
+            assert_eq!(
+                converge_events(None, Some(applied)).await,
+                vec!["deployments"],
+                "{why}: the policy must outlive the old pods"
+            );
+        }
+        // Unavailable reported as zero, rather than absent, is complete.
+        assert_eq!(
+            converge_events(None, Some(query_rollout(3, Some(3), 3, 3, Some(0), &ports))).await,
+            vec!["deployments", "delete rc-query-fragment"]
+        );
+    }
+
+    /// A policy with the fragment rule and an open rule admitting `open`.
+    fn policy_open_on(open: &[i32]) -> NetworkPolicy {
+        use crate::reconcile::FRAGMENT_PORT;
+        use k8s_openapi::api::networking::v1::{
+            NetworkPolicyIngressRule, NetworkPolicyPeer, NetworkPolicyPort, NetworkPolicySpec,
+        };
+        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+        let tcp = |port: i32| NetworkPolicyPort {
+            port: Some(IntOrString::Int(port)),
+            protocol: Some("TCP".to_string()),
+            end_port: None,
+        };
+        NetworkPolicy {
+            spec: Some(NetworkPolicySpec {
+                ingress: Some(vec![
+                    NetworkPolicyIngressRule {
+                        from: Some(vec![NetworkPolicyPeer::default()]),
+                        ports: Some(vec![tcp(FRAGMENT_PORT)]),
+                    },
+                    NetworkPolicyIngressRule {
+                        from: None,
+                        ports: Some(open.iter().copied().map(tcp).collect()),
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..fragment_policy("rc-query-fragment")
+        }
+    }
+
+    /// The ports a policy's open rule admits, sorted.
+    fn open_ports(policy: &NetworkPolicy) -> Vec<i32> {
+        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+        let mut ports: Vec<i32> = policy
+            .spec
+            .iter()
+            .flat_map(|spec| spec.ingress.iter().flatten())
+            .filter(|rule| rule.from.is_none())
+            .flat_map(|rule| rule.ports.iter().flatten())
+            .filter_map(|port| match port.port {
+                Some(IntOrString::Int(port)) => Some(port),
+                _ => None,
+            })
+            .collect();
+        ports.sort_unstable();
+        ports
+    }
+
+    /// The (event, open ports) trace of a converge pass.
+    async fn narrowing_trace(
+        live_query: Option<Deployment>,
+        applied_query: Option<Deployment>,
+    ) -> Vec<(String, Option<Vec<i32>>)> {
+        use crate::reconcile::HTTP_PORT;
+        converge_with_live(
+            Some(policy_open_on(&[HTTP_PORT])),
+            live_query,
+            applied_query,
+        )
+        .await
+        .into_iter()
+        .map(|(event, policy)| (event, policy.as_ref().map(open_ports)))
+        .collect()
+    }
+
+    /// Narrowing while distributed query stays on (the dedicated health port
+    /// turned off): the wider policy is held until the rollout of the query
+    /// Deployment completes, then the exact one replaces it.
+    #[tokio::test]
+    async fn wider_fragment_policy_is_held_through_a_narrowing_rollout() {
+        use crate::reconcile::{FRAGMENT_PORT, HEALTH_PORT, HTTP_PORT};
+        let old_spec = [HTTP_PORT, HEALTH_PORT, FRAGMENT_PORT];
+        let new_spec = [HTTP_PORT, FRAGMENT_PORT];
+        let mut wide = vec![HTTP_PORT, HEALTH_PORT];
+        wide.sort_unstable();
+        let held = |event: &str| (event.to_string(), Some(wide.clone()));
+        let exact = |event: &str| (event.to_string(), Some(vec![HTTP_PORT]));
+        let deployments = ("deployments".to_string(), None);
+
+        // The pass that starts the rollout: the live Deployment is the old,
+        // fully rolled-out spec, and the apply bumps its generation.
+        assert_eq!(
+            narrowing_trace(
+                Some(query_rollout(2, Some(2), 3, 3, None, &old_spec)),
+                Some(query_rollout(3, Some(2), 3, 3, None, &new_spec)),
+            )
+            .await,
+            vec![held("apply rc-query-fragment"), deployments.clone()],
+        );
+        // A later pass mid-rollout: the live template is already the new
+        // spec, but old pods remain, so the policy stays wide.
+        let mid = query_rollout(3, Some(3), 4, 2, Some(1), &new_spec);
+        assert_eq!(
+            narrowing_trace(Some(mid.clone()), Some(mid)).await,
+            vec![held("apply rc-query-fragment"), deployments.clone()],
+        );
+        // The rollout completed between the read and the apply: narrow once
+        // the applied object says so.
+        assert_eq!(
+            narrowing_trace(
+                Some(query_rollout(3, Some(3), 3, 2, None, &new_spec)),
+                Some(query_rollout(3, Some(3), 3, 3, None, &new_spec)),
+            )
+            .await,
+            vec![
+                held("apply rc-query-fragment"),
+                deployments.clone(),
+                exact("apply rc-query-fragment"),
+            ],
+        );
+        // Steady state after the rollout: one apply, already exact.
+        let done = query_rollout(3, Some(3), 3, 3, None, &new_spec);
+        assert_eq!(
+            narrowing_trace(Some(done.clone()), Some(done)).await,
+            vec![exact("apply rc-query-fragment"), deployments],
+        );
+    }
+
     /// Finding 3: credential resourceVersions are resolved before the gate and
     /// reused for the qualified-input hash. The value selected is the SHARED
     /// storage.s3 credential's (the one the qualify Job authenticates with),

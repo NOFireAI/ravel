@@ -9143,6 +9143,50 @@ mod tests {
         desired_objects(spec, "rc", "ns", &ctx()).expect("spec renders")
     }
 
+    /// A rotation of any one of the four distributed-query Secrets rolls the
+    /// query pods: the query checksum moves when that Secret's resourceVersion
+    /// changes and stays put when none does. No other tier mounts them, so the
+    /// gateway checksum never moves.
+    #[test]
+    fn query_checksum_follows_each_distributed_query_secret() {
+        let spec = distributed_query_spec(true);
+        let names: Vec<&str> = distributed_query_secret_refs(&spec)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["frag-tls", "frag-ca", "frag-keys", "sql-keys"]);
+        let with = |rvs: [&str; 4]| RenderCtx {
+            distributed_query_resource_versions: rvs.map(String::from).to_vec(),
+            ..ctx()
+        };
+        let query_checksum =
+            |rvs: [&str; 4]| checksum_of(&desired_query_deployment(&spec, "rc", &with(rvs)));
+        let gateway_checksum =
+            |rvs: [&str; 4]| checksum_of(&desired_gateway_deployment(&spec, "rc", &with(rvs)));
+        let base = ["t1", "c1", "k1", "s1"];
+        let before = query_checksum(base);
+        assert!(before.is_some());
+        assert_eq!(
+            query_checksum(base),
+            before,
+            "unchanged Secrets must not roll the query pods"
+        );
+        for (index, name) in names.iter().enumerate() {
+            let mut rotated = base;
+            rotated[index] = "rotated";
+            assert_ne!(
+                query_checksum(rotated),
+                before,
+                "rotating {name} must roll the query pods"
+            );
+            assert_eq!(
+                gateway_checksum(rotated),
+                gateway_checksum(base),
+                "rotating {name} must not roll the gateway pods"
+            );
+        }
+    }
+
     /// Enabled and complete: the query Deployment is the baseline plus exactly
     /// the distributed-query flags, the pod-IP env var, the fragment port, and
     /// the four Secret mounts, and a NetworkPolicy admits the fragment port only
