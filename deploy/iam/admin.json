@@ -31,7 +31,6 @@
         "arn:aws:s3:::my-ravel-bucket/sys/qualify/*",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/sys/auth",
-        "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/u/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/*/del/*.dreq",
@@ -39,6 +38,28 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/pq/grants",
         "arn:aws:s3:::my-ravel-bucket/sys/pq-probe/*"
       ]
+    },
+    {
+      "Sid": "AdminProvCreate",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*"
+        }
+      }
+    },
+    {
+      "Sid": "AdminProvCas",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/*/*/prov",
+      "Condition": {
+        "Null": {
+          "s3:if-match": "false"
+        }
+      }
     },
     {
       "Sid": "AdminQualifyDelete",

@@ -162,10 +162,10 @@ to reject an in-process authorization side channel.
 
 | Role | Process | Read | Write (create/mutate) | Delete |
 |---|---|---|---|---|
-| **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | no durable object; only the mutable per-process admission snapshots `t/<hash>/<sig>/admission/*` of dead processes (see the 2026-10-02 amendment below) |
+| **Gateway** | `Mode::Gateway`, or the gateway half of `Mode::All` | `prov`, `idem/<key>` (dedup lookup), `sys/tenancy`, `sys/qualification`, `sys/gc` (bootstrap reads); `l0/`, `c/` (fold's own read-back of what it just built on); `catalog/<sig>/**` (HEAD, snap parts, name postings — fold reads its own prior output to fold incrementally, `fold.rs` `get_head`/part/postings reads) | `l0/**` (CreateIfAbsent), `c/**cmt` (CreateIfAbsent, L0 commit records only), `idem/**` (Put), `prov` (CreateIfAbsent, adopt path only; create-only per the prov write conditions amendment below), `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` (CreateIfAbsent); `sys/tenancy` (CreateIfAbsent, first-boot race, see §4) | no durable object; only the mutable per-process admission snapshots `t/<hash>/<sig>/admission/*` of dead processes (see the 2026-10-02 amendment below) |
 | **Query** | `Mode::Query`, or the query half of `Mode::All` | `c/**` (Phase 1 listing), `l0/**`, `l1/**` (the query fetchers GET segment data directly — footer-first ranged reads — not just commit-record metadata; `ravel-query`'s fetcher, `ravel-server`'s exemplar/log/span fetchers), `catalog/<sig>/**` (snap/HEAD/idx), `prov`, `admission/query/**` (fleet-global query concurrency reconciliation, ADR-0061 decision 2: LIST the bucket-root `admission/query/` prefix and GET each sibling process's snapshot), `sys/tenancy`, `sys/qualification`, `sys/gc` | `catalog/<sig>/snap/**`, `catalog/<sig>/HEAD` (CasVersion), `catalog/<sig>/idx/**` — same fold grants as Gateway, per the code fact above; `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (Put, append-only query audit); `admission/query/<process_id>.snapshot` (Overwrite, this process's own fleet-concurrency snapshot, ADR-0061 decision 2 — a bucket-root key, deliberately **not** under a `t/<hash>/` prefix since the ceiling is fleet-global, not per-tenant); `sys/tenancy` (CreateIfAbsent, first-boot race); `t/<hash>/pq/t/**` (CreateIfAbsent only, HTTP Parquet DDL manifests) and `sys/pq-probe/*` (Overwrite, the bucket probe), see the HTTP DDL amendment below | no durable object; only the bucket probe's scratch object `sys/pq-probe/*` (see the HTTP DDL amendment below). A draining query worker overwrites its own `sys/query/workers/<process_id>` record instead of deleting it; see the query-worker reap amendment below |
 | **Maintain** | `Mode::Maintain` | `l0/**`, `c/**` (compaction input read, footer-first ranged reads); `l1/**` (HEAD, the lost-CAS-race convergence path re-verifies a part's existence before retrying publish); `maint/<shard>/cursor` (read before its own CAS mutation); `t/<hash>/u/<AUDIT>/**` (legal-hold refresh); `sys/tenancy`, `sys/qualification`, `sys/gc`, `prov` | `l1/**` (CreateIfAbsent); `c/**l1.cmt` (CreateIfAbsent, compaction records); `c/**retire.tmb` (Put, tombstones); `maint/<shard>/cursor` (mutable CAS); `sys/gc` (CreateIfAbsent bootstrap only — see §4 for the CasVersion mutation, which stays Admin); `sys/tenancy` (CreateIfAbsent, first-boot race); `catalog/<sig>/snap/**` (CreateIfAbsent), `catalog/<sig>/HEAD` (CasVersion, or CreateIfAbsent on the first fold), `catalog/<sig>/idx/**` (CreateIfAbsent) — the scheduled fold, see the maintain-tier fold amendment below | `l0/**`, `c/**` (records and tombstones, superseded/retention/orphan sweep), `l1/**` (unreferenced-part sweep), `idem/**` (marker sweep), `t/<hash>/u/<QUERY_AUDIT_SHARD>/**` (query-audit compaction + 90-day retention sweep — see the query-audit shard amendment below), `sys/maintain/workers/*` (dead-worker heartbeat reap, see the worker-heartbeat amendment below), `sys/query/workers/*` (dead query-worker record reap, see the query-worker reap amendment below), `t/<hash>/<sig>/del/*.dreq` (see the selective-erasure `del/` amendment below), `t/<hash>/pq/t/**` (superseded Parquet table manifests, `ravel-cli parquet sweep`, see the 2026-10-02 amendment below) — **the only role with durable-data deletion** |
-| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see the `c/**cmt` write amendment below) | the qualification scratch prefix `sys/qualify/*`, so `store qualify` can exercise the delete probe (see the qualification scratch delete amendment below), and the Parquet bucket probe prefix `sys/pq-probe/*` (see the 2026-10-02 amendment below); Admin still never deletes tenant data or any protected key |
+| **Admin** (`ravel-cli`, operator/CI use only, never a long-running server) | n/a — invoked out of band | everything the roles above read, plus `idem/<key>` single-key inspect | `sys/tenancy` (CreateIfAbsent bootstrap), `sys/qualification` (CreateIfAbsent, `store qualify`), `sys/qualify/<run-id>/**` (CreateIfAbsent, the same command's transient scratch prefix — `store qualify` exercises PUT/GET/LIST/CAS under this prefix as part of running the conformance suite, not just the final record write), `sys/gc` (CasVersion, `gc-config set`), `prov` (CasVersion, `provision reshard` / `provision adopt`; CAS-only and create-only grants per the prov write conditions amendment below), `t/<hash>/u/<AUDIT>/**` (legal hold set/clear, append-only), `c/**cmt` (CreateIfAbsent, reconstructed L0 commit records only, `commit reconstruct`, ADR-0058 — see the `c/**cmt` write amendment below) | the qualification scratch prefix `sys/qualify/*`, so `store qualify` can exercise the delete probe (see the qualification scratch delete amendment below), and the Parquet bucket probe prefix `sys/pq-probe/*` (see the 2026-10-02 amendment below); Admin still never deletes tenant data or any protected key |
 
 **Correction:**
 the table above was missing four read/write grants in its first accepted
@@ -187,6 +187,12 @@ key-epoch record `t/<hash>/enc`, the metric metadata record `t/<hash>/m/meta`,
 and the alert evaluator's lease and state memo under `t/<hash>/a/`, along with
 the alert transition writes the Query role makes; the control-plane key
 amendment below adds them and lists every control-plane key each role uses.
+
+The table's `prov` entries are incomplete too: Query and Maintain create the
+record on the startup and maintain-tick adopt paths, Maintain raises format
+floors under `CasVersion`, and Admin's `provision adopt` is `CreateIfAbsent`.
+The prov write conditions amendment below grants each of them and conditions
+every `prov` write on the put mode its callers send.
 
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
@@ -378,7 +384,9 @@ by whichever role's policy grants them a `PutObject` with the right
 precondition (see the write columns in §1's table) — a compromised writer
 with legitimate write access to `prov` can still corrupt it going forward,
 it just cannot destroy the object outright or roll back to a stale prior
-state via delete-then-recreate. Full immutability-against-overwrite is the
+state via delete-then-recreate. For `prov`, only Maintain and Admin hold a
+grant that can overwrite; Gateway and Query can only create a missing record
+(prov write conditions amendment below). Full immutability-against-overwrite is the
 gap ADR-0042 already named and reserved: `object_store` 0.14.1 has no
 per-PUT retention API, so true Object Lock enforcement stays bucket-level
 and out-of-band for this ADR too, exactly as ADR-0042 decided for `c/`. This
@@ -1461,3 +1469,74 @@ Recorded as an appended amendment, with an inline pointer added to the
 context's list of what the code deletes, §1, §2, the Consequences, and the
 worker-heartbeat, query-worker reap, control-plane key and 2026-10-02
 amendments.
+
+## Amendment (2026-10-03): prov write conditions per role
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|3. Deny-delete, everywhere, on the four prefixes nothing deletes" pointer="prov write conditions amendment" -->
+
+Issue #2396. Every write of the provisioning record
+`t/<hash>/<sig>/prov` goes through one of three functions in
+`crates/ravel-catalog/src/provisioning.rs`: `write_record_race_safe` with
+`PutMode::CreateIfAbsent`, reached from `validate_or_adopt` under
+`AbsentPolicy::CreateFromConfig` or `AbsentPolicy::AdoptIfData`, and
+`append_generation` and `raise_format_floor` with `PutMode::CasVersion`. No
+production path writes the record unconditionally. The callers, by the role
+whose credential issues them:
+
+- Gateway: `ProvisioningRecordWriter::ensure` on a tenant's first ingest
+  write (`CreateFromConfig`, so `CreateIfAbsent`).
+- Gateway, Query and Maintain: `validate_static_provisioning`
+  (`services/ravel-server/src/provisioning.rs`), which `main.rs` runs at
+  startup in every mode for each statically known tenant (`AdoptIfData`, so
+  `CreateIfAbsent` when the tenant's data predates its record).
+- Maintain: the maintain tick's per-tenant, per-signal `validate_or_adopt`
+  (`services/ravel-server/src/maintain.rs`, `AdoptIfData`), and
+  `ravel-cli maintain migrate`'s floor raise, `raise_format_floor` after a
+  clean re-audit (`CasVersion`, ADR-0066 decisions 3 and 5).
+- Admin: `ravel-cli provision adopt` (`AdoptIfData`, so `CreateIfAbsent`) and
+  `ravel-cli provision reshard` (`append_generation`, `CasVersion`).
+
+`query.json` and `maintain.json` granted no `prov` write, so on a per-role
+deployment a Query or Maintain process with a statically known tenant whose
+data predated its record failed at startup with `AccessDenied`, the maintain
+tick skipped that tenant's signal on every tick, and `maintain migrate`
+could not raise a floor. `gateway.json` and `admin.json` granted an
+unconditioned `PutObject` on the record.
+
+The S3 backend sends `CreateIfAbsent` as `If-None-Match: *` and
+`CasVersion` as `If-Match: <etag>`. Checked against AWS on 2026-10-03, IAM
+evaluates both keys on `PutObject`: a statement conditioned on
+`StringEquals` `s3:if-none-match` `*` allows only a create-if-absent PUT,
+and a statement conditioned on `Null` `s3:if-match` `false` allows only a
+compare-and-swap PUT. Each refuses an unconditional PUT and the other
+conditional kind. Every `prov` write grant is now one of those two shapes, on
+the resource `t/*/*/prov`:
+
+- `gateway.json`: `GatewayWrite` loses `t/*/*/prov`, and `GatewayProvCreate`
+  grants it create-only. No Gateway path appends a generation or raises a
+  floor.
+- `query.json`: `QueryProvCreate`, create-only.
+- `maintain.json`: `MaintainProvCreate`, create-only, and `MaintainProvCas`,
+  CAS-only. The migrate cursor change of issue #2359 is separate and does not
+  touch these grants.
+- `admin.json`: `AdminWrite` loses `t/*/*/prov`, and `AdminProvCreate` and
+  `AdminProvCas` grant it create-only and CAS-only.
+
+`DenyDeleteProtected` keeps `t/*/*/prov` in all four templates. A
+compromised Gateway or Query credential can now create a missing record and
+cannot replace an existing one: before this amendment Gateway could
+overwrite any tenant's record outright. A compromised Maintain or Admin
+credential can still rewrite a record through a CAS PUT after reading its
+ETag, which is the overwrite gap §3 already names. The operator's
+`append_generation` runs under the shared credential, not a template.
+`crates/ravel-commit/tests/iam_templates.rs` pins the condition on every
+`prov` statement per role, refuses an unconditioned `PutObject` reaching the
+record, and matches each caller above to a grant of its own kind.
+
+Net effect on §1: the Query and Maintain write columns gain the `prov`
+writes above, and the Gateway and Admin entries are conditioned. Net effect
+on §3: of the roles that write `prov`, only Maintain and Admin can overwrite
+it.
+
+Recorded as an appended amendment, with an inline pointer added to §1 and
+§3.
