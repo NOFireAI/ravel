@@ -1908,6 +1908,136 @@ fn validate_idle_flush_byte_floor(config: &ServerConfig) -> anyhow::Result<()> {
     })
 }
 
+/// Why a flush cadence was refused at startup: it spends the read-side scan
+/// slack `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` encodes. Returned by
+/// [`start`] for every caller and every [`Mode`], and by `Cli::validate`
+/// through the same functions, so the library and the command line refuse
+/// the same cadences with the same text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushCadenceError {
+    /// `max_flush_delay_idle` plus the ingest pipeline's `max_flush_lifetime`
+    /// exceeds `FLUSH_BOUND_SLACK_HOURS` (ADR-0076 decision 4).
+    FlushBoundExceedsSlack {
+        max_flush_delay_idle: Duration,
+        max_flush_lifetime: Duration,
+    },
+    /// The cadence leaves the flush deferral cap at 0 (ADR-1642 deferral cap
+    /// amendment), so a shard whose flush queue filled would refuse every
+    /// write from the first deferred trigger.
+    ZeroFlushDeferralCap {
+        max_flush_delay: Duration,
+        max_flush_delay_idle: Duration,
+        adaptive_flush_delay: bool,
+        max_flush_lifetime: Duration,
+        flush_trigger_age_bound_ns: i64,
+        flush_tick: Duration,
+    },
+}
+
+impl std::fmt::Display for FlushCadenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::FlushBoundExceedsSlack {
+                max_flush_delay_idle,
+                max_flush_lifetime,
+            } => write!(
+                f,
+                "--max-flush-delay-idle {:?} plus the ingest pipeline's max_flush_lifetime ({:?}) \
+                 exceeds FLUSH_BOUND_SLACK_HOURS ({} h): the read-side scan slack \
+                 ravel_catalog::FLUSH_BOUND_SLACK_HOURS encodes would no longer cover a \
+                 straggler flush pinned under a retiring shard-count generation, an \
+                 invisibility hazard. Lower --max-flush-delay-idle, or revisit \
+                 FLUSH_BOUND_SLACK_HOURS in ravel-catalog in lockstep (ADR-0076 decision 4).",
+                max_flush_delay_idle,
+                max_flush_lifetime,
+                ravel_catalog::FLUSH_BOUND_SLACK_HOURS,
+            ),
+            Self::ZeroFlushDeferralCap {
+                max_flush_delay,
+                max_flush_delay_idle,
+                adaptive_flush_delay,
+                max_flush_lifetime,
+                flush_trigger_age_bound_ns,
+                flush_tick,
+            } => write!(
+                f,
+                "--max-flush-delay-idle {:?} with --max-flush-delay {:?}{} leaves the flush \
+                 deferral cap at 0: FLUSH_BOUND_SLACK_HOURS ({} h) less max_flush_lifetime \
+                 ({:?}) less the flush trigger age bound ({} ns: the largest of \
+                 --max-flush-delay, --max-flush-delay-idle and, with --adaptive-flush-delay, \
+                 the adaptive ceiling, plus one flush_tick of {:?}) is not positive. A shard \
+                 whose flush queue filled would refuse every write from the first deferred \
+                 trigger (ADR-1642 deferral cap amendment). Lower --max-flush-delay-idle so \
+                 that it plus max_flush_lifetime plus one flush_tick stays below \
+                 FLUSH_BOUND_SLACK_HOURS.",
+                max_flush_delay_idle,
+                max_flush_delay,
+                if *adaptive_flush_delay {
+                    " and --adaptive-flush-delay"
+                } else {
+                    ""
+                },
+                ravel_catalog::FLUSH_BOUND_SLACK_HOURS,
+                max_flush_lifetime,
+                flush_trigger_age_bound_ns,
+                flush_tick,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FlushCadenceError {}
+
+/// Refuses an idle flush delay that, plus the ingest pipeline's default
+/// `max_flush_lifetime`, exceeds the read-side scan slack (ADR-0076 decision
+/// 4). The issue #1740 deferral term is bounded separately, by
+/// [`validate_flush_deferral_cap`].
+pub(crate) fn validate_flush_bound_slack(
+    max_flush_delay_idle: Duration,
+) -> Result<(), FlushCadenceError> {
+    let max_flush_lifetime = IngestConfig::default().max_flush_lifetime;
+    let flush_bound_ns = config::duration_nanos_saturating(max_flush_delay_idle)
+        .saturating_add(config::duration_nanos_saturating(max_flush_lifetime));
+    if flush_bound_ns > config::FLUSH_BOUND_SLACK_HOURS_NS {
+        return Err(FlushCadenceError::FlushBoundExceedsSlack {
+            max_flush_delay_idle,
+            max_flush_lifetime,
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a flush cadence that leaves the flush deferral cap
+/// ([`IngestConfig::flush_deferral_cap_ns`], ADR-1642 deferral cap amendment)
+/// at 0. The cap is computed from the cadence and the strict visibility budget
+/// `start` derives from it, every other term at its `IngestConfig` default.
+/// [`validate_flush_bound_slack`] admits such a cadence at equality.
+pub(crate) fn validate_flush_deferral_cap(
+    max_flush_delay: Duration,
+    max_flush_delay_idle: Duration,
+    adaptive_flush_delay: bool,
+) -> Result<(), FlushCadenceError> {
+    let ingest = IngestConfig {
+        max_flush_delay,
+        max_flush_delay_idle,
+        adaptive_flush_delay,
+        strict_visibility_budget_ns: config::duration_nanos_saturating(max_flush_delay)
+            .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
+        ..IngestConfig::default()
+    };
+    if ingest.flush_deferral_cap_ns() == 0 {
+        return Err(FlushCadenceError::ZeroFlushDeferralCap {
+            max_flush_delay,
+            max_flush_delay_idle,
+            adaptive_flush_delay,
+            max_flush_lifetime: ingest.max_flush_lifetime,
+            flush_trigger_age_bound_ns: ingest.flush_trigger_age_bound_ns(),
+            flush_tick: ingest.flush_tick,
+        });
+    }
+    Ok(())
+}
+
 /// The refusal text for one [`IngestConfigError`], with the advice naming the
 /// flags that variant's fields come from.
 fn ingest_config_refusal(e: &IngestConfigError) -> String {
@@ -2070,6 +2200,12 @@ pub async fn start_with_heartbeat(
     heartbeat: health_listener::Heartbeat,
 ) -> anyhow::Result<Running> {
     validate_idle_flush_byte_floor(&config)?;
+    validate_flush_bound_slack(config.max_flush_delay_idle)?;
+    validate_flush_deferral_cap(
+        config.max_flush_delay,
+        config.max_flush_delay_idle,
+        config.adaptive_flush_delay,
+    )?;
     validate_loop_intervals(&config)?;
 
     // Install the rustls process-level crypto provider before any TLS endpoint
