@@ -5285,12 +5285,11 @@ mod tests {
     /// - `plan`: per object, the pinned suffix probe, the SKIP_IDX chase it
     ///   forces, and the whole-object fallback.
     ///   `PROBE_MISS_OBJECTS * (suffix + skip_idx_len + object_len)`.
-    /// - `probe`: the uncarried segment's data read pays its own suffix probe,
-    ///   its SKIP_IDX chase, and the front span: STREAM_DIR and FIELD_DIR in
-    ///   one GET (ADR-2066 decision 1). The read then crosses over to a
-    ///   whole-object GET and never uses STREAM_DIR, so STREAM_DIR's bytes are
-    ///   paid for nothing on this shape.
-    ///   `surplus * (suffix + skip_idx_len + front_span)`.
+    /// - `probe`: the uncarried segment's data read pays its own suffix probe
+    ///   and nothing else: the plan phase decoded the segment's directories and
+    ///   carries them to the open (ADR-2414 decision A1), so the open neither
+    ///   chases SKIP_IDX nor reads the STREAM_DIR plus FIELD_DIR front span.
+    ///   `surplus * suffix`.
     /// - `scan`: one whole-object GET for that segment's block data.
     ///   `surplus * object_len`.
     ///
@@ -5303,7 +5302,7 @@ mod tests {
     /// For the carry-dependent half of the split, dropping the
     /// `carried_seen < budget` bound from `compute_plan_counts` in
     /// `ravel_sql::logs_scan` carries every segment: the probe figure then
-    /// reads 0 against the expected suffix, SKIP_IDX and front-span bytes, and
+    /// reads 0 against the expected suffix bytes, and
     /// the scan figure 0 against the expected object length.
     #[tokio::test]
     async fn reconcile_accepts_a_measured_run_with_an_exact_phase_split() {
@@ -5319,12 +5318,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("section {kind}"))
         };
         let skip_idx_len = section(ravel_logseg::footer::kind::SKIP_IDX).len;
-        // The one GET that fetches both front sections covers the span from
-        // the first section's start to the last one's end.
-        let stream_dir = section(ravel_logseg::footer::kind::STREAM_DIR);
-        let field_dir = section(ravel_logseg::footer::kind::FIELD_DIR);
-        let front_span = (stream_dir.offset + stream_dir.len).max(field_dir.offset + field_dir.len)
-            - stream_dir.offset.min(field_dir.offset);
 
         let acc = measured
             .per_run_accounting
@@ -5351,10 +5344,10 @@ mod tests {
         );
         assert_eq!(
             phase(QueryPhase::Probe),
-            surplus * (suffix + skip_idx_len + front_span),
+            surplus * suffix,
             "probe: the {surplus} uncarried segment's data read pays its own \
-             {suffix}-byte suffix probe, its {skip_idx_len}-byte SKIP_IDX \
-             chase, and the {front_span}-byte STREAM_DIR plus FIELD_DIR span"
+             {suffix}-byte suffix probe and reads no directory section, \
+             since the plan phase's decode is carried to it"
         );
         assert_eq!(
             phase(QueryPhase::Scan),
@@ -5366,7 +5359,7 @@ mod tests {
         // The residual is the catalog's, and it is the whole of the difference:
         // nothing else in this statement's read path goes unattributed.
         let attributed = planned * (suffix + skip_idx_len + object_len)
-            + surplus * (suffix + skip_idx_len + front_span)
+            + surplus * suffix
             + surplus * object_len;
         assert_eq!(
             attributed + cold.wire_bytes_unattributed,
