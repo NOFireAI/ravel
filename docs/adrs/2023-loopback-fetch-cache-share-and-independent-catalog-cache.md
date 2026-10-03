@@ -83,6 +83,10 @@ the query remainder to 6.76 GB.
    Every other deployment keeps 25%. The resolved line names the source
    `budget-carve-loopback`. With whole-object reads a cache that holds the
    corpus serves repeated statements without touching the store's disk.
+   ADR-1170's available-memory amendment (issue #2367) derives a smaller
+   budget on a host with co-resident processes, which puts this share at
+   about 11.11 GB on that machine, below the 11.24 GB corpus cited here and
+   above the 9.84 GB corpus v0.21.0 loads.
 4. **The combination is measured before it ships.** A fresh bot-style
    end-to-end run of the stock entry, built from the change, must reach:
    - concurrent throughput at or above 0.40 QPS;

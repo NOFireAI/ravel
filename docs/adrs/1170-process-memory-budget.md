@@ -906,25 +906,39 @@ server were alone on the host, and on that host it was not.
    changes: the limit is already the server's share, and memory outside the
    cgroup does not count against it.
 
-   The floor is 25% of `MemTotal - RESERVE` (7,689,077,760 bytes on the
-   reference host). Without one, a server that starts while a co-resident
-   process holds most of the host, or that restarts while the memory of the
-   process it replaces is still being reclaimed, reads a small `MemAvailable`
-   and derives a budget near zero. The 2026-09-07 amendment's startup check
-   then refuses to start the process at all. Before this amendment the same
-   host always started. A server that cannot start serves nothing, while a
-   small budget still serves every statement that fits it, so the floor
-   trades some overcommit risk in that case for availability. When the floor
-   binds, the derivation logs a warning naming the `MemAvailable` reading,
-   the floor, and `--memory-budget-bytes` as the remedy.
+   The host profile must carry what this branch needs. Today it holds one
+   figure, `MemTotal` already capped by the cgroup limit, with no record of
+   which won. It gains the uncapped `MemTotal`, the cgroup limit when one is
+   set, and `MemAvailable`. The derivation applies item 1 only when no
+   cgroup limit is set, and logs which branch it took. `/proc/meminfo` is
+   not cgroup-aware, so applying the `MemAvailable` term inside a container
+   would size the budget from the host's free memory, which this item
+   forbids.
+
+   The floor is 1 GiB. The 2026-09-07 amendment refuses startup only when
+   the hard caps reach the budget, and the derived caps are fixed shares of
+   the budget (30%, or 45% on loopback), so that refusal fires only at a
+   budget of exactly 0. That happens when `MemAvailable + own_rss` is at or
+   below the reserve, for example when a co-resident process holds nearly
+   all of the host. Any budget above 0 starts and serves the statements
+   that fit it, so the floor exists only to keep that case from being a
+   refusal, and a larger floor would raise the budget above free memory,
+   which is the overcommit this amendment removes. When the floor binds,
+   the derivation logs a warning naming the `MemAvailable` reading and
+   `--memory-budget-bytes` as the remedy.
 2. `--memory-budget-bytes` sets the budget explicitly and wins over both
    derivations. It is the escape hatch for a co-resident process that starts
    after the server, which a startup reading cannot see. Its resolved value is
    logged with `source="flag"`, like every other performance flag.
 3. The derived SQL pools (`sql_tenant_max_bytes` and `sql_max_query_bytes`,
-   50% of `MemTotal` each since the B1 amendment) are capped by the budget's
-   shared remainder after the cache carve. An explicit flag is not capped.
-   The derivation logs whether the cap applied, as `clamped` does today.
+   50% of `MemTotal` each since the B1 amendment) are capped at 90% of the
+   budget's shared remainder after the cache carve. The fetch ledger draws
+   from the same remainder, including the SQL path's own fetchers, and a
+   fetch the remainder cannot admit answers 503 (the SQL fetcher amendment
+   above). A cap at the whole remainder would let one tenant at its ceiling
+   leave the fetch side nothing, so 10% stays outside the SQL ceiling. An
+   explicit flag is not capped. The derivation logs whether the cap applied,
+   as `clamped` does today.
 
 On the reference host, with `MemAvailable` at 29,922,488,320 bytes read with no
 Ravel process running, the budget is about 27,775,004,672 bytes. How it carves
@@ -933,16 +947,24 @@ cache:
 
 | store | fetcher cache | catalog cache | shared remainder | derived SQL pools |
 |---|---|---|---|---|
-| real S3 (the #1248 reference passes) | 25%, about 6.94 GB | about 1.39 GB | about 19.44 GB | 16,451,897,344, not capped |
-| loopback (the ClickBench entry's local RustFS) | 40%, 11,110,001,868 | 1,388,750,233 | 15,276,252,571 | **15,276,252,571, capped by item 3** |
+| real S3 (the #1248 reference passes) | 25%, about 6.94 GB | about 1.39 GB | 19,442,503,271 | 16,451,897,344, not capped (90% of the remainder is 17,498,252,943) |
+| loopback (the ClickBench entry's local RustFS) | 40%, 11,110,001,868 | 1,388,750,233 | 15,276,252,571 | **13,748,627,313, capped by item 3** |
 
-The loopback row is the case item 3 exists for: the remainder after the larger
-cache carve is below 50% of `MemTotal`. Both pool values are above q33's
+The loopback row is the case item 3 exists for: 90% of the remainder after the
+larger cache carve is below 50% of `MemTotal`. Both pool values are above q33's
 measured peak reservation of 10,855,811,936 bytes, so the claim of 43 of 43
 statements in the stock configuration still holds by derivation on both stores.
-It is re-measured stock on that host before this lands. The derived figures in
-`docs/internal/clickbench.md`, the configuration guide and the reference runbook
-move with it.
+It is re-measured stock on that host before this lands.
+
+The loopback fetcher cache falls from 12.3 GB to 11.11 GB. ADR-2023 sized its
+40% share to hold the corpus, then 11.24 GB, and 11.11 GB would not. The corpus
+the entry loads is now smaller, 9,844,635,064 bytes on v0.21.0 (#1248, the
+v0.21.0 fresh-box result), so the reduced share still holds it. That is a
+property of the current corpus and not of the share: a corpus above about
+11.1 GB, or a host with less free memory, would leave warm runs reading part of
+the store again. The figures that move with this amendment are in
+`docs/internal/clickbench.md`, the configuration guide, the reference runbook
+and ADR-2023's sizing paragraph, which gains a pointer here.
 
 The derived figures now depend on a `MemAvailable` reading, so two stock passes
 on the same host can resolve different ceilings. A published stock result
