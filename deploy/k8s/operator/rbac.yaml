@@ -25,6 +25,10 @@
 #   - PodDisruptionBudgets (policy): create/patch (apply) and delete only, for
 #     the per-tier PDBs (issue #126, ADR-0034 hardening amendment). Applied and
 #     swept, never read.
+#   - NetworkPolicies (networking.k8s.io): create/patch (apply) and delete
+#     only, for the query tier's fragment-port policy rendered under
+#     spec.query.distributedQuery (ADR-1689 decision 4). Applied and swept,
+#     never read.
 #   - Jobs (batch): create/patch (apply), get (observe the qualify Job's
 #     terminal state, controller::observe_qualify_job), delete (recreate it with
 #     foreground propagation when the qualified inputs change; its pod template
@@ -122,6 +126,10 @@ rules:
   # applied and swept only, never read.
   - apiGroups: ["policy"]
     resources: ["poddisruptionbudgets"]
+    verbs: ["create", "patch", "delete"]
+  # applied and swept only, never read.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
     verbs: ["create", "patch", "delete"]
   # apply, explicit .get() (observe the qualify Job), delete (foreground
   # recreate). Not watched by an informer, so no list/watch.

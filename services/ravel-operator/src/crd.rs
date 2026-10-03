@@ -684,6 +684,13 @@ pub struct QuerySpec {
     /// clusters are unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_secret_ref: Option<LocalSecretRef>,
+
+    /// Distributed query fan-out across the query replicas (ADR-0071, ADR-1689
+    /// decision 4 and its operator-rendering amendment). Omit, or leave
+    /// `enabled` false, to keep the query tier on local execution with none of
+    /// the distributed-query flags, mounts, or NetworkPolicy rendered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distributed_query: Option<DistributedQuerySpec>,
 }
 
 impl Default for QuerySpec {
@@ -692,8 +699,51 @@ impl Default for QuerySpec {
             replicas: default_replicas(),
             resources: None,
             credentials_secret_ref: None,
+            distributed_query: None,
         }
     }
+}
+
+/// Distributed query for the query tier (ADR-1689 decision 4).
+///
+/// When `enabled`, the query Deployment runs `--distributed-query` with the
+/// dedicated TLS fragment listener on [`crate::reconcile::FRAGMENT_PORT`], and
+/// the operator applies a NetworkPolicy admitting that port only from the
+/// query tier's own pods. Every Secret reference is optional in the schema so
+/// a disabled block can be kept half-written, but `enabled: true` with any of
+/// them unset renders none of it and records a `Degraded` condition naming
+/// the missing field.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DistributedQuerySpec {
+    /// Whether distributed query is on. Defaults to false: the block is an
+    /// explicit opt-in, because turning it on also restricts ingress to the
+    /// query pods with a NetworkPolicy.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Secret holding the fragment listener's server certificate and private
+    /// key under `tls.crt` and `tls.key` (the `kubernetes.io/tls` shape). The
+    /// certificate needs a `ravel-fragment` dNSName SAN and both the
+    /// `serverAuth` and `clientAuth` extended key usages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_tls_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret holding the CA bundle that signed every query pod's fragment
+    /// certificate, under `ca.crt`. May name the same Secret as
+    /// `fragmentTlsSecretRef` when it carries all three keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_ca_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret holding the cluster fragment key file under `keys`: one
+    /// 64-hex-character key per line, the first mints and all verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fragment_key_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret holding the SQL ticket key file under `keys`, the same shape as
+    /// the fragment key file and with different keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_ticket_key_secret_ref: Option<LocalSecretRef>,
 }
 
 /// Maintain tier: enabled flag, replicas, interval, resources.
@@ -1655,6 +1705,55 @@ mod tests {
         });
         let spec: RavelClusterSpec = serde_json::from_value(json).expect("deserialize");
         assert_eq!(spec.audit_token_key_secret_ref, None);
+    }
+
+    /// `spec.query.distributedQuery` is optional, an empty block stays
+    /// disabled, and the schema carries the flag and the four Secret
+    /// references.
+    #[test]
+    fn distributed_query_is_optional_and_disabled_by_default() {
+        let crd = ravel_cluster_crd();
+        let dq_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|root| root.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|spec| spec.properties.as_ref())
+            .and_then(|p| p.get("query"))
+            .and_then(|query| query.properties.as_ref())
+            .and_then(|p| p.get("distributedQuery"))
+            .and_then(|dq| dq.properties.as_ref())
+            .expect("query.distributedQuery properties in the schema");
+        let mut keys: Vec<&str> = dq_props.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "enabled",
+                "fragmentCaSecretRef",
+                "fragmentKeySecretRef",
+                "fragmentTlsSecretRef",
+                "sqlTicketKeySecretRef",
+            ]
+        );
+
+        let base = serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        });
+        let spec: RavelClusterSpec = serde_json::from_value(base.clone()).expect("deserialize");
+        assert_eq!(spec.query.distributed_query, None);
+
+        let mut declared = base;
+        declared["query"] = serde_json::json!({ "distributedQuery": {} });
+        let spec: RavelClusterSpec = serde_json::from_value(declared).expect("deserialize");
+        assert_eq!(
+            spec.query.distributed_query,
+            Some(DistributedQuerySpec::default())
+        );
+        assert!(!DistributedQuerySpec::default().enabled);
     }
 
     #[test]

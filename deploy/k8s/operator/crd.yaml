@@ -429,6 +429,74 @@
                         ],
                         "type": "object"
                       },
+                      "distributedQuery": {
+                        "description": "Distributed query fan-out across the query replicas (ADR-0071, ADR-1689\ndecision 4 and its operator-rendering amendment). Omit, or leave\n`enabled` false, to keep the query tier on local execution with none of\nthe distributed-query flags, mounts, or NetworkPolicy rendered.",
+                        "nullable": true,
+                        "properties": {
+                          "enabled": {
+                            "default": false,
+                            "description": "Whether distributed query is on. Defaults to false: the block is an\nexplicit opt-in, because turning it on also restricts ingress to the\nquery pods with a NetworkPolicy.",
+                            "type": "boolean"
+                          },
+                          "fragmentCaSecretRef": {
+                            "description": "Secret holding the CA bundle that signed every query pod's fragment\ncertificate, under `ca.crt`. May name the same Secret as\n`fragmentTlsSecretRef` when it carries all three keys.",
+                            "nullable": true,
+                            "properties": {
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "fragmentKeySecretRef": {
+                            "description": "Secret holding the cluster fragment key file under `keys`: one\n64-hex-character key per line, the first mints and all verify.",
+                            "nullable": true,
+                            "properties": {
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "fragmentTlsSecretRef": {
+                            "description": "Secret holding the fragment listener's server certificate and private\nkey under `tls.crt` and `tls.key` (the `kubernetes.io/tls` shape). The\ncertificate needs a `ravel-fragment` dNSName SAN and both the\n`serverAuth` and `clientAuth` extended key usages.",
+                            "nullable": true,
+                            "properties": {
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "name"
+                            ],
+                            "type": "object"
+                          },
+                          "sqlTicketKeySecretRef": {
+                            "description": "Secret holding the SQL ticket key file under `keys`, the same shape as\nthe fragment key file and with different keys.",
+                            "nullable": true,
+                            "properties": {
+                              "name": {
+                                "description": "Name of the Secret.",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "name"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "type": "object"
+                      },
                       "replicas": {
                         "default": 1,
                         "description": "Replica count for the query Deployment.",

@@ -17,7 +17,7 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
-use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -53,9 +53,9 @@ use crate::reconcile::{
     STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
     audit_token_key_missing, desired_objects, desired_qualify_job, grpcroute_api_resource,
     httproute_api_resource, plan_qualify_gate, possible_gateway_route_names,
-    possible_ingest_ingress_names, possible_pod_disruption_budget_names,
-    possible_router_object_names, qualification_decision, qualify_job_input_hash,
-    qualify_job_phase, s3_allow_http,
+    possible_ingest_ingress_names, possible_network_policy_names,
+    possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
+    qualify_job_input_hash, qualify_job_phase, s3_allow_http,
 };
 
 /// Server-side-apply field manager name.
@@ -1801,21 +1801,13 @@ async fn reconcile_inner(
     // Collected rather than pushed straight onto `extra_conditions`: a
     // conditions array is keyed by type, so a pass may record at most one
     // `Degraded` entry, and the `sys/gc` bootstrap check below can also produce
-    // one. Resolved once, after that check.
-    //
-    // A missing audit-token-key (#1487 rework) takes this slot ahead of a
-    // router render error: it means the query tier itself cannot be rolled to
-    // a working spec, where a router error only stops ingest routing.
-    let mut degraded: Option<(String, String)> = if audit_key_missing {
-        Some((
-            AUDIT_TOKEN_KEY_MISSING_REASON.to_string(),
-            AUDIT_TOKEN_KEY_MISSING_MESSAGE.to_string(),
-        ))
-    } else {
-        desired
-            .router_render_error
-            .map(|err| degraded_reason(&Error::Render(err)))
-    };
+    // one. Resolved once, after that check; `render_degraded` ranks the render
+    // causes.
+    let mut degraded = render_degraded(
+        audit_key_missing,
+        desired.distributed_query_render_error,
+        desired.router_render_error,
+    );
     let mut desired_router_names: BTreeSet<String> = BTreeSet::new();
     if let Some(mut sa) = desired.router_service_account {
         let name = sa.name_any();
@@ -1870,6 +1862,25 @@ async fn reconcile_inner(
     query_svc.metadata.namespace = Some(namespace.to_string());
     query_svc.metadata.owner_references = owner.clone();
     apply(&services, &child(instance, "query"), &query_svc).await?;
+
+    // The fragment-port NetworkPolicy (ADR-1689 decision 4): applied before
+    // the query Deployment that opens the port, and swept whenever distributed
+    // query is off or incomplete.
+    let network_policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
+    let mut desired_policy_names: BTreeSet<String> = BTreeSet::new();
+    if let Some(mut policy) = desired.query_network_policy {
+        let name = policy.name_any();
+        policy.metadata.namespace = Some(namespace.to_string());
+        policy.metadata.owner_references = owner.clone();
+        apply(&network_policies, &name, &policy).await?;
+        desired_policy_names.insert(name);
+    }
+    for name in possible_network_policy_names(instance) {
+        if desired_policy_names.contains(&name) {
+            continue;
+        }
+        delete_if_present(&network_policies, &name).await?;
+    }
 
     // Pod disruption budgets (issue #126, deliverable 4): apply one per rendered
     // tier, then delete every possible PDB name the render did not produce, so
@@ -2625,8 +2636,34 @@ fn degraded_reason(err: &Error) -> (String, String) {
         Error::Render(RenderError::SchemelessS3Endpoint { .. }) => {
             ("SchemelessS3Endpoint".to_string(), err.to_string())
         }
+        Error::Render(RenderError::DistributedQuerySecretRefMissing { .. }) => (
+            "DistributedQuerySecretRefMissing".to_string(),
+            err.to_string(),
+        ),
         other => ("ReconcileError".to_string(), other.to_string()),
     }
+}
+
+/// The pass's `Degraded` entry from the render, before the `sys/gc` bootstrap
+/// check can override it. A missing audit-token-key (#1487 rework) ranks first:
+/// the query tier cannot be rolled at all. An incomplete
+/// `spec.query.distributedQuery` ranks next: the query tier runs, but without
+/// the distribution its spec asks for. A router render error ranks last, since
+/// it only stops ingest routing.
+fn render_degraded(
+    audit_key_missing: bool,
+    distributed_query_error: Option<RenderError>,
+    router_error: Option<RenderError>,
+) -> Option<(String, String)> {
+    if audit_key_missing {
+        return Some((
+            AUDIT_TOKEN_KEY_MISSING_REASON.to_string(),
+            AUDIT_TOKEN_KEY_MISSING_MESSAGE.to_string(),
+        ));
+    }
+    distributed_query_error
+        .or(router_error)
+        .map(|err| degraded_reason(&Error::Render(err)))
 }
 
 /// Current Unix time in seconds. The wiring-layer clock read (like [`now_ns`]);
@@ -3077,6 +3114,34 @@ mod tests {
             degraded_reason(&Error::Render(RenderError::CanonicalTenantResolverMissing));
         assert_eq!(reason, "CanonicalTenantResolverMissing");
         assert!(!message.is_empty(), "message carries the error text");
+    }
+
+    /// An enabled `spec.query.distributedQuery` missing a Secret reference
+    /// takes the pass's `Degraded` slot with its own reason and the field in
+    /// the message, below a missing audit-token-key and above a router error.
+    #[test]
+    fn missing_distributed_query_secret_ref_sets_a_degraded_condition_naming_it() {
+        let missing = || RenderError::DistributedQuerySecretRefMissing {
+            missing: vec!["fragmentCaSecretRef"],
+        };
+        let (reason, message) = render_degraded(
+            false,
+            Some(missing()),
+            Some(RenderError::RouterImageMissing),
+        )
+        .expect("a Degraded entry");
+        assert_eq!(reason, "DistributedQuerySecretRefMissing");
+        assert!(
+            message.contains("spec.query.distributedQuery.fragmentCaSecretRef"),
+            "{message}"
+        );
+
+        let (reason, _) = render_degraded(true, Some(missing()), None).expect("a Degraded entry");
+        assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
+        let (reason, _) = render_degraded(false, None, Some(RenderError::RouterImageMissing))
+            .expect("a Degraded entry");
+        assert_eq!(reason, "RouterImageMissing");
+        assert_eq!(render_degraded(false, None, None), None);
     }
 
     /// ADR-1693: a cluster still carrying `spec.gateway.fold` learns that the
