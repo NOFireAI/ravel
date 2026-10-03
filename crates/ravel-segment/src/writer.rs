@@ -546,16 +546,17 @@ fn assemble_v4_body_impl(
 
     let dict = build_dictionary_v4(&series, &exemplars)?;
 
-    let mut series_index_by_id: HashMap<[u8; 16], u32> = HashMap::with_capacity(series.len());
-    for (i, s) in series.iter().enumerate() {
-        series_index_by_id.insert(s.series_id.0, i as u32);
-    }
     let mut resolved_exemplars = Vec::with_capacity(exemplars.len());
     let mut exemplar_attr_cursor = 0usize;
     for e in &exemplars {
-        let series_index = *series_index_by_id
-            .get(&e.series_id.0)
-            .ok_or(WriteError::ExemplarUnknownSeries)?;
+        // `series` is sorted ascending by `series_id.0` and duplicate-free at
+        // this point on every path (both normalization branches above sort by
+        // series id and reject duplicates before falling through here), so a
+        // binary search finds the same index a HashMap lookup would.
+        let series_index = series
+            .binary_search_by_key(&e.series_id.0, |s| s.series_id.0)
+            .map(|i| i as u32)
+            .map_err(|_| WriteError::ExemplarUnknownSeries)?;
         let mut attr_ords = Vec::with_capacity(e.attrs.len());
         for _ in &e.attrs {
             let name_ord = dict.exemplar_attr_ordinals[exemplar_attr_cursor];
@@ -2272,6 +2273,63 @@ mod v4_tests {
         }
     }
 
+    /// Binary search over `series` must reject an absent id wherever it
+    /// would land: before the first entry, between two entries, and after
+    /// the last. `Err(i)` from `binary_search_by_key` is an insertion point,
+    /// not a resolved index; a bug that mapped it in anyway would still
+    /// `Ok(())` here if the error check were weaker than an exact variant
+    /// match.
+    #[test]
+    fn exemplar_unknown_series_id_rejected_at_any_sorted_position() {
+        let low = SeriesId([0x10; 16]);
+        let mid = SeriesId([0x20; 16]);
+        let high = SeriesId([0x30; 16]);
+        fn three_series(low: SeriesId, mid: SeriesId, high: SeriesId) -> Vec<SeriesInputV4> {
+            vec![
+                SeriesInputV4 {
+                    series_id: low,
+                    labels: labels("low"),
+                    runs: vec![scalar_run(0, 0, 0, &low, &[10], &[1.0], false)],
+                },
+                SeriesInputV4 {
+                    series_id: mid,
+                    labels: labels("mid"),
+                    runs: vec![scalar_run(0, 0, 0, &mid, &[20], &[2.0], false)],
+                },
+                SeriesInputV4 {
+                    series_id: high,
+                    labels: labels("high"),
+                    runs: vec![scalar_run(0, 0, 0, &high, &[30], &[3.0], false)],
+                },
+            ]
+        }
+
+        let before_first = SeriesId([0x05; 16]);
+        let between = SeriesId([0x18; 16]);
+        let after_last = SeriesId([0x40; 16]);
+        for unknown in [before_first, between, after_last] {
+            let exemplars = vec![ExemplarInput {
+                series_id: unknown,
+                ts_ns: 10,
+                value: 1.0,
+                trace_id: [0u8; 16],
+                span_id: [0u8; 8],
+                attrs: Vec::new(),
+            }];
+            match SegmentWriter::write_v4(
+                three_series(low, mid, high),
+                test_identity(),
+                test_bounds(),
+                test_compaction_meta(),
+                exemplars,
+            ) {
+                Err(WriteError::ExemplarUnknownSeries) => {}
+                Err(other) => panic!("unexpected error for {unknown:?}: {other:?}"),
+                Ok(_) => panic!("an exemplar for an unknown series {unknown:?} must be rejected"),
+            }
+        }
+    }
+
     #[test]
     fn zero_sample_run_is_dropped_but_series_survives_with_remaining_runs() {
         let id = SeriesId([0x01; 16]);
@@ -3944,6 +4002,111 @@ mod direct_v7_emit_bit_parity {
             })
             .collect();
         assert_parity(specs, Vec::new());
+    }
+
+    fn section_bytes<'a>(obj: &'a [u8], footer: &Footer, kind: u32) -> &'a [u8] {
+        let s = footer
+            .sections
+            .iter()
+            .find(|s| s.kind == kind)
+            .unwrap_or_else(|| panic!("missing section kind {kind}"));
+        &obj[s.offset as usize..(s.offset + s.len) as usize]
+    }
+
+    /// ADR-2425 decision 2: exemplar series-index resolution in
+    /// `assemble_v4_body_impl` switched from a `HashMap` lookup to a binary
+    /// search over `series` (sorted by `series_id`, duplicate-free, by the
+    /// time exemplars resolve). Enough series that resolving against input
+    /// order instead of sorted order would show up, with exemplars at the
+    /// sorted-order extremes and several interior points -- not just the
+    /// two-series swap the other exemplar-ordering test above already pins.
+    #[test]
+    fn exemplar_series_index_equals_sorted_position_across_many_series() {
+        const N: u16 = 200;
+        // Input order is the reverse of sorted (series_id) order: series_id_for
+        // is monotonic in `idx`, so ascending `idx` is ascending sorted order.
+        let specs: Vec<SeriesSpec> = (0..N)
+            .map(|i| {
+                let idx = N - 1 - i;
+                SeriesSpec {
+                    idx,
+                    values: ValueSpec::Scalar(vec![
+                        (1_000 + i64::from(idx), f64::from(idx)),
+                        (2_000 + i64::from(idx), f64::from(idx) + 0.5),
+                    ]),
+                }
+            })
+            .collect();
+
+        // First, last, and several interior points of the sorted order.
+        let targets = [0u16, 50, 100, 150, N - 1];
+        let exemplar_specs: Vec<ExemplarSpec> = targets
+            .iter()
+            .map(|&idx| ExemplarSpec {
+                target_idx: idx,
+                ts_ns: 1_000 + i64::from(idx),
+                value: f64::from(idx) + 0.25,
+                trace_byte: idx as u8,
+                span_byte: idx as u8,
+                attr: None,
+            })
+            .collect();
+
+        let new_written = SegmentWriter::write_histograms_with_exemplars(
+            instantiate(&specs),
+            fixed_identity(),
+            fixed_bounds(),
+            instantiate_exemplars(&exemplar_specs),
+        )
+        .expect("production writer succeeds");
+        let reference_written = reference_write_histograms_with_exemplars(
+            instantiate(&specs),
+            fixed_identity(),
+            fixed_bounds(),
+            instantiate_exemplars(&exemplar_specs),
+        )
+        .expect("reference writer succeeds");
+        assert_eq!(
+            new_written.bytes.as_ref(),
+            reference_written.bytes.as_ref(),
+            "binary-search resolution diverged from the HashMap reference"
+        );
+
+        // Below V5_SPARSE_THRESHOLD, this is a whole-object v7 catalog: read
+        // it back with the crate's real reader and confirm each exemplar
+        // landed on the series id it was given, not a neighbor.
+        let obj = new_written.bytes.as_ref();
+        let loc =
+            crate::open_from_full(obj, crate::ReaderLimits::default()).expect("v7 object opens");
+        let footer = &loc.footer;
+        let catalog = crate::decode_catalog_v4(
+            footer,
+            section_bytes(obj, footer, section_kind::LABEL_DICT),
+            section_bytes(obj, footer, section_kind::SERIES_IDS),
+            section_bytes(obj, footer, section_kind::SERIES_META),
+            crate::ReaderLimits::default(),
+        )
+        .expect("catalog decodes");
+        let records = crate::decode_exemplars_section(
+            footer,
+            section_bytes(obj, footer, section_kind::LABEL_DICT),
+            section_bytes(obj, footer, section_kind::EXEMPLARS),
+            crate::ReaderLimits::default(),
+        )
+        .expect("exemplars decode");
+
+        assert_eq!(records.len(), targets.len());
+        let mut resolved: Vec<(i64, SeriesId)> = records
+            .iter()
+            .map(|r| (r.ts_ns, catalog[r.series_index as usize].entry.series_id))
+            .collect();
+        resolved.sort_by_key(|(ts, _)| *ts);
+        let mut expected: Vec<(i64, SeriesId)> = targets
+            .iter()
+            .map(|&idx| (1_000 + i64::from(idx), series_id_for(idx)))
+            .collect();
+        expected.sort_by_key(|(ts, _)| *ts);
+        assert_eq!(resolved, expected);
     }
 
     fn value_spec_strategy() -> impl Strategy<Value = ValueSpec> {
