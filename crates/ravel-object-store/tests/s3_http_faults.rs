@@ -3338,7 +3338,11 @@ async fn scheduled_large_put_with_integrity_takes_one_permit() {
     let handle = classed.foreground();
     let payload = Bytes::from(vec![6u8; 4 * MULTIPART_PART_SIZE + 1]);
 
-    let put = handle.put("scheduled/integrity", payload.clone(), PutOptions::default());
+    let put = handle.put(
+        "scheduled/integrity",
+        payload.clone(),
+        PutOptions::default(),
+    );
     let reads = async {
         fake.wait_in_flight(1).await;
         futures::future::join_all(
@@ -3352,7 +3356,11 @@ async fn scheduled_large_put_with_integrity_takes_one_permit() {
         read.expect("a GET beside the put must succeed");
     }
 
-    assert_eq!(fake.count(Op::CreateMultipart), 0, "integrity keeps one PUT");
+    assert_eq!(
+        fake.count(Op::CreateMultipart),
+        0,
+        "integrity keeps one PUT"
+    );
     assert_eq!(fake.count(Op::Put), 1, "exactly one PUT request");
     let ends = fake.hold_ends(Op::Put);
     assert_eq!(ends.len(), 1, "the one PUT was held");

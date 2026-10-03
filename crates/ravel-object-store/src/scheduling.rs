@@ -1687,7 +1687,11 @@ mod tests {
             let put =
                 tokio::spawn(async move { handle.put("big", data, PutOptions::default()).await });
             gate.wait_until_held(1).await;
-            assert_eq!(sched.global.available_permits(), 7, "the put holds one permit");
+            assert_eq!(
+                sched.global.available_permits(),
+                7,
+                "the put holds one permit"
+            );
             assert_eq!(sched.bg_sem.available_permits(), bg_free);
             for id in gate.held() {
                 gate.release(id);
