@@ -84,12 +84,16 @@ Buffered mode (opt-in per request, named "buffered"):
   of them, so a shard starts refusing new writes before a deferred buffered
   row could open its flush too late for the read-side scan slack. The cap
   stops new writes; it does not force the deferred flush open. Three kinds of
-  row are therefore not bounded by it: buffered rows already acknowledged in
-  a buffer whose flush stays deferred, which wait for a queue slot for as
-  long as the stall lasts and can open past the slack; buffered rows held
-  under a non-zero `--idle-flush-byte-floor`, whose hold already spends that
-  slack; and rows of a strict write that already timed out (`AckTimeout`),
-  which are written by whichever flush opens, inside the cap or past it.
+  row can therefore still open their flush past the slack: buffered rows
+  already acknowledged in a buffer whose flush stays deferred, which wait for
+  a queue slot for as long as the stall lasts; buffered rows held under a
+  non-zero `--idle-flush-byte-floor`, whose hold already spends that slack;
+  and rows of a strict write that already timed out (`AckTimeout`). Their
+  visibility does not depend on the cap: a flush that opens past the slack on
+  a retiring shard index hands its rows to the tenant's current shard
+  generation instead of writing them where no query scans (see Online
+  resharding below). What stays unbounded is how long such a row waits before
+  it is stored.
 - The `max_flush_lifetime` abandonment budget is measured from the moment the
   flush's permit is granted, not from flush-open, so time spent queued behind
   a stalled prefix does not count against it: a flush that waited behind a
@@ -239,8 +243,10 @@ durable-sibling count at `warn` with the tenant hash instead, and the bulk
   "identical duplicates are harmless" framing above is true for metrics only
   and must not be over-read to cover logs and spans (ADR-0051 §5).
 - A strict write answered `Abandoned` because its buffer's deferral reached
-  the flush deferral cap (see Strict mode above) has its rows stored anyway,
-  by a later flush, so a client retry stores them twice. Metrics collapse the
+  the flush deferral cap (see Strict mode above), or because its buffer was
+  handed to the current shard generation at flush open (see Online
+  resharding), has its rows stored anyway, by a later flush, so a client
+  retry stores them twice. Metrics collapse the
   copy at query time by `(series_id, ts)`; for logs and spans it is
   user-visible duplication, and an idempotency key does not prevent it, since
   no marker is written for a write that was never acknowledged.
@@ -516,6 +522,17 @@ onward routes with the new count. Guarantees:
 - A writer during the transition either observes the new generation before it
   activates or fail-stops on record staleness; it never silently writes to the
   wrong shard set.
+- No flush writes under a shard index the read side does not scan for the
+  ingest hour it pins (ADR-1642 scan-set amendment), however long the flush
+  was deferred. At flush open a shard checks its index against the scan rule
+  for that hour, on the tenant's generation view trusted only as long as
+  routing trusts it; outside the scan set it hands the rows to the tenant's
+  current generation, and on a view it cannot trust it does not open the
+  flush and keeps the rows. A strict write still waiting on handed-back rows
+  is answered `Abandoned` (503, outcome unknown): the rows are written by
+  another shard. The one exception is a shutdown or channel-close drain that
+  cannot confirm the view or reach the current generation: it writes the rows
+  in place rather than drop them.
 - Commit tokens are unaffected: a token minted under any generation resolves
   forever, because token resolution reconstructs the exact key from the
   token's own fields and never consults `shard_count`. Read-your-write holds

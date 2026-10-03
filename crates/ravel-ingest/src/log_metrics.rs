@@ -196,6 +196,10 @@ pub struct LogIngestMetrics {
     /// rather than fleet-wide-outed; the log-pipeline counterpart of
     /// `IngestMetrics::grace_extended_stale_flushes`.
     grace_extended_stale_flushes: AtomicU64,
+    /// Flushes handed back instead of written outside the scan set of the hour
+    /// they pinned (ADR-1642 scan-set amendment), the log-pipeline counterpart
+    /// of `IngestMetrics::rerouted_flushes`.
+    rerouted_flushes: AtomicU64,
     /// Flushes whose per-tenant indexed-field list resolved from a stale cached
     /// value or a failed-re-read/validation fallback rather than a fresh durable
     /// `TenantConfig` read this tick (ADR-0079 deliverable 6). Degraded, not
@@ -359,6 +363,9 @@ pub struct LogIngestMetricsSnapshot {
     pub shards_condemned: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
+    /// Flushes handed back instead of written outside the scan set (ADR-1642
+    /// scan-set amendment).
+    pub rerouted_flushes: u64,
     pub indexed_fields_stale_fallbacks: u64,
     pub postings_objects: u64,
     pub postings_bytes_total: u64,
@@ -731,6 +738,17 @@ impl LogIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One flush handed back instead of written outside the scan set
+    /// (ADR-1642 scan-set amendment).
+    pub(crate) fn record_rerouted_flush(&self) {
+        self.rerouted_flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Flushes handed back so far, read by the router's drain.
+    pub(crate) fn rerouted_flushes(&self) -> u64 {
+        self.rerouted_flushes.load(Ordering::Relaxed)
+    }
+
     /// One flush resolved its indexed-field list from a stale cached value or a
     /// failed-re-read/validation fallback rather than a fresh durable read
     /// (ADR-0079 deliverable 6). Called from `run_flush` on the overlay's
@@ -823,6 +841,7 @@ impl LogIngestMetrics {
             shards_condemned: self.shards_condemned.load(Ordering::Relaxed),
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
+            rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
             indexed_fields_stale_fallbacks: self
                 .indexed_fields_stale_fallbacks
                 .load(Ordering::Relaxed),
