@@ -44,7 +44,7 @@ const TRIES: usize = 3;
 #[derive(Parser, Debug)]
 #[command(about = "ClickBench Parquet lane: run, judge and stamp one arm (ADR-2040 D7)")]
 struct Args {
-    /// The server root, for example `http://127.0.0.1:9090`.
+    /// The server root, for example `http://127.0.0.1:4318`.
     #[arg(long)]
     server: String,
     /// Name of the environment variable holding the bearer token. The token
@@ -138,6 +138,24 @@ fn check_reference_dir(dir: &Path) -> Result<String, String> {
     Ok(version)
 }
 
+/// Creates `out`'s parent directory if it is missing and opens `out` for
+/// writing, truncating it, so a path the report cannot be written to is
+/// refused before the run. What it leaves is an empty file the report
+/// overwrites.
+fn check_out(out: &Path) -> Result<(), String> {
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(out)
+        .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    Ok(())
+}
+
 /// What setup established before anything reaches the server.
 struct Setup {
     prereg: Prereg,
@@ -147,9 +165,9 @@ struct Setup {
     suite: Suite,
 }
 
-/// Every refusal that needs no server, the concurrency phase's arguments
-/// included, so an invalid argument runs nothing. `env` reads the token's
-/// environment variable.
+/// Every refusal that needs no server, the server log's stamps, the
+/// concurrency phase's arguments and `--out` included, so an invalid
+/// argument runs nothing. `env` reads the token's environment variable.
 fn prepare(args: &Args, env: impl Fn(&str) -> Option<String>) -> Result<Setup, String> {
     let prereg = report::load_prereg(&args.prereg).map_err(|e| e.to_string())?;
     let token = read_token(&args.token_env, env)?;
@@ -164,6 +182,18 @@ fn prepare(args: &Args, env: impl Fn(&str) -> Option<String>) -> Result<Setup, S
     let server_log = std::fs::read_to_string(&args.server_log)
         .map_err(|e| format!("cannot read {}: {e}", args.server_log.display()))?;
     let server_settings = report::parse_server_settings(&server_log);
+    for setting in &server_settings {
+        if setting.single().is_none() {
+            return Err(format!(
+                "{} must log {} exactly once with a readable value; found {} values and {} \
+                 unreadable lines",
+                args.server_log.display(),
+                setting.setting,
+                setting.values.len(),
+                setting.unreadable_lines.len()
+            ));
+        }
+    }
     let suite = suite::load_default().map_err(|e| e.to_string())?;
     if args.concurrency_seconds > 0 {
         concurrency::check_shape(
@@ -173,6 +203,7 @@ fn prepare(args: &Args, env: impl Fn(&str) -> Option<String>) -> Result<Setup, S
         )
         .map_err(|e| format!("--concurrency-tasks {}: {e}", args.concurrency_tasks))?;
     }
+    check_out(&args.out)?;
     Ok(Setup {
         prereg,
         token,
@@ -401,7 +432,7 @@ mod tests {
 
     const REQUIRED: [&str; 20] = [
         "--server",
-        "http://127.0.0.1:9090",
+        "http://127.0.0.1:4318",
         "--token-env",
         "RAVEL_TOKEN",
         "--arm",
@@ -487,8 +518,28 @@ mod tests {
         }
     }
 
+    fn stamp_line(setting: &str, value: u64) -> String {
+        format!(
+            "INFO ravel_server::config: performance default resolved setting=\"{setting}\" \
+             value={value} source=\"derived\"\n"
+        )
+    }
+
+    /// A server log stamping each of [`report::STAMPED_SETTINGS`] once, with
+    /// the SQL budgets `REQUIRED` passes.
+    fn stamped_log() -> String {
+        [
+            stamp_line("cache_max_bytes", 7_689_077_760),
+            stamp_line("catalog_cache_max_bytes", 1_537_815_552),
+            stamp_line("fetch_concurrency", 32),
+            stamp_line("sql_max_query_bytes", 1),
+            stamp_line("sql_tenant_max_bytes", 2),
+        ]
+        .concat()
+    }
+
     /// A reference directory datafusion-cli 54.1.0 could have written, a
-    /// filled prereg and an empty server log under `dir`, with `args`
+    /// filled prereg and a fully stamped server log under `dir`, with `args`
     /// pointing at them.
     fn stage_inputs(dir: &Path, args: &mut Args) {
         let reference = dir.join("ref");
@@ -507,7 +558,7 @@ mod tests {
         )
         .expect("write");
         let server_log = dir.join("server.log");
-        std::fs::write(&server_log, "").expect("write");
+        std::fs::write(&server_log, stamped_log()).expect("write");
         args.reference = reference;
         args.prereg = prereg;
         args.server_log = server_log;
@@ -541,6 +592,66 @@ mod tests {
         assert!(
             prepare(&args, token_env).is_ok(),
             "no phase, nothing to refuse"
+        );
+    }
+
+    #[test]
+    fn an_unwritable_out_is_a_setup_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = parse(&[], None).expect("parses");
+        stage_inputs(dir.path(), &mut args);
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "").expect("write");
+        args.out = blocker.join("report.json");
+        let error = prepare(&args, token_env)
+            .err()
+            .expect("an --out under a regular file is refused at setup");
+        assert!(
+            error.starts_with(&format!("cannot create {}: ", blocker.display())),
+            "{error}"
+        );
+
+        args.out = dir.path().join("new").join("report.json");
+        prepare(&args, token_env).expect("a missing parent directory is created");
+        assert_eq!(std::fs::read(&args.out).expect("probe file"), b"");
+    }
+
+    #[test]
+    fn a_stamp_missing_or_repeated_in_the_server_log_is_a_setup_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut args = parse(&[], None).expect("parses");
+        stage_inputs(dir.path(), &mut args);
+        prepare(&args, token_env).expect("every stamp once passes");
+        let log = args.server_log.display().to_string();
+
+        let missing: String = stamped_log()
+            .lines()
+            .filter(|l| !l.contains("\"catalog_cache_max_bytes\""))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&args.server_log, missing).expect("write");
+        let error = prepare(&args, token_env)
+            .err()
+            .expect("a missing stamp is refused at setup");
+        assert_eq!(
+            error,
+            format!(
+                "{log} must log catalog_cache_max_bytes exactly once with a readable value; \
+                 found 0 values and 0 unreadable lines"
+            )
+        );
+
+        let repeated = format!("{}{}", stamped_log(), stamp_line("fetch_concurrency", 64));
+        std::fs::write(&args.server_log, repeated).expect("write");
+        let error = prepare(&args, token_env)
+            .err()
+            .expect("a repeated stamp is refused at setup");
+        assert_eq!(
+            error,
+            format!(
+                "{log} must log fetch_concurrency exactly once with a readable value; \
+                 found 2 values and 0 unreadable lines"
+            )
         );
     }
 

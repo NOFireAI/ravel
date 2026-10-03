@@ -1076,9 +1076,11 @@ the reference.
 The bench exits 0 when the report meets the bar, 1 when it does not, after
 printing each violation, and 2 on a setup error (an unfilled prereg, a bad
 token variable, a location that does not fit the arm, a refused reference,
-an unreadable log, a failed `CREATE`, concurrency arguments the phase
-refuses, an unwritable `--out`). Concurrency arguments are checked before
-the first statement runs, so a refused `--concurrency-tasks` runs nothing.
+an unreadable log, a log missing a stamp or carrying one twice, a failed
+`CREATE`, concurrency arguments the phase refuses, an unwritable `--out`).
+Every one of these but the `CREATE` is checked before anything reaches the
+server, so a refused argument runs nothing. That check creates `--out`'s
+directory if it is missing and leaves an empty `--out` the report overwrites.
 Past setup it writes the report before judging it: a concurrency phase that
 fails once started is recorded in the report's `concurrency_error`, the
 report is written with every statement's figures, and the bench exits 1. A
