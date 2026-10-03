@@ -301,12 +301,12 @@ async fn footer_carried_subset_open_skips_the_probe() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
     let fetcher = ranged_fetcher(store, tail);
     let acc = QueryAccounting::new();
-    let (survivors, _stats, footer, _whole_object) = fetcher
+    let (survivors, _dirs, _stats, footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &query, &acc)
         .await
         .expect("plan")
         .expect("relevant");
-    assert_eq!(survivors, N, "every block survives the full window");
+    assert_eq!(survivors.len(), N, "every block survives the full window");
     let footer = footer.expect("the fast plan path carries a footer");
     assert_eq!(
         counting.suffix_gets(),
@@ -395,7 +395,7 @@ async fn footer_carried_open_still_catches_an_etag_change() {
     let base = store_with_object(bytes).await;
     let plan_fetcher = ranged_fetcher(Arc::clone(&base) as Arc<dyn ObjectStoreBackend>, tail);
     let acc = QueryAccounting::new();
-    let (_survivors, _stats, footer, _whole_object) = plan_fetcher
+    let (_survivors, _dirs, _stats, footer, _whole_object) = plan_fetcher
         .plan_segment(&seg, TENANT, &query, &acc)
         .await
         .expect("plan")
@@ -464,7 +464,7 @@ async fn a_carried_whole_object_is_refused_for_another_segment_or_tenant() {
     let acc = QueryAccounting::new();
 
     // The carry under test, produced by a real plan read of `carried_seg`.
-    let (_survivors, _stats, _footer, carry) = fetcher
+    let (_survivors, _dirs, _stats, _footer, carry) = fetcher
         .plan_segment(&carried_seg, TENANT, &query, &acc)
         .await
         .expect("plan")

@@ -758,12 +758,12 @@ async fn a_zero_survivor_skip_decidable_plan_records_no_touch() {
 
     // `code` is 500 on every record, so this arm is disjoint from every block's
     // numeric stat and prunes them all.
-    let (survivors, _stats, footer, _whole_object) = fetcher
+    let (survivors, _dirs, _stats, footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &coded_query(9_000, 10_000), &accounting)
         .await
         .expect("plan")
         .expect("the segment is ts-relevant, so this is not the irrelevant None");
-    assert_eq!(survivors, 0, "the prune arm eliminates every block");
+    assert_eq!(survivors.len(), 0, "the prune arm eliminates every block");
     assert!(
         footer.is_some(),
         "the skip-decidable branch carries its footer forward; a None footer \
@@ -793,12 +793,12 @@ async fn a_surviving_skip_decidable_plan_records_exactly_one_touch() {
     let fetcher = LogSegmentFetcher::new(store);
     let accounting = QueryAccounting::new();
 
-    let (survivors, _stats, footer, _whole_object) = fetcher
+    let (survivors, _dirs, _stats, footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &coded_query(0, 1_000), &accounting)
         .await
         .expect("plan")
         .expect("relevant");
-    assert!(survivors > 0, "the wide prune arm keeps blocks");
+    assert!(!survivors.is_empty(), "the wide prune arm keeps blocks");
     assert!(
         footer.is_some(),
         "same skip-decidable branch as the sibling"
@@ -868,7 +868,7 @@ async fn a_zero_candidate_fallback_plan_records_no_touch() {
 
     // `code` is 500 on every record, so this arm is disjoint from every block's
     // numeric stat and prunes them all; the content arm forces the fallback.
-    let (survivors, _stats, footer, _whole_object) = fetcher
+    let (survivors, _dirs, _stats, footer, _whole_object) = fetcher
         .plan_segment(
             &seg,
             TENANT,
@@ -879,7 +879,8 @@ async fn a_zero_candidate_fallback_plan_records_no_touch() {
         .expect("plan")
         .expect("the segment is ts-relevant, so this is not the irrelevant None");
     assert_eq!(
-        survivors, 0,
+        survivors.len(),
+        0,
         "the disjoint prune arm eliminates every block"
     );
     assert!(
@@ -916,7 +917,7 @@ async fn a_block_decoding_fallback_plan_records_exactly_one_touch() {
 
     // `code = 500` on every record falls inside this arm, so every block is a
     // candidate and the ranged fetch resolves and decodes blocks.
-    let (_survivors, _stats, footer, _whole_object) = fetcher
+    let (_survivors, _dirs, _stats, footer, _whole_object) = fetcher
         .plan_segment(
             &seg,
             TENANT,

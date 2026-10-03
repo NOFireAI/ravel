@@ -1247,13 +1247,13 @@ async fn plan_segment_on_a_version_4_object_fetches_no_page_bytes() {
     let query = LogQuery::new(i64::MIN, i64::MAX).with_prune(code_between(0, 0));
     let acc = QueryAccounting::new();
 
-    let (survivors, stats, footer, _whole_object) = fetcher
+    let (survivors, _dirs, stats, footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &query, &acc)
         .await
         .expect("plan_segment")
         .expect("relevant segment");
 
-    assert_eq!(survivors, 1, "the numeric arm keeps one block");
+    assert_eq!(survivors.len(), 1, "the numeric arm keeps one block");
     assert_eq!(stats.blocks_total, BLOCKS as u32);
     assert_eq!(stats.blocks_scanned, 0, "no block decoded");
     assert_eq!(
@@ -1325,12 +1325,12 @@ async fn plan_segment_charges_directory_decompression_to_the_plan_phase() {
     let query = LogQuery::new(i64::MIN, i64::MAX).with_prune(code_between(0, 0));
     let phase = ravel_query::PhaseAccounting::new();
 
-    let (survivors, _stats, _footer, _whole_object) = fetcher
+    let (survivors, _dirs, _stats, _footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &query, phase.plan())
         .await
         .expect("plan_segment")
         .expect("relevant segment");
-    assert_eq!(survivors, 1, "the numeric arm keeps one block");
+    assert_eq!(survivors.len(), 1, "the numeric arm keeps one block");
 
     let snap = phase.snapshot();
     assert_eq!(
@@ -1386,7 +1386,7 @@ async fn plan_segment_fallback_charges_the_reader_open_to_the_plan_phase() {
     });
     let phase = ravel_query::PhaseAccounting::new();
 
-    let (_survivors, _stats, carried_footer, _whole_object) = fetcher
+    let (_survivors, _dirs, _stats, carried_footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &query, phase.plan())
         .await
         .expect("plan_segment")
@@ -1442,12 +1442,12 @@ async fn plan_phase_field_dir_cache_is_reused_by_a_narrow_scan() {
     // FIELD_DIR and caches it under `plan_section_raw`'s own per-section key.
     let plan_query = LogQuery::new(i64::MIN, i64::MAX).with_prune(code_between(0, 0));
     let plan_acc = QueryAccounting::new();
-    let (survivors, _stats, _footer, _whole_object) = fetcher
+    let (survivors, _dirs, _stats, _footer, _whole_object) = fetcher
         .plan_segment(&seg, TENANT, &plan_query, &plan_acc)
         .await
         .expect("plan_segment")
         .expect("relevant segment");
-    assert_eq!(survivors, 1, "the numeric arm keeps one block");
+    assert_eq!(survivors.len(), 1, "the numeric arm keeps one block");
 
     let after_plan = recording.ranges().len();
     assert!(

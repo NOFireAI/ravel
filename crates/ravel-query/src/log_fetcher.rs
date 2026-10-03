@@ -2124,8 +2124,15 @@ impl LogSegmentFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         accounting: &QueryAccounting,
-    ) -> Result<(Vec<usize>, Arc<SegmentDirectories>, ScanStats, footer::LogFooter), LogFetchError>
-    {
+    ) -> Result<
+        (
+            Vec<usize>,
+            Arc<SegmentDirectories>,
+            ScanStats,
+            footer::LogFooter,
+        ),
+        LogFetchError,
+    > {
         // The `page_fetch` phase span the slow path also carries, so the trace
         // shows the probe this path issues. `s3_bytes` reports block bytes only
         // (zero here, matching the slow path's block-range branch convention);
@@ -5420,7 +5427,15 @@ impl BlockRangeFetcher {
         accounting: &QueryAccounting,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         self.fetch_object_with_footer_impl(
-            seg_ref, tenant_hash, ts_min_ns, ts_max_ns, prune, columns, plan_footer, phases, None,
+            seg_ref,
+            tenant_hash,
+            ts_min_ns,
+            ts_max_ns,
+            prune,
+            columns,
+            plan_footer,
+            phases,
+            None,
             accounting,
         )
         .await
@@ -5451,8 +5466,16 @@ impl BlockRangeFetcher {
         accounting: &QueryAccounting,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         self.fetch_object_with_footer_impl(
-            seg_ref, tenant_hash, ts_min_ns, ts_max_ns, prune, columns, plan_footer, phases,
-            owned_blocks, accounting,
+            seg_ref,
+            tenant_hash,
+            ts_min_ns,
+            ts_max_ns,
+            prune,
+            columns,
+            plan_footer,
+            phases,
+            owned_blocks,
+            accounting,
         )
         .await
     }
@@ -7626,11 +7649,12 @@ mod plan_fast_path_tests {
 
         // Predicate-free, ts window strictly contains [min, max].
         let query = LogQuery::new(i64::MIN, i64::MAX);
-        let (count, stats, _footer, _carried) = f
+        let (indices, _dirs, stats, _footer, _carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
             .expect("relevant segment");
+        let count = indices.len();
 
         assert_eq!(count, N, "survivor count is the segment block count");
         assert_eq!(stats.blocks_total, N as u32);
@@ -7664,11 +7688,12 @@ mod plan_fast_path_tests {
 
         // Exact span bounds: ts_min == min_event_ts_ns, ts_max == max_event_ts_ns.
         let query = LogQuery::new(seg.min_event_ts_ns, seg.max_event_ts_ns);
-        let (count, _stats, _footer, _carried) = f
+        let (indices, _dirs, _stats, _footer, _carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
             .expect("relevant segment");
+        let count = indices.len();
         assert_eq!(count, N);
         assert_eq!(acc.snapshot().total_s3_bytes(), tail, "fast path fired");
     }
@@ -7696,11 +7721,12 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N, "content: no block pruned");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7714,11 +7740,12 @@ mod plan_fast_path_tests {
             AttrValue::Str("svc".into()),
         ));
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N, "stream_attr: single stream, all blocks survive");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7731,11 +7758,12 @@ mod plan_fast_path_tests {
             vec![("request.id".into(), "r0".into())],
         )]);
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N, "erasure: block count unchanged");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7747,11 +7775,12 @@ mod plan_fast_path_tests {
         // run and the survivor count is N-2, not N.
         let q = LogQuery::new(2, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N - 2, "partial overlap: ts pruning ran");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7769,11 +7798,12 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N, "prune: no block pruned");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7807,11 +7837,12 @@ mod plan_fast_path_tests {
             );
         let query = LogQuery::new(i64::MIN, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(
             count, N,
             "at-threshold: same survivor count as the fast path"
@@ -9435,11 +9466,12 @@ mod plan_skip_decidable_span_tests {
             min: Some(0i64 as u64),
             max: Some(1_000i64 as u64),
         });
-        let (count, _stats, footer, carried) = f
+        let (indices, _dirs, _stats, footer, carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
             .expect("relevant segment");
+        let count = indices.len();
         assert_eq!(count, N, "wide NumRange bound excludes no block");
         assert!(
             footer.is_some(),
@@ -9568,11 +9600,12 @@ mod plan_skip_decidable_span_tests {
             let f = fetcher_with_suffix(store, suffix);
             let acc = QueryAccounting::new();
 
-            let (count, _stats, footer, _carried) = f
+            let (indices, _dirs, _stats, footer, _carried) = f
                 .plan_segment(&seg, TENANT, &query, &acc)
                 .await
                 .expect("plan_segment")
                 .expect("relevant segment");
+            let count = indices.len();
             assert!(footer.is_some(), "both branches carry their footer forward");
 
             let indices: Vec<usize> = (0..count).collect();
