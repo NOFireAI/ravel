@@ -2227,8 +2227,10 @@ struct ExpectedRolePatterns {
 
 const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // Gateway: ingest. Writes L0 data, commit records, idempotency and
-    // admission records, provenance, and the catalog objects a commit
-    // publishes. Its one delete is the admission reconcile's reap of dead
+    // admission records, and provenance. No commit path writes a catalog
+    // object: the scheduled fold moved off the gateway with ADR-1693, so no
+    // gateway-mode ingest path exercises the catalog put patterns below.
+    // Its one delete is the admission reconcile's reap of dead
     // processes' mutable admission snapshots, and reaches no durable object
     // (gateway_template_covers_the_admission_snapshot_reap): its tenant hash
     // and signal segments are spelled as exactly 32 and 1 single-character
