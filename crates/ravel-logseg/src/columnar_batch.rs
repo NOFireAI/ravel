@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use ravel_types::logstream::{AttrValue, LogStreamId};
 
+use crate::error::LogSegError;
 use crate::record::{ColumnValue, FieldType, LogRecord, resolve_value};
 
 /// A packed presence bitmap, one bit per row, LSB-first within each byte.
@@ -266,6 +267,70 @@ impl ColumnarLogBatch {
         self.num_rows == 0
     }
 
+    /// Checks the cross-field invariants the field docs state, so a malformed
+    /// batch is refused before the writer indexes into it. Every violation is
+    /// [`LogSegError::MalformedColumnarBatch`] naming the condition and the
+    /// offending index or stream id.
+    pub fn validate(&self) -> Result<(), LogSegError> {
+        let malformed = |message: String| Err(LogSegError::MalformedColumnarBatch(message));
+        let n = self.num_rows;
+        let per_row = [
+            ("ts_ns", self.ts_ns.len()),
+            ("observed_ts_ns", self.observed_ts_ns.len()),
+            ("severity_num", self.severity_num.len()),
+            ("flags", self.flags.len()),
+            ("severity_text", self.severity_text.len()),
+            ("body", self.body.len()),
+            ("trace_id_validity", self.trace_id_validity.len()),
+            ("span_id_validity", self.span_id_validity.len()),
+            ("stream_refs", self.stream_refs.len()),
+        ];
+        for (name, len) in per_row {
+            if len != n {
+                return malformed(format!("{name} has {len} entries but num_rows is {n}"));
+            }
+        }
+        let trace_len = self.trace_id_validity.count_present() * 16;
+        if self.trace_id.len() != trace_len {
+            return malformed(format!(
+                "trace_id holds {} bytes but {} present trace ids need {trace_len}",
+                self.trace_id.len(),
+                self.trace_id_validity.count_present(),
+            ));
+        }
+        let span_len = self.span_id_validity.count_present() * 8;
+        if self.span_id.len() != span_len {
+            return malformed(format!(
+                "span_id holds {} bytes but {} present span ids need {span_len}",
+                self.span_id.len(),
+                self.span_id_validity.count_present(),
+            ));
+        }
+        let (ids, blobs) = (self.stream_ids.len(), self.stream_attrs.len());
+        if blobs < ids {
+            return malformed(format!(
+                "stream {} (index {blobs}) has no stream_attrs blob: {ids} stream ids but {blobs} stream_attrs entries",
+                self.stream_ids[blobs].to_hex(),
+            ));
+        }
+        if blobs > ids {
+            return malformed(format!(
+                "stream_attrs entry at index {ids} has no stream id: {blobs} stream_attrs entries but {ids} stream ids"
+            ));
+        }
+        if let Some((row, r)) = self
+            .stream_refs
+            .iter()
+            .enumerate()
+            .find(|(_, r)| **r as usize >= ids)
+        {
+            return malformed(format!(
+                "stream_refs[{row}] is {r:#x} but the batch has {ids} stream ids"
+            ));
+        }
+        Ok(())
+    }
+
     /// The 16-byte trace id of the `slot`-th present trace-id row.
     pub fn trace_id_at(&self, slot: usize) -> &[u8] {
         &self.trace_id[slot * 16..slot * 16 + 16]
@@ -294,8 +359,8 @@ impl ColumnarLogBatch {
         let mut batch = ColumnarLogBatch::new();
         batch.num_rows = n;
 
-        // Distinct stream ids in first-seen order mapped to a dense local ref;
-        // re-sorted to id order at the end so `stream_ids` is ascending.
+        // Distinct stream ids and their blobs. A BTreeMap, so it iterates in id
+        // order; the binary search below depends on that order.
         let mut stream_blob: BTreeMap<LogStreamId, Vec<u8>> = BTreeMap::new();
 
         // Dynamic columns keyed by (name, type byte), each accumulating a value
