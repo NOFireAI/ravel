@@ -47,6 +47,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
 
 use promql_parser::label::Labels;
 use promql_parser::parser::token::{
@@ -683,12 +684,28 @@ fn one_to_one(
     modifier: &BinModifier,
     ctx: &QueryWindow,
 ) -> Result<InstantVector, Error> {
+    let stage0_mode = crate::stage0::mode();
     let matching = modifier.matching.as_ref();
     let mut rhs_map: HashMap<LabelSet, &InstantSample> = HashMap::new();
+    // Stage 0 measurement only (issue #2443): raw labels behind each map/set
+    // touch, in order, so the mode-1 replay below can redo the identical
+    // key-build/index-operation sequence against fresh maps.
+    let mut stage0_rhs_labels: Vec<LabelSet> = Vec::new();
+    let mut stage0_lhs_labels: Vec<LabelSet> = Vec::new();
+    let mut stage0_lhs_matched_labels: Vec<LabelSet> = Vec::new();
     for s in &rhs {
         let key = matching_signature(&s.labels, matching);
+        if stage0_mode == 1 {
+            stage0_rhs_labels.push(s.labels.clone());
+        }
         if rhs_map.insert(key.clone(), s).is_some() {
+            if stage0_mode == 1 {
+                crate::stage0::MATCH_RHS_BUILD_HITS.fetch_add(1, Ordering::Relaxed);
+            }
             return Err(ambiguous_match_error(&key));
+        }
+        if stage0_mode == 1 {
+            crate::stage0::MATCH_RHS_BUILD_MISSES.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -697,9 +714,18 @@ fn one_to_one(
     let mut out = Vec::new();
     for l in &lhs {
         let key = matching_signature(&l.labels, matching);
+        if stage0_mode == 1 {
+            stage0_lhs_labels.push(l.labels.clone());
+        }
         let Some(r) = rhs_map.get(&key) else {
+            if stage0_mode == 1 {
+                crate::stage0::MATCH_PROBE_MISSES.fetch_add(1, Ordering::Relaxed);
+            }
             continue;
         };
+        if stage0_mode == 1 {
+            crate::stage0::MATCH_PROBE_HITS.fetch_add(1, Ordering::Relaxed);
+        }
         // The surviving value/histogram of a filter-mode comparison is the
         // literal left operand's own.
         let combined = combine_value(
@@ -720,15 +746,106 @@ fn one_to_one(
         if matches!(combined, Combined::DropIncompatible) {
             continue;
         }
+        if stage0_mode == 1 {
+            stage0_lhs_matched_labels.push(l.labels.clone());
+        }
         if !matched_sigs.insert(key.clone()) {
+            if stage0_mode == 1 {
+                crate::stage0::MATCH_DEDUP_HITS.fetch_add(1, Ordering::Relaxed);
+            }
             return Err(ambiguous_match_error(&key));
+        }
+        if stage0_mode == 1 {
+            crate::stage0::MATCH_DEDUP_MISSES.fetch_add(1, Ordering::Relaxed);
         }
         let labels = one_to_one_output_labels(&l.labels, matching, drop_name);
         if let Some(sample) = output_sample(combined, labels, l.ts_ns) {
             out.push(sample);
         }
     }
+    if stage0_mode == 1 {
+        stage0_replay_one_to_one(
+            &stage0_rhs_labels,
+            &stage0_lhs_labels,
+            &stage0_lhs_matched_labels,
+            matching,
+        );
+    }
     check_unique_output_labels(out)
+}
+
+/// Stage 0 measurement only (issue #2443): replay the exact key-build and
+/// index-operation sequence `one_to_one` just performed across its three
+/// map/set touches (the `rhs_map` build, the lhs-probes-`rhs_map` lookup,
+/// and the `matched_sigs` dedup insert), each against a fresh map/set of the
+/// same type, timed with `Instant`. Key-build time (`matching_signature`) is
+/// timed separately from index-operation time so it is not folded into the
+/// index-work estimate.
+fn stage0_replay_one_to_one(
+    rhs_labels: &[LabelSet],
+    lhs_labels: &[LabelSet],
+    lhs_matched_labels: &[LabelSet],
+    matching: Option<&LabelModifier>,
+) {
+    use std::time::Instant;
+
+    let mut key_build_ns: u64 = 0;
+
+    let mut rhs_build_ns: u64 = 0;
+    let mut replay_rhs_map: HashMap<LabelSet, ()> = HashMap::new();
+    for labels in rhs_labels {
+        let t0 = Instant::now();
+        let key = matching_signature(labels, matching);
+        key_build_ns += t0.elapsed().as_nanos() as u64;
+
+        let t1 = Instant::now();
+        replay_rhs_map.insert(key.clone(), ());
+        rhs_build_ns += t1.elapsed().as_nanos() as u64;
+    }
+
+    let mut probe_ns: u64 = 0;
+    for labels in lhs_labels {
+        let t0 = Instant::now();
+        let key = matching_signature(labels, matching);
+        key_build_ns += t0.elapsed().as_nanos() as u64;
+
+        let t1 = Instant::now();
+        let _ = replay_rhs_map.get(&key);
+        probe_ns += t1.elapsed().as_nanos() as u64;
+    }
+
+    let mut dedup_ns: u64 = 0;
+    let mut replay_dedup: HashSet<LabelSet> = HashSet::new();
+    for labels in lhs_matched_labels {
+        let t0 = Instant::now();
+        let key = matching_signature(labels, matching);
+        key_build_ns += t0.elapsed().as_nanos() as u64;
+
+        let t1 = Instant::now();
+        replay_dedup.insert(key.clone());
+        dedup_ns += t1.elapsed().as_nanos() as u64;
+    }
+
+    crate::stage0::MATCH_KEY_BUILD_NS.fetch_add(key_build_ns, Ordering::Relaxed);
+    crate::stage0::MATCH_RHS_BUILD_NS.fetch_add(rhs_build_ns, Ordering::Relaxed);
+    crate::stage0::MATCH_PROBE_NS.fetch_add(probe_ns, Ordering::Relaxed);
+    crate::stage0::MATCH_DEDUP_NS.fetch_add(dedup_ns, Ordering::Relaxed);
+}
+
+/// Stage 0 measurement only (issue #2443): call one-to-one vector matching
+/// directly for `lhs + rhs` with no `on`/`ignoring`/`group_left`/
+/// `group_right` (matching on the full label set, Prometheus' default),
+/// bypassing `eval_binary`/`eval_vector_vector`'s expression evaluation and
+/// cardinality dispatch (irrelevant here: the cardinality is known, and
+/// `one_to_one` itself only reads `modifier.matching`/`modifier.return_bool`).
+#[doc(hidden)]
+pub fn stage0_one_to_one_add(
+    lhs: InstantVector,
+    rhs: InstantVector,
+    ctx: &QueryWindow,
+) -> Result<InstantVector, Error> {
+    let modifier = BinModifier::default();
+    one_to_one(T_ADD, lhs, rhs, &modifier, ctx)
 }
 
 /// `group_left`/`group_right` matching. `lhs_is_many` selects which operand

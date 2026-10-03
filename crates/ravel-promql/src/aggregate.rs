@@ -205,13 +205,32 @@ fn group_by<T>(
     input: InstantVector,
     mut extract: impl FnMut(InstantSample) -> T,
 ) -> Vec<(LabelSet, Vec<T>)> {
+    let stage0_mode = crate::stage0::mode();
     let mut index: HashMap<LabelSet, usize> = HashMap::new();
     let mut groups: Vec<(LabelSet, Vec<T>)> = Vec::new();
+    // Stage 0 measurement only (issue #2443): the raw labels behind each
+    // group key, in the exact order group_by saw them, so the mode-1 replay
+    // below can recompute the same keys and redo the same index operations
+    // against a fresh map, with nothing shared with the real `index`/`groups`
+    // above it.
+    let mut stage0_raw_labels: Vec<LabelSet> = Vec::new();
     for sample in input {
         let key = group_labels(&sample.labels, modifier);
+        if stage0_mode == 1 {
+            stage0_raw_labels.push(sample.labels.clone());
+        }
         let idx = match index.get(&key) {
-            Some(&i) => i,
+            Some(&i) => {
+                if stage0_mode == 1 {
+                    crate::stage0::AGG_PROBE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                i
+            }
             None => {
+                if stage0_mode == 1 {
+                    crate::stage0::AGG_PROBE_MISSES
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 let i = groups.len();
                 index.insert(key.clone(), i);
                 groups.push((key, Vec::new()));
@@ -220,7 +239,61 @@ fn group_by<T>(
         };
         groups[idx].1.push(extract(sample));
     }
+    if stage0_mode == 1 {
+        stage0_replay_group_by(&stage0_raw_labels, modifier);
+    }
     groups
+}
+
+/// Stage 0 measurement only (issue #2443): replay the exact key-build and
+/// index-operation sequence `group_by` just performed, against a fresh
+/// `HashMap`, timed with `Instant`. Key-build time (`group_labels`) and
+/// index-operation time (`get`/`insert`/the clone on insert) are timed
+/// separately so index work is not inflated by the cost of building the key
+/// it probes with.
+fn stage0_replay_group_by(raw_labels: &[LabelSet], modifier: Option<&LabelModifier>) {
+    use std::time::Instant;
+
+    let mut key_build_ns: u64 = 0;
+    let mut index_ns: u64 = 0;
+    let mut replay_index: HashMap<LabelSet, usize> = HashMap::new();
+    let mut next_group = 0usize;
+    for labels in raw_labels {
+        let t0 = Instant::now();
+        let key = group_labels(labels, modifier);
+        key_build_ns += t0.elapsed().as_nanos() as u64;
+
+        let t1 = Instant::now();
+        match replay_index.get(&key) {
+            Some(_) => {}
+            None => {
+                replay_index.insert(key.clone(), next_group);
+                next_group += 1;
+            }
+        }
+        index_ns += t1.elapsed().as_nanos() as u64;
+    }
+    crate::stage0::AGG_INDEX_NS.fetch_add(index_ns, std::sync::atomic::Ordering::Relaxed);
+    crate::stage0::AGG_KEY_BUILD_NS.fetch_add(key_build_ns, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Stage 0 measurement only (issue #2443): call the plain-aggregate operator
+/// (`sum`/`avg`/`min`/`max`/`count`/`group`/`stddev`/`stdvar`) directly,
+/// bypassing `eval_aggregate`'s expression evaluation and pre-sort of the
+/// input vector (unrelated to the grouping index this measures) and the
+/// `Evaluator`/`SeriesSource` machinery that would otherwise be needed to
+/// reach it.
+#[doc(hidden)]
+pub fn stage0_eval_sum_by(
+    by_labels: &[&str],
+    input: InstantVector,
+    eval_ts_ns: i64,
+    ctx: &QueryWindow,
+) -> InstantVector {
+    let modifier = LabelModifier::Include(Labels {
+        labels: by_labels.iter().map(|s| s.to_string()).collect(),
+    });
+    eval_plain_aggregate(T_SUM, Some(&modifier), input, eval_ts_ns, ctx)
 }
 
 fn eval_scalar_param(

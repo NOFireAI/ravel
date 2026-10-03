@@ -28,6 +28,8 @@ mod matchers;
 mod plan;
 pub mod redact;
 mod source;
+#[doc(hidden)]
+pub mod stage0;
 pub mod testsource;
 
 pub use eval::{
@@ -48,3 +50,11 @@ pub use source::{
     HistogramSample, HistogramSeriesData, LabelMatcher, MatchOp, MatcherError, SeriesData,
     SeriesSource, SourceError,
 };
+
+// Stage 0 measurement only (issue #2443), re-exported so
+// `examples/stage0_maps.rs` can reach the operator entry points and the mode
+// switch directly; both private modules otherwise stay unexported.
+#[doc(hidden)]
+pub use aggregate::stage0_eval_sum_by;
+#[doc(hidden)]
+pub use binop::stage0_one_to_one_add;
