@@ -384,6 +384,13 @@ path = "src/bin/sql_latency_bench.rs"
 required-features = ["sql-latency"]
 bench = false
 
+# The ClickBench Parquet lane's operator entry point (ADR-2040 D7, #2055).
+[[bin]]
+name = "clickbench_parquet_bench"
+path = "src/bin/clickbench_parquet_bench.rs"
+required-features = ["sql-latency"]
+bench = false
+
 [[bin]]
 name = "spans_scan_bench"
 path = "src/bin/spans_scan_bench.rs"
