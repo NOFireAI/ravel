@@ -144,6 +144,7 @@ pub async fn publish_record_with_conservation(
         inputs.iter().map(|i| i.record.sample_count),
         identities,
         None,
+        1,
         input_set_hash,
         parts,
         start_ns,
@@ -160,8 +161,9 @@ pub async fn publish_record_with_conservation(
 /// `superseded_record_key` names it, and its `input_set_hash` is the version 2
 /// hash over both, which `input_set_hash` must equal: the parts were built
 /// under it, since it is in their keys and footers. The conservation gate
-/// compares the predecessor's part record counts with `parts`'. Everything
-/// else is [`publish_record_with_conservation`]'s protocol unchanged: the
+/// compares the predecessor's part record counts with `parts`'. Its `level`
+/// is the predecessor's, the level the re-encoded parts' footers carry.
+/// Everything else is [`publish_record_with_conservation`]'s protocol unchanged: the
 /// abandonment deadline, the `CreateIfAbsent` record PUT under the canonical
 /// key for the stored hash, and the convergence on an equal winner.
 #[allow(clippy::too_many_arguments)]
@@ -197,6 +199,7 @@ pub(crate) async fn publish_superseding_record(
         predecessor.parts.iter().map(|p| p.sample_count),
         predecessor.inputs.clone(),
         Some(predecessor_key),
+        predecessor.level,
         input_set_hash,
         parts,
         start_ns,
@@ -207,7 +210,9 @@ pub(crate) async fn publish_superseding_record(
 
 /// The publish protocol both record versions share. `input_sample_counts` is
 /// what the record's parts must conserve; `superseded_record_key` is `Some`
-/// for a version 2 record and `None` for version 1.
+/// for a version 2 record and `None` for version 1. `level` is the record's
+/// level, which must equal the level stamped in its parts' footers: 1 for a
+/// compaction of L0 inputs, the predecessor's for a version 2 record.
 #[allow(clippy::too_many_arguments)]
 async fn publish_compaction_record(
     store: &dyn ObjectStoreBackend,
@@ -217,6 +222,7 @@ async fn publish_compaction_record(
     input_sample_counts: impl Iterator<Item = u64>,
     identities: Vec<CompactionInputIdentity>,
     superseded_record_key: Option<&str>,
+    level: u32,
     input_set_hash: &[u8; 32],
     parts: &[BuiltPart],
     start_ns: i64,
@@ -269,7 +275,7 @@ async fn publish_compaction_record(
         signal,
         shard: bucket.shard,
         ingest_hour_bucket: bucket.ingest_hour_bucket,
-        level: 1,
+        level,
         inputs: identities,
         input_set_hash: input_set_hash.to_vec(),
         parts: parts.iter().map(|p| p.part.clone()).collect(),
@@ -290,10 +296,15 @@ async fn publish_compaction_record(
     let opts = PutOptions::create_if_absent().with_checksum(checksum);
 
     // Dry-run: the record and its key are assembled identically, but the
-    // publishing PUT is skipped. A dry run only reaches here for a bucket with
-    // no existing compaction record (compact_bucket returns AlreadyCompacted
-    // before building anything otherwise), so the real run's outcome here is
-    // always Published; the convergence/repair path is never dry-run reachable.
+    // publishing PUT is skipped and the outcome reported is Published; the
+    // convergence/repair path is never dry-run reachable. A version 1 record
+    // reaches here only for a bucket with no compaction record
+    // (compact_bucket returns AlreadyCompacted otherwise). A version 2 record
+    // reaches here for a bucket that holds its predecessor, but only when the
+    // planning listing held no record superseding that predecessor (the
+    // selector would have excluded the predecessor and the run planned from
+    // the superseding record instead), so no record existed at this key when
+    // the run planned.
     if config.dry_run {
         return Ok(PublishOutcome::Published);
     }

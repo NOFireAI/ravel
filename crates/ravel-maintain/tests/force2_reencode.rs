@@ -38,13 +38,18 @@ use ravel_object_store::fault::{
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, list_all};
 use ravel_proto::commit::v1::{
-    CompactionRecord, ErasurePredicateMatcher, ErasureRequest, RewriteDrop, RewriteRecord,
+    CompactionInputIdentity, CompactionPart, CompactionRecord, ErasurePredicateMatcher,
+    ErasureRequest, RewriteDrop, RewriteRecord,
 };
 use ravel_segment::{
-    ReaderLimits, SeriesEntryV4, ValueKind, decode_catalog_v5, decode_run_pages_soa,
-    open_from_full, plan_ranges_v4,
+    CompactionMetaV4, ExemplarInput, HistogramCounts, HistogramSample, HistogramSpan,
+    HistogramValue, IngestBounds, ReaderLimits, ResetHint, RunInputV7, SampleProvenance,
+    SegmentIdentity, SegmentWriter, SeriesEntryV4, SeriesInputV7, SeriesValues,
+    V5_SPARSE_THRESHOLD, ValueKind, decode_catalog_v5, decode_exemplars_section,
+    decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4, open_from_full,
+    plan_ranges_v4,
 };
-use ravel_types::Signal;
+use ravel_types::{LabelSet, Sample, SeriesId, Signal};
 use uuid::Uuid;
 
 /// A lease long enough that no run here comes due for a renewal unless the
@@ -405,6 +410,491 @@ async fn metrics_reencode_serves_the_predecessors_exact_rows() {
     assert_eq!(rseg_rows(&store, &after.1).await, want);
 }
 
+/// The level the hand-built metrics predecessor is recorded at. Not 1, so a
+/// re-encode that stamps compaction's own level instead of the predecessor's
+/// is visible.
+const RICH_LEVEL: u32 = 2;
+
+/// Footer ingest bounds of the hand-built metrics predecessor's two parts.
+const RICH_INGEST: [(i64, i64); 2] = [(7_000, 99_000), (11_000, 55_000)];
+
+fn provenance(created_unix_ns: i64, writer_seq: u64, in_page_index: u32) -> SampleProvenance {
+    SampleProvenance {
+        created_unix_ns,
+        writer_epoch: 10,
+        writer_seq,
+        in_page_index,
+    }
+}
+
+/// One run of `values` under the run-wide provenance `(created, 10, seq)`.
+fn rich_run(
+    id: SeriesId,
+    created: i64,
+    seq: u64,
+    values: SeriesValues,
+    provenance: Option<Vec<SampleProvenance>>,
+) -> RunInputV7 {
+    RunInputV7 {
+        run: encode_run_v4(&id, created, 10, seq, &values).expect("encode run"),
+        provenance,
+    }
+}
+
+fn scalar(samples: &[(i64, f64)]) -> SeriesValues {
+    SeriesValues::Scalar(
+        samples
+            .iter()
+            .map(|&(ts_ns, value)| Sample { ts_ns, value })
+            .collect(),
+    )
+}
+
+fn histogram(ts_ns: i64, zero_count: u64, sum: f64) -> HistogramSample {
+    HistogramSample {
+        ts_ns,
+        value: HistogramValue {
+            scale: 0,
+            zero_threshold: 0.0,
+            sum: Some(sum),
+            custom_values: None,
+            positive_spans: vec![HistogramSpan {
+                offset: 0,
+                length: 2,
+            }],
+            negative_spans: Vec::new(),
+            counts: HistogramCounts::Int {
+                zero_count,
+                count: zero_count + 5,
+                positive: vec![2, 3],
+                negative: Vec::new(),
+            },
+            reset_hint: ResetHint::No,
+        },
+    }
+}
+
+fn exemplar(id: SeriesId, ts_ns: i64, value: f64, attrs: &[(&str, &str)]) -> ExemplarInput {
+    ExemplarInput {
+        series_id: id,
+        ts_ns,
+        value,
+        trace_id: [ts_ns as u8; 16],
+        span_id: [value.to_bits() as u8; 8],
+        attrs: attrs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+    }
+}
+
+/// Write one part of the hand-built predecessor at `level`, PUT it, and return
+/// its record entry, recorded one version below the current one.
+async fn put_rich_part(
+    store: &dyn ObjectStoreBackend,
+    b: &ravel_maintain::Bucket,
+    input_set_hash: &[u8; 32],
+    part_index: u32,
+    mut series: Vec<SeriesInputV7>,
+    exemplars: Vec<ExemplarInput>,
+) -> CompactionPart {
+    series.sort_by_key(|s| s.series_id);
+    let run_count = series.iter().map(|s| s.runs.len() as u64).sum();
+    let first = series.first().expect("a series").series_id;
+    let last = series.last().expect("a series").series_id;
+    let (min_ingest_ts_ns, max_ingest_ts_ns) = RICH_INGEST[part_index as usize];
+    let written = SegmentWriter::write_v7_with_provenance(
+        series,
+        SegmentIdentity {
+            tenant_hash: b.tenant_hash.0,
+            shard: b.shard,
+            writer_id: "fixture".to_string(),
+            writer_epoch: 0,
+            writer_seq: 0,
+        },
+        IngestBounds {
+            min_ingest_ts_ns,
+            max_ingest_ts_ns,
+        },
+        CompactionMetaV4 {
+            ingest_hour_bucket: b.ingest_hour_bucket,
+            input_set_hash: *input_set_hash,
+            part_index,
+            level: RICH_LEVEL,
+        },
+        exemplars,
+    )
+    .expect("write part");
+    let content_hash = written.summary.blake3;
+    let key = keys::l1_part_key(
+        &b.tenant_hash,
+        b.signal,
+        b.shard,
+        b.ingest_hour_bucket,
+        &hex::encode(&input_set_hash[..8]),
+        part_index,
+        &hex::encode(&content_hash[..8]),
+    )
+    .expect("part key");
+    let mut part = CompactionPart {
+        part_index,
+        first_series_id: first.0.to_vec(),
+        last_series_id: last.0.to_vec(),
+        content_hash: content_hash.to_vec(),
+        object_size: written.bytes.len() as u64,
+        sample_count: written.summary.sample_count,
+        series_count: written.summary.series_count,
+        run_count,
+        min_event_ts_ns: written.summary.min_event_ts_ns,
+        max_event_ts_ns: written.summary.max_event_ts_ns,
+        segment_format_version: current_version(Signal::Metrics) - 1,
+        declared_column_stats: Vec::new(),
+    };
+    ravel_commit::declared_stats::stamp_compaction_part(&mut part, &[]);
+    store
+        .put(&key, written.bytes, PutOptions::create_if_absent())
+        .await
+        .expect("put part");
+    part
+}
+
+/// A metrics bucket whose one compaction record, at level [`RICH_LEVEL`], has
+/// two below-target parts written directly through the RSEG writer, since the
+/// L0 fixtures carry no histograms or exemplars:
+///
+/// - part 0 is dense: a scalar series with two runs, each with its own
+///   run-wide provenance and a per-sample provenance column (one run holds a
+///   NaN with a payload and a -0.0), a native histogram series with a
+///   provenance column, and a scalar series with none; exemplars on the
+///   first two.
+/// - part 1 has [`V5_SPARSE_THRESHOLD`] series, so its catalog is the sparse
+///   (chunked) form; every 512th series carries a provenance column, and two
+///   series carry exemplars.
+///
+/// Each part's footer ingest bounds are its entry in [`RICH_INGEST`].
+async fn seed_rich_metrics(store: &dyn ObjectStoreBackend) -> (String, CompactionRecord) {
+    let b = bucket();
+    let inputs = vec![
+        CompactionInputIdentity {
+            writer_id: Uuid::from_u128(1).to_string(),
+            writer_epoch: 10,
+            writer_seq: 1,
+        },
+        CompactionInputIdentity {
+            writer_id: Uuid::from_u128(2).to_string(),
+            writer_epoch: 10,
+            writer_seq: 2,
+        },
+    ];
+    let hash = erasure::compute_compaction_input_set_hash(&inputs);
+
+    let (keep, keep_labels, _) = raw_series("rich_keep", &[("k", "a")], &[]);
+    let (hist, hist_labels, _) = raw_series("rich_hist", &[("k", "h")], &[]);
+    let (plain, plain_labels, _) = raw_series("rich_plain", &[("k", "p")], &[]);
+    let nan = f64::from_bits(0x7ff8_0000_0000_0001);
+    let dense = vec![
+        SeriesInputV7 {
+            series_id: keep,
+            labels: keep_labels,
+            runs: vec![
+                rich_run(
+                    keep,
+                    100,
+                    1,
+                    scalar(&[(1_000, 1.0), (2_000, -0.0)]),
+                    Some(vec![provenance(100, 1, 0), provenance(101, 1, 3)]),
+                ),
+                rich_run(
+                    keep,
+                    200,
+                    2,
+                    scalar(&[(1_500, nan), (2_000, 2.0)]),
+                    Some(vec![provenance(200, 2, 1), provenance(202, 2, 0)]),
+                ),
+            ],
+        },
+        SeriesInputV7 {
+            series_id: hist,
+            labels: hist_labels,
+            runs: vec![rich_run(
+                hist,
+                300,
+                3,
+                SeriesValues::Histogram(vec![histogram(1_000, 1, 10.5), histogram(2_000, 4, -0.0)]),
+                Some(vec![provenance(300, 3, 2), provenance(301, 3, 0)]),
+            )],
+        },
+        SeriesInputV7 {
+            series_id: plain,
+            labels: plain_labels,
+            runs: vec![rich_run(plain, 400, 4, scalar(&[(3_000, 3.0)]), None)],
+        },
+    ];
+    let dense_exemplars = vec![
+        exemplar(keep, 1_000, 1.0, &[("trace", "a")]),
+        exemplar(keep, 2_000, -0.0, &[]),
+        exemplar(hist, 1_500, 0.5, &[("le", "1"), ("pod", "p")]),
+    ];
+
+    let mut sparse = Vec::new();
+    let mut sparse_exemplars = Vec::new();
+    for n in 0..V5_SPARSE_THRESHOLD {
+        let (id, labels, _) = raw_series("rich_sparse", &[("i", &n.to_string())], &[]);
+        let ts = 1_000 + n as i64;
+        let column = (n % 512 == 0).then(|| vec![provenance(500 + n as i64, 5, n as u32)]);
+        if n == 0 || n == V5_SPARSE_THRESHOLD - 1 {
+            sparse_exemplars.push(exemplar(id, ts, n as f64, &[("n", &n.to_string())]));
+        }
+        sparse.push(SeriesInputV7 {
+            series_id: id,
+            labels,
+            runs: vec![rich_run(id, 500, 5, scalar(&[(ts, n as f64)]), column)],
+        });
+    }
+
+    let parts = vec![
+        put_rich_part(store, &b, &hash, 0, dense, dense_exemplars).await,
+        put_rich_part(store, &b, &hash, 1, sparse, sparse_exemplars).await,
+    ];
+    let rec = CompactionRecord {
+        format_version: 1,
+        tenant_hash: b.tenant_hash.0.to_vec(),
+        signal: signal::to_proto(Signal::Metrics) as i32,
+        shard: b.shard,
+        ingest_hour_bucket: b.ingest_hour_bucket,
+        level: RICH_LEVEL,
+        inputs,
+        input_set_hash: hash.to_vec(),
+        parts,
+        created_unix_ns: sealed_now_ns() - 1_000,
+        superseded_record_key: String::new(),
+    };
+    let key = keys::compaction_record_key_for(&rec).expect("record key");
+    store
+        .put(
+            &key,
+            record::encode_compaction(&rec),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put record");
+    (key, rec)
+}
+
+/// One sample of an RSEG run: its timestamp, its value (a scalar's bit
+/// pattern, or a histogram printed with every field), and its per-sample
+/// provenance when the run carries the column.
+type RichSample = (i64, String, Option<(i64, u64, u64, u32)>);
+
+/// One run: its run-wide provenance and its samples, in stored order.
+type RichRun = ((i64, u64, u64), Vec<RichSample>);
+
+/// One exemplar, resolved to its series id: timestamp, value bits, trace id,
+/// span id, attributes.
+type RichExemplar = ([u8; 16], i64, u64, [u8; 16], [u8; 8], Vec<(String, String)>);
+
+/// Everything item 7 says a re-encoded RSEG part keeps, read from one part.
+#[derive(Debug, PartialEq)]
+struct RsegPartContents {
+    part_index: u32,
+    level: u32,
+    ingest: (i64, i64),
+    sparse: bool,
+    series: Vec<([u8; 16], LabelSet, ValueKind, Vec<RichRun>)>,
+    exemplars: Vec<RichExemplar>,
+}
+
+/// The contents of every part of `rec`, in part-index order.
+async fn rseg_part_contents(
+    store: &dyn ObjectStoreBackend,
+    rec: &CompactionRecord,
+) -> Vec<RsegPartContents> {
+    let limits = ReaderLimits::default();
+    let mut out = Vec::new();
+    for part in &rec.parts {
+        let obj = get_full(store, &keys::reconstruct_l1_part_key(rec, part).unwrap()).await;
+        let loc = open_from_full(&obj, limits).expect("open part");
+        let footer = &loc.footer;
+        let entries = decode_catalog_v5(footer, &obj, limits).expect("catalog");
+        let refs: Vec<&SeriesEntryV4> = entries.iter().collect();
+        let mut planned = plan_ranges_v4(footer, &refs).expect("plan").into_iter();
+        let slice = |(off, len): (u64, u64)| &obj[off as usize..(off + len) as usize];
+        let mut series = Vec::new();
+        for entry in &entries {
+            let id = entry.entry.series_id;
+            let mut runs = Vec::new();
+            for (i, run) in entry.runs.iter().enumerate() {
+                let range = planned.next().expect("a range per run");
+                let values: Vec<(i64, String)> = match entry.entry.value_kind {
+                    ValueKind::Scalar => {
+                        let (mut scratch, mut ts, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+                        decode_run_pages_soa(
+                            &id,
+                            run,
+                            slice(range.ts_range),
+                            slice(range.val_range),
+                            limits,
+                            &mut scratch,
+                            &mut ts,
+                            &mut vals,
+                        )
+                        .expect("decode scalar run");
+                        ts.into_iter()
+                            .zip(vals)
+                            .map(|(t, v)| (t, format!("{:#018x}", v.to_bits())))
+                            .collect()
+                    }
+                    ValueKind::Histogram => decode_run_histogram_pages(
+                        &id,
+                        run,
+                        slice(range.ts_range),
+                        slice(range.hist_range),
+                        limits,
+                    )
+                    .expect("decode histogram run")
+                    .into_iter()
+                    .map(|h| (h.ts_ns, format!("{:?}", h.value)))
+                    .collect(),
+                };
+                let column = entry.per_sample_provenance.get(i).cloned().flatten();
+                let samples = values
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, (t, v))| {
+                        let p = column.as_ref().map(|c| {
+                            let p = c[j];
+                            (
+                                p.created_unix_ns,
+                                p.writer_epoch,
+                                p.writer_seq,
+                                p.in_page_index,
+                            )
+                        });
+                        (t, v, p)
+                    })
+                    .collect();
+                runs.push((
+                    (run.created_unix_ns, run.writer_epoch, run.writer_seq),
+                    samples,
+                ));
+            }
+            series.push((
+                id.0,
+                entry.entry.labels.clone(),
+                entry.entry.value_kind,
+                runs,
+            ));
+        }
+        let section = |kind: u32| footer.sections.iter().find(|s| s.kind == kind);
+        let mut exemplars: Vec<RichExemplar> = match (section(10), section(1)) {
+            (Some(ex), Some(dict)) => decode_exemplars_section(
+                footer,
+                slice((dict.offset, dict.len)),
+                slice((ex.offset, ex.len)),
+                limits,
+            )
+            .expect("decode exemplars")
+            .into_iter()
+            .map(|r| {
+                (
+                    entries[r.series_index as usize].entry.series_id.0,
+                    r.ts_ns,
+                    r.value.to_bits(),
+                    r.trace_id,
+                    r.span_id,
+                    r.attrs,
+                )
+            })
+            .collect(),
+            _ => Vec::new(),
+        };
+        exemplars.sort();
+        out.push(RsegPartContents {
+            part_index: footer.part_index,
+            level: footer.level,
+            ingest: (footer.min_ingest_ts_ns, footer.max_ingest_ts_ns),
+            sparse: section(8).is_some(),
+            series,
+            exemplars,
+        });
+    }
+    out.sort_by_key(|p| p.part_index);
+    out
+}
+
+/// Metrics exact contents per part (ADR-0066 force 2 amendment, item 7): each
+/// new part holds what its predecessor part held, part for part: the series
+/// and their labels and value kinds, every run's run-wide provenance, every
+/// sample's timestamp and value bits (a NaN payload and -0.0 among them, and a
+/// native histogram's every field), every per-sample provenance entry, the
+/// exemplars, and the footer's ingest bounds and level. The record carries the
+/// predecessor's level too. One predecessor part has a sparse catalog.
+///
+/// The fixture is asserted to hold each of these, so each comparison bites. In
+/// `reencode_rseg_part`, each of these changes fails `assert_eq!(after_parts,
+/// want)`, run one at a time:
+/// - `rseg_part_exemplars(object, footer, &entries, limits)?` replaced with an
+///   empty `Vec` (the exemplar copy): part 0 and part 1 lose their exemplars.
+/// - `IngestBounds { min_ingest_ts_ns: footer.min_ingest_ts_ns, .. }` replaced
+///   with zeroes (the ingest bounds copy): both parts' `ingest` differ.
+/// - `provenance: entry.per_sample_provenance.get(i).cloned().flatten()`
+///   replaced with `None` (the provenance copy): every column is lost.
+/// - the `ValueKind::Histogram` arm replaced with an `Err` (the histogram
+///   branch): the re-encode itself fails, so `reencode_published` panics.
+///
+/// In `publish_superseding_record`, passing `1` instead of `predecessor.level`
+/// fails the record level assertion; in `reencode_rseg_parts`, passing `1`
+/// instead of `predecessor.level` fails the footer level comparison.
+#[tokio::test]
+async fn metrics_reencode_keeps_each_parts_exact_contents() {
+    let store = MemoryStore::new();
+    let b = bucket();
+    let (pred_key, pred) = seed_rich_metrics(&store).await;
+    let want = rseg_part_contents(&store, &pred).await;
+    assert_eq!(want.len(), 2);
+    let (dense, sparse) = (&want[0], &want[1]);
+    assert!(!dense.sparse && sparse.sparse, "part 1 alone is sparse");
+    assert_eq!(sparse.series.len() as u64, V5_SPARSE_THRESHOLD);
+    for (part, ingest) in want.iter().zip(RICH_INGEST) {
+        assert_eq!(part.level, RICH_LEVEL);
+        assert_eq!(part.ingest, ingest);
+        assert!(
+            !part.exemplars.is_empty(),
+            "part {} has exemplars",
+            part.part_index
+        );
+        assert!(
+            part.series
+                .iter()
+                .flat_map(|s| &s.3)
+                .flat_map(|r| &r.1)
+                .any(|sample| sample.2.is_some()),
+            "part {} carries per-sample provenance",
+            part.part_index
+        );
+    }
+    assert_eq!(dense.exemplars.len(), 3);
+    assert_eq!(sparse.exemplars.len(), 2);
+    assert!(
+        dense
+            .series
+            .iter()
+            .any(|s| s.2 == ValueKind::Histogram && !s.3.is_empty()),
+        "part 0 holds a native histogram series"
+    );
+
+    reencode_published(&store, &b, &pred_key).await;
+
+    let after = served_one(&store, &b).await;
+    assert_current_successor(Signal::Metrics, &pred_key, &after);
+    assert_eq!(after.1.level, pred.level, "the record keeps its level");
+    let after_parts = rseg_part_contents(&store, &after.1).await;
+    assert_eq!(after_parts.len(), want.len(), "part for part");
+    for (new, old) in after_parts.iter().zip(&want) {
+        assert_eq!(new, old, "part {} keeps its exact contents", old.part_index);
+    }
+}
+
 /// Logs differential: the selector serves the predecessor's log records,
 /// every field of each, from current-version parts.
 ///
@@ -473,7 +963,6 @@ async fn the_version_2_record_names_its_predecessor_under_its_canonical_key() {
         keys::compaction_record_key_for(v2).expect("canonical key"),
         "stored at the canonical key of its version 2 hash"
     );
-    assert_eq!(v2.level, pred.level);
 }
 
 /// A store over `seed`'s bucket that fails every PUT made through it, so a
