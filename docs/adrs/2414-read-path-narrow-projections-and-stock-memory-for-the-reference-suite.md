@@ -264,7 +264,7 @@ hold; both now carry a pointer here, and the rest of this ADR stands.
   projection directly over one, now has the aggregate's group keys appended
   as trailing tiebreak terms, which makes its key total, and is then
   spill-eligible. That is the tie-order proof decision B2 asked for. The
-  terms are appended whatever the spill setting, so q33 returns the same top
-  ten with spill forced and with spill off.
+  terms are appended whatever the spill setting, so a statement of q33's
+  shape returns the same top ten with spill forced and with spill off.
 
 Decision B2 itself stands as a record of what this ADR did not change.
