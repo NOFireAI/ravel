@@ -473,7 +473,8 @@ jobs:
         run: bash .claude/guards/epic-status-nudge.test.sh
       - name: Disk-reap cases
         run: bash scripts/disk-reap.test.sh
-      - run: bash benchmarks/clickbench/parquet/make-reference.test.sh
+      - name: Make-reference cases
+        run: bash benchmarks/clickbench/parquet/make-reference.test.sh
       - name: Reproduce-figure cases
         run: bash scripts/reproduce-figure.test.sh
       - name: Flag-doc guard cases (issue #1297)
