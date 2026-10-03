@@ -130,11 +130,15 @@ drivers call it: the background maintenance supervisor's compaction tick, and
 `ravel-cli maintain compact-bucket` / `compact-tenant`. Both reach it through
 `ravel_maintain::compact_bucket_claimed`, so an operator's run and a supervisor
 no longer both pay for merging the same sealed bucket. One small mutable object
-per unit of expensive merge work is what stops that double payment. Claiming is
-skipped, and the bucket merged unclaimed, when the input set is below
-`claim_min_input_bytes` (64 MiB by default), when coordination is switched off,
-or when the driver installs no participant at all, which is what
-`ravel-cli`'s `--dry-run` and `--no-claim` do. `work_id` is
+per unit of expensive merge work is what stops that double payment. The erasure
+rewrite of a bucket (`ravel_maintain::erasure_rewrite_bucket`) takes the same
+claim under the same `work_id`, and both passes hold it through their record PUT
+and re-list the bucket just before that PUT, publishing nothing if its record
+set changed, so neither publishes over the other (ADR-1029's 2026-10-03
+amendment). Claiming is skipped, and the bucket processed unclaimed, only when
+coordination is switched off or when the driver installs no participant at all,
+which is what `ravel-cli`'s `--dry-run` and `--no-claim` do; the re-list still
+runs, and `claim_min_input_bytes` no longer decides anything. `work_id` is
 `blake3::derive_key("ravel-compaction-claim-v1", tenant_hash || signal ||
 shard || ingest_hour_bucket)`, hex-encoded, where `tenant_hash` is the raw 16
 bytes, `signal` is the one-byte signal key prefix (`l`, `m`, `s`, ...), and

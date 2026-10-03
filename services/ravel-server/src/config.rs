@@ -830,14 +830,11 @@ pub struct Cli {
     #[arg(long = "maintain-claim-lease", value_name = "DURATION")]
     pub maintain_claim_lease: Option<String>,
 
-    /// The advisory-claim cost gate (ADR-1029 decision 4), in bytes: a
-    /// bucket is claimed only when its listed L0 input bytes reach this.
-    /// Below it, the bucket runs unclaimed through the same pipeline -- a
-    /// duplicated merge costs less than the PUT-class claim traffic that
-    /// would prevent it. Omitted defaults to
-    /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB).
-    /// Zero is refused at startup: it would claim every bucket regardless of
-    /// size, defeating the cost gate this flag configures.
+    /// Has no effect and will be removed: since the compaction fence
+    /// (ADR-1029, the 2026-10-03 amendment) a compaction or erasure rewrite
+    /// with claims on takes the bucket's claim whatever its size, so this
+    /// former cost gate decides nothing. It is still parsed so a deployment
+    /// that sets it starts unchanged, and zero is still refused at startup.
     #[arg(long = "maintain-claim-min-input-bytes", value_name = "BYTES")]
     pub maintain_claim_min_input_bytes: Option<u64>,
 
@@ -5708,14 +5705,14 @@ impl Cli {
     /// Parse `--maintain-claim-min-input-bytes` (ADR-1029 decision 4),
     /// defaulting to
     /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] when unset.
-    /// Zero is refused: it would claim every bucket regardless of size,
-    /// defeating the cost gate this flag configures.
+    /// The value has no effect since the 2026-10-03 amendment; zero is still
+    /// refused, as it was before, so the accepted set of values is unchanged.
     pub fn parse_maintain_claim_min_input_bytes(&self) -> anyhow::Result<u64> {
         match self.maintain_claim_min_input_bytes {
             None => Ok(ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES),
             Some(0) => anyhow::bail!(
-                "--maintain-claim-min-input-bytes must be nonzero: a zero cost gate claims \
-                 every bucket regardless of size"
+                "--maintain-claim-min-input-bytes must be nonzero; the flag has no effect and \
+                 will be removed, so the simplest fix is to drop it"
             ),
             Some(bytes) => Ok(bytes),
         }
@@ -12694,8 +12691,8 @@ mod tests {
 
     /// `--maintain-claim-min-input-bytes` defaults to
     /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB) and
-    /// refuses zero: a zero cost gate would claim every bucket regardless of
-    /// size (ADR-1029 decision 4).
+    /// still refuses zero, so a deployment that sets the now inert flag starts
+    /// exactly as it did before (ADR-1029, the 2026-10-03 amendment).
     #[test]
     fn maintain_claim_min_input_bytes_parses_default_and_refuses_zero() {
         assert_eq!(
