@@ -567,7 +567,8 @@ under ADR-1331. So a compaction record gains its own supersession.
    version 1. The version-2 domain lives in `ravel_commit::erasure` beside the
    existing version-1 and rewrite domains, so the decode-time check and the
    writer share one preimage; the compactor's call site,
-   `ravel_maintain::read::input_set_hash`, selects it for a v2 record, and
+   `ravel_maintain::read::input_set_hash`, selects it for a v2 record (not
+   so: see the 2026-10-03 note after the task list), and
    `seal_divergence` recomputes the hash for the record's own version.
 3. **Resolution.** Supersession is applied inside the shared authoritative
    selector before the overlap-component winner is chosen: a compaction record
@@ -633,6 +634,18 @@ resolution in `ravel-catalog`; T4 sweep and erasure; T5 the re-encode
 primitive in `rewrite.rs`, writer switch off by default; T6 `migrate` wiring;
 T7 (optional) background low-priority re-encode. T2 to T4 release before T5 to
 T7 are switched on.
+
+Note (2026-10-03, T5): item 2's "the compactor's call site,
+`ravel_maintain::read::input_set_hash`, selects it for a v2 record" does not
+describe the code. `read::input_set_hash` computes the version 1 hash only. The
+T5 writer, `rewrite::reencode_compaction_parts`, and the publish path it calls
+take the version 2 hash from
+`ravel_commit::erasure::compute_superseding_compaction_input_set_hash`
+directly, so the writer and the decode-time check still share one preimage. T5
+re-encodes an RSEG record part for part (same part indexes, every run's
+provenance and per-sample provenance column kept); RLOG and RSPAN parts go
+through their codec's compaction merge, so their part split can differ from the
+predecessor's.
 
 ## Amendment (2026-10-03, #2271): a below-floor HEAD is rebuilt, not refused as newer
 
