@@ -710,7 +710,9 @@ own content hash -- one GET per such part, and no other object is ever
 fetched on its account. If the ref is absent, or the GET comes back
 not-found, or the object fails to decode (`FetchOutcome::DecodeRefused`,
 logged once via `tracing::warn!` and counted once in
-`Catalog::column_stats_decode_refusals`), that part is left with no loaded
+`Catalog::column_stats_decode_refusals`; a read CPU gate job that panicked
+or was cancelled is logged each time and not counted, since it says
+nothing about the object), that part is left with no loaded
 statistics at all: the query scans for it, exactly as if no statistics
 existed for that part. There is no whole-tenant fallback and no
 declared-entry-count coverage comparison to decide whether one is needed --
@@ -1565,10 +1567,10 @@ pinning are unchanged:
    any other decode error of that object without the object being
    corrupt: a part falls back to listing (step 2), a postings object
    disables pruning for the resolve, and a column-statistics object leaves
-   its part uncovered and is counted as a refused decode, with the
+   its part uncovered, logged but not counted as a refused decode, with the
    statistics loaded from the other parts cached for that HEAD as usual.
-   Without a gate every decode runs on the resolving task. The server does
-   not install the gate yet.
+   Without a gate every decode runs on the resolving task. The server
+   installs its read gate on the catalog it builds.
 2. On any other failure in step 1 (HEAD absent, corrupt, part missing or
    hash-mismatched, postings content-hash or entry-count mismatch): log,
    fall back to full listing for the whole window. Queries never

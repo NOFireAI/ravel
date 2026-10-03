@@ -159,7 +159,7 @@ For the query routes, the status codes come from one shared error mapping:
   shard-generation or format-floor history, or carries a format version below
   the lowest this build supports, a supersession chain of compaction or
   rewrite records that is cyclic, deeper than the resolver's fixed bound, or
-  names a predecessor with a different input set, a catalog decode job that
+  names a predecessor with a different input set, a segment decode job that
   panicked, a non-monotonic run). It is not retryable, and its message is
   fixed so no object key or tenant hash leaks.
 - 503 `unavailable`: a transient storage fault, an invalidated snapshot, a
@@ -169,7 +169,7 @@ For the query routes, the status codes come from one shared error mapping:
   snapshot part entry level), which a peer on a newer build can read during a
   rolling upgrade, a provisioning record written in a format version above
   the highest this build reads, a Parquet table's manifest or grants record
-  written in a format version above the highest this build reads, a catalog
+  written in a format version above the highest this build reads, a segment
   decode job the read CPU gate cancelled at shutdown, or an unsatisfiable
   `min_commit_token`. Retryable. A store fault that is a checksum mismatch
   answers 500 instead, on a catalog read as on a segment fetch and on a SQL
@@ -177,6 +177,9 @@ For the query routes, the status codes come from one shared error mapping:
   table's manifest or grants record written in a format version below the
   lowest this build supports answers 500. A column-statistics object this
   build cannot decode answers no error: the query reads the data instead.
+  Neither does a decode job for a catalog snapshot part, postings or
+  column-statistics object that panics, or that the read CPU gate
+  cancels at shutdown: the query still answers exactly, by a slower path.
 - 504 `timeout`: the query passed its deadline.
 - 401 `unauthorized`: no resolvable credential.
 
