@@ -102,7 +102,7 @@ fn match_labels(id: usize, metric_name: &str) -> LabelSet {
         label("instance_id", format!("host-{id:08}")),
         label("pod_name", format!("pod-{id:08}")),
         label("region", REGIONS[id % REGIONS.len()].to_string()),
-        label("zone_id", format!("z-{:05}", id % 16)),
+        label("zone_id", format!("z-{:06}", id % 16)),
     ])
     .expect("distinct label names")
 }
