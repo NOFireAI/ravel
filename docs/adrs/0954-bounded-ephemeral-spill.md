@@ -573,9 +573,11 @@ startup, now with an error that names the missing variable. Requirement 3's
 purpose is kept: the directory is never the OS temp directory and the
 ceiling is never DataFusion's 100 GB default; a derived directory sits under
 the path the operator already chose for ephemeral local storage. The
-instance identity is the `process_id` of the process's `WorkerSet`, the
-identity its `sys/maintain/workers/<process_id>` heartbeat carries, drawn
-fresh at each process start; no second identity is minted for spill.
+instance identity is the `process_id` of the process's `WorkerSet`, drawn
+fresh at each process start, which every mode builds; the same id is
+written as a `sys/maintain/workers/<process_id>` heartbeat only by a
+process that runs the maintenance loop (`maintain` mode). No second
+identity is minted for spill.
 Startup logs the outcome as two `performance default resolved` lines,
 `sql_spill_dir` and `sql_spill_max_bytes`, each with a `source` of `env`,
 `cache-dir`, `env-override`, `derived`, `flag-off` or `unset`.

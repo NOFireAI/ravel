@@ -2819,31 +2819,36 @@ mod tests {
     }
 
     /// The production measurement is the volume's FREE space, not its size:
-    /// with no budget cap in play, the derived ceiling is half of what
-    /// `ravel_sql::measure_free_bytes` reports for `<cache-dir>/sql-spill`,
-    /// within 256 MiB of drift between the two readings.
+    /// with no budget cap in play, the derived ceiling is at most half of
+    /// what `ravel_sql::measure_free_bytes` reports for `<cache-dir>/sql-spill`
+    /// afterwards, plus 4 GiB for whatever another process writes to the
+    /// volume in between. The bound is one-sided, so space freed in between
+    /// only widens it; it fails only if more than 4 GiB is written between two
+    /// readings a few milliseconds apart. The exact arithmetic is pinned by
+    /// the injected cases above.
     ///
-    /// Prove-the-test: measure with `f_blocks * f_frsize` from `rustix::fs::statvfs` in
-    /// `prepare_sql_spill` and the ceiling is half the volume's size, off by
-    /// half its used bytes.
+    /// Prove-the-test: pass a measurement of the volume's size to
+    /// `prepare_sql_spill_with` in `prepare_sql_spill`, and on a volume with
+    /// more than 8 GiB in use the ceiling exceeds the bound.
     #[test]
     fn the_derived_ceiling_is_half_the_measured_free_space() {
         assert_spill_env_unset();
         let cache = tempfile::tempdir().expect("cache dir");
         let startup = prepare_sql_spill(Some(cache.path()), settings(false, u64::MAX), INSTANCE)
             .expect("cache-dir spill resolves");
-        let free = ravel_sql::measure_free_bytes(&cache.path().join("sql-spill"))
+        let free_after = ravel_sql::measure_free_bytes(&cache.path().join("sql-spill"))
             .expect("free space is measurable");
-        let half_free = (free / 2).max(GIB);
         let ceiling = startup
             .resolved
             .config
             .expect("cache-dir spill is enabled")
             .max_bytes;
+        let bound = ((free_after + 4 * GIB) / 2).max(GIB);
         assert!(
-            ceiling.abs_diff(half_free) <= 256 * 1024 * 1024,
-            "ceiling {ceiling} must be half the free bytes, {half_free}"
+            ceiling <= bound,
+            "ceiling {ceiling} must be half the free bytes, at most {bound}"
         );
+        assert!(ceiling >= GIB, "the 1 GiB floor holds");
     }
 
     /// The source precedence: the full env pair wins over `--cache-dir` (and
