@@ -1,16 +1,21 @@
-//! The compaction side of the advisory claim protocol (ADR-1029 decisions 3
-//! to 5): take a per-bucket claim before an expensive merge, consult it at the
-//! pipeline's quiescent checkpoints, and cancel a run whose claim is gone.
+//! The maintenance side of the bucket claim protocol (ADR-1029 decisions 3
+//! to 5 and its 2026-10-03 amendment): take a per-bucket claim before a
+//! compaction or an erasure rewrite builds, consult it at the pipeline's
+//! quiescent checkpoints, and cancel a run whose claim is gone.
 //!
 //! # What this buys, and what it does not
 //!
-//! A claim suppresses DUPLICATE WORK and nothing else. Two processes that
-//! compact one sealed bucket already converge on a single compaction record at
-//! its `CreateIfAbsent` ([`crate::publish`]), so a duplicate is a cost problem,
-//! never a correctness one. The claim confers zero publication rights and its
-//! absence removes none (ADR-1029 decision 2): the publish path never reads
-//! one, and a paused owner that lost its claim, woke, and finished anyway still
-//! converges at the content-addressed part keys and the record PUT.
+//! Between two compactions a claim suppresses DUPLICATE WORK and nothing else.
+//! Two processes that compact one sealed bucket already converge on a single
+//! compaction record at its `CreateIfAbsent` ([`crate::publish`]), so a
+//! duplicate is a cost problem, never a correctness one, and a paused owner
+//! that lost its claim, woke, and finished anyway still converges at the
+//! content-addressed part keys and the record PUT.
+//!
+//! Between a compaction and an erasure rewrite it is a fence: their records
+//! have different keys, so `CreateIfAbsent` does not serialize them, and a
+//! compaction published over inputs an erasure rewrite already rewrote serves
+//! the erased rows again (issue #2199). See the section on the fence below.
 //!
 //! The primitive itself -- the key space, the payload, acquire/renew/steal/
 //! complete and their outcome enums -- lives in [`ravel_fleet::claim`]. This
@@ -34,10 +39,10 @@
 //!
 //! # Where the claim is taken
 //!
-//! The claim is acquired after the bucket listing and after the input commit
-//! records are read, because the cost gate is priced on the `object_size`
-//! those records carry. It precedes every catalog and block read and every
-//! PUT. Outside its claim requests, a contender refused the claim has paid the
+//! A compaction acquires the claim after the bucket listing and after the
+//! input commit records are read, where the retired cost gate needed it; an
+//! erasure rewrite acquires it after its live-record resolution. Both precede
+//! every catalog and block read and every PUT. Outside its claim requests, a contender refused the claim has paid the
 //! bucket listing and one GET per input commit record, and no catalog, block
 //! or part request (ADR-1029, the amendment on where the claim is taken).
 //!
@@ -56,15 +61,32 @@
 //! it pays the jitter once, before its steal (ADR-1029, the amendment on
 //! jitter on the contended path).
 //!
-//! # An unreadable claim does not starve its bucket
+//! # An unreadable claim holds its bucket
 //!
 //! A claim whose payload does not decode (corruption, or a newer format
 //! written before a rollback) is never stolen: a reader that cannot read a
-//! claim cannot know it is safe to overwrite. Claims are advisory
-//! (ADR-1029 decision 2), so once the unreadable object's age by the store's
-//! `last_modified` exceeds one lease plus this contender's jitter, the run
-//! proceeds UNCLAIMED ([`Acquire::Unclaimed`]) with a warning naming the key.
-//! Before that age the bucket is deferred like any held claim.
+//! claim cannot know it is safe to overwrite. Once the unreadable object's age
+//! by the store's `last_modified` exceeds one lease plus this contender's
+//! jitter, [`ClaimGuard::acquire`] reports [`Acquire::Unclaimed`] with a
+//! warning naming the key; before that age the bucket is deferred like any
+//! held claim. Neither pass that uses this guard runs on an
+//! `Acquire::Unclaimed`: [`claim_bucket`] turns it into a back-off, because
+//! the claim fences the compaction publish against the erasure rewrite
+//! publish of the same bucket (ADR-1029, the 2026-10-03 amendment), and a run
+//! past an unreadable claim would publish unfenced.
+//!
+//! # The claim fences compaction against the erasure rewrite
+//!
+//! Since the 2026-10-03 amendment a claim is not only a cost measure. The
+//! compaction pass and the erasure rewrite pass each take the bucket's claim
+//! through [`claim_bucket`] before they build, and hold it through their record
+//! PUT, so one cannot publish over a record set the other planned from. Neither
+//! pass skips it for a small bucket. Each pass also re-lists the bucket after
+//! its last checkpoint and aborts if the record set changed
+//! ([`crate::rewrite::relist_changed`]). That second check narrows the window
+//! a claim leaves open (an owner paused past its lease after its last
+//! checkpoint), and it is the only fence for a caller that takes no claims at
+//! all: no [`ClaimParticipant`] installed, or coordination off.
 //!
 //! # Time and requests
 //!
@@ -170,10 +192,12 @@ pub enum ClaimSkipReason {
     /// steal), or the claim object was gone by the steal's CAS.
     StealLost,
     /// The claim's payload does not decode, or declares a format floor this
-    /// build does not understand, and it is not yet older than one lease plus
-    /// this contender's jitter. Such a claim is never stolen: a reader that
-    /// cannot read a claim cannot know it is safe to take. Past that age the
-    /// run goes ahead unclaimed instead ([`Acquire::Unclaimed`]).
+    /// build does not understand. Such a claim is never stolen: a reader that
+    /// cannot read a claim cannot know it is safe to take. Before it is older
+    /// than one lease plus this contender's jitter the guard reports this skip
+    /// itself; past that age the guard reports [`Acquire::Unclaimed`] and
+    /// [`claim_bucket`] reports this skip instead, so the bucket stays held
+    /// until an operator removes the unreadable object.
     UnreadableClaim,
     /// The claim existed at the `CreateIfAbsent` and was gone by the read that
     /// followed, twice in a row. One retry is free; a second vanishing means
@@ -228,9 +252,10 @@ pub enum Acquire {
     Skipped(ClaimSkip),
     /// The claim object is unreadable and older than one lease plus this
     /// contender's jitter by the store's `last_modified`. It is left in place
-    /// (never stolen, never deleted), and this run proceeds without a claim so
-    /// the bucket is not deferred forever. Advisory either way: the record's
-    /// `CreateIfAbsent` still serializes racing publishes.
+    /// (never stolen, never deleted), and this run holds no claim. The
+    /// maintenance passes do not run on it: [`claim_bucket`] reports it as a
+    /// [`ClaimSkipReason::UnreadableClaim`] back-off, because a pass without the
+    /// claim would publish unfenced against the other pass.
     Unclaimed {
         /// The unreadable claim's object key.
         key: String,
@@ -633,7 +658,7 @@ impl ClaimGuard {
             work_id = %observed.work_id.hex(),
             last_modified_unix_ms = observed.last_modified_unix_ms,
             "compaction claim is unreadable and older than one lease plus jitter; \
-             running the bucket unclaimed and leaving the claim in place (ADR-1029)"
+             leaving the claim in place (ADR-1029)"
         );
         Some(Acquire::Unclaimed {
             key: observed.key.clone(),
@@ -644,8 +669,8 @@ impl ClaimGuard {
     /// since the last successful write, and report [`Verdict::Cancel`] once the
     /// claim is gone.
     ///
-    /// A run that never took a claim (coordination off, or a bucket below the
-    /// cost gate) never reaches here: the driver installs no guard, so the
+    /// A run that never took a claim (coordination off, or no participant
+    /// installed) never reaches here: the driver installs no guard, so the
     /// checkpoint is a single `Option` check. A run whose claim was already
     /// lost keeps reporting `Cancel`, so a second checkpoint after the first
     /// costs no request.
@@ -785,8 +810,8 @@ impl ClaimGuard {
 /// the typed signal the pipeline unwinds on.
 ///
 /// This is what every seam inside the merge calls. With no guard installed
-/// (every unclaimed run: coordination off, a bucket below the cost gate, or a
-/// caller that installed no [`ClaimParticipant`]) it is one `Option` check and
+/// (every unclaimed run: coordination off, or a caller that installed no
+/// [`ClaimParticipant`]) it is one `Option` check and
 /// no await of anything.
 ///
 /// The error is internal plumbing, not an operator-facing failure:
@@ -806,13 +831,109 @@ pub(crate) async fn checkpoint(
     Ok(())
 }
 
-/// Whether `config` would claim a bucket whose listed input bytes are
-/// `input_bytes`: a participant is installed, coordination is on, and the
-/// bucket is at or above the cost gate (ADR-1029 decision 4).
-pub(crate) fn claims_bucket(config: &CompactorConfig, input_bytes: u64) -> bool {
-    config.claim_participant.is_some()
-        && config.coordination == Coordination::On
-        && input_bytes >= config.claim_min_input_bytes
+/// Whether `config` takes bucket claims at all: a participant is installed and
+/// coordination is on. The bucket's size is deliberately not an input: the
+/// claim fences the compaction and erasure rewrite publishes, so a small
+/// bucket needs it as much as a large one (ADR-1029, the 2026-10-03
+/// amendment).
+pub(crate) fn claims_bucket(config: &CompactorConfig) -> bool {
+    config.claim_participant.is_some() && config.coordination == Coordination::On
+}
+
+/// What [`claim_bucket`] produced for one pass over one bucket.
+pub(crate) enum BucketClaim {
+    /// This pass holds the bucket's claim and keeps it through its record PUT.
+    Held {
+        guard: ClaimGuard,
+        /// Whether this claim was taken over from an expired holder rather
+        /// than created fresh.
+        stolen: bool,
+    },
+    /// This caller takes no claims at all: no [`ClaimParticipant`] is
+    /// installed, or coordination is off. Its only fence is the pre-publish
+    /// re-list.
+    NotParticipating,
+    /// The claim is not available to this pass. The pass backs off without
+    /// building or publishing anything and retries at
+    /// [`ClaimSkip::reschedule_after_unix_ms`].
+    Skipped(ClaimSkip),
+}
+
+/// Take `bucket`'s claim for one compaction or erasure rewrite pass (ADR-1029,
+/// the 2026-10-03 amendment). `pass` names the pass in the logs.
+///
+/// Both passes call this, so both contend for the one claim object the
+/// bucket's work id names: a compaction and an erasure rewrite of the same
+/// bucket can never both hold it. Every outcome other than an acquisition is a
+/// back-off when the caller participates; in particular a stale unreadable
+/// claim ([`Acquire::Unclaimed`]) holds the bucket rather than letting the pass
+/// publish unfenced.
+pub(crate) async fn claim_bucket(
+    store: &dyn ObjectStoreBackend,
+    config: &CompactorConfig,
+    bucket: &Bucket,
+    pass: &'static str,
+) -> Result<BucketClaim> {
+    if !claims_bucket(config) {
+        return Ok(BucketClaim::NotParticipating);
+    }
+    let Some(participant) = config.claim_participant.as_ref() else {
+        return Ok(BucketClaim::NotParticipating);
+    };
+    // Claim writes ignore `dry_run`. Every caller that installs a participant
+    // keeps `claim_participant` unset on a dry run, so the two never meet. The
+    // claim's `input_set_hash` forensics field stays empty: the claim identity
+    // deliberately excludes it (ADR-1029 rejected alternative 3).
+    let guard = ClaimGuard::new(
+        bucket,
+        participant,
+        ClaimConfig {
+            lease_duration: config.claim_lease_duration,
+            ..ClaimConfig::default()
+        },
+        config.request_ledger.clone(),
+    );
+    let skip = match guard.acquire(store).await? {
+        Acquire::Acquired => {
+            let stolen = guard.stolen().await;
+            return Ok(BucketClaim::Held { guard, stolen });
+        }
+        Acquire::Unclaimed { key } => {
+            let now_ms = participant.clock().now_ns() / 1_000_000;
+            let lease_ms =
+                i64::try_from(config.claim_lease_duration.as_millis()).unwrap_or(i64::MAX);
+            tracing::warn!(
+                pass,
+                key = %key,
+                signal = ?bucket.signal,
+                shard = bucket.shard,
+                ingest_hour_bucket = bucket.ingest_hour_bucket,
+                "bucket claim is unreadable; the pass backs off rather than publish \
+                 unfenced, and the bucket stays held until the claim object is removed \
+                 (ADR-1029)"
+            );
+            ClaimSkip {
+                reason: ClaimSkipReason::UnreadableClaim,
+                work_id_hex: guard.work_id_hex(),
+                holder_process_id: None,
+                expiry_unix_ms: 0,
+                reschedule_after_unix_ms: now_ms.saturating_add(lease_ms),
+            }
+        }
+        Acquire::Skipped(skip) => skip,
+    };
+    tracing::info!(
+        pass,
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        work_id = %skip.work_id_hex,
+        reason = skip.reason.name(),
+        holder = ?skip.holder_process_id,
+        reschedule_after_unix_ms = skip.reschedule_after_unix_ms,
+        "pass skipped: another attempt holds this bucket's claim (ADR-1029)"
+    );
+    Ok(BucketClaim::Skipped(skip))
 }
 
 #[cfg(test)]
