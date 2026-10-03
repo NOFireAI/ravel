@@ -94,8 +94,9 @@ use ravel_types::{LabelSet, Sample, Signal, TenantHash};
 
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, OUTPUT_FORMAT_VERSION};
-use crate::claim_guard::{BucketClaim, claim_bucket};
+use crate::claim_guard::{BucketClaim, Checkpoint, ClaimSkipReason, claim_bucket};
 use crate::clock::Clock;
+use crate::compact::ClaimAcquisition;
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
@@ -1942,15 +1943,59 @@ pub enum ErasureRewriteOutcome {
     /// Built and published (or converged / abandoned): `parts` output parts
     /// written, `publish` records how the `RewriteRecord` PUT resolved.
     ///
-    /// `parts: 0` with [`PublishOutcome::Abandoned`] is also how a pass that
-    /// published nothing under the bucket claim reports (ADR-1029, the
-    /// 2026-10-03 amendment): refused the claim, cancelled at a claim
-    /// checkpoint, or stopped by the pre-publish re-list. Every applicable
-    /// `.dreq` stays pending and a later pass retries.
+    /// [`PublishOutcome::Abandoned`] means nothing was published, and
+    /// `abandoned` says why ([`ErasureAbandon`]); it is `Some` exactly when
+    /// `publish` is `Abandoned`. A pass that published nothing under the bucket
+    /// claim (ADR-1029, the 2026-10-03 amendment) reports `parts: 0`: refused
+    /// the claim, cancelled at a claim checkpoint, or stopped by the pre-publish
+    /// re-list. Every applicable `.dreq` stays pending and a later pass
+    /// retries.
+    ///
+    /// `claim` is this pass's claim acquisition, when it took the bucket's
+    /// claim: `None` for a caller that takes no claims and for a pass refused
+    /// the claim.
     Rewritten {
         parts: usize,
         publish: PublishOutcome,
+        abandoned: Option<ErasureAbandon>,
+        claim: Option<ClaimAcquisition>,
     },
+}
+
+/// Why an erasure rewrite pass published nothing
+/// ([`ErasureRewriteOutcome::Rewritten`] with [`PublishOutcome::Abandoned`]).
+///
+/// The reasons are kept apart because they mean different things to an
+/// operator: the first two are the bucket claim at work (ADR-1029, the
+/// 2026-10-03 amendment), the third is the pre-publish re-list, and the last is
+/// the run's own `max_compaction_lifetime` deadline. Each leaves every
+/// applicable `.dreq` pending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErasureAbandon {
+    /// The pass could not take the bucket's claim: another process holds it,
+    /// or `reason` names the other refusal ([`ClaimSkipReason`]). Nothing was
+    /// built.
+    ClaimHeld { reason: ClaimSkipReason },
+    /// The pass took the claim and lost it before its record PUT (stolen after
+    /// its lease expired, or the claim object is gone), and cancelled at `at`.
+    ClaimLost { at: Checkpoint },
+    /// The pre-publish re-list found a record set other than the one the pass
+    /// planned from, such as a compaction record that landed meanwhile.
+    RecordSetChanged,
+    /// The run exceeded `max_compaction_lifetime` before its record PUT.
+    Deadline,
+}
+
+impl ErasureAbandon {
+    /// Stable snake_case name, for logs.
+    pub fn name(self) -> &'static str {
+        match self {
+            ErasureAbandon::ClaimHeld { .. } => "claim_held",
+            ErasureAbandon::ClaimLost { .. } => "claim_lost",
+            ErasureAbandon::RecordSetChanged => "record_set_changed",
+            ErasureAbandon::Deadline => "deadline",
+        }
+    }
 }
 
 /// Rewrite one sealed bucket against every pending erasure request that
@@ -2015,8 +2060,9 @@ fn invalidate_after_publish(memo: &mut MaintainMemo, bucket: &Bucket, publish: &
 /// takes the bucket's claim before it builds, the same claim a compaction
 /// takes, and holds it through the record PUT; it re-lists the bucket before
 /// that PUT either way (ADR-1029, the 2026-10-03 amendment). A pass that
-/// cannot take the claim, or whose re-list finds the record set changed,
-/// publishes nothing and reports `Rewritten { parts: 0, publish: Abandoned }`.
+/// cannot take the claim, loses it, or whose re-list finds the record set
+/// changed publishes nothing and reports `Rewritten { parts: 0, publish:
+/// Abandoned, .. }` with the reason in `abandoned`.
 pub async fn erasure_rewrite_bucket(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -2096,13 +2142,17 @@ pub async fn erasure_rewrite_bucket(
     // rewrite and serve the erased rows again. A pass refused the claim backs
     // off and publishes nothing; the `.dreq` stays pending and a later pass
     // retries.
-    let guard = match claim_bucket(store, config, bucket, "erasure_rewrite").await? {
-        BucketClaim::Held { guard, .. } => Some(guard),
-        BucketClaim::NotParticipating => None,
-        BucketClaim::Skipped(_) => {
+    let (guard, claim) = match claim_bucket(store, config, bucket, "erasure_rewrite").await? {
+        BucketClaim::Held { guard, stolen } => (Some(guard), Some(ClaimAcquisition { stolen })),
+        BucketClaim::NotParticipating => (None, None),
+        BucketClaim::Skipped(skip) => {
             return Ok(ErasureRewriteOutcome::Rewritten {
                 parts: 0,
                 publish: PublishOutcome::Abandoned,
+                abandoned: Some(ErasureAbandon::ClaimHeld {
+                    reason: skip.reason,
+                }),
+                claim: None,
             });
         }
     };
@@ -2126,7 +2176,7 @@ pub async fn erasure_rewrite_bucket(
         start_ns,
     )
     .await;
-    let (parts, publish) = match built {
+    let (parts, publish, abandoned) = match built {
         Err(MaintainError::ClaimLost { at }) => {
             tracing::info!(
                 signal = ?bucket.signal,
@@ -2135,7 +2185,21 @@ pub async fn erasure_rewrite_bucket(
                 checkpoint = at,
                 "erasure rewrite cancelled at a claim checkpoint; nothing published (ADR-1029)"
             );
-            (0, PublishOutcome::Abandoned)
+            let cancelled_at = match guard.as_ref() {
+                Some(guard) => guard.cancelled_at().await,
+                None => None,
+            };
+            let Some(at) = cancelled_at else {
+                return Err(MaintainError::Invariant(format!(
+                    "an erasure rewrite reported its claim lost at {at} without a guard that \
+                     recorded the cancellation"
+                )));
+            };
+            (
+                0,
+                PublishOutcome::Abandoned,
+                Some(ErasureAbandon::ClaimLost { at }),
+            )
         }
         other => other?,
     };
@@ -2155,7 +2219,12 @@ pub async fn erasure_rewrite_bucket(
     }
 
     invalidate_after_publish(memo, bucket, &publish);
-    Ok(ErasureRewriteOutcome::Rewritten { parts, publish })
+    Ok(ErasureRewriteOutcome::Rewritten {
+        parts,
+        publish,
+        abandoned,
+        claim,
+    })
 }
 
 /// The signal-specific build and the shared publish tail of
@@ -2165,7 +2234,9 @@ pub async fn erasure_rewrite_bucket(
 /// re-list: a record set that moved since `planned` (a compaction record that
 /// landed meanwhile above all) means the build no longer covers the bucket's
 /// live records, so nothing is published and the outcome is
-/// [`PublishOutcome::Abandoned`] with zero parts.
+/// [`PublishOutcome::Abandoned`] with zero parts and
+/// [`ErasureAbandon::RecordSetChanged`]. A publish abandoned at the deadline
+/// reports [`ErasureAbandon::Deadline`].
 #[allow(clippy::too_many_arguments)]
 async fn build_and_publish_rewrite(
     store: &dyn ObjectStoreBackend,
@@ -2176,7 +2247,7 @@ async fn build_and_publish_rewrite(
     live: LiveInputs,
     overlapping: &[&PendingErasureRequest],
     start_ns: i64,
-) -> Result<(usize, PublishOutcome)> {
+) -> Result<(usize, PublishOutcome, Option<ErasureAbandon>)> {
     let (supersession, build) = match bucket.signal {
         Signal::Metrics => {
             let applicable: Vec<ApplicableRequest> = overlapping
@@ -2299,12 +2370,19 @@ async fn build_and_publish_rewrite(
         .await?
         .is_some()
     {
-        return Ok((0, PublishOutcome::Abandoned));
+        return Ok((
+            0,
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::RecordSetChanged),
+        ));
     }
     let parts = build.parts.len();
     let publish =
         publish_rewrite_record(store, config, clock, bucket, supersession, build, start_ns).await?;
-    Ok((parts, publish))
+    // `publish_rewrite_record` abandons at its deadline check and nowhere else.
+    let abandoned =
+        matches!(publish, PublishOutcome::Abandoned).then_some(ErasureAbandon::Deadline);
+    Ok((parts, publish, abandoned))
 }
 
 /// The catalog-resolver completion verdict for one bucket (ADR-0064 §4 F1).
@@ -3032,7 +3110,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -3528,7 +3606,7 @@ mod tests {
         .expect("rewrite must succeed even when >=2 live L0 commits share a series_id");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -3600,7 +3678,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!(
                 "expected Rewritten -- a windowed request matching physically-stored \
                  event timestamps must select the bucket even when those timestamps \
@@ -3674,7 +3752,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -3852,7 +3930,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(
@@ -4116,7 +4194,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -4283,7 +4361,7 @@ mod tests {
         .expect("rewrite must merge >=2 live L0 inputs into one part");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(
@@ -4613,7 +4691,7 @@ mod tests {
         .await
         .expect("erasure rewrite");
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(publish, PublishOutcome::Published);
@@ -5171,7 +5249,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -5335,7 +5413,7 @@ mod tests {
         .expect("rewrite must merge >=2 live L0 inputs into one part");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(
@@ -5519,7 +5597,7 @@ mod tests {
         .expect("rewrite");
 
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(parts, 1);
@@ -5690,7 +5768,7 @@ mod tests {
         .await
         .expect("erasure rewrite");
         let (parts, publish) = match outcome {
-            ErasureRewriteOutcome::Rewritten { parts, publish } => (parts, publish),
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
             other => panic!("expected Rewritten, got {other:?}"),
         };
         assert_eq!(publish, PublishOutcome::Published);

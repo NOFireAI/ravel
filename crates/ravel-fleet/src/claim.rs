@@ -469,9 +469,12 @@ pub enum Reclaim {
 /// (a renewal store error, any other error after the claim was taken, or a
 /// completed run's marker), or held by a concurrent sibling run in this
 /// process, which then cancels at its next renewal if that falls before it
-/// publishes and otherwise duplicates the merge. Either way, taking it back
-/// costs nothing correctness-wise: claims are advisory, and the worst case
-/// is a cancelled or duplicated merge, never incorrect data.
+/// publishes and otherwise duplicates the merge. Between two compactions the
+/// worst case is a cancelled or duplicated merge. When the sibling is an
+/// erasure rewrite of the same bucket the claim also fences the two
+/// publishes (ADR-1029, the 2026-10-03 amendment): a sibling past its last
+/// renewal is then stopped only by its pre-publish re-list, which leaves the
+/// short window between that re-list and its record PUT.
 ///
 /// The caller maps `Err(StoreError::NotFound)` (a claim deleted between the
 /// observation and the CAS, as the S3 adapter reports it) to a lost race, as
@@ -662,8 +665,11 @@ async fn observe(
     // Clamped above by MAX_OBSERVED_LEASE_MS: nothing ever deletes a claim, so
     // trusting an absurd holder-declared lease (misconfiguration, or decodable
     // corruption) would suppress claimed compaction of the bucket until the
-    // heat death of i64. The clamp is an availability guard on the advisory
-    // layer; correctness never depended on the lease.
+    // heat death of i64. The clamp is an availability guard. A lease it cuts
+    // short lets a steal come sooner; a stolen owner cancels at its next
+    // renewal, and its pre-publish re-list catches a steal after that, apart
+    // from the short window before its record PUT (ADR-1029, the 2026-10-03
+    // amendment).
     let lease_ms = holder
         .as_ref()
         .map(|h| h.lease_duration_ns)

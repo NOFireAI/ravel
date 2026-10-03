@@ -73,13 +73,17 @@ impl ravel_maintain::Clock for LiveClock {
 /// this library, the tests among them; the binary leaves all three at `None`.
 #[derive(Clone)]
 pub struct ClaimOptions {
-    /// `--no-claim`: take no claims at all. The run is still correct, because
-    /// the compaction record's `CreateIfAbsent` decides which output is
-    /// published, but it may duplicate a merge another maintainer is running.
+    /// `--no-claim`: take no claims at all. Against another compaction the
+    /// run is still correct, because the compaction record's `CreateIfAbsent`
+    /// decides which output is published, but it may duplicate a merge another
+    /// maintainer is running. Against an erasure rewrite of the same bucket
+    /// only the pre-publish re-list fences its publish, which leaves a short
+    /// window between that re-list and the record PUT.
     pub no_claim: bool,
     /// The identity this invocation's claims are written under.
     pub process_id: Uuid,
-    /// Replaces the compactor's `claim_min_input_bytes` cost gate when set.
+    /// Replaces the compactor's `claim_min_input_bytes` when set. The setting
+    /// no longer decides anything: a participating run claims every bucket.
     pub min_input_bytes: Option<u64>,
     /// Replaces the compactor's `claim_lease_duration` when set.
     pub lease_duration: Option<Duration>,
@@ -2172,6 +2176,13 @@ fn migrate_report_text(
 /// `target_version` defaults to the signal's current supported version
 /// ([`signal_current_version`]); `family` defaults to the signal's canonical
 /// family ([`signal_family`]).
+///
+/// Each bucket's migration publishes a compaction record, so it takes the
+/// bucket's claim under `claims` exactly as `compact-bucket` does, and backs
+/// off a bucket whose claim another process holds; the floor then stays
+/// unraised until a later run migrates it. `--no-claim` takes none, which
+/// leaves only the pre-publish re-list between a migration and an erasure
+/// rewrite of the same bucket.
 #[allow(clippy::too_many_arguments)]
 pub async fn migrate(
     store: Arc<dyn ObjectStoreBackend>,
@@ -2182,6 +2193,7 @@ pub async fn migrate(
     target_version: Option<u32>,
     family: Option<String>,
     budget_records: u64,
+    claims: &ClaimOptions,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
     selection.print_header();
@@ -2200,7 +2212,8 @@ pub async fn migrate(
     };
     let family = family.unwrap_or_else(|| signal_family(sig).to_string());
     let clock = wall_clock()?;
-    let config = CompactorConfig::default();
+    let mut config = CompactorConfig::default();
+    println!("{}", install_claims(&mut config, false, claims));
     let budget = MigrateBudget {
         max_records: budget_records,
     };

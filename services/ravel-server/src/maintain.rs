@@ -94,11 +94,11 @@ use ravel_maintain::worker_set::{
 };
 use ravel_maintain::{
     AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
-    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureRewriteOutcome, LeaseCheck, LegalHoldCheck,
-    MaintainError, OrphanPass, PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig,
-    WorkerSet, erasure_rewrite_bucket, pending_erasure_requests, read_all_memo_snapshots,
-    scan_and_compact, sweep_alert_retention, sweep_audit_retention, sweep_erasure_requests,
-    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
+    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureAbandon, ErasureRewriteOutcome, LeaseCheck,
+    LegalHoldCheck, MaintainError, OrphanPass, PendingErasureRequest, QUERY_AUDIT_SHARD,
+    RetentionConfig, WorkerSet, erasure_rewrite_bucket, pending_erasure_requests,
+    read_all_memo_snapshots, scan_and_compact, sweep_alert_retention, sweep_audit_retention,
+    sweep_erasure_requests, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
     sweep_unreferenced_catalog_objects, write_memo_snapshot,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
@@ -3188,17 +3188,27 @@ async fn list_erasure_scan_hours(
 /// decision and the log line.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ErasureRewritePass {
-    /// Buckets this tick actually rewrote (a `RewriteRecord` was published,
-    /// converged, or abandoned -- see `deferred` for the abandoned case).
+    /// Buckets this tick actually rewrote (a `RewriteRecord` was published or
+    /// converged). An abandoned publish is counted by its reason below, or
+    /// only logged, and sets `deferred`.
     rewritten: usize,
     /// Buckets whose live `RewriteRecord` already named every overlapping
     /// request, so nothing was republished (the idempotence guard).
     already_applied: usize,
-    /// Buckets whose rewrite backed off under the bucket claim fence
-    /// (ADR-1029, the 2026-10-03 amendment): `Rewritten` with zero parts and
-    /// an abandoned publish. Counted into `ravel_maintain_claims_skipped_total`,
-    /// as a compaction refused the claim is; `deferred` is set too.
+    /// Buckets whose rewrite could not take the bucket claim (ADR-1029, the
+    /// 2026-10-03 amendment): [`ErasureAbandon::ClaimHeld`]. Counted into
+    /// `ravel_maintain_claims_skipped_total`, as a compaction refused the claim
+    /// is; `deferred` is set too.
     claim_backoffs: usize,
+    /// Buckets whose rewrite took the claim and lost it before its record PUT
+    /// ([`ErasureAbandon::ClaimLost`]). Counted into
+    /// `ravel_maintain_claims_lost_total`, as a cancelled compaction is.
+    claims_lost: usize,
+    /// Claims the rewrites took, fresh or stolen, and the stolen subset.
+    /// Counted into `ravel_maintain_claims_acquired_total` and
+    /// `ravel_maintain_claims_stolen_total`, as a compaction's are.
+    claims_acquired: usize,
+    claims_stolen: usize,
     /// Buckets that contribute nothing to any pending request: no pending
     /// request's event-time range overlaps them, or they are tombstoned.
     out_of_scope: usize,
@@ -3294,41 +3304,35 @@ async fn erasure_rewrite_pass(
                 match erasure_rewrite_bucket(store, clock, compactor, hold, &bucket, pending, memo)
                     .await
                 {
-                    // Zero parts and an abandoned publish is the bucket claim
-                    // fence backing off: another pass held the claim (or took
-                    // it over, or the re-list saw the record set move), so
-                    // nothing was built or published and a later tick retries.
                     Ok(ErasureRewriteOutcome::Rewritten {
-                        parts: 0,
-                        publish: ravel_maintain::PublishOutcome::Abandoned,
+                        parts,
+                        publish,
+                        abandoned,
+                        claim,
                     }) => {
-                        pass.claim_backoffs += 1;
-                        pass.deferred = true;
-                        tracing::info!(
-                            tenant = %tenant.to_hex(),
-                            signal = ?signal,
-                            shard,
-                            hour,
-                            "maintenance: erasure rewrite backed off a bucket under its \
-                             compaction claim; nothing published, the request stays pending"
-                        );
-                    }
-                    Ok(ErasureRewriteOutcome::Rewritten { parts, publish }) => {
-                        pass.rewritten += 1;
-                        // An abandoned publish wrote no record, so this bucket
-                        // does not yet name the pending requests.
-                        if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
-                            pass.deferred = true;
+                        tally_erasure_rewrite(&mut pass, &publish, abandoned, claim);
+                        match abandoned {
+                            None => tracing::info!(
+                                tenant = %tenant.to_hex(),
+                                signal = ?signal,
+                                shard,
+                                hour,
+                                parts,
+                                publish = ?publish,
+                                "maintenance: erasure rewrite published for a bucket"
+                            ),
+                            Some(reason) => tracing::info!(
+                                tenant = %tenant.to_hex(),
+                                signal = ?signal,
+                                shard,
+                                hour,
+                                parts,
+                                reason = reason.name(),
+                                detail = ?reason,
+                                "maintenance: erasure rewrite of a bucket published nothing; \
+                                 the request stays pending and a later tick retries"
+                            ),
                         }
-                        tracing::info!(
-                            tenant = %tenant.to_hex(),
-                            signal = ?signal,
-                            shard,
-                            hour,
-                            parts,
-                            publish = ?publish,
-                            "maintenance: erasure rewrite published for a bucket"
-                        );
                     }
                     Ok(ErasureRewriteOutcome::AlreadyApplied) => pass.already_applied += 1,
                     Ok(
@@ -3411,6 +3415,36 @@ async fn erasure_rewrite_pass(
         }
     }
     pass
+}
+
+/// Count one [`ErasureRewriteOutcome::Rewritten`] into `pass`.
+///
+/// An abandoned publish wrote no record, so the bucket does not yet name the
+/// pending requests and the tick defers, whatever the reason. Only the two
+/// claim reasons land on claim counters: a re-list that found the record set
+/// changed and a deadline abandonment have nothing to do with a claim, and the
+/// caller logs them with their reason.
+fn tally_erasure_rewrite(
+    pass: &mut ErasureRewritePass,
+    publish: &ravel_maintain::PublishOutcome,
+    abandoned: Option<ErasureAbandon>,
+    claim: Option<ravel_maintain::ClaimAcquisition>,
+) {
+    if let Some(claim) = claim {
+        pass.claims_acquired += 1;
+        if claim.stolen {
+            pass.claims_stolen += 1;
+        }
+    }
+    if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
+        pass.deferred = true;
+    }
+    match abandoned {
+        None => pass.rewritten += 1,
+        Some(ErasureAbandon::ClaimHeld { .. }) => pass.claim_backoffs += 1,
+        Some(ErasureAbandon::ClaimLost { .. }) => pass.claims_lost += 1,
+        Some(ErasureAbandon::RecordSetChanged | ErasureAbandon::Deadline) => {}
+    }
 }
 
 /// Write one request's `.done` completion record (ADR-0064 decision 1 and 4).
@@ -3562,14 +3596,19 @@ async fn run_erasure_pass(
                 memo,
             )
             .await;
-            safety.claims_skipped[signal_index(signal)]
-                .fetch_add(pass.claim_backoffs as u64, Ordering::Relaxed);
+            let index = signal_index(signal);
+            safety.claims_skipped[index].fetch_add(pass.claim_backoffs as u64, Ordering::Relaxed);
+            safety.claims_lost[index].fetch_add(pass.claims_lost as u64, Ordering::Relaxed);
+            safety.claims_acquired[index].fetch_add(pass.claims_acquired as u64, Ordering::Relaxed);
+            safety.claims_stolen[index].fetch_add(pass.claims_stolen as u64, Ordering::Relaxed);
             tracing::info!(
                 tenant = %tenant.to_hex(),
                 signal = ?signal,
                 pending = pending.len(),
                 rewritten = pass.rewritten,
                 claim_backoffs = pass.claim_backoffs,
+                claims_lost = pass.claims_lost,
+                claims_acquired = pass.claims_acquired,
                 already_applied = pass.already_applied,
                 out_of_scope = pass.out_of_scope,
                 not_sealed = pass.not_sealed,
@@ -12101,5 +12140,124 @@ mod query_worker_reap_tests {
             "the error names the prefix and the undeleted count: {fields}"
         );
         assert_eq!(query_worker_keys(&store).await.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod erasure_rewrite_accounting_tests {
+    //! How one erasure rewrite outcome is counted (ADR-1029, the 2026-10-03
+    //! amendment): each abandonment reason lands on its own counter, or on
+    //! none, and every abandoned publish defers the tick's completion.
+
+    use ravel_maintain::{Checkpoint, ClaimAcquisition, ClaimSkipReason, PublishOutcome};
+
+    use super::*;
+
+    fn tally(
+        publish: PublishOutcome,
+        abandoned: Option<ErasureAbandon>,
+        claim: Option<ClaimAcquisition>,
+    ) -> ErasureRewritePass {
+        let mut pass = ErasureRewritePass::default();
+        tally_erasure_rewrite(&mut pass, &publish, abandoned, claim);
+        pass
+    }
+
+    /// A claim held by another process is a claim skip, and nothing else.
+    /// Fails if the `ClaimHeld` arm of `tally_erasure_rewrite` counts onto
+    /// `claims_lost` or `rewritten` instead.
+    #[test]
+    fn a_claim_held_by_another_process_counts_as_a_claim_skip() {
+        let pass = tally(
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::ClaimHeld {
+                reason: ClaimSkipReason::HeldByAnother,
+            }),
+            None,
+        );
+        assert_eq!(
+            pass,
+            ErasureRewritePass {
+                claim_backoffs: 1,
+                deferred: true,
+                ..ErasureRewritePass::default()
+            }
+        );
+    }
+
+    /// A claim taken (here, stolen) and then lost counts as acquired, stolen
+    /// and lost, never as a skip.
+    #[test]
+    fn a_claim_lost_mid_run_counts_as_lost_and_its_acquisition_counts() {
+        let pass = tally(
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::ClaimLost {
+                at: Checkpoint::Publish,
+            }),
+            Some(ClaimAcquisition { stolen: true }),
+        );
+        assert_eq!(
+            pass,
+            ErasureRewritePass {
+                claims_lost: 1,
+                claims_acquired: 1,
+                claims_stolen: 1,
+                deferred: true,
+                ..ErasureRewritePass::default()
+            }
+        );
+    }
+
+    /// A re-list that found the record set changed, with no claim involved, and
+    /// a deadline abandonment under a held claim land on no claim-skip or
+    /// claim-lost counter, and still defer the tick. Before the reason was
+    /// carried, both were counted as claim skips.
+    #[test]
+    fn a_relist_abort_and_a_deadline_count_on_no_claim_counter() {
+        let relist = tally(
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::RecordSetChanged),
+            None,
+        );
+        assert_eq!(
+            relist,
+            ErasureRewritePass {
+                deferred: true,
+                ..ErasureRewritePass::default()
+            }
+        );
+
+        let deadline = tally(
+            PublishOutcome::Abandoned,
+            Some(ErasureAbandon::Deadline),
+            Some(ClaimAcquisition { stolen: false }),
+        );
+        assert_eq!(
+            deadline,
+            ErasureRewritePass {
+                claims_acquired: 1,
+                deferred: true,
+                ..ErasureRewritePass::default()
+            }
+        );
+    }
+
+    /// A published rewrite is counted as rewritten and does not defer; its
+    /// fresh claim counts as acquired and not stolen.
+    #[test]
+    fn a_published_rewrite_counts_as_rewritten_and_does_not_defer() {
+        let pass = tally(
+            PublishOutcome::Published,
+            None,
+            Some(ClaimAcquisition { stolen: false }),
+        );
+        assert_eq!(
+            pass,
+            ErasureRewritePass {
+                rewritten: 1,
+                claims_acquired: 1,
+                ..ErasureRewritePass::default()
+            }
+        );
     }
 }

@@ -1426,10 +1426,13 @@ enum MaintainCommand {
         /// Takes no compaction claim.
         #[arg(long)]
         dry_run: bool,
-        /// Take no advisory compaction claim, for repair work when a claim is
-        /// in the way. Safe for correctness, because the compaction record's
-        /// create-if-absent still decides which output is published, but the
-        /// merge may duplicate one another maintainer is running.
+        /// Take no compaction claim, for repair work when a claim is in the
+        /// way. Safe between two compactions, because the compaction record's
+        /// create-if-absent still decides which output is published, though
+        /// the merge may duplicate one another maintainer is running. Against
+        /// an erasure rewrite of the same bucket only the pre-publish re-list
+        /// then fences the publish, which leaves a short window between the
+        /// re-list and the record PUT.
         #[arg(long)]
         no_claim: bool,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
@@ -1508,10 +1511,13 @@ enum MaintainCommand {
         /// records. Takes no compaction claims.
         #[arg(long)]
         dry_run: bool,
-        /// Take no advisory compaction claims, for repair work when a claim is
-        /// in the way. Safe for correctness, because each compaction record's
-        /// create-if-absent still decides which output is published, but a
-        /// merge may duplicate one another maintainer is running.
+        /// Take no compaction claims, for repair work when a claim is in the
+        /// way. Safe between two compactions, because each compaction record's
+        /// create-if-absent still decides which output is published, though a
+        /// merge may duplicate one another maintainer is running. Against an
+        /// erasure rewrite of the same bucket only the pre-publish re-list then
+        /// fences each publish, which leaves a short window between the
+        /// re-list and the record PUT.
         #[arg(long)]
         no_claim: bool,
         /// Override the compactor's `max_flush_lifetime` (humantime duration,
@@ -1669,6 +1675,13 @@ enum MaintainCommand {
         /// cursor and returning (0 = unlimited; drain the whole walk).
         #[arg(long, default_value_t = 0)]
         budget_records: u64,
+        /// Take no bucket claims, for repair work when a claim is in the way.
+        /// Each migration publishes a compaction record; against an erasure
+        /// rewrite of the same bucket only the pre-publish re-list then fences
+        /// that publish, which leaves a short window between the re-list and
+        /// the record PUT.
+        #[arg(long)]
+        no_claim: bool,
     },
     /// Re-verify the content-addressed chain for a tenant at rest (both
     /// signals): every live data object's content still hashes to the hash16
@@ -2084,6 +2097,7 @@ async fn main() -> anyhow::Result<()> {
                     target_version,
                     family,
                     budget_records,
+                    no_claim,
                 },
         } => {
             maintain::migrate(
@@ -2095,6 +2109,7 @@ async fn main() -> anyhow::Result<()> {
                 target_version,
                 family,
                 budget_records,
+                &maintain::ClaimOptions::for_invocation(no_claim),
             )
             .await
         }
@@ -4635,6 +4650,38 @@ mod tests {
             } = cli.command
             else {
                 panic!("expected the maintain compact-tenant subcommand");
+            };
+            assert_eq!(no_claim, want, "--no-claim {argv_tail:?} reaches the field");
+            assert_eq!(
+                maintain::ClaimOptions::for_invocation(no_claim).no_claim,
+                want,
+                "and the ClaimOptions the walk is dispatched with",
+            );
+        }
+    }
+
+    /// `--no-claim` on `migrate`, and its absence, reach the `ClaimOptions`
+    /// the walk runs with (issue #2199). The flag is declared separately on
+    /// each subcommand, so the `compact-bucket` pin above does not cover it.
+    ///
+    /// Non-vacuity (prove-the-test): unwire the flag by changing
+    /// `MaintainCommand::Migrate::no_claim`'s `#[arg(long)]` to
+    /// `#[arg(skip)]`, and the `try_parse_from` carrying `--no-claim` fails
+    /// with "unexpected argument '--no-claim' found".
+    #[test]
+    fn migrate_no_claim_flag_reaches_the_claim_options() {
+        let base = [
+            "ravel", "maintain", "migrate", "--tenant", "acme", "--signal", "logs",
+        ];
+
+        for (argv_tail, want) in [(Vec::new(), false), (vec!["--no-claim"], true)] {
+            let cli = Cli::try_parse_from(base.iter().copied().chain(argv_tail.iter().copied()))
+                .unwrap_or_else(|e| panic!("migrate {argv_tail:?} parses: {e}"));
+            let Command::Maintain {
+                command: super::MaintainCommand::Migrate { no_claim, .. },
+            } = cli.command
+            else {
+                panic!("expected the maintain migrate subcommand");
             };
             assert_eq!(no_claim, want, "--no-claim {argv_tail:?} reaches the field");
             assert_eq!(
