@@ -546,9 +546,9 @@ impl LogIngestRouter {
     /// layout, `WriteMode::Strict` ack contract, flush triggers, and RLOG format
     /// are unchanged; only the buffered input shape differs.
     ///
-    /// Until #605 wires the Parquet bulk loader, no shipping binary constructs a
-    /// [`ColumnarLogBatch`] to hand here; this is the router seam that loader
-    /// will call, reachable today only from tests.
+    /// The bulk loader (`services/ravel-cli/src/load/logs.rs`) calls this in
+    /// production; the `ravel-bench` columnar load harness and tests call it
+    /// too.
     pub async fn write_columnar(
         &self,
         tenant: ravel_types::TenantId,
@@ -556,6 +556,18 @@ impl LogIngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<LogWriteReceipt, LogWriteError> {
+        // Caller-side input rejection, before anything else: a malformed batch
+        // must not reach `est_columnar_bytes` (which indexes `stream_attrs` by
+        // `stream_refs` with no bound check of its own) or `partition_columnar`,
+        // and must not be counted as a `stream_id_collisions` hit the way a
+        // batch that reached the writer's directory merge would be. Maps to
+        // `SegmentBuild`, the same variant the shard actor's own flush-time
+        // `LogSegError::MalformedColumnarBatch` maps to (log_shard.rs), so a
+        // caller sees one failure shape whichever point rejects its input.
+        batch
+            .validate()
+            .map_err(|e| LogWriteError::SegmentBuild(e.to_string()))?;
+
         if batch.is_empty() {
             return Ok(LogWriteReceipt::default());
         }
