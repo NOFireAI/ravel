@@ -5627,16 +5627,23 @@ const PROV_S_PATTERN: &str = "t/????????????????????????????????/s/prov";
 const PROV_PATTERNS: [&str; 3] = [PROV_M_PATTERN, PROV_L_PATTERN, PROV_S_PATTERN];
 
 /// Keys ending in `/prov` that are not a provisioning record: nested keys under
-/// `c/`, `del/` and `l0/` of a provisioned signal, and the `prov` key of every
-/// signal that has no record. No provisioning-record grant may reach one.
+/// `c/`, `del/` and `l0/` of a provisioned signal, a provisioned signal's
+/// `prov` key under a tenant segment one character narrower (31) or wider (33)
+/// than a tenant hash, and the `prov` key of every signal that has no record.
+/// No provisioning-record grant may reach one.
 fn prov_lookalike_keys() -> Vec<String> {
     let hash = test_tenant().to_hex();
+    let narrow = &hash[..hash.len() - 1];
+    let wide = format!("{hash}0");
+    assert_eq!((narrow.len(), wide.len()), (31, 33));
     let mut keys = Vec::new();
     for signal in PROVISIONED_SIGNALS {
         let sig = signal.key_prefix();
         keys.push(format!("t/{hash}/{sig}/c/0000/20260101T00/prov"));
         keys.push(format!("t/{hash}/{sig}/del/prov"));
         keys.push(format!("t/{hash}/{sig}/l0/0000/prov"));
+        keys.push(format!("t/{narrow}/{sig}/prov"));
+        keys.push(format!("t/{wide}/{sig}/prov"));
     }
     for signal in ALL_SIGNALS {
         if !PROVISIONED_SIGNALS.contains(&signal) {
@@ -5657,6 +5664,21 @@ fn prov_patterns_follow_the_provisioned_signals() {
         .map(|signal| format!("t/{}/{}/prov", "?".repeat(width), signal.key_prefix()))
         .collect();
     assert_eq!(PROV_PATTERNS.to_vec(), expected);
+    // The 31- and 33-character lookalikes are live: a pattern one `?` narrower
+    // or wider reaches them, so only the width of `PROV_PATTERNS` keeps them out.
+    let hash = test_tenant().to_hex();
+    for (width, key) in [
+        (width - 1, format!("t/{}/m/prov", &hash[..width - 1])),
+        (width + 1, format!("t/{hash}0/m/prov")),
+    ] {
+        let pattern = format!("t/{}/m/prov", "?".repeat(width));
+        assert!(glob_matches(&pattern, &key), "{pattern} reaches {key}");
+        assert!(
+            !glob_matches(PROV_M_PATTERN, &key),
+            "{PROV_M_PATTERN} reaches {key}"
+        );
+        assert!(prov_lookalike_keys().contains(&key), "{key} is a lookalike");
+    }
     let unprovisioned: Vec<&str> = ALL_SIGNALS
         .iter()
         .filter(|s| !PROVISIONED_SIGNALS.contains(s))
@@ -5672,8 +5694,8 @@ fn prov_patterns_follow_the_provisioned_signals() {
 /// `validate_or_adopt` under `CreateFromConfig` or `AdoptIfData`),
 /// `append_generation` and `raise_format_floor` (both `PutMode::CasVersion`).
 /// No production path writes the record unconditionally. A `query` process
-/// runs the startup check under `CheckOnly` (`static_absent_policy`) and is
-/// not a caller.
+/// runs the startup check under `RefuseIfCommittedDataHidden`
+/// (`static_absent_policy`), which never writes, and is not a caller.
 const PROV_WRITE_CALL_SITES: &[(&str, &str, PutCondition)] = &[
     (
         "ProvisioningRecordWriter::ensure (services/ravel-server/src/provisioning.rs), \
@@ -5882,6 +5904,55 @@ fn a_prov_grant_widened_to_any_signal_reaches_the_lookalikes() {
         })
         .collect();
     assert_eq!(reached, prov_lookalike_keys());
+}
+
+/// The startup check of a `query` process over a tenant with no provisioning
+/// record (`AbsentPolicy::RefuseIfCommittedDataHidden` in `validate_or_adopt`,
+/// `crates/ravel-catalog/src/provisioning.rs`) issues one delimited listing of
+/// `t/<hash>/<sig>/c/` per provisioned signal (`commit_prefix` there) and never
+/// lists `t/<hash>/<sig>/l0/`. `query.json`'s ListBucket grant admits the
+/// first and does not admit the second. The ravel-server test
+/// `query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing`
+/// fails any `l0/` listing the way this template would, so a change to the
+/// check that lists `l0/` fails there unless this grant, and this test, change
+/// with it.
+#[test]
+fn query_template_admits_the_startup_commit_listing_and_not_l0() {
+    let query = load_policy("query");
+    let allowed = list_prefix_patterns(&query, Some("Allow"));
+    let denied = list_prefix_patterns(&query, Some("Deny"));
+    let tenant = test_tenant();
+    let hash = tenant.to_hex();
+    for signal in PROVISIONED_SIGNALS {
+        let sig = signal.key_prefix();
+        let shard_prefix = commit_shard_prefix(&tenant, signal, 0).expect("shard prefix");
+        let commit = shard_prefix
+            .strip_suffix("0000/")
+            .expect("commit shard prefix ends in the shard directory")
+            .to_string();
+        assert_eq!(commit, format!("t/{hash}/{sig}/c/"));
+        let l0_data =
+            data_key(&tenant, signal, 0, Uuid::from_u128(1), 1, 1, &[0u8; 32]).expect("data_key");
+        let l0_end = l0_data.find("/l0/").expect("data key has an l0 segment") + "/l0/".len();
+        let l0 = l0_data[..l0_end].to_string();
+        assert_eq!(l0, format!("t/{hash}/{sig}/l0/"));
+
+        assert!(
+            allowed.iter().any(|p| glob_matches(p, &commit)),
+            "query: no ListBucket s3:prefix admits {commit:?}, which the Query \
+             startup provisioning check lists. s3:prefix values: {allowed:?}"
+        );
+        assert!(
+            !denied.iter().any(|p| glob_matches(p, &commit)),
+            "query: a ListBucket Deny withdraws {commit:?}"
+        );
+        assert!(
+            !allowed.iter().any(|p| glob_matches(p, &l0)),
+            "query: a ListBucket s3:prefix admits {l0:?}; the Query startup check \
+             is documented and tested as never listing l0/. s3:prefix values: \
+             {allowed:?}"
+        );
+    }
 }
 
 /// A `query` process checks a present provisioning record at startup and never

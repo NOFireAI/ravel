@@ -227,8 +227,10 @@ async fn main() -> anyhow::Result<()> {
     // `--shards` is tolerated (ADR-0082). A brand-new tenant with no prior
     // writes and no record passes through cleanly (nothing to validate yet), so
     // a fresh, operator-managed cluster with configured tenants and zero data
-    // starts normally. `query` mode checks a present record and never adopts
-    // (`static_absent_policy`); every other mode adopts pre-ADR data. An
+    // starts normally. `query` mode never adopts and lists committed data only
+    // (`static_absent_policy`): it validates a present record and, for an
+    // absent one, still refuses when `--shards` would hide committed data.
+    // Every other mode adopts pre-ADR data. An
     // OIDC/mTLS deployment with no static tenants validates nothing here and
     // checks each tenant at first touch.
     ravel_server::provisioning::validate_static_provisioning(

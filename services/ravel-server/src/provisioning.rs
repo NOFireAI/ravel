@@ -9,8 +9,10 @@
 //! - the startup static-tenant check ([`validate_static_provisioning`]), which
 //!   refuses to start only when a statically-known tenant's record is
 //!   unreadable, has a structurally invalid generation history
-//!   ([`ProvisioningError::CorruptGenerations`]), or when adopting the
-//!   configured value would hide pre-ADR data. A decodable record with a valid
+//!   ([`ProvisioningError::CorruptGenerations`]), or when the configured value
+//!   would hide data. In `query` mode the check lists committed data only
+//!   (the commit prefix) and never adopts; it still refuses when the configured
+//!   `shard_count` would hide committed data. A decodable record with a valid
 //!   history whose recorded `shard_count` differs from the live `--shards`
 //!   default is tolerated: routing uses the record's own generation history
 //!   (ADR-0082).
@@ -22,11 +24,12 @@
 //!
 //! Fresh-deployment safety: a brand-new tenant with no
 //! prior writes and no provisioning record must never fail startup. The startup
-//! check uses [`AbsentPolicy::AdoptIfData`] in every mode but `query`
-//! ([`static_absent_policy`]), which returns
+//! check uses [`AbsentPolicy::AdoptIfData`] in every mode but `query`, and
+//! [`AbsentPolicy::RefuseIfCommittedDataHidden`] in `query`
+//! ([`static_absent_policy`]); both return
 //! [`ProvisioningCheck::FreshNoData`] for a (tenant, signal) with no record and
 //! no data, so an operator-managed cluster that starts with zero data and
-//! configured tenant tokens passes through cleanly; only pre-ADR data a lower
+//! configured tenant tokens passes through cleanly; only data a lower
 //! `shard_count` would hide, an unreadable record, or a record with a
 //! structurally invalid generation history, refuses. A decodable record with
 //! a valid history whose recorded `shard_count` differs from the live default
@@ -200,14 +203,16 @@ pub async fn ensure_provisioning_record(
 }
 
 /// What the startup static-tenant check may do about an absent record in
-/// `mode`. A `query` process serves reads only: it validates a present record
-/// and never adopts, so the Query credential needs no provisioning write and no
-/// `l0/` listing for this check (ADR-0055, prov write conditions amendment).
-/// Every mode that runs ingest or maintenance adopts pre-ADR data, as those
-/// paths do at runtime.
+/// `mode`. A `query` process serves committed data only: it validates a
+/// present record and never adopts, and for an absent record it lists the
+/// commit prefix and refuses when its configured count would hide committed
+/// data, so the Query credential needs no provisioning write and no `l0/`
+/// listing for this check (ADR-0055, prov write conditions amendment). Every
+/// mode that runs ingest or maintenance adopts pre-ADR data, as those paths do
+/// at runtime.
 pub fn static_absent_policy(mode: Mode) -> AbsentPolicy {
     match mode {
-        Mode::Query => AbsentPolicy::CheckOnly,
+        Mode::Query => AbsentPolicy::RefuseIfCommittedDataHidden,
         Mode::All | Mode::Gateway | Mode::Maintain => AbsentPolicy::AdoptIfData,
     }
 }
@@ -225,10 +230,11 @@ pub fn static_absent_policy(mode: Mode) -> AbsentPolicy {
 /// passes through without refusing (the fresh-deployment case), a (tenant,
 /// signal) with pre-ADR data is adopted once, and only an unreadable record or
 /// pre-ADR data a lower value would hide refuses. Under
-/// [`AbsentPolicy::CheckOnly`] an absent record passes without a listing or a
-/// write, and a present record is validated the same way. Either way a
-/// brand-new tenant with no prior writes and no provisioning record does not
-/// fail startup.
+/// [`AbsentPolicy::RefuseIfCommittedDataHidden`] (Query mode) an absent record
+/// lists only the commit prefix, refuses when committed data sits on a shard
+/// index at or above `shard_count`, and otherwise passes without a write; a
+/// present record is validated the same way. Either way a brand-new tenant
+/// with no prior writes and no provisioning record does not fail startup.
 pub async fn validate_static_provisioning(
     store: &dyn ObjectStoreBackend,
     static_tenants: &[TenantHash],
@@ -267,6 +273,7 @@ mod tests {
     use super::*;
     use prost::Message;
     use ravel_catalog::provisioning_key;
+    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
         GetRange, InstrumentedStore, ObjectStoreBackend, PutOptions, StoreError,
@@ -380,7 +387,7 @@ mod tests {
     fn only_query_mode_checks_without_adopting() {
         for mode in ALL_MODES {
             let expected = if mode == Mode::Query {
-                AbsentPolicy::CheckOnly
+                AbsentPolicy::RefuseIfCommittedDataHidden
             } else {
                 AbsentPolicy::AdoptIfData
             };
@@ -388,36 +395,80 @@ mod tests {
         }
     }
 
-    /// A `query` process never adopts at startup: over a tenant with pre-ADR
-    /// data and no record it issues no LIST and no PUT, writes no record, and
-    /// starts. The Query credential holds neither an `l0/` listing nor a
-    /// provisioning write, so either call would refuse startup with
-    /// `AccessDenied`. Fails with `Mode::Query => AbsentPolicy::AdoptIfData` in
-    /// [`static_absent_policy`]: the adopt path lists `l0/` and `c/` and
-    /// creates the record.
+    /// A store holding unprovisioned metrics data for `th` at `keys` (relative
+    /// to `t/<hex>/m/`) with no provisioning record, shaped like the Query
+    /// credential: any listing of an `l0/` prefix fails, as the Query template
+    /// grants no `l0/` listing. Wrapped in a counter so a test can assert which
+    /// operations ran.
+    async fn query_store_with_unprovisioned_data(
+        th: &TenantHash,
+        keys: &[&str],
+    ) -> InstrumentedStore<FaultStore<MemoryStore>> {
+        let inner = MemoryStore::new();
+        let hex = th.to_hex();
+        for key in keys {
+            inner
+                .put(
+                    &format!("t/{hex}/m/{key}"),
+                    vec![1].into(),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed shard data");
+        }
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::List,
+                ScriptedFault::Permanent("query credential: no l0 listing".into()),
+            )
+            .with_key_contains("/l0/"),
+        );
+        InstrumentedStore::new(FaultStore::new(inner, plan))
+    }
+
+    /// A `query` process never adopts at startup: over a tenant with committed
+    /// data in range and no record it lists only the commit prefix (one
+    /// delimited listing per provisioned signal), never `l0/`, writes no record,
+    /// and starts. `l0/` holds data on shard 9, above the configured count of
+    /// 4, which the adopt path would refuse over; Query does not serve it.
+    /// Fails with `Mode::Query => AbsentPolicy::AdoptIfData` in
+    /// [`static_absent_policy`]: the adopt path lists `l0/`.
     #[tokio::test]
-    async fn query_mode_startup_over_unprovisioned_data_lists_and_writes_nothing() {
+    async fn query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing() {
         let th = TenantId::new("acme").hash();
-        let store = store_with_unprovisioned_data(&th).await;
+        let store = query_store_with_unprovisioned_data(
+            &th,
+            &[
+                "c/0000/100/rec.cmt",
+                "c/0003/100/rec.cmt",
+                "l0/0009/100/seg",
+            ],
+        )
+        .await;
         let before = store.metrics().snapshot();
         validate_static_provisioning(&store, &[th], 4, Mode::Query, 1_000)
             .await
-            .expect("query-mode startup over unprovisioned data must pass");
+            .expect("query-mode startup over in-range committed data must pass");
         let after = store.metrics().snapshot();
         assert_eq!(
-            after.list_calls() - before.list_calls(),
+            store.inner().fault_count(Op::List, FaultKind::Permanent),
             0,
-            "query-mode startup must not list"
+            "query-mode startup must not list l0/"
+        );
+        assert_eq!(
+            after.list_calls() - before.list_calls(),
+            PROVISIONED_SIGNALS.len() as u64,
+            "one commit-prefix listing per provisioned signal"
         );
         assert_eq!(
             after.put.calls - before.put.calls,
             0,
             "query-mode startup must not write"
         );
-        // One record read per provisioned signal, so the check did run.
         assert_eq!(
             after.get.calls - before.get.calls,
-            PROVISIONED_SIGNALS.len() as u64
+            PROVISIONED_SIGNALS.len() as u64,
+            "one record read per provisioned signal"
         );
         let got = store
             .get(&provisioning_key(&th, Signal::Metrics), GetRange::Full)
@@ -425,6 +476,41 @@ mod tests {
         assert!(
             matches!(got, Err(StoreError::NotFound)),
             "no record written"
+        );
+    }
+
+    /// ADR-0050 section 5 in Query mode: committed data on shard 4 with
+    /// `--shards 4` and no record would be read through the implicit generation
+    /// 0 of 4 shards, leaving shard 4 out of every query, so startup refuses.
+    /// Fails with `Mode::Query => AbsentPolicy::CheckOnly` in
+    /// [`static_absent_policy`]: that policy returns before any listing.
+    #[tokio::test]
+    async fn query_mode_startup_refuses_when_shards_would_hide_committed_data() {
+        let th = TenantId::new("acme").hash();
+        let store =
+            query_store_with_unprovisioned_data(&th, &["c/0000/100/rec.cmt", "c/0004/100/rec.cmt"])
+                .await;
+        let before = store.metrics().snapshot();
+        let err = validate_static_provisioning(&store, &[th], 4, Mode::Query, 1_000)
+            .await
+            .expect_err("committed data on shard 4 is hidden by --shards 4");
+        assert!(
+            matches!(
+                err,
+                ProvisioningError::AdoptionWouldHideData {
+                    configured: 4,
+                    observed_shard: 4,
+                    ..
+                }
+            ),
+            "got {err}"
+        );
+        let after = store.metrics().snapshot();
+        assert_eq!(after.put.calls - before.put.calls, 0, "no write");
+        assert_eq!(
+            store.inner().fault_count(Op::List, FaultKind::Permanent),
+            0,
+            "no l0/ listing"
         );
     }
 
