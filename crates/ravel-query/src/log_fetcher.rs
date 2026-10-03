@@ -6182,7 +6182,7 @@ impl BlockRangeFetcher {
         stats.candidate_blocks = candidates.len() as u64;
         let wanted = projected_page_extents(
             key,
-            &page_dir,
+            page_dir,
             blocks_desc.offset,
             &candidates,
             selected.as_ref(),
