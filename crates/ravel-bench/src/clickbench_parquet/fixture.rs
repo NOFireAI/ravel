@@ -29,8 +29,12 @@
 //! size. Q40 has the same OFFSET-1000 shape but is not planted: its `WHERE`
 //! (`CounterID = 62 AND EventDate` in range `AND IsRefresh = 0`, with no
 //! further restriction) already passes for roughly a quarter of
-//! [`BASE_ROWS`]'s random rows, spread over up to 500 distinct `URL` values,
-//! which is already far past 1,010 distinct groups without any planting.
+//! [`BASE_ROWS`]'s random rows (`CounterID = 62` at 30%, `IsRefresh = 0` at
+//! 80%), and its `GROUP BY "TraficSourceID", "SearchEngineID", "AdvEngineID",
+//! Src, Dst` key multiplies that row set out across 11 distinct
+//! `TraficSourceID` values, 6 `SearchEngineID` values, and up to 500 distinct
+//! `Dst` (`"URL"`) values, which is already far past 1,010 distinct groups
+//! without any planting.
 //!
 //! Q28 and Q29 are not coverable by this fixture at all: both require a
 //! `GROUP BY ... HAVING COUNT(*) > 100000` on a single `CounterID` value
@@ -60,9 +64,7 @@ use rand::{RngExt, SeedableRng};
 pub const BASE_ROWS: usize = 10_000;
 /// Rows planted for Q39 (`WHERE ... GROUP BY "URL" ... OFFSET 1000`): each
 /// row carries a distinct `URL`, so the block contributes exactly this many
-/// groups. Two more than the 1,010 OFFSET+LIMIT needs, so the statement
-/// still returns rows even if a random base row happens to land in the same
-/// group as one of them.
+/// groups. Two more than the 1,010 OFFSET+LIMIT needs, as headroom.
 const Q39_BLOCK_ROWS: usize = 1_012;
 /// Rows planted for Q41 (`WHERE ... GROUP BY "URLHash", "EventDate" ...
 /// OFFSET 100`): each row carries a distinct `URLHash` at a fixed
@@ -73,12 +75,13 @@ const Q41_BLOCK_ROWS: usize = 112;
 /// Rows planted for Q42 (`WHERE ... GROUP BY "WindowClientWidth",
 /// "WindowClientHeight" ... OFFSET 10000`): each row carries a distinct
 /// `(WindowClientWidth, WindowClientHeight)` pair, so the block contributes
-/// exactly this many groups, past the 10,010 OFFSET+LIMIT needs.
+/// exactly this many groups: exactly the 10,010 OFFSET+LIMIT needs.
 const Q42_BLOCK_ROWS: usize = 10_010;
 /// Rows planted for Q43 (`WHERE ... GROUP BY DATE_TRUNC('minute',
 /// "EventTime") ... OFFSET 1000`): each row carries a distinct
 /// one-minute-truncated `EventTime` within a single day, so the block
-/// contributes exactly this many groups, past the 1,010 OFFSET+LIMIT needs.
+/// contributes exactly this many groups: exactly the 1,010 OFFSET+LIMIT
+/// needs.
 const Q43_BLOCK_ROWS: usize = 1_010;
 /// Total row count across the fixture's four parts: [`BASE_ROWS`] plus every
 /// targeted block.
@@ -1005,12 +1008,15 @@ mod tests {
         is_download: i16,
         dont_count_hits: i16,
         trafic_source_id: i16,
+        search_engine_id: i16,
+        adv_engine_id: i16,
         url_hash: i64,
         referer_hash: i64,
         window_client_width: i16,
         window_client_height: i16,
         event_time: i64,
         url: Vec<u8>,
+        referer: Vec<u8>,
     }
 
     fn all_rows(batches: &[RecordBatch]) -> Vec<Row> {
@@ -1058,6 +1064,18 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .expect("Int16Array");
+            let search_engine_id = batch
+                .column_by_name("SearchEngineID")
+                .expect("SearchEngineID column")
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("Int16Array");
+            let adv_engine_id = batch
+                .column_by_name("AdvEngineID")
+                .expect("AdvEngineID column")
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("Int16Array");
             let url_hash = batch
                 .column_by_name("URLHash")
                 .expect("URLHash column")
@@ -1094,6 +1112,12 @@ mod tests {
                 .as_any()
                 .downcast_ref::<BinaryArray>()
                 .expect("BinaryArray");
+            let referer = batch
+                .column_by_name("Referer")
+                .expect("Referer column")
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("BinaryArray");
 
             for i in 0..batch.num_rows() {
                 rows.push(Row {
@@ -1104,12 +1128,15 @@ mod tests {
                     is_download: is_download.value(i),
                     dont_count_hits: dont_count_hits.value(i),
                     trafic_source_id: trafic_source_id.value(i),
+                    search_engine_id: search_engine_id.value(i),
+                    adv_engine_id: adv_engine_id.value(i),
                     url_hash: url_hash.value(i),
                     referer_hash: referer_hash.value(i),
                     window_client_width: window_client_width.value(i),
                     window_client_height: window_client_height.value(i),
                     event_time: event_time.value(i),
                     url: url.value(i).to_vec(),
+                    referer: referer.value(i).to_vec(),
                 });
             }
         }
@@ -1118,10 +1145,10 @@ mod tests {
 
     /// Required test, distinguishing: red against the pre-block fixture
     /// (only the ~114-row random chance of matching Q39's predicate, well
-    /// under 1,001 distinct `URL` groups), green once `Q39_BLOCK_ROWS` rows
+    /// under 1,010 distinct `URL` groups), green once `Q39_BLOCK_ROWS` rows
     /// are planted. Q39's `GROUP BY "URL" ... LIMIT 10 OFFSET 1000` returns
-    /// rows only when the WHERE-matching set has more than 1,000 distinct
-    /// `URL` values.
+    /// 10 rows only when the WHERE-matching set has at least 1,010 (OFFSET +
+    /// LIMIT) distinct `URL` values.
     #[test]
     fn q39_block_has_enough_groups_past_offset() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1141,18 +1168,67 @@ mod tests {
             .map(|r| r.url.clone())
             .collect();
         assert!(
-            groups.len() > 1_000,
-            "Q39 needs more than 1,000 distinct URL groups past OFFSET 1000, got {}",
+            groups.len() >= 1_010,
+            "Q39 needs at least 1,010 distinct URL groups (OFFSET 1000 + LIMIT 10), got {}",
+            groups.len()
+        );
+    }
+
+    /// Group key for [`q40_block_has_enough_groups_past_offset`]:
+    /// `(TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst)`.
+    type Q40GroupKey = (i16, i16, i16, Vec<u8>, Vec<u8>);
+
+    /// Required test: Q40's `GROUP BY "TraficSourceID", "SearchEngineID",
+    /// "AdvEngineID", Src, Dst ... LIMIT 10 OFFSET 1000` returns 10 rows only
+    /// when the WHERE-matching set (`CounterID = 62 AND EventDate` in range
+    /// `AND IsRefresh = 0`, no further restriction) has at least 1,010
+    /// (OFFSET + LIMIT) distinct groups. Unlike Q39/Q41/Q42/Q43 this needs no
+    /// planted block: `Src` (`CASE WHEN ("SearchEngineID" = 0 AND
+    /// "AdvEngineID" = 0) THEN "Referer" ELSE ''`) and `Dst` (`"URL"`) already
+    /// vary enough across the random base rows that match the `WHERE` (see
+    /// the module doc comment above).
+    #[test]
+    fn q40_block_has_enough_groups_past_offset() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_hits(dir.path(), 7).expect("write_hits");
+        let combined = read_all(&dir.path().join("hits.parquet"));
+        let rows = all_rows(&combined);
+
+        let groups: HashSet<Q40GroupKey> = rows
+            .iter()
+            .filter(|r| {
+                r.counter_id == 62
+                    && (EVENT_DATE_MIN..=EVENT_DATE_MAX).contains(&r.event_date)
+                    && r.is_refresh == 0
+            })
+            .map(|r| {
+                let src = if r.search_engine_id == 0 && r.adv_engine_id == 0 {
+                    r.referer.clone()
+                } else {
+                    Vec::new()
+                };
+                (
+                    r.trafic_source_id,
+                    r.search_engine_id,
+                    r.adv_engine_id,
+                    src,
+                    r.url.clone(),
+                )
+            })
+            .collect();
+        assert!(
+            groups.len() >= 1_010,
+            "Q40 needs at least 1,010 distinct (TraficSourceID, SearchEngineID, AdvEngineID, Src, Dst) groups (OFFSET 1000 + LIMIT 10), got {}",
             groups.len()
         );
     }
 
     /// Required test, distinguishing: red against the pre-block fixture
     /// (on the order of 10 rows match Q41's predicate by random chance,
-    /// well under 101 distinct groups), green once `Q41_BLOCK_ROWS` rows are
+    /// well under 110 distinct groups), green once `Q41_BLOCK_ROWS` rows are
     /// planted. Q41's `GROUP BY "URLHash", "EventDate" ... LIMIT 10 OFFSET
-    /// 100` returns rows only when the WHERE-matching set has more than 100
-    /// distinct `(URLHash, EventDate)` pairs.
+    /// 100` returns 10 rows only when the WHERE-matching set has at least
+    /// 110 (OFFSET + LIMIT) distinct `(URLHash, EventDate)` pairs.
     #[test]
     fn q41_block_has_enough_groups_past_offset() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1172,19 +1248,19 @@ mod tests {
             .map(|r| (r.url_hash, r.event_date))
             .collect();
         assert!(
-            groups.len() > 100,
-            "Q41 needs more than 100 distinct (URLHash, EventDate) groups past OFFSET 100, got {}",
+            groups.len() >= 110,
+            "Q41 needs at least 110 distinct (URLHash, EventDate) groups (OFFSET 100 + LIMIT 10), got {}",
             groups.len()
         );
     }
 
     /// Required test, distinguishing: red against the pre-block fixture (on
     /// the order of 50 rows match Q42's predicate by random chance, well
-    /// under 10,001 distinct groups), green once `Q42_BLOCK_ROWS` rows are
+    /// under 10,010 distinct groups), green once `Q42_BLOCK_ROWS` rows are
     /// planted. Q42's `GROUP BY "WindowClientWidth", "WindowClientHeight"
-    /// ... LIMIT 10 OFFSET 10000` returns rows only when the WHERE-matching
-    /// set has more than 10,000 distinct `(WindowClientWidth,
-    /// WindowClientHeight)` pairs.
+    /// ... LIMIT 10 OFFSET 10000` returns 10 rows only when the
+    /// WHERE-matching set has at least 10,010 (OFFSET + LIMIT) distinct
+    /// `(WindowClientWidth, WindowClientHeight)` pairs.
     #[test]
     fn q42_block_has_enough_groups_past_offset() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1204,19 +1280,22 @@ mod tests {
             .map(|r| (r.window_client_width, r.window_client_height))
             .collect();
         assert!(
-            groups.len() > 10_000,
-            "Q42 needs more than 10,000 distinct (WindowClientWidth, WindowClientHeight) groups past OFFSET 10000, got {}",
+            groups.len() >= 10_010,
+            "Q42 needs at least 10,010 distinct (WindowClientWidth, WindowClientHeight) groups (OFFSET 10000 + LIMIT 10), got {}",
             groups.len()
         );
     }
 
     /// Required test, distinguishing: red against the pre-block fixture (on
     /// the order of 130 rows match Q43's predicate by random chance, well
-    /// under 1,001 distinct minute buckets), green once `Q43_BLOCK_ROWS`
+    /// under 1,010 distinct minute buckets), green once `Q43_BLOCK_ROWS`
     /// rows are planted. Q43's `GROUP BY DATE_TRUNC('minute', "EventTime")
-    /// ... LIMIT 10 OFFSET 1000` returns rows only when the WHERE-matching
-    /// set has more than 1,000 distinct truncated-to-the-minute
-    /// `EventTime` values.
+    /// ... LIMIT 10 OFFSET 1000` returns 10 rows only when the
+    /// WHERE-matching set has at least 1,010 (OFFSET + LIMIT) distinct
+    /// truncated-to-the-minute `EventTime` values. Q43's own `WHERE` is
+    /// `"EventDate" >= '2013-07-14' AND "EventDate" <= '2013-07-15'`
+    /// (`queries.sql` line 43): `Q43_EVENT_DATE` is the first of those two
+    /// days, so the second is `Q43_EVENT_DATE + 1`, not `- 1`.
     #[test]
     fn q43_block_has_enough_groups_past_offset() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1228,15 +1307,15 @@ mod tests {
             .iter()
             .filter(|r| {
                 r.counter_id == 62
-                    && (r.event_date == Q43_EVENT_DATE || r.event_date == Q43_EVENT_DATE - 1)
+                    && (r.event_date == Q43_EVENT_DATE || r.event_date == Q43_EVENT_DATE + 1)
                     && r.is_refresh == 0
                     && r.dont_count_hits == 0
             })
             .map(|r| r.event_time.div_euclid(60))
             .collect();
         assert!(
-            groups.len() > 1_000,
-            "Q43 needs more than 1,000 distinct minute-truncated EventTime groups past OFFSET 1000, got {}",
+            groups.len() >= 1_010,
+            "Q43 needs at least 1,010 distinct minute-truncated EventTime groups (OFFSET 1000 + LIMIT 10), got {}",
             groups.len()
         );
     }
