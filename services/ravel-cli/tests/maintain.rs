@@ -1493,7 +1493,7 @@ async fn migrate_with_the_reencode_flag_reencodes_the_bucket_and_reports_it_migr
         .expect_err("the superseded record's part keeps the floor down until sweep")
         .to_string();
     assert!(
-        err.contains("the floor is raised by the first migrate run after that sweep"),
+        err.contains("so the floor is raised by the first migrate run after that second pass"),
         "{err}"
     );
 

@@ -1696,7 +1696,9 @@ enum MaintainCommand {
         /// reader and maintainer in the fleet must already run a build that
         /// reads version 2 compaction records; once one is written there is no
         /// rollback past a build that reads them. The format floor rises on
-        /// the first migrate run after sweep has deleted the superseded record.
+        /// the first migrate run after sweep has deleted the superseded record,
+        /// which takes two sweep passes: one that writes its unnamed-since
+        /// marker, and one at least the pinned-query window later.
         /// Off by default: such a bucket is then reported as reencode_blocked.
         #[arg(long)]
         reencode_compaction_parts: bool,

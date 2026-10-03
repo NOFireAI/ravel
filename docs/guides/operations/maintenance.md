@@ -1053,9 +1053,13 @@ rollout decision, not a tuning knob:
   reads them. The record is immutable, and leaving the flag off afterwards only
   stops new ones;
 - the superseded record and its parts stay listed, and keep counting in
-  `l1_compaction_parts`, until `sweep` deletes them. The run that re-encodes a
-  bucket therefore still reports "FOUND STRAGGLERS" for it, and the format
-  floor rises on the first `migrate` run after that sweep.
+  `l1_compaction_parts`, until `sweep` deletes them. That takes two sweep
+  passes: the first pass that finds the superseded record past the protection
+  horizon and unnamed by HEAD only writes its unnamed-since marker, and a pass
+  at least the pinned-query window later (1 h 20 min 30 s at the defaults; see
+  [The pinned-query window](#the-pinned-query-window)) deletes it. The run that
+  re-encodes a bucket therefore still reports "FOUND STRAGGLERS" for it, and the
+  format floor rises on the first `migrate` run after that second pass.
 
 Re-encoding takes the bucket's claim exactly as a migration does, and
 `--no-claim` takes none.

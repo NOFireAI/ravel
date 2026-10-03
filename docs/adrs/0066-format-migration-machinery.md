@@ -659,9 +659,14 @@ writer switch that is off: `ReencodeBlockedReason::MultipleRecords`, alongside
 `ContestedOverlap` and `WriterDisabled`, on
 `FamilyMigrateReport::reencode_blocked`. A bucket counts as migrated only when
 this run published its version 2 record. The predecessor's parts keep counting
-toward the below-target figure until `sweep` reclaims it (item 6), so the floor
-is raised by the first `migrate` run after that sweep, through the existing
-fresh re-audit. The switch is still off by default. The operator turns it on per
+toward the below-target figure until `sweep` reclaims it (item 6), which takes
+two passes under the ADR-1133 unnamed-since marker gate: the first pass that
+finds the predecessor past the protection horizon and unnamed by HEAD only
+writes its marker, and a pass at least the pinned-query window later
+(`max_query_duration + head_cache_ttl + 4 * clock_skew_allowance`, 1 h 20 min
+30 s at the defaults) deletes it with its parts. The floor is raised by the
+first `migrate` run after that second pass, through the existing fresh
+re-audit. The switch is still off by default. The operator turns it on per
 run with `ravel-cli maintain migrate --reencode-compaction-parts`, whose help
 states item 8's rollout rule, and the command prints one `reencode_blocked`
 line per bucket with its reason and one `not_migrated` line per bucket whose

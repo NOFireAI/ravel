@@ -32,8 +32,8 @@ use ravel_maintain::migrate::{
 use ravel_maintain::{
     ClaimParticipant, ClaimSkipReason, Clock, CompactionOutcome, CompactorConfig, Coordination,
     ErasureRewriteOutcome, FamilyMigrateReport, FixedClock, MaintainMemo, MigrateBudget, NoLeases,
-    PendingErasureRequest, PublishOutcome, Verification, compact_bucket, erasure_rewrite_bucket,
-    migrate_family, read, sweep_superseded,
+    PendingErasureRequest, PinnedQueryWindow, PublishOutcome, SupersededSweepOutcome, Verification,
+    compact_bucket, erasure_rewrite_bucket, migrate_family, read, sweep_superseded,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault,
@@ -52,6 +52,9 @@ const SHARDS: u32 = SHARD + 1;
 
 /// The key fragment of every L1 and rewrite part object.
 const PART_KEYS: &str = "/l1/";
+
+/// The key fragment of every unnamed-since marker (ADR-1133).
+const MARKER_KEYS: &str = "/maint/unn/";
 
 /// A lease no run here outlives.
 const LEASE: Duration = Duration::from_secs(3);
@@ -260,6 +263,28 @@ async fn migrate(
     .expect("migrate")
 }
 
+/// The pinned-query window of the default config: how long after a sweep
+/// writes an unnamed-since marker the objects it gates may be deleted.
+fn pinned_window_ns() -> i64 {
+    let w = PinnedQueryWindow::from_config(&CompactorConfig::default());
+    w.max_query_duration_ns + w.head_cache_ttl_ns + 4 * w.clock_skew_allowance_ns
+}
+
+/// One rule 2 sweep pass over the bucket's shard at `now_ns`.
+async fn sweep_at(store: &dyn ObjectStoreBackend, now_ns: i64) -> SupersededSweepOutcome {
+    sweep_superseded(
+        store,
+        &FixedClock::new(now_ns),
+        &CompactorConfig::default(),
+        &NoLeases,
+        &tenant_hash(),
+        Signal::Metrics,
+        SHARD,
+    )
+    .await
+    .expect("sweep")
+}
+
 async fn floor(store: &dyn ObjectStoreBackend) -> Option<u32> {
     ravel_catalog::current_floor_from_store(store, &tenant_hash(), Signal::Metrics, FAMILY)
         .await
@@ -295,8 +320,10 @@ fn not_migrated(path: MigrationPath, reason: NotMigratedReason) -> Vec<NotMigrat
 /// With the switch on, a bucket held below the target only by its one
 /// compaction record's parts is re-encoded and counted as migrated. The
 /// predecessor stays listed, so this run's re-audit still counts its one part
-/// and leaves the floor unraised; once `sweep` reclaims the predecessor, the
-/// next run's fresh re-audit raises the floor.
+/// and leaves the floor unraised. The sweep's first pass only writes the
+/// unnamed-since markers (ADR-1133); a pass once the pinned-query window has
+/// elapsed since then reclaims the predecessor, and the next run's fresh
+/// re-audit raises the floor.
 ///
 /// Removing the `reencode_compaction_parts(store, clock, config, &bucket)` call
 /// from the walk's `Force2::Reencode` arm (recording nothing instead) leaves
@@ -340,21 +367,64 @@ async fn the_switch_on_reencodes_and_a_later_reaudit_raises_the_floor() {
         "every part of the version 2 record is at the target"
     );
 
-    let past_horizon = sealed_now_ns() + CompactorConfig::default().protection_horizon_ns + 1;
-    sweep_superseded(
-        &store,
-        &FixedClock::new(past_horizon),
-        &CompactorConfig::default(),
-        &NoLeases,
-        &tenant_hash(),
-        Signal::Metrics,
-        SHARD,
-    )
-    .await
-    .expect("sweep");
+    // The first pass finds the predecessor's chain unnamed and only writes its
+    // unnamed-since markers; the predecessor goes once they have aged.
+    let first_pass_ns = sealed_now_ns() + CompactorConfig::default().protection_horizon_ns + 1;
+    let aged_ns = first_pass_ns + pinned_window_ns();
+    let before = all_keys(&store).await;
+
+    let marking = sweep_at(&store, first_pass_ns).await;
+    assert_eq!(marking.records_deleted, 0);
+    assert_eq!(marking.data_deleted, 0);
+    assert_eq!(
+        marking.held_by_pinned_window, 6,
+        "two L0 records and their data, the predecessor and its part"
+    );
+    assert_eq!(marking.unnamed_markers.written, 2);
+    let markers: Vec<String> = all_keys(&store)
+        .await
+        .into_iter()
+        .filter(|k| !before.contains(k))
+        .collect();
+    assert_eq!(markers.len(), 2, "only the two markers were added");
+    assert!(
+        markers.iter().all(|k| k.contains(MARKER_KEYS)),
+        "{markers:?}"
+    );
+    let marked = all_keys(&store).await;
+
+    let early = sweep_at(&store, aged_ns - 1).await;
+    assert_eq!(early.records_deleted, 0, "the window has not elapsed");
+    assert_eq!(early.data_deleted, 0);
+    assert_eq!(early.held_by_pinned_window, 6);
+    assert_eq!(early.unnamed_markers.written, 0);
+    assert_eq!(all_keys(&store).await, marked);
+
+    let reclaiming = sweep_at(&store, aged_ns).await;
+    assert_eq!(
+        reclaiming.records_deleted, 3,
+        "the two L0 records and the predecessor"
+    );
+    assert_eq!(
+        reclaiming.data_deleted, 3,
+        "the two L0 objects and the predecessor's part"
+    );
+    assert_eq!(reclaiming.held_by_pinned_window, 0);
+    assert_eq!(reclaiming.unnamed_markers.retired, 2);
     let records = compaction_records(&store).await;
     assert_eq!(records.len(), 1, "the sweep reclaimed the predecessor");
     assert_eq!(records[0].0, *v2_key);
+    let left = all_keys(&store).await;
+    assert_eq!(
+        left.iter().filter(|k| k.contains(PART_KEYS)).count(),
+        1,
+        "only the version 2 record's part: {left:?}"
+    );
+    assert_eq!(
+        left.iter().filter(|k| k.contains(MARKER_KEYS)).count(),
+        0,
+        "{left:?}"
+    );
 
     let second = migrate(&store, &reencode_cfg(), target()).await;
 

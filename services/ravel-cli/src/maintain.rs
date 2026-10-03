@@ -2497,8 +2497,10 @@ pub async fn migrate_to(
                  migrated by this job at all. A below-target compaction part is re-encoded only \
                  by a run with --reencode-compaction-parts, and only in a bucket whose one \
                  compaction record survives supersession; the record it supersedes keeps \
-                 counting in l1_compaction_parts until `sweep` deletes it, so the floor is raised \
-                 by the first migrate run after that sweep. The {} blocked_bucket line(s) above \
+                 counting in l1_compaction_parts until `sweep` deletes it, which takes two sweep \
+                 passes (the first writes its unnamed-since marker, and one at least the \
+                 pinned-query window later deletes it), so the floor is raised by the first \
+                 migrate run after that second pass. The {} blocked_bucket line(s) above \
                  name every bucket THIS INVOCATION EXAMINED that no re-run clears, with its \
                  reason -- a walk that resumed from a cursor does not re-report the loser-only \
                  buckets an earlier invocation found, and a below-target compaction part gets a \
