@@ -5234,13 +5234,19 @@ impl BlockRangeFetcher {
         Ok((skip, stats))
     }
 
-    /// Bring the named TAIL sections into `resident`. Sections the probe already
+    /// Bring the named sections into `resident`. Sections the probe already
     /// covered cost nothing; the rest are fetched as coalesced runs, so a probe
     /// too short for two adjacent sections (SKIP_IDX and PAGE_DIR always are --
     /// the writer emits PAGE_DIR immediately after SKIP_IDX) costs one extra GET
     /// rather than two (issue #766). Every named section the probe WINDOW did
-    /// not cover is counted in [`BlockRangeStats::probe_misses`], whether or not
-    /// a GET was needed for it.
+    /// not cover is counted in `stats`' [`BlockRangeStats::probe_misses`],
+    /// whether or not a GET was needed for it.
+    ///
+    /// The miss count is meaningful for TAIL sections, the ones a probe can
+    /// cover. [`fetch_plan_directories`](Self::fetch_plan_directories) also
+    /// brings the two front sections (STREAM_DIR and FIELD_DIR) through here,
+    /// passing a scratch `stats` whose misses it discards, since a front
+    /// section is never inside the probe window.
     ///
     /// A kind the footer does not carry is skipped, which is how a version-3
     /// object passes PAGE_DIR here harmlessly.
