@@ -95,9 +95,9 @@ ravel-parquet = { workspace = true }
 # upgrade adds a new one (ADR-0097).
 datafusion = { version = "54", default-features = false, features = ["sql"] }
 
-# Free-space measurement and the spill root's owner lock; see the workspace
-# root's entry for why this is a dependency.
-fs4 = { workspace = true }
+# Free-space measurement (`rustix::fs::statvfs`); see the workspace root's
+# entry. The spill root's owner lock is std's `File::try_lock`, no dependency.
+rustix = { workspace = true }
 
 # `url::Url` appears in the `ObjectStoreRegistry` trait signature, which
 # ravel-sql implements to install a registry that holds no stores at all in

@@ -144,12 +144,17 @@ pub fn cache_spill_dir(cache_dir: &Path, instance_id: &str) -> PathBuf {
     cache_dir.join(SQL_SPILL_SUBDIR).join(instance_id)
 }
 
-/// Bytes available to a non-privileged process on the volume backing `path`
-/// (POSIX `statvfs.f_bavail`, not the raw `f_bfree` total). The workspace
-/// forbids `unsafe_code`, so this is a thin wrapper over the `fs4` crate's
-/// safe cross-platform implementation rather than a direct `statvfs(2)` call.
+/// Bytes available to a non-privileged process on the volume backing `path`:
+/// [`available_bytes`] of its `statvfs(2)`.
 pub fn measure_free_bytes(path: &Path) -> std::io::Result<u64> {
-    fs4::available_space(path)
+    Ok(available_bytes(&rustix::fs::statvfs(path)?))
+}
+
+/// `f_bavail * f_frsize`: the blocks a non-privileged process may still
+/// allocate, in bytes. Not `f_bfree`, which also counts the blocks reserved
+/// for root, and not `f_blocks`, the volume's size.
+fn available_bytes(stat: &rustix::fs::StatVfs) -> u64 {
+    stat.f_bavail.saturating_mul(stat.f_frsize)
 }
 
 /// The multiple of the process memory budget that caps a `--cache-dir`-derived
@@ -780,21 +785,12 @@ mod tests {
         assert_eq!(config.spill, None);
     }
 
-    /// `measure_free_bytes` wraps `fs4::available_space`, not
-    /// `fs4::statvfs(..).total_space()`: a wrong implementation that read the
-    /// total instead of the available figure would, on almost any real
-    /// filesystem with anything written to it, report more free space than
-    /// the volume actually has available, i.e. a value exceeding
-    /// `fs4::statvfs`'s own `total_space()` for the same path -- which this
-    /// invariant catches whether or not the wrong number happens to be
-    /// nonzero.
+    /// `measure_free_bytes` never reports more than the volume's size.
     #[test]
     fn measure_free_bytes_is_available_not_total() {
         let available = measure_free_bytes(Path::new(".")).expect("the current directory exists");
-        let total = fs4::statvfs(".")
-            .expect("the current directory exists")
-            .total_space();
-        assert!(available <= total);
+        let stat = rustix::fs::statvfs(".").expect("the current directory exists");
+        assert!(available <= stat.f_blocks.saturating_mul(stat.f_frsize));
     }
 
     /// `with_spill_resolved` with `sql_spill_off` false and an already-set

@@ -2823,7 +2823,7 @@ mod tests {
     /// `ravel_sql::measure_free_bytes` reports for `<cache-dir>/sql-spill`,
     /// within 256 MiB of drift between the two readings.
     ///
-    /// Prove-the-test: measure with `fs4::statvfs(path)?.total_space()` in
+    /// Prove-the-test: measure with `f_blocks * f_frsize` from `rustix::fs::statvfs` in
     /// `prepare_sql_spill` and the ceiling is half the volume's size, off by
     /// half its used bytes.
     #[test]
