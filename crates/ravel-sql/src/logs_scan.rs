@@ -2801,6 +2801,7 @@ impl ExecutionPlan for LogsScanExec {
             consecutive_fallbacks: 0,
             pending_range: None,
             current_indices: Vec::new(),
+            current_survivors: None,
             current_footer: None,
             current_whole_object: None,
             current_dirs: None,
@@ -2833,7 +2834,7 @@ struct SegPlan {
     /// Whole-object block indices surviving this query's pruning, ascending
     /// (ADR-2414 decision A1): the set [`owned_work`] deals, whole row group
     /// by whole row group, into each partition's share.
-    indices: Vec<usize>,
+    indices: Arc<Vec<usize>>,
     /// This segment's directories, decoded once by the plan phase
     /// ([`LogSegmentFetcher::plan_segment`]) and carried to every
     /// per-partition subset open through [`OwnedSeg`] so the open reuses them
@@ -3010,7 +3011,7 @@ async fn compute_plan_counts(
                 _ => None,
             };
             segs[idx] = Some(SegPlan {
-                indices,
+                indices: Arc::new(indices),
                 dirs,
                 stats,
                 footer,
@@ -3043,6 +3044,14 @@ struct OwnedSeg {
     /// segment field of every row-ref built from it (ADR-0774).
     ordinal: usize,
     indices: Vec<usize>,
+    /// The segment's whole surviving-block list this query's plan produced
+    /// (ascending whole-object block indices), of which `indices` is this
+    /// partition's share. A row-ref addresses a block by its position in this
+    /// list ([`RowRefRange`]), not by its whole-object index, so the scan
+    /// resolves each block's row-ref through it. `None` on the whole-segment
+    /// fast path, where `indices` is empty and the cursor position already is
+    /// the surviving-block position.
+    survivors: Option<Arc<Vec<usize>>>,
     /// The plan-phase footer for this segment (#693 part 3, deliverable 2),
     /// carried to the subset open so it skips its own suffix probe. `None` on the
     /// whole-segment fast path (no plan phase) and when the plan slow branch ran.
@@ -3136,6 +3145,7 @@ fn owned_work(
                     seg: segments[seg_idx].clone(),
                     ordinal: seg_idx,
                     indices,
+                    survivors: Some(Arc::clone(&plan.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
                     dirs: Some(Arc::clone(&plan.dirs)),
@@ -3153,7 +3163,8 @@ fn owned_work(
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
                     ordinal: seg_idx,
-                    indices: plan.indices.clone(),
+                    indices: plan.indices.to_vec(),
+                    survivors: Some(Arc::clone(&plan.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
                     dirs: Some(Arc::clone(&plan.dirs)),
@@ -3194,6 +3205,7 @@ fn owned_whole_segments(
                 seg: seg.clone(),
                 ordinal: seg_idx,
                 indices: Vec::new(),
+                survivors: None,
                 footer: None,
                 whole_object: None,
                 dirs: None,
@@ -3561,17 +3573,32 @@ struct RowRefRange {
 ///
 /// A free function rather than a method because the columnar drain calls it
 /// while the block cursor holds a mutable borrow of the stream's state field.
-fn block_index(row_refs: bool, indices: &[usize], cursor: usize) -> DFResult<Option<usize>> {
+fn block_index(
+    row_refs: bool,
+    indices: &[usize],
+    survivors: Option<&[usize]>,
+    cursor: usize,
+) -> DFResult<Option<usize>> {
     if !row_refs {
         return Ok(None);
     }
     if indices.is_empty() {
         return Ok(Some(cursor));
     }
-    indices.get(cursor).copied().map(Some).ok_or_else(|| {
+    let owned = indices.get(cursor).copied().ok_or_else(|| {
         DataFusionError::Internal(format!(
             "row-ref cursor at block {cursor} past this partition's {} owned blocks",
             indices.len()
+        ))
+    })?;
+    // `indices` hold whole-object block indices; the row-ref carries the
+    // block's position in the segment's surviving-block list.
+    let Some(survivors) = survivors else {
+        return Ok(Some(owned));
+    };
+    survivors.binary_search(&owned).map(Some).map_err(|_| {
+        DataFusionError::Internal(format!(
+            "owned block {owned} is not among the segment's surviving blocks"
         ))
     })
 }
@@ -3697,6 +3724,9 @@ struct LogScanStream {
     /// current_seg`], kept so the `attrs_raw` fallback re-opens the row path
     /// over the SAME list (ADR-0102). Set alongside `current_seg`.
     current_indices: Vec<usize>,
+    /// The segment's whole surviving-block list, for resolving a row-ref's
+    /// block position ([`OwnedSeg::survivors`]).
+    current_survivors: Option<Arc<Vec<usize>>>,
     /// The plan-phase footer for [`Self::current_seg`] (#693 part 3, deliverable
     /// 2), kept so the `attrs_raw` fallback re-opens the subset with the same
     /// footer it first used. `None` on the whole-segment fast path.
@@ -3786,7 +3816,12 @@ impl LogScanStream {
     /// whole-segment fast path leaves the list empty and drains every survivor
     /// in order, so there the cursor position *is* the surviving-block index.
     fn current_block(&self) -> DFResult<Option<usize>> {
-        block_index(self.row_refs, &self.current_indices, self.block_cursor)
+        block_index(
+            self.row_refs,
+            &self.current_indices,
+            self.current_survivors.as_deref().map(Vec::as_slice),
+            self.block_cursor,
+        )
     }
 
     /// The row-ref address for the block the cursor is about to yield, and
@@ -4038,6 +4073,7 @@ impl LogScanStream {
                         seg,
                         ordinal,
                         indices,
+                        survivors,
                         footer,
                         whole_object,
                         dirs,
@@ -4045,6 +4081,7 @@ impl LogScanStream {
                         this.current_seg = Some(seg.clone());
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = indices.clone();
+                        this.current_survivors = survivors;
                         this.current_footer = footer.clone();
                         this.current_dirs = dirs.clone();
                         // Moved, not cloned: this stream consumes the carried
@@ -4193,6 +4230,7 @@ impl LogScanStream {
                                 let built = block_index(
                                     this.row_refs,
                                     &this.current_indices,
+                                    this.current_survivors.as_deref().map(Vec::as_slice),
                                     this.block_cursor,
                                 )
                                 .and_then(|block| {
