@@ -47,6 +47,24 @@
 //! cancelled acquire -- a `select!` timeout, a client disconnect, shutdown --
 //! releases it on the way out instead of pinning the decision forever.
 //!
+//! # Ops that fan out
+//!
+//! One permit stands for one store request in flight. [`S3Store::put`] above
+//! [`MULTIPART_THRESHOLD`](crate::s3::MULTIPART_THRESHOLD) is one op but
+//! several requests, because its parts go out concurrently. The handle's `put`
+//! therefore takes its first permit as usual, then up to the store's fan-out
+//! for that payload ([`crate::s3::put_fan_out`]) in extra permits, taking only
+//! the ones admission would grant right now and never waiting for one. A put
+//! that waited for its extras while holding its first permit could deadlock
+//! against another large put doing the same, and no put holds more permits
+//! than its class has. The number held is installed as a task-local request
+//! budget (`request_budget`) around the inner call, and the store keeps at
+//! most that many requests in flight. A task-local reaches the store through
+//! every wrapper in between (instrumentation, KMS routing) without each of
+//! them forwarding a new method.
+//!
+//! [`S3Store::put`]: crate::s3::S3Store
+//!
 //! # Off by default (ADR-0070 decision 2)
 //!
 //! [`ClassedStore::passthrough`] is the default construction: both handles are
@@ -75,6 +93,19 @@ use crate::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError, UploadChecksum,
 };
+
+tokio::task_local! {
+    /// How many store requests the op running in this scope may have in
+    /// flight at once: the permits its [`ScheduledHandle`] holds.
+    static REQUEST_BUDGET: usize;
+}
+
+/// The number of store requests the current op may have in flight at once,
+/// when a scheduled handle admitted it; `None` when no scheduler is in the
+/// call path, so the store applies its own bound.
+pub(crate) fn request_budget() -> Option<usize> {
+    REQUEST_BUDGET.try_with(|budget| *budget).ok()
+}
 
 /// The class a store handle belongs to. Attached to the handle at construction,
 /// never threaded through a call.
@@ -260,6 +291,46 @@ impl RequestScheduler {
             RequestClass::Foreground => self.acquire_foreground().await,
             RequestClass::Background => self.acquire_background().await,
         }
+    }
+
+    /// Acquire one permit of `class` as [`Self::acquire`] does, then up to
+    /// `want - 1` more that admission grants without waiting. Never returns
+    /// fewer than one permit, nor more than `want` (when `want >= 1`).
+    async fn acquire_up_to(&self, class: RequestClass, want: usize) -> Vec<Permit> {
+        let mut permits = vec![self.acquire(class).await];
+        while permits.len() < want {
+            match self.try_acquire_now(class) {
+                Some(permit) => permits.push(permit),
+                None => break,
+            }
+        }
+        permits
+    }
+
+    /// One more permit of `class` if admission would grant it immediately:
+    /// no foreground acquire is waiting (so a release meant for it is not taken
+    /// first), and both semaphores the class draws from have a free permit,
+    /// which tokio never reports while an acquirer is queued on it. A
+    /// background permit holds a `bg_committed` slot like any other, so the
+    /// floor counts it.
+    fn try_acquire_now(&self, class: RequestClass) -> Option<Permit> {
+        if self.fg_waiters.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
+        let (bg, bg_committed) = match class {
+            RequestClass::Foreground => (None, None),
+            RequestClass::Background => (
+                Some(Arc::clone(&self.bg_sem).try_acquire_owned().ok()?),
+                Some(CountGuard::acquire(&self.bg_committed)),
+            ),
+        };
+        let global = Arc::clone(&self.global).try_acquire_owned().ok()?;
+        Some(Permit {
+            global: Some(global),
+            bg,
+            bg_committed,
+            wake: Arc::clone(&self.wake),
+        })
     }
 
     /// Foreground admission. Registers as a waiter (so background yields to it),
@@ -522,6 +593,9 @@ impl ScheduledHandle {
 
 #[async_trait::async_trait]
 impl ObjectStoreBackend for ScheduledHandle {
+    /// Takes one permit, plus free ones up to the store's fan-out for this
+    /// payload, and runs the inner put under a request budget of the number
+    /// held. See "Ops that fan out" in the [module docs](self).
     async fn put(
         &self,
         key: &str,
@@ -531,9 +605,12 @@ impl ObjectStoreBackend for ScheduledHandle {
         // Payload length is read before the move, and counted whether or not
         // the backend accepts the write (mirrors `InstrumentedStore`).
         let bytes = data.len() as u64;
-        let _permit = self.scheduler.acquire(self.class).await;
+        let want = crate::s3::put_fan_out(data.len(), &opts.mode);
+        let permits = self.scheduler.acquire_up_to(self.class, want).await;
         let start = self.clock.now_nanos();
-        let result = self.inner.put(key, data, opts).await;
+        let result = REQUEST_BUDGET
+            .scope(permits.len(), self.inner.put(key, data, opts))
+            .await;
         self.record(StoreOp::Put, start, bytes, &result);
         result
     }
@@ -789,6 +866,8 @@ mod tests {
         gets: AtomicU64,
         puts: AtomicU64,
         deletes: AtomicU64,
+        /// The request budget each `put` ran under, in call order.
+        put_budgets: parking_lot::Mutex<Vec<Option<usize>>>,
     }
 
     #[async_trait::async_trait]
@@ -800,6 +879,7 @@ mod tests {
             _opts: PutOptions,
         ) -> Result<PutOutcome, StoreError> {
             self.puts.fetch_add(1, Ordering::SeqCst);
+            self.put_budgets.lock().push(request_budget());
             Ok(PutOutcome {
                 etag: crate::Etag("fake".into()),
                 version: crate::Version("fake".into()),
@@ -1459,6 +1539,122 @@ mod tests {
             bg_held <= 1,
             "at most one background request may hold a permit ahead of \
              foreground: {held:?}"
+        );
+    }
+
+    /// A `put` runs under a request budget equal to the permits its handle
+    /// holds (issue #2327): the store's fan-out for a large overwrite when the
+    /// class has that many free, fewer when it has fewer, and one for a
+    /// payload or mode the store sends as a single request. Every permit comes
+    /// back afterwards, background floor slots included, and passthrough sets
+    /// no budget.
+    #[tokio::test]
+    async fn a_put_runs_under_a_budget_of_the_permits_it_holds() {
+        let large = Bytes::from(vec![0u8; 4 * crate::s3::MULTIPART_PART_SIZE + 1]);
+        assert_eq!(
+            crate::s3::put_fan_out(large.len(), &crate::PutMode::Overwrite),
+            4
+        );
+        let small = Bytes::from_static(b"small");
+        let create = PutOptions {
+            mode: crate::PutMode::CreateIfAbsent,
+            checksum: None,
+        };
+
+        let counting = Arc::new(CountingStore::default());
+        let cs = ClassedStore::scheduled(
+            Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>,
+            SchedulerConfig::new(8, 2, 1),
+        );
+        let fg = cs.foreground();
+        let bg = cs.background();
+        fg.put("a", large.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        bg.put("b", large.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        fg.put("c", small, PutOptions::default())
+            .await
+            .expect("put");
+        fg.put("d", large.clone(), create).await.expect("put");
+        {
+            // Six of the eight global permits held elsewhere: two are free.
+            let held = scheduler(&cs)
+                .acquire_up_to(RequestClass::Foreground, 6)
+                .await;
+            assert_eq!(held.len(), 6);
+            fg.put("e", large.clone(), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        assert_eq!(
+            *counting.put_budgets.lock(),
+            vec![Some(4), Some(2), Some(1), Some(1), Some(2)]
+        );
+        let sched = scheduler(&cs);
+        assert_eq!(sched.global.available_permits(), 8);
+        assert_eq!(sched.bg_sem.available_permits(), 2);
+        assert_eq!(sched.bg_committed.load(Ordering::SeqCst), 0);
+
+        // A class whose whole capacity is one permit.
+        let counting = Arc::new(CountingStore::default());
+        let cs = ClassedStore::scheduled(
+            Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>,
+            SchedulerConfig::new(1, 1, 1),
+        );
+        cs.foreground()
+            .put("f", large.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        cs.background()
+            .put("g", large.clone(), PutOptions::default())
+            .await
+            .expect("put");
+        assert_eq!(*counting.put_budgets.lock(), vec![Some(1), Some(1)]);
+
+        let counting = Arc::new(CountingStore::default());
+        let cs = ClassedStore::passthrough(Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>);
+        cs.foreground()
+            .put("h", large, PutOptions::default())
+            .await
+            .expect("put");
+        assert_eq!(*counting.put_budgets.lock(), vec![None]);
+    }
+
+    /// The extra permits a large put takes are only ones nobody is waiting
+    /// for: with a foreground acquire parked, a permit released for it is not
+    /// taken as an extra, by either class.
+    #[tokio::test]
+    async fn extra_permits_skip_a_waiting_foreground_acquire() {
+        let sched = Arc::new(RequestScheduler::new(SchedulerConfig::new(2, 2, 1)));
+        let mut held = sched.acquire_up_to(RequestClass::Foreground, 2).await;
+        assert_eq!(held.len(), 2);
+
+        let waiter_sched = Arc::clone(&sched);
+        let waiter =
+            tokio::spawn(async move { waiter_sched.acquire(RequestClass::Foreground).await });
+        assert!(
+            spin_until(|| sched.fg_waiters.load(Ordering::SeqCst) == 1).await,
+            "the foreground acquire parks as a waiter"
+        );
+
+        // A permit is free, but the parked waiter is owed it.
+        drop(held.pop());
+        assert_eq!(sched.global.available_permits(), 1);
+        assert!(sched.try_acquire_now(RequestClass::Foreground).is_none());
+        assert!(sched.try_acquire_now(RequestClass::Background).is_none());
+        assert_eq!(sched.bg_committed.load(Ordering::SeqCst), 0);
+        assert_eq!(sched.bg_sem.available_permits(), 2);
+
+        let permit = waiter.await.expect("the waiter task completes");
+        assert_eq!(sched.global.available_permits(), 0);
+        drop(permit);
+        drop(held);
+        assert_eq!(
+            sched.acquire_up_to(RequestClass::Background, 4).await.len(),
+            2,
+            "with nobody waiting, extras run up to the free capacity"
         );
     }
 }
