@@ -14,7 +14,8 @@
 //! footprint is cardinality-dependent once labels materialize as columns, so a
 //! sample cap cannot stand in for a byte cap.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use datafusion::execution::memory_pool::MemoryPool;
@@ -128,6 +129,71 @@ pub const ENV_SPILL_DIR: &str = "RAVEL_SQL_SPILL_DIR";
 /// decimal integer. See [`ENV_SPILL_DIR`].
 pub const ENV_SPILL_MAX_BYTES: &str = "RAVEL_SQL_SPILL_MAX_BYTES";
 
+/// Subdirectory of `--cache-dir` every process's spill root lives under
+/// (ADR-0954 amendment, issue #2416): `<cache-dir>/sql-spill/<instance-id>`.
+/// Shared with `crate::spill`'s ownership lock and startup sweep, which must
+/// agree with [`cache_spill_dir`] on exactly this path for a given
+/// `(cache_dir, instance_id)`.
+pub const SQL_SPILL_SUBDIR: &str = "sql-spill";
+
+/// The per-process spill root under a configured `--cache-dir`:
+/// `<cache_dir>/sql-spill/<instance_id>`. `instance_id` is whatever identity
+/// the process already carries (ADR-0954 amendment, issue #2416); this
+/// function does not mint one.
+pub fn cache_spill_dir(cache_dir: &Path, instance_id: &str) -> PathBuf {
+    cache_dir.join(SQL_SPILL_SUBDIR).join(instance_id)
+}
+
+/// Bytes available to a non-privileged process on the volume backing `path`
+/// (POSIX `statvfs.f_bavail`, not the raw `f_bfree` total). The workspace
+/// forbids `unsafe_code`, so this is a thin wrapper over the `fs4` crate's
+/// safe cross-platform implementation rather than a direct `statvfs(2)` call.
+pub fn measure_free_bytes(path: &Path) -> std::io::Result<u64> {
+    fs4::available_space(path)
+}
+
+/// The multiple of the process memory budget that caps a `--cache-dir`-derived
+/// spill ceiling (ADR-0954 amendment, issue #2416): see
+/// [`derive_spill_max_bytes`].
+pub const DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE: u64 = 4;
+
+/// The floor under a `--cache-dir`-derived spill ceiling (ADR-0954 amendment,
+/// issue #2416): see [`derive_spill_max_bytes`].
+pub const DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Derive a `--cache-dir` spill ceiling from the volume's free bytes at
+/// startup and the process memory budget (ADR-0954 amendment, issue #2416):
+/// half the free space, capped at
+/// [`DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE`] times the memory budget, and
+/// floored at [`DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES`]. Half, not all, of free
+/// space so spill never claims the whole volume out from under whatever else
+/// shares it (another process, the OS itself); the memory-budget cap keeps
+/// the derived ceiling from outgrowing what a single query's spill could
+/// plausibly need; the floor keeps a nearly-full volume from deriving a
+/// ceiling so small every spill attempt immediately exhausts its budget.
+pub fn derive_spill_max_bytes(free_bytes: u64, memory_budget_bytes: u64) -> u64 {
+    let half_free = free_bytes / 2;
+    let memory_cap = memory_budget_bytes.saturating_mul(DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE);
+    half_free
+        .min(memory_cap)
+        .max(DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES)
+}
+
+/// The inputs a `--cache-dir`-configured deployment resolves a
+/// [`SpillConfig`] from, when neither half of the env pair names a
+/// directory (ADR-0954 amendment, issue #2416). See [`SpillConfig::resolve`].
+pub struct CacheDirSpill<'a> {
+    /// The configured `--cache-dir`.
+    pub cache_dir: &'a Path,
+    /// This process's own instance identity (not minted here).
+    pub instance_id: &'a str,
+    /// Free bytes on the volume backing `cache_dir`, measured once at
+    /// startup ([`measure_free_bytes`]).
+    pub free_bytes: u64,
+    /// The process memory budget ([`derive_spill_max_bytes`]'s cap input).
+    pub memory_budget_bytes: u64,
+}
+
 /// Both halves of the spill configuration. Spill is enabled for a query only
 /// when this whole struct is present AND the query's plan is exactness-eligible
 /// (`crate::executor`'s spill eligibility predicate); either half missing means
@@ -182,24 +248,74 @@ impl SpillConfig {
     pub fn from_env() -> Result<Option<SpillConfig>, SpillConfigError> {
         let dir = std::env::var_os(ENV_SPILL_DIR);
         let quota = std::env::var_os(ENV_SPILL_MAX_BYTES);
-        let (dir, quota) = match (dir, quota) {
-            (None, None) => return Ok(None),
-            (Some(dir), Some(quota)) => (dir, quota),
-            _ => return Err(SpillConfigError::Incomplete),
-        };
-        if dir.is_empty() {
-            return Err(SpillConfigError::EmptyDir);
+        Self::resolve(dir.as_deref(), quota.as_deref(), None)
+    }
+
+    /// The full three-source precedence (ADR-0954 amendment, issue #2416):
+    ///
+    /// 1. `env_dir` and `env_quota` both set: used directly, unchanged from
+    ///    [`SpillConfig::from_env`]'s original (pre-`--cache-dir`) behavior.
+    ///    Wins outright over `cache_dir`.
+    /// 2. Neither of the above, but `cache_dir` is `Some`: the spill root is
+    ///    derived from it (`crate::config::cache_spill_dir`), and the
+    ///    ceiling is `env_quota` when it alone is set (the env quota overrides
+    ///    the derived ceiling under a `--cache-dir` deployment), else
+    ///    [`derive_spill_max_bytes`] of `cache_dir`'s free bytes and memory
+    ///    budget.
+    /// 3. Neither 1 nor 2: `Ok(None)`, the no-spill default.
+    ///
+    /// `env_dir` set with `env_quota` unset is always
+    /// [`SpillConfigError::Incomplete`], with or without `cache_dir`: there is
+    /// no symmetric "derive a quota" fallback for a bare directory, only for a
+    /// bare quota under a configured `--cache-dir`.
+    pub fn resolve(
+        env_dir: Option<&OsStr>,
+        env_quota: Option<&OsStr>,
+        cache_dir: Option<CacheDirSpill<'_>>,
+    ) -> Result<Option<SpillConfig>, SpillConfigError> {
+        match (env_dir, env_quota) {
+            (Some(dir), Some(quota)) => return Ok(Some(Self::parse_pair(dir, quota)?)),
+            (Some(_), None) => return Err(SpillConfigError::Incomplete),
+            (None, Some(quota)) => {
+                let Some(cache_dir) = cache_dir else {
+                    return Err(SpillConfigError::Incomplete);
+                };
+                let max_bytes = Self::parse_quota(quota)?;
+                return Ok(Some(SpillConfig {
+                    dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
+                    max_bytes,
+                }));
+            }
+            (None, None) => {}
         }
+        let Some(cache_dir) = cache_dir else {
+            return Ok(None);
+        };
+        let max_bytes = derive_spill_max_bytes(cache_dir.free_bytes, cache_dir.memory_budget_bytes);
+        Ok(Some(SpillConfig {
+            dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
+            max_bytes,
+        }))
+    }
+
+    fn parse_quota(quota: &OsStr) -> Result<u64, SpillConfigError> {
         let quota = quota.to_string_lossy().trim().to_string();
-        let max_bytes: u64 = quota
+        quota
             .parse()
             .ok()
             .filter(|bytes| *bytes > 0)
-            .ok_or(SpillConfigError::BadQuota { value: quota })?;
-        Ok(Some(SpillConfig {
+            .ok_or(SpillConfigError::BadQuota { value: quota })
+    }
+
+    fn parse_pair(dir: &OsStr, quota: &OsStr) -> Result<SpillConfig, SpillConfigError> {
+        if dir.is_empty() {
+            return Err(SpillConfigError::EmptyDir);
+        }
+        let max_bytes = Self::parse_quota(quota)?;
+        Ok(SpillConfig {
             dir: PathBuf::from(dir),
             max_bytes,
-        }))
+        })
     }
 }
 
@@ -365,6 +481,33 @@ impl SqlConfig {
         Ok(self)
     }
 
+    /// Fill [`SqlConfig::spill`] from the full `--cache-dir`-aware precedence
+    /// (ADR-0954 amendment, issue #2416) when it is still `None`:
+    /// [`SpillConfig::resolve`] over the current environment and
+    /// `cache_dir`. `sql_spill_off` is `--sql-spill off` (ADR-0954
+    /// requirement 9's no-spill profile): it forces `spill` to `None`
+    /// outright, regardless of the environment, `cache_dir`, or any prior
+    /// value of this field, because it is the deployment's own declared
+    /// refusal to spill.
+    ///
+    /// Call once at process startup, like [`SqlConfig::with_spill_from_env`].
+    pub fn with_spill_resolved(
+        mut self,
+        sql_spill_off: bool,
+        cache_dir: Option<CacheDirSpill<'_>>,
+    ) -> Result<Self, SpillConfigError> {
+        if sql_spill_off {
+            self.spill = None;
+            return Ok(self);
+        }
+        if self.spill.is_none() {
+            let dir = std::env::var_os(ENV_SPILL_DIR);
+            let quota = std::env::var_os(ENV_SPILL_MAX_BYTES);
+            self.spill = SpillConfig::resolve(dir.as_deref(), quota.as_deref(), cache_dir)?;
+        }
+        Ok(self)
+    }
+
     /// Build the query's DataFusion memory pool: a [`TenantDelegatingPool`]
     /// capped at `max_query_bytes` that forwards every grow/shrink to
     /// `tenant`. Install it on the query's `RuntimeEnv` via
@@ -491,5 +634,186 @@ mod tests {
     fn bounded_topk_defaults_to_a_limit_of_1024() {
         assert_eq!(SqlConfig::default().bounded_topk_max_limit, Some(1024));
         assert_eq!(DEFAULT_BOUNDED_TOPK_MAX_LIMIT, 1024);
+    }
+
+    fn cache_dir_spill(free_bytes: u64, memory_budget_bytes: u64) -> CacheDirSpill<'static> {
+        CacheDirSpill {
+            cache_dir: Path::new("/var/cache/ravel"),
+            instance_id: "inst-1",
+            free_bytes,
+            memory_budget_bytes,
+        }
+    }
+
+    /// Neither the env pair nor `--cache-dir` is configured: spill stays off,
+    /// the same as `from_env` with nothing set. A wrong implementation that
+    /// derives a spill config whenever a memory budget is merely in scope
+    /// (treating "a budget exists" as "cache-dir is configured") would enable
+    /// spill here with no directory to write to.
+    #[test]
+    fn resolve_with_neither_env_nor_cache_dir_is_off() {
+        assert_eq!(
+            SpillConfig::resolve(None, None, None).expect("neither source is set"),
+            None
+        );
+    }
+
+    /// The full env pair wins outright over `--cache-dir`: this is
+    /// unchanged, original `from_env` behavior, and a `--cache-dir`-derived
+    /// implementation must not shadow it. A wrong implementation that checks
+    /// `cache_dir` before the env pair would return the derived config
+    /// instead of the operator's explicit directory and quota.
+    #[test]
+    fn resolve_full_env_pair_wins_over_cache_dir() {
+        let resolved = SpillConfig::resolve(
+            Some(OsStr::new("/explicit/spill")),
+            Some(OsStr::new("4096")),
+            Some(cache_dir_spill(1_000_000_000_000, 1024)),
+        )
+        .expect("a full env pair is always valid here");
+        assert_eq!(
+            resolved,
+            Some(SpillConfig {
+                dir: PathBuf::from("/explicit/spill"),
+                max_bytes: 4096,
+            })
+        );
+    }
+
+    /// `--cache-dir` alone (no env pair) derives both the directory, under
+    /// `cache_spill_dir`, and the ceiling, via `derive_spill_max_bytes`. A
+    /// wrong implementation that derives the ceiling from total disk space
+    /// instead of free space, or that omits the memory-budget cap entirely,
+    /// would both pass a test that only checks the directory; this pins the
+    /// byte figure too.
+    #[test]
+    fn resolve_cache_dir_alone_derives_dir_and_ceiling() {
+        // free_bytes = 10 GiB, half = 5 GiB; memory_budget = 1 GiB, 4x cap = 4
+        // GiB. The cap binds, so the ceiling is 4 GiB, not half of free space.
+        let free_bytes = 10 * 1024 * 1024 * 1024;
+        let memory_budget_bytes = 1024 * 1024 * 1024;
+        let resolved = SpillConfig::resolve(
+            None,
+            None,
+            Some(cache_dir_spill(free_bytes, memory_budget_bytes)),
+        )
+        .expect("a cache-dir-only resolution never errors")
+        .expect("a configured cache-dir always enables spill");
+        assert_eq!(
+            resolved.dir,
+            PathBuf::from("/var/cache/ravel/sql-spill/inst-1")
+        );
+        assert_eq!(resolved.max_bytes, 4 * 1024 * 1024 * 1024);
+    }
+
+    /// The derived ceiling floors at 1 GiB even on a nearly-full volume. A
+    /// wrong implementation with no floor would derive a ceiling so small
+    /// (or zero) that every spill attempt immediately exhausts its budget.
+    #[test]
+    fn resolve_cache_dir_ceiling_floors_at_one_gib() {
+        let resolved = SpillConfig::resolve(None, None, Some(cache_dir_spill(1024, 1024)))
+            .expect("a cache-dir-only resolution never errors")
+            .expect("a configured cache-dir always enables spill");
+        assert_eq!(resolved.max_bytes, DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES);
+    }
+
+    /// `RAVEL_SQL_SPILL_MAX_BYTES` alone, with no directory, overrides the
+    /// derived ceiling under a configured `--cache-dir`: the directory still
+    /// comes from `cache_dir`, but the quota is the operator's, not derived.
+    /// A wrong implementation that ignores a dir-less env quota under
+    /// `--cache-dir` would derive the ceiling anyway and silently discard the
+    /// operator's number.
+    #[test]
+    fn resolve_env_quota_alone_overrides_derived_ceiling_under_cache_dir() {
+        let resolved = SpillConfig::resolve(
+            None,
+            Some(OsStr::new("777")),
+            Some(cache_dir_spill(1_000_000_000_000, 1024 * 1024 * 1024)),
+        )
+        .expect("a dir-less env quota under cache-dir never errors")
+        .expect("a configured cache-dir always enables spill");
+        assert_eq!(
+            resolved.dir,
+            PathBuf::from("/var/cache/ravel/sql-spill/inst-1")
+        );
+        assert_eq!(resolved.max_bytes, 777);
+    }
+
+    /// `RAVEL_SQL_SPILL_MAX_BYTES` alone with no `--cache-dir` at all is still
+    /// `Incomplete`: there is no cache-dir-less derivation to fall back to.
+    #[test]
+    fn resolve_env_quota_alone_without_cache_dir_is_incomplete() {
+        assert_eq!(
+            SpillConfig::resolve(None, Some(OsStr::new("777")), None).expect_err(
+                "a dir-less env quota with no cache-dir has nowhere to derive a directory from"
+            ),
+            SpillConfigError::Incomplete
+        );
+    }
+
+    /// `RAVEL_SQL_SPILL_DIR` alone is always `Incomplete`, with or without
+    /// `--cache-dir`: there is no symmetric "derive a directory" fallback for
+    /// a bare env directory, only for a bare env quota.
+    #[test]
+    fn resolve_env_dir_alone_is_incomplete_even_with_cache_dir() {
+        assert_eq!(
+            SpillConfig::resolve(
+                Some(OsStr::new("/explicit/spill")),
+                None,
+                Some(cache_dir_spill(1_000_000_000_000, 1024)),
+            )
+            .expect_err("a bare env dir has no quota fallback, with or without cache-dir"),
+            SpillConfigError::Incomplete
+        );
+    }
+
+    /// `--sql-spill off` forces spill off outright, regardless of a fully-set
+    /// env pair or a configured `--cache-dir`. A wrong implementation that
+    /// only checks `sql_spill_off` after already resolving the environment
+    /// (rather than short-circuiting first) would still return the env pair's
+    /// config here instead of `None`.
+    #[test]
+    fn with_spill_resolved_off_wins_over_a_fully_configured_cache_dir() {
+        let config = SqlConfig::default()
+            .with_spill_resolved(true, Some(cache_dir_spill(1_000_000_000_000, 1024)))
+            .expect("off never errors");
+        assert_eq!(config.spill, None);
+    }
+
+    /// `measure_free_bytes` wraps `fs4::available_space`, not
+    /// `fs4::statvfs(..).total_space()`: a wrong implementation that read the
+    /// total instead of the available figure would, on almost any real
+    /// filesystem with anything written to it, report more free space than
+    /// the volume actually has available, i.e. a value exceeding
+    /// `fs4::statvfs`'s own `total_space()` for the same path -- which this
+    /// invariant catches whether or not the wrong number happens to be
+    /// nonzero.
+    #[test]
+    fn measure_free_bytes_is_available_not_total() {
+        let available = measure_free_bytes(Path::new(".")).expect("the current directory exists");
+        let total = fs4::statvfs(".")
+            .expect("the current directory exists")
+            .total_space();
+        assert!(available <= total);
+    }
+
+    /// `with_spill_resolved` with `sql_spill_off` false and an already-set
+    /// field leaves it untouched, the same invariant
+    /// `with_spill_from_env` pins: an explicit setting is never silently
+    /// replaced.
+    #[test]
+    fn with_spill_resolved_does_not_override_an_explicit_setting() {
+        let explicit = SpillConfig {
+            dir: PathBuf::from("/explicit"),
+            max_bytes: 4096,
+        };
+        let config = SqlConfig {
+            spill: Some(explicit.clone()),
+            ..SqlConfig::default()
+        };
+        let after = config
+            .with_spill_resolved(false, Some(cache_dir_spill(1_000_000_000_000, 1024)))
+            .expect("an already-set field reads nothing else");
+        assert_eq!(after.spill, Some(explicit));
     }
 }
