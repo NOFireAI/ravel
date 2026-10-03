@@ -53,8 +53,26 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/a/l0/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/a/c/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/a/alert-lease",
-        "arn:aws:s3:::my-ravel-bucket/t/*/a/state/latest"
+        "arn:aws:s3:::my-ravel-bucket/t/*/a/state/latest",
+        "arn:aws:s3:::my-ravel-bucket/sys/pq-probe/*"
       ]
+    },
+    {
+      "Sid": "QueryManifestCreate",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/pq/t/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*"
+        }
+      }
+    },
+    {
+      "Sid": "QueryProbeDelete",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/sys/pq-probe/*"
     },
     {
       "Sid": "QueryTenantKms",
