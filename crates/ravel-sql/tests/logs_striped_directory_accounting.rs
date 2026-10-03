@@ -31,6 +31,7 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableProvider;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::{Expr, col, lit};
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use ravel_cache::{Cache, CacheLimits};
@@ -129,6 +130,14 @@ fn writer_config() -> RlogConfig {
 /// One object per segment, and the raw bytes so a test can read each footer.
 async fn write_segment(store: &dyn ObjectStoreBackend, seg: usize) -> (SegmentRef, Vec<u8>) {
     let recs: Vec<LogRecord> = (0..BLOCKS_PER_SEG).map(|b| record(seg, b)).collect();
+    write_records(store, seg, recs).await
+}
+
+async fn write_records(
+    store: &dyn ObjectStoreBackend,
+    seg: usize,
+    recs: Vec<LogRecord>,
+) -> (SegmentRef, Vec<u8>) {
     let identity = ObjectIdentity {
         tenant_hash: TENANT,
         shard: 0,
@@ -344,6 +353,24 @@ async fn run_with(
     fetcher: LogSegmentFetcher,
 ) -> Run {
     let _ = store;
+    run_scan(
+        snapshot,
+        target_partitions,
+        fetcher,
+        Some(vec![LOG_COL_BODY]),
+        &[],
+    )
+    .await
+}
+
+/// [`run_with`] with any projection (`None` is every column) and filters.
+async fn run_scan(
+    snapshot: &Snapshot,
+    target_partitions: usize,
+    fetcher: LogSegmentFetcher,
+    projection: Option<Vec<usize>>,
+    filters: &[Expr],
+) -> Run {
     let phase = PhaseAccounting::new();
     let provider =
         LogsTableProvider::new(snapshot.clone(), TenantHash(TENANT), fetcher, phase.clone())
@@ -351,8 +378,7 @@ async fn run_with(
     let ctx = SessionContext::new_with_config(
         SessionConfig::new().with_target_partitions(target_partitions),
     );
-    let projection = vec![LOG_COL_BODY];
-    let plan = TableProvider::scan(&provider, &ctx.state(), Some(&projection), &[], None)
+    let plan = TableProvider::scan(&provider, &ctx.state(), projection.as_ref(), filters, None)
         .await
         .expect("scan");
     let batches = collect(Arc::clone(&plan), Arc::new(TaskContext::default()))
@@ -627,4 +653,192 @@ async fn interleaved_groups_move_each_groups_span_once() {
         "each group's projected span is moved once"
     );
     assert!(run.phases.scan.s3_bytes[get] <= obj.len() as u64);
+}
+
+/// Blocks in the short segment: one group of [`GROUP_BLOCKS`] and one of one.
+const SHORT_BLOCKS: usize = GROUP_BLOCKS + 1;
+/// The value of `c0` that only block 1 of the short segment holds when its
+/// middle block is to be pruned, outside [`C0_BELOW`].
+const C0_OUTLIER: i64 = 1_000_000;
+const C0_BELOW: i64 = 1_000;
+
+/// One segment of [`SHORT_BLOCKS`] blocks. With `prune_middle`, block 1's `c0`
+/// is [`C0_OUTLIER`], so `c0 < C0_BELOW` prunes it and leaves a hole inside
+/// the first group.
+async fn short_segment(prune_middle: bool) -> (Arc<dyn ObjectStoreBackend>, Snapshot, Vec<u8>) {
+    let base = Arc::new(MemoryStore::new());
+    let recs: Vec<LogRecord> = (0..SHORT_BLOCKS)
+        .map(|b| {
+            let mut r = record(0, b);
+            if prune_middle && b == 1 {
+                r.attrs[0].1 = AttrValue::I64(C0_OUTLIER);
+            }
+            r
+        })
+        .collect();
+    let (seg, obj) = write_records(base.as_ref(), 0, recs).await;
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    (base, snapshot, obj)
+}
+
+/// A ranged fetcher with a read cache and a probe far shorter than the
+/// object, so every block page is a separate ranged read.
+fn short_probe_fetcher(
+    store: Arc<dyn ObjectStoreBackend>,
+    coalesce_gap: Option<u64>,
+) -> LogSegmentFetcher {
+    let mut block_range = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_suffix_len(512)
+        .with_whole_object_threshold(0);
+    if let Some(gap) = coalesce_gap {
+        block_range = block_range.with_coalesce_gap(gap);
+    }
+    let cache_bytes = 64u64 << 20;
+    let cache: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(CacheLimits::new(
+        cache_bytes,
+        (cache_bytes / 4096) as usize,
+        cache_bytes,
+    )));
+    LogSegmentFetcher::new(store)
+        .with_block_range(block_range)
+        .with_cache(cache)
+        .with_block_range_threshold(0)
+}
+
+/// Each row group's span over every column: from its first chunk's start to
+/// its last chunk's end.
+fn all_column_group_spans(obj: &[u8]) -> Vec<u64> {
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(obj, &cfg).expect("open");
+    let dirs = RlogReader::decode_directories(obj, &cfg).expect("directories");
+    (0..reader.row_group_count())
+        .map(|g| {
+            let chunks: Vec<(u64, u64)> = dirs.page_dir().groups[g]
+                .chunks
+                .iter()
+                .filter_map(|c| reader.column_chunk_range(g, c.column_id))
+                .collect();
+            let start = chunks.iter().map(|c| c.0).min().expect("a chunk");
+            let end = chunks.iter().map(|c| c.0 + c.1).max().expect("a chunk");
+            end - start
+        })
+        .collect()
+}
+
+fn section_len(obj: &[u8], k: u32) -> u64 {
+    ravel_logseg::footer::open(obj)
+        .expect("footer")
+        .section(k)
+        .expect("section")
+        .len
+}
+
+/// Five blocks in groups of four and one, every column projected, two
+/// partitions: the first owns the four-block group, which alone covers more
+/// than the coverage threshold of the BLOCKS section, and the second owns the
+/// one-block group. Each partition's crossover weighs its own span, so the
+/// first issues one covering range of exactly its group and the second one
+/// range of its group: wire bytes are the two spans plus the BLOOM range both
+/// ask for, within the object's length. One partition owns every block and
+/// takes the one whole-object GET.
+///
+/// Fails against the whole-object crossover on a partial share (the first
+/// partition moves the object, and the sum passes its length) and against a
+/// collapse onto the object's BLOCKS extent (the first partition moves the
+/// section).
+#[tokio::test]
+async fn a_partial_share_crossover_moves_its_own_span() {
+    let (store, snapshot, obj) = short_segment(false).await;
+    let spans = all_column_group_spans(&obj);
+    assert_eq!(spans.len(), 2, "groups of four and one");
+    let blocks_len = section_len(&obj, kind::BLOCKS);
+    assert!(
+        spans[0] as f64 / blocks_len as f64 >= ravel_query::DEFAULT_LOG_COVERAGE_THRESHOLD,
+        "the four-block group must cross the default threshold against the section"
+    );
+    let bloom = section_len(&obj, kind::BLOOM);
+    let get = ravel_types::accounting::AccountedOp::Get.index();
+
+    let run = run_scan(
+        &snapshot,
+        2,
+        short_probe_fetcher(Arc::clone(&store), None),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(run.rows, SHORT_BLOCKS);
+    assert_eq!(
+        sum_metric(
+            &run.plan,
+            "fast_path_rejected_fewer_segments_than_partitions"
+        ),
+        2,
+        "the striped route"
+    );
+    assert_eq!(
+        run.phases.scan.s3_requests[get], 3,
+        "one covering range per share, and the shared BLOOM range"
+    );
+    assert_eq!(
+        run.phases.scan.s3_bytes[get],
+        spans[0] + spans[1] + bloom,
+        "each share moves exactly its own span"
+    );
+    assert!(run.phases.scan.s3_bytes[get] <= obj.len() as u64);
+
+    let whole = run_scan(
+        &snapshot,
+        1,
+        short_probe_fetcher(Arc::clone(&store), None),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(whole.rows, SHORT_BLOCKS);
+    assert_eq!(
+        (
+            whole.phases.scan.s3_requests[get],
+            whole.phases.scan.s3_bytes[get]
+        ),
+        (1, obj.len() as u64),
+        "a full share reads the object in one GET"
+    );
+}
+
+/// The same segment with block 1 pruned by `c0 < 1000` and no coalesce gap:
+/// the first partition's share is blocks 0, 2 and 3, whose pages leave a hole
+/// in every column chunk. Without a crossover that share issues one GET per
+/// chunk run (bridged down to the L0 cap); its runs cover more than the
+/// threshold of its own span, so it issues one covering range of exactly that
+/// span instead.
+///
+/// Fails against a partial share that never crosses over (the first share's
+/// GETs are its bridged runs, not one), against the whole-object crossover (the
+/// object is moved), and against a collapse onto the object's BLOCKS extent.
+#[tokio::test]
+async fn a_partial_share_crossover_collapses_a_pruned_hole_into_one_range() {
+    let (store, snapshot, obj) = short_segment(true).await;
+    let spans = all_column_group_spans(&obj);
+    let bloom = section_len(&obj, kind::BLOOM);
+    let get = ravel_types::accounting::AccountedOp::Get.index();
+    let filters = vec![col(attr_name(0)).lt(lit(C0_BELOW))];
+    let run = run_scan(
+        &snapshot,
+        2,
+        short_probe_fetcher(Arc::clone(&store), Some(0)),
+        None,
+        &filters,
+    )
+    .await;
+    assert_eq!(run.rows, SHORT_BLOCKS - 1, "block 1 is filtered out");
+    assert_eq!(
+        run.phases.scan.s3_requests[get], 3,
+        "one covering range per share, and the shared BLOOM range"
+    );
+    assert_eq!(run.phases.scan.s3_bytes[get], spans[0] + spans[1] + bloom);
 }
