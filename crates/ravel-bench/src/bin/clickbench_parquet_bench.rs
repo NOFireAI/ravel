@@ -139,8 +139,9 @@ fn check_reference_dir(dir: &Path) -> Result<String, String> {
 }
 
 /// Creates `out`'s parent directory if it is missing and opens `out` for
-/// writing, truncating it, so a path the report cannot be written to is
-/// refused before the run. What it leaves is an empty file the report
+/// writing without truncating it, so a path the report cannot be written to
+/// is refused before the run while an existing report survives until the new
+/// one replaces it. A missing `out` is left as an empty file the report
 /// overwrites.
 fn check_out(out: &Path) -> Result<(), String> {
     if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -150,7 +151,7 @@ fn check_out(out: &Path) -> Result<(), String> {
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .truncate(false)
         .open(out)
         .map_err(|e| format!("cannot write {}: {e}", out.display()))?;
     Ok(())

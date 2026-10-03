@@ -1019,7 +1019,7 @@ the secret), then grant both arms' locations:
 
 ```sh
 for loc in s3://clickbench-parquet/hits/ s3://clickbench-parquet/hits.parquet; do
-  target/release/ravel-cli --parquet-profiles profiles.json \
+  target/release/ravel-cli --store <your-store-flags> --parquet-profiles profiles.json \
     tenant parquet-grant add --tenant clickbench --location "$loc" --profile rustfs
 done
 ```
@@ -1080,7 +1080,8 @@ an unreadable log, a log missing a stamp or carrying one twice, a failed
 `CREATE`, concurrency arguments the phase refuses, an unwritable `--out`).
 Every one of these but the `CREATE` is checked before anything reaches the
 server, so a refused argument runs nothing. That check creates `--out`'s
-directory if it is missing and leaves an empty `--out` the report overwrites.
+directory if it is missing and opens `--out` without truncating it, so a
+report from an earlier run survives until a new one replaces it.
 Past setup it writes the report before judging it: a concurrency phase that
 fails once started is recorded in the report's `concurrency_error`, the
 report is written with every statement's figures, and the bench exits 1. A
