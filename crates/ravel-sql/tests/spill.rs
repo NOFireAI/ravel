@@ -26,7 +26,11 @@
 //! - scratch is cleaned up on completion, on a typed error, and on a cancelled
 //!   stream (requirement 7);
 //! - the spilling aggregation's pool-accounted peak stays within the configured
-//!   cap (requirement 1, the implementation-constraint measurement).
+//!   cap (requirement 1, the implementation-constraint measurement);
+//! - an `ORDER BY ... LIMIT` over an eligible aggregate, with many groups tied
+//!   on the sort key, returns the same rows in the same order with spill
+//!   forced, in memory, and with spill off (issue #2416), including when a
+//!   select-list alias carries a group column's name.
 //!
 //! # Where each test drives the spill from
 //!
@@ -1290,10 +1294,11 @@ async fn run_top_ten(executor: &ravel_sql::SqlExecutor, sql: &str) -> TopTen {
     }
 }
 
-/// Run `sql` over the q33 table twice: in memory under
-/// [`AMPLE_QUERY_BYTES`], and with spill forced by a per-query pool of a
-/// quarter of the in-memory run's measured peak. Asserts that the first run
-/// did not spill and the second did, and returns `(spilled, in_memory)`.
+/// Run `sql` over the q33 table three times: in memory under
+/// [`AMPLE_QUERY_BYTES`], with spill forced by a per-query pool of a quarter
+/// of the in-memory run's measured peak, and with spill not configured at
+/// all. Asserts that only the second run spilled and that the third returned
+/// the first's rows, and returns `(spilled, in_memory)`.
 async fn spilled_and_in_memory(sql: &str) -> (TopTen, TopTen) {
     let file = q33_parquet();
     let scratch = tempfile::tempdir().expect("scratch root");
@@ -1334,6 +1339,14 @@ async fn spilled_and_in_memory(sql: &str) -> (TopTen, TopTen) {
     assert!(
         spilled.peak_pool_bytes <= budget as u64,
         "the spilled run stays inside its pool"
+    );
+
+    let mut spill_off = config(AMPLE_QUERY_BYTES);
+    spill_off.spill = None;
+    let spill_off = run_top_ten(&*q33_executor(spill_off, &file).await, sql).await;
+    assert_eq!(
+        spill_off.rows, in_memory.rows,
+        "with spill off the statement returns the same rows in the same order"
     );
     (spilled, in_memory)
 }

@@ -91,6 +91,7 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::empty::EmptyTable;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::SessionState;
 use datafusion::execution::disk_manager::DiskManager;
 use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, UnboundedMemoryPool};
 use datafusion::logical_expr::{
@@ -1027,6 +1028,10 @@ pub struct SqlExecutor {
     /// [`SqlExecutor::new`] default) keeps that constant; the server installs
     /// the deployment's own sweep grace with [`Self::with_ddl_min_grace_ms`].
     ddl_min_grace_ms: Option<u64>,
+    /// Replaces the plan a pinned statement executes after the tie-order
+    /// rewrite, so a test can make it diverge from the classification plan.
+    #[cfg(test)]
+    executed_plan_tamper: Option<fn(LogicalPlan) -> LogicalPlan>,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -1062,6 +1067,8 @@ impl SqlExecutor {
             parquet: None,
             clock: Arc::new(SystemClock),
             ddl_min_grace_ms: None,
+            #[cfg(test)]
+            executed_plan_tamper: None,
         }
     }
 
@@ -2044,22 +2051,59 @@ impl SqlExecutor {
             },
             None => SpillDecision::Disabled,
         };
-        let ctx = build_session(config, pool, table, exact_typed_aggregates, decision)
-            .map_err(plan_error)?;
-        let mut frame = ctx.sql(sql).await.map_err(plan_error)?;
-        // ADR-0954 (issue #2416): the same tiebreak rewrite applied to
-        // `analyzed` above, now applied to the plan this session actually
-        // executes. `analyzed` comes from a separate, throwaway parse
-        // (`analyzed_classification_plan`) used only to decide `decision`;
-        // reaching `Enabled` here already proves `plan_is_spill_eligible` held
-        // for the rewritten `analyzed`, which has the same shape `ctx.sql`
-        // just produced, so this rewrite is expected to find the same `Sort`
-        // nodes and append the same terms.
-        if matches!(decision, SpillDecision::Enabled { .. }) {
-            let plan = rewrite_sort_group_key_tie_order(frame.logical_plan().clone())
-                .map_err(plan_error)?;
-            frame = DataFrame::new(ctx.state(), plan);
+        // Kept only while spill is enabled, to rebuild the session without it
+        // if the executed plan fails the re-check below.
+        let spill_enabled = matches!(decision, SpillDecision::Enabled { .. });
+        let fallback_table = spill_enabled.then(|| clone_session_table(&table));
+        let mut ctx = build_session(
+            config,
+            Arc::clone(&pool),
+            table,
+            exact_typed_aggregates,
+            decision,
+        )
+        .map_err(plan_error)?;
+        // ADR-0954 (issue #2416): the tiebreak rewrite applied to `analyzed`
+        // above, now applied to the plan this session executes, and applied
+        // whatever the spill decision. A Sort over a spill-exact aggregate
+        // therefore has the same total order with spill on, off or disabled,
+        // so the statement returns the same rows in every configuration.
+        let mut plan = ctx
+            .sql(sql)
+            .await
+            .map_err(plan_error)?
+            .into_unoptimized_plan();
+        if plan_is_spill_eligible_ignoring_sort_order(&plan) {
+            plan = tie_ordered_or_unchanged(plan);
         }
+        #[cfg(test)]
+        if let Some(tamper) = self.executed_plan_tamper {
+            plan = tamper(plan);
+        }
+        // The spill decision was taken on `analyzed`, a separate parse. Fail
+        // closed if the plan that actually runs is not eligible after the
+        // rewrite: rebuild the session with the disk manager disabled and drop
+        // the scratch directory, so no Sort without a total key ever runs
+        // with spill.
+        let mut scratch = scratch;
+        if let Some(table) = fallback_table
+            && !executed_plan_is_spill_eligible(&ctx.state(), &plan)
+        {
+            tracing::warn!(
+                "SQL spill disabled for this statement: the plan it executes is not \
+                 spill-eligible, although its classification plan was"
+            );
+            ctx = build_session(
+                config,
+                pool,
+                table,
+                exact_typed_aggregates,
+                SpillDecision::Disabled,
+            )
+            .map_err(plan_error)?;
+            scratch = None;
+        }
+        let mut frame = DataFrame::new(ctx.state(), plan);
         // The row window (ADR-1374 decision 3, prerequisite 2), inserted into
         // the plan `ctx.sql` just produced -- before any optimizer pass, and
         // before the schema is read, so the reported schema is the one the
@@ -4002,6 +4046,34 @@ fn plan_is_spill_eligible(plan: &LogicalPlan) -> bool {
     !aggregates.is_empty()
         && aggregates.iter().all(aggregate_node_is_spill_exact)
         && distincts.iter().all(distinct_node_is_exact)
+}
+
+/// [`plan_is_spill_eligible`] for a plan `ctx.sql` produced, which the
+/// analyzer has not run over yet: the predicate reads resolved, type-coerced
+/// expression types, so it runs on the analyzed form. A plan the analyzer
+/// rejects is not eligible.
+fn executed_plan_is_spill_eligible(state: &SessionState, plan: &LogicalPlan) -> bool {
+    let config_options = Arc::clone(state.config_options());
+    state
+        .analyzer()
+        .execute_and_check(plan.clone(), &config_options, |_, _| {})
+        .is_ok_and(|analyzed| plan_is_spill_eligible(&analyzed))
+}
+
+/// A second handle on the table `table` serves, for rebuilding a query's
+/// session: every variant holds its providers behind `Arc`s.
+fn clone_session_table(table: &SessionTable) -> SessionTable {
+    match table {
+        SessionTable::Metrics(provider) => SessionTable::Metrics(Arc::clone(provider)),
+        SessionTable::Logs(provider) => SessionTable::Logs(Arc::clone(provider)),
+        SessionTable::Spans(provider) => SessionTable::Spans(Arc::clone(provider)),
+        SessionTable::Alerts(provider) => SessionTable::Alerts(Arc::clone(provider)),
+        SessionTable::Audit(provider) => SessionTable::Audit(Arc::clone(provider)),
+        SessionTable::Parquet(session) => SessionTable::Parquet(ParquetSession {
+            tables: session.tables.clone(),
+            store: Arc::clone(&session.store),
+        }),
+    }
 }
 
 /// [`plan_is_spill_eligible`], except a `Sort` is always treated as a
@@ -6093,6 +6165,115 @@ mod tests {
         ))
         .await;
         assert!(rewrite_sort_group_key_tie_order(plan).is_err());
+    }
+
+    /// A float GROUP BY key stays spill-ineligible under an `ORDER BY`: the
+    /// rewrite is not even attempted (the plan is ineligible whatever its sort
+    /// order), and running it anyway does not make the plan eligible.
+    #[tokio::test]
+    async fn a_float_group_key_under_order_by_stays_ineligible() {
+        let plan = eviction_test_executor()
+            .analyzed_classification_plan(
+                TenantHash([109u8; 16]),
+                "SELECT value, count(*) AS c FROM samples GROUP BY value ORDER BY c DESC LIMIT 10",
+                &[],
+                None,
+            )
+            .await
+            .expect("the statement plans");
+        assert!(!plan_is_spill_eligible_ignoring_sort_order(&plan));
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+        assert_eq!(
+            sort_terms(&rewritten),
+            vec![term(None, "c", false), term(Some("samples"), "value", true)]
+        );
+        assert!(!plan_is_spill_eligible(&rewritten));
+    }
+
+    /// Strips every `Sort` back to its first term: the shape a classification
+    /// plan and an executed plan would have if the rewrite reached only one.
+    fn keep_the_first_sort_term(plan: LogicalPlan) -> LogicalPlan {
+        plan.transform_down(|node| match node {
+            LogicalPlan::Sort(mut sort) => {
+                sort.expr.truncate(1);
+                Ok(Transformed::yes(LogicalPlan::Sort(sort)))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .expect("the closure never fails")
+        .data
+    }
+
+    /// Issue #2416: spill is decided on the classification plan, and the plan
+    /// a pinned statement executes is checked again after the rewrite. When
+    /// the two diverge (here the executed plan loses its tiebreak terms), the
+    /// statement runs with spill disabled: no scratch directory, and the plan
+    /// it runs is the diverged one. The control pins the same statement with
+    /// spill granted.
+    #[tokio::test]
+    async fn an_executed_plan_that_is_not_eligible_runs_with_spill_disabled() {
+        use ravel_catalog::Catalog;
+
+        let sql = "SELECT ts, series_id, count(*) AS c FROM samples \
+                   GROUP BY ts, series_id ORDER BY c DESC LIMIT 10";
+        let root = tempfile::tempdir().expect("spill root");
+        let pin = |tamper: Option<fn(LogicalPlan) -> LogicalPlan>| {
+            let store = Arc::new(MemoryStore::new());
+            let catalog =
+                Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+            let mut executor = SqlExecutor::new(
+                catalog,
+                SegmentFetcher::new(store.clone()),
+                LogSegmentFetcher::new(store.clone()),
+                SpanSegmentFetcher::new(store),
+                SqlConfig {
+                    spill: Some(crate::config::SpillConfig {
+                        dir: root.path().to_path_buf(),
+                        max_bytes: 1 << 30,
+                    }),
+                    ..SqlConfig::default()
+                },
+                1 << 30,
+            );
+            executor.executed_plan_tamper = tamper;
+            async move {
+                let snapshot = Snapshot {
+                    segments: Vec::new(),
+                    segments_pruned: 0,
+                    pending_erasure: Vec::new(),
+                };
+                executor
+                    .plan_pinned(
+                        TenantHash([110u8; 16]),
+                        snapshot,
+                        sql,
+                        &QueryAccounting::new(),
+                        &[],
+                    )
+                    .await
+                    .expect("the statement plans")
+            }
+        };
+
+        let granted = pin(None).await;
+        assert!(granted.scratch.is_some(), "the control is granted spill");
+        assert_eq!(sort_terms(granted.frame.logical_plan()).len(), 3);
+        drop(granted);
+
+        let refused = pin(Some(keep_the_first_sort_term)).await;
+        assert!(
+            refused.scratch.is_none(),
+            "a diverged executed plan must not keep its spill grant"
+        );
+        assert_eq!(
+            sort_terms(refused.frame.logical_plan()),
+            vec![term(None, "c", false)]
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("readable").count(),
+            0,
+            "the scratch directory the classification granted is removed"
+        );
     }
 
     fn eviction_test_executor() -> SqlExecutor {
