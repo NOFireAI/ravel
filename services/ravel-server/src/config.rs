@@ -230,9 +230,10 @@ pub enum LogsFetchPolicyArg {
     /// Derive the request cost from the active store cost profile: the larger
     /// of its price term and its time term. At the reference (intra-region)
     /// profile the rate is the time term, 6.3 MB per request, so a narrow
-    /// projection of an object above the projection break-even (five request
-    /// costs, 31.5 MB) reads ranged and an object at or below it reads whole;
-    /// at egress prices it resolves to a small byte cost.
+    /// projection reads an object ranged when the bytes it skips exceed the
+    /// projection break-even (five request costs, 31.5 MB), and an object at
+    /// or below the break-even reads whole; at egress prices it resolves to a
+    /// small byte cost.
     #[default]
     CostBased,
     /// Resolves the byte quantities exactly as `byte-minimal` does (issue
@@ -1370,9 +1371,10 @@ pub struct Cli {
     /// `--store-cost-profile` as the larger of its price term and its time
     /// term (request latency times per-connection throughput), which at the
     /// reference intra-region profile is the time term, 6.3 MB per request:
-    /// a narrow projection of an object above the projection break-even
-    /// (the larger of the routing threshold and five request costs, 31.5 MB
-    /// by default) reads ranged, and an object at or below it reads whole;
+    /// a narrow projection reads an object ranged when the bytes it skips
+    /// exceed the projection break-even (the larger of the routing threshold
+    /// and five request costs, 31.5 MB by default), and an object at or below
+    /// the break-even reads whole;
     /// `latency-first` (issue #1196) resolves
     /// the byte quantities exactly as `byte-minimal` does. Read at startup
     /// only: the running engine never changes its own policy, so the stamped
@@ -1418,9 +1420,10 @@ pub struct Cli {
     /// The only consumer at startup is `--logs-fetch-policy cost-based`, which
     /// derives the byte-denominated request cost as the larger of the price
     /// term and the time term (latency times throughput: 6.3 MB on the
-    /// reference profile), so a narrow projection of an object above the
-    /// projection break-even (the larger of the routing threshold and five
-    /// request costs) reads ranged and an object at or below it reads whole;
+    /// reference profile), so a narrow projection reads an object ranged when
+    /// the bytes it skips exceed the projection break-even (the larger of the
+    /// routing threshold and five request costs), and an object at or below
+    /// the break-even reads whole;
     /// no price ever reaches the fetch layer (ADR-0904's layering, preserved).
     /// A file that is unreadable, is not valid TOML, carries an unknown key,
     /// sets one timing without the other, or names no profile fails startup

@@ -265,7 +265,10 @@ request count.
   rate is infinite by definition), and quotient overflow (near-free but
   nonzero byte prices, the startup-logged case above). The floor clamps
   apply to every finite result. At the reference profile this resolves
-  to request-minimal; at list egress prices it resolves to ~4.4 KB,
+  to request-minimal (no longer: the rate is now the larger of this price
+  term and a time term from the profile's measured timings, 6,300,000
+  bytes at the reference profile; see the time-term amendment below); at
+  list egress prices it resolves to ~4.4 KB,
   which the floors clamp — reproducing ADR-0904's worked examples from
   the profile instead of prose. The fetch bound below is NOT part of this
   derivation: capping the resolved rate to the bound would let a
@@ -777,3 +780,27 @@ runs, or one GET on crossover), where before this amendment it was not.
 996-3's policy-driven fetch bound and segmented covering fallback remain a
 separate, not-yet-implemented mechanism; this amendment does not anticipate
 or substitute for it.
+
+## Amendment (2026-10-03, ADR-2414): the time-term amendment to the cost-based rate
+
+<!-- amendment-applies: sections="2. The fetch policy: `request-minimal \| byte-minimal \| cost-based`" pointer="time-term amendment" -->
+
+ADR-2414 decision A3 changes the `cost-based` derivation in decision 2. The
+store cost profile now records two measured constants beside its prices, a
+request latency and a per-connection throughput, with the date and host they
+were measured on, set together or not at all. Their product, the bytes one
+connection moves during one request's latency, is a time term, and the
+resolved rate is the larger of the price term above and that time term. A
+saturated price term (both byte prices zero, or a quotient at `u64::MAX`)
+yields to the time term, so the rate saturates only on a profile that records
+neither a byte price nor timings; a profile without timings keeps the
+price-only rate. The reference profile records 70 ms and 90 MB/s, so its rate
+is 6,300,000 bytes from the time term instead of `u64::MAX`, the routing
+threshold keeps its configured value, and an explicit
+`--logs-block-range-threshold` is no longer overridden there. Under
+`cost-based` with a finite rate the projection break-even becomes the larger of
+the routing threshold and five request costs (31,500,000 bytes at the reference
+profile), so narrow projections of large objects read ranged while objects at
+or below the break-even read whole. `request-minimal`, `byte-minimal` and
+`latency-first` resolve as before. The startup stamp names the term
+(`rate_term`) and the break-even (`projection_break_even_bytes`).

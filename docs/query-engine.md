@@ -412,8 +412,22 @@ than their product. That product is the size crossover the fetch layer already
 compares whole object sizes against, and this is the same comparison with the
 projection moved into the saving: at a projected fraction of 0 the two are the
 same test. Note that `--logs-block-range-threshold` pins BOTH the funnel's
-routing threshold and that crossover, so at its 512 KiB default the effective
-break-even is 512 KiB of saving, not the request-cost-derived 8.9 MiB.
+routing threshold and that crossover, so under `byte-minimal` and
+`latency-first` at its 512 KiB default the effective break-even is 512 KiB of
+saving, not the request-cost-derived 8.9 MiB.
+
+Under `cost-based`, and only there, a finite rate also resolves a projection
+break-even (ADR-2414 decision A3): the larger of the routing threshold and
+`WHOLE_OBJECT_REQUEST_MULTIPLE` request costs, carried as
+`EngineConfig::logs_projection_break_even_bytes` and handed to the fetcher with
+`LogSegmentFetcher::with_projection_break_even_bytes`. When it is set,
+`ranged_projection_pays` weighs the saving against it and the ranged fetch's
+size crossover reads it too, so an object the route sent ranged is not read
+whole one layer down and an object at or below the break-even is read whole on
+either entry. The reference profile's rate is its time term, 6,300,000 bytes,
+so the break-even is 31,500,000 bytes: a one-column statement over 35 MB
+objects reads ranged, a 3 MB object reads whole whatever its projection. The
+other policies resolve no break-even and keep the routing threshold as it.
 
 The projected fraction is estimated from column counts (the selection's width
 over the object's column population), because the exact projected byte volume
@@ -423,6 +437,41 @@ one layer down, which falls back to a single whole-object GET when the projected
 pages turn out to cover the object after all. `LogsScanExec` publishes
 `fast_path_ranged_segments` and `fast_path_whole_object_segments` so
 `EXPLAIN ANALYZE` shows the split without counting store requests.
+
+### The ranged fast path's per-partition pipeline
+
+A partition drains its owned segments in owned order. Opened one at a time, a
+partition's ranged reads cost its round trips times the request latency, not
+its bytes over its throughput: a ranged open is a probe, a directory read and
+its column ranges in sequence. So while the segment a partition is opening or
+draining was opened ranged, the partition issues the ranged opens of its next
+owned segments ahead of their turn (ADR-2414 decision A2), up to
+
+```text
+share = max(2, store_get_concurrency / sql_partition_count)
+```
+
+opens held at once, counting the current segment. A pushed `fetch` turns the
+pipeline off (share 1), since the partition may stop before the segments it
+would have prefetched.
+
+The prefetched opens are the same opens the sequential walk builds, polled by
+the partition stream until they resolve and consumed in owned order, so the
+rows, the per-segment counters (`segments_opened`, the route split, the
+opens-by-shape and data-objects-touched accounting, the per-segment timeline
+points) and the per-query request and byte accounting are those of the
+sequential walk. A resolved open, error included, waits for its segment's
+turn, so an error is reported for its own segment after the segments before
+it have been emitted.
+
+Each prefetched open holds the fetched column-chunk bytes of its segment,
+reserved against the fetcher's memory budget like any open's, so a partition
+holds at most `share` times one segment's projected bytes for opened
+segments. Three opens stay sequential: a whole-object fast-path open, which is
+never prefetched and stops the pipeline at its turn because an in-flight
+whole-object open holds a full object per slot; every open on the striped
+route; and the `attrs_raw` fallback reopen, which leaves the prefetches
+behind it in flight and consumes them after the reopened scan ends.
 
 ## The striped route: directories once per segment, row groups whole
 

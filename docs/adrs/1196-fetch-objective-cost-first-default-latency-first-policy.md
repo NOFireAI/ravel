@@ -112,7 +112,9 @@ instance, not of the store, and `StoreCostProfile` is explicitly "this
 deployment's object-store prices" (`crates/ravel-types/src/cost_profile.rs:110-140`).
 Putting NIC bandwidth into a profile named `s3-intra-region-2026`, shared across
 every instance type, is a category error. A named policy expresses the operator's
-intent without pretending to have measured their hardware.
+intent without pretending to have measured their hardware. (Superseded by
+ADR-2414 decision A3, which gives `cost-based` that time term from timings
+recorded as measured constants; see the time-term amendment below.)
 
 **Set a non-zero `transfer_nanodollars_per_gib` so `cost-based` stops
 saturating.** One line, no new fields. Rejected because it lies about the bill to
@@ -169,3 +171,20 @@ concurrent queries on the ClickBench reference machine, the loopback
 second, and reached 0.170 even with a corpus-sized fetch cache (#2014, #2023).
 ADR-2023 decision 1 withdraws the exception: with `--logs-fetch-policy` unset,
 every deployment resolves `cost-based` again, as this ADR decided.
+
+## Amendment (2026-10-03, ADR-2414): the time-term amendment
+
+<!-- amendment-applies: sections="Rejected alternatives" pointer="time-term amendment" -->
+
+The rejected alternative "give `cost-based` a time term" is superseded by
+ADR-2414 decision A3. The objection was that bandwidth and latency are
+properties of the instance, not of the store, and that putting them into a
+profile of store prices is a category error. ADR-2414 records them as measured
+constants instead: each profile that carries them names the date and host they
+were measured on (the reference profile: 70 ms per request and 90 MB/s per
+connection, measured on 2026-10-03 from the 32 GB reference box, intra-region
+against S3), and a profile without them keeps the price-only rate. The
+`cost-based` rate is the larger of the price term and the time term, and the
+default stays `cost-based`; what the default now does at the reference profile
+is read a narrow projection of a large object ranged, where it read every
+object whole. `latency-first` is unchanged.
