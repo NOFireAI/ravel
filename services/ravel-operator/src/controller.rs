@@ -1831,12 +1831,8 @@ async fn reconcile_inner(
     // `query_tier_apply_target`) and records a `Degraded` condition, so the
     // gateway and maintain tiers still reconcile and the running query pods
     // keep serving.
-    let distributed_query = resolve_distributed_query_resource_versions(
-        client,
-        namespace,
-        &obj.spec,
-    )
-    .await?;
+    let distributed_query =
+        resolve_distributed_query_resource_versions(client, namespace, &obj.spec).await?;
     let distributed_query_secret_missing = distributed_query.holds_query_tier();
 
     let render_ctx = RenderCtx {
@@ -2106,7 +2102,10 @@ async fn reconcile_inner(
     // the desired policy is gone) the wider hold that keeps a newly opened port
     // from being blocked on the new pods through the disabling rollout.
     let held_policy = match &query_policy {
-        Some(policy) => Some(query_network_policy_during_rollout(policy, live_query.as_ref())),
+        Some(policy) => Some(query_network_policy_during_rollout(
+            policy,
+            live_query.as_ref(),
+        )),
         None => query_fragment_policy_hold_while_disabling(instance, live_query.as_ref()).map(
             |mut policy| {
                 policy.metadata.namespace = Some(namespace.to_string());
