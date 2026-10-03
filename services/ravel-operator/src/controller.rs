@@ -17,7 +17,7 @@ use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{Secret, Service, ServiceAccount};
-use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::api::rbac::v1::{Role, RoleBinding};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -53,9 +53,9 @@ use crate::reconcile::{
     STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
     audit_token_key_missing, desired_objects, desired_qualify_job, grpcroute_api_resource,
     httproute_api_resource, plan_qualify_gate, possible_gateway_route_names,
-    possible_ingest_ingress_names, possible_pod_disruption_budget_names,
-    possible_router_object_names, qualification_decision, qualify_job_input_hash,
-    qualify_job_phase, s3_allow_http,
+    possible_ingest_ingress_names, possible_network_policy_names,
+    possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
+    qualify_job_input_hash, qualify_job_phase, s3_allow_http,
 };
 
 /// Server-side-apply field manager name.
@@ -1143,6 +1143,48 @@ where
     Ok(())
 }
 
+/// Converge the fragment-port NetworkPolicy around the Deployment applies.
+///
+/// A rendered `policy` is applied before `apply_deployments` runs, so a query
+/// pod never opens the fragment port without the policy covering it. Every
+/// other name in `possible_names` is deleted only after `apply_deployments`
+/// reports that it applied the query Deployment, so a pass that holds the
+/// query apply back (a missing audit-token key, or the bootstrap order
+/// waiting on maintain) keeps the policy. The apply does not wait for the
+/// rollout: pods of the old ReplicaSet can still listen on the port for the
+/// rest of the rolling update after the delete, guarded then only by the
+/// fragment listener's mutual TLS. The callbacks are injected so tests can
+/// record the order.
+async fn converge_query_network_policy<A, AF, D, DF>(
+    policy: Option<NetworkPolicy>,
+    possible_names: Vec<String>,
+    apply_policy: A,
+    mut delete_policy: D,
+    apply_deployments: impl Future<Output = Result<bool, Error>>,
+) -> Result<(), Error>
+where
+    A: FnOnce(String, NetworkPolicy) -> AF,
+    AF: Future<Output = Result<(), Error>>,
+    D: FnMut(String) -> DF,
+    DF: Future<Output = Result<(), Error>>,
+{
+    let desired_name = policy.as_ref().map(ResourceExt::name_any);
+    if let (Some(name), Some(policy)) = (desired_name.clone(), policy) {
+        apply_policy(name, policy).await?;
+    }
+    let query_applied = apply_deployments.await?;
+    if !query_applied {
+        return Ok(());
+    }
+    for name in possible_names {
+        if desired_name.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        delete_policy(name).await?;
+    }
+    Ok(())
+}
+
 /// [`DeleteParams`] for the stale qualify Job (finding 2): foreground
 /// propagation, so Kubernetes keeps the Job object (blocked by the
 /// `foregroundDeletion` finalizer) until its owned Pod has been deleted, rather
@@ -1801,21 +1843,13 @@ async fn reconcile_inner(
     // Collected rather than pushed straight onto `extra_conditions`: a
     // conditions array is keyed by type, so a pass may record at most one
     // `Degraded` entry, and the `sys/gc` bootstrap check below can also produce
-    // one. Resolved once, after that check.
-    //
-    // A missing audit-token-key (#1487 rework) takes this slot ahead of a
-    // router render error: it means the query tier itself cannot be rolled to
-    // a working spec, where a router error only stops ingest routing.
-    let mut degraded: Option<(String, String)> = if audit_key_missing {
-        Some((
-            AUDIT_TOKEN_KEY_MISSING_REASON.to_string(),
-            AUDIT_TOKEN_KEY_MISSING_MESSAGE.to_string(),
-        ))
-    } else {
-        desired
-            .router_render_error
-            .map(|err| degraded_reason(&Error::Render(err)))
-    };
+    // one. Resolved once, after that check; `render_degraded` ranks the render
+    // causes.
+    let mut degraded = render_degraded(
+        audit_key_missing,
+        desired.distributed_query_render_error,
+        desired.router_render_error,
+    );
     let mut desired_router_names: BTreeSet<String> = BTreeSet::new();
     if let Some(mut sa) = desired.router_service_account {
         let name = sa.name_any();
@@ -1934,11 +1968,33 @@ async fn reconcile_inner(
     if tiers.maintain.is_none() {
         delete_if_present(&deployments, &maintain_name).await?;
     }
-    for tier in plan.apply_sequence(maintain_ready_before, request_serving_exists) {
-        tiers
-            .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
-            .await?;
-    }
+    // The fragment-port NetworkPolicy (ADR-1689 decision 4) converges around
+    // the Deployment applies: see `converge_query_network_policy` for the order.
+    let network_policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
+    let query_policy = desired.query_network_policy.map(|mut policy| {
+        policy.metadata.namespace = Some(namespace.to_string());
+        policy.metadata.owner_references = owner.clone();
+        policy
+    });
+    let network_policies = &network_policies;
+    converge_query_network_policy(
+        query_policy,
+        possible_network_policy_names(instance),
+        |name, policy| async move {
+            apply(network_policies, &name, &policy).await?;
+            Ok(())
+        },
+        |name| async move { delete_if_present(network_policies, &name).await },
+        async {
+            for tier in plan.apply_sequence(maintain_ready_before, request_serving_exists) {
+                tiers
+                    .apply_tier(&deployments, namespace, instance, owner.as_ref(), tier)
+                    .await?;
+            }
+            Ok(tiers.applied(DeploymentTier::Query).is_some())
+        },
+    )
+    .await?;
 
     // Report the readiness the maintain apply just observed, but decide the
     // `Available` condition from the count the ORDERING used: that is the one
@@ -2625,8 +2681,34 @@ fn degraded_reason(err: &Error) -> (String, String) {
         Error::Render(RenderError::SchemelessS3Endpoint { .. }) => {
             ("SchemelessS3Endpoint".to_string(), err.to_string())
         }
+        Error::Render(RenderError::DistributedQuerySecretRefMissing { .. }) => (
+            "DistributedQuerySecretRefMissing".to_string(),
+            err.to_string(),
+        ),
         other => ("ReconcileError".to_string(), other.to_string()),
     }
+}
+
+/// The pass's `Degraded` entry from the render, before the `sys/gc` bootstrap
+/// check can override it. A missing audit-token-key (#1487 rework) ranks first:
+/// the query tier cannot be rolled at all. An incomplete
+/// `spec.query.distributedQuery` ranks next: the query tier runs, but without
+/// the distribution its spec asks for. A router render error ranks last, since
+/// it only stops ingest routing.
+fn render_degraded(
+    audit_key_missing: bool,
+    distributed_query_error: Option<RenderError>,
+    router_error: Option<RenderError>,
+) -> Option<(String, String)> {
+    if audit_key_missing {
+        return Some((
+            AUDIT_TOKEN_KEY_MISSING_REASON.to_string(),
+            AUDIT_TOKEN_KEY_MISSING_MESSAGE.to_string(),
+        ));
+    }
+    distributed_query_error
+        .or(router_error)
+        .map(|err| degraded_reason(&Error::Render(err)))
 }
 
 /// Current Unix time in seconds. The wiring-layer clock read (like [`now_ns`]);
@@ -3077,6 +3159,34 @@ mod tests {
             degraded_reason(&Error::Render(RenderError::CanonicalTenantResolverMissing));
         assert_eq!(reason, "CanonicalTenantResolverMissing");
         assert!(!message.is_empty(), "message carries the error text");
+    }
+
+    /// An enabled `spec.query.distributedQuery` missing a Secret reference
+    /// takes the pass's `Degraded` slot with its own reason and the field in
+    /// the message, below a missing audit-token-key and above a router error.
+    #[test]
+    fn missing_distributed_query_secret_ref_sets_a_degraded_condition_naming_it() {
+        let missing = || RenderError::DistributedQuerySecretRefMissing {
+            missing: vec!["fragmentCaSecretRef"],
+        };
+        let (reason, message) = render_degraded(
+            false,
+            Some(missing()),
+            Some(RenderError::RouterImageMissing),
+        )
+        .expect("a Degraded entry");
+        assert_eq!(reason, "DistributedQuerySecretRefMissing");
+        assert!(
+            message.contains("spec.query.distributedQuery.fragmentCaSecretRef"),
+            "{message}"
+        );
+
+        let (reason, _) = render_degraded(true, Some(missing()), None).expect("a Degraded entry");
+        assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
+        let (reason, _) = render_degraded(false, None, Some(RenderError::RouterImageMissing))
+            .expect("a Degraded entry");
+        assert_eq!(reason, "RouterImageMissing");
+        assert_eq!(render_degraded(false, None, None), None);
     }
 
     /// ADR-1693: a cluster still carrying `spec.gateway.fold` learns that the
@@ -4105,6 +4215,70 @@ mod tests {
         assert_eq!(degraded[0].status, "False");
         assert_eq!(degraded[0].reason, STORE_QUALIFIED_FAILED_REASON);
         assert_eq!(degraded[0].message, message);
+    }
+
+    fn fragment_policy(name: &str) -> NetworkPolicy {
+        NetworkPolicy {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Run `converge_query_network_policy` with recording callbacks and return
+    /// the calls in the order they ran. `query_applied` is what the Deployment
+    /// step reports: whether it applied the query Deployment this pass.
+    async fn converge_events(policy: Option<NetworkPolicy>, query_applied: bool) -> Vec<String> {
+        let events = std::cell::RefCell::new(Vec::new());
+        let log = &events;
+        converge_query_network_policy(
+            policy,
+            vec!["rc-query-fragment".to_string()],
+            |name, _policy| async move {
+                log.borrow_mut().push(format!("apply {name}"));
+                Ok(())
+            },
+            |name| async move {
+                log.borrow_mut().push(format!("delete {name}"));
+                Ok(())
+            },
+            async move {
+                log.borrow_mut().push("deployments".to_string());
+                Ok(query_applied)
+            },
+        )
+        .await
+        .expect("recording callbacks never fail");
+        events.into_inner()
+    }
+
+    /// Enabling: the policy is applied, before the Deployment that opens the
+    /// fragment port, and never deleted.
+    #[tokio::test]
+    async fn fragment_policy_is_applied_before_the_query_deployment() {
+        assert_eq!(
+            converge_events(Some(fragment_policy("rc-query-fragment")), true).await,
+            vec!["apply rc-query-fragment", "deployments"]
+        );
+    }
+
+    /// Disabling: the policy is deleted, and only after the Deployment step
+    /// applied the query Deployment that no longer opens the port.
+    #[tokio::test]
+    async fn fragment_policy_is_deleted_after_the_query_deployment_is_applied() {
+        assert_eq!(
+            converge_events(None, true).await,
+            vec!["deployments", "delete rc-query-fragment"]
+        );
+    }
+
+    /// Disabling while the query apply is held back: the live pods may still
+    /// open the fragment port, so the policy stays.
+    #[tokio::test]
+    async fn fragment_policy_is_kept_while_the_query_apply_is_held_back() {
+        assert_eq!(converge_events(None, false).await, vec!["deployments"]);
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and

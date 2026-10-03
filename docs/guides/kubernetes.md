@@ -285,6 +285,12 @@ A minimal example is in
 | `spec.gateway.exposure.gatewayApi` | object | none | Gateway API exposure, independent of `ingestAffinity`. Renders `HTTPRoute`/`GRPCRoute` onto an existing `Gateway` instead of Ingress objects. Fields `gatewayRef.name`/`gatewayRef.namespace`, `hostnames`, `grpc` (default true). See [ingest-affinity.md](ingest-affinity.md). |
 | `spec.query.replicas` | integer | `1` | |
 | `spec.query.resources` | object | `requests: {cpu: 200m, memory: 512Mi}`, no limits | An explicit block replaces the default entirely rather than merging with it. |
+| `spec.query.distributedQuery` | object | none | Distributed PromQL fan-out across the query replicas, on the dedicated TLS fragment listener. Omit and nothing is rendered. See "Distributed query" below. |
+| `spec.query.distributedQuery.enabled` | boolean | `false` | `true` renders the distributed-query flags, the fragment port, the four Secret mounts, and the fragment NetworkPolicy. `false` renders none of them and deletes the NetworkPolicy once the query Deployment without them is applied. |
+| `spec.query.distributedQuery.fragmentTlsSecretRef.name` | string | none | Secret with keys `tls.crt` and `tls.key`: the fragment listener's certificate and private key. Required when `enabled`. |
+| `spec.query.distributedQuery.fragmentCaSecretRef.name` | string | none | Secret with key `ca.crt`: the CA that signed every query pod's fragment certificate. May name the same Secret as `fragmentTlsSecretRef`. Required when `enabled`. |
+| `spec.query.distributedQuery.fragmentKeySecretRef.name` | string | none | Secret with key `keys`: the fragment key file. Required when `enabled`. |
+| `spec.query.distributedQuery.sqlTicketKeySecretRef.name` | string | none | Secret with key `keys`: the SQL ticket key file. Required when `enabled`. |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
 | `spec.maintain.replicas` | integer | `1` | |
 | `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
@@ -380,6 +386,127 @@ leaves the query Deployment exactly as it is -- any existing query pods
 keep serving on their current spec -- until `auditTokenKeySecretRef` (or
 `deploymentKeySecretRef`) is set.
 
+### Distributed query
+
+`spec.query.distributedQuery` turns on distributed PromQL fan-out across the
+query replicas, over the dedicated TLS fragment listener. SQL fan-out is not
+reachable through this block yet: it runs only for a Flight SQL client, and
+the operator gives the query Deployment no `--listen-grpc`, so its Flight SQL
+service listens on loopback only, while the HTTP SQL endpoint executes every
+statement locally. SQL fan-out needs a Flight SQL client path the operator
+does not expose yet. For the same reason, the Flight SQL address each query
+pod publishes in its worker record (its pod IP on port 4317) is not
+reachable from other pods; nothing dials it while every pod runs the
+fragment listener. What the lanes do, and what each flag means, is in the
+[distributed query guide](distributed-query.md) and the
+[deployment guide](operations/deployment.md#the-dedicated-fragment-listener).
+
+```yaml
+spec:
+  query:
+    replicas: 3
+    distributedQuery:
+      enabled: true
+      fragmentTlsSecretRef:
+        name: ravel-fragment-tls
+      fragmentCaSecretRef:
+        name: ravel-fragment-tls
+      fragmentKeySecretRef:
+        name: ravel-fragment-keys
+      sqlTicketKeySecretRef:
+        name: ravel-sql-ticket-keys
+```
+
+The block expects four Secrets in the `RavelCluster`'s namespace. The
+operator only mounts them; it never reads, creates, or rotates them.
+
+| Reference | Secret keys | Mounted at | Flag |
+|---|---|---|---|
+| `fragmentTlsSecretRef` | `tls.crt`, `tls.key` | `/etc/ravel/fragment-tls/` | `--fragment-tls-cert`, `--fragment-tls-key` |
+| `fragmentCaSecretRef` | `ca.crt` | `/etc/ravel/fragment-ca/` | `--fragment-tls-ca` |
+| `fragmentKeySecretRef` | `keys` | `/etc/ravel/fragment-key/` | `--fragment-key-file` |
+| `sqlTicketKeySecretRef` | `keys` | `/etc/ravel/sql-ticket-key/` | `--sql-ticket-key-file` |
+
+The certificate needs a `ravel-fragment` dNSName SAN and both the
+`serverAuth` and `clientAuth` extended key usages, because each query pod
+presents it in both directions of the mutual handshake. A cert-manager
+`Certificate` with `dnsNames: [ravel-fragment]` and
+`usages: [server auth, client auth]`, issued by a CA issuer (cert-manager
+writes `ca.crt` only when the issuer is a CA it holds, such as a `CA` or
+self-signed issuer), writes `tls.crt`, `tls.key`, and `ca.crt` into one
+Secret, which is why both TLS references may name it. The
+two key files hold one 64-hex-character key per line; give them different
+keys:
+
+```sh
+kubectl create secret generic ravel-fragment-keys \
+  --from-literal="keys=$(openssl rand -hex 32)"
+kubectl create secret generic ravel-sql-ticket-keys \
+  --from-literal="keys=$(openssl rand -hex 32)"
+```
+
+With the block enabled and all four references set, the query Deployment
+gains these arguments, the `fragment` container port 4319, the four
+read-only Secret volumes, and a `RAVEL_POD_IP` env var from the downward API
+(`status.podIP`):
+
+```text
+--distributed-query
+--fragment-key-file /etc/ravel/fragment-key/keys
+--sql-ticket-key-file /etc/ravel/sql-ticket-key/keys
+--fragment-listener 0.0.0.0:4319
+--fragment-tls-cert /etc/ravel/fragment-tls/tls.crt
+--fragment-tls-key /etc/ravel/fragment-tls/tls.key
+--fragment-tls-ca /etc/ravel/fragment-ca/ca.crt
+--advertise-fragment-endpoint $(RAVEL_POD_IP)
+```
+
+The fragment listener binds a wildcard address, which `ravel-server` refuses
+to publish to sibling coordinators, so each pod advertises its own pod IP
+instead.
+
+The operator also applies the NetworkPolicy `<cluster>-query-fragment`,
+owned by the `RavelCluster`. It selects the query pods and has two ingress
+rules: port 4319 from the query pods of the same cluster and namespace only,
+and every other port the query container declares (4318, and 4316 under
+`spec.probes.dedicatedHealthPort`) from any source. A NetworkPolicy that
+selects a pod isolates every port on it, so the second rule is what keeps
+client and probe traffic flowing as before. A port that a sidecar or another
+injected container listens on without declaring it on the `ravel-server`
+container is not in that rule, so the policy blocks it. The policy has an
+effect only on
+a cluster whose network plugin enforces NetworkPolicy. The operator's
+ClusterRole grants `create`, `patch`, and `delete` on `networkpolicies` for
+it.
+
+`enabled: true` with any reference unset renders none of the above: the
+query Deployment renders with local-only arguments, and the `RavelCluster`
+reports `Degraded` with reason `DistributedQuerySecretRefMissing` and a
+message naming each unset field, such as
+`spec.query.distributedQuery.fragmentCaSecretRef`. Setting `enabled: false`,
+or removing the block, renders the same local-only query Deployment. Either
+way, a block that was enabled and complete rolls the query Deployment back to
+local-only arguments. The operator deletes the NetworkPolicy only after it
+has applied that query Deployment. It does not wait for the rollout, so
+while the old pods are being replaced they can still accept connections on
+port 4319 from any pod in the namespace; the fragment listener's mutual TLS
+still refuses a peer without a certificate from the fragment CA. A pass that
+holds the query Deployment back, such as one reporting
+`AuditTokenKeyMissing`, deletes no NetworkPolicy. When enabling, the policy
+is applied even in such a pass, before the held-back Deployment.
+
+Upgrading the operator to a version with this block: apply
+`deploy/k8s/operator/rbac.yaml` before rolling out the new operator image.
+The operator deletes the fragment NetworkPolicy on every reconcile of a
+cluster without the block, and without the `networkpolicies` grant that
+delete fails and stops reconciliation of every `RavelCluster`.
+
+`ravel-server` reads all four files once at startup, and their Secrets do
+not feed the pod-template secrets checksum, so editing one does not roll the
+query pods. After rotating a certificate or a key file, run
+`kubectl rollout restart deployment/<cluster>-query`, following the key
+rotation order in the deployment guide.
+
 ### Managed objects
 
 For a `RavelCluster` named `dev`:
@@ -390,7 +517,8 @@ For a `RavelCluster` named `dev`:
 | `dev-gateway` | Deployment | `--mode gateway`, RollingUpdate. |
 | `dev-gateway` | Service | Ports 4318 (HTTP/OTLP/query API) and 4317 (OTLP/gRPC). |
 | `dev-query` | Deployment | `--mode query`, RollingUpdate. |
-| `dev-query` | Service | Port 4318. |
+| `dev-query` | Service | Port 4318. The fragment port is not on the Service: coordinators dial each query pod's own IP. |
+| `dev-query-fragment` | NetworkPolicy | Admits port 4319 on the query pods only from the query pods. Only under `query.distributedQuery` enabled with every Secret reference set. |
 | `dev-maintain` | Deployment | `--mode maintain`, `spec.maintain.replicas` replicas (default 1), `RollingUpdate` strategy. Absent when `maintain.enabled` is `false`. |
 | `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
 | `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
