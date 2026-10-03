@@ -1006,3 +1006,171 @@ fn build_batch(
     let batch = RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)?;
     Ok((batch, batch_bytes))
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use datafusion::arrow::array::{Float64Array, Int64Array, UInt32Array, UInt64Array};
+    use ravel_types::SeriesId;
+
+    use super::*;
+    use crate::schema::{COL_CREATED_UNIX_NS, COL_IN_PAGE_INDEX, COL_WRITER_EPOCH, COL_WRITER_SEQ};
+
+    fn priority(created: i64, epoch: u64, seq: u64, in_page: u32) -> SamplePriority {
+        SamplePriority {
+            created_unix_ns: created,
+            writer_epoch: epoch,
+            writer_seq: seq,
+            in_page_index: in_page,
+        }
+    }
+
+    fn soa(
+        sid: u8,
+        timestamps: Vec<i64>,
+        values: Vec<f64>,
+        column: Option<Vec<SamplePriority>>,
+    ) -> FetchedSeriesSoa {
+        FetchedSeriesSoa {
+            series_id: SeriesId([sid; 16]),
+            labels: LabelSet::default(),
+            timestamps,
+            values,
+            created_unix_ns: 1,
+            writer_epoch: 1,
+            writer_seq: 1,
+            per_sample_priorities: column,
+        }
+    }
+
+    fn mismatch(priorities: usize, samples: usize) -> String {
+        ravel_query::QueryError::PrioritySampleCountMismatch {
+            priorities,
+            samples,
+        }
+        .to_string()
+    }
+
+    /// A per-sample column with fewer entries than the run has samples is
+    /// the typed mismatch, not an index past the column's end.
+    #[test]
+    fn from_soa_rejects_a_column_shorter_than_the_samples() {
+        let fs = soa(
+            1,
+            vec![10, 10, 20],
+            vec![1.0, 2.0, 3.0],
+            Some(vec![priority(5, 1, 1, 0), priority(5, 1, 2, 0)]),
+        );
+        match Run::from_soa([1; 16], fs) {
+            Err(SqlError::Internal(msg)) => assert_eq!(msg, mismatch(2, 3)),
+            Err(other) => panic!("expected the count mismatch, got {other}"),
+            Ok(run) => panic!("short column accepted, run of {}", run.len()),
+        }
+    }
+
+    /// A per-sample column with more entries than the run has samples is
+    /// the typed mismatch, not silently cut down to the samples.
+    #[test]
+    fn from_soa_rejects_a_column_longer_than_the_samples() {
+        let fs = soa(
+            1,
+            vec![10, 20],
+            vec![1.0, 2.0],
+            Some(vec![
+                priority(5, 1, 1, 0),
+                priority(5, 1, 1, 1),
+                priority(5, 1, 1, 2),
+            ]),
+        );
+        match Run::from_soa([1; 16], fs) {
+            Err(SqlError::Internal(msg)) => assert_eq!(msg, mismatch(3, 2)),
+            Err(other) => panic!("expected the count mismatch, got {other}"),
+            Ok(run) => panic!("long column accepted, run of {}", run.len()),
+        }
+    }
+
+    /// The provenance a scan batch emits never decreases inside one
+    /// `(series, ts)` group, for a per-sample run whose column arrives out
+    /// of key order and for a run-wide run of the same series merged with
+    /// it. Each row's emitted key is also the one its column holds for its
+    /// value, so the reorder moved the key with its sample.
+    #[test]
+    fn emitted_keys_never_decrease_within_a_series_ts_group() {
+        let per_sample = soa(
+            7,
+            vec![10, 10, 10, 20, 20],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0],
+            Some(vec![
+                priority(300, 2, 1, 0),
+                priority(300, 1, 9, 0),
+                priority(100, 5, 5, 0),
+                priority(200, 1, 1, 1),
+                priority(200, 1, 1, 0),
+            ]),
+        );
+        let run_wide = soa(7, vec![10, 20], vec![6.0, 7.0], None);
+        let runs = vec![
+            Run::from_soa([7; 16], per_sample).expect("parallel column"),
+            Run::from_soa([7; 16], run_wide).expect("run-wide run"),
+        ];
+        let mut merger = Merger::new(Prepared {
+            runs,
+            labels: HashMap::new(),
+        });
+        assert_eq!(merger.fill(BATCH_ROWS), 7);
+        let metrics_set = ExecutionPlanMetricsSet::new();
+        let metrics = ScanMetrics::new(&metrics_set, 0);
+        let (batch, _) = build_batch(&merger, internal_schema(), &metrics).expect("build batch");
+
+        fn column<'a, T: 'static>(batch: &'a RecordBatch, idx: usize) -> &'a T {
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<T>()
+                .expect("internal schema column type")
+        }
+        let ts = column::<TimestampNanosecondArray>(&batch, COL_TS);
+        let value = column::<Float64Array>(&batch, COL_VALUE);
+        let created = column::<Int64Array>(&batch, COL_CREATED_UNIX_NS);
+        let epoch = column::<UInt64Array>(&batch, COL_WRITER_EPOCH);
+        let seq = column::<UInt64Array>(&batch, COL_WRITER_SEQ);
+        let in_page = column::<UInt32Array>(&batch, COL_IN_PAGE_INDEX);
+        let rows: Vec<(i64, (i64, u64, u64, u32), f64)> = (0..batch.num_rows())
+            .map(|i| {
+                (
+                    ts.value(i),
+                    (
+                        created.value(i),
+                        epoch.value(i),
+                        seq.value(i),
+                        in_page.value(i),
+                    ),
+                    value.value(i),
+                )
+            })
+            .collect();
+        for pair in rows.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                assert!(
+                    pair[0].1 <= pair[1].1,
+                    "key decreased inside ts {}: {:?} then {:?}",
+                    pair[0].0,
+                    pair[0].1,
+                    pair[1].1
+                );
+            }
+        }
+        assert_eq!(
+            rows,
+            vec![
+                (10, (1, 1, 1, 0), 6.0),
+                (10, (100, 5, 5, 0), 3.0),
+                (10, (300, 1, 9, 0), 2.0),
+                (10, (300, 2, 1, 0), 1.0),
+                (20, (1, 1, 1, 1), 7.0),
+                (20, (200, 1, 1, 0), 5.0),
+                (20, (200, 1, 1, 1), 4.0),
+            ]
+        );
+    }
+}
