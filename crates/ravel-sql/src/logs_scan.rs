@@ -319,9 +319,11 @@ use ravel_catalog::{
 };
 use ravel_commit::declared_stats::{StatCarrier, observe_declared_stat_drops};
 use ravel_logseg::footer::LogFooter;
+use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{
     AttrColumn, BoolCursor, BytesCursor, ColumnSelection, ColumnarBlockView, F64BitsCursor,
-    FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, ScanStats, StrDictColumn,
+    FieldSel, FieldType, I64Cursor, LogRecord, LogSegError, Predicate, ScanStats,
+    SegmentDirectories, StrDictColumn,
 };
 use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
@@ -2801,6 +2803,7 @@ impl ExecutionPlan for LogsScanExec {
             current_indices: Vec::new(),
             current_footer: None,
             current_whole_object: None,
+            current_dirs: None,
             state,
             fetch: self.fetch,
             rows_emitted: 0,
@@ -2827,9 +2830,16 @@ struct PlanCounts {
 
 /// One relevant segment's contribution to [`PlanCounts`].
 struct SegPlan {
-    /// Blocks surviving this query's pruning; the count the block-index stripe
-    /// is computed over.
-    survivors: usize,
+    /// Whole-object block indices surviving this query's pruning, ascending
+    /// (ADR-2414 decision A1): the set [`owned_work`] deals, whole row group
+    /// by whole row group, into each partition's share.
+    indices: Vec<usize>,
+    /// This segment's directories, decoded once by the plan phase
+    /// ([`LogSegmentFetcher::plan_segment`]) and carried to every
+    /// per-partition subset open through [`OwnedSeg`] so the open reuses them
+    /// via `RlogReader::from_decoded` instead of decoding them again
+    /// (ADR-2414 decision A1).
+    dirs: Arc<SegmentDirectories>,
     /// The whole-segment prune stats ([`BlockMetrics::record_segment_totals`]
     /// consumes `blocks_total` and the postings drop). `blocks_scanned`/`pages`
     /// are zero here -- planning decodes nothing.
@@ -2879,12 +2889,15 @@ fn plan_counts_future(
     })
 }
 
-/// One segment's [`LogSegmentFetcher::plan_segment`] result: survivor count,
-/// stats, a carried footer (skip-decidable branches), and a carried
-/// whole-object body (the fallback branch, issue #835). `None` when the
-/// segment was pruned by ts bounds alone and never reached the fetcher.
+/// One segment's [`LogSegmentFetcher::plan_segment`] result: the surviving
+/// whole-object block indices and this segment's decoded directories
+/// (ADR-2414 decision A1), stats, a carried footer (skip-decidable
+/// branches), and a carried whole-object body (the fallback branch, issue
+/// #835). `None` when the segment was pruned by ts bounds alone and never
+/// reached the fetcher.
 type PlanSegmentResult = Option<(
-    usize,
+    Vec<usize>,
+    Arc<SegmentDirectories>,
     ScanStats,
     Option<LogFooter>,
     Option<CarriedWholeObject>,
@@ -2969,7 +2982,8 @@ async fn compute_plan_counts(
     let mut carried_seen = 0usize;
     while let Some((idx, entry)) = stream.next().await {
         let entry: PlanSegmentResult = entry.map_err(SqlError::from)?;
-        if let Some((survivors, stats, footer, whole_object)) = entry {
+        if let Some((indices, dirs, stats, footer, whole_object)) = entry {
+            let survivors = indices.len();
             total_blocks += survivors;
             // A relevant segment planned from the skip index carries its
             // footer forward; the whole-object fallback (#761) carries none.
@@ -2996,7 +3010,8 @@ async fn compute_plan_counts(
                 _ => None,
             };
             segs[idx] = Some(SegPlan {
-                survivors,
+                indices,
+                dirs,
                 stats,
                 footer,
                 whole_object,
@@ -3037,25 +3052,63 @@ struct OwnedSeg {
     /// `None` whenever [`SegPlan::whole_object`] was `None`, and always
     /// `None` on the whole-segment fast path (no plan phase).
     whole_object: Option<CarriedWholeObject>,
+    /// This segment's directories, decoded once by the plan phase (ADR-2414
+    /// decision A1), carried to the subset open so it reuses them instead of
+    /// decoding them again. `None` only on the whole-segment fast path (no
+    /// plan phase ever runs there).
+    dirs: Option<Arc<SegmentDirectories>>,
+}
+
+/// Groups `indices` (a segment's surviving whole-object block indices,
+/// ascending) into whole row groups by `page_dir`'s own group boundaries, so
+/// [`owned_work`] can deal a row group's blocks to one partition as a unit
+/// (ADR-2414 decision A1) instead of splitting it across partitions. Indices
+/// are ascending and row groups are contiguous ranges of block numbers, so
+/// consecutive indices mapping to the same group's `first_block` are always
+/// one unbroken run. A block [`PageDir::locate_block`] cannot place (it
+/// should not happen: PAGE_DIR is validated at decode time to cover every
+/// block the segment's footer declares) keeps its own singleton group rather
+/// than joining one it does not belong to.
+fn row_groups(indices: &[usize], page_dir: &PageDir) -> Vec<Vec<usize>> {
+    let mut groups: Vec<(Option<u32>, Vec<usize>)> = Vec::new();
+    for &idx in indices {
+        let block = u32::try_from(idx).unwrap_or(u32::MAX);
+        let first_block = page_dir.locate_block(block).map(|(g, _)| g.first_block);
+        match groups.last_mut() {
+            Some((cur, items)) if *cur == first_block => items.push(idx),
+            _ => groups.push((first_block, vec![idx])),
+        }
+    }
+    groups.into_iter().map(|(_, items)| items).collect()
 }
 
 /// This partition's share of the block assignment, in one of two modes
 /// (ADR-0102, amended by #693), both with `n = target_partitions.max(1).
 /// min(total.max(1))`.
 ///
-/// - **`stripe_blocks` true** (a read cache is wired): the flattened block
-///   assignment. Unit `i` in the segment-then-block order over all surviving
-///   blocks goes to partition `i % n`, so a segment's blocks stripe across
-///   partitions and single-flight coalesces the re-opens.
+/// - **`stripe_blocks` true** (a read cache is wired): the flattened
+///   row-group assignment (ADR-2414 decision A1). Each segment's surviving
+///   blocks are grouped into whole row groups by [`row_groups`], and group
+///   `i` in the segment-then-group order over all surviving row groups goes
+///   to partition `i % n` -- every block of a row group to the same
+///   partition, never split. Dealing by group rather than by block is what
+///   deliverable 2 requires: a row group's column chunks and dictionary
+///   pages are decoded together, so splitting one across partitions would
+///   make more than one partition decode (and charge `decompressed_bytes`
+///   for) the same chunk. Round-robin over groups, not blocks, stays
+///   balanced in practice because PAGE_DIR groups are uniform-sized by
+///   construction (`group_target_blocks`, default 32) except each segment's
+///   own last, possibly partial, group -- the same bound the old
+///   per-block round robin had on its own last partial pass over `n`.
 /// - **`stripe_blocks` false** (un-cached): the segment-granular assignment.
 ///   Counting only segments with a surviving block, in snapshot order, segment
 ///   `j` goes to partition `j % n` and that partition drains all of the
-///   segment's surviving block indices (`0..survivors`). Each segment is opened
+///   segment's surviving block indices. Each segment is opened
 ///   by exactly one partition, so with nothing to coalesce re-opens the scan
 ///   still costs one read per segment rather than one per partition per segment.
 ///
-/// Returns, per owned segment, the surviving-block indices this partition
-/// drains, in ascending order.
+/// Returns, per owned segment, the surviving whole-object block indices this
+/// partition drains, in ascending order.
 fn owned_work(
     counts: &PlanCounts,
     segments: &[SegmentRef],
@@ -3065,16 +3118,19 @@ fn owned_work(
 ) -> VecDeque<OwnedSeg> {
     let mut work = VecDeque::new();
     if stripe_blocks {
-        let mut global = 0usize;
+        let mut global_group = 0usize;
         for (seg_idx, plan) in counts.segs.iter().enumerate() {
             let Some(plan) = plan else { continue };
-            let mut indices = Vec::new();
-            for local in 0..plan.survivors {
-                if (global + local) % n == partition {
-                    indices.push(local);
-                }
+            if plan.indices.is_empty() {
+                continue;
             }
-            global += plan.survivors;
+            let mut indices = Vec::new();
+            for group in row_groups(&plan.indices, plan.dirs.page_dir()) {
+                if global_group % n == partition {
+                    indices.extend(group);
+                }
+                global_group += 1;
+            }
             if !indices.is_empty() {
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
@@ -3082,6 +3138,7 @@ fn owned_work(
                     indices,
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
+                    dirs: Some(Arc::clone(&plan.dirs)),
                 });
             }
         }
@@ -3089,16 +3146,17 @@ fn owned_work(
         let mut seg_ordinal = 0usize;
         for (seg_idx, plan) in counts.segs.iter().enumerate() {
             let Some(plan) = plan else { continue };
-            if plan.survivors == 0 {
+            if plan.indices.is_empty() {
                 continue;
             }
             if seg_ordinal % n == partition {
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
                     ordinal: seg_idx,
-                    indices: (0..plan.survivors).collect(),
+                    indices: plan.indices.clone(),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
+                    dirs: Some(Arc::clone(&plan.dirs)),
                 });
             }
             seg_ordinal += 1;
@@ -3138,6 +3196,7 @@ fn owned_whole_segments(
                 indices: Vec::new(),
                 footer: None,
                 whole_object: None,
+                dirs: None,
             });
         }
         ordinal += 1;
@@ -3287,7 +3346,9 @@ fn refuse_unreadable_version(seg: &SegmentRef) -> Result<(), SqlError> {
 type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> + Send>>;
 
 /// Fetch one segment's bytes and open its pruned, column-projected scan
-/// restricted to the surviving-block positions in `indices` (ADR-0102).
+/// restricted to the whole-object block indices in `indices` (ADR-2414
+/// decision A1: `owned_work` deals whole row groups, so these are raw block
+/// indices, not ordinal survivor positions).
 /// `Ok(None)` means the catalog summary proved the segment irrelevant, with no
 /// GET issued -- which cannot happen for a segment that was already counted
 /// with survivors, but is handled as end-of-segment rather than panicking.
@@ -3297,12 +3358,13 @@ fn open_segment_subset(
     indices: Vec<usize>,
     footer: Option<LogFooter>,
     whole_object: Option<CarriedWholeObject>,
+    dirs: Option<Arc<SegmentDirectories>>,
 ) -> OpenFuture {
     Box::pin(async move {
         refuse_unreadable_version(&seg)?;
         let scan = ctx
             .fetcher
-            .scan_accounted_with_tenant_subset(
+            .scan_accounted_with_tenant_subset_raw(
                 &seg,
                 ctx.tenant_hash,
                 &ctx.query,
@@ -3310,6 +3372,7 @@ fn open_segment_subset(
                 &indices,
                 footer.as_ref(),
                 whole_object,
+                dirs.as_ref(),
                 ctx.phase_accounting.scan(),
             )
             .await
@@ -3656,6 +3719,11 @@ struct LogScanStream {
     /// those opens were charged under as cache hits before this carry existed.
     /// The memory bound is unaffected: `Bytes` clones share one allocation.
     current_whole_object: Option<CarriedWholeObject>,
+    /// This segment's directories, decoded once by the plan phase (ADR-2414
+    /// decision A1), kept so the `attrs_raw` fallback re-opens the subset
+    /// through the same reused decode rather than a fresh one. `None` on the
+    /// whole-segment fast path (no plan phase).
+    current_dirs: Option<Arc<SegmentDirectories>>,
     state: LogScanState,
     /// The `fetch` pushed into the exec (issue #362), carried unchanged from
     /// [`LogsScanExec::fetch`]. `None` means this stream drains every segment
@@ -3972,11 +4040,13 @@ impl LogScanStream {
                         indices,
                         footer,
                         whole_object,
+                        dirs,
                     }) => {
                         this.current_seg = Some(seg.clone());
                         this.current_seg_ordinal = ordinal;
                         this.current_indices = indices.clone();
                         this.current_footer = footer.clone();
+                        this.current_dirs = dirs.clone();
                         // Moved, not cloned: this stream consumes the carried
                         // whole object exactly once, by whichever open below
                         // `take()`s it first. A later `ReopenRows` reopen
@@ -4023,6 +4093,7 @@ impl LogScanStream {
                                 indices,
                                 footer,
                                 whole_object,
+                                dirs,
                             ))
                         };
                     }
@@ -4222,6 +4293,7 @@ impl LogScanStream {
                                     this.current_indices.clone(),
                                     this.current_footer.clone(),
                                     this.current_whole_object.take(),
+                                    this.current_dirs.clone(),
                                 )
                             };
                             this.blocks.reopens.add(1);

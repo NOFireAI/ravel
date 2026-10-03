@@ -886,14 +886,16 @@ impl LogSegmentFetcher {
         self
     }
 
-    /// Opens the pruned scan over `bytes` ([`open_scan`](Self::open_scan), or
-    /// [`open_scan_subset`](Self::open_scan_subset) when `indices` is set)
-    /// inside `span`. With a read gate set the open is one `log_postings` job
-    /// (ADR-1702 decision 4): it decodes the directory sections and probes
-    /// POSTINGS, which `RlogReader::scan_blocks` runs internally, so the probe
-    /// cannot be a job of its own from this crate. With `block_sizes` the job
-    /// also reads the job size of each later block decode; without a gate that
-    /// size is 0 and unread.
+    /// Opens the pruned scan over `bytes` ([`open_scan`](Self::open_scan), or,
+    /// when `indices` is set, [`open_scan_subset`](Self::open_scan_subset) for
+    /// ordinal survivor positions or
+    /// [`open_scan_raw_subset`](Self::open_scan_raw_subset) for whole-object
+    /// block indices depending on `raw`) inside `span`. With a read gate set
+    /// the open is one `log_postings` job (ADR-1702 decision 4): it decodes
+    /// the directory sections and probes POSTINGS, which `RlogReader::scan_blocks`
+    /// runs internally, so the probe cannot be a job of its own from this
+    /// crate. With `block_sizes` the job also reads the job size of each
+    /// later block decode; without a gate that size is 0 and unread.
     #[allow(clippy::too_many_arguments)]
     async fn open_scan_on_gate(
         &self,
@@ -902,6 +904,7 @@ impl LogSegmentFetcher {
         query: &LogQuery,
         columns: &ColumnSelection,
         indices: Option<&[usize]>,
+        raw: bool,
         block_sizes: bool,
         accounting: &QueryAccounting,
         span: &tracing::Span,
@@ -909,6 +912,9 @@ impl LogSegmentFetcher {
         let Some(gate) = &self.read_gate else {
             let scan = span.in_scope(|| match indices {
                 None => self.open_scan(key, bytes, query, columns, accounting),
+                Some(indices) if raw => {
+                    self.open_scan_raw_subset(key, bytes, query, columns, indices, accounting)
+                }
                 Some(indices) => {
                     self.open_scan_subset(key, bytes, query, columns, indices, accounting)
                 }
@@ -929,12 +935,126 @@ impl LogSegmentFetcher {
                 let (key, bytes) = (job_key.as_str(), &job_bytes);
                 let scan = match &indices {
                     None => fetcher.open_scan(key, bytes, &query, &columns, &accounting),
+                    Some(indices) if raw => fetcher.open_scan_raw_subset(
+                        key,
+                        bytes,
+                        &query,
+                        &columns,
+                        indices,
+                        &accounting,
+                    ),
                     Some(indices) => {
                         fetcher.open_scan_subset(key, bytes, &query, &columns, indices, &accounting)
                     }
                 }?;
                 let block_job_bytes = if block_sizes {
                     max_block_uncompressed_len(bytes, &fetcher.cfg, &accounting)
+                } else {
+                    0
+                };
+                Ok((scan, block_job_bytes))
+            })
+        })
+        .await
+        .map_err(|err| log_gate_failed(key, err))?
+    }
+
+    /// [`open_scan_on_gate`](Self::open_scan_on_gate), specialized to the shape
+    /// [`plan_segment`](Self::plan_segment)'s fallback branch needs: no index
+    /// restriction, no block-size probe, and the open's decoded
+    /// [`SegmentDirectories`] returned alongside the scan so the fallback can
+    /// carry them forward for later per-partition opens of this segment to
+    /// reuse via [`RlogReader::from_decoded`] instead of decoding them again
+    /// (ADR-2414 decision A1).
+    async fn open_scan_on_gate_with_directories(
+        &self,
+        key: &str,
+        bytes: &LogObjectBytes,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+        span: &tracing::Span,
+    ) -> Result<(BlockScan, Arc<SegmentDirectories>), LogFetchError> {
+        let Some(gate) = &self.read_gate else {
+            return span.in_scope(|| {
+                self.open_scan_with_directories(key, bytes, query, columns, accounting)
+            });
+        };
+        let size = JobSize::Bytes(open_job_len(bytes, false));
+        let fetcher = self.clone();
+        let job_key = key.to_string();
+        let job_bytes = bytes.clone();
+        let query = query.clone();
+        let columns = columns.clone();
+        let accounting = accounting.clone();
+        let span = span.clone();
+        gate.run(ReadSite::LogPostings, size, move || {
+            span.in_scope(|| {
+                fetcher.open_scan_with_directories(
+                    job_key.as_str(),
+                    &job_bytes,
+                    &query,
+                    &columns,
+                    &accounting,
+                )
+            })
+        })
+        .await
+        .map_err(|err| log_gate_failed(key, err))?
+    }
+
+    /// [`open_scan_on_gate`](Self::open_scan_on_gate)'s raw-subset case, reusing
+    /// an already-decoded [`SegmentDirectories`] via
+    /// [`open_scan_raw_subset_with_decoded`](Self::open_scan_raw_subset_with_decoded)
+    /// instead of decoding the directories again (ADR-2414 decision A1): the
+    /// striped route's per-partition open of a segment the plan phase already
+    /// opened once. The block-size job the gate gives each later block decode
+    /// is read from the already-decoded `PageDir`
+    /// ([`max_block_uncompressed_len_from_page_dir`]), never a third decode.
+    #[allow(clippy::too_many_arguments)]
+    async fn open_scan_on_gate_from_decoded(
+        &self,
+        key: &str,
+        bytes: &LogObjectBytes,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        indices: &[usize],
+        dirs: &Arc<SegmentDirectories>,
+        block_sizes: bool,
+        span: &tracing::Span,
+    ) -> Result<(BlockScan, u64), LogFetchError> {
+        let Some(gate) = &self.read_gate else {
+            let scan = span.in_scope(|| {
+                self.open_scan_raw_subset_with_decoded(key, bytes, query, columns, indices, dirs)
+            })?;
+            let block_job_bytes = if block_sizes {
+                max_block_uncompressed_len_from_page_dir(dirs.page_dir())
+            } else {
+                0
+            };
+            return Ok((scan, block_job_bytes));
+        };
+        let size = JobSize::Bytes(open_job_len(bytes, block_sizes));
+        let fetcher = self.clone();
+        let job_key = key.to_string();
+        let job_bytes = bytes.clone();
+        let query = query.clone();
+        let columns = columns.clone();
+        let indices = indices.to_vec();
+        let dirs = Arc::clone(dirs);
+        let span = span.clone();
+        gate.run(ReadSite::LogPostings, size, move || {
+            span.in_scope(|| {
+                let scan = fetcher.open_scan_raw_subset_with_decoded(
+                    job_key.as_str(),
+                    &job_bytes,
+                    &query,
+                    &columns,
+                    &indices,
+                    &dirs,
+                )?;
+                let block_job_bytes = if block_sizes {
+                    max_block_uncompressed_len_from_page_dir(dirs.page_dir())
                 } else {
                     0
                 };
@@ -1259,14 +1379,7 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Vec<LogStreamId>, LogSegError> {
         let dir = self.decode_stream_dir(bytes, accounting)?;
-        let needles: Vec<Vec<u8>> = filters.iter().map(stream_attr_needle).collect();
-        let mut out = Vec::new();
-        for entry in dir.entries() {
-            if needles.iter().all(|n| blob_contains(&entry.blob, n)) {
-                out.push(entry.stream_id);
-            }
-        }
-        Ok(out)
+        Ok(matching_streams_in(&dir, filters))
     }
 
     /// Fetches, prunes, and scans one segment for records matching `query`.
@@ -1534,7 +1647,9 @@ impl LogSegmentFetcher {
         let key = &seg_ref.data_object_key;
         let span = decode_span();
         let (scan, block_job_bytes) = self
-            .open_scan_on_gate(key, &bytes, query, columns, None, true, accounting, &span)
+            .open_scan_on_gate(
+                key, &bytes, query, columns, None, false, true, accounting, &span,
+            )
             .await?;
         Ok(Some(self.scan_handle(
             key,
@@ -1591,7 +1706,9 @@ impl LogSegmentFetcher {
         let key = &seg_ref.data_object_key;
         let span = decode_span();
         let (scan, block_job_bytes) = self
-            .open_scan_on_gate(key, &bytes, query, columns, None, true, accounting, &span)
+            .open_scan_on_gate(
+                key, &bytes, query, columns, None, false, true, accounting, &span,
+            )
             .await?;
         Ok(Some(self.scan_handle(
             key,
@@ -1654,7 +1771,8 @@ impl LogSegmentFetcher {
         caller_accounting: &QueryAccounting,
     ) -> Result<
         Option<(
-            usize,
+            Vec<usize>,
+            Arc<SegmentDirectories>,
             ScanStats,
             Option<footer::LogFooter>,
             Option<CarriedWholeObject>,
@@ -1691,14 +1809,15 @@ impl LogSegmentFetcher {
                 && query.ts_min_ns <= seg_ref.min_event_ts_ns
                 && seg_ref.max_event_ts_ns <= query.ts_max_ns
             {
-                let (n, stats, footer) = self
+                let (indices, dirs, stats, footer) = self
                     .plan_segment_fast(seg_ref, tenant_hash, accounting)
                     .await?;
                 // Footer-carrying branch: no block byte is read here, so the
                 // touch is the scan that follows a nonzero survivor count.
                 // No whole-object bytes to carry either: this branch reads
                 // only the footer, never a block.
-                return Ok(Some((n, stats, Some(footer), n > 0, None)));
+                let touched = !indices.is_empty();
+                return Ok(Some((indices, dirs, stats, Some(footer), touched, None)));
             }
 
             // Skip-index-only survivor count (#761): when every block-level predicate
@@ -1731,9 +1850,14 @@ impl LogSegmentFetcher {
                     s3_bytes = tracing::field::Empty,
                     probe_misses = tracing::field::Empty,
                 );
-                let (footer, skip, field_dir, stats) = async {
+                // ADR-2414 decision A1: decode all four directories here, not
+                // just SKIP_IDX + FIELD_DIR -- this branch's segment is still
+                // opened per-partition by the striped route when
+                // `segment_count < target_partitions`, and that open must
+                // reuse the decode rather than repeat it.
+                let (footer, dirs, stats) = async {
                     self.block_range
-                        .fetch_plan_sections(seg_ref, tenant_hash, accounting)
+                        .fetch_plan_directories(seg_ref, tenant_hash, accounting)
                         .await
                 }
                 .instrument(fetch_span.clone())
@@ -1746,13 +1870,18 @@ impl LogSegmentFetcher {
                 // this plan phase. A nonzero value here is the extra request a
                 // too-small derivation costs.
                 self.record_probe_misses(&fetch_span, &stats, ProbePhase::Plan);
+                accounting.add_decompressed_bytes(dirs.open_decompressed_bytes());
 
                 let refs: Vec<&Predicate> = query.prune.iter().collect();
-                let numeric = field_dir.numeric_range_arms(&refs);
-                let survivors = skip
-                    .candidate_blocks(query.ts_min_ns, query.ts_max_ns, None, &numeric)
-                    .len();
-                let blocks = skip.l0.len() as u32;
+                let numeric = dirs.field_dir().numeric_range_arms(&refs);
+                let indices = dirs.skip_index().candidate_blocks(
+                    query.ts_min_ns,
+                    query.ts_max_ns,
+                    None,
+                    &numeric,
+                );
+                let survivors = indices.len();
+                let blocks = dirs.skip_index().l0.len() as u32;
                 let plan_stats = ScanStats {
                     blocks_total: blocks,
                     blocks_after_skip: survivors as u32,
@@ -1767,12 +1896,13 @@ impl LogSegmentFetcher {
                     bloom_degraded: false,
                     postings_degraded: false,
                 };
-                // Footer-carrying branch: only the probe, SKIP_IDX and FIELD_DIR
-                // were read, no block byte, so the touch is the scan a nonzero
-                // survivor count will drive. No whole-object bytes either, for
-                // the same reason as the fast path above.
+                // Footer-carrying branch: only the probe and the four
+                // directories were read, no BLOCKS byte, so the touch is the
+                // scan a nonzero survivor count will drive. No whole-object
+                // bytes either, for the same reason as the fast path above.
                 return Ok(Some((
-                    survivors,
+                    indices,
+                    dirs,
                     plan_stats,
                     Some(footer),
                     survivors > 0,
@@ -1808,8 +1938,12 @@ impl LogSegmentFetcher {
             };
             let key = &seg_ref.data_object_key;
             let span = decode_span();
-            let (scan, _) = self
-                .open_scan_on_gate(key, &bytes, query, &all, None, false, accounting, &span)
+            // ADR-2414 decision A1: capture the directories this open decoded
+            // (over the fetched buffer) so a later per-partition open of this
+            // segment reuses them via `RlogReader::from_decoded` instead of
+            // decoding a second time.
+            let (scan, dirs) = self
+                .open_scan_on_gate_with_directories(key, &bytes, query, &all, accounting, &span)
                 .await?;
             // Opening the scan decoded the four directory sections over the
             // fetched buffer (and ran the POSTINGS probe for an eligible prune
@@ -1844,7 +1978,8 @@ impl LogSegmentFetcher {
                 Some(_) => None,
             };
             Ok(Some((
-                scan.remaining_blocks(),
+                scan.survivor_block_indices(),
+                dirs,
                 scan.stats(),
                 None,
                 touched,
@@ -1892,13 +2027,15 @@ impl LogSegmentFetcher {
         // fallback from whether `tenant_bytes` read any block (contract:
         // `ravel_types::accounting`, blocks read are cache-inclusive, so the
         // signal is resolved blocks, never wire bytes).
-        if let Ok(Some((_, _, _, touched, _))) = &result
+        if let Ok(Some((_, _, _, _, touched, _))) = &result
             && *touched
         {
             caller_accounting.add_data_objects_touched(1);
         }
         result.map(|opt| {
-            opt.map(|(survivors, stats, footer, _, carried)| (survivors, stats, footer, carried))
+            opt.map(|(indices, dirs, stats, footer, _, carried)| {
+                (indices, dirs, stats, footer, carried)
+            })
         })
     }
 
@@ -1962,12 +2099,28 @@ impl LogSegmentFetcher {
     /// well-formed object: both are stamped from the writer's one-entry-per-block
     /// `block_spans` counter (see the `footer_block_count_matches_unpruned_\
     /// blocks_total` round-trip proof in `ravel-logseg`).
+    /// ADR-2414 decision A1: reads and decodes all four footer directories
+    /// (not just the footer [`fetch_footer`](BlockRangeFetcher::fetch_footer)
+    /// alone would read), so the returned [`SegmentDirectories`] is ready for
+    /// every later open of this segment within the query to reuse via
+    /// [`RlogReader::from_decoded`] -- this branch's segment is still opened
+    /// per-partition by the striped route when `segment_count <
+    /// target_partitions`, and that open must not decode the directories
+    /// again.
     async fn plan_segment_fast(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         accounting: &QueryAccounting,
-    ) -> Result<(usize, ScanStats, footer::LogFooter), LogFetchError> {
+    ) -> Result<
+        (
+            Vec<usize>,
+            Arc<SegmentDirectories>,
+            ScanStats,
+            footer::LogFooter,
+        ),
+        LogFetchError,
+    > {
         // The `page_fetch` phase span the slow path also carries, so the trace
         // shows the probe this path issues. `s3_bytes` reports block bytes only
         // (zero here, matching the slow path's block-range branch convention);
@@ -1979,9 +2132,9 @@ impl LogSegmentFetcher {
             s3_bytes = tracing::field::Empty,
             probe_misses = tracing::field::Empty,
         );
-        let (footer, stats) = async {
+        let (footer, dirs, stats) = async {
             self.block_range
-                .fetch_footer(seg_ref, tenant_hash, accounting)
+                .fetch_plan_directories(seg_ref, tenant_hash, accounting)
                 .await
         }
         .instrument(fetch_span.clone())
@@ -1998,6 +2151,10 @@ impl LogSegmentFetcher {
             source: LogSegError::Corrupted("footer block_count out of range".into()),
         })?;
         let blocks = footer.block_count as u32;
+        // The directory decode just performed is charged here, the one place
+        // it happened (ADR-2414 decision A1): every per-partition open of this
+        // segment that follows reuses `dirs` and decodes nothing more.
+        accounting.add_decompressed_bytes(dirs.open_decompressed_bytes());
         let plan_stats = ScanStats {
             blocks_total: blocks,
             blocks_after_skip: blocks,
@@ -2012,7 +2169,10 @@ impl LogSegmentFetcher {
             bloom_degraded: false,
             postings_degraded: false,
         };
-        Ok((n, plan_stats, footer))
+        // Every block survives (the fast path's containment check proved it),
+        // so the raw whole-object block index equals the ordinal position.
+        let raw_indices: Vec<usize> = (0..n).collect();
+        Ok((raw_indices, dirs, plan_stats, footer))
     }
 
     /// Report this segment's exact per-block record counts and per-numeric-column
@@ -2130,18 +2290,21 @@ impl LogSegmentFetcher {
     }
 
     /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant),
-    /// restricted to the surviving blocks at the positions in `indices`
-    /// (intra-segment scan partitioning, ADR-0102). Same GET, same cache, same
-    /// pruning; the returned [`LogSegmentScan`] drains only the named subset of
-    /// the segment's surviving blocks, in the order given.
+    /// restricted to the blocks named in `indices` (intra-segment scan
+    /// partitioning, ADR-0102). Same GET, same cache, same pruning; the
+    /// returned [`LogSegmentScan`] drains only the named subset of the
+    /// segment's surviving blocks.
     ///
-    /// `indices` index into the ordered survivor list this query's pruning
-    /// produces over this (immutable) object, the same list a prior
-    /// [`plan_segment`](Self::plan_segment) counted, so a partition hands the
-    /// exact positions it was assigned. The returned scan's whole-segment stats
-    /// totals are reported by [`plan_segment`] instead, to keep one segment's
-    /// totals from being counted once per partition (see `ravel_sql::
-    /// logs_scan`).
+    /// `indices` are whole-object block indices (ADR-2414 decision A1), the
+    /// partition's share of the segment's row groups as
+    /// `ravel_sql::logs_scan::owned_work` deals them, not ordinal positions
+    /// into a survivor list: a row group is dealt whole, so the partition's
+    /// raw block indices are known before this query's own pruning runs over
+    /// this object and cannot be expressed as positions into a pruning result
+    /// that has not run yet. The returned scan's whole-segment stats totals
+    /// are reported by [`plan_segment`](Self::plan_segment) instead, to keep
+    /// one segment's totals from being counted once per partition (see
+    /// `ravel_sql::logs_scan`).
     ///
     /// `footer`, when `Some`, is the [`footer::LogFooter`] a prior
     /// [`plan_segment`](Self::plan_segment) fast path already read for this exact
@@ -2161,6 +2324,11 @@ impl LogSegmentFetcher {
     ///
     /// [`scan_accounted_with_tenant`]: Self::scan_accounted_with_tenant
     ///
+    /// `indices` are ordinal positions into this object's survivor list (a
+    /// row-ref's recorded position, ADR-0774). See
+    /// [`scan_accounted_with_tenant_subset_raw`](Self::scan_accounted_with_tenant_subset_raw)
+    /// for the whole-object-block-index counterpart.
+    ///
     /// Issue #796: `scan` phase, same reasoning and the same not-buffered
     /// `accounting` handling as
     /// [`scan_accounted_with_tenant`](Self::scan_accounted_with_tenant)'s doc
@@ -2177,6 +2345,83 @@ impl LogSegmentFetcher {
         carried_whole: Option<CarriedWholeObject>,
         accounting: &QueryAccounting,
     ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        self.scan_accounted_with_tenant_subset_impl(
+            seg_ref,
+            tenant_hash,
+            query,
+            columns,
+            indices,
+            false,
+            footer,
+            carried_whole,
+            None,
+            accounting,
+        )
+        .await
+    }
+
+    /// [`scan_accounted_with_tenant_subset`](Self::scan_accounted_with_tenant_subset),
+    /// but `indices` names whole-object block indices (ADR-2414 decision A1):
+    /// the partition's share of a segment's row groups as
+    /// `ravel_sql::logs_scan::owned_work` deals them, known before this
+    /// query's own pruning runs over this object and so not expressible as
+    /// positions into a pruning result that does not exist yet.
+    ///
+    /// `dirs`, when `Some`, is the [`SegmentDirectories`] a prior
+    /// [`plan_segment`](Self::plan_segment) already decoded for this exact
+    /// object: the open reuses them via [`RlogReader::from_decoded`] instead
+    /// of decoding STREAM_DIR, FIELD_DIR, SKIP_IDX, and PAGE_DIR again
+    /// (ADR-2414 decision A1). `None` decodes as before.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn scan_accounted_with_tenant_subset_raw(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        indices: &[usize],
+        footer: Option<&footer::LogFooter>,
+        carried_whole: Option<CarriedWholeObject>,
+        dirs: Option<&Arc<SegmentDirectories>>,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        self.scan_accounted_with_tenant_subset_impl(
+            seg_ref,
+            tenant_hash,
+            query,
+            columns,
+            indices,
+            true,
+            footer,
+            carried_whole,
+            dirs,
+            accounting,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn scan_accounted_with_tenant_subset_impl(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        indices: &[usize],
+        raw: bool,
+        footer: Option<&footer::LogFooter>,
+        carried_whole: Option<CarriedWholeObject>,
+        dirs: Option<&Arc<SegmentDirectories>>,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<LogSegmentScan>, LogFetchError> {
+        // `indices` is only raw whole-object block indices when `raw` holds
+        // (ADR-2414 decision A1 deliverable 3): the ordinal case's indices are
+        // positions into the pruned survivor list, a different index space
+        // that must never restrict the object-level candidate set below.
+        let owned_blocks = raw.then(|| OwnedBlocks {
+            blocks: indices,
+            dirs: dirs.map(|d| &**d),
+        });
         let Some((bytes, _blocks_read)) = self
             .tenant_bytes_with_footer(
                 seg_ref,
@@ -2185,6 +2430,7 @@ impl LogSegmentFetcher {
                 columns,
                 footer,
                 carried_whole,
+                owned_blocks,
                 ProbePhase::Scan,
                 accounting,
             )
@@ -2194,18 +2440,28 @@ impl LogSegmentFetcher {
         };
         let key = &seg_ref.data_object_key;
         let span = decode_span();
-        let (scan, block_job_bytes) = self
-            .open_scan_on_gate(
-                key,
-                &bytes,
-                query,
-                columns,
-                Some(indices),
-                true,
-                accounting,
-                &span,
-            )
-            .await?;
+        let (scan, block_job_bytes) = match dirs {
+            Some(dirs) if raw => {
+                self.open_scan_on_gate_from_decoded(
+                    key, &bytes, query, columns, indices, dirs, true, &span,
+                )
+                .await?
+            }
+            _ => {
+                self.open_scan_on_gate(
+                    key,
+                    &bytes,
+                    query,
+                    columns,
+                    Some(indices),
+                    raw,
+                    true,
+                    accounting,
+                    &span,
+                )
+                .await?
+            }
+        };
         Ok(Some(self.scan_handle(
             key,
             bytes,
@@ -2253,6 +2509,7 @@ impl LogSegmentFetcher {
             columns,
             None,
             None,
+            None,
             phase,
             accounting,
         )
@@ -2295,6 +2552,14 @@ impl LogSegmentFetcher {
     /// re-check: see [`CarriedWholeObject`]'s doc. A carry whose own
     /// `(key, tenant)` is not this call's is rejected as
     /// [`LogFetchError::CarryMismatch`] before any decode.
+    ///
+    /// `owned_blocks`, when `Some` (ADR-2414 decision A1 deliverable 3), is
+    /// the caller's own raw whole-object block indices: the striped route's
+    /// per-partition subset open passes its `owned_work` share so the
+    /// above-threshold ranged read covers only those blocks, through
+    /// [`BlockRangeFetcher::fetch_object_with_footer_subset`]. A caller with
+    /// no such list (every other funnel here) passes `None`, the unchanged
+    /// behavior.
     #[allow(clippy::too_many_arguments)]
     async fn tenant_bytes_with_footer(
         &self,
@@ -2304,6 +2569,7 @@ impl LogSegmentFetcher {
         columns: &ColumnSelection,
         footer: Option<&footer::LogFooter>,
         carried_whole: Option<CarriedWholeObject>,
+        owned_blocks: Option<OwnedBlocks<'_>>,
         phase: ProbePhase,
         accounting: &QueryAccounting,
     ) -> Result<Option<(LogObjectBytes, Option<u64>)>, LogFetchError> {
@@ -2349,24 +2615,19 @@ impl LogSegmentFetcher {
             );
             // What the plan read that produced this footer already counted
             // (#883, issue #885 review). `plan_segment` has exactly two
-            // footer-carrying branches and they are mutually exclusive on the
-            // same predicate this asks: the fast path requires
-            // `is_block_predicate_free` (an empty `prune`), while
-            // `plan_skip_decidable` requires a non-empty all-NumRange `prune`.
-            // So a footer carried for this (segment, query) pair came from
-            // `fetch_plan_sections`, which counted the tail sections, exactly
-            // when `plan_skip_decidable` holds, and from `fetch_footer`, which
-            // counted nothing about them, otherwise. Asking the predicate
-            // `plan_segment` itself branches on keeps the two from drifting
-            // apart, and any answer this cannot place falls to `false`, the
-            // direction that counts a miss rather than hiding one.
+            // footer-carrying branches, and since ADR-2414 decision A1 both
+            // read the segment's directories through
+            // `fetch_plan_directories` / `fetch_plan_sections`, which count the
+            // SKIP_IDX and PAGE_DIR probe misses into the plan phase. A footer
+            // carried for this (segment, query) pair therefore always
+            // arrives with its tail misses already counted.
             let carried = footer.map(|f| CarriedFooter {
                 footer: f,
-                tail_misses_counted: Self::plan_skip_decidable(query),
+                tail_misses_counted: true,
             });
             let (bytes, stats) = async {
                 self.block_range
-                    .fetch_object_with_footer(
+                    .fetch_object_with_footer_subset(
                         seg_ref,
                         tenant_hash,
                         query.ts_min_ns,
@@ -2375,6 +2636,7 @@ impl LogSegmentFetcher {
                         columns,
                         carried,
                         phases,
+                        owned_blocks,
                         accounting,
                     )
                     .await
@@ -2657,6 +2919,7 @@ impl LogSegmentFetcher {
                 query,
                 &ColumnSelection::all(),
                 None,
+                false,
                 true,
                 accounting,
                 span,
@@ -2796,7 +3059,8 @@ impl LogSegmentFetcher {
     /// the set of blocks the returned cursor will drain differs. `indices`
     /// index into the same ordered survivor list `open_scan` would produce over
     /// this (immutable) object, so they line up with a prior
-    /// [`plan_segment`](Self::plan_segment) count.
+    /// [`plan_segment`](Self::plan_segment) count or a row-ref's recorded
+    /// position (ADR-0774).
     fn open_scan_subset(
         &self,
         key: &str,
@@ -2812,6 +3076,77 @@ impl LogSegmentFetcher {
         reader
             .scan_blocks_subset(&pred, &query.prune, columns, indices)
             .map_err(|source| corrupt(key, source))
+    }
+
+    /// [`open_scan_subset`](Self::open_scan_subset), but `indices` names
+    /// whole-object block indices (ADR-2414 decision A1), not ordinal survivor
+    /// positions: the partition's share of a segment's row groups as
+    /// `ravel_sql::logs_scan::owned_work` deals them, known before this query's
+    /// own pruning runs over this object and so not expressible as positions
+    /// into a pruning result that does not exist yet.
+    fn open_scan_raw_subset(
+        &self,
+        key: &str,
+        bytes: &LogObjectBytes,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        indices: &[usize],
+        accounting: &QueryAccounting,
+    ) -> Result<BlockScan, LogFetchError> {
+        let pred = self.combined_predicate(key, bytes, query, accounting)?;
+        let reader =
+            RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        reader
+            .scan_blocks_raw_subset(&pred, &query.prune, columns, indices)
+            .map_err(|source| corrupt(key, source))
+    }
+
+    /// [`open_scan_raw_subset`](Self::open_scan_raw_subset), reusing an
+    /// already-decoded [`SegmentDirectories`] via [`RlogReader::from_decoded`]
+    /// instead of decoding STREAM_DIR, FIELD_DIR, SKIP_IDX, and PAGE_DIR again
+    /// from `bytes` (ADR-2414 decision A1): the striped route's per-partition
+    /// open of a segment the plan phase already opened once.
+    fn open_scan_raw_subset_with_decoded(
+        &self,
+        key: &str,
+        bytes: &LogObjectBytes,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        indices: &[usize],
+        dirs: &SegmentDirectories,
+    ) -> Result<BlockScan, LogFetchError> {
+        let stream_ids = if query.stream_attrs.is_empty() {
+            None
+        } else {
+            Some(matching_streams_in(dirs.stream_dir(), &query.stream_attrs))
+        };
+        let pred = combined_predicate_with_streams(query, stream_ids);
+        let reader = RlogReader::from_decoded(bytes, dirs);
+        reader
+            .scan_blocks_raw_subset(&pred, &query.prune, columns, indices)
+            .map_err(|source| corrupt(key, source))
+    }
+
+    /// [`open_scan`](Self::open_scan), also returning the [`SegmentDirectories`]
+    /// this open decoded (ADR-2414 decision A1), for a caller that will open
+    /// this same segment again later within the query and wants to reuse the
+    /// decode via [`RlogReader::from_decoded`] instead of repeating it.
+    fn open_scan_with_directories(
+        &self,
+        key: &str,
+        bytes: &LogObjectBytes,
+        query: &LogQuery,
+        columns: &ColumnSelection,
+        accounting: &QueryAccounting,
+    ) -> Result<(BlockScan, Arc<SegmentDirectories>), LogFetchError> {
+        let pred = self.combined_predicate(key, bytes, query, accounting)?;
+        let reader =
+            RlogReader::from_source(bytes, &self.cfg).map_err(|source| corrupt(key, source))?;
+        let dirs = Arc::new(reader.directories());
+        let scan = reader
+            .scan_blocks(&pred, &query.prune, columns)
+            .map_err(|source| corrupt(key, source))?;
+        Ok((scan, dirs))
     }
 
     /// The combined exact predicate (`ts range AND resolved streams AND
@@ -2835,19 +3170,7 @@ impl LogSegmentFetcher {
             )
         };
 
-        let mut arms = Vec::with_capacity(2 + query.content.len());
-        arms.push(Predicate::TsRange {
-            min_ns: query.ts_min_ns,
-            max_ns: query.ts_max_ns,
-        });
-        if let Some(ids) = stream_ids {
-            // An empty set is intentional: it means no stream in this object
-            // satisfies the attribute filter, and the reader short-circuits an
-            // empty StreamIn to zero records.
-            arms.push(Predicate::StreamIn(ids));
-        }
-        arms.extend(query.content.iter().cloned());
-        Ok(Predicate::And(arms))
+        Ok(combined_predicate_with_streams(query, stream_ids))
     }
 
     /// Fetch and decode just the STREAM_DIR section (ADR-1103 decision 2's
@@ -2985,6 +3308,41 @@ impl LogSegmentFetcher {
         let raw = read_section_accounted_from(bytes, desc, &self.cfg, accounting)?;
         StreamDir::decode(&raw, MAX_STREAMS)
     }
+}
+
+/// The stream ids in `dir` whose attribute blob carries every filter's needle
+/// ([`LogSegmentFetcher::matching_streams`]'s resolution over an
+/// already-decoded STREAM_DIR).
+fn matching_streams_in(dir: &StreamDir, filters: &[StreamAttrEquals]) -> Vec<LogStreamId> {
+    let needles: Vec<Vec<u8>> = filters.iter().map(stream_attr_needle).collect();
+    let mut out = Vec::new();
+    for entry in dir.entries() {
+        if needles.iter().all(|n| blob_contains(&entry.blob, n)) {
+            out.push(entry.stream_id);
+        }
+    }
+    out
+}
+
+/// `ts range AND resolved streams AND content`, the predicate both
+/// scan-opening paths hand to the reader. `stream_ids` is `Some` when the query
+/// carries stream-attribute equalities; an empty set is intentional: it means
+/// no stream in the object satisfies the filter, and the reader short-circuits
+/// an empty StreamIn to zero records.
+fn combined_predicate_with_streams(
+    query: &LogQuery,
+    stream_ids: Option<Vec<LogStreamId>>,
+) -> Predicate {
+    let mut arms = Vec::with_capacity(2 + query.content.len());
+    arms.push(Predicate::TsRange {
+        min_ns: query.ts_min_ns,
+        max_ns: query.ts_max_ns,
+    });
+    if let Some(ids) = stream_ids {
+        arms.push(Predicate::StreamIn(ids));
+    }
+    arms.extend(query.content.iter().cloned());
+    Predicate::And(arms)
 }
 
 /// Default suffix length of the etag-establishing probe GET (ADR-0107 decision
@@ -3404,6 +3762,19 @@ pub struct CarriedFooter<'a> {
     /// this object's tail-section probe misses
     /// ([`BlockRangeStats::probe_misses`]).
     pub tail_misses_counted: bool,
+}
+
+/// What one per-partition subset open of a segment already knows about it
+/// (ADR-2414 decision A1): the whole-object block indices its partition owns,
+/// and, when the plan phase decoded them, the segment's directories.
+///
+/// `blocks` is ascending. With `dirs` the ranged read fetches and decodes none
+/// of STREAM_DIR, FIELD_DIR, SKIP_IDX or PAGE_DIR: the reader built over the
+/// result takes them from `dirs`.
+#[derive(Clone, Copy)]
+struct OwnedBlocks<'a> {
+    blocks: &'a [usize],
+    dirs: Option<&'a SegmentDirectories>,
 }
 
 /// The whole-object bytes [`LogSegmentFetcher::plan_segment`]'s whole-object
@@ -4935,11 +5306,17 @@ impl BlockRangeFetcher {
             .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
             .await?;
 
+        // SKIP_IDX and PAGE_DIR are the tail sections whose probe misses the
+        // plan phase counts (the same pair `fetch_plan_sections` counts). The
+        // front pair is brought through a scratch stats value: a front section
+        // is never inside the suffix probe, so counting it would add two
+        // misses per object that report a property of the section order, not
+        // of the probe length.
         self.ensure_tail_plan_sections(
             seg_ref,
             tenant_hash,
             &footer,
-            &[kind::STREAM_DIR, kind::FIELD_DIR, kind::SKIP_IDX, kind::PAGE_DIR],
+            &[kind::SKIP_IDX, kind::PAGE_DIR],
             phase,
             &mut resident,
             &pin,
@@ -4947,10 +5324,26 @@ impl BlockRangeFetcher {
             &mut stats,
         )
         .await?;
+        let mut front_stats = BlockRangeStats::default();
+        self.ensure_tail_plan_sections(
+            seg_ref,
+            tenant_hash,
+            &footer,
+            &[kind::STREAM_DIR, kind::FIELD_DIR],
+            phase,
+            &mut resident,
+            &pin,
+            accounting,
+            &mut front_stats,
+        )
+        .await?;
+        stats.metadata_gets += front_stats.metadata_gets;
 
         let mut sparse = SparseObject::new(seg_ref.object_size);
         for (start, bytes) in resident {
-            sparse.place(start, bytes).map_err(|source| corrupt(key, source))?;
+            sparse
+                .place(start, bytes)
+                .map_err(|source| corrupt(key, source))?;
         }
         let dirs = RlogReader::decode_directories(&sparse, &self.cfg)
             .map_err(|source| corrupt(key, source))?;
@@ -5072,6 +5465,74 @@ impl BlockRangeFetcher {
         columns: &ColumnSelection,
         plan_footer: Option<CarriedFooter<'_>>,
         phases: ReadPhases,
+        accounting: &QueryAccounting,
+    ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
+        self.fetch_object_with_footer_impl(
+            seg_ref,
+            tenant_hash,
+            ts_min_ns,
+            ts_max_ns,
+            prune,
+            columns,
+            plan_footer,
+            phases,
+            None,
+            accounting,
+        )
+        .await
+    }
+
+    /// [`fetch_object_with_footer`](Self::fetch_object_with_footer), additionally
+    /// restricting a version-4 object's ranged read to `owned_blocks`'s
+    /// whole-object block indices (ADR-2414 decision A1 deliverable 3): the
+    /// striped route's per-partition open, whose `owned_work` dealt this
+    /// segment's row groups across partitions, asks for only its own row
+    /// groups' blocks rather than every block the ts/numeric candidate set
+    /// would otherwise keep for the WHOLE object. Ignored on the version-3
+    /// path (no row-group concept to restrict by); see
+    /// [`fetch_object_v4`](Self::fetch_object_v4)'s own doc for where the
+    /// intersection happens.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_object_with_footer_subset(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        ts_min_ns: i64,
+        ts_max_ns: i64,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+        plan_footer: Option<CarriedFooter<'_>>,
+        phases: ReadPhases,
+        owned_blocks: Option<OwnedBlocks<'_>>,
+        accounting: &QueryAccounting,
+    ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
+        self.fetch_object_with_footer_impl(
+            seg_ref,
+            tenant_hash,
+            ts_min_ns,
+            ts_max_ns,
+            prune,
+            columns,
+            plan_footer,
+            phases,
+            owned_blocks,
+            accounting,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_object_with_footer_impl(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        ts_min_ns: i64,
+        ts_max_ns: i64,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+        plan_footer: Option<CarriedFooter<'_>>,
+        phases: ReadPhases,
+        owned_blocks: Option<OwnedBlocks<'_>>,
         accounting: &QueryAccounting,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
@@ -5260,6 +5721,7 @@ impl BlockRangeFetcher {
                     asm,
                     &pin,
                     phases,
+                    owned_blocks,
                     accounting,
                     stats,
                 )
@@ -5520,6 +5982,16 @@ impl BlockRangeFetcher {
     /// one contiguous span and coalesce into exactly one range, which is why
     /// there is no separate whole-group case here.
     ///
+    /// `owned_blocks`, when `Some` (ADR-2414 decision A1 deliverable 3), further
+    /// narrows the ts/numeric candidate set to the whole-object block indices
+    /// this call's caller actually owns: the striped route's per-partition
+    /// open, whose `owned_work` dealt this segment's row groups across
+    /// partitions, so a partition's ranged plan covers only its own blocks
+    /// instead of every block the ts bounds and skip index would otherwise
+    /// keep for the WHOLE object. `None` is every other caller's unchanged
+    /// behavior (the version-4 whole-segment and ordinal-subset paths, which
+    /// have no per-partition block list to restrict by).
+    ///
     /// # Checksums
     ///
     /// Nothing here verifies a block crc, and nothing can: under version 4 that
@@ -5549,11 +6021,14 @@ impl BlockRangeFetcher {
         mut asm: ObjectAssembler,
         pin: &EtagPin,
         phases: ReadPhases,
+        owned_blocks: Option<OwnedBlocks<'_>>,
         accounting: &QueryAccounting,
         mut stats: BlockRangeStats,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
         let total_size = seg_ref.object_size;
+        let dirs = owned_blocks.and_then(|o| o.dirs);
+        let owned_blocks = owned_blocks.map(|o| o.blocks);
         let blocks_desc = *footer
             .section(kind::BLOCKS)
             .ok_or_else(|| corrupt(key, LogSegError::Corrupted("missing BLOCKS".into())))?;
@@ -5616,26 +6091,39 @@ impl BlockRangeFetcher {
         // The two are adjacent in the object -- the writer emits PAGE_DIR
         // immediately after SKIP_IDX -- so a probe that missed both costs one
         // coalesced GET rather than two.
-        self.place_sections_coalesced(
-            seg_ref,
-            tenant_hash,
-            &[skip_desc, page_desc],
-            phases.metadata,
-            pin,
-            &mut asm,
-            accounting,
-            &mut stats,
-        )
-        .await?;
-        let skip_raw = self
-            .placed_section_raw(key, &asm, &skip_desc, accounting)
+        //
+        // With `dirs` (ADR-2414 decision A1: the plan phase already decoded this
+        // segment's directories) none of the four sections is fetched or decoded
+        // here: the reader built over the result takes them from `dirs`, so
+        // placing them would only move bytes nobody reads, and decoding them
+        // would charge a second `decompressed_bytes` for the same sections.
+        let local_skip;
+        let local_page_dir;
+        let (skip, page_dir): (&SkipIndex, &PageDir) = if let Some(dirs) = dirs {
+            (dirs.skip_index(), &**dirs.page_dir())
+        } else {
+            self.place_sections_coalesced(
+                seg_ref,
+                tenant_hash,
+                &[skip_desc, page_desc],
+                phases.metadata,
+                pin,
+                &mut asm,
+                accounting,
+                &mut stats,
+            )
             .await?;
-        let skip =
-            SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
-        let page_raw = self
-            .placed_section_raw(key, &asm, &page_desc, accounting)
-            .await?;
-        let page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
+            let skip_raw = self
+                .placed_section_raw(key, &asm, &skip_desc, accounting)
+                .await?;
+            local_skip =
+                SkipIndex::decode(&skip_raw, MAX_BLOCKS).map_err(|source| corrupt(key, source))?;
+            let page_raw = self
+                .placed_section_raw(key, &asm, &page_desc, accounting)
+                .await?;
+            local_page_dir = PageDir::decode(&page_raw).map_err(|source| corrupt(key, source))?;
+            (&local_skip, &local_page_dir)
+        };
         page_dir
             .validate_extents(blocks_desc.len)
             .map_err(|source| corrupt(key, source))?;
@@ -5649,18 +6137,24 @@ impl BlockRangeFetcher {
             .iter()
             .any(|p| matches!(p, Predicate::NumRange { .. }));
         let (numeric, selected) = if wants_numeric || !columns.is_all() {
-            let field_dir = self
-                .place_and_decode_field_dir(
-                    seg_ref,
-                    tenant_hash,
-                    footer,
-                    phases.metadata,
-                    pin,
-                    &mut asm,
-                    accounting,
-                    &mut stats,
-                )
-                .await?;
+            let local_field_dir;
+            let field_dir: &FieldDir = if let Some(dirs) = dirs {
+                dirs.field_dir()
+            } else {
+                local_field_dir = self
+                    .place_and_decode_field_dir(
+                        seg_ref,
+                        tenant_hash,
+                        footer,
+                        phases.metadata,
+                        pin,
+                        &mut asm,
+                        accounting,
+                        &mut stats,
+                    )
+                    .await?;
+                &local_field_dir
+            };
             let numeric = if wants_numeric {
                 let refs: Vec<&Predicate> = prune.iter().collect();
                 field_dir.numeric_range_arms(&refs)
@@ -5670,12 +6164,21 @@ impl BlockRangeFetcher {
             // The same resolution `RlogReader::scan_blocks` runs on the same
             // FIELD_DIR, so the pages fetched here are exactly the pages the
             // decode addresses.
-            (numeric, columns.resolve(&field_dir))
+            (numeric, columns.resolve(field_dir))
         } else {
             (Vec::new(), None)
         };
 
-        let candidates = skip.candidate_blocks(ts_min_ns, ts_max_ns, None, &numeric);
+        let mut candidates = skip.candidate_blocks(ts_min_ns, ts_max_ns, None, &numeric);
+        // Deliverable 3 (ADR-2414 decision A1): a partition's ranged plan
+        // covers only its own blocks, not every surviving block of the
+        // object. `owned_blocks` is ascending (`owned_work` deals whole row
+        // groups in ascending order), and `candidate_blocks` is ascending
+        // too (`SkipIndex::candidate_blocks`'s own doc), so a binary search
+        // per candidate is enough; no caller passes an unsorted list.
+        if let Some(owned) = owned_blocks {
+            candidates.retain(|c| owned.binary_search(c).is_ok());
+        }
         stats.candidate_blocks = candidates.len() as u64;
         let wanted = projected_page_extents(
             key,
@@ -5775,27 +6278,33 @@ impl BlockRangeFetcher {
         // their adjacent span (ADR-2066 decision 1). On the narrow-projection
         // path `place_and_decode_field_dir` already brought both, so this is a
         // no-op there; on an all-columns v4 read it is the read's one front GET.
-        self.place_front_sections(
-            seg_ref,
-            tenant_hash,
-            footer,
-            phases.metadata,
-            pin,
-            &mut asm,
-            accounting,
-            &mut stats,
-        )
-        .await?;
+        // Skipped when `dirs` carries the decoded directories (ADR-2414
+        // decision A1): the reader takes both from it.
+        if dirs.is_none() {
+            self.place_front_sections(
+                seg_ref,
+                tenant_hash,
+                footer,
+                phases.metadata,
+                pin,
+                &mut asm,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        }
 
         // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
         // GET each, never coalesced with the front across the BLOCKS gap. The
         // reader re-verifies each section's crc on decode, so a corrupt section
-        // hit fails closed there (ADR-0046).
+        // hit fails closed there (ADR-0046). With `dirs`, SKIP_IDX and PAGE_DIR
+        // are not placed either: nothing reads them from the buffer.
         for section in &footer.sections {
             if matches!(
                 section.kind,
                 kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR
-            ) {
+            ) || (dirs.is_some() && matches!(section.kind, kind::SKIP_IDX | kind::PAGE_DIR))
+            {
                 continue;
             }
             self.place_section(
@@ -7009,6 +7518,14 @@ fn scan_lost(key: &str) -> LogFetchError {
 /// charges that decode to `accounting` like every other: the bytes zstd
 /// produced here count against the query's `TooManyBytesScanned` budget the
 /// same as the ones the open produced.
+///
+/// Only [`open_scan_on_gate`](LogSegmentFetcher::open_scan_on_gate)'s gated
+/// closure, which has no decoded [`SegmentDirectories`] of its own, calls
+/// this. [`open_scan_on_gate_from_decoded`](LogSegmentFetcher::open_scan_on_gate_from_decoded)
+/// has one already and reads
+/// [`max_block_uncompressed_len_from_page_dir`] instead (ADR-2414 decision
+/// A1): the job size for a later block decode must come from the carried
+/// `PageDir`, never a third decode of it.
 fn max_block_uncompressed_len<S: ByteSource + ?Sized>(
     bytes: &S,
     cfg: &RlogConfig,
@@ -7022,6 +7539,13 @@ fn max_block_uncompressed_len<S: ByteSource + ?Sized>(
     let Some(page_dir) = page_dir else {
         return u64::MAX;
     };
+    max_block_uncompressed_len_from_page_dir(&page_dir)
+}
+
+/// [`max_block_uncompressed_len`]'s computation, over an already-decoded
+/// [`PageDir`] and with no further section read or accounting charge
+/// (ADR-2414 decision A1).
+fn max_block_uncompressed_len_from_page_dir(page_dir: &PageDir) -> u64 {
     let mut largest = 0u64;
     for group in &page_dir.groups {
         let mut per_block = vec![0u64; group.block_count as usize];
@@ -7138,6 +7662,19 @@ mod plan_fast_path_tests {
         bytes.len() as u64 - (b.offset + b.len)
     }
 
+    /// Stored bytes of the two front directory sections (STREAM_DIR and
+    /// FIELD_DIR): the part of a segment's directories the suffix probe does not
+    /// cover, which `plan_segment` reads with one extra range GET so the
+    /// segment's decoded directories can be carried to every later open
+    /// (ADR-2414 decision A1).
+    fn front_dirs_len(bytes: &[u8]) -> u64 {
+        let f = footer::open(bytes).expect("footer");
+        [kind::STREAM_DIR, kind::FIELD_DIR]
+            .iter()
+            .map(|k| f.section(*k).expect("front section").len)
+            .sum()
+    }
+
     async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         store
@@ -7163,8 +7700,8 @@ mod plan_fast_path_tests {
 
     /// (Test b) The fast path fires for a predicate-free, fully-contained query:
     /// the returned count is the block count, the stats show nothing scanned,
-    /// and only the tail probe crossed the wire -- never a block-range fetch
-    /// sized to the object.
+    /// and only the tail probe plus the two front directory sections crossed the
+    /// wire -- never a block-range fetch sized to the object.
     ///
     /// Non-vacuity: deleting the fast-path branch in `plan_segment` (the
     /// `if seg_ref.object_size > 0 && query.is_block_predicate_free() ...`
@@ -7181,6 +7718,7 @@ mod plan_fast_path_tests {
         let bytes = build_object(&records);
         let total = bytes.len() as u64;
         let tail = tail_len(&bytes);
+        let front = front_dirs_len(&bytes);
         assert!(
             tail < total,
             "the object must carry a nonempty BLOCKS section"
@@ -7193,11 +7731,12 @@ mod plan_fast_path_tests {
 
         // Predicate-free, ts window strictly contains [min, max].
         let query = LogQuery::new(i64::MIN, i64::MAX);
-        let (count, stats, _footer, _carried) = f
+        let (indices, _dirs, stats, _footer, _carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
             .expect("relevant segment");
+        let count = indices.len();
 
         assert_eq!(count, N, "survivor count is the segment block count");
         assert_eq!(stats.blocks_total, N as u32);
@@ -7210,8 +7749,10 @@ mod plan_fast_path_tests {
 
         let read = acc.snapshot().total_s3_bytes();
         assert_eq!(
-            read, tail,
-            "fast path reads only the footer probe ({tail} B), not the {total} B object"
+            read,
+            tail + front,
+            "fast path reads the footer probe ({tail} B) and the front directory \
+             sections ({front} B), not the {total} B object"
         );
     }
 
@@ -7224,6 +7765,7 @@ mod plan_fast_path_tests {
         let bytes = build_object(&records);
         let total = bytes.len() as u64;
         let tail = tail_len(&bytes);
+        let front = front_dirs_len(&bytes);
         let seg = seg_ref(total, &records);
         let store = store_with_object(bytes).await;
         let f = fetcher(store, tail);
@@ -7231,13 +7773,18 @@ mod plan_fast_path_tests {
 
         // Exact span bounds: ts_min == min_event_ts_ns, ts_max == max_event_ts_ns.
         let query = LogQuery::new(seg.min_event_ts_ns, seg.max_event_ts_ns);
-        let (count, _stats, _footer, _carried) = f
+        let (indices, _dirs, _stats, _footer, _carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
             .expect("relevant segment");
+        let count = indices.len();
         assert_eq!(count, N);
-        assert_eq!(acc.snapshot().total_s3_bytes(), tail, "fast path fired");
+        assert_eq!(
+            acc.snapshot().total_s3_bytes(),
+            tail + front,
+            "fast path fired"
+        );
     }
 
     /// (Test c) Every case that is NOT predicate-free-and-contained goes through
@@ -7263,11 +7810,12 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N, "content: no block pruned");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7281,11 +7829,12 @@ mod plan_fast_path_tests {
             AttrValue::Str("svc".into()),
         ));
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N, "stream_attr: single stream, all blocks survive");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7298,11 +7847,12 @@ mod plan_fast_path_tests {
             vec![("request.id".into(), "r0".into())],
         )]);
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N, "erasure: block count unchanged");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7314,11 +7864,12 @@ mod plan_fast_path_tests {
         // run and the survivor count is N-2, not N.
         let q = LogQuery::new(2, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N - 2, "partial overlap: ts pruning ran");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7336,11 +7887,12 @@ mod plan_fast_path_tests {
             word: "hello".into(),
         });
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &q, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(count, N, "prune: no block pruned");
         assert!(
             acc.snapshot().total_s3_bytes() > tail,
@@ -7374,11 +7926,12 @@ mod plan_fast_path_tests {
             );
         let query = LogQuery::new(i64::MIN, i64::MAX);
         let acc = QueryAccounting::new();
-        let (count, _, _, _) = f
+        let (indices, _dirs, _, _, _) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan")
             .expect("relevant");
+        let count = indices.len();
         assert_eq!(
             count, N,
             "at-threshold: same survivor count as the fast path"
@@ -9002,11 +9555,12 @@ mod plan_skip_decidable_span_tests {
             min: Some(0i64 as u64),
             max: Some(1_000i64 as u64),
         });
-        let (count, _stats, footer, carried) = f
+        let (indices, _dirs, _stats, footer, carried) = f
             .plan_segment(&seg, TENANT, &query, &acc)
             .await
             .expect("plan_segment")
             .expect("relevant segment");
+        let count = indices.len();
         assert_eq!(count, N, "wide NumRange bound excludes no block");
         assert!(
             footer.is_some(),
@@ -9072,19 +9626,16 @@ mod plan_skip_decidable_span_tests {
     /// exactly once across the pair -- by the plan phase when the plan read
     /// located those sections, and by the scan when it did not.
     ///
-    /// This is what pins the derivation in `tenant_bytes_with_footer`, which is
-    /// the only place that decides which of the two a carried footer came from.
-    /// The fetcher-level tests in `tests/log_block_range.rs` and
+    /// This is what pins the flag `tenant_bytes_with_footer` sets on a carried
+    /// footer. The fetcher-level tests in `tests/log_block_range.rs` and
     /// `tests/log_page_dir_fetch.rs` construct the [`CarriedFooter`] by hand and
     /// so cannot catch a wrong flag here.
     ///
-    /// Prove-the-test: inverting that derivation to
-    /// `tail_misses_counted: !Self::plan_skip_decidable(query)` swaps both
-    /// halves -- the predicate-free scan reads 0 against the expected 2, and the
-    /// NumRange scan reads 2 against the expected 0. Hardcoding it to `true`
-    /// (the previous commit's `plan_footer.is_some()` gate) fails the
-    /// predicate-free half alone; hardcoding it to `false` (no gate at all)
-    /// fails the NumRange half alone.
+    /// Both plan branches count the tail misses themselves (ADR-2414 decision
+    /// A1: each reads the segment's directories), so the flag is `true` for
+    /// every carried footer. Prove-the-test: hardcoding it to `false` makes the
+    /// scan count the same two sections again, so both cases read a scan-phase 2
+    /// against the expected 0 and a total of 4 against 2.
     #[tokio::test]
     // Holds the test_tracing serialization guard across `.await`; the
     // current-thread test runtime runs this future to completion with no other
@@ -9102,13 +9653,12 @@ mod plan_skip_decidable_span_tests {
         let _serial = crate::test_tracing::guard();
 
         // (query, plan-phase misses, scan-phase misses). The predicate-free
-        // query takes `plan_segment_fast`, whose `fetch_footer` reads no tail
-        // section and counts nothing, leaving both misses to the scan. The
-        // NumRange query takes the skip-decidable branch, whose
-        // `fetch_plan_sections` reads both tail sections and counts them, so the
+        // query takes `plan_segment_fast`, whose `fetch_plan_directories` reads
+        // and counts both tail sections. The NumRange query takes the
+        // skip-decidable branch, whose `fetch_plan_sections` does the same. The
         // scan must count neither. Either way the total is 2.
         let cases = [
-            (LogQuery::new(i64::MIN, i64::MAX), 0u64, 2u64),
+            (LogQuery::new(i64::MIN, i64::MAX), 2u64, 0u64),
             (
                 LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::NumRange {
                     field: FieldSel::Attr("code".into()),
@@ -9135,11 +9685,12 @@ mod plan_skip_decidable_span_tests {
             let f = fetcher_with_suffix(store, suffix);
             let acc = QueryAccounting::new();
 
-            let (count, _stats, footer, _carried) = f
+            let (indices, _dirs, _stats, footer, _carried) = f
                 .plan_segment(&seg, TENANT, &query, &acc)
                 .await
                 .expect("plan_segment")
                 .expect("relevant segment");
+            let count = indices.len();
             assert!(footer.is_some(), "both branches carry their footer forward");
 
             let indices: Vec<usize> = (0..count).collect();
