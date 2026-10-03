@@ -171,6 +171,25 @@ fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     sorted.get(rank.clamp(1, sorted.len()) - 1).copied()
 }
 
+/// Every refusal [`run`] makes before it starts a task, so a caller can
+/// refuse the same arguments before it runs anything else.
+pub fn check_shape(
+    tasks: usize,
+    statements: usize,
+    duration: Duration,
+) -> Result<(), ConcurrencyError> {
+    if tasks == 0 {
+        return Err(ConcurrencyError::NoTasks);
+    }
+    if statements == 0 {
+        return Err(ConcurrencyError::NoStatements);
+    }
+    if duration.is_zero() {
+        return Err(ConcurrencyError::ZeroDuration);
+    }
+    Ok(())
+}
+
 /// Runs the phase: task `i` cycles `statements` from position
 /// `i * TASK_OFFSET_STRIDE` (mod their count) and starts no statement once
 /// `duration` has passed on its clock since it began. A statement already
@@ -183,15 +202,7 @@ pub async fn run(
     duration: Duration,
     registered: &BTreeSet<u32>,
 ) -> Result<ConcurrencyFigures, ConcurrencyError> {
-    if tasks.is_empty() {
-        return Err(ConcurrencyError::NoTasks);
-    }
-    if statements.is_empty() {
-        return Err(ConcurrencyError::NoStatements);
-    }
-    if duration.is_zero() {
-        return Err(ConcurrencyError::ZeroDuration);
-    }
+    check_shape(tasks.len(), statements.len(), duration)?;
     let task_count = tasks.len();
     let shared = Arc::new(statements.to_vec());
     let mut set = JoinSet::new();
@@ -515,6 +526,21 @@ mod tests {
             run(vec![task(&engine)], &statements(1), Duration::ZERO, &none).await,
             Err(ConcurrencyError::ZeroDuration)
         );
+    }
+
+    #[test]
+    fn check_shape_refuses_what_run_refuses() {
+        let second = Duration::from_secs(1);
+        assert_eq!(check_shape(0, 1, second), Err(ConcurrencyError::NoTasks));
+        assert_eq!(
+            check_shape(1, 0, second),
+            Err(ConcurrencyError::NoStatements)
+        );
+        assert_eq!(
+            check_shape(1, 1, Duration::ZERO),
+            Err(ConcurrencyError::ZeroDuration)
+        );
+        assert_eq!(check_shape(1, 1, second), Ok(()));
     }
 
     #[test]
