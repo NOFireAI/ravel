@@ -235,7 +235,9 @@ drops the reason drops the requirement.
    one. This matches ADR-0094's exact-typed classification (count/sum/min/
    max over non-float always exact, avg/mean over float never, any float
    GROUP BY key disqualifies, fail-closed on classification error), reused
-   as the eligibility gate rather than duplicated.
+   as the eligibility gate rather than duplicated. A `Sort` node (with or
+   without a fetch) over a spill-exact aggregate is admitted by the ADR-2414
+   amendment below; the exactness rule itself is unchanged.
 
 5. **Typed `spill_budget_exhausted`, `spill_unavailable`, and cleanup
    errors.** The invariant's three failure modes (scratch budget exceeded,
@@ -526,3 +528,19 @@ flowchart TB
     ErrQuota --> Clean
     ErrSpill --> Clean
 ```
+
+## Amendment (2026-10-03, Refs: #2414): a Sort over a spill-exact aggregate is eligible
+
+<!-- amendment-applies: sections="Normative implementation requirements" pointer="ADR-2414 amendment" -->
+
+Requirement 4 decides eligibility by exactness, but the plan classifier
+that implements it admits only Projection, Filter, Aggregate, Distinct,
+TableScan, SubqueryAlias, Limit, EmptyRelation and Values, so a statement
+whose exact aggregate feeds an `ORDER BY ... LIMIT` (the q33 shape this ADR
+was written for) is refused as a whole. ADR-2414 decision B2 admits
+`LogicalPlan::Sort`, with or without a fetch, over a spill-exact aggregate.
+A float group key still refuses, and a `Sort` over a plan with no
+spill-exact aggregate is still ineligible, since nothing in it spills
+exactly. Spill stays environment-gated as decided here; the default under
+`--cache-dir` is issue #2416.
+
