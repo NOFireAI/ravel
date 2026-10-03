@@ -130,6 +130,8 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         (Category::Clause, "REGEXP_REPLACE backreference") => Some(Expect::Str("ba")),
         // One extracted minute per sample.
         (Category::Clause, "date_part(minute)") => Some(Expect::Rows(count)),
+        // Same extraction, via the `EXTRACT(field FROM expr)` syntax (#2458).
+        (Category::Clause, "EXTRACT(minute FROM ...)") => Some(Expect::Rows(count)),
         // One truncated timestamp per sample.
         (Category::Clause, "DATE_TRUNC") => Some(Expect::Rows(count)),
         // ADR-0090: typed queries over the declared `i64` column `dur`, whose

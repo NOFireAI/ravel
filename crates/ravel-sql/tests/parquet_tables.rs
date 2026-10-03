@@ -99,6 +99,65 @@ fn hits_files() -> Vec<(&'static str, Bytes)> {
     ]
 }
 
+/// A base epoch second whose UTC minute, hour and year are known fixed
+/// points (2023-11-14T22:13:20Z: minute 13, hour 22, year 2023), so the
+/// `EXTRACT`/`date_part` equivalence tests below exercise real field values
+/// rather than a single magic timestamp.
+const CLICKBENCH_T0: i64 = 1_700_000_000;
+
+/// One row group of `UserID: Int64`, `EventTime: Int64` (seconds since
+/// epoch, as ClickBench's `hits` table stores it), `SearchPhrase: Utf8` --
+/// the three columns ClickBench Q19 (issue #2458) selects.
+fn clickbench_bytes(user_ids: &[i64], event_times: &[i64], phrases: &[&str]) -> Bytes {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("UserID", DataType::Int64, false),
+        Field::new("EventTime", DataType::Int64, false),
+        Field::new("SearchPhrase", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int64Array::from(user_ids.to_vec())) as ArrayRef,
+            Arc::new(Int64Array::from(event_times.to_vec())) as ArrayRef,
+            Arc::new(StringArray::from(phrases.to_vec())),
+        ],
+    )
+    .expect("batch");
+    let mut out = Vec::new();
+    let properties = WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .build();
+    let mut writer = ArrowWriter::try_new(&mut out, schema, Some(properties)).expect("writer");
+    writer.write(&batch).expect("write");
+    writer.close().expect("close");
+    Bytes::from(out)
+}
+
+/// Six rows across three files: `(UserID, EventTime, SearchPhrase)`.
+/// `(1, CLICKBENCH_T0, "a")` appears three times (minute 13, twice at the
+/// exact same second and once five seconds later, same minute), `(2,
+/// CLICKBENCH_T0 + 120, "b")` twice (minute 15, two minutes later), and `(3,
+/// CLICKBENCH_T0 + 240, "c")` once (minute 17, four minutes later) -- so
+/// `GROUP BY "UserID", EXTRACT(minute FROM ...), "SearchPhrase"` has exactly
+/// three groups of sizes 3, 2 and 1.
+fn clickbench_files() -> Vec<(&'static str, Bytes)> {
+    let t0 = CLICKBENCH_T0;
+    vec![
+        (
+            "t/hits/0.parquet",
+            clickbench_bytes(&[1, 1], &[t0, t0], &["a", "a"]),
+        ),
+        (
+            "t/hits/1.parquet",
+            clickbench_bytes(&[1, 2], &[t0 + 5, t0 + 120], &["a", "b"]),
+        ),
+        (
+            "t/hits/2.parquet",
+            clickbench_bytes(&[2, 3], &[t0 + 120, t0 + 240], &["b", "c"]),
+        ),
+    ]
+}
+
 struct Lake {
     ravel: Arc<InstrumentedStore<MemoryStore>>,
     lake: Arc<InstrumentedStore<MemoryStore>>,
@@ -270,6 +329,18 @@ impl Lake {
         self.create(tenant, "hits", files).await;
     }
 
+    /// Grant [`GRANT`] to `tenant` and create `hits` over
+    /// [`clickbench_files`]: `UserID`/`EventTime`/`SearchPhrase`, the
+    /// ClickBench Q19 (issue #2458) shape.
+    async fn clickbench_hits_for(&self, tenant: &TenantHash) {
+        let mut files = Vec::new();
+        for (key, bytes) in clickbench_files() {
+            files.push(self.put_file(key, bytes).await);
+        }
+        self.grant(tenant).await;
+        self.create(tenant, "hits", files).await;
+    }
+
     async fn execute(&self, tenant: &TenantHash, sql: &str) -> Result<SqlOutcome, SqlError> {
         self.executor.execute(*tenant, &request(sql)).await
     }
@@ -354,6 +425,73 @@ async fn a_parquet_table_answers_a_filtered_select_with_its_reads_split_by_phase
         lake_after - lake_before,
         probe.s3_requests(AccountedOp::Get) + scan.s3_requests(AccountedOp::Get),
         "every lake GET is charged to Probe or Scan"
+    );
+}
+
+/// Issue #2458: `EXTRACT(field FROM expr)` plans (via `DatetimeFunctionPlanner`,
+/// registered in `crate::session::build_session`) into the already-admitted
+/// `date_part('field', expr)` call it rewrites to, and returns identical
+/// rows, over a Parquet table -- the same entry point ClickBench Q19 plans
+/// on. Checked for `minute`, `hour` and `year`.
+#[tokio::test]
+async fn extract_matches_date_part_on_parquet_table() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.clickbench_hits_for(&acme).await;
+
+    for field in ["minute", "hour", "year"] {
+        let date_part_sql = format!(
+            "SELECT \"UserID\", date_part('{field}', to_timestamp_seconds(\"EventTime\")) FROM hits ORDER BY \"UserID\", \"EventTime\""
+        );
+        let extract_sql = format!(
+            "SELECT \"UserID\", EXTRACT({field} FROM to_timestamp_seconds(\"EventTime\")) FROM hits ORDER BY \"UserID\", \"EventTime\""
+        );
+
+        let expected = lake
+            .execute(&acme, &date_part_sql)
+            .await
+            .unwrap_or_else(|e| panic!("{date_part_sql} must plan and execute: {e}"));
+        let actual = lake
+            .execute(&acme, &extract_sql)
+            .await
+            .unwrap_or_else(|e| panic!("{extract_sql} must plan and execute: {e}"));
+
+        let expected_rows = rows(&expected);
+        let actual_rows = rows(&actual);
+        assert_eq!(
+            actual_rows, expected_rows,
+            "EXTRACT({field} FROM ...) must match date_part('{field}', ...) row for row"
+        );
+        assert_eq!(
+            actual_rows.len(),
+            6,
+            "all six fixture rows must be returned"
+        );
+    }
+}
+
+/// ClickBench Q19's exact text (issue #2458), over the
+/// [`Lake::clickbench_hits_for`] fixture: three groups of `(UserID, minute,
+/// SearchPhrase)`, of sizes 3, 2 and 1, ordered by `COUNT(*)` descending.
+#[tokio::test]
+async fn clickbench_q19_plans_and_groups_by_extracted_minute() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.clickbench_hits_for(&acme).await;
+
+    let outcome = lake
+        .execute(
+            &acme,
+            "SELECT \"UserID\", extract(minute FROM to_timestamp_seconds(\"EventTime\")) AS m, \"SearchPhrase\", COUNT(*) FROM hits GROUP BY \"UserID\", m, \"SearchPhrase\" ORDER BY COUNT(*) DESC LIMIT 10;",
+        )
+        .await
+        .expect("Q19 must plan and execute");
+
+    assert_eq!(
+        rows(&outcome),
+        vec!["1|13|a|3", "2|15|b|2", "3|17|c|1"],
+        "three groups, largest first: (UserID 1, minute 13, \"a\") x3, \
+         (UserID 2, minute 15, \"b\") x2, (UserID 3, minute 17, \"c\") x1"
     );
 }
 

@@ -524,14 +524,18 @@ pub fn registry() -> Vec<Construct> {
             "REGEXP_REPLACE backreference",
             "SELECT regexp_replace('ab', '(a)(b)', '\\2\\1') FROM samples LIMIT 1",
         ),
-        // The minute component of a timestamp. The `EXTRACT(minute FROM ts)`
-        // sugar is not planner-wired in this crate's DataFusion `sql` feature
-        // (no `ExprPlanner` for it, the same seam that leaves `attrs['k']` SQL
-        // text unplannable); the equivalent `date_part` scalar function is, so
-        // the minute-extraction capability is covered through that spelling.
+        // The minute component of a timestamp via the plain scalar spelling.
         (
             "date_part(minute)",
             "SELECT date_part('minute', ts) FROM samples",
+        ),
+        // `EXTRACT(field FROM expr)` sugar (issue #2458): `build_session`
+        // registers upstream's `DatetimeFunctionPlanner`
+        // (`crate::session::build_session`), which rewrites this syntax into
+        // the `date_part(minute)` call above before planning continues.
+        (
+            "EXTRACT(minute FROM ...)",
+            "SELECT EXTRACT(minute FROM ts) FROM samples",
         ),
         ("DATE_TRUNC", "SELECT date_trunc('hour', ts) FROM samples"),
     ];

@@ -124,6 +124,7 @@ use datafusion::execution::memory_pool::MemoryPool;
 use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::functions::datetime::planner::DatetimeFunctionPlanner;
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -751,6 +752,12 @@ pub fn build_session(
     // `crate::trace_id_planner` module docs for why it exists and what it
     // covers.
     ctx.register_expr_planner(trace_id_hex_literal_planner())?;
+
+    // `with_default_features()` only installs the `EXTRACT(field FROM expr)`
+    // planner under the facade's `datetime_expressions` feature, which this
+    // crate leaves off. The planner only rewrites to `date_part`, an admitted
+    // scalar, so registering it widens no allowlist.
+    ctx.register_expr_planner(Arc::new(DatetimeFunctionPlanner))?;
 
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration
     // boundary behind the parse gate. Enumerate every aggregate UDAF the
