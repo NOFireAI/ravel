@@ -309,6 +309,11 @@ path = "src/bin/logseg_live_by_site.rs"
 bench = false
 
 [[bin]]
+name = "logseg_peak_by_site"
+path = "src/bin/logseg_peak_by_site.rs"
+bench = false
+
+[[bin]]
 name = "histogram_size"
 path = "src/bin/histogram_size.rs"
 bench = false
