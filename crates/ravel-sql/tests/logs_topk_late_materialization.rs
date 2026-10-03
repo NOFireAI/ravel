@@ -62,22 +62,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use datafusion::arrow::array::TimestampNanosecondArray;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::error::DataFusionError;
 use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
 use datafusion::prelude::SessionContext;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_logseg::{
+    AttrValue, ColumnSelection, LogRecord, LogSegError, Predicate, RlogConfig, RlogReader,
+    RlogWriter, stream_attrs_bytes,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
     PageToken, PutOptions, PutOutcome, StoreError,
 };
-use ravel_query::{CacheFetchError, LogSegmentFetcher, PhaseAccounting};
+use ravel_query::{CacheFetchError, LogFetchError, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     CeilingBreach, DeclaredColumn, DeclaredType, LogsTableProvider, SessionTable, SpillDecision,
-    SqlConfig, TenantDelegatingPool, TenantMemoryAccountant, build_session,
+    SqlConfig, SqlError, TenantDelegatingPool, TenantMemoryAccountant, build_session,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -1010,4 +1015,232 @@ async fn explain_shows_both_phases_and_the_row_ref_column() {
             "the row-ref column reached the result"
         );
     }
+}
+
+// ---- a whole-segment fast-path open that prunes a block -------------------
+
+/// One-record blocks in the pruning fixture. Four, so that with block 1
+/// pruned a whole-object index of 2 is still a valid position (it names block
+/// 3), and an unguarded row-ref returns another block's row rather than an
+/// out-of-range error.
+const PRUNE_BLOCKS: usize = 4;
+const PRUNE_TS_BASE: i64 = 100;
+const PRUNE_OUTLIER_TS: i64 = 1_000_000_000;
+
+/// `ts` as a SQL literal.
+fn ts_literal(ns: i64) -> String {
+    format!("TIMESTAMP '1970-01-01 00:00:00.{ns:09}'")
+}
+
+/// One segment of [`PRUNE_BLOCKS`] one-record blocks, block `b` at
+/// `PRUNE_TS_BASE + b`. The catalog bounds are always that range; with
+/// `outlier`, block 1 actually holds [`PRUNE_OUTLIER_TS`], so its skip-index
+/// entry falls outside a window the catalog says contains the whole segment
+/// and the fast path's open prunes it.
+async fn prune_snapshot(store: &dyn ObjectStoreBackend, outlier: bool) -> Snapshot {
+    // The writer orders records by stream, then ts. One stream per record,
+    // ranked by stream id, puts each record in the block its rank names.
+    let resource = |i: usize| {
+        vec![(
+            "service.name".to_string(),
+            AttrValue::Str(format!("svc{i}")),
+        )]
+    };
+    let mut order: Vec<usize> = (0..PRUNE_BLOCKS).collect();
+    order
+        .sort_by_key(|&i| ravel_types::logstream::log_stream_id(&resource(i), "scope", "1.0", &[]));
+    let recs: Vec<LogRecord> = order
+        .iter()
+        .enumerate()
+        .map(|(block, &stream)| {
+            let mut r = record(block);
+            r.stream_id =
+                ravel_types::logstream::log_stream_id(&resource(stream), "scope", "1.0", &[]);
+            r.stream_attrs = stream_attrs_bytes(&resource(stream), "scope", "1.0", &[]);
+            r.ts_ns = if outlier && block == 1 {
+                PRUNE_OUTLIER_TS
+            } else {
+                PRUNE_TS_BASE + block as i64
+            };
+            r.observed_ts_ns = r.ts_ns;
+            r
+        })
+        .collect();
+    let cfg = RlogConfig {
+        block_target_records: 1,
+        ..RlogConfig::default()
+    };
+    let mut w = RlogWriter::new(cfg, identity(1));
+    for r in &recs {
+        w.push(r.clone()).expect("push");
+    }
+    let bytes = w.finish().expect("finish");
+
+    let reader = RlogReader::new(&bytes, &RlogConfig::default()).expect("open");
+    let mut scan = reader
+        .scan_blocks(
+            &Predicate::TsRange {
+                min_ns: i64::MIN,
+                max_ns: i64::MAX,
+            },
+            &[],
+            &ColumnSelection::fixed_only(),
+        )
+        .expect("scan");
+    let mut block_ts = Vec::new();
+    while let Some(block) = scan.next_block(&bytes).expect("block") {
+        block_ts.push(block.iter().map(|r| r.ts_ns).collect::<Vec<_>>());
+    }
+    let mut want: Vec<Vec<i64>> = (0..PRUNE_BLOCKS as i64)
+        .map(|b| vec![PRUNE_TS_BASE + b])
+        .collect();
+    if outlier {
+        want[1] = vec![PRUNE_OUTLIER_TS];
+    }
+    assert_eq!(
+        block_ts, want,
+        "one record per block, in the intended order"
+    );
+
+    let key = "logs/pruned.rlog".to_string();
+    let size = bytes.len() as u64;
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    store
+        .put(&key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put");
+    Snapshot {
+        segments: vec![SegmentRef {
+            data_object_key: key,
+            object_size: size,
+            min_event_ts_ns: PRUNE_TS_BASE,
+            max_event_ts_ns: PRUNE_TS_BASE + PRUNE_BLOCKS as i64 - 1,
+            ingest_hour_bucket: 0,
+            sample_count: PRUNE_BLOCKS as u64,
+            series_count: PRUNE_BLOCKS as u64,
+            shard: 0,
+            content_hash,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// `sql` over [`prune_snapshot`], one partition: the plan text and the rows,
+/// or the error the statement failed with.
+async fn run_pruned(
+    outlier: bool,
+    sql: &str,
+    rule: bool,
+) -> (String, Result<Vec<RecordBatch>, DataFusionError>) {
+    let store = Arc::new(MemoryStore::new());
+    let snapshot = prune_snapshot(store.as_ref(), outlier).await;
+    let fetcher = LogSegmentFetcher::new(store).with_cache(read_cache());
+    let provider = LogsTableProvider::new(
+        snapshot,
+        TenantHash(TENANT),
+        fetcher,
+        PhaseAccounting::pooled_over(&QueryAccounting::new()),
+    )
+    .with_declared_columns(declared_columns());
+    let ctx = session(provider, &config(Setup::new().rule(rule)));
+    let plan = ctx
+        .sql(sql)
+        .await
+        .expect("statement plans")
+        .create_physical_plan()
+        .await
+        .expect("physical plan");
+    let explain = displayable(plan.as_ref()).indent(false).to_string();
+    (explain, collect(plan, ctx.task_ctx()).await)
+}
+
+fn ts_of(rows: &[RecordBatch]) -> Vec<i64> {
+    rows.iter()
+        .flat_map(|b| {
+            let col = b
+                .column_by_name("ts")
+                .expect("ts column")
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("ts type")
+                .clone();
+            (0..col.len()).map(move |i| col.value(i))
+        })
+        .collect()
+}
+
+fn pruned_statement(order: &str, k: usize) -> String {
+    format!(
+        "SELECT * FROM logs WHERE ts >= {} AND ts <= {} ORDER BY ts {order} LIMIT {k}",
+        ts_literal(PRUNE_TS_BASE),
+        ts_literal(PRUNE_TS_BASE + PRUNE_BLOCKS as i64 - 1),
+    )
+}
+
+/// The whole-segment fast path stamps a row-ref with the decoded block's
+/// whole-object index, which late materialization resolves as a position
+/// among the blocks its reopen keeps. The two agree only while the open
+/// prunes nothing. Here the catalog says the segment lies inside the window,
+/// so the fast path runs, but block 1's skip-index entry lies outside it, so
+/// the open drains blocks 0, 2 and 3. The winner in block 2 is at drain
+/// position 1, and the scan fails with the typed survivor-mismatch error
+/// instead of stamping a row-ref. Unpruned, the same statement shape returns
+/// exactly the single-phase plan's rows, including the one in block 2.
+///
+/// Fails against a fast path that stamps the decoded index unguarded (the
+/// reopen resolves position 2 to block 3, and the statement returns block 3's
+/// row with no error) and against one that silently stamps the drain position
+/// instead (it returns rows, not the typed error).
+#[tokio::test]
+async fn a_fast_path_open_that_prunes_a_block_refuses_to_stamp_a_row_ref() {
+    let (explain, unpruned) = run_pruned(false, &pruned_statement("DESC", 2), true).await;
+    assert!(
+        explain.contains("LogsRowFetchExec"),
+        "the rule fires:\n{explain}"
+    );
+    let unpruned = unpruned.expect("unpruned statement runs");
+    let (_, single) = run_pruned(false, &pruned_statement("DESC", 2), false).await;
+    let single = single.expect("single-phase statement runs");
+    assert_eq!(ts_of(&unpruned), vec![PRUNE_TS_BASE + 3, PRUNE_TS_BASE + 2]);
+    assert_eq!(
+        unpruned, single,
+        "a row-ref addressing block 2 returns the single-phase plan's rows"
+    );
+
+    let (_, single) = run_pruned(true, &pruned_statement("ASC", 2), false).await;
+    assert_eq!(
+        ts_of(&single.expect("without row refs the pruned open reads fine")),
+        vec![PRUNE_TS_BASE, PRUNE_TS_BASE + 2]
+    );
+    let (_, pruned) = run_pruned(true, &pruned_statement("ASC", 2), true).await;
+    let err = match pruned {
+        Ok(rows) => panic!(
+            "a pruned fast-path open stamped row refs: ts {:?}",
+            ts_of(&rows)
+        ),
+        Err(e) => e,
+    };
+    let typed = match err.find_root() {
+        DataFusionError::External(e) => e.downcast_ref::<SqlError>(),
+        _ => None,
+    };
+    assert!(
+        matches!(
+            typed,
+            Some(SqlError::LogFetch(LogFetchError::Corrupt {
+                source: LogSegError::Corrupted(msg),
+                ..
+            })) if msg.contains("segment survivor mismatch")
+                && msg.contains("whole-segment open decoded block 2 at drain position 1")
+        ),
+        "expected the typed survivor-mismatch error, got {err:?}"
+    );
 }
