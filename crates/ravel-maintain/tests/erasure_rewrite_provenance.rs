@@ -88,7 +88,7 @@ const W2: Writer = Writer {
     seq: 9,
     created_unix_ns: hour_start() + 3 * MS,
 };
-/// The later commit: newer than every original flush, older than the
+/// A later commit that wins: newer than every original flush, older than the
 /// compaction record and the rewrite record, both stamped by the maintenance
 /// clock at `sealed_now_ns()`.
 const W5: Writer = Writer {
@@ -96,6 +96,15 @@ const W5: Writer = Writer {
     epoch: 1,
     seq: 1,
     created_unix_ns: hour_start() + 30 * 60_000 * MS,
+};
+/// A later commit that loses: older than W1, W3 and W4, newer than W2. A
+/// merged run whose samples all took W2's run-wide triple (the minimum the
+/// compactor stamps on it) would lose to it.
+const W6: Writer = Writer {
+    id: 6,
+    epoch: 99,
+    seq: 99,
+    created_unix_ns: hour_start() + 4 * MS,
 };
 
 const fn hour_start() -> i64 {
@@ -116,6 +125,7 @@ type Resolution = BTreeMap<([u8; 16], i64), Resolved>;
 /// How the query fetcher stamps a segment's samples: an L0 object by its commit
 /// record, an L1 or rewrite part by each run's own catalog provenance or, when
 /// the run carries one, its per-sample provenance column.
+#[derive(Clone, Copy)]
 enum Level {
     L0(Writer),
     L1,
@@ -310,13 +320,27 @@ fn original_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> 
     ]
 }
 
-/// The later commit: one more duplicate on a merged scalar run, a verbatim
-/// single-writer run, and a merged histogram run.
-fn later_flush() -> Vec<(SeriesId, LabelSet, SeriesValues)> {
+/// The later commits: W5 adds one more duplicate on a merged scalar run, a
+/// verbatim single-writer run, and a merged histogram run, and wins each; W6
+/// duplicates three contested timestamps and loses each.
+fn later_flushes() -> Vec<(Writer, Vec<(SeriesId, LabelSet, SeriesValues)>)> {
     vec![
-        scalar("alpha", "a", &[(1_000, bits(11.0))]),
-        scalar("solo", "s", &[(1_000, bits(12.0))]),
-        histogram("hist", "h", &[(1_000, 50)]),
+        (
+            W5,
+            vec![
+                scalar("alpha", "a", &[(1_000, bits(11.0))]),
+                scalar("solo", "s", &[(1_000, bits(12.0))]),
+                histogram("hist", "h", &[(1_000, 50)]),
+            ],
+        ),
+        (
+            W6,
+            vec![
+                scalar("alpha", "a", &[(2_000, bits(13.0))]),
+                scalar("beta", "b", &[(2_000, bits(14.0))]),
+                histogram("hist", "h", &[(2_000, 60)]),
+            ],
+        ),
     ]
 }
 
@@ -413,8 +437,9 @@ fn slice(bytes: &[u8], (offset, len): (u64, u64)) -> &[u8] {
     &bytes[offset as usize..(offset + len) as usize]
 }
 
-/// A windowless erasure request for every series named `victim`.
-fn erase_victim() -> PendingErasureRequest {
+/// An erasure request for every series named `name`, over the half-open
+/// `[window_start_ns, window_end_ns)` (zero on a side leaves it open).
+fn erasure_request(name: &str, window_start_ns: i64, window_end_ns: i64) -> PendingErasureRequest {
     let request_id = Uuid::from_u128(0x2409);
     PendingErasureRequest {
         request_key: keys::erasure_request_key(&tenant_hash(), Signal::Metrics, request_id)
@@ -427,10 +452,10 @@ fn erase_victim() -> PendingErasureRequest {
             created_unix_ns: 0,
             predicate: vec![ErasurePredicateMatcher {
                 key: "__name__".to_string(),
-                value: "victim".to_string(),
+                value: name.to_string(),
             }],
-            window_start_ns: 0,
-            window_end_ns: 0,
+            window_start_ns,
+            window_end_ns,
             reason: String::new(),
         },
     }
@@ -465,16 +490,22 @@ async fn l1_segments(store: &dyn ObjectStoreBackend, keys: &[String]) -> Vec<(Le
     out
 }
 
-/// Compact the original flushes into `store`. Returns the L0 segments as the
-/// query would read them before compaction and the compaction part keys.
-async fn seed_and_compact(
+/// Seed the original flushes into `store` and, when `compact` is set, compact
+/// them. Returns the L0 segments as the query reads them before compaction and
+/// the bucket's live segments afterwards (the L0 segments themselves when not
+/// compacted).
+async fn seed_originals(
     store: &MemoryStore,
     clock: &FixedClock,
-) -> (Vec<(Level, Bytes)>, Vec<String>) {
+    compact: bool,
+) -> (Vec<(Level, Bytes)>, Vec<(Level, Bytes)>) {
     let mut l0 = Vec::new();
     for (w, batch) in original_flushes() {
         let key = seed_l0(store, w, batch).await;
         l0.push((Level::L0(w), get_full(store, &key).await));
+    }
+    if !compact {
+        return (l0.clone(), l0);
     }
     let outcome = compact_bucket(store, clock, &CompactorConfig::default(), &bucket())
         .await
@@ -485,15 +516,19 @@ async fn seed_and_compact(
     );
     let key = record_key(store, false).await;
     let rec = CompactionRecord::decode(get_full(store, &key).await.as_ref()).unwrap();
-    let parts = rec
+    let parts: Vec<String> = rec
         .parts
         .iter()
         .map(|p| keys::reconstruct_l1_part_key(&rec, p).unwrap())
         .collect();
-    (l0, parts)
+    (l0, l1_segments(store, &parts).await)
 }
 
-async fn erase(store: &MemoryStore, clock: &FixedClock) -> Vec<String> {
+async fn erase(
+    store: &MemoryStore,
+    clock: &FixedClock,
+    request: &PendingErasureRequest,
+) -> Vec<String> {
     let mut memo = MaintainMemo::with_default_interval();
     let outcome = erasure_rewrite_bucket(
         store,
@@ -501,7 +536,7 @@ async fn erase(store: &MemoryStore, clock: &FixedClock) -> Vec<String> {
         &CompactorConfig::default(),
         &NoLeases,
         &bucket(),
-        &[erase_victim()],
+        std::slice::from_ref(request),
         &mut memo,
     )
     .await
@@ -539,99 +574,139 @@ fn assert_original_winners(r: &Resolution) {
     assert_eq!(scalar_at("victim", "v", 1_000), Resolved::Scalar(bits(9.0)));
 }
 
-/// Erasing an unrelated series leaves every surviving (series, timestamp)
-/// resolving to the identical bits, and a later commit duplicating three of
-/// those timestamps wins or loses the same way against the rewrite as against
-/// the compaction it replaced.
-#[tokio::test]
-async fn erasure_rewrite_keeps_every_dedup_winner() {
+/// The later commits resolve the way [`later_flushes`] says.
+fn assert_later_winners(r: &Resolution) {
+    let at = |name, k, ts| r[&(id(name, k), ts)];
+    assert_eq!(at("alpha", "a", 1_000), Resolved::Scalar(bits(11.0)));
+    assert_eq!(at("solo", "s", 1_000), Resolved::Scalar(bits(12.0)));
+    assert_eq!(at("hist", "h", 1_000), Resolved::Histogram(50));
+    assert_eq!(at("alpha", "a", 2_000), Resolved::Scalar(bits(-0.0)));
+    assert_eq!(at("beta", "b", 2_000), Resolved::Scalar(bits(0.0)));
+    assert_eq!(at("hist", "h", 2_000), Resolved::Histogram(40));
+}
+
+/// `r` with every (series, ts) `erased` names removed.
+fn without(r: &Resolution, erased: impl Fn(&([u8; 16], i64)) -> bool) -> Resolution {
+    r.iter()
+        .filter(|(key, _)| !erased(key))
+        .map(|(k, v)| (*k, *v))
+        .collect()
+}
+
+/// World A holds the original flushes (compacted when `compact` is set) and
+/// world B the same, then `request` applied by the erasure rewrite. Every
+/// (series, ts) that `erased` does not name must resolve to identical bits in
+/// both, before and after the later commits land in each.
+async fn assert_rewrite_keeps_winners(
+    request: PendingErasureRequest,
+    erased: impl Fn(&([u8; 16], i64)) -> bool,
+    compact: bool,
+) {
     let clock = FixedClock::new(sealed_now_ns());
 
-    // World A: compaction only.
-    let compacted = MemoryStore::new();
-    let (l0, compacted_parts) = seed_and_compact(&compacted, &clock).await;
+    let world_a = MemoryStore::new();
+    let (mut l0, mut a_live) = seed_originals(&world_a, &clock, compact).await;
     let from_l0 = resolve(&l0);
     assert_original_winners(&from_l0);
-    let compacted_segments = l1_segments(&compacted, &compacted_parts).await;
-    assert!(
-        compacted_segments.iter().any(|(_, obj)| {
-            let loc = open_from_full(obj, ReaderLimits::default()).unwrap();
-            decode_catalog_v5(&loc.footer, obj, ReaderLimits::default())
-                .unwrap()
-                .iter()
-                .any(|e| e.per_sample_provenance.iter().any(Option::is_some))
-        }),
-        "compaction merged runs, so its parts carry per-sample provenance"
-    );
-    let from_compaction = resolve(&compacted_segments);
+    let from_a = resolve(&a_live);
     assert_eq!(
-        from_compaction, from_l0,
-        "compaction resolves every (series, ts) as its L0 inputs did"
+        from_a, from_l0,
+        "the live record set resolves every (series, ts) as the L0 inputs do"
     );
+    if compact {
+        assert!(
+            a_live.iter().any(|(_, obj)| {
+                let loc = open_from_full(obj, ReaderLimits::default()).unwrap();
+                decode_catalog_v5(&loc.footer, obj, ReaderLimits::default())
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.per_sample_provenance.iter().any(Option::is_some))
+            }),
+            "compaction merged runs, so its parts carry per-sample provenance"
+        );
+    }
+    let erased_in_a = from_a.keys().filter(|k| erased(k)).count();
+    assert!(erased_in_a > 0, "the request matches samples in the bucket");
 
-    // World B: the same compaction, then an erasure of `victim`.
-    let rewritten = MemoryStore::new();
-    let (_, rewritten_compaction) = seed_and_compact(&rewritten, &clock).await;
-    assert_eq!(
-        rewritten_compaction, compacted_parts,
-        "both worlds hold the same compaction"
-    );
-    let rewrite_parts = erase(&rewritten, &clock).await;
-    let from_rewrite = resolve(&l1_segments(&rewritten, &rewrite_parts).await);
-    let victim = id("victim", "v");
-    let mut surviving = from_compaction.clone();
-    surviving.retain(|(series, _), _| *series != victim);
+    let world_b = MemoryStore::new();
+    seed_originals(&world_b, &clock, compact).await;
+    let rewrite_parts = erase(&world_b, &clock, &request).await;
+    let mut b_live = l1_segments(&world_b, &rewrite_parts).await;
+    let from_b = resolve(&b_live);
     assert!(
-        from_rewrite.keys().all(|(series, _)| *series != victim),
-        "the rewrite erased the subject"
+        from_b.keys().all(|k| !erased(k)),
+        "the rewrite erased every matching sample"
     );
     assert_eq!(
-        from_rewrite, surviving,
+        from_b,
+        without(&from_a, &erased),
         "every surviving (series, ts) resolves to identical bits after the rewrite"
     );
 
-    // A later commit from a fifth writer, against each world.
-    let a_late = seed_l0(&compacted, W5, later_flush()).await;
-    let b_late = seed_l0(&rewritten, W5, later_flush()).await;
-    let mut a_segments = compacted_segments;
-    a_segments.push((Level::L0(W5), get_full(&compacted, &a_late).await));
-    let mut b_segments = l1_segments(&rewritten, &rewrite_parts).await;
-    b_segments.push((Level::L0(W5), get_full(&rewritten, &b_late).await));
-    let a_resolved = resolve(&a_segments);
-    let b_resolved = resolve(&b_segments);
-
-    let mut l0_late = l0;
-    l0_late.push((Level::L0(W5), get_full(&compacted, &a_late).await));
+    for (w, batch) in later_flushes() {
+        let a_key = seed_l0(&world_a, w, batch.clone()).await;
+        let b_key = seed_l0(&world_b, w, batch).await;
+        let a_obj = get_full(&world_a, &a_key).await;
+        l0.push((Level::L0(w), a_obj.clone()));
+        a_live.push((Level::L0(w), a_obj));
+        b_live.push((Level::L0(w), get_full(&world_b, &b_key).await));
+    }
+    let late_a = resolve(&a_live);
     assert_eq!(
-        a_resolved,
-        resolve(&l0_late),
-        "the compaction resolves the later commit as its L0 inputs would"
+        late_a,
+        resolve(&l0),
+        "the live record set resolves the later commits as the L0 inputs do"
     );
-    assert_eq!(
-        a_resolved[&(id("alpha", "a"), 1_000)],
-        Resolved::Scalar(bits(11.0)),
-        "the later commit is newer than every original flush"
-    );
-    assert_eq!(
-        a_resolved[&(id("solo", "s"), 1_000)],
-        Resolved::Scalar(bits(12.0))
-    );
-    assert_eq!(
-        a_resolved[&(id("hist", "h"), 1_000)],
-        Resolved::Histogram(50)
-    );
-
-    let mut a_surviving = a_resolved;
-    a_surviving.retain(|(series, _), _| *series != victim);
-    for (key, winner) in &a_surviving {
+    assert_later_winners(&late_a);
+    let late_b = resolve(&b_live);
+    for (key, winner) in &without(&late_a, &erased) {
         assert_eq!(
-            b_resolved.get(key),
+            late_b.get(key),
             Some(winner),
-            "series {} ts {}: the later commit resolves the same against the \
-             rewrite as against the compaction",
+            "series {} ts {}: the later commits resolve the same against the \
+             rewrite as against the record it replaced",
             hex::encode(key.0),
             key.1
         );
     }
-    assert_eq!(b_resolved, a_surviving);
+    assert_eq!(late_b, without(&late_a, &erased));
+}
+
+/// Erasing an unrelated series from a compacted bucket: every other run is
+/// copied through, including the merged runs and their provenance columns.
+#[tokio::test]
+async fn erasing_another_series_keeps_every_dedup_winner() {
+    let victim = id("victim", "v");
+    assert_rewrite_keeps_winners(
+        erasure_request("victim", 0, 0),
+        |(series, _)| *series == victim,
+        true,
+    )
+    .await;
+}
+
+/// A windowed erasure inside a merged run: W2's `alpha` sample at 3000 goes,
+/// and the run's survivors are re-encoded with their own provenance entries.
+#[tokio::test]
+async fn erasing_part_of_a_merged_run_keeps_every_dedup_winner() {
+    let alpha = id("alpha", "a");
+    assert_rewrite_keeps_winners(
+        erasure_request("alpha", 3_000, 4_000),
+        |(series, ts)| *series == alpha && *ts == 3_000,
+        true,
+    )
+    .await;
+}
+
+/// The same windowed erasure over the raw L0 inputs of a bucket never
+/// compacted: each run keeps its commit record's identity.
+#[tokio::test]
+async fn erasing_part_of_a_raw_l0_bucket_keeps_every_dedup_winner() {
+    let alpha = id("alpha", "a");
+    assert_rewrite_keeps_winners(
+        erasure_request("alpha", 3_000, 4_000),
+        |(series, ts)| *series == alpha && *ts == 3_000,
+        false,
+    )
+    .await;
 }
