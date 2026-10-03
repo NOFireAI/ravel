@@ -418,10 +418,13 @@ spec:
 ```
 
 The block expects four Secrets in the `RavelCluster`'s namespace. The
-operator mounts them and reads their `resourceVersion` to detect a
-rotation; it never reads their values, and never creates or rotates them. A
-referenced Secret that does not exist fails the reconcile with
-`SecretNotFound`, as a missing deployment key Secret does.
+operator mounts them and reads only their `resourceVersion` (a metadata-only
+read) to detect a rotation; it never loads their values, and never creates
+or rotates them. A referenced Secret that does not exist does not fail the
+whole reconcile: the operator holds back only the query tier (its running
+pods keep serving), keeps the fragment NetworkPolicy in place, and records a
+`Degraded` condition naming the Secret, while the gateway and maintain
+Deployments reconcile as usual.
 
 | Reference | Secret keys | Mounted at | Flag |
 |---|---|---|---|
@@ -504,13 +507,33 @@ turning `spec.probes.dedicatedHealthPort` off, waits for the same rollout
 condition. While query pods of an older spec may still be running, the
 policy's second rule also admits every port those pods can listen on (4318
 and 4316), and the operator narrows it to the new spec's ports once the
-rollout completes.
+rollout completes. Disabling the block while the rollout is incomplete is
+the same: the operator holds that wider policy (so a port the new pods open,
+such as a dedicated health port turned on in the same change, is not blocked
+under the old policy) and deletes it only once the rollout completes.
+
+"Rollout completes" means the query Deployment has no pod left on an older
+spec, including terminating ones: the operator also waits for
+`status.terminatingReplicas` to reach zero when the cluster reports it, so it
+does not delete or narrow the policy while an old pod is still shutting down
+on the fragment port. When the cluster does not report that field (before
+Kubernetes 1.33, or with the feature gate off) the operator cannot see
+terminating pods, so the policy can be removed while one lingers for up to
+that pod's termination grace period (45s, or 51s with the dedicated health
+port). The window is not closed, only narrowed: the fragment listener's own
+mutual TLS still refuses any peer that presents no certificate from the
+fragment CA.
 
 Upgrading the operator to a version with this block: apply
 `deploy/k8s/operator/rbac.yaml` before rolling out the new operator image.
 The operator deletes the fragment NetworkPolicy on every reconcile of a
 cluster without the block, and without the `networkpolicies` grant that
-delete fails and stops reconciliation of every `RavelCluster`.
+delete fails and stops reconciliation of every `RavelCluster`. A cluster
+with the block already enabled sees one query rollout on the upgrade: the
+four Secrets' `resourceVersion`s now feed the query pod template's checksum
+(see below), which moves it once. If one of those four Secrets is missing,
+that upgrade pass holds the query tier back and reports `Degraded` naming the
+Secret, while the gateway and maintain Deployments still reconcile.
 
 `ravel-server` reads all four files once at startup, so the four Secrets'
 `resourceVersion`s feed the query pod template's secrets checksum, the same
