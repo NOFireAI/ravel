@@ -29,8 +29,9 @@
 //! year outside 0000 to 9999, or a `Date64` that is not a whole day) is an
 //! error. `Decimal128` is a string of its exact decimal text. Binary types
 //! are lowercase hex strings. A type with no arm is an error naming the
-//! type. These are all `SqlError::Internal`: the HTTP response carries only
-//! the fixed internal message, and the server logs the detail.
+//! type. These are all `SqlError::Internal`: `/api/v1/sql` answers with
+//! only the fixed internal message and logs the detail, while the `/mcp`
+//! tool output carries the error's full text.
 
 use std::fmt::Write as _;
 
