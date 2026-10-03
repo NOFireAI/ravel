@@ -73,6 +73,26 @@ const BAND_OPERATOR_MATCH: Band = Band { lo: 11.0, hi: 13.0 };
 const BAND_ASSEMBLY: Band = Band { lo: 0.0, hi: 10.0 };
 const BAND_REMAINDER: Band = Band { lo: 0.0, hi: 5.0 };
 
+/// Issue #2479 stage 0b: pre-registered bands for Q_AGG's **fan-out**
+/// (per-segment future) unattributed time share, i.e. share of the sum of
+/// `FUTURE_NS` -- not share of wall, which the stage 0 bands above use.
+/// `BAND_MATCHER_EVAL` has no step to check it against (see the report's
+/// `matcher_evaluation` line) and is kept only so the pre-registration is
+/// visible in one place.
+const BAND_LABEL_CLONE: Band = Band { lo: 40.0, hi: 70.0 };
+const BAND_MAP_SET_INSERTS: Band = Band { lo: 10.0, hi: 30.0 };
+#[allow(dead_code)]
+const BAND_MATCHER_EVAL: Band = Band { lo: 5.0, hi: 20.0 };
+const BAND_SAMPLE_ASSEMBLY_FUTURE: Band = Band { lo: 0.0, hi: 15.0 };
+const BAND_LIMITER_PLAN_FUTURE: Band = Band { lo: 0.0, hi: 5.0 };
+const BAND_FUTURE_REMAINDER: Band = Band { lo: 0.0, hi: 5.0 };
+
+/// Labels per series `build_series` emits (`__name__`, the two group labels,
+/// `dc_zone`, `host_pool`, `svc_tier`, `series_key`); used to turn a
+/// label-SET clone count into a label-STRING allocation count for the
+/// multiplier report.
+const LABELS_PER_SERIES: u64 = 7;
+
 /// Build one series' label set and `SeriesId`. `i` ranges over
 /// `0..SERIES_PER_METRIC`, independently for each metric: the group-label
 /// pair depends only on `i % TOTAL_GROUPS`, so metric A's grouping is exact
@@ -196,6 +216,33 @@ struct QueryInstantSample {
     segments_fetched: u64,
     fetch_requests: u64,
     fetch_bytes: u64,
+    // --- Issue #2479 stage 0b: per-segment future tiling and the two gaps
+    // outside it (see `phase_timers.rs`'s stage 0b doc comments).
+    future_ns: u64,
+    future_calls: u64,
+    limiter_wait_ns: u64,
+    limiter_wait_calls: u64,
+    footer_parse_ns: u64,
+    footer_parse_calls: u64,
+    catalog_retain_ns: u64,
+    catalog_retain_calls: u64,
+    page_plan_ns: u64,
+    page_plan_calls: u64,
+    run_plan_lookup_ns: u64,
+    run_plan_lookup_calls: u64,
+    label_clone_ns: u64,
+    label_clone_calls: u64,
+    sample_assembly_ns: u64,
+    sample_assembly_calls: u64,
+    pre_fanout_ns: u64,
+    pre_fanout_calls: u64,
+    post_fanout_ns: u64,
+    post_fanout_calls: u64,
+    /// Engine-cumulative `SegmentFetcher::label_sets_materialized` diff
+    /// across this one query (catalog-decode-time materialisation, distinct
+    /// from `label_clone_calls`'s later per-run clone -- see the multiplier
+    /// report).
+    label_sets_materialized: u64,
 }
 
 async fn run_instant(
@@ -222,6 +269,27 @@ async fn run_instant(
     let materialize_calls_before = phase_timers::MATERIALIZE_CALLS.load(Ordering::Relaxed);
     let assembly_ns_before = phase_timers::RESULT_ASSEMBLY_NS.load(Ordering::Relaxed);
     let assembly_calls_before = phase_timers::RESULT_ASSEMBLY_CALLS.load(Ordering::Relaxed);
+    let future_ns_before = phase_timers::FUTURE_NS.load(Ordering::Relaxed);
+    let future_calls_before = phase_timers::FUTURE_CALLS.load(Ordering::Relaxed);
+    let limiter_wait_ns_before = phase_timers::LIMITER_WAIT_NS.load(Ordering::Relaxed);
+    let limiter_wait_calls_before = phase_timers::LIMITER_WAIT_CALLS.load(Ordering::Relaxed);
+    let footer_parse_ns_before = phase_timers::FOOTER_PARSE_NS.load(Ordering::Relaxed);
+    let footer_parse_calls_before = phase_timers::FOOTER_PARSE_CALLS.load(Ordering::Relaxed);
+    let catalog_retain_ns_before = phase_timers::CATALOG_RETAIN_NS.load(Ordering::Relaxed);
+    let catalog_retain_calls_before = phase_timers::CATALOG_RETAIN_CALLS.load(Ordering::Relaxed);
+    let page_plan_ns_before = phase_timers::PAGE_PLAN_NS.load(Ordering::Relaxed);
+    let page_plan_calls_before = phase_timers::PAGE_PLAN_CALLS.load(Ordering::Relaxed);
+    let run_plan_lookup_ns_before = phase_timers::RUN_PLAN_LOOKUP_NS.load(Ordering::Relaxed);
+    let run_plan_lookup_calls_before = phase_timers::RUN_PLAN_LOOKUP_CALLS.load(Ordering::Relaxed);
+    let label_clone_ns_before = phase_timers::LABEL_CLONE_NS.load(Ordering::Relaxed);
+    let label_clone_calls_before = phase_timers::LABEL_CLONE_CALLS.load(Ordering::Relaxed);
+    let sample_assembly_ns_before = phase_timers::SAMPLE_ASSEMBLY_NS.load(Ordering::Relaxed);
+    let sample_assembly_calls_before = phase_timers::SAMPLE_ASSEMBLY_CALLS.load(Ordering::Relaxed);
+    let pre_fanout_ns_before = phase_timers::PRE_FANOUT_NS.load(Ordering::Relaxed);
+    let pre_fanout_calls_before = phase_timers::PRE_FANOUT_CALLS.load(Ordering::Relaxed);
+    let post_fanout_ns_before = phase_timers::POST_FANOUT_NS.load(Ordering::Relaxed);
+    let post_fanout_calls_before = phase_timers::POST_FANOUT_CALLS.load(Ordering::Relaxed);
+    let label_sets_materialized_before = engine.label_sets_materialized();
 
     let start = Instant::now();
     let (value, stats) = engine
@@ -290,6 +358,43 @@ async fn run_instant(
         segments_fetched: stats.segments_fetched,
         fetch_requests,
         fetch_bytes,
+        future_ns: phase_timers::FUTURE_NS.load(Ordering::Relaxed) - future_ns_before,
+        future_calls: phase_timers::FUTURE_CALLS.load(Ordering::Relaxed) - future_calls_before,
+        limiter_wait_ns: phase_timers::LIMITER_WAIT_NS.load(Ordering::Relaxed)
+            - limiter_wait_ns_before,
+        limiter_wait_calls: phase_timers::LIMITER_WAIT_CALLS.load(Ordering::Relaxed)
+            - limiter_wait_calls_before,
+        footer_parse_ns: phase_timers::FOOTER_PARSE_NS.load(Ordering::Relaxed)
+            - footer_parse_ns_before,
+        footer_parse_calls: phase_timers::FOOTER_PARSE_CALLS.load(Ordering::Relaxed)
+            - footer_parse_calls_before,
+        catalog_retain_ns: phase_timers::CATALOG_RETAIN_NS.load(Ordering::Relaxed)
+            - catalog_retain_ns_before,
+        catalog_retain_calls: phase_timers::CATALOG_RETAIN_CALLS.load(Ordering::Relaxed)
+            - catalog_retain_calls_before,
+        page_plan_ns: phase_timers::PAGE_PLAN_NS.load(Ordering::Relaxed) - page_plan_ns_before,
+        page_plan_calls: phase_timers::PAGE_PLAN_CALLS.load(Ordering::Relaxed)
+            - page_plan_calls_before,
+        run_plan_lookup_ns: phase_timers::RUN_PLAN_LOOKUP_NS.load(Ordering::Relaxed)
+            - run_plan_lookup_ns_before,
+        run_plan_lookup_calls: phase_timers::RUN_PLAN_LOOKUP_CALLS.load(Ordering::Relaxed)
+            - run_plan_lookup_calls_before,
+        label_clone_ns: phase_timers::LABEL_CLONE_NS.load(Ordering::Relaxed)
+            - label_clone_ns_before,
+        label_clone_calls: phase_timers::LABEL_CLONE_CALLS.load(Ordering::Relaxed)
+            - label_clone_calls_before,
+        sample_assembly_ns: phase_timers::SAMPLE_ASSEMBLY_NS.load(Ordering::Relaxed)
+            - sample_assembly_ns_before,
+        sample_assembly_calls: phase_timers::SAMPLE_ASSEMBLY_CALLS.load(Ordering::Relaxed)
+            - sample_assembly_calls_before,
+        pre_fanout_ns: phase_timers::PRE_FANOUT_NS.load(Ordering::Relaxed) - pre_fanout_ns_before,
+        pre_fanout_calls: phase_timers::PRE_FANOUT_CALLS.load(Ordering::Relaxed)
+            - pre_fanout_calls_before,
+        post_fanout_ns: phase_timers::POST_FANOUT_NS.load(Ordering::Relaxed)
+            - post_fanout_ns_before,
+        post_fanout_calls: phase_timers::POST_FANOUT_CALLS.load(Ordering::Relaxed)
+            - post_fanout_calls_before,
+        label_sets_materialized: engine.label_sets_materialized() - label_sets_materialized_before,
     }
 }
 
@@ -343,10 +448,218 @@ fn phase_report(
     }
 }
 
+/// Same time/share computation as [`phase_report`], for a step with no
+/// pre-registered band (issue #2479 stage 0b's `footer_parse`/
+/// `catalog_retain`, and the `pre_fanout`/`post_fanout` gaps): always reports
+/// "not pre-registered" rather than a band verdict.
+fn phase_report_unregistered(
+    samples: &[QueryInstantSample],
+    denom_run_means: &[f64],
+    f: impl Fn(&QueryInstantSample) -> u64,
+) -> PhaseReport {
+    let field_means = per_run_u64_means(samples, f);
+    let share_run = share_of(&field_means, denom_run_means);
+    let time = run_stats(&mut field_means.clone());
+    let share = run_stats(&mut share_run.clone());
+    PhaseReport {
+        time,
+        share,
+        verdict: "not pre-registered",
+    }
+}
+
 fn print_phase(label: &str, r: &PhaseReport) {
     println!(
         "  {label:<34}: time_ns min={:.0} median={:.0} max={:.0} | share% min={:.3} median={:.3} max={:.3} -> {}",
         r.time.min, r.time.median, r.time.max, r.share.min, r.share.median, r.share.max, r.verdict
+    );
+}
+
+/// Like [`phase_report`]/[`phase_report_unregistered`], picking the banded
+/// form when `band` is `Some` (issue #2479 stage 0b: only the steps the task
+/// pre-registered a Q_AGG fan-out-share band for pass one in).
+fn fanout_step(
+    samples: &[QueryInstantSample],
+    denom_run_means: &[f64],
+    f: impl Fn(&QueryInstantSample) -> u64,
+    band: Option<&Band>,
+) -> PhaseReport {
+    match band {
+        Some(b) => phase_report(samples, denom_run_means, f, b),
+        None => phase_report_unregistered(samples, denom_run_means, f),
+    }
+}
+
+/// Issue #2479 stage 0b report: per-segment future tiling, the two gaps
+/// outside the fan-out, and the multiplier counts (deliverable 4). `bands`
+/// applies the task's pre-registered Q_AGG fan-out-share bands when true
+/// (Q_MATCH has none, so every step there prints "not pre-registered").
+/// `ground_truth_distinct` is the compile-time-known count of distinct
+/// series this query's selector(s) touch before any per-segment
+/// multiplication, used to compute the "built k times or once" multiplier.
+fn print_stage0b_fanout(
+    query_label: &str,
+    samples: &[QueryInstantSample],
+    wall_run_means: &[f64],
+    apply_bands: bool,
+    ground_truth_distinct: u64,
+) {
+    println!("{query_label} stage 0b fan-out (issue #2479):");
+
+    let future_means = per_run_u64_means(samples, |s| s.future_ns);
+    let future_share_wall = share_of(&future_means, wall_run_means);
+    let future_time = run_stats(&mut future_means.clone());
+    let future_share = run_stats(&mut future_share_wall.clone());
+    let fdw_means = per_run_u64_means(samples, |s| s.fetch_decode_wall_ns);
+    let fdw_time = run_stats(&mut fdw_means.clone());
+    println!(
+        "  future_ns (sum of per-segment futures)   : min={:.0} median={:.0} max={:.0} ns | share-of-wall% median={:.2} (informational: futures run concurrently inside fetch_decode_wall, so > 100% of it is expected, not a bug)",
+        future_time.min, future_time.median, future_time.max, future_share.median
+    );
+    println!(
+        "  fetch_decode_wall_ns (fan-out wall span) : median={:.0} ns | concurrency_factor = future_sum/wall = {:.2}",
+        fdw_time.median,
+        future_time.median / fdw_time.median.max(1.0)
+    );
+
+    let limiter_plan = fanout_step(
+        samples,
+        &future_means,
+        |s| s.limiter_wait_ns + s.page_plan_ns,
+        apply_bands.then_some(&BAND_LIMITER_PLAN_FUTURE),
+    );
+    print_phase("limiter_wait+page_plan (share of future)", &limiter_plan);
+    print_phase(
+        "  limiter_wait alone (share of future)",
+        &fanout_step(samples, &future_means, |s| s.limiter_wait_ns, None),
+    );
+    print_phase(
+        "  page_plan alone (share of future)",
+        &fanout_step(samples, &future_means, |s| s.page_plan_ns, None),
+    );
+
+    println!(
+        "  matcher_evaluation (share of future)     : not separately instrumentable from ravel-query -- executes inside ravel_segment::decode_catalog_matching_v4 (out of this crate's scope), counted inside DECODE_NS alongside page decode; pre-registered band {:.0}-{:.0}% cannot be checked here",
+        BAND_MATCHER_EVAL.lo, BAND_MATCHER_EVAL.hi
+    );
+
+    print_phase(
+        "run_plan_lookup (map/set-insert analog, share of future)",
+        &fanout_step(
+            samples,
+            &future_means,
+            |s| s.run_plan_lookup_ns,
+            apply_bands.then_some(&BAND_MAP_SET_INSERTS),
+        ),
+    );
+    print_phase(
+        "label_clone (label-set construction, share of future)",
+        &fanout_step(
+            samples,
+            &future_means,
+            |s| s.label_clone_ns,
+            apply_bands.then_some(&BAND_LABEL_CLONE),
+        ),
+    );
+    print_phase(
+        "sample_assembly (share of future)",
+        &fanout_step(
+            samples,
+            &future_means,
+            |s| s.sample_assembly_ns,
+            apply_bands.then_some(&BAND_SAMPLE_ASSEMBLY_FUTURE),
+        ),
+    );
+    print_phase(
+        "footer_parse (share of future, not pre-registered)",
+        &fanout_step(samples, &future_means, |s| s.footer_parse_ns, None),
+    );
+    print_phase(
+        "catalog_retain (share of future, not pre-registered)",
+        &fanout_step(samples, &future_means, |s| s.catalog_retain_ns, None),
+    );
+    print_phase(
+        "remainder_inside_futures (share of future)",
+        &fanout_step(
+            samples,
+            &future_means,
+            |s| {
+                let steps = s.limiter_wait_ns
+                    + s.footer_parse_ns
+                    + s.catalog_retain_ns
+                    + s.page_plan_ns
+                    + s.run_plan_lookup_ns
+                    + s.label_clone_ns
+                    + s.sample_assembly_ns
+                    + s.fetch_ns
+                    + s.decode_ns;
+                s.future_ns.saturating_sub(steps)
+            },
+            apply_bands.then_some(&BAND_FUTURE_REMAINDER),
+        ),
+    );
+
+    print_phase(
+        "pre_fanout_gap (share of wall, not pre-registered)",
+        &phase_report_unregistered(samples, wall_run_means, |s| s.pre_fanout_ns),
+    );
+    print_phase(
+        "post_fanout_gap (share of wall, not pre-registered)",
+        &phase_report_unregistered(samples, wall_run_means, |s| s.post_fanout_ns),
+    );
+    print_phase(
+        "remainder_outside_stage0b (share of wall; tightens stage 0's own remainder by also subtracting pre/post_fanout)",
+        &phase_report_unregistered(samples, wall_run_means, |s| {
+            s.wall_ns.saturating_sub(
+                s.resolve_ns
+                    + s.fetch_decode_wall_ns
+                    + s.materialize_ns
+                    + s.result_assembly_ns
+                    + s.pre_fanout_ns
+                    + s.post_fanout_ns,
+            )
+        }),
+    );
+
+    // --- Multiplier counts (deliverable 4) ---
+    let n = samples.len() as f64;
+    let label_clone_calls_total: u64 = samples.iter().map(|s| s.label_clone_calls).sum();
+    let run_plan_lookup_calls_total: u64 = samples.iter().map(|s| s.run_plan_lookup_calls).sum();
+    let label_sets_materialized_total: u64 =
+        samples.iter().map(|s| s.label_sets_materialized).sum();
+    let decode_calls_total: u64 = samples.iter().map(|s| s.decode_calls).sum();
+    let label_clone_calls_per_query = label_clone_calls_total as f64 / n;
+    let multiplier = label_clone_calls_per_query / ground_truth_distinct as f64;
+    println!("  {query_label} multiplier counts (issue #2479 deliverable 4):");
+    println!(
+        "    series-run materialisations (label_clone_calls), per-query mean : {label_clone_calls_per_query:.1} (= sum over fetched segments of series matched in that segment)"
+    );
+    println!(
+        "    run_plan_lookup_calls, per-query mean                            : {:.1} (want == label_clone_calls; cross-checked by assertion above)",
+        run_plan_lookup_calls_total as f64 / n
+    );
+    println!(
+        "    label_sets_materialized (engine-cumulative, catalog-decode path), per-query mean: {:.1}",
+        label_sets_materialized_total as f64 / n
+    );
+    println!("    ground-truth distinct series this query's selector(s) touch     : {ground_truth_distinct}");
+    println!(
+        "    multiplier = label_clone_calls / ground_truth_distinct           : {multiplier:.3} -> {}",
+        if multiplier > 1.05 {
+            "ABOVE 1x: a series is materialised MORE THAN ONCE per query (once per segment it is matched in, not once per query) -- see stage0b-promql-fanout.md"
+        } else if multiplier < 0.95 {
+            "BELOW 1x: fewer label-set clones than ground-truth distinct series; unexpected, investigate"
+        } else {
+            "approximately 1x: each series materialised once per query (no per-segment multiplier observed for this query/shard layout)"
+        }
+    );
+    println!(
+        "    label strings allocated (label_clone_calls * {LABELS_PER_SERIES} labels/series), per-query mean: {:.0}",
+        label_clone_calls_per_query * LABELS_PER_SERIES as f64
+    );
+    println!(
+        "    samples decoded: NOT separately instrumented (no per-sample counter exists in ravel-query); decode_calls per-query mean={:.1} is a per-run-call proxy (one call per series-run, not per sample within it) -- documented deviation, see stage0b-promql-fanout.md",
+        decode_calls_total as f64 / n
     );
 }
 
@@ -523,6 +836,99 @@ async fn main() {
                     "{label}: RESULT_ASSEMBLY_CALLS was {} (want exactly 1)",
                     s.result_assembly_calls
                 ));
+            }
+        }
+    }
+    // Issue #2479 stage 0b: every new per-segment-future step timer must
+    // fire at least once per query, and `FUTURE_CALLS`/`CATALOG_RETAIN_CALLS`
+    // exactly once per fetched segment (one per-segment future, one
+    // `decode_selected` call, each), and `PRE_FANOUT_CALLS`/
+    // `POST_FANOUT_CALLS` exactly twice per query (two disjoint regions per
+    // attempt, no retry expected against this bench's in-memory store).
+    // `run_plan_lookup`/`label_clone`/`sample_assembly` all fire once per
+    // (series, run) pair in the same per-series loop, so their call counts
+    // must agree with each other exactly.
+    for (label, samples) in [("Q_AGG", &agg_samples), ("Q_MATCH", &match_samples)] {
+        for s in samples.iter() {
+            if s.future_calls != s.segments_fetched {
+                failures.push(format!(
+                    "{label}: FUTURE_CALLS was {} (want exactly segments_fetched={})",
+                    s.future_calls, s.segments_fetched
+                ));
+            }
+            if s.catalog_retain_calls != s.segments_fetched {
+                failures.push(format!(
+                    "{label}: CATALOG_RETAIN_CALLS was {} (want exactly segments_fetched={})",
+                    s.catalog_retain_calls, s.segments_fetched
+                ));
+            }
+            if s.limiter_wait_calls < 1 {
+                failures.push(format!("{label}: LIMITER_WAIT_CALLS did not fire"));
+            }
+            if s.footer_parse_calls < 1 {
+                failures.push(format!("{label}: FOOTER_PARSE_CALLS did not fire"));
+            }
+            if s.page_plan_calls < 1 {
+                failures.push(format!("{label}: PAGE_PLAN_CALLS did not fire"));
+            }
+            if s.run_plan_lookup_calls < 1 {
+                failures.push(format!("{label}: RUN_PLAN_LOOKUP_CALLS did not fire"));
+            }
+            if s.label_clone_calls < 1 {
+                failures.push(format!("{label}: LABEL_CLONE_CALLS did not fire"));
+            }
+            if s.sample_assembly_calls < 1 {
+                failures.push(format!("{label}: SAMPLE_ASSEMBLY_CALLS did not fire"));
+            }
+            if s.run_plan_lookup_calls != s.label_clone_calls
+                || s.label_clone_calls != s.sample_assembly_calls
+            {
+                failures.push(format!(
+                    "{label}: per-series-run call counts disagree: run_plan_lookup={} label_clone={} sample_assembly={} (want all equal)",
+                    s.run_plan_lookup_calls, s.label_clone_calls, s.sample_assembly_calls
+                ));
+            }
+            if s.pre_fanout_calls != 2 {
+                failures.push(format!(
+                    "{label}: PRE_FANOUT_CALLS was {} (want exactly 2)",
+                    s.pre_fanout_calls
+                ));
+            }
+            if s.post_fanout_calls != 2 {
+                failures.push(format!(
+                    "{label}: POST_FANOUT_CALLS was {} (want exactly 2)",
+                    s.post_fanout_calls
+                ));
+            }
+            // Inside the per-segment futures, the tiled steps
+            // (limiter_wait, footer_parse, catalog_retain, page_plan,
+            // run_plan_lookup, label_clone, sample_assembly, plus the
+            // existing fetch/decode) must sum to within 5% of FUTURE_NS's
+            // own sum; a wider gap means a statement inside the future is
+            // not yet attributed to any step.
+            let steps_sum = s.limiter_wait_ns
+                + s.footer_parse_ns
+                + s.catalog_retain_ns
+                + s.page_plan_ns
+                + s.run_plan_lookup_ns
+                + s.label_clone_ns
+                + s.sample_assembly_ns
+                + s.fetch_ns
+                + s.decode_ns;
+            if s.future_ns > 0 {
+                let remainder = s.future_ns.abs_diff(steps_sum.min(s.future_ns));
+                let remainder_pct = 100.0 * remainder as f64 / s.future_ns as f64;
+                if steps_sum > s.future_ns && remainder_pct > 5.0 {
+                    failures.push(format!(
+                        "{label}: in-future steps_sum={steps_sum}ns exceeds FUTURE_NS={}ns by {remainder_pct:.1}% (want <=5%)",
+                        s.future_ns
+                    ));
+                } else if remainder_pct > 5.0 {
+                    failures.push(format!(
+                        "{label}: in-future unattributed remainder is {remainder_pct:.1}% of FUTURE_NS={}ns (steps_sum={steps_sum}ns, want <=5%); see stage0b-promql-fanout.md for which statements are left unattributed",
+                        s.future_ns
+                    ));
+                }
             }
         }
     }
@@ -746,5 +1152,22 @@ async fn main() {
     println!(
         "  object_fetch requests/bytes      : requests median={:.1} bytes median={:.0} | segments_fetched median={:.1}",
         match_fetch_requests.median, match_fetch_bytes.median, match_segments.median
+    );
+
+    // --- Issue #2479 stage 0b: per-segment fan-out report ---
+    println!("promql_fanout_share report (issue #2479 stage 0b)");
+    print_stage0b_fanout(
+        "Q_AGG",
+        &agg_samples,
+        &agg_run_means,
+        true,
+        SERIES_PER_METRIC as u64,
+    );
+    print_stage0b_fanout(
+        "Q_MATCH",
+        &match_samples,
+        &match_run_means,
+        false,
+        (SERIES_PER_METRIC * 2) as u64,
     );
 }

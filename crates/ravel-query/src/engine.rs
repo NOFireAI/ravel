@@ -545,6 +545,16 @@ impl QueryEngine {
         self
     }
 
+    /// Issue #2479 stage 0b multiplier count: cumulative label sets this
+    /// engine's `fetcher` has materialised (dictionary-ordinal path plus
+    /// whole-catalog path, [`SegmentFetcher::label_sets_materialized`])
+    /// across every query this engine has run, not just the most recent one.
+    /// A caller measuring one query snapshots this before and after and
+    /// diffs, the same pattern already used for the `phase_timers` statics.
+    pub fn label_sets_materialized(&self) -> u64 {
+        self.fetcher.label_sets_materialized()
+    }
+
     /// Evaluates over `source` with `eval`: on the read gate when one is set,
     /// sized by the samples `source` holds, and inline otherwise.
     async fn evaluate<R, F>(
@@ -1943,6 +1953,11 @@ impl QueryEngine {
             ));
         }
 
+        // Issue #2479 stage 0b: pre-fan-out gap, region 1 of 2 (see
+        // `phase_timers::PRE_FANOUT_NS`'s doc comment). Excludes the
+        // `plan_selectors`/`EvalWindow` construction in `instant_inner`,
+        // which runs before this function is even called.
+        let pre_fanout_start = Instant::now();
         let windows: Vec<TimeRange> = plans
             .iter()
             .map(|plan| selector_fetch_window(plan, eval_window))
@@ -1979,6 +1994,9 @@ impl QueryEngine {
         // upper-envelope, undeduplicated count) would report a round count
         // the fan-out never actually needed.
         let service_fetch_multiplier = distinct_plans_by_matcher(plans).len() as u64;
+        phase_timers::PRE_FANOUT_NS
+            .fetch_add(pre_fanout_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        phase_timers::PRE_FANOUT_CALLS.fetch_add(1, Ordering::Relaxed);
         // Captured by reference (like `plans`), so the `FnMut` attempt copies
         // the reference on each retry rather than moving the owned `Vec` out of
         // its environment. The per-plan futures below build owned pairs from it.
@@ -2020,6 +2038,11 @@ impl QueryEngine {
             // reference it -- `distinct_plans_by_matcher` is the same
             // dedup `service_fetch_multiplier` below was sized from, so the
             // two never drift onto two different notions of "distinct".
+            // Issue #2479 stage 0b: pre-fan-out gap, region 2 of 2: the
+            // per-attempt setup that runs after `resolve_snapshot_with_retry`
+            // hands back a snapshot (first try, or the not-found retry) and
+            // before the per-segment fan-out starts.
+            let pre_fanout_attempt_start = Instant::now();
             let distinct_plans = distinct_plans_by_matcher(plans);
             // ADR-0103 eligibility gate, evaluated ONCE per query over the whole
             // resolved snapshot's segment set and the generation history THIS
@@ -2044,6 +2067,11 @@ impl QueryEngine {
             // candidate.
             let pushdown_target =
                 count_over_time_pushdown_target(plans, eval_window, snapshot_eligible)?;
+            phase_timers::PRE_FANOUT_NS.fetch_add(
+                pre_fanout_attempt_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            phase_timers::PRE_FANOUT_CALLS.fetch_add(1, Ordering::Relaxed);
             // Issue #2468 stage 0: fetch+decode wall span. Segments fetch and
             // decode concurrently across this `buffer_unordered` fan-out, so
             // this is the WALL time the whole stage occupies, not a sum of
@@ -2148,6 +2176,11 @@ impl QueryEngine {
             // the scalar caps are checked (the per-selector loop above
             // deliberately does not check them for scalars; histograms, merged
             // per selector, still check there).
+            // Issue #2479 stage 0b: post-fan-out gap, region 1 of 2 (see
+            // `phase_timers::POST_FANOUT_NS`'s doc comment): per-plan result
+            // collection plus cross-cluster federation, both before
+            // `MATERIALIZE_NS`'s span starts.
+            let post_fanout_b1_start = Instant::now();
             let mut all_scalar_runs: Vec<Vec<FetchedSeriesSoa>> = Vec::new();
             let mut combined_histograms: HashMap<LabelSet, HistogramSeriesData> = HashMap::new();
             let mut page_stats = FetchStats::default();
@@ -2232,6 +2265,11 @@ impl QueryEngine {
             page_stats.raw_f64_bytes = page_stats
                 .raw_f64_bytes
                 .saturating_add(fed_stats.raw_f64_bytes);
+            phase_timers::POST_FANOUT_NS.fetch_add(
+                post_fanout_b1_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            phase_timers::POST_FANOUT_CALLS.fetch_add(1, Ordering::Relaxed);
 
             // Issue #2468 stage 0: series materialisation, the k-way run merge
             // plus the label-set sort immediately after it. Sequential (not
@@ -2245,6 +2283,11 @@ impl QueryEngine {
                 Ordering::Relaxed,
             );
             phase_timers::MATERIALIZE_CALLS.fetch_add(1, Ordering::Relaxed);
+            // Issue #2479 stage 0b: post-fan-out gap, region 2 of 2: the
+            // histogram sort, `precomputed_count` construction, and this
+            // closure's own `Ok(..)` return, all after `MATERIALIZE_NS`'s
+            // span closes.
+            let post_fanout_b2_start = Instant::now();
             let mut histogram_series: Vec<HistogramSeriesData> =
                 combined_histograms.into_values().collect();
             histogram_series.sort_by(|a, b| a.labels.iter().cmp(b.labels.iter()));
@@ -2272,6 +2315,11 @@ impl QueryEngine {
                 }),
                 _ => None,
             };
+            phase_timers::POST_FANOUT_NS.fetch_add(
+                post_fanout_b2_start.elapsed().as_nanos() as u64,
+                Ordering::Relaxed,
+            );
+            phase_timers::POST_FANOUT_CALLS.fetch_add(1, Ordering::Relaxed);
             Ok((
                 (
                     MergedSource {
@@ -2723,14 +2771,23 @@ impl QueryEngine {
                 let matchers = Arc::clone(&matchers);
                 let accounting = accounting.clone();
                 async move {
-                    fetcher
+                    // Issue #2479 stage 0b: per-segment future, entry to
+                    // return. Sum across every segment and compare to
+                    // `FETCH_DECODE_WALL_NS`; see `phase_timers::FUTURE_NS`'s
+                    // doc comment.
+                    let future_start = Instant::now();
+                    let result = fetcher
                         .fetch_soa_and_histograms_phase_accounted(
                             tenant_hash,
                             &seg_ref,
                             matchers.as_slice(),
                             &accounting,
                         )
-                        .await
+                        .await;
+                    phase_timers::FUTURE_NS
+                        .fetch_add(future_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    phase_timers::FUTURE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    result
                 }
             })
             .buffer_unordered(concurrency);

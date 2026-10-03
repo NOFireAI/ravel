@@ -1217,9 +1217,16 @@ impl SegmentFetcher {
         range: GetRange,
         accounting: &QueryAccounting,
     ) -> Result<GetOutcome, StoreError> {
+        // Issue #2479 stage 0b: limiter wait, timed separately from the
+        // fetch below so queue time and transfer time are never folded
+        // together.
+        let limiter_start = Instant::now();
         let _permit = self.get_limiter.acquire().await.map_err(|_| {
             StoreError::Transient("GetLimiter semaphore closed unexpectedly".into())
         })?;
+        phase_timers::LIMITER_WAIT_NS
+            .fetch_add(limiter_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        phase_timers::LIMITER_WAIT_CALLS.fetch_add(1, Ordering::Relaxed);
         accounting.record_s3_request(AccountedOp::Get);
         // Issue #2468 stage 0: object fetch. This is the single funnel every
         // ranged GET in this file passes through (see the doc comment
@@ -1679,9 +1686,14 @@ impl SegmentFetcher {
             let first_start = total_size.saturating_sub(first.data.len() as u64);
             regions.insert(first_start, first.data.clone());
 
-            let footer = match open_from_suffix(&first.data, total_size, self.limits)
-                .map_err(|source| corrupt(key, source))?
-            {
+            // Issue #2479 stage 0b: footer parse, CPU-only (no I/O), timed
+            // separately from the GET it follows.
+            let footer_parse_start = Instant::now();
+            let first_parsed = open_from_suffix(&first.data, total_size, self.limits);
+            phase_timers::FOOTER_PARSE_NS
+                .fetch_add(footer_parse_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            phase_timers::FOOTER_PARSE_CALLS.fetch_add(1, Ordering::Relaxed);
+            let footer = match first_parsed.map_err(|source| corrupt(key, source))? {
                 FooterOutcome::Ready(loc) => loc.footer,
                 FooterOutcome::NeedRange { offset, len } => {
                     let (got, got_cost) = self
@@ -1698,9 +1710,14 @@ impl SegmentFetcher {
                     span_requests = span_requests.saturating_add(got_cost.requests);
                     span_bytes = span_bytes.saturating_add(got_cost.bytes);
                     regions.insert(offset, got.data.clone());
-                    match open_from_suffix(&got.data, total_size, self.limits)
-                        .map_err(|source| corrupt(key, source))?
-                    {
+                    let second_parse_start = Instant::now();
+                    let second_parsed = open_from_suffix(&got.data, total_size, self.limits);
+                    phase_timers::FOOTER_PARSE_NS.fetch_add(
+                        second_parse_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    phase_timers::FOOTER_PARSE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    match second_parsed.map_err(|source| corrupt(key, source))? {
                         FooterOutcome::Ready(loc) => loc.footer,
                         FooterOutcome::NeedRange { .. } => {
                             return Err(corrupt(key, ravel_segment::SegmentError::Truncated));
@@ -1928,7 +1945,15 @@ impl SegmentFetcher {
             // The decode was charged for the whole catalog; from here only the
             // matched entries are held, through the page fetches the caller
             // runs next.
-            Ok(self.shrink_to_retained(matched))
+            // Issue #2479 stage 0b: catalog retention accounting, the one
+            // statement here that runs after `DECODE_NS`'s timer has
+            // already closed.
+            let retain_start = Instant::now();
+            let shrunk = self.shrink_to_retained(matched);
+            phase_timers::CATALOG_RETAIN_NS
+                .fetch_add(retain_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            phase_timers::CATALOG_RETAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+            Ok(shrunk)
         }
         .instrument(span.clone())
         .await
@@ -2102,7 +2127,14 @@ impl SegmentFetcher {
                 if series.is_empty() {
                     return Ok(Vec::new());
                 }
-                plan_ranges_v4(footer, series).map_err(|source| corrupt(key, source))
+                // Issue #2479 stage 0b: page plan construction (page
+                // selection), one call per non-empty series slice.
+                let plan_start = Instant::now();
+                let planned = plan_ranges_v4(footer, series).map_err(|source| corrupt(key, source));
+                phase_timers::PAGE_PLAN_NS
+                    .fetch_add(plan_start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                phase_timers::PAGE_PLAN_CALLS.fetch_add(1, Ordering::Relaxed);
+                planned
             };
             let scalar_planned = plan(scalar)?;
             let histogram_planned = plan(histogram)?;
@@ -2382,10 +2414,20 @@ impl SegmentFetcher {
                     let mut timestamps = Vec::new();
                     let mut values = Vec::new();
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
-                            .ok_or_else(|| {
-                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
-                            })?;
+                        // Issue #2479 stage 0b: run-plan lookup, the linear
+                        // scan over `planned` this task's measurement
+                        // targets (see `phase_timers::RUN_PLAN_LOOKUP_NS`'s
+                        // doc comment).
+                        let lookup_start = Instant::now();
+                        let found = find_run_plan(planned, &entry.entry.series_id, run_index);
+                        phase_timers::RUN_PLAN_LOOKUP_NS.fetch_add(
+                            lookup_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        phase_timers::RUN_PLAN_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
+                        let plan = found.ok_or_else(|| {
+                            corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                        })?;
                         let (kind, decoded) = self.decode_run(
                             key,
                             &entry.entry.series_id,
@@ -2402,9 +2444,22 @@ impl SegmentFetcher {
                             stats.record_val_page(kind, plan.val_range.1 as usize);
                         }
                     }
+                    // Issue #2479 stage 0b: label-set construction, timed
+                    // separately from the rest of the unit's assembly below.
+                    let label_clone_start = Instant::now();
+                    let labels = entry.entry.labels.clone();
+                    phase_timers::LABEL_CLONE_NS.fetch_add(
+                        label_clone_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    phase_timers::LABEL_CLONE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    // Issue #2479 stage 0b: sample-run assembly (struct
+                    // build, priority column, push), excluding the label
+                    // clone above and the page decode (`DECODE_NS`).
+                    let assembly_start = Instant::now();
                     out.push(RunDecode {
                         series_id: entry.entry.series_id,
-                        labels: entry.entry.labels.clone(),
+                        labels,
                         timestamps,
                         values,
                         created_unix_ns: seg_ref.created_unix_ns,
@@ -2412,16 +2467,27 @@ impl SegmentFetcher {
                         writer_seq: seg_ref.writer_seq,
                         per_sample_priorities: concat_priority_column(&entry.per_sample_provenance),
                     });
+                    phase_timers::SAMPLE_ASSEMBLY_NS.fetch_add(
+                        assembly_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    phase_timers::SAMPLE_ASSEMBLY_CALLS.fetch_add(1, Ordering::Relaxed);
                 }
                 SegmentLevel::L1 { .. } => {
                     // One unit per (series, run): each run keeps its own
                     // provenance so cross-input duplicate samples resolve
                     // under the same total order as the pre-compaction L0s.
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
-                            .ok_or_else(|| {
-                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
-                            })?;
+                        let lookup_start = Instant::now();
+                        let found = find_run_plan(planned, &entry.entry.series_id, run_index);
+                        phase_timers::RUN_PLAN_LOOKUP_NS.fetch_add(
+                            lookup_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        phase_timers::RUN_PLAN_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
+                        let plan = found.ok_or_else(|| {
+                            corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                        })?;
                         let mut timestamps = Vec::new();
                         let mut values = Vec::new();
                         let (kind, decoded) = self.decode_run(
@@ -2439,9 +2505,17 @@ impl SegmentFetcher {
                         if count_stats {
                             stats.record_val_page(kind, plan.val_range.1 as usize);
                         }
+                        let label_clone_start = Instant::now();
+                        let labels = entry.entry.labels.clone();
+                        phase_timers::LABEL_CLONE_NS.fetch_add(
+                            label_clone_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        phase_timers::LABEL_CLONE_CALLS.fetch_add(1, Ordering::Relaxed);
+                        let assembly_start = Instant::now();
                         out.push(RunDecode {
                             series_id: entry.entry.series_id,
-                            labels: entry.entry.labels.clone(),
+                            labels,
                             timestamps,
                             values,
                             created_unix_ns: run.created_unix_ns,
@@ -2452,6 +2526,11 @@ impl SegmentFetcher {
                                 run_index,
                             ),
                         });
+                        phase_timers::SAMPLE_ASSEMBLY_NS.fetch_add(
+                            assembly_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        phase_timers::SAMPLE_ASSEMBLY_CALLS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -2559,10 +2638,16 @@ impl SegmentFetcher {
                     let mut timestamps = Vec::new();
                     let mut values = Vec::new();
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
-                            .ok_or_else(|| {
-                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
-                            })?;
+                        let lookup_start = Instant::now();
+                        let found = find_run_plan(planned, &entry.entry.series_id, run_index);
+                        phase_timers::RUN_PLAN_LOOKUP_NS.fetch_add(
+                            lookup_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        phase_timers::RUN_PLAN_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
+                        let plan = found.ok_or_else(|| {
+                            corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                        })?;
                         let decoded = self.decode_histogram_run(
                             key,
                             &entry.entry.series_id,
@@ -2575,9 +2660,17 @@ impl SegmentFetcher {
                         )?;
                         span_decompressed = span_decompressed.saturating_add(decoded);
                     }
+                    let label_clone_start = Instant::now();
+                    let labels = entry.entry.labels.clone();
+                    phase_timers::LABEL_CLONE_NS.fetch_add(
+                        label_clone_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    phase_timers::LABEL_CLONE_CALLS.fetch_add(1, Ordering::Relaxed);
+                    let assembly_start = Instant::now();
                     out.push(RunHistogramDecode {
                         series_id: entry.entry.series_id,
-                        labels: entry.entry.labels.clone(),
+                        labels,
                         timestamps,
                         values,
                         created_unix_ns: seg_ref.created_unix_ns,
@@ -2585,16 +2678,27 @@ impl SegmentFetcher {
                         writer_seq: seg_ref.writer_seq,
                         per_sample_priorities: concat_priority_column(&entry.per_sample_provenance),
                     });
+                    phase_timers::SAMPLE_ASSEMBLY_NS.fetch_add(
+                        assembly_start.elapsed().as_nanos() as u64,
+                        Ordering::Relaxed,
+                    );
+                    phase_timers::SAMPLE_ASSEMBLY_CALLS.fetch_add(1, Ordering::Relaxed);
                 }
                 SegmentLevel::L1 { .. } => {
                     // One unit per (series, run): each run keeps its own
                     // provenance so cross-input duplicate samples resolve under
                     // the same total order as the pre-compaction L0s.
                     for (run_index, run) in entry.runs.iter().enumerate() {
-                        let plan = find_run_plan(planned, &entry.entry.series_id, run_index)
-                            .ok_or_else(|| {
-                                corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
-                            })?;
+                        let lookup_start = Instant::now();
+                        let found = find_run_plan(planned, &entry.entry.series_id, run_index);
+                        phase_timers::RUN_PLAN_LOOKUP_NS.fetch_add(
+                            lookup_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        phase_timers::RUN_PLAN_LOOKUP_CALLS.fetch_add(1, Ordering::Relaxed);
+                        let plan = found.ok_or_else(|| {
+                            corrupt(key, ravel_segment::SegmentError::SectionOutOfBounds)
+                        })?;
                         let mut timestamps = Vec::new();
                         let mut values = Vec::new();
                         let decoded = self.decode_histogram_run(
@@ -2608,9 +2712,17 @@ impl SegmentFetcher {
                             accounting,
                         )?;
                         span_decompressed = span_decompressed.saturating_add(decoded);
+                        let label_clone_start = Instant::now();
+                        let labels = entry.entry.labels.clone();
+                        phase_timers::LABEL_CLONE_NS.fetch_add(
+                            label_clone_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        phase_timers::LABEL_CLONE_CALLS.fetch_add(1, Ordering::Relaxed);
+                        let assembly_start = Instant::now();
                         out.push(RunHistogramDecode {
                             series_id: entry.entry.series_id,
-                            labels: entry.entry.labels.clone(),
+                            labels,
                             timestamps,
                             values,
                             created_unix_ns: run.created_unix_ns,
@@ -2621,6 +2733,11 @@ impl SegmentFetcher {
                                 run_index,
                             ),
                         });
+                        phase_timers::SAMPLE_ASSEMBLY_NS.fetch_add(
+                            assembly_start.elapsed().as_nanos() as u64,
+                            Ordering::Relaxed,
+                        );
+                        phase_timers::SAMPLE_ASSEMBLY_CALLS.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
