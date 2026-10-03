@@ -893,7 +893,7 @@ server were alone on the host, and on that host it was not.
 
 1. On a host with no cgroup memory limit, `memory_budget_bytes` is derived
    from what is free when the server starts:
-   `max(floor, min(MemTotal - RESERVE, MemAvailable + own_rss - RESERVE))`,
+   `min(MemTotal - RESERVE, max(floor, MemAvailable + own_rss - RESERVE))`,
    every subtraction saturating, where `RESERVE` is
    `MEMORY_OVERHEAD_RESERVE_BYTES` and `own_rss` is the server's resident set
    at the moment of derivation. The `min` is a stated rule, not a consequence
@@ -920,12 +920,17 @@ server were alone on the host, and on that host it was not.
    the budget (30%, or 45% on loopback), so that refusal fires only at a
    budget of exactly 0. That happens when `MemAvailable + own_rss` is at or
    below the reserve, for example when a co-resident process holds nearly
-   all of the host. Any budget above 0 starts and serves the statements
-   that fit it, so the floor exists only to keep that case from being a
-   refusal, and a larger floor would raise the budget above free memory,
-   which is the overcommit this amendment removes. When the floor binds,
-   the derivation logs a warning naming the `MemAvailable` reading and
-   `--memory-budget-bytes` as the remedy.
+   all of the host. Any budget above 0 starts, so the floor exists to keep
+   that case from being a refusal. 1 GiB rather than the smallest value
+   that starts is a usability choice: a budget that can serve a small
+   statement. In the case it covers, free memory is at or below the
+   reserve, so it accepts up to 1 GiB of overcommit, bounded and logged,
+   where a 25% floor would have accepted gigabytes. The floor sits under
+   the `min`, so it never lifts the budget above `MemTotal - RESERVE`. A
+   host too small to fit the reserve still derives 0 and is still refused,
+   as before this amendment. When the floor binds, the derivation logs a
+   warning naming the `MemAvailable` reading and `--memory-budget-bytes` as
+   the remedy.
 2. `--memory-budget-bytes` sets the budget explicitly and wins over both
    derivations. It is the escape hatch for a co-resident process that starts
    after the server, which a startup reading cannot see. Its resolved value is
@@ -936,8 +941,14 @@ server were alone on the host, and on that host it was not.
    from the same remainder, including the SQL path's own fetchers, and a
    fetch the remainder cannot admit answers 503 (the SQL fetcher amendment
    above). A cap at the whole remainder would let one tenant at its ceiling
-   leave the fetch side nothing, so 10% stays outside the SQL ceiling. An
-   explicit flag is not capped. The derivation logs whether the cap applied,
+   leave the fetch side nothing, so 10% stays outside the SQL ceiling. The
+   10% is a minimum headroom, not a figure sized to peak fetch demand. In
+   the #2367 run, fetch reservations reached 16.98 GB on their own, and SQL
+   reservations 14.19 GB, and no 5 s sample showed both high at once. A fetch that arrives while
+   a tenant sits at its ceiling and the remaining 10% is already reserved
+   still answers 503. The cap removes the case where the fetch side has no
+   headroom at all; it does not size fetch concurrency. An explicit flag is
+   not capped. The derivation logs whether the cap applied,
    as `clamped` does today.
 
 On the reference host, with `MemAvailable` at 29,922,488,320 bytes read with no

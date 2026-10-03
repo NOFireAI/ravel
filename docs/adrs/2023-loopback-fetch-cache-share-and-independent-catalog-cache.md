@@ -84,9 +84,12 @@ the query remainder to 6.76 GB.
    `budget-carve-loopback`. With whole-object reads a cache that holds the
    corpus serves repeated statements without touching the store's disk.
    ADR-1170's available-memory amendment (issue #2367) derives a smaller
-   budget on a host with co-resident processes, which puts this share at
-   about 11.11 GB on that machine, below the 11.24 GB corpus cited here and
-   above the 9.84 GB corpus v0.21.0 loads.
+   budget on a host with co-resident processes. On the ClickBench c6a.4xlarge
+   that puts this share at about 11.11 GB, below the 11.24 GB corpus cited
+   here and above the 9.84 GB corpus v0.21.0 loads. The 12.03 GB figure for
+   the 30 GiB reference host stands only where that host has no co-resident
+   process. Otherwise it follows that host's `MemAvailable` reading, which
+   this ADR does not record.
 4. **The combination is measured before it ships.** A fresh bot-style
    end-to-end run of the stock entry, built from the change, must reach:
    - concurrent throughput at or above 0.40 QPS;
