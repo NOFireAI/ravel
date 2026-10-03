@@ -982,8 +982,8 @@ fn parse_sysctl_memsize(output: &str) -> Option<u64> {
 /// Default minimum L0 records for a bucket to be worth compacting.
 pub const DEFAULT_MIN_COMPACTION_INPUTS: usize = 2;
 /// Default `claim_min_input_bytes`: 64 MiB of listed input bytes (ADR-1029
-/// decision 4). Below it a duplicated merge is cheaper than the PUT-class
-/// claim traffic that would prevent it, so the bucket runs unclaimed.
+/// decision 4). Inert since the 2026-10-03 amendment: a participating
+/// compaction claims every bucket, below this size too.
 pub const DEFAULT_CLAIM_MIN_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// Default `claim_lease_duration`: 300 s (ADR-1029 decision 3), the same
 /// figure [`ravel_fleet::claim::DEFAULT_LEASE_DURATION`] carries. The lease
@@ -1295,24 +1295,27 @@ impl Default for AuditPipelineConfig {
 /// [`Coordination::Off`] is the fleet-wide fallback for a store whose
 /// qualification record predates the CAS probes, or an emergency. It is not a
 /// separate code path: an unclaimed run is the same pipeline with no claim
-/// taken, exactly what a bucket below
-/// [`CompactorConfig::claim_min_input_bytes`] does, so the unclaimed path is
-/// the one this crate's default tests exercise.
+/// taken, so the unclaimed path is the one this crate's default tests
+/// exercise. With it off, a compaction and an erasure rewrite of one bucket
+/// are fenced by their pre-publish re-lists alone (ADR-1029, the 2026-10-03
+/// amendment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Coordination {
-    /// Claim buckets at or above the cost gate. The default.
+    /// Claim every bucket a compaction or an erasure rewrite publishes to.
+    /// The default.
     #[default]
     On,
-    /// Never claim. Racing runs still converge at the compaction record's
-    /// `CreateIfAbsent`, which is what makes claims advisory (ADR-1029
-    /// decision 2); the loser just pays its merge first.
+    /// Never claim. Racing compactions still converge at the compaction
+    /// record's `CreateIfAbsent` (ADR-1029 decision 2); the loser just pays
+    /// its merge first.
     Off,
 }
 
 /// Who this process claims as, and the clock its claim decisions read.
 ///
 /// Installed by the caller that drives a coordinated compaction
-/// ([`crate::compact::compact_bucket_claimed`]); `None` means this caller takes
+/// ([`crate::compact::compact_bucket_claimed`]) or an erasure rewrite
+/// ([`crate::erasure_rewrite::erasure_rewrite_bucket`]); `None` means this caller takes
 /// no claims whatever [`CompactorConfig::coordination`] says, which is the
 /// state every existing direct caller of [`crate::compact::compact_bucket`] is
 /// in. The background supervisor tick installs one, and so does `ravel-cli`'s
@@ -1764,16 +1767,19 @@ pub struct CompactorConfig {
     pub interior_reverify_ns: i64,
     /// Whether this process takes advisory compaction claims (ADR-1029
     /// decision 5). Default [`Coordination::On`]; [`Coordination::Off`]
-    /// disables claiming fleet-wide. Claims are advisory either way: the
-    /// compaction record's `CreateIfAbsent` remains the only serialization
-    /// point that decides anything durable.
+    /// disables claiming fleet-wide. Between two compactions the compaction
+    /// record's `CreateIfAbsent` decides what is durable either way. A
+    /// compaction and an erasure rewrite write different record keys, so
+    /// with claims on the shared bucket claim fences them, and with claims
+    /// off only the pre-publish re-list does (ADR-1029, the compaction-fence
+    /// amendment).
     pub coordination: Coordination,
-    /// The cost gate (ADR-1029 decision 4): a bucket is claimed only when its
-    /// listed input bytes (the summed `object_size` of the L0 commit records
-    /// the bucket listing found) reach this. Below it, a duplicated merge
-    /// costs less than the PUT-class claim traffic that would prevent it, so
-    /// the bucket runs unclaimed through the same pipeline. Default
-    /// [`DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB).
+    /// The retired cost gate (ADR-1029 decision 4). It no longer decides
+    /// anything: since the 2026-10-03 amendment a participating compaction
+    /// claims every bucket whatever its size, because the claim fences the
+    /// compaction publish against an erasure rewrite publish of the same
+    /// bucket. The field stays so existing configuration still parses.
+    /// Default [`DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB).
     pub claim_min_input_bytes: u64,
     /// How long a claim this process takes stays live without a renewal
     /// (ADR-1029 decision 3). Held as a [`Duration`] rather than this struct's

@@ -358,13 +358,17 @@ enum ClaimState {
 // compact-tenant` run racing the supervisor, a membership handoff window, a
 // wedged owner).
 //
-// ADVISORY, and load-bearingly so: a claim confers zero publication rights and
-// its absence removes none. The publish path never reads this object. A paused
-// owner that lost its claim and finishes anyway still collides at
-// content-addressed part keys and at the compaction record's CreateIfAbsent, and
-// either converges or takes an existing typed error. A claim bug can waste work;
-// it cannot corrupt data (ADR-1029 decision 2). The published compaction record
-// remains the only completion marker that means anything.
+// Between two compactions a claim is advisory: it confers zero publication
+// rights and its absence removes none. A paused owner that lost its claim and
+// finishes anyway still collides at content-addressed part keys and at the
+// compaction record's CreateIfAbsent, and either converges or takes an existing
+// typed error, so there a claim bug can only waste work (ADR-1029 decision 2).
+// Between a compaction and an erasure rewrite of the same bucket the claim is
+// the fence: a pass that takes it checks it is still held at its publish
+// checkpoint and publishes nothing when it is not, so there a claim bug can let
+// erased rows be served again (ADR-1029, the compaction-fence amendment). The
+// published compaction record remains the only completion marker that means
+// anything.
 //
 // Expiry is judged from the STORE OBJECT's server-generated `last_modified`
 // (read by head() on the contention path), never from `owner_clock_ns` below:

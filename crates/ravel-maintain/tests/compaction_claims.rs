@@ -4,10 +4,11 @@
 //! The unit-level protocol (acquire, renew, steal, complete, the renewal
 //! cadence, `NotFound` as a lost claim) is pinned in `claim_guard.rs`'s own
 //! tests. This file drives `compact_bucket_claimed` over real seeded buckets
-//! and asserts what the pipeline does with a claim: the cost gate, a claim lost
-//! mid-merge, and the property the whole design rests on -- that a claim
-//! confers no publication rights, so an owner that loses its claim and finishes
-//! anyway still converges on exactly one record.
+//! and asserts what the pipeline does with a claim: that the retired cost gate
+//! no longer exempts a small bucket, a claim lost mid-merge, and that an owner
+//! that loses its claim and finishes anyway still leaves exactly one record.
+//! The fence the claim forms against an erasure rewrite of the same bucket is
+//! pinned in `erasure_compaction_fence.rs`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
@@ -21,8 +22,9 @@ use common::*;
 use ravel_fleet::claim::{COMPACTION_CLAIMS_PREFIX, ClaimConfig};
 use ravel_maintain::claim_guard::{Acquire, ClaimGuard, ClaimSleeper};
 use ravel_maintain::{
-    Checkpoint, ClaimParticipant, ClaimedCompaction, Clock, CompactionOutcome, CompactorConfig,
-    Coordination, FixedClock, PublishOutcome, RequestLedger, compact_bucket_claimed,
+    Checkpoint, ClaimParticipant, ClaimSkipReason, ClaimedCompaction, Clock, CompactionOutcome,
+    CompactorConfig, Coordination, FixedClock, PublishOutcome, RequestLedger,
+    compact_bucket_claimed,
 };
 use ravel_object_store::fault::{
     FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
@@ -59,8 +61,9 @@ impl ClaimSleeper for NoWait {
     }
 }
 
-/// A compactor config that claims as `process`, on `clock`, over any bucket at
-/// or above `min_input_bytes`, with `ledger` installed.
+/// A compactor config that claims as `process`, on `clock`, with `ledger`
+/// installed. `min_input_bytes` sets the retired cost gate, which no longer
+/// changes whether a bucket is claimed.
 fn claiming_config(
     process: u128,
     clock: &FixedClock,
@@ -130,25 +133,26 @@ async fn record_keys_in(store: &dyn ObjectStoreBackend, b: &ravel_maintain::Buck
     out
 }
 
-/// The cost gate (ADR-1029 decision 4), both sides of it, on one fixture.
+/// The retired cost gate (ADR-1029 decision 4, retired by the 2026-10-03
+/// amendment) no longer decides whether a participating run claims: the claim
+/// fences the compaction publish against an erasure rewrite of the same bucket,
+/// so a bucket far below `claim_min_input_bytes` is claimed exactly like one
+/// above it.
 ///
-/// Below `claim_min_input_bytes` the bucket runs unclaimed and issues EXACTLY
-/// zero coordinate-phase requests: no claim object is written at all. At a
-/// threshold the same bucket clears, it issues exactly two -- one acquisition
-/// and one completion -- because the merge is far shorter than a third of the
-/// lease, so no renewal is due.
+/// On both sides of the old threshold the run issues exactly two
+/// coordinate-phase requests -- one acquisition and one completion, the merge
+/// being far shorter than a third of the lease -- and writes one claim object.
 ///
-/// Shown failing against a guard that ignores the gate (the `input_bytes >=
-/// claim_min_input_bytes` term removed from `claim_guard::claims_bucket`): the
-/// first half then fails at "a bucket below the cost gate issues no claim
-/// request at all", left 2, right 0.
+/// Shown failing against the pre-amendment `claim_guard::claims_bucket`, which
+/// carried the `input_bytes >= claim_min_input_bytes` term: the first half then
+/// reads zero coordinate requests instead of two.
 #[tokio::test]
-async fn the_cost_gate_decides_whether_a_bucket_is_claimed_at_all() {
+async fn a_bucket_below_the_retired_cost_gate_is_claimed() {
     // The shipped defaults this test's two halves stand on.
     assert_eq!(
         CompactorConfig::default().claim_min_input_bytes,
         64 * 1024 * 1024,
-        "the shipped cost gate is 64 MiB of listed input bytes"
+        "the shipped (now inert) cost gate is 64 MiB of listed input bytes"
     );
     assert_eq!(
         CompactorConfig::default().coordination,
@@ -179,23 +183,24 @@ async fn the_cost_gate_decides_whether_a_bucket_is_claimed_at_all() {
                 ..
             })
         ),
-        "the bucket is compacted, just not claimed: {outcome:?}"
+        "the bucket is compacted: {outcome:?}"
     );
     assert_eq!(
         ledger.report().coordinate.requests,
-        0,
-        "a bucket below the cost gate issues no claim request at all"
+        2,
+        "a bucket below the old cost gate is claimed: one acquisition and one \
+         completion"
     );
     assert_eq!(
         list_all(&store, COMPACTION_CLAIMS_PREFIX)
             .await
             .expect("list claims")
             .len(),
-        0,
-        "and writes no claim object"
+        1,
+        "and writes its claim object"
     );
 
-    // At the gate: the same fixture, a threshold every bucket clears.
+    // Above the old gate: the same fixture, a threshold every bucket clears.
     let store = MemoryStore::new();
     seed_two_metric_inputs(&store).await;
     let ledger = RequestLedger::new();
@@ -237,9 +242,9 @@ async fn the_cost_gate_decides_whether_a_bucket_is_claimed_at_all() {
     );
 }
 
-/// Coordination off is the same code path as a below-gate bucket: the merge
-/// runs, publishes, and issues no claim request (ADR-1029 decision 5's escape
-/// hatch is a config value, not a second pipeline).
+/// Coordination off runs the same pipeline unclaimed: the merge runs,
+/// publishes, and issues no claim request (ADR-1029 decision 5's escape hatch
+/// is a config value, not a second pipeline).
 #[tokio::test]
 async fn coordination_off_runs_the_same_pipeline_unclaimed() {
     let store = MemoryStore::new();
@@ -367,7 +372,7 @@ async fn a_held_claim_skips_the_bucket_without_merging_it() {
     assert_eq!(
         report.record_read.requests, 2,
         "the claim is taken after the input commit records are read (one GET \
-         per input), because the cost gate is priced on them"
+         per input)"
     );
     assert_eq!(
         report.catalog_read.requests + report.block_read.requests,
@@ -464,16 +469,18 @@ async fn a_lost_renewal_cancels_at_the_part_boundary_and_publishes_nothing() {
     );
 }
 
-/// ADR-1029 decision 2, the property the whole design rests on: a claim confers
-/// no publication rights and its absence removes none.
+/// ADR-1029 decision 2 between two compactions: a stale owner the claim did
+/// not stop still publishes no second record.
 ///
 /// Owner A takes the claim and is paused mid-merge, at its first part PUT. The
 /// lease expires under it; owner B steals the claim and merges the bucket to
 /// completion. A then resumes and finishes anyway -- its next checkpoint does
 /// not renew, because the renewal cadence has not come due on its own clock, so
-/// nothing cancels it -- and its publish collides at the content-addressed part
-/// keys and the record's `CreateIfAbsent`. Both converge: exactly ONE
-/// compaction record exists, and the rows it serves are the inputs' exactly.
+/// nothing cancels it. Its pre-publish re-list (the 2026-10-03 amendment) then
+/// finds B's record and A reports the bucket already compacted without a
+/// record PUT; without the re-list, A's publish would collide at the
+/// record's `CreateIfAbsent` and converge. Either way exactly ONE compaction
+/// record exists, and the rows it serves are the inputs' exactly.
 ///
 /// This is the case a claim bug looks like, and it costs work and nothing else.
 #[tokio::test]
@@ -537,13 +544,15 @@ async fn a_paused_stale_owner_that_finishes_after_a_steal_converges_on_one_recor
     assert!(
         matches!(
             a_outcome,
-            ClaimedCompaction::Ran(CompactionOutcome::Compacted {
-                publish: PublishOutcome::Converged { .. },
-                ..
-            })
+            ClaimedCompaction::Ran(CompactionOutcome::AlreadyCompacted)
         ),
-        "A finished after losing its claim and converged on B's record rather \
-         than publishing a second: {a_outcome:?}"
+        "A finished after losing its claim and its re-list found B's record \
+         rather than publishing a second: {a_outcome:?}"
+    );
+    assert_eq!(
+        a_ledger.report().publish.requests,
+        0,
+        "A issued no record PUT"
     );
 
     assert_eq!(
@@ -1042,15 +1051,16 @@ async fn a_failed_completion_keeps_the_published_outcome_and_the_pass_goes_on() 
     }
 }
 
-/// An unreadable claim older than one lease plus jitter does not starve its
-/// bucket: the run goes ahead unclaimed and publishes, the claim object is
-/// left untouched, and the claim protocol issues only the contention path
-/// (no steal, no completion).
+/// An unreadable claim older than one lease plus jitter holds its bucket: the
+/// run backs off rather than publish unfenced against an erasure rewrite
+/// (ADR-1029, the 2026-10-03 amendment), the claim object is left untouched,
+/// and the claim protocol issues only the contention path (no steal, no
+/// completion).
 ///
-/// Shown failing against a guard that skips an unreadable claim whatever its
-/// age: the outcome is `SkippedClaimed(.. UnreadableClaim ..)` instead.
+/// Shown failing against the pre-amendment compaction path, which ran such a
+/// bucket unclaimed: the outcome is `Ran(Compacted { .. })` instead.
 #[tokio::test]
-async fn a_stale_unreadable_claim_runs_the_bucket_unclaimed() {
+async fn a_stale_unreadable_claim_holds_the_bucket() {
     let store = MemoryStore::new();
     let now_ns = sealed_now_ns();
     let written_ms = now_ns / 1_000_000;
@@ -1084,20 +1094,26 @@ async fn a_stale_unreadable_claim_runs_the_bucket_unclaimed() {
     )
     .await
     .expect("compact");
-    assert!(
-        matches!(
-            outcome,
-            ClaimedCompaction::Ran(CompactionOutcome::Compacted {
-                publish: PublishOutcome::Published,
-                ..
-            })
-        ),
-        "{outcome:?}"
-    );
+    match outcome {
+        ClaimedCompaction::SkippedClaimed(skip) => {
+            assert_eq!(skip.reason, ClaimSkipReason::UnreadableClaim);
+            assert_eq!(
+                skip.reschedule_after_unix_ms,
+                later_ns / 1_000_000 + LEASE.as_millis() as i64,
+                "the bucket is retried one lease later"
+            );
+        }
+        other => panic!("a stale unreadable claim holds the bucket: {other:?}"),
+    }
     assert_eq!(
         ledger.report().coordinate.requests,
         3,
         "the rejected CreateIfAbsent, one GET and one HEAD: no steal, no completion"
+    );
+    assert_eq!(
+        ledger.report().catalog_read.requests,
+        0,
+        "nothing was merged"
     );
     assert_eq!(
         store
@@ -1108,7 +1124,7 @@ async fn a_stale_unreadable_claim_runs_the_bucket_unclaimed() {
         garbage,
         "the unreadable claim is left in place"
     );
-    assert_eq!(record_keys(&store).await.len(), 1);
+    assert_eq!(record_keys(&store).await.len(), 0);
 }
 
 /// The Publish checkpoint (rewrite.rs, immediately before the record PUT)

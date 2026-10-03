@@ -194,11 +194,13 @@ impl S3UploadIntegrity {
 /// that does not depend on clap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
 pub enum MaintainClaimsArg {
-    /// Claim buckets at or above the cost gate. The default.
+    /// Claim every bucket a compaction, migration or erasure rewrite works
+    /// on, whatever its size. The default.
     #[default]
     On,
-    /// Never claim; racing runs still converge at the compaction record's
-    /// `CreateIfAbsent`.
+    /// Never claim; racing compactions still converge at the compaction
+    /// record's `CreateIfAbsent`, and a compaction and an erasure rewrite of
+    /// the same bucket are fenced only by the pre-publish re-list.
     Off,
 }
 
@@ -816,8 +818,10 @@ pub struct Cli {
     #[arg(long = "maintain-interior-reverify", value_name = "DURATION")]
     pub maintain_interior_reverify: Option<String>,
 
-    /// How long an advisory compaction claim (ADR-1029) stays live without a
-    /// renewal, as a humantime duration (e.g. `300s`, `5m`). Passed straight
+    /// How long a bucket claim (ADR-1029) stays live without a renewal, as a
+    /// humantime duration (e.g. `300s`, `5m`). The claim saves duplicate
+    /// compaction work and fences a compaction against an erasure rewrite of
+    /// the same bucket. Passed straight
     /// to `ravel_maintain::config::CompactorConfig::claim_lease_duration`.
     /// Omitted defaults to
     /// [`ravel_maintain::config::DEFAULT_CLAIM_LEASE_DURATION`] (300 s). Zero
@@ -830,14 +834,11 @@ pub struct Cli {
     #[arg(long = "maintain-claim-lease", value_name = "DURATION")]
     pub maintain_claim_lease: Option<String>,
 
-    /// The advisory-claim cost gate (ADR-1029 decision 4), in bytes: a
-    /// bucket is claimed only when its listed L0 input bytes reach this.
-    /// Below it, the bucket runs unclaimed through the same pipeline -- a
-    /// duplicated merge costs less than the PUT-class claim traffic that
-    /// would prevent it. Omitted defaults to
-    /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB).
-    /// Zero is refused at startup: it would claim every bucket regardless of
-    /// size, defeating the cost gate this flag configures.
+    /// Has no effect and will be removed: since the compaction fence
+    /// (ADR-1029, the 2026-10-03 amendment) a compaction or erasure rewrite
+    /// with claims on takes the bucket's claim whatever its size, so this
+    /// former cost gate decides nothing. It is still parsed so a deployment
+    /// that sets it starts unchanged, and zero is still refused at startup.
     #[arg(long = "maintain-claim-min-input-bytes", value_name = "BYTES")]
     pub maintain_claim_min_input_bytes: Option<u64>,
 
@@ -865,12 +866,14 @@ pub struct Cli {
     #[arg(long = "maintain-l1-part-memory-target-bytes", value_name = "BYTES")]
     pub maintain_l1_part_memory_target_bytes: Option<u64>,
 
-    /// Whether this process takes advisory compaction claims at all
-    /// (ADR-1029 decision 5's escape hatch). `off` is the fleet-wide
+    /// Whether this process takes bucket claims at all (ADR-1029 decision 5's
+    /// escape hatch). `off` is the fleet-wide
     /// fallback for a store whose qualification record predates the CAS
-    /// probes, or an emergency: claims are advisory either way, so racing
-    /// runs still converge at the compaction record's `CreateIfAbsent` and
-    /// the loser just pays its merge first.
+    /// probes, or an emergency: racing compactions still converge at the
+    /// compaction record's `CreateIfAbsent` and the loser just pays its merge
+    /// first, but a compaction and an erasure rewrite of the same bucket are
+    /// then fenced only by the pre-publish re-list (ADR-1029, the
+    /// compaction-fence amendment).
     #[arg(long = "maintain-claims", value_enum, default_value_t = MaintainClaimsArg::On)]
     pub maintain_claims: MaintainClaimsArg,
 
@@ -5708,14 +5711,14 @@ impl Cli {
     /// Parse `--maintain-claim-min-input-bytes` (ADR-1029 decision 4),
     /// defaulting to
     /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] when unset.
-    /// Zero is refused: it would claim every bucket regardless of size,
-    /// defeating the cost gate this flag configures.
+    /// The value has no effect since the 2026-10-03 amendment; zero is still
+    /// refused, as it was before, so the accepted set of values is unchanged.
     pub fn parse_maintain_claim_min_input_bytes(&self) -> anyhow::Result<u64> {
         match self.maintain_claim_min_input_bytes {
             None => Ok(ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES),
             Some(0) => anyhow::bail!(
-                "--maintain-claim-min-input-bytes must be nonzero: a zero cost gate claims \
-                 every bucket regardless of size"
+                "--maintain-claim-min-input-bytes must be nonzero; the flag has no effect and \
+                 will be removed, so the simplest fix is to drop it"
             ),
             Some(bytes) => Ok(bytes),
         }
@@ -12694,8 +12697,8 @@ mod tests {
 
     /// `--maintain-claim-min-input-bytes` defaults to
     /// [`ravel_maintain::config::DEFAULT_CLAIM_MIN_INPUT_BYTES`] (64 MiB) and
-    /// refuses zero: a zero cost gate would claim every bucket regardless of
-    /// size (ADR-1029 decision 4).
+    /// still refuses zero, so a deployment that sets the now inert flag starts
+    /// exactly as it did before (ADR-1029, the 2026-10-03 amendment).
     #[test]
     fn maintain_claim_min_input_bytes_parses_default_and_refuses_zero() {
         assert_eq!(

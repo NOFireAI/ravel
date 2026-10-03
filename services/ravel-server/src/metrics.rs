@@ -3633,8 +3633,9 @@ pub struct MaintenanceSafetySignalSnapshot {
     /// than losing the claim, since process start. Backs
     /// `ravel_maintain_claim_renew_failures_total`.
     pub claim_renew_failures: u64,
-    /// Bucket evaluations that did not compact because an unexpired claim held
-    /// the bucket, one per pass while the hold lasts, since process start (the
+    /// Bucket evaluations that did not compact, or erasure rewrites that backed
+    /// off, because a claim held the bucket, one per pass while the hold
+    /// lasts, since process start (the
     /// Consequences list's
     /// `claimed_buckets_skipped`). Backs
     /// `ravel_maintain_claims_skipped_total`.
@@ -4172,16 +4173,18 @@ fn render_maintain_safety_family(
         );
     }
 
-    // Advisory compaction claim counters (ADR-1029 decision 3, issue #1035):
-    // claims are advisory only, correctness rests on content-addressed parts
-    // and CreateIfAbsent record publication, so these exist to size the lease
-    // and diagnose contention, not to prove correctness.
+    // Bucket claim counters (ADR-1029 decision 3, issue #1035). Between two
+    // compactions a claim only saves work; between a compaction and an
+    // erasure rewrite of the same bucket it fences the publishes (the
+    // 2026-10-03 amendment). These size the lease and diagnose contention;
+    // they prove nothing about that fence.
     write_header(
         out,
         "ravel_maintain_claims_acquired_total",
-        "Compaction claims this process acquired, by signal, since process start, fresh or \
-         taken over from an expired claim. Counted from shard passes that complete: a pass \
-         that ends in an error drops the claim counts it had gathered.",
+        "Bucket claims this process acquired for a compaction or an erasure rewrite, by signal, \
+         since process start, fresh or taken over from an expired claim. Counted from shard \
+         passes that complete: a pass that ends in an error drops the claim counts it had \
+         gathered.",
         "counter",
     );
     for signal in &snapshot.signals {
@@ -4249,11 +4252,13 @@ fn render_maintain_safety_family(
     write_header(
         out,
         "ravel_maintain_claims_skipped_total",
-        "Bucket evaluations in which this process did not compact because of a claim, by \
-         signal, since process start: an unexpired claim held the bucket, another contender \
-         won the steal, the claim could not be read, or it vanished twice. A held bucket adds \
-         one per maintenance pass until its claim expires. Counted from shard passes that \
-         complete.",
+        "Bucket evaluations in which this process did not compact, or did not publish an \
+         erasure rewrite, because it could not take the bucket's claim, by signal, since process \
+         start: an unexpired claim held the bucket, another contender won the steal, the claim \
+         could not be read, or it vanished twice. A claim lost mid-run counts on \
+         ravel_maintain_claims_lost_total instead, and an erasure rewrite stopped by its \
+         pre-publish re-list or its deadline counts on neither. A held bucket adds one per \
+         maintenance pass until its claim expires. Counted from shard passes that complete.",
         "counter",
     );
     for signal in &snapshot.signals {
