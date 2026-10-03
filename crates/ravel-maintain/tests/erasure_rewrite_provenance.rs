@@ -37,10 +37,10 @@ use ravel_proto::commit::v1::{
     CompactionRecord, ErasurePredicateMatcher, ErasureRequest, RewriteRecord,
 };
 use ravel_segment::{
-    CompactionMetaV4, HistogramCounts, HistogramSample, HistogramValue, IngestBounds,
-    ReaderLimits, ResetHint, SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues,
-    VERSION_V7, ValueKind, decode_catalog_v5, decode_run_histogram_pages, decode_run_pages_soa,
-    encode_run_v4, open_from_full, plan_ranges_v4,
+    CompactionMetaV4, HistogramCounts, HistogramSample, HistogramValue, IngestBounds, ReaderLimits,
+    ResetHint, SegmentIdentity, SegmentWriter, SeriesInputV4, SeriesValues, VERSION_V7, ValueKind,
+    decode_catalog_v5, decode_run_histogram_pages, decode_run_pages_soa, encode_run_v4,
+    open_from_full, plan_ranges_v4,
 };
 use ravel_types::{LabelSet, Sample, SeriesId, Signal, TenantId};
 use uuid::Uuid;
