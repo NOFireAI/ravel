@@ -829,7 +829,7 @@ Each of the operator's three Deployments maps to one storage credential role:
 | Deployment | `--mode` | Storage credential role | Scope in one line |
 |---|---|---|---|
 | `<name>-gateway` | `gateway` | Gateway | Ingest writes (L0, commit records, idempotency, adopt), plus fleet-admission reconciliation snapshots. Runs no catalog fold. Deletes only dead processes' admission snapshots. |
-| `<name>-query` | `query` | Query | Reads commit and catalog objects, folds only through the on-demand fold route, appends query audit. No delete. |
+| `<name>-query` | `query` | Query | Reads commit and catalog objects, folds only through the on-demand fold route, appends query audit, and creates Parquet table manifest versions for `CREATE EXTERNAL TABLE` and `DROP TABLE` (create only, never an overwrite). Deletes only its own bucket-probe scratch objects under `sys/pq-probe/`: no data, catalog or control-plane object. |
 | `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep and the scheduled catalog fold, so it writes catalog snapshot parts, `HEAD` and index objects. The only one granted delete over durable data: `l0/`, `l1/`, `c/`, `idem/`, the query-audit shard `t/*/u/*/0001/*`, `del/*.dreq` erasure requests and superseded Parquet table manifests `t/*/pq/t/*`. It also deletes superseded catalog snapshot parts and index objects, quarantined copies and dead worker records. |
 
 A fourth role, **Admin**, backs `ravel-cli` and is deliberately not managed by
