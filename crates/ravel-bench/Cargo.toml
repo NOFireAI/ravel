@@ -283,6 +283,11 @@ path = "src/bin/logseg_ref_of_alloc.rs"
 bench = false
 
 [[bin]]
+name = "logseg_resolved_row_alloc"
+path = "src/bin/logseg_resolved_row_alloc.rs"
+bench = false
+
+[[bin]]
 name = "histogram_size"
 path = "src/bin/histogram_size.rs"
 bench = false

@@ -613,8 +613,10 @@ impl RlogWriter {
         let mut stamp = StampScratch::default();
         stamp.prepare(stamp_index.slots());
         let mut rows: Vec<ResolvedRow> = Vec::with_capacity(self.records.len());
+        let row_sample = stage0::row_sample_enabled();
         for r in &self.records {
-            rows.push(resolve_row(
+            let row_before = row_sample.then(stage0::sample);
+            let row = resolve_row(
                 r,
                 ref_of.as_ref(),
                 &sorted_ids,
@@ -623,7 +625,11 @@ impl RlogWriter {
                 &stamp_index,
                 &stream_seeds,
                 &mut stamp,
-            ));
+            );
+            if let Some(before) = row_before {
+                stage0::record_whole_row(before, stage0::sample());
+            }
+            rows.push(row);
         }
         match &cluster {
             None => rows.sort_by(|a, b| {
@@ -1914,6 +1920,11 @@ fn resolve_row(
     stream_seeds: &HashMap<LogStreamId, StreamSeed>,
     stamp: &mut StampScratch,
 ) -> ResolvedRow {
+    // Stage 0 resolved-row memory measurement (issue #2469): one relaxed load,
+    // then every `stage0::sample()` call below is gated on it so an unset
+    // sampler (every build outside this measurement) pays nothing beyond
+    // this one check.
+    let row_sample = stage0::row_sample_enabled();
     let stream_ref = match ref_of {
         Some(m) => m.get(&r.stream_id).copied().unwrap_or(0),
         None => sorted_ids.binary_search(&r.stream_id).map_or(0, |i| i as u32),
@@ -1930,32 +1941,58 @@ fn resolve_row(
     // budget overflow alike).
     stamp.begin();
     for (k, v) in &r.attrs {
+        let owned_before = row_sample.then(stage0::sample);
         let (ty, cv) = resolve_value(v);
+        if let Some(before) = owned_before {
+            stage0::record_owned_values(before, stage0::sample());
+        }
         let slot = slot_of.get(k.as_str()).copied();
         match column_lookup(column_of, k, ty.to_u8()) {
             Some(cid) if !cols.contains_key(&cid) => {
                 if let Some(slot) = slot {
+                    let before = row_sample.then(stage0::sample);
                     stamp.push_columnar(slot, ty.to_u8(), cv.clone());
+                    if let Some(before) = before {
+                        stage0::record_stamp_scratch(before, stage0::sample());
+                    }
                 }
+                let before = row_sample.then(stage0::sample);
                 cols.insert(cid, cv);
+                if let Some(before) = before {
+                    stage0::record_column_map(before, stage0::sample());
+                }
             }
             // Overflow column, or a duplicate (name,type) already columnar this
             // row: fold into attrs_raw so no value is lost.
             _ => {
                 if let Some(slot) = slot {
+                    let before = row_sample.then(stage0::sample);
                     stamp.push_overflow(slot, v.clone());
+                    if let Some(before) = before {
+                        stage0::record_stamp_scratch(before, stage0::sample());
+                    }
                 }
+                let before = row_sample.then(stage0::sample);
                 overflow.push((k.clone(), v.clone()));
+                if let Some(before) = before {
+                    stage0::record_overflow(before, stage0::sample());
+                }
             }
         }
     }
     let attrs_raw = if overflow.is_empty() {
         None
     } else {
-        Some(canonical_attr_bytes(&overflow))
+        let before = row_sample.then(stage0::sample);
+        let bytes = canonical_attr_bytes(&overflow);
+        if let Some(before) = before {
+            stage0::record_overflow(before, stage0::sample());
+        }
+        Some(bytes)
     };
     let mut indexed_terms: Vec<(u32, ColumnValue)> = Vec::new();
     let mut stat_winners: Vec<(u32, ColumnValue)> = Vec::new();
+    let stamp_finish_before = row_sample.then(stage0::sample);
     stamp.finish(
         index,
         stream_seeds.get(&r.stream_id).unwrap_or(&EMPTY_STREAM_SEED),
@@ -1964,18 +2001,32 @@ fn resolve_row(
             stat: &mut stat_winners,
         },
     );
+    if let Some(before) = stamp_finish_before {
+        stage0::record_stamp_scratch(before, stage0::sample());
+    }
+    let columns_before = row_sample.then(stage0::sample);
+    let columns = cols.into_iter().collect();
+    if let Some(before) = columns_before {
+        stage0::record_column_map(before, stage0::sample());
+    }
+    let scalars_before = row_sample.then(stage0::sample);
+    let severity_text = r.severity_text.clone();
+    let body = r.body.clone();
+    if let Some(before) = scalars_before {
+        stage0::record_everything_else(before, stage0::sample());
+    }
     ResolvedRow {
         stream_ref,
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
         severity_num: r.severity_num,
-        severity_text: r.severity_text.clone(),
-        body: r.body.clone(),
+        severity_text,
+        body,
         trace_id: r.trace_id,
         span_id: r.span_id,
         flags: r.flags,
         attrs_raw,
-        columns: cols.into_iter().collect(),
+        columns,
         indexed_terms,
         stat_winners,
     }
@@ -6007,11 +6058,11 @@ mod row_order_tests {
     }
 }
 
-/// Stage 0 measurement scaffolding (issue #2426, #2428); never merged.
+/// Stage 0 measurement scaffolding (issue #2426, #2428, #2469); never merged.
 #[doc(hidden)]
 pub mod stage0 {
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU8, AtomicU64};
+    use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering::Relaxed};
     pub static MODE: AtomicU8 = AtomicU8::new(0);
     pub static BUILD_NS: AtomicU64 = AtomicU64::new(0);
     pub static REPLAY_NS: AtomicU64 = AtomicU64::new(0);
@@ -6032,5 +6083,119 @@ pub mod stage0 {
         if let Some(f) = HOOK.get() {
             f(label);
         }
+    }
+
+    /// Stage 0 resolved-row memory measurement (issue #2469): a driver
+    /// installs a stats-sampling fn pointer once; `build_object`'s
+    /// row-resolution loop and `resolve_row` call it at fixed points, each
+    /// guarded by `ROW_SAMPLE`, so the library carries no dependency on the
+    /// sampling allocator crate. The fn returns `(live_bytes,
+    /// allocation_count)`, both cumulative totals as the driver's allocator
+    /// reports them; callers difference two samples themselves.
+    pub static STATS_SAMPLER: OnceLock<fn() -> (i64, u64)> = OnceLock::new();
+
+    /// Set by the driver to turn per-row bucket sampling on. Checked once per
+    /// row; unset costs one relaxed load and nothing else.
+    pub static ROW_SAMPLE: AtomicBool = AtomicBool::new(false);
+
+    pub static ROWS_SAMPLED: AtomicU64 = AtomicU64::new(0);
+    pub static WHOLE_ROW_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static WHOLE_ROW_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// The per-row column map: the `BTreeMap<u32, ColumnValue>` node
+    /// allocations in `resolve_row`'s `cols.insert` calls, plus the final
+    /// `cols.into_iter().collect()` into `ResolvedRow::columns`.
+    pub static COLUMN_MAP_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static COLUMN_MAP_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// The owned string and byte values `resolve_value` copies into a
+    /// `ColumnValue::Str`/`::Bytes`, for every attribute regardless of
+    /// whether it lands in the column map or the overflow list.
+    pub static OWNED_VALUES_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static OWNED_VALUES_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// The overflow attribute list: the `(String, AttrValue)` clones pushed
+    /// into `overflow`, plus `canonical_attr_bytes(&overflow)` building
+    /// `ResolvedRow::attrs_raw`.
+    pub static OVERFLOW_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static OVERFLOW_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// The stamp scratch work: every `stamp.push_columnar`/`push_overflow`
+    /// call (the second `ColumnValue`/`AttrValue` copy, fed to the scratch
+    /// rather than stored directly) and `stamp.finish`, which populates
+    /// `ResolvedRow::indexed_terms` and `::stat_winners`. These cannot be
+    /// separated from each other without restructuring `resolve_row`'s
+    /// control flow, so they share one bucket.
+    pub static STAMP_SCRATCH_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static STAMP_SCRATCH_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    /// Everything else `ResolvedRow` holds: the `severity_text`/`body`
+    /// `String` clones. (`stream_ref`, `ts_ns`, `observed_ts_ns`,
+    /// `severity_num`, `trace_id`, `span_id`, `flags` are plain scalars/fixed
+    /// arrays copied onto the struct with no heap allocation.)
+    pub static EVERYTHING_ELSE_BYTES: AtomicI64 = AtomicI64::new(0);
+    pub static EVERYTHING_ELSE_ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    pub fn row_sample_enabled() -> bool {
+        ROW_SAMPLE.load(Relaxed)
+    }
+
+    /// `(live_bytes, allocation_count)` right now, or `(0, 0)` when no
+    /// sampler is installed (every build outside this measurement).
+    #[inline]
+    pub fn sample() -> (i64, u64) {
+        match STATS_SAMPLER.get() {
+            Some(f) => f(),
+            None => (0, 0),
+        }
+    }
+
+    pub fn record_whole_row(before: (i64, u64), after: (i64, u64)) {
+        WHOLE_ROW_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        WHOLE_ROW_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+        ROWS_SAMPLED.fetch_add(1, Relaxed);
+    }
+
+    pub fn record_column_map(before: (i64, u64), after: (i64, u64)) {
+        COLUMN_MAP_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        COLUMN_MAP_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_owned_values(before: (i64, u64), after: (i64, u64)) {
+        OWNED_VALUES_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        OWNED_VALUES_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_overflow(before: (i64, u64), after: (i64, u64)) {
+        OVERFLOW_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        OVERFLOW_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_stamp_scratch(before: (i64, u64), after: (i64, u64)) {
+        STAMP_SCRATCH_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        STAMP_SCRATCH_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    pub fn record_everything_else(before: (i64, u64), after: (i64, u64)) {
+        EVERYTHING_ELSE_BYTES.fetch_add(after.0 - before.0, Relaxed);
+        EVERYTHING_ELSE_ALLOCS.fetch_add(after.1 - before.1, Relaxed);
+    }
+
+    /// Zeroes every row-sample accumulator; called before each sampled
+    /// encode so results never carry over from a prior one.
+    pub fn reset_row_samples() {
+        ROWS_SAMPLED.store(0, Relaxed);
+        WHOLE_ROW_BYTES.store(0, Relaxed);
+        WHOLE_ROW_ALLOCS.store(0, Relaxed);
+        COLUMN_MAP_BYTES.store(0, Relaxed);
+        COLUMN_MAP_ALLOCS.store(0, Relaxed);
+        OWNED_VALUES_BYTES.store(0, Relaxed);
+        OWNED_VALUES_ALLOCS.store(0, Relaxed);
+        OVERFLOW_BYTES.store(0, Relaxed);
+        OVERFLOW_ALLOCS.store(0, Relaxed);
+        STAMP_SCRATCH_BYTES.store(0, Relaxed);
+        STAMP_SCRATCH_ALLOCS.store(0, Relaxed);
+        EVERYTHING_ELSE_BYTES.store(0, Relaxed);
+        EVERYTHING_ELSE_ALLOCS.store(0, Relaxed);
     }
 }
