@@ -378,9 +378,9 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
 - `--sql-max-segments 1000000` lifts the engine's sealed-segment ceiling from
   its default of 1024; a folded ClickBench tenant sits far above that and
   every statement would otherwise fail with `8424 exceeds max 1024`.
-- `--cache-bytes 25769803776` (24 GiB) exceeds the ~12 GB corpus, so the second
-  and third runs have a hot column to report. Leave it off for a cold-only
-  pass.
+- `--cache-bytes 25769803776` (24 GiB) exceeds the 9,844,635,064-byte corpus,
+  so the second and third runs have a hot column to report. Leave it off for
+  a cold-only pass.
 - `--tenant clickbench` measures the loaded tenant (not an in-process generated
   dataset). It resolves the tenant's real durable declaration and **skips** any
   statement whose required declared column is absent or the wrong type, rather
@@ -729,32 +729,65 @@ No performance flags. Since #1141 the server derives all six of them from the
 host at startup. Two are host-independent and match a published entry exactly:
 a 1,000,000 sealed-segment cap and an 11-minute engine deadline. Fetch
 concurrency is CPU-derived and also matches on this box: 32, two per core on
-16 cores. The memory-derived settings are computed from this box's own `MemTotal`
-(capped by the cgroup limit when the server runs in a container, which the
-reference box does not), which Linux reports as 32,903,794,688 bytes here (MemTotal 32132612 kB),
-so they land within 2.3% of the published figures rather than on them. The
-two caches carve the memory budget, `MemTotal` less the 2 GiB overhead
-reserve (30,756,311,040 here against the published 30,064,771,072): a 25%
-read cache of 7,689,077,760 bytes against the published 7,516,192,768 and a
-5% catalog byte cache of 1,537,815,552 against 1,503,238,553 (#1141). The
-50% per-query and per-tenant SQL pools carve `MemTotal` itself:
-16,451,897,344 each against 16,106,127,360. Do not assume the resolved values: record the
-server's own startup log lines (below) with the entry. Both of the two settings
-that used to be mandatory here are among the derived six: a folded ClickBench
-tenant sits far above the old 1024 sealed-segment ceiling, so an un-derived
-server failed every statement with `8424 exceeds max 1024`, and the cache must
-exceed the ~12 GB corpus or every run is cold and there is no hot column to
-compare.
+16 cores.
 
-Read the resolved values off the server's own startup log rather than assuming
-them, and record them with the entry (the values below are the reference-host
-32,212,254,720-byte derivation used throughout this repo; the real box's
-32,903,794,688-byte total shifts the memory-derived lines as noted above):
+### Deriving the reference sizes
+
+The memory-derived settings are computed from this box's own memory profile:
+`MemTotal` (capped by the cgroup limit when the server runs in a container,
+which the reference box does not), which Linux reports as 32,903,794,688
+bytes here (MemTotal 32132612 kB), and -- since ADR-1170, amended 2026-10-03
+by issue #2367 -- `MemAvailable`, which this box reports as 29,922,488,320
+bytes, with this process's own resident set at effectively `0` just after
+startup. With no cgroup limit and a readable `MemAvailable`, the budget is
+`min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`:
+`27,775,004,672` here, resolved with `source="derived-available"`, against
+32,903,794,688 - 2,147,483,648 = 30,756,311,040 if the derivation still used
+raw `MemTotal` as it did before the amendment. The two caches carve this
+budget, not `MemTotal`: a 25% read cache of 6,943,751,168 bytes and a 5%
+catalog byte cache of 1,388,750,233 bytes against an `s3` store. Against a
+loopback store the read cache instead carves a 40% share, 11,110,001,868
+bytes.
+
+The 50% per-query and per-tenant SQL pools still carve raw `MemTotal` first
+(16,451,897,344 each, unchanged by the amendment), but a DERIVED (not
+explicit-flag) pool is then held at or below 90% of
+`memory_remainder_bytes` -- what the budget above leaves once the two
+caches are carved out of it. Against the `s3` store, the remainder is
+19,442,503,271 and its 90% cap (17,498,252,943) does not bind, so both SQL
+pools stay at 16,451,897,344 with `remainder_capped=false`. Against the
+loopback store, the larger 40% read-cache carve leaves a remainder of
+15,276,252,571, whose 90% cap (13,748,627,313) does bind: both SQL pools
+resolve to that same 13,748,627,313 (the exact `bytes_as_usize`-truncated
+90% figure) with `remainder_capped=true`. This box's exact numbers depend on
+`MemAvailable` at the moment the server starts, not only on its fixed
+`MemTotal`: a co-resident process on the same host at that moment would
+derive a smaller budget and smaller caches, so two stock passes on the same
+host can resolve different ceilings (ADR-1170's 2026-10-03 available-memory
+amendment). Do not assume the resolved values: record the server's own
+startup log lines (below) with the entry, alongside the `MemAvailable`
+reading those lines were derived from. When comparing two passes against
+each other (an A/B, a regression check), pin `--memory-budget-bytes` to one
+value on both runs, so the budget is not the variable that differs between
+them. Both of the two settings that used to be mandatory here are among the
+derived six: a folded ClickBench tenant sits far above the old 1024
+sealed-segment ceiling, so an un-derived server failed every statement with
+`8424 exceeds max 1024`, and the cache must exceed the 9,844,635,064-byte
+corpus or every run is cold and there is no hot column to compare.
+
+Read the resolved values off the server's own startup log rather than
+assuming them, and record them with the entry (the lines below are this
+real box, `s3` store, at the `MemAvailable` reading above; a loopback store
+or a different `MemAvailable` reading changes the memory-derived lines as
+described above):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
-INFO performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
-INFO performance default resolved setting="catalog_cache_max_bytes" value=1610612736 source="derived"
+INFO performance default resolved setting="cache_max_bytes" value=6943751168 source="budget-carve"
+INFO performance default resolved setting="catalog_cache_max_bytes" value=1388750233 source="budget-carve"
+INFO performance default resolved setting="memory_budget_bytes" value=27775004672 source="derived-available"
+INFO performance default resolved setting="sql_max_query_bytes" value=16451897344 source="derived" clamped=false remainder_capped=false
+INFO performance default resolved setting="sql_tenant_max_bytes" value=16451897344 source="derived" raised=false remainder_capped=false
 ```
 
 Pass a flag only to measure a setting other than the derived one; a flag logs
@@ -1035,11 +1068,15 @@ target/release/ravel-server --store s3 <the --s3-* flags for Ravel's bucket> \
   --tenant-token "$TOKEN=clickbench;ddl" > server.log 2>&1 &
 ```
 
-Pass no performance flags. The bench reads five startup lines from
-`server.log`, each like
+Pass no performance flags except `--memory-budget-bytes`, set to the same
+value for both arms. Arms A and B are compared against each other, and since
+ADR-1170's available-memory amendment a derived budget follows the
+`MemAvailable` reading at each start, so an unpinned budget could differ
+between the arms. The bench reads five startup lines from `server.log`, each
+like
 
 ```
-INFO ravel_server::config: performance default resolved setting="cache_max_bytes" value=8053063680 source="derived"
+INFO ravel_server::config: performance default resolved setting="cache_max_bytes" value=8053063680 source="budget-carve"
 ```
 
 for `cache_max_bytes`, `catalog_cache_max_bytes`, `fetch_concurrency`,

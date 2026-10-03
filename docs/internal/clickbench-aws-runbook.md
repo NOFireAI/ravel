@@ -414,7 +414,7 @@ growth and reads as a leak that is not one.
 
 ```sh
 TCMALLOC=$(ls /usr/lib64/libtcmalloc.so.4 /usr/lib64/libtcmalloc.so 2>/dev/null | head -1)
-CACHE_BYTES=25769803776    # 24 GiB, larger than the 12 GB corpus
+CACHE_BYTES=25769803776    # 24 GiB, larger than the 9.84 GB corpus
 
 mkdir -p /root/explain
 
@@ -451,6 +451,23 @@ per-query pool above (16,451,897,344 bytes, the server's derived 50% share on
 the reference box) holds q33's 10,855,811,936-byte peak, where the earlier
 8 GiB pin did not. Assert the measured and failed identities instead, as step
 9 does; a non-zero exit is a statement to name, not a known cost.
+
+These flags go to `sql_latency_bench`, which runs the engine in process and
+has no memory-budget derivation: its pools are exactly what the flags say.
+The server's derived figures, including the 90%-of-remainder cap that
+ADR-1170 (amended 2026-10-03 by issue #2367) places on a derived pool, apply
+to `ravel-server` runs only; see
+[`docs/internal/clickbench.md`](clickbench.md#deriving-the-reference-sizes)
+for the worked S3 and loopback figures and how they move with
+`MemAvailable`.
+
+Because the derived figures depend on a `MemAvailable` reading, two stock
+passes on the same instance type can resolve different ceilings. A published
+stock result records the `MemAvailable` reading next to the resolved
+`performance default resolved` lines in the entry. Comparing two passes
+against each other (an A/B, a regression check) pins `--memory-budget-bytes`
+to one value on both runs instead, so the budget is not the variable that
+differs between them.
 
 ## 9. Check the report before reading the headline
 

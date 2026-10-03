@@ -1019,7 +1019,14 @@ mod catalog_cache_tests {
 
         let cli = crate::Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         let resolved = cli
-            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .resolve_performance(HostProfile::new(
+                16,
+                Some(32_212_254_720),
+                Some(32_212_254_720),
+                None,
+                None,
+                None,
+            ))
             .expect("performance defaults resolve");
         // The two caches derive to different ceilings on the same host.
         assert_eq!(resolved.cache_max_bytes, 7_516_192_768);
@@ -1049,7 +1056,14 @@ mod catalog_cache_tests {
         let flagged = crate::Cli::try_parse_from(["ravel-server", "--cache-max-bytes", "4096"])
             .expect("flag parses");
         let resolved = flagged
-            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .resolve_performance(HostProfile::new(
+                16,
+                Some(32_212_254_720),
+                Some(32_212_254_720),
+                None,
+                None,
+                None,
+            ))
             .expect("performance defaults resolve");
         assert_eq!(resolved.cache_max_bytes, 4096);
         assert_eq!(
@@ -1061,7 +1075,14 @@ mod catalog_cache_tests {
             crate::Cli::try_parse_from(["ravel-server", "--catalog-cache-max-bytes", "4096"])
                 .expect("flag parses");
         let resolved = catalog_flagged
-            .resolve_performance(HostProfile::new(16, Some(32_212_254_720)))
+            .resolve_performance(HostProfile::new(
+                16,
+                Some(32_212_254_720),
+                Some(32_212_254_720),
+                None,
+                None,
+                None,
+            ))
             .expect("performance defaults resolve");
         assert_eq!(resolved.catalog_cache_max_bytes, 4096);
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -1607,7 +1628,14 @@ mod catalog_cache_tests {
         let cli = crate::Cli::parse_validated_from(argv).expect("flags parse");
         cli.validate().expect("flags validate");
         let resolved = cli
-            .resolve_performance(crate::config::HostProfile::new(16, Some(32_212_254_720)))
+            .resolve_performance(crate::config::HostProfile::new(
+                16,
+                Some(32_212_254_720),
+                Some(32_212_254_720),
+                None,
+                None,
+                None,
+            ))
             .expect("performance defaults resolve");
         crate::ServerConfig {
             mode: crate::Mode::Query,
@@ -2170,7 +2198,14 @@ mod tests {
         // memory, so a test that read the machine it runs on would assert a
         // different number on every box.
         let resolved = cli
-            .resolve_performance(crate::config::HostProfile::new(16, Some(32_212_254_720)))
+            .resolve_performance(crate::config::HostProfile::new(
+                16,
+                Some(32_212_254_720),
+                Some(32_212_254_720),
+                None,
+                None,
+                None,
+            ))
             .expect("performance defaults resolve");
         let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
         build_sql_state(
