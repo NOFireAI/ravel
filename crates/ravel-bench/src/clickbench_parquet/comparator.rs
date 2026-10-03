@@ -1852,17 +1852,19 @@ mod tests {
     #[test]
     fn json_reference_matches_equivalent_batch() {
         use datafusion::arrow::array::{
-            BinaryArray, BooleanArray, Date32Array, Float64Array, Int64Array, TimestampSecondArray,
+            BooleanArray, Date32Array, Float64Array, Int64Array, TimestampSecondArray,
         };
         use datafusion::arrow::datatypes::{Field, Schema};
         use std::sync::Arc;
 
+        // No Binary column here: a JSON reference has no byte-string
+        // representation, so a `Bytes` subject column is refused rather than
+        // coerced (see `json_string_against_binary_subject_is_refused`).
         let schema = Arc::new(Schema::new(vec![
             Field::new("b", DataType::Boolean, false),
             Field::new("i", DataType::Int64, false),
             Field::new("f", DataType::Float64, false),
             Field::new("s", DataType::Utf8, false),
-            Field::new("y", DataType::Binary, false),
             Field::new("d", DataType::Date32, false),
             Field::new("t", DataType::Timestamp(TimeUnit::Second, None), false),
         ]));
@@ -1873,7 +1875,6 @@ mod tests {
                 Arc::new(Int64Array::from(vec![42])),
                 Arc::new(Float64Array::from(vec![1.5])),
                 Arc::new(datafusion::arrow::array::StringArray::from(vec!["hi"])),
-                Arc::new(BinaryArray::from(vec![b"hi".as_slice()])),
                 Arc::new(Date32Array::from(vec![
                     days_from_civil_checked(2013, 7, 15).expect("valid date") as i32,
                 ])),
@@ -1893,7 +1894,6 @@ mod tests {
                 ColumnKind::Int,
                 ColumnKind::Float,
                 ColumnKind::Str,
-                ColumnKind::Bytes,
                 ColumnKind::Date,
                 ColumnKind::Ts,
             ]
@@ -1902,7 +1902,6 @@ mod tests {
             true,
             42,
             1.5,
-            "hi",
             "hi",
             "2013-07-15",
             "2013-07-15T01:02:03Z"
