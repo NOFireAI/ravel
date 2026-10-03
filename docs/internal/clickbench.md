@@ -729,14 +729,14 @@ a 1,000,000 sealed-segment cap and an 11-minute engine deadline. Fetch
 concurrency is CPU-derived and also matches on this box: 32, two per core on
 16 cores. The memory-derived settings are computed from this box's own `MemTotal`
 (capped by the cgroup limit when the server runs in a container, which the
-reference box does not), which Linux reports as 32,909,025,280 bytes here,
+reference box does not), which Linux reports as 32,903,794,688 bytes here (MemTotal 32132612 kB),
 so they land within 2.3% of the published figures rather than on them. The
 two caches carve the memory budget, `MemTotal` less the 2 GiB overhead
-reserve (30,761,541,632 here against the published 30,064,771,072): a 25%
-read cache of 7,690,385,408 bytes against the published 7,516,192,768 and a
-5% catalog byte cache of 1,538,077,081 against 1,503,238,553 (#1141). The
+reserve (30,756,311,040 here against the published 30,064,771,072): a 25%
+read cache of 7,689,077,760 bytes against the published 7,516,192,768 and a
+5% catalog byte cache of 1,537,815,552 against 1,503,238,553 (#1141). The
 50% per-query and per-tenant SQL pools carve `MemTotal` itself:
-16,454,512,640 each against 16,106,127,360. Do not assume the resolved values: record the
+16,451,897,344 each against 16,106,127,360. Do not assume the resolved values: record the
 server's own startup log lines (below) with the entry. Both of the two settings
 that used to be mandatory here are among the derived six: a folded ClickBench
 tenant sits far above the old 1024 sealed-segment ceiling, so an un-derived
@@ -747,7 +747,7 @@ compare.
 Read the resolved values off the server's own startup log rather than assuming
 them, and record them with the entry (the values below are the reference-host
 32,212,254,720-byte derivation used throughout this repo; the real box's
-32,909,025,280-byte total shifts the memory-derived lines as noted above):
+32,903,794,688-byte total shifts the memory-derived lines as noted above):
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"

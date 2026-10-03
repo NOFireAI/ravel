@@ -506,6 +506,12 @@ S_GROUP_BYTES_MAX   = 33.2e9       # q20..q24 GROUP TOTAL; target: 5% each
 # against the corpus-wide number would fail on the baseline it came from.
 CORPUS_AMPLIFICATION_MAX = 6.1     # all measured rows; measured 5.794 (+5%)
 F_AMPLIFICATION_MAX      = 7.7     # Class F rows only; measured 7.302 (+5%)
+# Both bands were registered over the 42 statements that measured on the
+# #913 baseline, before q33 fit the per-query pool. q33 is measured (the
+# integrity check above demands it) but kept OUT of both amplification
+# populations until the bands are re-registered with it (#2421); a band
+# applied to a population it was not measured on is not a band.
+AMPLIFICATION_EXCLUDED   = {"q33"}
                                    # target for both: 1.25, provisional
 
 # Operator pre-registration for THIS run's wall clock (a property of the run,
@@ -847,10 +853,11 @@ def amplification(qs, label, band):
                      f"(target 1.25, provisional)")
 
 f_qs = sorted(q for q in by_q if cls.get(q) == "full_value")
+f_qs = [q for q in f_qs if q not in AMPLIFICATION_EXCLUDED]
 if not f_qs:
     fails.append("no Class-F statements found in the corpus; the Class-F band "
                  "cannot be evaluated and must not silently pass")
-amplification(sorted(by_q), "corpus-wide", CORPUS_AMPLIFICATION_MAX)
+amplification(sorted(q for q in by_q if q not in AMPLIFICATION_EXCLUDED), "corpus-wide", CORPUS_AMPLIFICATION_MAX)
 amplification(f_qs,         "class F",     F_AMPLIFICATION_MAX)
 
 # --- Operator wall-clock bands: assert if pre-registered, else SKIP loudly -
@@ -1000,4 +1007,4 @@ An idle instance bills at its full on-demand rate. Stop it when a run finishes.
 | Every declared column projects NULL | Queried before the declaration was visible. The staleness horizon applies to anything going through `ravel-server`. |
 | `InvalidAccessKeyId` | The shell has no exported credentials, or SSM returned an empty value. Re-run the export block. |
 | Resident memory climbs across runs | glibc arena growth, not a leak. Run under tcmalloc via `LD_PRELOAD`. |
-| Bench exits non-zero, report looks fine | Expected when any statement fails. Assert the measured and failed counts; do not read the exit code as the verdict. |
+| Bench exits non-zero, report looks fine | Non-zero whenever any statement fails, and none is expected to fail now that the per-query pool holds q33. Name the failing statement from the report (the identity checks in step 9 do); do not read the exit code as the verdict. |
