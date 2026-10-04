@@ -231,7 +231,9 @@ answered by a new `crates/ravel-query/src/log_series.rs` module that:
    them, since the erasure check in step 2 reads record attributes
    (`retain_log_records`, `crates/ravel-query/src/erasure.rs:335`), the
    same widening `crates/ravel-sql/src/logs_scan.rs` applies; never
-   otherwise;
+   otherwise (see the merged-view erasure correction below: the check is
+   now the merged-view rule, and the projection rule is unchanged because
+   resource and scope attributes come from the stream directory);
 4. charges every decoded record against the existing samples budget
    (`EngineConfig::max_samples`, default 10,000,000, the "Samples
    materialized" row in docs/guides/query.md), every distinct label set
@@ -403,3 +405,21 @@ matching, so pushing an unproven literal as a bloom-pruning `HasWord` could
 drop a matching row. The per-record `__body__` check is unchanged and still
 runs on every decoded record; the extracted literal only prunes blocks
 before decode, it never replaces that check.
+
+## Correction 2026-10-04 (issue #2541): the lane applies the merged-view erasure rule
+
+<!-- amendment-applies: sections="4. Engine integration" pointer="merged-view erasure correction" -->
+
+Step 3 of section 4 described the lane's erasure check as
+`retain_log_records`, the fetcher-level pre-filter over per-record
+attributes. That check could not see a subject named only in a resource or
+scope attribute, so `ravel_log_lines` and `ravel_log_bytes` kept counting
+records an erasure request had excluded. `fetch_log_series` now runs
+`retain_unerased_log_records`, the authoritative exclusion of ADR-0064
+decision 2 over the merged resource, scope and record view, on every decoded
+block before any record is folded into a series; the pre-filter stays in the
+`LogQuery` because it prunes early. The projection rule in step 3 is
+unchanged: resource and scope attributes come from the stream directory, so
+the merged view costs a decode of each record's `stream_attrs` blob and no
+extra column. A blob that does not decode under a pending predicate fails the
+query with a typed error.

@@ -687,8 +687,11 @@ impl Distributed {
     /// This machinery is correct and tested, but no caller in the engine or SQL
     /// layer dispatches a `Signal::Spans` distributed fetch yet
     /// (`fetch_samples_and_histograms_maybe_distributed` only ever passes
-    /// `Signal::Metrics`, and the SQL span scan is single-process); wiring a real
-    /// span caller is a later task's scope.
+    /// `Signal::Metrics`). The SQL `spans` scan does not call this method
+    /// either: its fan-out is `ravel-sql`'s `distributed_rlog` slice-scan plan,
+    /// compiled only in `flight-sql` builds and installed through
+    /// `SpansTableProvider::with_distributed_scan`, which no shipping caller
+    /// does yet. Wiring a real span caller is a later task's scope.
     #[allow(clippy::too_many_arguments)]
     pub async fn fetch_spans(
         &self,

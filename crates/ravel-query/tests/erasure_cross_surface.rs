@@ -16,6 +16,9 @@
 //! - metrics metadata (`QueryEngine::resolve_series`, the `fetch_all_series`
 //!   funnel),
 //! - logs (`LogSegmentFetcher::fetch`, the `retain_log_records` call site),
+//! - PromQL over logs (`QueryEngine::instant` on `ravel_log_lines`) against
+//!   the merged-view rule the SQL `logs` scan runs, for a subject named only
+//!   in a resource attribute,
 //! - the ADR-0071 DISTRIBUTED fan-out (`QueryEngine::instant` with a
 //!   `Distributed` context over a slice worker that applies the coordinator's
 //!   erasure predicates), and
@@ -38,6 +41,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,7 +61,10 @@ use ravel_query::distrib::client::{DistribError, SliceFetcher, SliceResponse};
 use ravel_query::distrib::codec;
 use ravel_query::distrib::partition::DistribThresholds;
 use ravel_query::distrib::{Distributed, Federation, RemoteCluster};
-use ravel_query::erasure::ErasurePredicate;
+use ravel_query::erasure::{
+    ErasurePredicate, merged_log_attrs, retain_unerased_log_records,
+    snapshot_pending_erasure_predicates,
+};
 use ravel_query::{
     EngineConfig, FetchStats, FetchedSeriesSoa, LogQuery, LogSegmentFetcher, QueryEngine,
 };
@@ -607,6 +614,249 @@ async fn logs_surface_excludes_erased_keeps_other() {
         .await,
         kept_only(),
         "log surface must exclude the erased subject's rows and keep the other",
+    );
+}
+
+// ===========================================================================
+// Log-derived series (PromQL over logs) against the SQL logs rule, with a
+// subject named only in a resource attribute (issue #2541)
+// ===========================================================================
+
+/// The erased and the surviving `host.name` resource values.
+const ERASED_HOST: &str = "h-erased";
+const KEPT_HOST: &str = "h-kept";
+
+/// A log record whose stream differs from its sibling's only in the
+/// `host.name` resource attribute, with no per-record attributes: a predicate
+/// on `host.name` is visible only through the merged view.
+fn host_log_record(ts: i64, host: &str) -> LogRecord {
+    let resource = vec![
+        (
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        ),
+        ("host.name".to_string(), AttrValue::Str(host.to_string())),
+    ];
+    LogRecord {
+        stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+        stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+        ts_ns: ts,
+        observed_ts_ns: ts,
+        severity_num: 9,
+        severity_text: "INFO".into(),
+        body: "ok".into(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    }
+}
+
+/// Writes one RLOG object and publishes a `Signal::Logs` commit record for it.
+async fn publish_log_segment(
+    store: &MemoryStore,
+    tenant_hash: TenantHash,
+    records: &[LogRecord],
+) -> CommitToken {
+    let identity = ObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        ..log_identity()
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for r in records {
+        writer.push(r.clone()).expect("push");
+    }
+    let object = bytes::Bytes::from(writer.finish().expect("finish"));
+    let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+    let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id: Uuid::from_bytes([2u8; 16]),
+        writer_epoch: 1,
+        writer_seq: 1,
+        object_size: object.len() as u64,
+        content_hash: *blake3::hash(&object).as_bytes(),
+        sample_count: records.len() as u64,
+        series_count: 2,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        min_ingest_ts_ns: min,
+        max_ingest_ts_ns: max,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        created_unix_ns: max,
+        ingest_hour_bucket: u32::try_from(max / (3_600 * NS)).expect("fits u32"),
+    })
+    .expect("valid logs commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    publish::put_data_object(store, &data_key, object)
+        .await
+        .expect("put data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish")
+}
+
+/// Writes a durable windowless logs `.dreq` erasing `host.name = ERASED_HOST`.
+async fn put_host_dreq(store: &MemoryStore, tenant_hash: TenantHash) {
+    let request_id = Uuid::new_v4();
+    let request = ErasureRequest {
+        format_version: 1,
+        tenant_hash: tenant_hash.0.to_vec(),
+        signal: signal::to_proto(Signal::Logs) as i32,
+        request_id: request_id.to_string(),
+        created_unix_ns: 1,
+        predicate: vec![ErasurePredicateMatcher {
+            key: "host.name".to_string(),
+            value: ERASED_HOST.to_string(),
+        }],
+        window_start_ns: 0,
+        window_end_ns: 0,
+        reason: String::new(),
+    };
+    let key = keys::erasure_request_key(&tenant_hash, Signal::Logs, request_id).expect("dreq key");
+    store
+        .put(
+            &key,
+            ravel_commit::erasure::encode_request(&request),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("put dreq");
+}
+
+/// The query time and window both surfaces read: every fixture record falls
+/// inside `(LOG_QUERY_TS - 1h, LOG_QUERY_TS]`.
+const LOG_QUERY_TS: i64 = TS_A + 10 * NS;
+
+/// Per-host record counts from PromQL over logs:
+/// `sum by (host_name) (count_over_time(ravel_log_lines[1h]))`.
+async fn promql_host_counts(
+    store: &Arc<MemoryStore>,
+    tenant_hash: TenantHash,
+    token: &CommitToken,
+) -> BTreeMap<String, u64> {
+    let (value, _coverage) = engine_over(store)
+        .instant(
+            tenant_hash,
+            "sum by (host_name) (count_over_time(ravel_log_lines[1h]))",
+            LOG_QUERY_TS / 1_000_000,
+            std::slice::from_ref(token),
+            TS_B + NS,
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("log-derived instant query");
+    let Value::Vector(vector) = value else {
+        panic!("an aggregation over a range function returns a vector");
+    };
+    vector
+        .iter()
+        .map(|s| {
+            (
+                s.labels
+                    .get("host_name")
+                    .expect("series carries host_name")
+                    .to_string(),
+                s.value as u64,
+            )
+        })
+        .collect()
+}
+
+/// Per-host record counts the SQL `logs` table exposes over the same window:
+/// the snapshot's segments and pending erasure, the fetcher's `with_erasure`
+/// pre-filter, then `retain_unerased_log_records`, which is the rule
+/// `ravel-sql`'s logs scan runs (its `rlog_attrs::retain_unerased` delegates
+/// to it). `host.name` is read off the merged view, as the `attrs` column
+/// exposes it.
+async fn sql_rule_host_counts(
+    store: &Arc<MemoryStore>,
+    tenant_hash: TenantHash,
+    token: &CommitToken,
+) -> BTreeMap<String, u64> {
+    let backend: Arc<dyn ObjectStoreBackend> = store.clone();
+    let catalog = Catalog::new(backend.clone(), CatalogConfig::default()).expect("catalog");
+    let snapshot = catalog
+        .resolve(
+            &tenant_hash,
+            Signal::Logs,
+            TimeRange {
+                start_ns: LOG_QUERY_TS - 3_600 * NS,
+                end_ns: LOG_QUERY_TS,
+            },
+            std::slice::from_ref(token),
+            TS_B + NS,
+        )
+        .await
+        .expect("resolve logs snapshot");
+    let erasure = snapshot_pending_erasure_predicates(&snapshot);
+    let fetcher = LogSegmentFetcher::new(backend);
+    let mut counts = BTreeMap::new();
+    for seg_ref in &snapshot.segments {
+        let query =
+            LogQuery::new(LOG_QUERY_TS - 3_600 * NS, LOG_QUERY_TS).with_erasure(erasure.clone());
+        let Some(out) = fetcher.fetch(seg_ref, &query).await.expect("log fetch") else {
+            continue;
+        };
+        let mut records = out.records;
+        retain_unerased_log_records(&mut records, &erasure).expect("merged-view exclusion");
+        for r in &records {
+            let host = merged_log_attrs(r)
+                .expect("merged view")
+                .into_iter()
+                .find_map(|(k, v)| match v {
+                    AttrValue::Str(s) if k == "host.name" => Some(s),
+                    _ => None,
+                })
+                .expect("record carries host.name");
+            *counts.entry(host).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Issue #2541: SQL and PromQL over logs agree on a subject named only in a
+/// resource attribute. Before the `.dreq` both surfaces count both hosts;
+/// after it both count only the kept host, and the erased host's series is
+/// absent from PromQL. Remove the `retain_unerased_log_records` call in
+/// `ravel_query::log_series::fetch_log_series` and the PromQL side still
+/// reports `h-erased`, so the equality fails.
+#[tokio::test]
+async fn log_series_and_sql_logs_agree_on_resource_only_erasure() {
+    let (_tenant_id, tenant_hash) = tenant();
+    let store = Arc::new(MemoryStore::new());
+    let records = vec![
+        host_log_record(TS_A, ERASED_HOST),
+        host_log_record(TS_A + NS, ERASED_HOST),
+        host_log_record(TS_A + 2 * NS, ERASED_HOST),
+        host_log_record(TS_A, KEPT_HOST),
+        host_log_record(TS_A + NS, KEPT_HOST),
+    ];
+    let token = publish_log_segment(&store, tenant_hash, &records).await;
+
+    let before: BTreeMap<String, u64> =
+        [(ERASED_HOST.to_string(), 3), (KEPT_HOST.to_string(), 2)].into();
+    assert_eq!(
+        sql_rule_host_counts(&store, tenant_hash, &token).await,
+        before,
+        "SQL logs rule before erasure"
+    );
+    assert_eq!(
+        promql_host_counts(&store, tenant_hash, &token).await,
+        before,
+        "PromQL over logs before erasure"
+    );
+
+    put_host_dreq(&store, tenant_hash).await;
+    let after: BTreeMap<String, u64> = [(KEPT_HOST.to_string(), 2)].into();
+    let sql = sql_rule_host_counts(&store, tenant_hash, &token).await;
+    let promql = promql_host_counts(&store, tenant_hash, &token).await;
+    assert_eq!(sql, after, "SQL logs rule excludes the erased host");
+    assert_eq!(
+        promql, sql,
+        "PromQL over logs must exclude the resource-only subject exactly as SQL does"
     );
 }
 
