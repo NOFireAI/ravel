@@ -10031,6 +10031,9 @@ mod fast_path_prefetch_tests {
         /// Calls the hold gate held for the reopen, counted when partition 0
         /// was parked on it.
         reopen_held: usize,
+        /// How the statement ended, observed after every stream was dropped
+        /// and the reserved bytes checked.
+        outcome: Result<(), DataFusionError>,
     }
 
     /// The overflow fixture (segment 0's last block falls back to the
@@ -10041,8 +10044,8 @@ mod fast_path_prefetch_tests {
     /// which leaves it holding segment 1's open and segment 3's prefetch;
     /// then the gate releases everything and partition 0, then partition 1,
     /// run to their ends. Every stream is dropped and reserved bytes are
-    /// asserted 0 before an error is returned.
-    async fn reopen_refused(limit: u64) -> Result<ReopenRun, DataFusionError> {
+    /// asserted 0 before the outcome is returned.
+    async fn reopen_refused(limit: u64) -> ReopenRun {
         let (store, segments) = fixture(Some(0)).await;
         let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
         let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
@@ -10055,8 +10058,10 @@ mod fast_path_prefetch_tests {
             .execute(1, Arc::new(TaskContext::default()))
             .expect("execute 1");
         let mut rows = [Vec::new(), Vec::new()];
+        let mut sibling_held_both = false;
+        let mut reopen_held = 0;
         let outcome = tokio::time::timeout(Duration::from_secs(10), async {
-            let reopen_held = loop {
+            reopen_held = loop {
                 match futures::poll!(s0.next()) {
                     Poll::Ready(Some(item)) => rows[0].extend(timestamps(&[item?])),
                     Poll::Ready(None) => {
@@ -10089,7 +10094,7 @@ mod fast_path_prefetch_tests {
                     Poll::Pending => tokio::task::yield_now().await,
                 }
             }
-            let sibling_held_both = holds_open_prefetch(&exec, 1);
+            sibling_held_both = holds_open_prefetch(&exec, 1);
             let releaser = release_all(gate.clone());
             let drained = async {
                 while let Some(item) = s0.next().await {
@@ -10102,20 +10107,20 @@ mod fast_path_prefetch_tests {
             }
             .await;
             releaser.abort();
-            drained.map(|()| (sibling_held_both, reopen_held))
+            drained
         })
         .await
         .expect("the statement ends rather than waiting or retrying forever");
         drop(s0);
         drop(s1);
         assert_eq!(budget.reserved(), 0, "every fetch reservation is released");
-        let (sibling_held_both, reopen_held) = outcome?;
-        Ok(ReopenRun {
+        ReopenRun {
             rows,
             exec,
             sibling_held_both,
             reopen_held,
-        })
+            outcome,
+        }
     }
 
     /// `name`'s value on partition `p` alone.
@@ -10404,22 +10409,22 @@ mod fast_path_prefetch_tests {
         assert_eq!(off.rows, [rows_of(&[0, 2, 4]), rows_of(&[1, 3, 5])]);
         assert_eq!(off.metric("reopens"), 1);
 
-        let both = |run: Result<ReopenRun, DataFusionError>| {
-            run.map(|r| r.sibling_held_both).unwrap_or(false)
-        };
-        assert!(both(reopen_refused(CEILING).await));
+        // Whether partition 1 held both opens at the park point depends only
+        // on what happened before it, not on how the run then ends.
+        assert!(reopen_refused(CEILING).await.sibling_held_both);
         let (mut lo, mut hi) = (fits_2, CEILING);
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
-            if both(reopen_refused(mid).await) {
+            if reopen_refused(mid).await.sibling_held_both {
                 hi = mid;
             } else {
                 lo = mid;
             }
         }
-        let run = reopen_refused(hi)
-            .await
-            .expect("the refused reopen is retried");
+        let run = reopen_refused(hi).await;
+        if let Err(e) = &run.outcome {
+            panic!("the refused reopen is retried: {e}");
+        }
         assert!(run.sibling_held_both);
         assert_eq!(
             run.reopen_held, 1,
