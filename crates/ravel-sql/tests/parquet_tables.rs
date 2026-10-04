@@ -501,8 +501,8 @@ async fn clickbench_q19_plans_and_groups_by_extracted_minute() {
 /// and `LargeBinary` back as `BinaryView`, so one binary column covers both.
 fn typed_bytes() -> Bytes {
     use datafusion::arrow::array::{
-        BinaryArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array, Float16Array,
-        Int8Array, Int16Array, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        BinaryArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array,
+        Decimal256Array, DurationMillisecondArray, Float16Array, Int8Array, Int16Array, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
         Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
         TimestampSecondArray, UInt16Array,
     };
@@ -538,6 +538,9 @@ fn typed_bytes() -> Bytes {
         Field::new("t32_ms", DataType::Time32(TimeUnit::Millisecond), false),
         Field::new("t64_us", DataType::Time64(TimeUnit::Microsecond), false),
         Field::new("t64_ns", DataType::Time64(TimeUnit::Nanosecond), false),
+        Field::new("dec32", DataType::Decimal32(9, 2), false),
+        Field::new("dec64", DataType::Decimal64(18, 3), false),
+        Field::new("dur", DataType::Duration(TimeUnit::Millisecond), false),
     ]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -572,6 +575,17 @@ fn typed_bytes() -> Bytes {
             Arc::new(Time32MillisecondArray::from(vec![1, 3_661_123])),
             Arc::new(Time64MicrosecondArray::from(vec![1, 3_661_123_456])),
             Arc::new(Time64NanosecondArray::from(vec![1, 86_399_999_999_999])),
+            Arc::new(
+                Decimal32Array::from(vec![-5, 999_999_999])
+                    .with_precision_and_scale(9, 2)
+                    .expect("decimal"),
+            ),
+            Arc::new(
+                Decimal64Array::from(vec![-1, 999_999_999_999_999_999])
+                    .with_precision_and_scale(18, 3)
+                    .expect("decimal"),
+            ),
+            Arc::new(DurationMillisecondArray::from(vec![-1, 1_500])),
         ],
     )
     .expect("batch");
@@ -584,7 +598,8 @@ fn typed_bytes() -> Bytes {
 
 /// Issues #2390 and #2496: a Parquet table's Int8, Int16, UInt16, Date32,
 /// Date64, second/millisecond/microsecond timestamp, Decimal128, binary,
-/// Decimal256, Float16 and time-of-day columns encode through the JSON output
+/// Decimal256, Float16, time-of-day, Decimal32, Decimal64 and duration
+/// columns encode through the JSON output
 /// path the SQL endpoint serves, instead of failing with "no JSON encoding for
 /// arrow type".
 #[tokio::test]
@@ -632,6 +647,9 @@ async fn parquet_column_types_encode_as_json() {
         ("t32_ms", "Time32(ms)"),
         ("t64_us", "Time64(µs)"),
         ("t64_ns", "Time64(ns)"),
+        ("dec32", "Decimal32(9, 2)"),
+        ("dec64", "Decimal64(18, 3)"),
+        ("dur", "Duration(ms)"),
     ];
     assert_eq!(
         types,
@@ -661,7 +679,10 @@ async fn parquet_column_types_encode_as_json() {
                 0,
                 1_000_000,
                 1_000,
-                1
+                1,
+                "-0.05",
+                "-0.001",
+                -1_000_000
             ],
             [
                 8,
@@ -679,7 +700,10 @@ async fn parquet_column_types_encode_as_json() {
                 86_399_000_000_000_i64,
                 3_661_123_000_000_i64,
                 3_661_123_456_000_i64,
-                86_399_999_999_999_i64
+                86_399_999_999_999_i64,
+                "9999999.99",
+                "999999999999999.999",
+                1_500_000_000
             ]
         ])
     );
