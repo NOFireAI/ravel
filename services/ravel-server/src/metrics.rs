@@ -343,7 +343,9 @@ pub enum Label {
     /// `MemoryBudget::sql_reserved()` (the raw-counter API
     /// `TenantMemoryAccountant` uses), `Fetch` is
     /// `MemoryBudget::fetch_reserved()` (the RAII `Reservation` API
-    /// `ravel-query`'s fetchers use). The two counters are disjoint by
+    /// `ravel-query`'s fetchers use, and that the Parquet footer reads
+    /// `ravel-parquet`'s `snapshot_location` makes for
+    /// `CREATE EXTERNAL TABLE` use too). The two counters are disjoint by
     /// construction (`ravel_memory::MemoryBudget` tracks fetch reservations
     /// separately from the total, so `sql_reserved` is the total minus
     /// `fetch_reserved`, never the total itself), so summing both samples
@@ -520,9 +522,9 @@ impl AllocatorStat {
 /// counter API; `Fetch` is the fetch layer's own reservation against that
 /// same budget (the PromQL, fragment and cache-warm `SegmentFetcher` and
 /// `LogSegmentFetcher` instances, and the three fetchers `build_sql_state`
-/// constructs, RSPAN included, through the RAII `reserve`/`Reservation`
-/// API), which the Parquet footer reads of `CREATE EXTERNAL TABLE` also
-/// reserve through.
+/// constructs, RSPAN included, and the Parquet footer reads `ravel-parquet`'s
+/// `snapshot_location` makes for `CREATE EXTERNAL TABLE`, all through the
+/// RAII `reserve`/`Reservation` API).
 /// `ravel_memory::MemoryBudget` tracks the fetch share in its own counter, so
 /// the two never double-count (see [`Label::MemoryComponent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
