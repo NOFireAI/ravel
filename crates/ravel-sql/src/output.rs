@@ -33,8 +33,17 @@
 //! and `Date64` are `YYYY-MM-DD` strings, and a value with no such form (a
 //! year outside 0000 to 9999, or a `Date64` that is not a whole day) is an
 //! error. Every decimal width (`Decimal32` to `Decimal256`) is a string of
-//! its exact decimal text. Binary types are lowercase hex strings. A type
-//! with no arm is an error naming the type. These are all
+//! its exact decimal text. Binary types are lowercase hex strings.
+//!
+//! An `Interval` of any unit is an object with all three of `months`, `days`
+//! and `nanoseconds` (integers; a unit without a component sets it to 0). The
+//! components stay apart because none converts into another exactly (a month
+//! has no fixed number of days), and ISO 8601 durations cannot carry a
+//! negative component beside a positive one. Every list layout (`List`,
+//! `LargeList`, `FixedSizeList`, `ListView`, `LargeListView`) is a JSON array
+//! whose elements follow these same rules, and a `Dictionary` with any
+//! integer key type encodes as the value its key addresses. A type with no
+//! arm is an error naming the type. These are all
 //! `SqlError::Internal`: `/api/v1/sql`
 //! answers with only the fixed internal message and logs the detail, while
 //! the `/mcp` tool output carries the error's full text.
@@ -45,14 +54,19 @@ use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
     DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-    DurationSecondArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray,
-    StringArray, StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+    DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray,
+    IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray, LargeListArray,
+    LargeListViewArray, LargeStringArray, ListArray, ListViewArray, MapArray, StringArray,
+    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::{DataType, Int32Type, SchemaRef, TimeUnit, i256};
+use datafusion::arrow::datatypes::{
+    ArrowDictionaryKeyType, ArrowNativeType, DataType, Int8Type, Int16Type, Int32Type, Int64Type,
+    IntervalUnit, SchemaRef, TimeUnit, UInt8Type, UInt16Type, UInt32Type, UInt64Type, i256,
+};
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use serde_json::{Map as JsonMap, Value as Json, json};
@@ -274,27 +288,63 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
         DataType::BinaryView => json!(hex(
             downcast::<BinaryViewArray>(array, "BinaryView")?.value(row)
         )),
-        DataType::Dictionary(key, value) if **key == DataType::Int32 => {
-            let dict = downcast::<DictionaryArray<Int32Type>>(array, "Dictionary(Int32, _)")?;
-            let index = resolve_key(dict.keys().value(row), dict.values().len())?;
+        DataType::Interval(IntervalUnit::YearMonth) => {
+            let months = downcast::<IntervalYearMonthArray>(array, "Interval(YearMonth)")?;
+            interval_json(months.value(row), 0, 0)
+        }
+        DataType::Interval(IntervalUnit::DayTime) => {
+            let value = downcast::<IntervalDayTimeArray>(array, "Interval(DayTime)")?.value(row);
+            let nanoseconds = i64::from(value.milliseconds)
+                .checked_mul(1_000_000)
+                .ok_or_else(|| {
+                    SqlError::Internal(format!(
+                        "{} milliseconds overflow an i64 count of nanoseconds",
+                        array.data_type()
+                    ))
+                })?;
+            interval_json(0, value.days, nanoseconds)
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let value =
+                downcast::<IntervalMonthDayNanoArray>(array, "Interval(MonthDayNano)")?.value(row);
+            interval_json(value.months, value.days, value.nanoseconds)
+        }
+        DataType::Dictionary(key, value) => {
+            let (values, index) = match **key {
+                DataType::Int8 => dictionary_entry::<Int8Type>(array, row)?,
+                DataType::Int16 => dictionary_entry::<Int16Type>(array, row)?,
+                DataType::Int32 => dictionary_entry::<Int32Type>(array, row)?,
+                DataType::Int64 => dictionary_entry::<Int64Type>(array, row)?,
+                DataType::UInt8 => dictionary_entry::<UInt8Type>(array, row)?,
+                DataType::UInt16 => dictionary_entry::<UInt16Type>(array, row)?,
+                DataType::UInt32 => dictionary_entry::<UInt32Type>(array, row)?,
+                DataType::UInt64 => dictionary_entry::<UInt64Type>(array, row)?,
+                _ => return Err(no_json_encoding(array)),
+            };
             if matches!(**value, DataType::Map(_, _)) {
-                map_to_json(dict.values(), index)
+                map_to_json(values, index)
             } else {
-                cell_to_json(dict.values(), index)
+                cell_to_json(values, index)
             }?
         }
         DataType::Map(_, _) => map_to_json(array, row)?,
         // `spans.events` is a `List(Struct{...})` (issue #1710). A list cell
         // becomes a JSON array and a struct cell a JSON object, each element
         // encoded by the same rules as a top-level cell, so a nested Utf8 or
-        // Map reads exactly as it would in a column of its own.
-        DataType::List(_) => {
-            let values = downcast::<ListArray>(array, "List")?.value(row);
-            let mut items = Vec::with_capacity(values.len());
-            for i in 0..values.len() {
-                items.push(cell_to_json(&values, i)?);
-            }
-            Json::Array(items)
+        // Map reads exactly as it would in a column of its own. Every list
+        // layout encodes the same way.
+        DataType::List(_) => list_json(&downcast::<ListArray>(array, "List")?.value(row))?,
+        DataType::LargeList(_) => {
+            list_json(&downcast::<LargeListArray>(array, "LargeList")?.value(row))?
+        }
+        DataType::FixedSizeList(_, _) => {
+            list_json(&downcast::<FixedSizeListArray>(array, "FixedSizeList")?.value(row))?
+        }
+        DataType::ListView(_) => {
+            list_json(&downcast::<ListViewArray>(array, "ListView")?.value(row))?
+        }
+        DataType::LargeListView(_) => {
+            list_json(&downcast::<LargeListViewArray>(array, "LargeListView")?.value(row))?
         }
         DataType::Struct(fields) => {
             let columns = downcast::<StructArray>(array, "Struct")?;
@@ -305,13 +355,43 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
             }
             Json::Object(object)
         }
-        other => {
-            return Err(SqlError::Internal(format!(
-                "no JSON encoding for arrow type {other}"
-            )));
-        }
+        _ => return Err(no_json_encoding(array)),
     };
     Ok(value)
+}
+
+fn no_json_encoding(array: &ArrayRef) -> SqlError {
+    SqlError::Internal(format!(
+        "no JSON encoding for arrow type {}",
+        array.data_type()
+    ))
+}
+
+/// The elements of one list cell, each encoded by the top-level rules.
+fn list_json(values: &ArrayRef) -> Result<Json, SqlError> {
+    let mut items = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        items.push(cell_to_json(values, i)?);
+    }
+    Ok(Json::Array(items))
+}
+
+/// An interval of any unit as its three components. They are kept apart
+/// because none converts into another exactly: a month has no fixed number of
+/// days, and a day has no fixed number of nanoseconds across a DST change.
+fn interval_json(months: i32, days: i32, nanoseconds: i64) -> Json {
+    json!({ "months": months, "days": days, "nanoseconds": nanoseconds })
+}
+
+/// The dictionary values of a `Dictionary(K, _)` cell and the index its key
+/// resolves to.
+fn dictionary_entry<K: ArrowDictionaryKeyType>(
+    array: &ArrayRef,
+    row: usize,
+) -> Result<(&ArrayRef, usize), SqlError> {
+    let dict = downcast::<DictionaryArray<K>>(array, "Dictionary")?;
+    let index = resolve_key(dict.keys().value(row), dict.values().len())?;
+    Ok((dict.values(), index))
 }
 
 /// A `Map(Utf8, Utf8)` cell becomes a JSON object. Ravel's only map column
@@ -470,16 +550,17 @@ fn decimal_text(value: impl ExactDecimalDigits, scale: i8) -> String {
     }
 }
 
-/// Resolve a dictionary key into a valid index into the `len` distinct
-/// values. A negative key (via `usize::try_from`) or an index `>= len` is a
-/// corrupt column, so it becomes a typed `SqlError::Internal` rather than an
-/// out-of-bounds index panic on `dict.values()`. This mirrors the sibling
-/// decoder in `labels.rs`, which rejects the identical condition on the same
-/// `Dictionary(Int32, Map)` column, so both decoders fail loudly and the same
-/// way. Callers handle a null cell before reaching here.
-fn resolve_key(key: i32, len: usize) -> Result<usize, SqlError> {
-    let k = usize::try_from(key)
-        .map_err(|_| SqlError::Internal(format!("negative dictionary key {key}")))?;
+/// Resolve a dictionary key of any integer key type into a valid index into
+/// the `len` distinct values. A negative key (via `to_usize`) or an index
+/// `>= len` is a corrupt column, so it becomes a typed `SqlError::Internal`
+/// rather than an out-of-bounds index panic on `dict.values()`. This mirrors
+/// the sibling decoder in `labels.rs`, which rejects the identical condition
+/// on the same `Dictionary(Int32, Map)` column, so both decoders fail loudly
+/// and the same way. Callers handle a null cell before reaching here.
+fn resolve_key<K: ArrowNativeType>(key: K, len: usize) -> Result<usize, SqlError> {
+    let k = key
+        .to_usize()
+        .ok_or_else(|| SqlError::Internal(format!("negative dictionary key {key:?}")))?;
     if k >= len {
         return Err(SqlError::Internal(format!(
             "dictionary key {k} out of range for {len} entries"
@@ -1290,5 +1371,147 @@ mod tests {
             "{expected}"
         );
         assert_eq!(column_error(array), expected);
+    }
+
+    #[test]
+    fn interval_year_month_is_months_only() {
+        let array =
+            Arc::new(IntervalYearMonthArray::from(vec![Some(-14), None, Some(3)])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![
+                json!({ "months": -14, "days": 0, "nanoseconds": 0 }),
+                Json::Null,
+                json!({ "months": 3, "days": 0, "nanoseconds": 0 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_day_time_is_days_and_nanoseconds() {
+        use datafusion::arrow::datatypes::IntervalDayTime;
+        let array = Arc::new(IntervalDayTimeArray::from(vec![
+            Some(IntervalDayTime::new(-2, -1_500)),
+            None,
+            Some(IntervalDayTime::new(i32::MAX, i32::MAX)),
+        ])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![
+                json!({ "months": 0, "days": -2, "nanoseconds": -1_500_000_000_i64 }),
+                Json::Null,
+                json!({
+                    "months": 0,
+                    "days": i32::MAX,
+                    "nanoseconds": i64::from(i32::MAX) * 1_000_000,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_month_day_nano_copies_its_three_fields() {
+        use datafusion::arrow::datatypes::IntervalMonthDayNano;
+        let array = Arc::new(IntervalMonthDayNanoArray::from(vec![
+            Some(IntervalMonthDayNano::new(-1, 2, -3)),
+            None,
+            Some(IntervalMonthDayNano::new(i32::MIN, i32::MAX, i64::MIN)),
+        ])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![
+                json!({ "months": -1, "days": 2, "nanoseconds": -3 }),
+                Json::Null,
+                json!({ "months": i32::MIN, "days": i32::MAX, "nanoseconds": i64::MIN }),
+            ]
+        );
+    }
+
+    /// The cells every list layout below holds: a list with a negative and a
+    /// null element, a null list, and an empty list.
+    fn list_cells() -> Vec<Option<Vec<Option<i32>>>> {
+        vec![Some(vec![Some(-1), None, Some(2)]), None, Some(vec![])]
+    }
+
+    fn expected_list_json() -> Vec<Json> {
+        vec![json!([-1, null, 2]), Json::Null, json!([])]
+    }
+
+    #[test]
+    fn large_list_is_a_json_array() {
+        let array = Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+            list_cells(),
+        )) as ArrayRef;
+        assert_eq!(column_json(array).expect("json"), expected_list_json());
+    }
+
+    #[test]
+    fn list_view_is_a_json_array() {
+        let array = Arc::new(ListViewArray::from_iter_primitive::<Int32Type, _, _>(
+            list_cells(),
+        )) as ArrayRef;
+        assert_eq!(column_json(array).expect("json"), expected_list_json());
+    }
+
+    #[test]
+    fn large_list_view_is_a_json_array() {
+        let array = Arc::new(LargeListViewArray::from_iter_primitive::<Int32Type, _, _>(
+            list_cells(),
+        )) as ArrayRef;
+        assert_eq!(column_json(array).expect("json"), expected_list_json());
+    }
+
+    #[test]
+    fn fixed_size_list_is_a_json_array() {
+        let array = Arc::new(FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+            vec![
+                Some(vec![Some(-1), None]),
+                None,
+                Some(vec![Some(3), Some(4)]),
+            ],
+            2,
+        )) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!([-1, null]), Json::Null, json!([3, 4])]
+        );
+    }
+
+    /// One dictionary column per integer key type, each holding a value with a
+    /// negative number in it, a null key, and a key addressing a null value.
+    /// Every key type must encode as the plain value column would.
+    #[test]
+    fn dictionary_with_any_integer_key_is_its_value() {
+        fn check<K: ArrowDictionaryKeyType>(keys: Vec<Option<K::Native>>) {
+            let values = Arc::new(Int64Array::from(vec![Some(-7), None])) as ArrayRef;
+            let keys: datafusion::arrow::array::PrimitiveArray<K> = keys.into_iter().collect();
+            let dict = DictionaryArray::<K>::try_new(keys, values).expect("dict");
+            let key_type = dict.keys().data_type().clone();
+            assert_eq!(
+                column_json(Arc::new(dict) as ArrayRef).expect("json"),
+                vec![json!(-7), Json::Null, Json::Null, json!(-7)],
+                "key type {key_type}"
+            );
+        }
+        check::<Int8Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<Int16Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<Int32Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<Int64Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<UInt8Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<UInt16Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<UInt32Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<UInt64Type>(vec![Some(0), None, Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn dictionary_keys_of_every_width_are_bounds_checked() {
+        assert!(matches!(resolve_key(-1_i8, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(-1_i64, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(4_u16, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(
+            resolve_key(u64::MAX, 4),
+            Err(SqlError::Internal(_))
+        ));
+        assert!(matches!(resolve_key(3_u8, 4), Ok(3)));
     }
 }
