@@ -1394,13 +1394,18 @@ const SOURCE_SHARD: u32 = 2;
 /// drains the 4-shard set first; one of its actors is held inside its teardown
 /// flush by a held data PUT. Meanwhile a 3-shard buffer whose flush opens in an
 /// hour the 4-shard generation owns hands its rows up to exactly that actor.
-/// The actor closed its mailbox before the teardown flush, so the send fails as
-/// closed, the rows stay with the source, and the source's own teardown writes
-/// them. Every acknowledged row is stored exactly once.
+/// The actor closed its mailbox before the teardown flush, so the target is
+/// not live and the source writes the rows in place on that same flush.
+/// Every acknowledged row is stored exactly once. This covers only the
+/// refused-as-closed half of `close_mailbox`; the absorb of a hand-back
+/// queued before the close is pinned by each shard module's
+/// `a_hand_back_queued_behind_shutdown_is_written_exactly_once`.
 ///
 /// Guard: the `self.rx.close()` call in each actor's `close_mailbox`. Without
-/// it the send is accepted into a mailbox nothing reads again, the source
-/// gives the rows up, and they are lost when the actor's receiver drops.
+/// it the drain never leaves `close_mailbox`, since the switch still holds
+/// senders to that mailbox, so the held actor's teardown flush never reaches
+/// its data PUT and shutdown does not finish. Rows are not lost that way;
+/// the drain hangs.
 async fn a_hand_back_to_a_draining_set_is_never_lost<P: Pipe>() {
     let world = World::<P>::with_config(up_config()).await;
     let keys: Vec<usize> = (0..10_000)
@@ -1472,10 +1477,11 @@ async fn a_hand_back_to_a_draining_set_is_never_lost<P: Pipe>() {
     assert!(
         drive(&clock, || {
             let c = counters();
-            c.rerouted + c.hand_back_failures > 0
+            c.rerouted + c.hand_back_failures + c.mismatch_in_place > 0
         })
         .await,
-        "the late flush hands its rows up while the 4-shard set drains, counters {:?}",
+        "the late flush tries to hand its rows up while the 4-shard set drains, \
+         counters {:?}",
         counters()
     );
     let held_puts = held(&put, Op::Put, &parked_data);
@@ -1498,18 +1504,18 @@ async fn a_hand_back_to_a_draining_set_is_never_lost<P: Pipe>() {
     let c = counters();
     assert_eq!(c.rerouted, 0, "the draining set accepted nothing");
     assert_eq!(
-        c.hand_back_failures, 1,
-        "the closed mailbox refused the send"
+        c.hand_back_failures, 0,
+        "a closed target is not retried, so no hand-back is kept"
     );
     assert_eq!(c.unscanned, 0);
     assert_eq!(
         c.mismatch_in_place, 1,
-        "the source's teardown counts its in-place write"
+        "the flush that found the target closed counts its in-place write"
     );
     assert_eq!(
         rows_at::<P>(store, &deferred, SOURCE_SHARD, pin_hour).await,
         expected(&keys),
-        "the source's teardown wrote the rows in place"
+        "the source wrote the rows in place"
     );
 }
 
@@ -1623,13 +1629,38 @@ async fn strict_waiter_on_a_mismatched_buffer_is_abandoned<P: Pipe>() {
     );
 }
 
-/// Collects the message of every WARN event on this thread.
+/// Collects the message of every WARN event on the thread that installed it,
+/// until the capture is dropped.
+///
+/// The layer behind it is the process-wide default, installed once, and not
+/// a thread-scoped `set_default`: a callsite another test thread registers
+/// while a scoped default is being registered can cache an interest that
+/// leaves the scoped subscriber out, and the capture then sees nothing.
 #[derive(Clone, Default)]
 struct WarnCapture {
     messages: Arc<Mutex<Vec<String>>>,
 }
 
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+thread_local! {
+    static THREAD_CAPTURE: std::cell::RefCell<Option<WarnCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hands each WARN event to the capture installed on its thread, if any.
+struct ThreadWarnLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadWarnLayer {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if *metadata.level() == tracing::Level::WARN {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
     fn on_event(
         &self,
         event: &tracing::Event<'_>,
@@ -1638,9 +1669,13 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
         if *event.metadata().level() != tracing::Level::WARN {
             return;
         }
-        let mut visitor = MessageVisitor::default();
-        event.record(&mut visitor);
-        self.messages.lock().expect("lock").push(visitor.0);
+        THREAD_CAPTURE.with(|slot| {
+            if let Some(capture) = slot.borrow().as_ref() {
+                let mut visitor = MessageVisitor::default();
+                event.record(&mut visitor);
+                capture.messages.lock().expect("lock").push(visitor.0);
+            }
+        });
     }
 }
 
@@ -1655,7 +1690,29 @@ impl tracing::field::Visit for MessageVisitor {
     }
 }
 
+/// Removes this thread's capture when dropped.
+struct WarnCaptureGuard;
+
+impl Drop for WarnCaptureGuard {
+    fn drop(&mut self) {
+        THREAD_CAPTURE.with(|slot| slot.borrow_mut().take());
+    }
+}
+
 impl WarnCapture {
+    /// Captures this thread's WARN events until the guard drops.
+    fn install(&self) -> WarnCaptureGuard {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(ThreadWarnLayer),
+            )
+            .expect("no other global subscriber in this test binary");
+        });
+        THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(self.clone()));
+        WarnCaptureGuard
+    }
+
     fn count(&self, needle: &str) -> usize {
         self.messages
             .lock()
@@ -1671,14 +1728,14 @@ impl WarnCapture {
 /// WARN and counts the write once on the in-place counter, not on the
 /// unscanned one.
 ///
-/// Guard: the `!enforced || self.mismatch_in_place` in-place branch of each
-/// actor's hand-back arm in `flush_tenant`. Without it the teardown takes the
-/// unscanned-write branch: no WARN, the in-place counter reads 0 and the
-/// unscanned counter 1.
+/// Guard: the in-place branch of each actor's hand-back arm in
+/// `flush_tenant`, which a target that is not live reaches on the first
+/// pass. Without it the enforced passes keep the rows and the bypass passes
+/// take the unscanned-write branch: no WARN, the in-place counter reads 0 and
+/// the unscanned counter 1.
 async fn a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone<P: Pipe>() {
     let capture = WarnCapture::default();
-    let _default =
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    let _capture = capture.install();
     // Not `drain_only_config`: its day-long age clocks spend the whole
     // read-side slack, so its deferral cap is 0 and the bounded retry, not
     // the teardown, would write the rows in place.
