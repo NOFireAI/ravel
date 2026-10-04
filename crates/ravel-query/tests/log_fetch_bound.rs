@@ -11,12 +11,14 @@
 //! probe-only plan records none, and that a partition's subset scans do not
 //! double-count.
 //!
-//! The routing tests pin ADR-0996's outcome at the shipped default: a saturated
-//! resolved rate saturates the routing threshold too, so `cost-based` at the
-//! reference profile routes every object whole and the plan phase issues no
-//! footer probe. They run against an object above the production 512 KiB routing
-//! threshold, which is the only band where the ranged path and the
-//! skip-decidable plan branch are reachable at all.
+//! The routing tests pin ADR-0996's outcome: a saturated resolved rate
+//! saturates the routing threshold too, so every object routes whole and the
+//! plan phase issues no footer probe. At the reference profile, whose rate is
+//! finite since ADR-2414 decision A3, an object at or below the projection
+//! break-even reads whole on the planned route with no probe as well. They run
+//! against an object above the production 512 KiB routing threshold, which is
+//! the only band where the ranged path and the skip-decidable plan branch are
+//! reachable at all.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -253,7 +255,7 @@ fn coded_record(ts: i64, code: i64) -> LogRecord {
 fn above_threshold_object() -> (Vec<LogRecord>, Vec<u8>) {
     let records: Vec<LogRecord> = (0..700i64).map(|ts| coded_record(ts, 500)).collect();
     let bytes = build_object(&records);
-    // The tightest consumer is `cost_based_at_the_reference_profile_routes_whole_object`'s
+    // The tightest consumer is `a_saturated_cost_based_resolution_routes_whole_object`'s
     // 0.9x counterfactual (`ranged_projection_pays(size, 0.1)`): it needs the
     // projection's SAVED bytes, `size * (1.0 - 0.1)`, to exceed the routing
     // threshold, which is a strictly larger object than merely `size >
@@ -969,7 +971,7 @@ async fn a_block_decoding_fallback_plan_records_exactly_one_touch() {
 /// true, and the fetch issues a probe plus section and chunk GETs instead of the
 /// single covering GET asserted here.
 #[tokio::test]
-async fn cost_based_at_the_reference_profile_routes_whole_object() {
+async fn a_saturated_cost_based_resolution_routes_whole_object() {
     let untimed = StoreCostProfile {
         request_latency_micros: None,
         per_connection_throughput_bytes_per_s: None,

@@ -3327,14 +3327,20 @@ impl LogSegmentFetcher {
     /// stream-attrs blob, for the caller to decode with
     /// [`ravel_logseg::record::decode_stream_attrs`].
     ///
-    /// At or below [`Self::block_range_threshold`] this takes the same
-    /// whole-object crossover [`plan_segment`](Self::plan_segment) and
-    /// [`tenant_bytes`](Self::tenant_bytes) apply, via
-    /// [`whole_object_bytes`](Self::whole_object_bytes): a ranged probe would
-    /// pay for a second cache key on an object [`fetch_footer`](Self::fetch_footer)'s
-    /// doc explains is already read whole in one GET below the threshold. Above
-    /// it, the ranged probe-then-section path below is what actually saves the
-    /// BLOCKS bytes the ADR-1103 cost model counts on.
+    /// At or below [`Self::block_range_threshold`] this reads the object
+    /// whole, via [`whole_object_bytes`](Self::whole_object_bytes), the read
+    /// [`tenant_bytes`](Self::tenant_bytes) takes there too: a ranged probe
+    /// would pay for a second cache key on an object
+    /// [`fetch_footer`](Self::fetch_footer)'s doc explains is already read
+    /// whole in one GET below the threshold. Above it, it probes and reads
+    /// STREAM_DIR ranged, the path that saves the BLOCKS bytes the ADR-1103
+    /// cost model counts on. Unlike [`plan_segment`](Self::plan_segment) and
+    /// the ranged fetch, it does not move that bound up to the projection
+    /// break-even (ADR-2414 decision A3). A segment none of whose streams
+    /// match is pruned on this read alone; one that matches is then scanned,
+    /// and under `cost-based` an object above the routing threshold but at or
+    /// below the break-even is read whole by that scan, after this probe and
+    /// section read.
     pub(crate) async fn fetch_stream_dir(
         &self,
         seg_ref: &SegmentRef,

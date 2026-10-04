@@ -11834,11 +11834,11 @@ mod tests {
     /// Prove-the-test: pass `Some(self.logs_request_cost_bytes.unwrap_or(
     /// ravel_query::DEFAULT_LOG_REQUEST_COST_BYTES))` as the resolution's
     /// explicit input (erasing the unset case) and the derived-rate assertion
-    /// reads 1887437 against the expected `u64::MAX`.
+    /// reads 1887437 against the expected 6300000.
     #[test]
     fn explicit_request_cost_wins_over_policy_and_unset_derives() {
         // Explicit, under the default cost-based policy whose derived rate
-        // would otherwise saturate at the reference profile.
+        // would otherwise be the reference profile's 6,300,000-byte time term.
         let cli = Cli::try_parse_from(["ravel-server", "--logs-request-cost-bytes", "123456"])
             .expect("flag parses");
         let engine = engine_from(&cli);

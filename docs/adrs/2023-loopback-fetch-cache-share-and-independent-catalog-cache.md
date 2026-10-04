@@ -217,9 +217,10 @@ a 35 MB compacted object at a narrow projection reads ranged. The loopback
 measurement in decision 4 was reasoned about, not re-run, and the result is
 this. Unless `--store-cost-profile` names another profile, a loopback
 deployment resolves the reference profile and its 31,500,000-byte break-even. Decision 4 states no object
-size; ADR-2414 puts the L0 objects of that layout at about 3 MB, and its
-11.24 GB corpus would have to sit in fewer than 357 objects for their average
-to reach the break-even. So on the reference profile those objects' blocks
+size; ADR-2414 puts the L0 objects of that layout at about 3 MB each, so on
+that figure each object decision 4 measured sits under the break-even on its
+own (whether an object reads whole depends on its own size, not on the
+corpus average). So on the reference profile those objects' blocks
 are still read in one whole-object GET on the whole-segment fast path and on
 the planned route alike. On the planned route (any statement the
 whole-segment fast path refuses) an object at or below the break-even is read
