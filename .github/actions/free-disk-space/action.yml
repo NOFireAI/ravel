@@ -9,7 +9,9 @@ inputs:
       once, so the job does not wait for space it only needs at link time.
       Never set it on a job that pulls or runs a container image: the image
       prune would then run beside the pull and can delete the image the job
-      just fetched.
+      just fetched. In this mode the output and the number of bytes freed go
+      to files under RUNNER_TEMP that only the disk-usage action's report
+      phase prints, so a job that sets this should end with that step.
     required: false
     default: "false"
 runs:
@@ -27,12 +29,37 @@ runs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL || true
           docker image prune -af || true
         }
+        # The same deletes, with what they freed written to $1 in KiB once the
+        # last one is done. The job is writing to the same volume while this
+        # runs, so the figure is each directory's size before it is deleted
+        # plus the prune's own total, not a difference in free space.
+        reclaim_measured() {
+          local freed_kb=0 size dir prune_out prune_kb
+          for dir in /usr/share/dotnet /opt/ghc \
+            "${ANDROID_HOME:-/usr/local/lib/android}" /opt/hostedtoolcache/CodeQL; do
+            if [ -e "$dir" ]; then
+              size="$(sudo du -sk "$dir" 2>/dev/null | awk '{ print $1 }')" || size=0
+              freed_kb=$((freed_kb + ${size:-0}))
+              sudo rm -rf "$dir" || true
+            fi
+          done
+          prune_out="$(docker image prune -af 2>&1)" || true
+          printf '%s\n' "$prune_out"
+          # "Total reclaimed space: 1.863GB", decimal units.
+          prune_kb="$(printf '%s\n' "$prune_out" | awk '
+            /^Total reclaimed space:/ {
+              unit = $4; gsub(/[0-9.]/, "", unit)
+              scale = (unit == "GB") ? 1000000 : (unit == "MB") ? 1000 : (unit == "kB") ? 1 : 0
+              printf "%d", ($4 + 0) * scale
+            }')"
+          echo "$((freed_kb + ${prune_kb:-0}))" > "$1"
+        }
         if [ "$FREE_DISK_BACKGROUND" = "true" ]; then
           # Output goes to a file, not the step's pipe, so the step ends when
-          # this shell does and not when the deletes do. The disk-usage
-          # action's report phase prints the file.
+          # this shell does and not when the deletes do.
           log="${RUNNER_TEMP:?RUNNER_TEMP is not set}/free-disk-space.log"
-          ( reclaim ) > "$log" 2>&1 &
+          freed="${RUNNER_TEMP}/free-disk-space-freed-kb"
+          ( reclaim_measured "$freed" ) > "$log" 2>&1 &
           echo "reclaiming disk in the background; output in $log"
         else
           reclaim
