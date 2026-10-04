@@ -12613,6 +12613,118 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         assert!(out.contains("ravel_cache_max_bytes{mode=\"query\",cache=\"catalog\"} 2000"));
     }
 
+    /// The `/metrics` handler's catalog residency wiring itself (#2488): every
+    /// `render_cache_residency_family` test above feeds it hand-built tuples,
+    /// so replacing the real accessor calls in [`metrics_handler`]
+    /// (`state.catalog.byte_cache_ram_residency()` /
+    /// `byte_cache_disk_residency()`) with `None` survives every one of them.
+    /// This drives the real handler over a real, byte-cache-enabled
+    /// [`Catalog`] (`CatalogConfig::default()`, RAM tier only, no
+    /// `--cache-dir`), so the `cache="catalog"` rows asserted on below came
+    /// from the live accessor chain, not a synthetic tuple. The cache is
+    /// empty (`Some((0, 0))`), which is still a real, non-`None` reading
+    /// distinct from a disabled cache's `None`: what this test proves is that
+    /// the reading reaches the response at all, not a specific byte count
+    /// (the accessors' own RAM/disk arithmetic, which an empty RAM-only cache
+    /// cannot exercise, is pinned separately by
+    /// `byte_cache_tiered_residency_reports_ram_and_disk_separately` in
+    /// `ravel-catalog`).
+    ///
+    /// Prove-the-test: replace the two accessor calls feeding
+    /// `catalog_ram_residency`/`catalog_disk_residency` in
+    /// [`metrics_handler`] with `None` and this test fails, since the
+    /// `cache="catalog"` resident-entry/byte rows stop rendering entirely.
+    #[tokio::test]
+    async fn metrics_handler_renders_catalog_residency_from_a_real_catalog() {
+        use ravel_catalog::CatalogConfig;
+        use ravel_ingest::{AdmissionLimits, SystemClock};
+        use ravel_memory::MemoryBudget;
+        use ravel_object_store::memory::MemoryStore;
+
+        let catalog = Arc::new(
+            Catalog::new(Arc::new(MemoryStore::new()), CatalogConfig::default()).expect("catalog"),
+        );
+        let catalog_cache_metrics = catalog.byte_cache_metrics();
+        assert!(
+            catalog_cache_metrics.is_some(),
+            "CatalogConfig::default() must build with the byte cache enabled \
+             for this test to exercise the enabled path"
+        );
+
+        let state = MetricsState {
+            mode: Mode::All,
+            store_metrics: Arc::new(StoreMetrics::default()),
+            ingest_router: None,
+            log_ingest_router: None,
+            span_ingest_router: None,
+            catalog,
+            tenant_discovery: None,
+            maintenance_safety: None,
+            maintenance_ownership: None,
+            merge_memory: None,
+            scrub: None,
+            cache_metrics: None,
+            cache_disk_metrics: None,
+            catalog_cache_metrics,
+            catalog_cache_disk_metrics: None,
+            admission: Arc::new(AdmissionController::new(
+                Arc::new(SystemClock),
+                AdmissionLimits::default(),
+            )),
+            reconcile_cycle: Arc::new(crate::admission_reconcile::ReconcileCycleMetrics::default()),
+            metrics_tenant_labels: false,
+            metrics_tenant_allowlist: Arc::new(HashSet::new()),
+            query_accounting: Arc::new(QueryAccountingMetrics::new(HashSet::new())),
+            ingest_concurrency: crate::ingest_concurrency::IngestConcurrencyController::shared(
+                crate::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+            ),
+            ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+                ravel_ingest::IngestByteBudgetLimit::Unlimited,
+            ),
+            distrib: None,
+            #[cfg(feature = "flight-sql")]
+            sql_slice_rejects: None,
+            durable_auth: None,
+            ingest_byte_metrics: Arc::new(crate::ingest_byte_metrics::IngestByteMetrics::new()),
+            normalize_reject_metrics: Arc::new(
+                crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+            ),
+            metadata_cache: None,
+            cache: None,
+            cache_max_bytes: 0,
+            catalog_cache_max_bytes: 0,
+            audit_pipeline: None,
+            process_memory_budget: Arc::new(MemoryBudget::unlimited()),
+            process_memory_budget_is_fallback: false,
+            cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
+            can_fold: true,
+            fold_loop: Default::default(),
+            heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
+        };
+
+        let response = metrics_handler(State(state)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        let body = String::from_utf8(bytes.to_vec()).expect("metrics body is utf8");
+
+        assert!(
+            body.contains("ravel_cache_resident_entries{mode=\"all\",cache=\"catalog\"} 0"),
+            "an enabled, empty catalog byte cache must render its real (zero) \
+             residency, not be silently absent:\n{body}"
+        );
+        assert!(
+            body.contains("ravel_cache_resident_bytes{mode=\"all\",cache=\"catalog\"} 0"),
+            "an enabled, empty catalog byte cache must render its real (zero) \
+             residency, not be silently absent:\n{body}"
+        );
+        assert!(
+            !body.contains("cache=\"catalog\",tier="),
+            "a RAM-only catalog cache must render with no tier label:\n{body}"
+        );
+    }
+
     fn tenant_usage(tenant: &str, signal: Signal) -> TenantUsage {
         TenantUsage {
             tenant_hash: ravel_types::TenantId::new(tenant).hash(),
