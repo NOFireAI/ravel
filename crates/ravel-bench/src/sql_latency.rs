@@ -4429,9 +4429,10 @@ mod tests {
     /// plan phase's whole-object read is handed to the scan rather than
     /// re-read, and the cache has no within-run second read of the data object
     /// to absorb: the cold run's hit is the catalog's, not the scan's. On the
-    /// warm run the data object and most of the resolve are cache-served, so
-    /// store GETs fall to 1 and cache hits rise from 1 to 3, with no store
-    /// bytes transferred. What the cache does absorb within a run is a segment
+    /// warm run the data object and the resolve are cache-served, the `l/HEAD`
+    /// NotFound included (ADR-2509 decision 3), so store GETs fall to 0 and
+    /// cache hits rise from 1 to 4 (that HEAD lookup counts as a hit), with no
+    /// store bytes transferred. What the cache does absorb within a run is a segment
     /// the carry budget does not cover, which needs more segments than this
     /// fixture has (see `cache_flag_cuts_store_gets_within_a_run`).
     ///
@@ -4502,14 +4503,15 @@ mod tests {
         // page entries, identical down to their crc32c before, now differ.
         assert_eq!(acc[0].object_store_bytes, 851, "cold run's store bytes");
 
-        // Warm run: served from cache, so it drops to plan reads only.
+        // Warm run: served from cache, and the never-folded tenant's NotFound
+        // l/HEAD stays cached too (ADR-2509 decision 3), so no store GET.
         assert_eq!(
-            acc[1].object_store_get_requests, 1,
-            "warm run's store GETs fall from 3 to 1 (the rest cache-served)"
+            acc[1].object_store_get_requests, 0,
+            "warm run's store GETs fall from 3 to 0 (all cache-served)"
         );
         assert_eq!(
-            acc[1].cache_hits, 3,
-            "warm run's cache hits rise from 1 to 3"
+            acc[1].cache_hits, 4,
+            "warm run's cache hits rise from 1 to 4, the cached l/HEAD NotFound included"
         );
         assert_eq!(
             acc[1].object_store_bytes, 0,
@@ -6206,7 +6208,8 @@ mod tests {
             .expect("per_run_accounting is a JSON array");
         assert_eq!(per_run.len(), 2, "per_run_accounting has one entry per run");
         assert_eq!(per_run[0]["object_store_get_requests"], 3);
-        assert_eq!(per_run[1]["object_store_get_requests"], 1);
+        // The warm run's l/HEAD NotFound is cached (ADR-2509 decision 3).
+        assert_eq!(per_run[1]["object_store_get_requests"], 0);
     }
 
     #[test]
