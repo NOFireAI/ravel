@@ -201,17 +201,19 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
     }
 
     /// Counted via [`Counters::record_pinned_get`]: a pinned read is still
-    /// one GET on the wire, so it also bumps the plain GET totals.
+    /// one GET on the wire, so it also bumps the plain GET totals. Counted
+    /// whatever the outcome, as `head` is: a read refused with
+    /// `PreconditionFailed` is still a paid request, and adds 0 bytes.
     async fn get_pinned(
         &self,
         key: &str,
         range: GetRange,
         pin: &Pin,
     ) -> Result<PinnedRead, StoreError> {
-        let read = self.inner.get_pinned(key, range, pin).await?;
-        self.counters
-            .record_pinned_get(read.outcome.data.len() as u64);
-        Ok(read)
+        let read = self.inner.get_pinned(key, range, pin).await;
+        let bytes = read.as_ref().map_or(0, |r| r.outcome.data.len() as u64);
+        self.counters.record_pinned_get(bytes);
+        read
     }
 
     /// Counted via [`Counters::record_pinned_get`], for the same reason as
@@ -473,5 +475,36 @@ mod tests {
             2 * "hello".len() as u64,
             "two reads of a 5-byte object"
         );
+    }
+
+    /// A pinned read refused with `PreconditionFailed` is still one GET on
+    /// the wire: it counts as a pinned get and a GET, with no bytes.
+    #[tokio::test]
+    async fn counting_backend_counts_a_refused_pinned_get() {
+        let inner = MemoryStore::new();
+        inner
+            .put(
+                "k",
+                Bytes::from_static(b"hello"),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("seed key");
+        let store = CountingBackend::new(inner);
+
+        let err = store
+            .get_pinned("k", GetRange::Full, &Pin::etag("not-the-real-etag"))
+            .await
+            .expect_err("a wrong ETag must be refused");
+        assert!(
+            matches!(err, StoreError::PreconditionFailed),
+            "got {err:?}, want PreconditionFailed"
+        );
+
+        let counters = store.counters();
+        assert_eq!(counters.pinned_get_count(), 1);
+        assert_eq!(counters.get_count(), 1, "a refused pinned get is a GET");
+        assert_eq!(counters.pinned_get_bytes(), 0);
+        assert_eq!(counters.get_bytes(), 0);
     }
 }
