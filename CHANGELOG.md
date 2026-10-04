@@ -2273,8 +2273,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and be admitted by the grant segment by segment: a location naming one
   object is checked with a HEAD, and otherwise the location is listed with a
   trailing slash for up to 8 pages, preferring a `.parquet` key and falling
-  back to any such object, so a zero-byte folder marker or an object under a
-  sibling prefix (`data/t10/` for `data/t1`) is never probed (issue #2318).
+  back to any admitted non-empty object when it finds none, so a zero-byte
+  folder marker or an object under a sibling prefix (`data/t10/` for
+  `data/t1`) is never probed (issue #2318).
   Credential profiles are read from the JSON file named by the new top-level
   `--parquet-profiles` flag or `RAVEL_PARQUET_PROFILES`. `parquet sweep`
   takes its minimum `--grace` from `sys/gc`'s `max_query_duration_ns`,

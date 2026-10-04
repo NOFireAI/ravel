@@ -366,9 +366,10 @@ pub fn resolve_location(grants: &[Grant], url: &str) -> Result<(Grant, KeyPrefix
 }
 
 /// How many listing pages [`one_object_under`] reads before it stops looking.
-/// A location whose first admitted object is further into the listing than
-/// this reports [`ProbeObject::PageCapReached`], which bounds the search on a
-/// bucket whose listing is dominated by keys the location does not admit.
+/// A location with no admitted non-empty object inside this many pages
+/// reports [`ProbeObject::PageCapReached`] when the store offers another page,
+/// which bounds the search on a bucket whose listing is dominated by keys the
+/// location does not admit.
 pub const MAX_PROBE_LIST_PAGES: usize = 8;
 
 /// What [`one_object_under`] found under a location.
@@ -379,8 +380,8 @@ pub enum ProbeObject {
     Found(String),
     /// The listing ran to its end without one.
     Empty,
-    /// [`MAX_PROBE_LIST_PAGES`] pages were read without one, and the listing
-    /// had more.
+    /// [`MAX_PROBE_LIST_PAGES`] pages were read without one, and the store
+    /// offered another page.
     PageCapReached,
 }
 
