@@ -1795,7 +1795,8 @@ than on the request path:
   are quoted strings, so an unquoted value could be rejected as malformed
   instead of evaluated as a precondition, which would pass the probe for the
   wrong reason. The probe writes nothing to the store it is qualifying.
-- `probe_not_ravel_bucket(ravel_store, candidate_store)` refuses a candidate
+- `probe_not_ravel_bucket(ravel_store, cleanup_store, candidate_store)`
+  refuses a candidate
   that is a Ravel bucket, which would let an external table read Ravel's
   objects across tenants. It reads two keys from the candidate and both must
   come back a clean `NotFound`.
@@ -1824,14 +1825,24 @@ than on the request path:
   rather than a `NotFound`, so a grant offered under least-privilege
   credentials of that shape is refused. That is the intended trade, because
   the probe cannot tell "you may not ask" from "there is nothing there".
-  The probe issues a delete for its own object before returning, on every
-  path it returns through; a failed delete is logged and does not change the
-  verdict. Two paths never reach that delete and can leave an object behind:
-  a probe put that timed out after the object had landed, and a cancelled
-  probe (the future dropped before the delete is issued). Nothing in Ravel
-  reaps `sys/pq-probe/`, so what bounds the leak is whatever lifecycle rule
-  the operator sets on that prefix in the bucket itself. Each leaked object
-  is 32 bytes.
+  The probe deletes its own object through `ravel_store` before returning a
+  verdict; a failed delete is logged and does not change the verdict. A drop
+  guard, armed before the put is issued and disarmed only when that inline
+  delete succeeds, covers the paths that never reach it or where it failed:
+  the future dropped mid-probe (a cancelled grant, a statement deadline), a
+  put reported failed after the object had landed, and an inline delete
+  that returned an error. The guard spawns a best-effort delete through
+  `cleanup_store` on the current tokio runtime; a caller that counts the
+  probe's requests passes its counting wrapper as `ravel_store` and the
+  unwrapped store as `cleanup_store`, so the background delete cannot race
+  the cost read. The guard deletes a key that may never have been written,
+  which is safe because `delete` is idempotent (see "Operations"). An
+  object is still left behind when the background delete fails, when the
+  process exits before it runs, or when the guard fires with no tokio
+  runtime; each case is logged at warn. Nothing in Ravel reaps
+  `sys/pq-probe/`, so what bounds that residual leak is whatever lifecycle
+  rule the operator sets on that prefix in the bucket itself. Each leaked
+  object is 32 bytes.
 
 Nothing in a shipping binary constructs an `ExternalStore` or calls either
 probe yet. The callers are the Parquet reader and the grant and
