@@ -70,6 +70,19 @@ fn write_rows(cfg: &RlogConfig, records: &[LogRecord]) -> Vec<u8> {
     w.finish().expect("finish")
 }
 
+/// The reference row builder ([`RlogWriter::finish_row_reference`]), not
+/// `push` + `finish`: `finish` now routes row input through the columnar
+/// builder too (ADR-2467 decision 1), so a test that compares row-pushed
+/// output against [`write_columnar`]'s output needs this to actually reach
+/// `build_object` rather than compare the columnar builder with itself.
+fn write_rows_reference(cfg: &RlogConfig, records: &[LogRecord]) -> Vec<u8> {
+    let mut w = RlogWriter::new(*cfg, identity());
+    for r in records {
+        w.push(r.clone()).expect("push");
+    }
+    w.finish_row_reference().expect("finish")
+}
+
 fn write_columnar(cfg: &RlogConfig, batch: ColumnarLogBatch) -> Vec<u8> {
     let mut w = RlogWriter::new(*cfg, identity());
     w.push_columnar(batch).expect("push columnar");
@@ -814,7 +827,7 @@ fn row_and_columnar_paths_identical_with_the_new_codecs() {
         ..RlogConfig::default()
     };
 
-    let rows = write_rows(&cfg, &records);
+    let rows = write_rows_reference(&cfg, &records);
     let columnar = write_columnar(&cfg, ColumnarLogBatch::from_records(&records));
     let dict = write_columnar(
         &cfg,
