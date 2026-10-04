@@ -527,6 +527,11 @@ Defaults. No `ravel-server` flag configures them:
 | `max_body_len` | 65,536 bytes |
 | `max_resource_attributes` | 128 |
 | `max_scope_attributes` | 64 |
+| Attribute nesting | 15 kvlists around a value; an array level costs half a kvlist level, so 31 arrays fit |
+| Entries in one array or kvlist | 1,048,576 |
+
+The last two rows are not configurable limits. They are what log storage can
+hold, and they apply to every resource, scope and record attribute.
 
 The body and attribute-value ceilings are deliberately wider than the metric
 equivalents. A log body carries a message or a stack trace, where a metric
@@ -561,6 +566,8 @@ Every rejection reason:
 | `TooManyAttributes` | One record has more attributes than `max_attributes_per_record`. Ravel rejects that record. |
 | `AttributeKeyTooLong` | An attribute key exceeds `max_attribute_key_len`. Ravel drops that one attribute, not the record. |
 | `AttributeValueTooLong` | An attribute value's payload exceeds `max_attribute_value_len` (nested list and map entries count toward it). Ravel drops that one attribute, not the record. |
+| `AttributeTooDeeplyNested` | An array or kvlist attribute value nests deeper than log storage holds: more than 15 kvlists around a value, with an array level costing half a kvlist level. On a record, Ravel drops that one attribute and stores the record. On a resource or scope, the attribute is part of stream identity, so Ravel rejects every record under that resource or scope. |
+| `AttributeTooManyEntries` | An array or kvlist inside an attribute value holds more than 1,048,576 entries. The value-length limit does not catch this on its own, because an empty array or kvlist entry adds nothing to the measured length. On a record, Ravel drops that one attribute and stores the record. On a resource or scope, Ravel rejects every record under it. |
 | `BodyTooLong` | The record body, after normalization to a string, exceeds `max_body_len`. Ravel rejects that record. |
 | `UnsupportedBodyKind` | The body is a string-table reference, which indexes a table the record does not carry, so there is nothing to store. Array and map bodies are converted, not rejected; see below. |
 | `MissingAttributeValue` | An attribute arrived with its `value` field unset. Ravel drops and reports that one attribute; it never silently discards it. |
