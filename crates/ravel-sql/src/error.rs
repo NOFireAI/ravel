@@ -342,6 +342,23 @@ pub enum SqlError {
     #[error("internal ravel-sql error: {0}")]
     Internal(String),
 
+    /// A result cell the JSON encoding cannot represent: a type with no JSON
+    /// form, or a value of an encodable type outside what that form can hold
+    /// (a timestamp past the i64 nanosecond range, a date outside years 0000
+    /// to 9999). The query was valid and Arrow IPC carries the value exactly,
+    /// so this is the caller's choice of encoding, not an engine fault. The
+    /// fields name only the result column, its Arrow type and a fixed reason,
+    /// never the value, so the text is safe to return to the client.
+    #[error(
+        "column \"{column}\" of type {data_type} cannot be encoded as JSON: {reason}; \
+         request the Arrow IPC format to read it exactly"
+    )]
+    UnencodableResult {
+        column: String,
+        data_type: String,
+        reason: &'static str,
+    },
+
     /// A DataFusion operator panicked while the query's stream was being
     /// polled, and [`crate::PinnedStream`] unwound it into an error rather
     /// than letting it escape (issue #737).
@@ -500,6 +517,7 @@ impl SqlError {
             | SqlError::SpillBudgetExhausted(_)
             | SqlError::SpillUnavailable(_)
             | SqlError::Plan(_)
+            | SqlError::UnencodableResult { .. }
             | SqlError::Execution(_)
             | SqlError::Internal(_)
             | SqlError::OperatorPanic(_) => ErrorClass::Unsupported,
@@ -620,6 +638,9 @@ impl SqlError {
             // deployment filesystem layout. Redacted like a storage fault.
             SqlError::SpillUnavailable(_) => MSG_SPILL_UNAVAILABLE.to_string(),
             SqlError::Plan(_) => MSG_PLAN.to_string(),
+            // A result column name, an Arrow type and a fixed reason; the
+            // variant never carries the value.
+            SqlError::UnencodableResult { .. } => self.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
             SqlError::Internal(_) | SqlError::OperatorPanic(_) => MSG_INTERNAL.to_string(),
             SqlError::Shared { message, .. } => message.clone(),
