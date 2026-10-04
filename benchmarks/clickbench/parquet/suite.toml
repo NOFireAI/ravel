@@ -50,6 +50,12 @@
 # Pass is vacuous. The acceptance test lists them in ZERO_ROWS_ON_FIXTURE and
 # asserts they stay empty on both engines, so a fixture large enough to give
 # them rows is noticed.
+#
+# Q19 needs no override, but its comparison is weaker than it looks: it is
+# `ORDER BY COUNT(*) DESC LIMIT 10`, so most of its rows fall in a tie on the
+# count and are compared by count only, not by the extracted minute. The
+# cell-level guard for the minute is
+# crates/ravel-sql/tests/parquet_tables.rs::clickbench_q19_plans_and_groups_by_extracted_minute.
 
 [table]
 # `{location}` is substituted with the fixture's hits.parquet object URL.

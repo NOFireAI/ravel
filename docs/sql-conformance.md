@@ -78,9 +78,9 @@ and stays conformant.
 ## Score
 
 - Supported and covered: 44
-- Intentionally rejected: 68
+- Intentionally rejected: 70
 - Unclassified / broken: 0
-- **Conformance: 112 / 112 = 100.0%**
+- **Conformance: 114 / 114 = 100.0%**
 
 ## Conformance table
 
@@ -143,8 +143,10 @@ and stays conformant.
 | Clause / operator | `LIMIT` | `SELECT ts, value FROM samples ORDER BY series_id, ts LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
 | Clause / operator | `OFFSET` | `SELECT value FROM samples ORDER BY value OFFSET 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `ORDER BY` | `SELECT ts, value FROM samples ORDER BY ts` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
+| Clause / operator | `POSITION(x IN y)` | `SELECT POSITION('a' IN 'ab')` | Intentionally rejected | `SqlError::Plan` | no registered expression planner; call strpos(y, x) instead |
 | Clause / operator | `Projection` | `SELECT ts, value FROM samples ORDER BY series_id, ts` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | covered by the two-layer differential gate (tests/differential.rs) |
 | Clause / operator | `REGEXP_REPLACE backreference` | `SELECT regexp_replace('ab', '(a)(b)', '\2\1') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
+| Clause / operator | `SUBSTRING(x FROM y FOR z)` | `SELECT SUBSTRING('abc' FROM 1 FOR 2)` | Intentionally rejected | `SqlError::Plan` | no registered expression planner; call "substr"(x, y, z), name double-quoted, instead |
 | Clause / operator | `count(DISTINCT)` | `SELECT count(DISTINCT series_id) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `date_part(minute)` | `SELECT date_part('minute', ts) FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | analytical clause/operator over typed columns (ADR-0090 decision 8) |
 | Clause / operator | `declared i64 typed aggregate` | `SELECT sum(dur) FROM logs` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | typed predicate/aggregate over a typed attribute column (ADR-0090) |
