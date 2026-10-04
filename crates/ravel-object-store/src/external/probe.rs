@@ -23,16 +23,16 @@ use crate::{GetRange, ObjectStoreBackend, Pin, PutOptions, StoreError};
 /// Prefix for the objects [`probe_not_ravel_bucket`] writes.
 ///
 /// Objects under it are meant to be transient. The probe deletes its own object
-/// inline once the candidate has answered, and a drop guard covers the paths
-/// that never reach that delete or that see it fail: the probe future dropped
-/// mid-flight (a caller's deadline), a put reported as failed (which a put that
-/// timed out after the object landed also is), and an inline delete that
-/// returned an error. On those paths the guard spawns a best-effort delete on
-/// the current tokio runtime.
+/// inline before it returns: once the candidate has answered, and also when the
+/// put is reported as failed (which a put that timed out after the object
+/// landed also is). A drop guard covers the two paths that inline delete does
+/// not: the probe future dropped mid-flight (a caller's deadline), and an
+/// inline delete that returned an error. On those paths the guard spawns a
+/// best-effort delete on the current tokio runtime.
 ///
 /// An object can still be left behind when that spawned delete fails, when the
-/// process exits before it runs, or when the guard fires outside a tokio
-/// runtime and so has nowhere to spawn it. Nothing in Ravel reaps this prefix,
+/// process exits or is killed before it runs, or when the guard fires outside a
+/// tokio runtime and so has nowhere to spawn it. Nothing in Ravel reaps this prefix,
 /// so what bounds the leak is whatever lifecycle rule the operator sets on
 /// `sys/pq-probe/` in the bucket itself. Each leaked object is 32 bytes.
 pub const PROBE_PREFIX: &str = "sys/pq-probe/";
@@ -230,24 +230,28 @@ pub enum RavelBucketProbeFailure {
 /// from "there is nothing there", and qualifying a bucket on an error message
 /// is how a Ravel bucket gets granted to an external table.
 ///
-/// `ravel_store` serves the probe's put and its inline delete. `cleanup_store`
-/// is the same bucket, and serves only the delete a [`ProbeObjectGuard`] spawns
-/// when the probe cannot delete its object itself; it is an owned handle
-/// because that task outlives the call. A caller with no cost accounting
+/// `ravel_store` serves the probe's put and its inline deletes. `cleanup_store`
+/// serves only the delete a [`ProbeObjectGuard`] spawns when the probe cannot
+/// delete its object itself; it is cloned into that task, which outlives the
+/// call. `cleanup_store` must name the same bucket as `ravel_store`, since that
+/// is where the probe object was written. Passing the candidate there would
+/// send a delete to the customer's bucket. A caller with no cost accounting
 /// passes the same store for both. A caller that counts its requests passes
 /// its counting wrapper as `ravel_store` and the unwrapped store as
 /// `cleanup_store`, so a background delete is never in the cost it reports:
 /// whether that request landed before the cost was read would be a race.
 ///
-/// Once the candidate has answered, the probe deletes its own object inline,
-/// on every verdict. An inline delete that fails is logged and does not change
-/// the verdict: the verdict is the answer the caller asked for, and losing it
-/// to report a leaked probe object would be the worse trade. The guard then
-/// retries it in the background. The guard also deletes the object when the
-/// put is reported failed and when this future is dropped before the inline
-/// delete returns. [`PROBE_PREFIX`] says what can still leave an object behind.
+/// The probe deletes its own object inline, through `ravel_store`, before it
+/// returns: once the candidate has answered, on every verdict, and when the put
+/// is reported failed, because a put reported failed may still have landed. An
+/// inline delete that fails is logged and does not change the result: the
+/// verdict is the answer the caller asked for, and losing it to report a leaked
+/// probe object would be the worse trade. The guard covers what the inline
+/// delete does not: it retries a failed inline delete in the background, and
+/// it deletes the object when this future is dropped before an inline delete
+/// returns. [`PROBE_PREFIX`] says what can still leave an object behind.
 pub async fn probe_not_ravel_bucket(
-    ravel_store: &dyn ObjectStoreBackend,
+    ravel_store: &Arc<dyn ObjectStoreBackend>,
     cleanup_store: &Arc<dyn ObjectStoreBackend>,
     candidate_store: &dyn ObjectStoreBackend,
 ) -> Result<(), RavelBucketProbeFailure> {
@@ -266,6 +270,10 @@ pub async fn probe_not_ravel_bucket(
         .put(&key, payload.clone(), PutOptions::default())
         .await
     {
+        // Awaited here rather than left to the guard: this future is
+        // returning, and a caller whose runtime ends with it (`ravel-cli`)
+        // would cancel a spawned delete before it ran.
+        guard.delete_inline(ravel_store.as_ref()).await;
         return Err(RavelBucketProbeFailure::ProbeWriteFailed { key, source });
     }
 
@@ -289,14 +297,7 @@ pub async fn probe_not_ravel_bucket(
         }),
     };
 
-    match ravel_store.delete(&key).await {
-        Ok(()) => guard.disarm(),
-        Err(e) => tracing::warn!(
-            key = %key,
-            error = %e,
-            "the bucket probe object could not be deleted; retrying in the background"
-        ),
-    }
+    guard.delete_inline(ravel_store.as_ref()).await;
     verdict
 }
 
@@ -315,8 +316,18 @@ struct ProbeObjectGuard {
 }
 
 impl ProbeObjectGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
+    /// Delete the probe object through `ravel_store` now. Success disarms the
+    /// guard; a failure is logged and leaves it armed, so it retries in the
+    /// background when it drops.
+    async fn delete_inline(&mut self, ravel_store: &dyn ObjectStoreBackend) {
+        match ravel_store.delete(&self.key).await {
+            Ok(()) => self.armed = false,
+            Err(e) => tracing::warn!(
+                key = %self.key,
+                error = %e,
+                "the bucket probe object could not be deleted; retrying in the background"
+            ),
+        }
     }
 }
 
@@ -329,7 +340,8 @@ impl Drop for ProbeObjectGuard {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             tracing::warn!(
                 key = %key,
-                "no tokio runtime to delete the bucket probe object from; it is left behind"
+                "no tokio runtime to delete the bucket probe object from; it is left behind \
+                 if its put landed"
             );
             return;
         };
@@ -339,7 +351,8 @@ impl Drop for ProbeObjectGuard {
                 tracing::warn!(
                     key = %key,
                     error = %e,
-                    "the bucket probe object could not be deleted in the background"
+                    "the bucket probe object could not be deleted in the background; it may \
+                     not exist, since its put may never have landed"
                 );
             }
         });
@@ -654,9 +667,9 @@ mod tests {
         // The same store reached through a second handle: exactly the "one
         // bucket under two names" case the probe exists for.
         let candidate = Arc::clone(&ravel);
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
 
-        let err = probe_not_ravel_bucket(ravel.as_ref(), &cleanup, candidate.as_ref())
+        let err = probe_not_ravel_bucket(&handle, &handle,candidate.as_ref())
             .await
             .expect_err("Ravel's own bucket must be detected");
         assert!(
@@ -672,10 +685,10 @@ mod tests {
     #[tokio::test]
     async fn a_genuinely_different_bucket_passes_and_leaves_nothing_behind() {
         let ravel = Arc::new(MemoryStore::new());
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = MemoryStore::new();
 
-        probe_not_ravel_bucket(ravel.as_ref(), &cleanup, &candidate)
+        probe_not_ravel_bucket(&handle, &handle,&candidate)
             .await
             .expect("a different bucket must pass");
         assert!(
@@ -695,7 +708,7 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_that_cannot_be_read_is_inconclusive_not_a_pass() {
         let ravel = Arc::new(MemoryStore::new());
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = FaultStore::new(
             MemoryStore::new(),
             FaultPlan::empty().with_rule(Rule::new(
@@ -704,7 +717,7 @@ mod tests {
             )),
         );
 
-        let err = probe_not_ravel_bucket(&ravel, &cleanup, &candidate)
+        let err = probe_not_ravel_bucket(&handle, &handle, &candidate)
             .await
             .expect_err("an unreadable candidate must not qualify");
         assert!(
@@ -724,7 +737,7 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_that_is_a_copy_of_a_ravel_bucket_is_refused() {
         let ravel = Arc::new(MemoryStore::new());
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = MemoryStore::new();
         candidate
             .put(
@@ -735,7 +748,7 @@ mod tests {
             .await
             .expect("seed the candidate's tenancy marker");
 
-        let err = probe_not_ravel_bucket(&ravel, &cleanup, &candidate)
+        let err = probe_not_ravel_bucket(&handle, &handle, &candidate)
             .await
             .expect_err("a bucket carrying a Ravel tenancy marker must not qualify");
         assert!(
@@ -758,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_that_refuses_the_tenancy_read_is_inconclusive() {
         let ravel = Arc::new(MemoryStore::new());
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = FaultStore::new(
             MemoryStore::new(),
             FaultPlan::empty().with_rule(
@@ -772,7 +785,7 @@ mod tests {
             ),
         );
 
-        let err = probe_not_ravel_bucket(&ravel, &cleanup, &candidate)
+        let err = probe_not_ravel_bucket(&handle, &handle, &candidate)
             .await
             .expect_err("a candidate that will not answer about the marker must not qualify");
         assert!(
@@ -844,10 +857,10 @@ mod tests {
     #[tokio::test]
     async fn a_candidate_that_serves_other_bytes_is_inconclusive() {
         let ravel = Arc::new(MemoryStore::new());
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = ServesPlaceholderForEveryKey;
 
-        let err = probe_not_ravel_bucket(&ravel, &cleanup, &candidate)
+        let err = probe_not_ravel_bucket(&handle, &handle, &candidate)
             .await
             .expect_err("a candidate that served neither the payload nor a 404 is inconclusive");
         assert!(
@@ -857,40 +870,53 @@ mod tests {
         assert!(probe_objects_left(&ravel).await.is_empty());
     }
 
-    /// A put that never reached the store still leaves the guard armed, so it
-    /// issues one delete of a key that is not there, and that delete succeeds.
+    /// A put that never reached the store is deleted inline all the same,
+    /// since the probe cannot tell it from one that landed: one delete of a key
+    /// that is not there, through `ravel_store`, and it succeeds. That disarms
+    /// the guard, so nothing reaches `cleanup_store`.
     #[tokio::test]
     async fn a_probe_that_cannot_be_written_says_so_and_does_not_pass() {
         let memory = Arc::new(MemoryStore::new());
-        let ravel = FaultStore::new(
+        let counted_ravel = Arc::new(InstrumentedStore::new(FaultStore::new(
             Arc::clone(&memory),
             FaultPlan::empty().with_rule(Rule::new(
                 Op::Put,
                 ScriptedFault::Transient("the bucket is unreachable".into()),
             )),
-        );
+        )));
+        let ravel: Arc<dyn ObjectStoreBackend> = counted_ravel.clone();
         let counted_cleanup = Arc::new(InstrumentedStore::new(Arc::clone(&memory)));
         let cleanup: Arc<dyn ObjectStoreBackend> = counted_cleanup.clone();
         let candidate = MemoryStore::new();
 
-        let err = probe_not_ravel_bucket(&ravel, &cleanup, &candidate)
+        let err = probe_not_ravel_bucket(&handle, &handle, &candidate)
             .await
             .expect_err("a probe that was never written answers nothing");
         assert!(
             matches!(err, RavelBucketProbeFailure::ProbeWriteFailed { .. }),
             "got {err:?}"
         );
-        assert_eq!(ravel.fault_count(Op::Put, FaultKind::Transient), 1);
+        assert_eq!(
+            counted_ravel
+                .inner()
+                .fault_count(Op::Put, FaultKind::Transient),
+            1
+        );
         assert!(probe_objects_left(memory.as_ref()).await.is_empty());
+        let inline = counted_ravel.metrics().snapshot().delete;
+        assert_eq!(
+            (inline.calls, inline.ok),
+            (1, 1),
+            "one inline delete of the absent key, and it succeeds"
+        );
 
         for _ in 0..100 {
             tokio::task::yield_now().await;
         }
-        let delete = counted_cleanup.metrics().snapshot().delete;
         assert_eq!(
-            (delete.calls, delete.ok),
-            (1, 1),
-            "one background delete of the absent key, and it succeeds"
+            counted_cleanup.metrics().snapshot().delete.calls,
+            0,
+            "the inline delete disarmed the guard"
         );
     }
 
@@ -914,23 +940,35 @@ mod tests {
         FaultPlan::empty().with_rule(Rule::new(Op::Put, ScriptedFault::DuplicateDelivery))
     }
 
+    /// [`put_lands_then_reports_failure`], and the probe's first delete fails
+    /// too, so the guard is left armed when the probe returns.
+    fn put_lands_then_reports_failure_and_the_first_delete_fails() -> FaultPlan {
+        put_lands_then_reports_failure().with_rule(
+            Rule::new(
+                Op::Delete,
+                ScriptedFault::Transient("the delete timed out".into()),
+            )
+            .with_occurrence(Occurrence::Nth(1)),
+        )
+    }
+
     /// The guard can fire with no tokio runtime, when another executor drives
     /// the probe. It logs and returns instead of panicking, and the object is
-    /// left behind, which is the residual leak [`PROBE_PREFIX`] names.
+    /// left behind, which is the residual leak [`PROBE_PREFIX`] names. The
+    /// guard is reached through a put reported failed whose inline delete also
+    /// failed, since an inline delete that succeeds disarms it.
     #[test]
     fn a_guard_that_fires_outside_a_runtime_does_not_panic() {
         assert!(tokio::runtime::Handle::try_current().is_err());
         let ravel = Arc::new(FaultStore::new(
             MemoryStore::new(),
-            put_lands_then_reports_failure(),
+            put_lands_then_reports_failure_and_the_first_delete_fails(),
         ));
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = MemoryStore::new();
 
         let err = futures::executor::block_on(probe_not_ravel_bucket(
-            ravel.as_ref(),
-            &cleanup,
-            &candidate,
+            &handle, &handle, &candidate,
         ))
         .expect_err("a put reported as failed fails the probe");
         let key = match err {
@@ -938,6 +976,7 @@ mod tests {
             other => panic!("expected ProbeWriteFailed, got {other:?}"),
         };
         assert_eq!(ravel.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+        assert_eq!(ravel.fault_count(Op::Delete, FaultKind::Transient), 1);
         assert!(
             futures::executor::block_on(ravel.inner().head(&key)).is_ok(),
             "with no runtime there is nowhere to spawn the delete"
@@ -953,14 +992,19 @@ mod tests {
     #[test]
     fn a_put_reported_failed_leaves_no_object_when_the_runtime_drops_on_return() {
         let memory = Arc::new(MemoryStore::new());
-        let ravel = FaultStore::new(Arc::clone(&memory), put_lands_then_reports_failure());
+        let ravel = Arc::new(FaultStore::new(
+            Arc::clone(&memory),
+            put_lands_then_reports_failure(),
+        ));
+        let ravel_handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let cleanup: Arc<dyn ObjectStoreBackend> = memory.clone();
         let candidate = MemoryStore::new();
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build a current-thread runtime");
-        let verdict = runtime.block_on(probe_not_ravel_bucket(&ravel, &cleanup, &candidate));
+        let verdict =
+            runtime.block_on(probe_not_ravel_bucket(&ravel_handle, &cleanup, &candidate));
         drop(runtime);
 
         let key = match verdict {
@@ -988,7 +1032,8 @@ mod tests {
             .put(&sibling, Bytes::from_static(b"p"), PutOptions::default())
             .await
             .expect("seed a concurrent probe's object");
-        let ravel = InstrumentedStore::new(Arc::clone(&memory));
+        let counted_ravel = Arc::new(InstrumentedStore::new(Arc::clone(&memory)));
+        let ravel: Arc<dyn ObjectStoreBackend> = counted_ravel.clone();
         let counted_cleanup = Arc::new(InstrumentedStore::new(Arc::clone(&memory)));
         let cleanup: Arc<dyn ObjectStoreBackend> = counted_cleanup.clone();
 
@@ -999,35 +1044,84 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let inline = ravel.metrics().snapshot().delete;
+        let inline = counted_ravel.metrics().snapshot().delete;
         assert_eq!((inline.calls, inline.ok), (1, 1));
         assert_eq!(counted_cleanup.metrics().snapshot().delete.calls, 0);
         assert_eq!(probe_objects_left(memory.as_ref()).await, vec![sibling]);
     }
 
     /// A probe put that lands and is then reported as failed (a timeout after
-    /// the write) returns before the inline delete. The guard deletes it.
+    /// the write) is deleted inline before the probe returns, through
+    /// `ravel_store`. Nothing is left for the guard, so `cleanup_store` sees no
+    /// delete.
     #[tokio::test]
     async fn a_probe_write_that_landed_and_was_reported_failed_is_deleted() {
-        let ravel = Arc::new(FaultStore::new(
-            MemoryStore::new(),
+        let memory = Arc::new(MemoryStore::new());
+        let counted_ravel = Arc::new(InstrumentedStore::new(FaultStore::new(
+            Arc::clone(&memory),
             put_lands_then_reports_failure(),
-        ));
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        )));
+        let ravel: Arc<dyn ObjectStoreBackend> = counted_ravel.clone();
+        let counted_cleanup = Arc::new(InstrumentedStore::new(Arc::clone(&memory)));
+        let cleanup: Arc<dyn ObjectStoreBackend> = counted_cleanup.clone();
 
-        let err = probe_not_ravel_bucket(ravel.as_ref(), &cleanup, &MemoryStore::new())
+        let err = probe_not_ravel_bucket(&ravel, &cleanup, &MemoryStore::new())
             .await
             .expect_err("a put reported as failed fails the probe");
         let key = match err {
             RavelBucketProbeFailure::ProbeWriteFailed { key, .. } => key,
             other => panic!("expected ProbeWriteFailed, got {other:?}"),
         };
-        assert_eq!(ravel.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
-        // The spawned delete has not run yet: `MemoryStore` never yields.
-        assert_eq!(probe_objects_left(ravel.inner()).await, vec![key.clone()]);
+        assert_eq!(
+            counted_ravel
+                .inner()
+                .fault_count(Op::Put, FaultKind::DuplicateDelivery),
+            1
+        );
+        // No yield since the probe returned: only an inline delete has run.
+        assert!(
+            probe_objects_left(memory.as_ref()).await.is_empty(),
+            "the probe object {key} was still there when the probe returned"
+        );
+        let inline = counted_ravel.metrics().snapshot().delete;
+        assert_eq!((inline.calls, inline.ok), (1, 1));
 
-        let left = probe_objects_left_after_cleanup(ravel.inner()).await;
-        assert!(left.is_empty(), "the probe object {key} must be deleted");
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(counted_cleanup.metrics().snapshot().delete.calls, 0);
+    }
+
+    /// A put reported failed whose inline delete also fails leaves the guard
+    /// armed, and its background delete through `cleanup_store` removes the
+    /// object.
+    #[tokio::test]
+    async fn a_put_reported_failed_whose_inline_delete_fails_is_deleted_by_the_guard() {
+        let memory = Arc::new(MemoryStore::new());
+        let faulty = Arc::new(FaultStore::new(
+            Arc::clone(&memory),
+            put_lands_then_reports_failure_and_the_first_delete_fails(),
+        ));
+        let ravel: Arc<dyn ObjectStoreBackend> = faulty.clone();
+        let counted_cleanup = Arc::new(InstrumentedStore::new(Arc::clone(&memory)));
+        let cleanup: Arc<dyn ObjectStoreBackend> = counted_cleanup.clone();
+
+        let err = probe_not_ravel_bucket(&ravel, &cleanup, &MemoryStore::new())
+            .await
+            .expect_err("a put reported as failed fails the probe");
+        let key = match err {
+            RavelBucketProbeFailure::ProbeWriteFailed { key, .. } => key,
+            other => panic!("expected ProbeWriteFailed, got {other:?}"),
+        };
+        assert_eq!(faulty.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+        assert_eq!(faulty.fault_count(Op::Delete, FaultKind::Transient), 1);
+        // The spawned delete has not run yet: `MemoryStore` never yields.
+        assert_eq!(probe_objects_left(memory.as_ref()).await, vec![key.clone()]);
+
+        let left = probe_objects_left_after_cleanup(memory.as_ref()).await;
+        assert!(left.is_empty(), "the guard's delete left {left:?}");
+        let background = counted_cleanup.metrics().snapshot().delete;
+        assert_eq!((background.calls, background.ok), (1, 1));
     }
 
     /// The probe future dropped while the candidate's identity read is held,
@@ -1035,11 +1129,11 @@ mod tests {
     #[tokio::test]
     async fn a_probe_dropped_while_its_candidate_read_is_held_leaves_no_object() {
         let ravel = Arc::new(MemoryStore::new());
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
         let gate = candidate.hold(Op::Get, Some(PROBE_PREFIX.to_string()), Occurrence::Always);
 
-        let mut probe = Box::pin(probe_not_ravel_bucket(ravel.as_ref(), &cleanup, &candidate));
+        let mut probe = Box::pin(probe_not_ravel_bucket(&handle, &handle,&candidate));
         tokio::select! {
             verdict = &mut probe => panic!("a held identity read cannot complete: {verdict:?}"),
             () = gate.wait_until_held(1) => {}
@@ -1116,15 +1210,20 @@ mod tests {
     #[tokio::test]
     async fn a_probe_dropped_after_its_put_landed_but_before_it_returned_leaves_no_object() {
         let memory = Arc::new(MemoryStore::new());
-        let ravel = PutLandsThenHangs {
+        let ravel = Arc::new(PutLandsThenHangs {
             inner: Arc::clone(&memory),
             landed: AtomicBool::new(false),
             landed_notify: tokio::sync::Notify::new(),
-        };
+        });
+        let ravel_handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let cleanup: Arc<dyn ObjectStoreBackend> = memory.clone();
         let candidate = MemoryStore::new();
 
-        let mut probe = Box::pin(probe_not_ravel_bucket(&ravel, &cleanup, &candidate));
+        let mut probe = Box::pin(probe_not_ravel_bucket(
+            &ravel_handle,
+            &cleanup,
+            &candidate,
+        ));
         tokio::select! {
             verdict = &mut probe => panic!("a hanging put cannot complete: {verdict:?}"),
             () = ravel.landed_notify.notified() => {}
@@ -1151,9 +1250,9 @@ mod tests {
                 .with_occurrence(Occurrence::Nth(1)),
             ),
         ));
-        let cleanup: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
 
-        probe_not_ravel_bucket(ravel.as_ref(), &cleanup, &MemoryStore::new())
+        probe_not_ravel_bucket(&handle, &handle,&MemoryStore::new())
             .await
             .expect("a failed inline delete does not change the verdict");
         assert_eq!(ravel.fault_count(Op::Delete, FaultKind::Transient), 1);
@@ -1172,31 +1271,27 @@ mod tests {
     #[tokio::test]
     async fn the_background_delete_goes_through_the_cleanup_store_only() {
         let memory = Arc::new(MemoryStore::new());
-        let ravel = InstrumentedStore::new(FaultStore::new(
-            Arc::clone(&memory),
-            put_lands_then_reports_failure(),
-        ));
+        let counted_ravel = Arc::new(InstrumentedStore::new(Arc::clone(&memory)));
+        let ravel: Arc<dyn ObjectStoreBackend> = counted_ravel.clone();
         let counted_cleanup = Arc::new(InstrumentedStore::new(Arc::clone(&memory)));
         let cleanup: Arc<dyn ObjectStoreBackend> = counted_cleanup.clone();
+        let candidate = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+        let gate = candidate.hold(Op::Get, Some(PROBE_PREFIX.to_string()), Occurrence::Always);
 
-        let err = probe_not_ravel_bucket(&ravel, &cleanup, &MemoryStore::new())
-            .await
-            .expect_err("a put reported as failed fails the probe");
-        assert!(
-            matches!(err, RavelBucketProbeFailure::ProbeWriteFailed { .. }),
-            "got {err:?}"
-        );
-        assert_eq!(
-            ravel
-                .inner()
-                .fault_count(Op::Put, FaultKind::DuplicateDelivery),
-            1
-        );
+        // Dropped mid-probe, so no inline delete runs and the guard fires.
+        let mut probe = Box::pin(probe_not_ravel_bucket(&ravel, &cleanup, &candidate));
+        tokio::select! {
+            verdict = &mut probe => panic!("a held identity read cannot complete: {verdict:?}"),
+            () = gate.wait_until_held(1) => {}
+        }
         assert_eq!(probe_objects_left(memory.as_ref()).await.len(), 1);
+        drop(probe);
 
         let left = probe_objects_left_after_cleanup(memory.as_ref()).await;
         assert!(left.is_empty(), "{left:?}");
-        assert_eq!(ravel.metrics().snapshot().delete.calls, 0);
+        let through_ravel = counted_ravel.metrics().snapshot();
+        assert_eq!(through_ravel.put.calls, 1);
+        assert_eq!(through_ravel.delete.calls, 0);
         let background = counted_cleanup.metrics().snapshot().delete;
         assert_eq!((background.calls, background.ok), (1, 1));
     }

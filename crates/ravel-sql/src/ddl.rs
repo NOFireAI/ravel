@@ -50,6 +50,7 @@
 //! from a best-effort background task, through the unwrapped Ravel store, so
 //! that delete is not in the statement's reported cost.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ravel_object_store::external::probe::{
@@ -775,11 +776,9 @@ impl SqlExecutor {
                     })?;
                 // The probe's own requests count into the statement's cost;
                 // a cleanup delete it spawns goes through the unwrapped store.
-                probe_not_ravel_bucket(
-                    &recorder.probe_store(ravel_store),
-                    ravel_store,
-                    &probe_external,
-                )
+                let costed_ravel_store: Arc<dyn ObjectStoreBackend> =
+                    Arc::new(recorder.probe_store(ravel_store));
+                probe_not_ravel_bucket(&costed_ravel_store, ravel_store, &probe_external)
                 .await
                 .map_err(|source| DdlExecuteError::RavelBucketProbe {
                     location: location.clone(),
