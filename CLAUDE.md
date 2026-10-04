@@ -83,8 +83,14 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p <your-crate>        # plus --workspace when your change is cross-crate
 ```
 
-None of those compile `ravel-server`'s SQL or Flight SQL surfaces: both sit
-behind cargo features that are off by default. When your change touches
+Those do not cover `ravel-server`'s SQL and Flight SQL surfaces: both sit
+behind cargo features that are off by default. A crate-scoped run
+(`-p ravel-server`) compiles neither. A `--workspace` run does compile the
+SQL surface, because `ravel-cli`'s dev-dependency turns on `ravel-server`'s
+`sql` feature and cargo unifies features across the workspace, but it never
+compiles Flight SQL, and it does not build `ravel-server` with `sql` selected
+on its own, without the dependency features the rest of the workspace adds.
+When your change touches
 `ravel-server`, `ravel-sql`, or `ravel-query`, add:
 
 ```sh
