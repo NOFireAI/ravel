@@ -106,6 +106,16 @@ pub enum SuiteError {
          \"by-name\" without a reason"
     )]
     ColumnMatchWithoutReason { number: u32 },
+    /// A `[[statement]]` override declared `column_match = "by-name"`
+    /// together with `order_key`: by-name matching exists because the two
+    /// engines' column orders differ, so a single `order_key` position
+    /// cannot name the same column on both sides. A by-name statement names
+    /// its key with `order_key_columns` instead.
+    #[error(
+        "benchmarks/clickbench/parquet/suite.toml: statement {number} declares column_match = \
+         \"by-name\" with order_key; use order_key_columns to name the key instead"
+    )]
+    ColumnMatchWithOrderKey { number: u32 },
     /// A `[[statement]]` override names a statement number `queries.sql`
     /// does not hold, so it would apply to nothing.
     #[error(
@@ -343,6 +353,11 @@ pub fn load(queries_sql: &str, suite_toml: &str) -> Result<Suite, SuiteError> {
                     number: over.number,
                 });
             }
+            if over.order_key.is_some() {
+                return Err(SuiteError::ColumnMatchWithOrderKey {
+                    number: over.number,
+                });
+            }
         }
     }
     Ok(Suite {
@@ -492,6 +507,24 @@ mod tests {
             err,
             SuiteError::ColumnMatchWithoutReason { number: 24 }
         ));
+    }
+
+    /// `column_match = "by-name"` together with a positional `order_key` is
+    /// a typed load error, even with a reason.
+    #[test]
+    fn column_match_with_order_key_is_refused() {
+        let toml = r#"
+            [table]
+            template = "CREATE EXTERNAL TABLE hits () STORED AS PARQUET LOCATION '{location}'"
+
+            [[statement]]
+            number = 24
+            column_match = "by-name"
+            reason = "column orders differ"
+            order_key = [4]
+        "#;
+        let err = load(QUERIES_SQL, toml).expect_err("by-name with order_key is refused");
+        assert_eq!(err, SuiteError::ColumnMatchWithOrderKey { number: 24 });
     }
 
     /// A `column_match` value other than `"by-name"` is a typed load error.

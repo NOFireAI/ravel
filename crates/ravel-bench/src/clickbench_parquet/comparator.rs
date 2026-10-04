@@ -79,6 +79,17 @@ pub enum ColumnKind {
 pub enum ComparatorError {
     #[error("reference and subject rows have different column counts: {reference} != {subject}")]
     ColumnCountMismatch { reference: usize, subject: usize },
+    #[error(
+        "{row_side} row {row} has {row_width} columns, but the {width_side} side's first row \
+         has {width}"
+    )]
+    RowWidthMismatch {
+        width_side: &'static str,
+        width: usize,
+        row_side: &'static str,
+        row: usize,
+        row_width: usize,
+    },
     #[error("column {index}: unsupported Arrow type {data_type:?}")]
     UnsupportedArrowType { index: usize, data_type: DataType },
     #[error("column {index}: JSON value {value} cannot be read as {kind:?}")]
@@ -168,6 +179,15 @@ pub struct TieSpec {
     pub cardinality_reason: Option<String>,
 }
 
+impl TieSpec {
+    /// Whether no row identity can be resolved, so only row and column
+    /// counts are compared: a declared cardinality reason, or a LIMIT with
+    /// no key at all.
+    pub fn is_cardinality_only(&self) -> bool {
+        self.cardinality_reason.is_some() || (self.limit.is_some() && self.key.is_empty())
+    }
+}
+
 /// Final judgement a comparison reaches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -177,6 +197,8 @@ pub enum Verdict {
     /// were checked: either the statement has a LIMIT but no resolvable
     /// ORDER BY key (`None`), or `suite.toml` declares `compare =
     /// "cardinality"` for it, carrying the declared reason (`Some`).
+    /// [`compare_with_columns`] takes the column counts from both schemas,
+    /// so they are compared even when neither side returned a row.
     CardinalityOnly(Option<String>),
     /// A row mismatch survived boundary-tie reduction and float tolerance.
     Fail,
@@ -272,7 +294,9 @@ pub struct ComparisonReport {
     pub float_mismatches: Vec<FloatMismatch>,
     pub row_mismatch: RowMismatch,
     /// Rows exempted from exact comparison because their ORDER BY key tied
-    /// with the first or last reference row (summed across both sides).
+    /// with the first or last reference row (summed across both sides):
+    /// rows paired at a cut, plus cut nominees that found no counterpart at
+    /// the cut or in the interior comparison and were dropped.
     pub tie_rows_reduced: u64,
     /// Float cells actually paired and inspected, counted on both sides of
     /// each pair (a boundary-cut row's float cells are inspected too: see
@@ -681,6 +705,12 @@ pub fn json_cell(
 /// which Rust guarantees is correctly rounded; every other kind is
 /// unaffected by this and is parsed the same way [`json_cell`] always has,
 /// via an ordinary `serde_json::Value` built from the same text.
+///
+/// A float literal that parses to a non-finite value is refused: JSON has
+/// no non-finite number spelling and the reference's JSON writer
+/// (arrow-json, behind `datafusion-cli --format json`) emits a non-finite
+/// float as `null`, so such a literal can only be one outside
+/// `f64`'s range (`1e400`), which `parse` rounds to infinity.
 fn json_cell_raw(index: usize, raw: &str, kind: ColumnKind) -> Result<Cell, ComparatorError> {
     let trimmed = raw.trim();
     if trimmed == "null" {
@@ -689,8 +719,10 @@ fn json_cell_raw(index: usize, raw: &str, kind: ColumnKind) -> Result<Cell, Comp
     if kind == ColumnKind::Float {
         return trimmed
             .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
             .map(|f| Cell::Float(f.to_bits()))
-            .map_err(|_| ComparatorError::InvalidJsonCell {
+            .ok_or_else(|| ComparatorError::InvalidJsonCell {
                 index,
                 value: raw.to_string(),
                 kind,
@@ -1030,8 +1062,14 @@ fn by_name_permutation(
 /// Under [`ColumnMatch::ByName`] every subject row is reordered to
 /// `reference_columns`' order first, so `tie.key`, the verdict, and every
 /// listed row and float mismatch use the reference's column positions.
-/// Under [`ColumnMatch::Positional`] the names are not consulted and this is
-/// [`compare`] itself.
+/// Under [`ColumnMatch::Positional`] the names are otherwise not consulted
+/// and this is [`compare`] itself.
+///
+/// When `tie` [is cardinality-only](TieSpec::is_cardinality_only), the two
+/// name lists' lengths are compared first, whatever `column_match` says, so
+/// a column count difference is a [`ComparatorError::ColumnCountMismatch`]
+/// even when both sides returned zero rows and [`compare`] has no row to
+/// take a width from.
 pub fn compare_with_columns(
     reference: &[Vec<Cell>],
     reference_columns: &[String],
@@ -1041,6 +1079,12 @@ pub fn compare_with_columns(
     tie: &TieSpec,
     float_tolerance: Option<&FloatTolerance>,
 ) -> Result<ComparisonReport, ComparatorError> {
+    if tie.is_cardinality_only() && reference_columns.len() != subject_columns.len() {
+        return Err(ComparatorError::ColumnCountMismatch {
+            reference: reference_columns.len(),
+            subject: subject_columns.len(),
+        });
+    }
     match column_match {
         ColumnMatch::Positional => compare(reference, subject, tie, float_tolerance),
         ColumnMatch::ByName => {
@@ -1238,8 +1282,8 @@ fn compare_multiset(
 /// already remapped to the row's real index), the float cells compared, the
 /// leftover full rows for each side to fold into the interior comparison,
 /// and the number of rows paired on each side (so the caller's
-/// `tie_rows_reduced` counts only rows that actually tied, not nominees that
-/// turned out to have no counterpart).
+/// `tie_rows_reduced` counts a leftover only once the interior comparison
+/// also finds it no counterpart, not merely for having nominated).
 /// `(float_mismatches, float_cells_compared, leftover_ref, leftover_subj,
 /// paired_count)`, see [`reduce_cut_group`].
 type ReducedCutResult = (
@@ -1347,13 +1391,16 @@ fn reduce_cut_group(
 /// out of an interior comparison's missing/extra list when it found no
 /// counterpart there either: it is not a row-level defect, just a cut
 /// nominee that turned out to have no match anywhere (see
-/// [`reduce_cut_group`]).
-fn remove_one_each(pool: &mut Vec<Vec<Cell>>, targets: &[Vec<Cell>]) {
+/// [`reduce_cut_group`]). Returns how many rows it removed.
+fn remove_one_each(pool: &mut Vec<Vec<Cell>>, targets: &[Vec<Cell>]) -> u64 {
+    let mut removed = 0;
     for target in targets {
         if let Some(pos) = pool.iter().position(|row| row == target) {
             pool.remove(pos);
+            removed += 1;
         }
     }
+    removed
 }
 
 /// Compare `reference` against `subject` under `tie`, applying D7's
@@ -1368,13 +1415,30 @@ pub fn compare(
     tie: &TieSpec,
     float_tolerance: Option<&FloatTolerance>,
 ) -> Result<ComparisonReport, ComparatorError> {
-    let width = reference.first().or_else(|| subject.first()).map(Vec::len);
-    if let Some(width) = width {
-        for row in reference.iter().chain(subject.iter()) {
-            if row.len() != width {
-                return Err(ComparatorError::ColumnCountMismatch {
-                    reference: width,
-                    subject: row.len(),
+    let width = match (reference.first(), subject.first()) {
+        (Some(row), _) => Some(("reference", row.len())),
+        (None, Some(row)) => Some(("subject", row.len())),
+        (None, None) => None,
+    };
+    if let Some((width_side, width)) = width {
+        let rows = reference
+            .iter()
+            .enumerate()
+            .map(|(i, row)| ("reference", i, row))
+            .chain(
+                subject
+                    .iter()
+                    .enumerate()
+                    .map(|(i, row)| ("subject", i, row)),
+            );
+        for (row_side, row, cells) in rows {
+            if cells.len() != width {
+                return Err(ComparatorError::RowWidthMismatch {
+                    width_side,
+                    width,
+                    row_side,
+                    row,
+                    row_width: cells.len(),
                 });
             }
         }
@@ -1387,8 +1451,7 @@ pub fn compare(
     // reason, or a LIMIT with no key at all): no row past a count mismatch
     // can be told apart from any other, so the verdict says so instead of
     // attempting a listing that would name arbitrary rows as "the" mismatch.
-    let is_cardinality_mode =
-        tie.cardinality_reason.is_some() || (tie.limit.is_some() && tie.key.is_empty());
+    let is_cardinality_mode = tie.is_cardinality_only();
 
     // Row counts must agree in every verdict mode (D7 rule 1a), including
     // CardinalityOnly: a row-count mismatch is always a Fail, checked
@@ -1522,7 +1585,6 @@ pub fn compare(
     for m in &mut reduced_float_mismatches {
         m.column = tie.key[m.column];
     }
-    let tie_rows_reduced = 2 * paired as u64;
     interior_ref.extend(leftover_ref.iter().cloned());
     interior_subj.extend(leftover_subj.iter().cloned());
 
@@ -1540,8 +1602,11 @@ pub fn compare(
     // keeps full, normal reporting.
     let mut missing = interior_result.missing;
     let mut extra = interior_result.extra;
-    remove_one_each(&mut missing, &leftover_ref);
-    remove_one_each(&mut extra, &leftover_subj);
+    // Both the nominees that paired at a cut and the leftovers dropped here
+    // were exempted from exact comparison, so both count as reduced.
+    let tie_rows_reduced = 2 * paired as u64
+        + remove_one_each(&mut missing, &leftover_ref)
+        + remove_one_each(&mut extra, &leftover_subj);
 
     let mut float_mismatches = reduced_float_mismatches;
     float_mismatches.extend(interior_float_mismatches);
@@ -2356,6 +2421,131 @@ mod tests {
         let report =
             compare(&reference, &subject, &tie(vec![], Some(3), 0), None).expect("compare");
         assert_eq!(report.verdict, Verdict::Fail);
+    }
+
+    /// In cardinality mode the two schemas' column counts are compared even
+    /// when both sides returned zero rows, for a declared cardinality reason
+    /// and for a LIMIT with no key alike.
+    #[test]
+    fn cardinality_mode_compares_schema_widths_with_zero_rows() {
+        let declared = TieSpec {
+            cardinality_reason: Some("key not projected".into()),
+            ..tie(vec![], Some(10), 0)
+        };
+        for spec in [declared, tie(vec![], Some(10), 0)] {
+            let err = compare_with_columns(
+                &[],
+                &names(&["a", "b"]),
+                &[],
+                &names(&["a"]),
+                ColumnMatch::Positional,
+                &spec,
+                None,
+            )
+            .expect_err("a narrower subject schema must be refused");
+            assert_eq!(
+                err,
+                ComparatorError::ColumnCountMismatch {
+                    reference: 2,
+                    subject: 1,
+                }
+            );
+            let report = compare_with_columns(
+                &[],
+                &names(&["a", "b"]),
+                &[],
+                &names(&["a", "b"]),
+                ColumnMatch::Positional,
+                &spec,
+                None,
+            )
+            .expect("equal widths compare");
+            assert!(matches!(report.verdict, Verdict::CardinalityOnly(_)));
+        }
+    }
+
+    /// A row narrower than the first reference row is reported as the side
+    /// it is on, with the width it was measured against named as well.
+    #[test]
+    fn odd_width_reference_row_names_the_reference_side() {
+        let reference = vec![vec![Cell::Int(1), Cell::Int(2)], vec![Cell::Int(3)]];
+        let subject = vec![
+            vec![Cell::Int(1), Cell::Int(2)],
+            vec![Cell::Int(3), Cell::Int(4)],
+        ];
+        let err = compare(&reference, &subject, &tie(vec![0], None, 0), None)
+            .expect_err("an odd-width reference row must be refused");
+        assert_eq!(
+            err,
+            ComparatorError::RowWidthMismatch {
+                width_side: "reference",
+                width: 2,
+                row_side: "reference",
+                row: 1,
+                row_width: 1,
+            }
+        );
+
+        let err = compare(&[], &reference, &tie(vec![0], None, 0), None)
+            .expect_err("an odd-width subject row must be refused");
+        assert_eq!(
+            err,
+            ComparatorError::RowWidthMismatch {
+                width_side: "subject",
+                width: 2,
+                row_side: "subject",
+                row: 1,
+                row_width: 1,
+            }
+        );
+    }
+
+    /// Cut nominees that find no counterpart at the cut or in the interior
+    /// comparison are dropped, and count toward `tie_rows_reduced` alongside
+    /// the rows that paired at a cut.
+    ///
+    /// LIMIT 3 OFFSET 1, key column 0. The reference nominates `[10, u]` at
+    /// the top cut and `[1, a]` at the bottom; the subject nominates `[1, b]`
+    /// and `[1, a]`, both at the bottom. One bottom pair forms (2 rows); the
+    /// reference's `[10, u]` and the subject's surplus key-1 row are left
+    /// over, find no counterpart among the interior `[5, w]` rows, and are
+    /// dropped (2 more rows).
+    #[test]
+    fn dropped_cut_leftovers_count_as_reduced() {
+        let reference = vec![
+            vec![Cell::Int(10), Cell::Str("u".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            vec![Cell::Int(1), Cell::Str("a".into())],
+        ];
+        let subject = vec![
+            vec![Cell::Int(1), Cell::Str("b".into())],
+            vec![Cell::Int(5), Cell::Str("w".into())],
+            vec![Cell::Int(1), Cell::Str("a".into())],
+        ];
+        let report =
+            compare(&reference, &subject, &tie(vec![0], Some(3), 1), None).expect("compare");
+        assert_eq!(report.verdict, Verdict::Pass);
+        assert_eq!(report.tie_rows_reduced, 4);
+    }
+
+    /// A float literal outside `f64`'s range parses to infinity; it is
+    /// refused as an invalid cell rather than compared as one.
+    #[test]
+    fn json_float_out_of_range_is_invalid() {
+        for literal in ["1e400", "-1e400"] {
+            let err = rows_from_json(&format!("[[{literal}]]"), &[ColumnKind::Float])
+                .expect_err("an out-of-range float literal must be refused");
+            assert_eq!(
+                err,
+                ComparatorError::InvalidJsonCell {
+                    index: 0,
+                    value: literal.to_string(),
+                    kind: ColumnKind::Float,
+                }
+            );
+        }
+        let rows = rows_from_json("[[1e308]]", &[ColumnKind::Float]).expect("in range");
+        assert_eq!(rows, vec![vec![Cell::Float(1e308_f64.to_bits())]]);
     }
 
     /// Required (D3c): an out-of-range key index (from any override source:
