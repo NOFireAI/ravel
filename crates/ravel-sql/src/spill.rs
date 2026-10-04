@@ -36,8 +36,9 @@
 //! (ADR-0954 requirement 7 explicitly rejects a pid for this: a reused pid is
 //! live and owns nothing of the dead process's directory, while a `flock` is
 //! released by the kernel the instant the owning process's last handle to it
-//! closes, however that happens). At startup, after acquiring its own root, a
-//! process calls [`SpillRootOwner::sweep_orphaned_spill_roots`] to remove
+//! closes, however that happens). At startup a process calls
+//! [`sweep_orphaned_spill_roots_under`] (holding no root yet) or
+//! [`SpillRootOwner::sweep_orphaned_spill_roots`] (holding its own) to remove
 //! every sibling root whose lock it can take itself; a sibling whose
 //! ownership cannot be settled either way is left in place and logged, never
 //! guessed at. There is still no node-wide or per-tenant scratch quota;
@@ -527,149 +528,181 @@ impl SpillRootOwner {
     /// deleted without a lock check, and an entry gone by the time it is
     /// reached is skipped without a log line.
     ///
-    /// Call once at process startup, after [`SpillRootOwner::acquire`].
+    /// [`sweep_orphaned_spill_roots_under`] is the same sweep for a process
+    /// that holds no root yet.
     pub fn sweep_orphaned_spill_roots(&self) {
         let Some(sql_spill_root) = self.dir.parent() else {
             return;
         };
-        let entries = match std::fs::read_dir(sql_spill_root) {
-            Ok(entries) => entries,
-            Err(err) => {
-                tracing::warn!(
-                    dir = %sql_spill_root.display(),
-                    error = %err,
-                    "could not list SQL spill roots to sweep"
-                );
-                return;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    tracing::warn!(
-                        error = %err,
-                        "could not read a SQL spill root directory entry"
-                    );
-                    continue;
-                }
-            };
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if !file_type.is_dir() {
-                continue;
-            }
-            let candidate = sql_spill_root.join(entry.file_name());
-            if candidate == self.dir {
-                continue;
-            }
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(SWEPT_NAME_PREFIX)
-            {
-                remove_swept(&candidate);
-                continue;
-            }
-            self.sweep_one(&candidate);
-        }
+        sweep_spill_root_dir(sql_spill_root, Some(&self.dir));
     }
 
     /// Settle, and act on, one sibling spill root's ownership.
+    #[cfg(test)]
     fn sweep_one(&self, candidate: &Path) {
-        self.sweep_one_with(candidate, &mut || {}, &mut || {});
+        sweep_candidate_with(candidate, &mut || {}, &mut || {});
     }
 
-    /// [`Self::sweep_one`], running `after_lock` once the orphan's lock is
-    /// held and before the root is moved away, and `after_release` once the
-    /// lock is released and before the moved tree is deleted: the two points
-    /// where a test puts a peer's `acquire` of the same root.
-    ///
-    /// Ownership is settled and the root removed under one lock hold: the
-    /// root is renamed aside while the lock is held, so its path is free (and
-    /// any `acquire` that opened the old lock file sees it moved) before the
-    /// lock is released, and the renamed tree is deleted afterwards.
+    /// [`sweep_candidate_with`], called the way a sweep holding its own root
+    /// calls it.
+    #[cfg(test)]
     fn sweep_one_with(
         &self,
         candidate: &Path,
         after_lock: &mut dyn FnMut(),
         after_release: &mut dyn FnMut(),
     ) {
-        let lock_path = candidate.join(OWNER_LOCK_FILE_NAME);
-        let lock_file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-        {
-            Ok(file) => file,
-            // Moved away or removed since the listing, by another sweep or by
-            // this one: there is nothing left to settle.
-            Err(_) if !candidate.exists() => return,
+        sweep_candidate_with(candidate, after_lock, after_release);
+    }
+}
+
+/// [`SpillRootOwner::sweep_orphaned_spill_roots`] for a process that holds no
+/// spill root: every root under `<cache_dir>/sql-spill` is a candidate, under
+/// the same rule (removed only once its owner lock is taken here, left and
+/// logged when its ownership cannot be settled). A missing
+/// `<cache_dir>/sql-spill` is nothing to sweep, and is not created.
+pub fn sweep_orphaned_spill_roots_under(cache_dir: &Path) {
+    let sql_spill_root = cache_dir.join(crate::config::SQL_SPILL_SUBDIR);
+    if !sql_spill_root.is_dir() {
+        return;
+    }
+    sweep_spill_root_dir(&sql_spill_root, None);
+}
+
+/// The sweep both entry points run over `sql_spill_root`, skipping `own`.
+fn sweep_spill_root_dir(sql_spill_root: &Path, own: Option<&Path>) {
+    let entries = match std::fs::read_dir(sql_spill_root) {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::warn!(
+                dir = %sql_spill_root.display(),
+                error = %err,
+                "could not list SQL spill roots to sweep"
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
             Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not read a SQL spill root directory entry"
+                );
+                continue;
+            }
+        };
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let candidate = sql_spill_root.join(entry.file_name());
+        if own == Some(candidate.as_path()) {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SWEPT_NAME_PREFIX)
+        {
+            remove_swept(&candidate);
+            continue;
+        }
+        sweep_candidate_with(&candidate, &mut || {}, &mut || {});
+    }
+}
+
+/// Settle, and act on, one spill root's ownership, running `after_lock`
+/// once the orphan's lock is held and before the root is moved away, and
+/// `after_release` once the lock is released and before the moved tree is
+/// deleted: the two points where a test puts a peer's `acquire` of the
+/// same root.
+///
+/// Ownership is settled and the root removed under one lock hold: the
+/// root is renamed aside while the lock is held, so its path is free (and
+/// any `acquire` that opened the old lock file sees it moved) before the
+/// lock is released, and the renamed tree is deleted afterwards.
+fn sweep_candidate_with(
+    candidate: &Path,
+    after_lock: &mut dyn FnMut(),
+    after_release: &mut dyn FnMut(),
+) {
+    let lock_path = candidate.join(OWNER_LOCK_FILE_NAME);
+    let lock_file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        // Moved away or removed since the listing, by another sweep or by
+        // this one: there is nothing left to settle.
+        Err(_) if !candidate.exists() => return,
+        Err(err) => {
+            tracing::warn!(
+                dir = %candidate.display(),
+                error = %err,
+                "cannot prove ownership of this SQL spill root (no readable owner lock); \
+                 leaving it in place"
+            );
+            return;
+        }
+    };
+    match lock_file.try_lock() {
+        Ok(()) => {
+            // A new owner re-created the root after this sweep opened the
+            // old lock file: that root is live, not this one.
+            if !still_names(&lock_file, &lock_path) {
+                return;
+            }
+            after_lock();
+            let Some(parent) = candidate.parent() else {
+                return;
+            };
+            let swept = parent.join(format!(
+                "{SWEPT_NAME_PREFIX}{}-{:016x}-{}",
+                std::process::id(),
+                scratch_nonce(),
+                SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            if let Err(err) = std::fs::rename(candidate, &swept) {
                 tracing::warn!(
                     dir = %candidate.display(),
                     error = %err,
-                    "cannot prove ownership of this SQL spill root (no readable owner lock); \
-                     leaving it in place"
+                    "owner of this SQL spill root is gone, but it could not be moved aside \
+                     for removal; leaving it in place"
                 );
                 return;
             }
-        };
-        match lock_file.try_lock() {
-            Ok(()) => {
-                // A new owner re-created the root after this sweep opened the
-                // old lock file: that root is live, not this one.
-                if !still_names(&lock_file, &lock_path) {
-                    return;
-                }
-                after_lock();
-                let Some(parent) = candidate.parent() else {
-                    return;
-                };
-                let swept = parent.join(format!(
-                    "{SWEPT_NAME_PREFIX}{}-{:016x}-{}",
-                    std::process::id(),
-                    scratch_nonce(),
-                    SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-                ));
-                if let Err(err) = std::fs::rename(candidate, &swept) {
-                    tracing::warn!(
+            drop(lock_file);
+            after_release();
+            match remove_tree(&swept) {
+                Ok(()) => {
+                    tracing::info!(
                         dir = %candidate.display(),
-                        error = %err,
-                        "owner of this SQL spill root is gone, but it could not be moved aside \
-                         for removal; leaving it in place"
+                        "removed orphaned SQL spill root: its owner process is gone"
                     );
-                    return;
                 }
-                drop(lock_file);
-                after_release();
-                match remove_tree(&swept) {
-                    Ok(()) => {
-                        tracing::info!(
-                            dir = %candidate.display(),
-                            "removed orphaned SQL spill root: its owner process is gone"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            dir = %swept.display(),
-                            error = %err,
-                            "owner of this SQL spill root is gone, but it could not be removed"
-                        );
-                    }
+                Err(err) => {
+                    tracing::warn!(
+                        dir = %swept.display(),
+                        error = %err,
+                        "owner of this SQL spill root is gone, but it could not be removed"
+                    );
                 }
             }
-            Err(std::fs::TryLockError::WouldBlock) => {
-                // Owned by a live process. Expected steady state; nothing to log.
-            }
-            Err(std::fs::TryLockError::Error(err)) => {
-                tracing::warn!(
-                    dir = %candidate.display(),
-                    error = %err,
-                    "cannot prove ownership of this SQL spill root; leaving it in place"
-                );
-            }
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {
+            // Owned by a live process. Expected steady state; nothing to log.
+        }
+        Err(std::fs::TryLockError::Error(err)) => {
+            tracing::warn!(
+                dir = %candidate.display(),
+                error = %err,
+                "cannot prove ownership of this SQL spill root; leaving it in place"
+            );
         }
     }
 }
@@ -1279,6 +1312,31 @@ mod tests {
         assert!(
             owner.dir().is_dir(),
             "the sweep must never remove its own root"
+        );
+    }
+
+    /// The owner-free sweep applies the same lock rule to every root under
+    /// `<cache_dir>/sql-spill` (the orphan goes, the live root stays), and on
+    /// a cache dir with no `sql-spill` creates nothing.
+    ///
+    /// FLIP: drop the `is_dir` check in `sweep_orphaned_spill_roots_under`
+    /// for a `create_dir_all` and the empty cache dir gains `sql-spill`;
+    /// replace `sweep_candidate_with` with an unconditional removal and the
+    /// live root is gone.
+    #[test]
+    fn the_owner_free_sweep_keeps_the_lock_rule_and_creates_nothing() {
+        let root = tempfile::tempdir().expect("temp root");
+        let live = SpillRootOwner::acquire(root.path(), "inst-live").expect("acquire");
+        let dead = orphan(root.path(), "inst-dead");
+        sweep_orphaned_spill_roots_under(root.path());
+        assert!(!dead.exists(), "the orphan must be removed");
+        assert!(live.dir().is_dir(), "the live root must survive");
+
+        let empty = tempfile::tempdir().expect("temp root");
+        sweep_orphaned_spill_roots_under(empty.path());
+        assert!(
+            !empty.path().join(crate::config::SQL_SPILL_SUBDIR).exists(),
+            "a cache dir with no spill root must stay without one"
         );
     }
 
