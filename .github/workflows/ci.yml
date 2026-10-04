@@ -1153,6 +1153,50 @@ jobs:
       - name: Test ravel-server --features otap
         run: cargo test --locked -p ravel-server --features otap --lib
 
+  # The whole workspace with every feature of every member on at once (issue
+  # #1925). Each lane above builds one feature set; none builds their union, so
+  # a feature-gated call site that only one combination reaches (ravel-cli
+  # --features stage-timing in #1522) compiled nowhere. Lint only, no tests:
+  # the per-feature lanes above own the test runs, and `clippy --all-targets`
+  # already type-checks every target, so a separate `cargo check` adds nothing.
+  #
+  # Same shape as `features-otap`: its own job-scoped rust-cache key, the
+  # free-disk-space step (the union links arrow, datafusion, arrow-flight,
+  # tonic, pprof and the object_store aws tree into one target dir), and
+  # CARGO_TERM_COLOR never so a grep over the log is not defeated by ANSI codes.
+  #
+  # NOTE: this job is NOT yet a required check. Until main's protect-main
+  # ruleset lists `all-features`, a break here does not block a merge; branch
+  # protection is not edited here.
+  all-features:
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    # 45m, the `features` job's measured budget: this is one compile of the
+    # union of the configurations `features` builds one by one, plus the rest
+    # of the workspace, so `lint`'s 20m (default features, warm cache) is too
+    # small and `features`' cold 28m35s is the closest measured figure.
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/free-disk-space
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup show
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Restore everywhere, save only on main: a cache written on a PR ref
+          # is readable only by that same pull request's later runs, one on a
+          # queue ref by nothing at all, and both die with the ref while
+          # charging the budget that holds the main-scoped entries every run
+          # restores from (#1643).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy --workspace --all-features
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+
   # Supply-chain gate. deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
   # CI job enforced, so a new advisory, banned license, or unknown source
