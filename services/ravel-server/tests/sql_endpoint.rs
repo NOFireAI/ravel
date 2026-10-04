@@ -2427,6 +2427,59 @@ async fn accept_arrow_stream_returns_a_bit_exact_ipc_stream() {
     assert_eq!(values, vec![payload.to_bits(), (-0.0f64).to_bits()]);
 }
 
+/// Issue #2514: a valid query whose result the JSON encoding cannot hold (a
+/// `Date64` that is not a whole day has no `YYYY-MM-DD` form) is a client
+/// error, 422 `execution`, whose message names the column and its type and
+/// points at Arrow IPC, never the value. The same query read as Arrow IPC
+/// succeeds and carries the value exactly.
+#[tokio::test]
+async fn a_result_json_cannot_encode_is_422_naming_the_column_and_arrow_ipc_reads_it() {
+    use arrow::array::{Array, Date64Array};
+    use arrow::ipc::reader::StreamReader;
+
+    const MILLIS: i64 = 1_700_000_000_123;
+    let app = one_tenant_app("m", &[(1, 1.0)]).await;
+    let query = format!("SELECT arrow_cast({MILLIS}, 'Date64') AS d FROM samples LIMIT 1");
+
+    let (status, value) = post_json(&app, "acme-token", &query).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+    assert!(status.is_client_error());
+    assert_eq!(value["errorType"], "execution", "{value}");
+    let message = value["error"].as_str().expect("error message");
+    assert_eq!(
+        message,
+        "column \"d\" of type Date64 cannot be encoded as JSON: a JSON date must be a whole \
+         day from 0000-01-01 to 9999-12-31; request the Arrow IPC format to read it exactly"
+    );
+    assert!(
+        !message.contains(&MILLIS.to_string()),
+        "the message must not carry the value: {message}"
+    );
+
+    let (status, bytes) = post(
+        &app,
+        Some("acme-token"),
+        Some(ARROW_STREAM_MEDIA_TYPE),
+        body(&query),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let reader = StreamReader::try_new(bytes.as_slice(), None).expect("ipc reader");
+    let mut values = Vec::new();
+    for batch in reader {
+        let batch = batch.expect("batch");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Date64Array>()
+            .expect("Date64 column");
+        for i in 0..col.len() {
+            values.push(col.value(i));
+        }
+    }
+    assert_eq!(values, vec![MILLIS]);
+}
+
 #[tokio::test]
 async fn an_unauthenticated_request_is_rejected() {
     let app = one_tenant_app("m", &[(1, 1.0)]).await;

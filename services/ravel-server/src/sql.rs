@@ -773,6 +773,18 @@ mod tests {
                 "execution",
             ),
             (
+                // A valid query whose result the JSON encoding cannot hold
+                // (issue #2514): the caller's choice of encoding, answered
+                // like a plan error, never a 500 and never a 400.
+                SqlError::UnencodableResult {
+                    column: "d".to_string(),
+                    data_type: "Date64".to_string(),
+                    reason: "a JSON date must be a whole day from 0000-01-01 to 9999-12-31",
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+            ),
+            (
                 // The structural-complexity rejection (issue #1680) is a bad
                 // request like every other validation refusal, not a 413 and
                 // not a 422: the statement is malformed for this endpoint, and
