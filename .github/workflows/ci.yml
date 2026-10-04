@@ -823,11 +823,21 @@ jobs:
       - name: Clippy (flight-sql feature)
         run: cargo clippy --locked -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings
 
-  check:
+  # The workspace test run, split across four runners (issue #2518). The test
+  # phase is CPU-bound: 9,483 tests summed to 2,374 CPU-seconds and took 641 s
+  # on a four-core runner, so more runners is the only way to shorten it
+  # without dropping a test. Each leg builds the workspace itself and runs the
+  # tests nextest's hash partition assigns it; the partitions are disjoint and
+  # together cover every test. The required check is the `check` job below.
+  check-shard:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -859,21 +869,65 @@ jobs:
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Every leg builds the same thing, so they share one entry, under
+          # the name the unsplit job saved it as.
+          shared-key: check
+      # The denominator is the number of matrix entries, taken from the
+      # strategy so it cannot drift from the list: a larger one would leave a
+      # partition that no leg runs.
       - name: Test
-        run: cargo nextest run --locked --workspace --cargo-profile ci
-      # nextest does not run doctests; keep them covered separately. Same
+        run: cargo nextest run --locked --workspace --cargo-profile ci --partition hash:${{ matrix.shard }}/${{ strategy.job-total }}
+      # nextest does not run doctests; keep them covered separately, in one
+      # leg, since they are not partitioned. Same
       # `ci` profile as the step above (ADR-0053 D4, and what scripts/gates.sh
       # has always run): on the default profile this is a second target
       # subtree and so a second build of the workspace inside one job.
       # profile.ci inherits dev, so debug_assertions and overflow checks are
       # unchanged and only debug info is dropped.
       - name: Doctests
+        if: matrix.shard == 1
         run: cargo test --locked --doc --profile ci --workspace
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
         with:
           phase: report
+
+  # The required check for the matrix above, under the name main's
+  # protect-main ruleset lists. Same shape as `features`: it runs whatever the
+  # matrix did, because a skipped required check passes.
+  check:
+    needs: [changes, check-shard]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Decide the workspace test run
+        env:
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SHARDS_RESULT: ${{ needs.check-shard.result }}
+        run: |
+          echo "docs_only=$DOCS_ONLY changes=$CHANGES_RESULT check-shard=$SHARDS_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES_RESULT); the test run cannot be judged"
+            exit 1
+          fi
+          if [ "$DOCS_ONLY" = "true" ]; then
+            # A docs-only change. The matrix is expected to have skipped; any
+            # other result means the gating itself is wrong.
+            if [ "$SHARDS_RESULT" != "skipped" ]; then
+              echo "::error::docs_only is true but check-shard reported $SHARDS_RESULT"
+              exit 1
+            fi
+            echo "docs-only change; the workspace test run does not apply"
+            exit 0
+          fi
+          if [ "$SHARDS_RESULT" != "success" ]; then
+            echo "::error::check-shard reported $SHARDS_RESULT; the workspace test run is not green"
+            exit 1
+          fi
+          echo "every shard passed"
 
   # The SQL surface. Two things the `check` job cannot
   # cover:
