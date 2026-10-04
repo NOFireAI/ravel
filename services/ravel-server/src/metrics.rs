@@ -521,7 +521,8 @@ impl AllocatorStat {
 /// same budget (the PromQL, fragment and cache-warm `SegmentFetcher` and
 /// `LogSegmentFetcher` instances, and the three fetchers `build_sql_state`
 /// constructs, RSPAN included, through the RAII `reserve`/`Reservation`
-/// API).
+/// API), which the Parquet footer reads of `CREATE EXTERNAL TABLE` also
+/// reserve through.
 /// `ravel_memory::MemoryBudget` tracks the fetch share in its own counter, so
 /// the two never double-count (see [`Label::MemoryComponent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2821,7 +2822,9 @@ fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
 ///
 /// `ravel_memory_reserved_bytes{component="fetch"}` is
 /// `MemoryBudget::fetch_reserved()`: bytes currently held by a live
-/// `ravel_memory::Reservation` (`ravel-query`'s fetchers). `component="sql"`
+/// `ravel_memory::Reservation` (`ravel-query`'s fetchers, and the Parquet
+/// footer reads `ravel-parquet`'s `snapshot_location` makes for
+/// `CREATE EXTERNAL TABLE`). `component="sql"`
 /// is `MemoryBudget::sql_reserved()`, the total minus the fetch share, i.e.
 /// `TenantMemoryAccountant`'s raw-counter reservations -- never the whole
 /// budget total, so the two samples never double-count each other. Both
