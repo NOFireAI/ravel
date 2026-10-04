@@ -1681,7 +1681,9 @@ pub struct Cli {
     /// `ravel_ingest_queued_flushes`, both by `{mode, signal}`.
     /// Nothing is acked and nothing is dropped, so a refusal is a deferral,
     /// not a shed. A deferral is backed by the flush deferral cap, the 2 h
-    /// read-side scan slack less `max_flush_lifetime`, the slowest flush
+    /// flush slack (the flush-timing part of the 3 h read-side scan slack,
+    /// which adds one hour of clock skew) less `max_flush_lifetime`, the
+    /// slowest flush
     /// trigger (the largest of `--max-flush-delay`, `--max-flush-delay-idle`
     /// and, under `--adaptive-flush-delay`, the adaptive corridor's widest
     /// ceiling) and one flush tick (3559.8 s at the defaults): once a shard's
