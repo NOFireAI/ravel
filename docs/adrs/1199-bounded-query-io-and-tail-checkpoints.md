@@ -109,9 +109,9 @@ cannot distinguish them.
 
 They are not otherwise interchangeable, and the difference matters for what
 decision 1 records. The bounded path issues its per-shard LISTs concurrently
-under the resolve-wide semaphore (`catalog.rs:1917-1921`); the prefix path
-drains them sequentially so the runtime request cap is checked page by page
-(`catalog.rs:2379-2382`; retired, see the concurrent prefix listing amendment
+under the resolve-wide semaphore (`Catalog::list_window_bounded`); the prefix
+path drains them sequentially so the runtime request cap is checked page by page
+(`Catalog::list_shard_by_prefix`; retired, see the concurrent prefix listing amendment
 below). Equal request counts, different latency, and different serial depth:
 on the bounded path the serial LIST depth is the maximum page count over
 shards, while on the prefix path it is their sum. A

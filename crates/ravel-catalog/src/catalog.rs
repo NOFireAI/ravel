@@ -3706,6 +3706,9 @@ impl Catalog {
                     .store
                     .list_after(prefix_ref, start_after.as_deref(), page_token)
                     .await;
+                // Accounted when the page returns, so a page still in flight
+                // when a peer shard's refusal or error drops this future is
+                // issued to the store and not counted.
                 accounting.record_s3_request(AccountedOp::List);
                 Ok(page?)
             },
