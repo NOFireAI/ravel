@@ -130,16 +130,21 @@ with one array per row under `data.rows`. A non-finite float comes back as a
 string: `NaN`, `+Inf`, and `-Inf`. Other column types are encoded as follows:
 
 - every integer width is a JSON number;
+- `Float16` is widened to a 64-bit float and follows the float rule above,
+  including the `NaN`, `+Inf` and `-Inf` strings;
 - a timestamp of any unit is an integer count of nanoseconds since the
   epoch, with its time zone dropped (a value past 2^53 needs a client that
   parses JSON integers exactly, which a JavaScript `JSON.parse` does not);
+- a `Time32` or `Time64` of any unit is an integer count of nanoseconds
+  since midnight;
 - `Date32` and `Date64` are `YYYY-MM-DD` strings;
-- `Decimal128` is a string holding its exact decimal text;
+- `Decimal128` and `Decimal256` are strings holding their exact decimal text;
 - binary columns are lowercase hex strings.
 
 A column whose type or value has no JSON encoding (a type with no rule above,
-a timestamp past the i64 nanosecond range, a date outside years 0000 to 9999,
-or a `Date64` that is not a whole day) fails the query with 500 `internal` and
+a timestamp past the i64 nanosecond range, a time that is negative or a whole
+day or more, a date outside years 0000 to 9999, or a `Date64` that is not a
+whole day) fails the query with 500 `internal` and
 the fixed internal message; the server logs the column type and value at
 `warn`. Sending `Accept: application/vnd.apache.arrow.stream` yields an Arrow
 IPC stream instead, which is bit-exact for every type. The SQL surface
