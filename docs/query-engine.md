@@ -1980,8 +1980,21 @@ correctly-computed zero-in-window count) is dropped before it reaches
 absence-of-output-sample contract the raw path already has.
 
 This is the engine-level (queryfrag) fetch, merge, and federation machinery for
-all five signals, shipped and covered by the per-signal differential, erasure,
-skew, and federation tests. The coordinator caller that actually dispatches a
+all five signals. For metrics it is the production path. For logs, alerts,
+audit, and spans the worker serves slices, but production never decodes one:
+no production caller dispatches a log or span slice fetch, the `SliceFetcher`
+defaults for `fetch_logs` and `fetch_spans` answer `Unsupported`, and
+`RemoteSliceFetcher` overrides only the metrics `fetch`, so a log or span query
+in this lane runs locally and never becomes a slice. The test module drives the
+log and span fan-out end to end over an in-process loopback worker, decoding
+the frames with test-only decoders under the same per-slice frame and
+wire-byte caps the metrics decoder enforces; that is where the per-signal
+differential and erasure tests run (the federation tests live in the
+federation module over stub fetchers, and the skew test is metrics-only). A
+production override
+of either fetch has to decode the worker's frames incrementally under those
+caps, so a remote cannot decide how much the coordinator buffers. The
+coordinator caller that actually dispatches a
 Alerts/Audit/Spans distributed *search* is the SQL surface (trace search runs
 through the `alerts`/`audit`/`spans` tables, not PromQL); logs are reachable
 both ways, through the `logs` SQL table and, since ADR-1103, through the
@@ -2032,13 +2045,23 @@ slices):
   exercises with at least one generated case placing one stream's or trace's
   segments in two slices.
 
-Erasure is applied worker-side, per segment, through the same funnel the local
-path uses (`retain_series_soa` for metrics, `LogQuery` erasure for the RLOG
-family, `is_erased_span` for spans); the coordinator never re-applies it.
-Because each segment is self-contained, a resource-attribute-only exclusion
-evaluates identically wherever the segment is read, including when one stream's
-segments straddle two slices, proven by an erasure property test that diffs a
-distributed slice set against a local read of the same segments.
+The worker applies erasure per segment, before it streams, through the same
+fetch-level calls the local path makes. For metrics that is `retain_series_soa`
+(and `retain_histogram_series` for native histograms), and for spans
+`is_erased_span` over the span's merged attributes; both are the complete rule
+for their signal. For the RLOG family it is the fetcher-level pre-filter
+`retain_log_records`, threaded in through `LogQuery` erasure, which matches
+per-record attributes only. The authoritative log exclusion,
+`retain_unerased_log_records` over the merged resource, scope, and record view,
+is not part of the fetch on either path: it runs in every reader that hands log
+records to a caller (the `logs`, `alerts`, and `audit` table scans and the
+export path). A record erased only through a resource or scope attribute can
+therefore cross the slice boundary; the reader's scan layer drops it before any
+caller sees it. The pre-filter is per record, so it filters a stream whose
+segments straddle two slices the same way in each. The worker-side erasure
+tests diff a distributed slice set against a local read of the same segments
+under the same predicates: they prove the two fetch paths agree, not that the
+worker applies the authoritative rule, which it does not.
 
 ### The SQL-lane distributed scan (logs, alerts, audit, spans)
 
