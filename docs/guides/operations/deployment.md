@@ -332,6 +332,10 @@ operator credential rather than a service credential:
   running process should hold it.
 - Six `ravel-cli` commands take the Maintain credential instead:
   `parquet sweep`, which deletes superseded Parquet table manifests;
+  `parquet repair --delete` and `--delete-version`, which delete forged
+  Parquet table manifest keys: those above the version bound or naming no
+  version, and one named version an operator has judged forged (see
+  [repairing a forged Parquet table version](maintenance.md#repairing-a-forged-parquet-table-version));
   `maintain compact-bucket` and `maintain compact-tenant`, which take
   compaction claims under `sys/maintain/claims/compaction/` and write L1
   segments and compaction records; `maintain migrate`, which rewrites L1

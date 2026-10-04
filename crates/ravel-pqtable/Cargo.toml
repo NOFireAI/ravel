@@ -16,6 +16,7 @@ hex = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
@@ -23,6 +24,7 @@ blake3 = { workspace = true }
 object_store = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

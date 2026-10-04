@@ -223,6 +223,7 @@ pub enum DdlExecuteError {
     /// [`WriteError::RetriesExhausted`] are retryable storage contention
     /// (503-class); the remaining variants
     /// ([`WriteError::EmptyFileList`], [`WriteError::NoPutBudget`],
+    /// [`WriteError::VersionAboveBound`],
     /// [`WriteError::VersionOverflow`], [`WriteError::Manifest`],
     /// [`WriteError::Key`], [`WriteError::Name`]) are a malformed or
     /// internally inconsistent write (422/500-class; see
@@ -506,8 +507,9 @@ fn snapshot_error_class(err: &SnapshotError) -> DdlErrorClass {
 /// compare-and-swap retry is retryable (503); a version that has no
 /// successor, a corrupt or newer-format manifest, a misfiled object under
 /// the table prefix, or a malformed key or table name is a permanent data
-/// fault (500); an empty file list or an unusable grace budget is a
-/// well-formed statement this write refuses (422).
+/// fault (500); an empty file list, an unusable grace budget, or a next
+/// version above the manifest version bound is a well-formed statement this
+/// write refuses (422).
 fn write_error_class(err: &WriteError) -> DdlErrorClass {
     match err {
         WriteError::TableExists { .. } => DdlErrorClass::Conflict,
@@ -523,9 +525,9 @@ fn write_error_class(err: &WriteError) -> DdlErrorClass {
         WriteError::Store { .. } | WriteError::RetriesExhausted { .. } => {
             DdlErrorClass::Unavailable
         }
-        WriteError::EmptyFileList { .. } | WriteError::NoPutBudget { .. } => {
-            DdlErrorClass::Unsupported
-        }
+        WriteError::EmptyFileList { .. }
+        | WriteError::NoPutBudget { .. }
+        | WriteError::VersionAboveBound { .. } => DdlErrorClass::Unsupported,
         WriteError::VersionOverflow { .. }
         | WriteError::Manifest(_)
         | WriteError::Key(_)
@@ -1471,6 +1473,22 @@ mod tests {
         ] {
             assert_eq!(write_error_class(&err), DdlErrorClass::Unsupported, "{err}");
         }
+    }
+
+    // A refused statement, not a server fault, and the client sees the table,
+    // the version and the bound.
+    #[test]
+    fn write_version_above_bound_is_unsupported_and_names_table_version_and_bound() {
+        let err = DdlExecuteError::Write(WriteError::VersionAboveBound {
+            table: "hits".to_string(),
+            version: 4_294_967_297,
+            bound: 4_294_967_296,
+        });
+        assert_eq!(err.class(), DdlErrorClass::Unsupported);
+        let message = err.client_message();
+        assert!(message.contains("\"hits\""), "{message}");
+        assert!(message.contains("4294967297"), "{message}");
+        assert!(message.contains("4294967296"), "{message}");
     }
 
     #[test]

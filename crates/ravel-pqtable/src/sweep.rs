@@ -19,7 +19,11 @@
 //! every version committed after the writer's resolve is too young for a
 //! sweep to free the key the put targets. [`plan`] only ever selects a version that has a
 //! successor in the same listing, so it does not select a table's newest
-//! version, dropped or live, which the next writer numbers from.
+//! version, dropped or live, which the next writer numbers from. Versions
+//! above [`MAX_MANIFEST_VERSION`] are left out of that pairing, and so are
+//! `.pqm` keys whose 20 characters name no version, which the listing skips
+//! and counts as [`crate::resolve::versions`] does: none is a table's newest,
+//! so none counts as a successor, and none is deleted here.
 //!
 //! [`plan`] refuses a grace below the deployment's minimum (its
 //! `--gc-max-query-duration`). Ages come from the store's
@@ -33,7 +37,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use ravel_object_store::{ObjectMeta, ObjectStoreBackend, StoreError, list_all};
 use ravel_types::TenantHash;
 
-use crate::keys::{KeyError, parse_manifest_key, tenant_manifest_prefix};
+use crate::keys::{
+    KeyError, ListedManifestKey, MAX_MANIFEST_VERSION, parse_listed_manifest_key,
+    tenant_manifest_prefix,
+};
+use crate::resolve;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SweepError {
@@ -84,12 +92,15 @@ fn foreign(key: &str, prefix: &str, reason: impl ToString) -> SweepError {
     }
 }
 
+/// One table's manifest versions with their listing metadata.
+type Versions = Vec<(u64, ObjectMeta)>;
+
 /// Every manifest version of `tenant`, grouped by table, ascending. The only
 /// LIST a sweep issues, and it is scoped to the manifest prefix.
 async fn manifests_by_table(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
-) -> Result<BTreeMap<String, Vec<(u64, ObjectMeta)>>, SweepError> {
+) -> Result<BTreeMap<String, Versions>, SweepError> {
     let prefix = tenant_manifest_prefix(tenant);
     let listed = list_all(store, &prefix)
         .await
@@ -97,22 +108,46 @@ async fn manifests_by_table(
             key: prefix.clone(),
             source,
         })?;
-    let mut tables: BTreeMap<String, Vec<(u64, ObjectMeta)>> = BTreeMap::new();
+    // Per table: its versions, and the version characters of its keys that
+    // name no version.
+    let mut tables: BTreeMap<String, (Versions, Vec<String>)> = BTreeMap::new();
     for meta in listed {
-        let parsed = parse_manifest_key(&meta.key).map_err(|e| foreign(&meta.key, &prefix, e))?;
-        if parsed.tenant_hash != *tenant {
-            return Err(foreign(&meta.key, &prefix, "belongs to another tenant"));
+        match parse_listed_manifest_key(&meta.key).map_err(|e| foreign(&meta.key, &prefix, e))? {
+            ListedManifestKey::Version(parsed) => {
+                if parsed.tenant_hash != *tenant {
+                    return Err(foreign(&meta.key, &prefix, "belongs to another tenant"));
+                }
+                tables
+                    .entry(parsed.table)
+                    .or_default()
+                    .0
+                    .push((parsed.version, meta));
+            }
+            ListedManifestKey::InvalidVersion {
+                tenant_hash,
+                table,
+                slot,
+                ..
+            } => {
+                if tenant_hash != *tenant {
+                    return Err(foreign(&meta.key, &prefix, "belongs to another tenant"));
+                }
+                tables.entry(table).or_default().1.push(slot);
+            }
         }
-        tables
-            .entry(parsed.table)
-            .or_default()
-            .push((parsed.version, meta));
     }
-    for versions in tables.values_mut() {
-        versions.sort_by_key(|(v, _)| *v);
-        versions.dedup_by_key(|(v, _)| *v);
-    }
-    Ok(tables)
+    Ok(tables
+        .into_iter()
+        .map(|(table, (mut versions, mut slots))| {
+            versions.sort_by_key(|(v, _)| *v);
+            versions.dedup_by_key(|(v, _)| *v);
+            slots.sort_unstable();
+            slots.dedup();
+            let numbers: Vec<u64> = versions.iter().map(|(v, _)| *v).collect();
+            resolve::note_unresolvable(tenant, &table, &numbers, &slots);
+            (table, versions)
+        })
+        .collect())
 }
 
 /// Decide what a sweep of `tenant` at `now_ms` deletes. Reads no manifest
@@ -133,7 +168,11 @@ pub async fn plan(
     let tables = manifests_by_table(store, tenant).await?;
     let mut manifest_deletes = BTreeSet::new();
     for versions in tables.values() {
-        for pair in versions.windows(2) {
+        // A version above the bound is never a table's newest
+        // (`resolve::newest`), so it supersedes nothing and is left for
+        // `crate::repair`.
+        let bounded = &versions[..versions.partition_point(|(v, _)| *v <= MAX_MANIFEST_VERSION)];
+        for pair in bounded.windows(2) {
             let (older, successor) = (&pair[0].1, &pair[1].1);
             if past_grace(now_ms, successor.last_modified_unix_ms, grace_ms) {
                 manifest_deletes.insert(older.key.clone());
@@ -177,8 +216,9 @@ mod tests {
     use super::*;
     use crate::clock::FixedClock;
     use crate::keys::{grants_key, manifest_key};
+    use crate::manifest::encode_manifest;
     use crate::resolve;
-    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, file_for};
+    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, file_for, live_manifest};
     use crate::writer::{Intent, Outcome, apply};
 
     const GRACE: u64 = 660_000;
@@ -319,6 +359,110 @@ mod tests {
                 .expect("plan"),
             SweepPlan::default()
         );
+    }
+
+    #[tokio::test]
+    async fn a_version_above_the_bound_never_supersedes_the_newest() {
+        // Without the bound, the forged versions are v1's successors, and v1
+        // (the table's only legitimate version) is deleted once they age.
+        let store = MemoryStore::new();
+        store.set_clock_ms(0);
+        assert_eq!(commit(&store, "hits", create(&[1])).await, 1);
+        store.set_clock_ms(1_000);
+        for v in [MAX_MANIFEST_VERSION + 1, u64::MAX] {
+            let bytes =
+                encode_manifest(&TENANT_A, &live_manifest("hits", v, &[9])).expect("encode");
+            store
+                .put(
+                    &mkey("hits", v),
+                    Bytes::from(bytes),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put");
+        }
+        let now = (1_001 + GRACE + SKEW_MS) as i64;
+        assert_eq!(
+            plan(&store, &TENANT_A, now, GRACE, GRACE)
+                .await
+                .expect("plan"),
+            SweepPlan::default()
+        );
+
+        // A legitimate successor still supersedes v1; the forged versions
+        // are neither successors nor deleted.
+        assert_eq!(commit(&store, "hits", create(&[2])).await, 2);
+        assert_eq!(
+            plan(&store, &TENANT_A, now, GRACE, GRACE)
+                .await
+                .expect("plan"),
+            SweepPlan {
+                manifest_deletes: vec![mkey("hits", 1)]
+            }
+        );
+
+        // A version exactly at the bound is inside it: it supersedes v2, and
+        // as the newest it is kept.
+        let bytes = encode_manifest(
+            &TENANT_A,
+            &live_manifest("hits", MAX_MANIFEST_VERSION, &[3]),
+        )
+        .expect("encode");
+        store
+            .put(
+                &mkey("hits", MAX_MANIFEST_VERSION),
+                Bytes::from(bytes),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("put");
+        assert_eq!(
+            plan(&store, &TENANT_A, now, GRACE, GRACE)
+                .await
+                .expect("plan"),
+            SweepPlan {
+                manifest_deletes: vec![mkey("hits", 1), mkey("hits", 2)]
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_naming_no_version_is_skipped_by_the_sweep_listing_and_counted() {
+        use crate::resolve::tests::{INVALID_SLOTS, capture_logs, put_invalid, warnings_naming};
+
+        for (i, slot) in INVALID_SLOTS.iter().enumerate() {
+            let tenant = TenantHash([0x47 + i as u8; 16]);
+            let (logs, _guard) = capture_logs();
+            let store = MemoryStore::with_page_size(2);
+            store.set_clock_ms(0);
+            for v in [1, 2] {
+                let bytes =
+                    encode_manifest(&tenant, &live_manifest("hits", v, &[1])).expect("encode");
+                store
+                    .put(
+                        &manifest_key(&tenant, "hits", v).expect("key"),
+                        Bytes::from(bytes),
+                        PutOptions::create_if_absent(),
+                    )
+                    .await
+                    .expect("put");
+            }
+            put_invalid(&store, &tenant, slot).await;
+            let now = (1 + GRACE + SKEW_MS) as i64;
+            for _ in 0..2 {
+                assert_eq!(
+                    plan(&store, &tenant, now, GRACE, GRACE)
+                        .await
+                        .expect("plan"),
+                    SweepPlan {
+                        manifest_deletes: vec![manifest_key(&tenant, "hits", 1).expect("key")]
+                    },
+                    "{slot}"
+                );
+            }
+            assert_eq!(resolve::above_bound_resolves(&tenant, "hits"), 2, "{slot}");
+            assert_eq!(warnings_naming(&logs, slot), 1, "{slot}");
+        }
     }
 
     #[tokio::test]
