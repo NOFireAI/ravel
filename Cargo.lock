@@ -4922,6 +4922,7 @@ dependencies = [
  "proptest",
  "prost",
  "ravel-codec",
+ "ravel-logseg",
  "ravel-proto",
  "ravel-types",
  "stats_alloc",

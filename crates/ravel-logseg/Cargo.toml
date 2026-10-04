@@ -21,6 +21,19 @@ stage-timing = []
 # reader's refusal can be exercised. Off by default; only dev-dependencies may
 # enable it, never a production crate.
 test-support = []
+# Reference-only row builder (ADR-2467 decision 3; issue #2564). Off by
+# default: production encode of row input goes through the columnar builder
+# (`build_object_columnar`) unconditionally, and `build_object`/`resolve_row`/
+# `ResolvedRow`/`write_block`/`row_column`/`winner_value`/`chunk_blocks`/
+# `row_estimate`/`permute` would otherwise be dead code with the row path gone
+# from every production caller. On, `RlogWriter::finish_row_reference[_with_stats]`
+# builds through the row path directly, for the differential tests that hold
+# the two builders to the same bytes. Enabled via a self dev-dependency below
+# so `cargo test`/`cargo bench` in this crate see it without an explicit
+# `--features` flag; `ravel-sql`'s dev-dependencies and `ravel-bench`'s regular
+# dependency on this crate enable it the same way for their own row-reference
+# call sites. No shipped binary enables it.
+row-reference = []
 
 [dependencies]
 bytes = { workspace = true }
@@ -34,6 +47,20 @@ blake3 = { workspace = true }
 prost = { workspace = true }
 
 [dev-dependencies]
+# Self dev-dependency to turn on `row-reference` for this crate's own tests and
+# benches without an explicit `--features` flag on every `cargo test`/`cargo
+# bench` invocation: cargo unifies features across the dependency graph of one
+# build, so a dev-only edge back onto the same crate with the feature set
+# switches it on for `cfg(test)` and the `[[bench]]`/`[[test]]` targets alike,
+# while leaving the feature off for anything depending on the library target
+# (`ravel-logseg = { workspace = true }` elsewhere never requests it, so a
+# `cargo build -p ravel-logseg` or any shipped binary's own feature set is
+# unaffected). `required-features` was the alternative; it was not used here
+# because it only gates whether a target compiles given features already
+# requested on the command line, so `cargo test -p ravel-logseg` would still
+# need an explicit `--features row-reference` to run the gated tests, exactly
+# the manual step this is meant to remove.
+ravel-logseg = { path = ".", features = ["row-reference"] }
 proptest = { workspace = true }
 criterion = { workspace = true }
 # Peak-live-bytes measurement for the columnar writer memory test. Pinned to

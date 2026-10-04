@@ -21,9 +21,11 @@ use crate::error::LogSegError;
 use crate::page::{PageDesc, SealedPage, seal_page, smallest_stored};
 use crate::record::{
     COL_ATTRS_RAW, COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT,
-    COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS, ColumnValue, FieldType, ResolvedRow,
-    SPAN_ID_WIDTH, TRACE_ID_WIDTH,
+    COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS, ColumnValue, FieldType, SPAN_ID_WIDTH,
+    TRACE_ID_WIDTH,
 };
+#[cfg(feature = "row-reference")]
+use crate::record::ResolvedRow;
 use crate::rlog_codec::{
     StrShape, decode_column_ref, decode_dict_ids, decode_gcd_i64, encode_column_ref,
     i64_candidates, shape_candidates, string_dict_shape, string_shape,
@@ -399,6 +401,7 @@ fn bool_stat(column_id: u32, vals: &[Option<bool>]) -> NumStat {
 /// [`BlockWriteOut::payload`], are not in `column_id` order. Version 4's block
 /// crc is defined over the pages in `column_id` order and is computed while the
 /// row group is placed, not from the payload (ADR-0699 decision 2).
+#[cfg(feature = "row-reference")]
 pub fn write_block(
     rows: &[ResolvedRow],
     plans: &[ColumnPlan],
@@ -554,6 +557,7 @@ pub fn write_block(
     })
 }
 
+#[cfg(feature = "row-reference")]
 fn row_column(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
     row.columns
         .iter()
@@ -570,6 +574,7 @@ fn row_column(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
 /// "the row resolves no value for this name" and "the row resolves one but of a
 /// different type, so a reader materializing this typed column produces NULL
 /// for this row".
+#[cfg(feature = "row-reference")]
 fn winner_value(row: &ResolvedRow, column_id: u32) -> Option<&ColumnValue> {
     row.stat_winners
         .iter()

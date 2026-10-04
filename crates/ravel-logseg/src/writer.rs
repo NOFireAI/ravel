@@ -15,9 +15,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use ravel_types::logstream::{AttrValue, LogStreamId, canonical_attr_bytes};
 
 use crate::block::{
-    BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput, write_block,
+    BlockStrDict, BlockStrValues, BlockWriteOut, ColumnPlan, ColumnarBlockInput,
     write_block_columnar,
 };
+#[cfg(feature = "row-reference")]
+use crate::block::write_block;
 use crate::bloom::BloomBuilder;
 use crate::columnar_batch::ColumnarLogBatch;
 use crate::encoding::Enc;
@@ -32,9 +34,11 @@ use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
 use crate::reader::stream_attr_pairs;
 use crate::record::{
-    COL_BODY, COL_SEVERITY_TEXT, ColumnValue, FIRST_DYNAMIC_COL, FieldType, LogRecord, ResolvedRow,
+    COL_BODY, COL_SEVERITY_TEXT, ColumnValue, FIRST_DYNAMIC_COL, FieldType, LogRecord,
     canonical_value_bytes, resolve_value,
 };
+#[cfg(feature = "row-reference")]
+use crate::record::ResolvedRow;
 use crate::rlog_bloom::encode_rlog_bloom_section;
 use crate::rlog_codec::{MAX_DICT_ENTRIES, encode_dict_ids, encode_dict_page};
 use crate::skip_index::{Level0Entry, SkipIndex};
@@ -333,6 +337,27 @@ impl RlogWriter {
         self.build(0, Vec::new(), 0, layout)
     }
 
+    /// Reference-only (ADR-2467 decision 3): builds the object through the row
+    /// builder ([`RlogWriter::build_object`]) directly, bypassing
+    /// [`RlogWriter::build`]'s routing. Never reached on a production path --
+    /// `row-reference` is off by default precisely so nothing ships it. Exists
+    /// for the differential tests that hold the row and columnar builders to
+    /// the same bytes now that `finish`/`finish_with_stats` no longer reach
+    /// `build_object` for row input.
+    #[cfg(feature = "row-reference")]
+    pub fn finish_row_reference(self) -> Result<Vec<u8>, LogSegError> {
+        self.finish_row_reference_with_stats().map(|(bytes, _)| bytes)
+    }
+
+    /// Like [`RlogWriter::finish_row_reference`], but also returns counters
+    /// ([`WriteStats`]) not otherwise recoverable from the object bytes.
+    #[cfg(feature = "row-reference")]
+    pub fn finish_row_reference_with_stats(self) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        let cluster = self.cluster_for_build()?;
+        let layout = self.layout();
+        self.build_object(0, Vec::new(), 0, layout, cluster)
+    }
+
     /// The row-group layout this writer's configuration asks for.
     fn layout(&self) -> Layout {
         Layout {
@@ -340,6 +365,27 @@ impl RlogWriter {
             zstd_level: self.cfg.zstd_level,
             dict_budget: self.cfg.block_max_bytes,
         }
+    }
+
+    /// The clustered row order `build_object`/`build_object_columnar` sort
+    /// into, plus the one config check that has to happen before either
+    /// builder assigns a column id. Shared by [`RlogWriter::build`] and
+    /// [`RlogWriter::finish_row_reference_with_stats`] so the two entry
+    /// points refuse an over-budget config and an invalid sort descriptor
+    /// identically.
+    fn cluster_for_build(&self) -> Result<Option<ClusterOrder>, LogSegError> {
+        // A config whose dynamic-column budget could assign an id past the
+        // decoder's cap writes objects that cannot be read back. Refuse it here,
+        // before any column is assigned, against the same shared cap the decoder
+        // enforces ([`MAX_DYNAMIC_COLUMNS`]), rather than letting the mismatch
+        // surface at read time as an object nothing can decode.
+        if self.cfg.max_dynamic_columns as u64 > MAX_DYNAMIC_COLUMNS {
+            return Err(LogSegError::LimitExceeded(format!(
+                "max_dynamic_columns {} exceeds {MAX_DYNAMIC_COLUMNS}, the most the decoder can read back",
+                self.cfg.max_dynamic_columns
+            )));
+        }
+        cluster_order(self.sort_descriptor.as_ref(), self.clustering_generation)
     }
 
     /// Routes to the row or columnar build pipeline. A writer is one or the
@@ -352,8 +398,8 @@ impl RlogWriter {
     /// builder (`build_object`) is reference-only behind the `row-reference`
     /// feature from here on, and every production encode of row input goes
     /// through the columnar builder instead. An empty writer (no records, no
-    /// batches) still reaches `build_object`'s empty-object check below, so
-    /// the `LimitExceeded("empty object")` refusal is unchanged.
+    /// batches) still reaches `build_object_columnar`'s empty-object check
+    /// below, so the `LimitExceeded("empty object")` refusal is unchanged.
     fn build(
         mut self,
         level: u32,
@@ -361,18 +407,7 @@ impl RlogWriter {
         part_index: u32,
         layout: Layout,
     ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
-        // A config whose dynamic-column budget could assign an id past the
-        // decoder's cap writes objects that cannot be read back. Refuse it here,
-        // before any column is assigned, against the same shared cap the decoder
-        // enforces ([`MAX_DYNAMIC_COLUMNS`]), rather than letting the mismatch
-        // surface at read time as an object nothing can decode.
-        if self.cfg.max_dynamic_columns as u64 > MAX_DYNAMIC_COLUMNS {
-            return Err(LogSegError::LimitExceeded(format!(
-                "max_dynamic_columns {} exceeds {MAX_DYNAMIC_COLUMNS}, the most the decoder can read back",
-                self.cfg.max_dynamic_columns
-            )));
-        }
-        let cluster = cluster_order(self.sort_descriptor.as_ref(), self.clustering_generation)?;
+        let cluster = self.cluster_for_build()?;
         if !self.records.is_empty() && self.batches.is_empty() {
             let records = std::mem::take(&mut self.records);
             let batch = ColumnarLogBatch::fold_records(&records)?;
@@ -380,10 +415,13 @@ impl RlogWriter {
             batch.validate()?;
             self.batches = vec![batch];
         }
-        if !self.batches.is_empty() {
-            return self.build_object_columnar(level, input_set_hash, part_index, layout, cluster);
-        }
-        self.build_object(level, input_set_hash, part_index, layout, cluster)
+        // Empty writer (no records, no batches) falls straight through to
+        // here with `self.batches` still empty: `build_object_columnar`'s own
+        // `total_rows == 0` check (line ~1066) returns the identical
+        // `LimitExceeded("empty object")` the row builder returned for the
+        // same input, so the empty-writer case needs no row-builder call at
+        // all and `build_object` can stay entirely behind `row-reference`.
+        self.build_object_columnar(level, input_set_hash, part_index, layout, cluster)
     }
 
     /// Produces the whole object as an L1 compacted part, stamping the caller's
@@ -427,6 +465,15 @@ impl RlogWriter {
     /// two are the footer's compaction-identity fields; every section is built
     /// identically, so identical records plus identical identity yield
     /// byte-identical output regardless of which entry point was used.
+    ///
+    /// Reference-only (ADR-2467 decision 3): `RlogWriter::build` no longer
+    /// routes row-shaped input here (it folds into a [`ColumnarLogBatch`] and
+    /// calls [`RlogWriter::build_object_columnar`] instead), so this is dead
+    /// on every production path. It is kept, behind the off-by-default
+    /// `row-reference` feature, as the independent second implementation the
+    /// byte-identity differential tests hold the columnar builder to; see
+    /// [`RlogWriter::finish_row_reference`].
+    #[cfg(feature = "row-reference")]
     fn build_object(
         self,
         level: u32,
@@ -1955,11 +2002,15 @@ fn stream_level_column_eligible(
 /// merged-view POSTINGS terms this record contributes, and its per-name NumStat
 /// winners.
 ///
+/// Row-builder-exclusive (ADR-2467 decision 3): only [`RlogWriter::build_object`]
+/// calls this, so it is gated behind `row-reference` alongside it.
+///
 /// The last two are two projections of one merged view
 /// ([`StampScratch::finish`]), not two independently derived answers: they must
 /// not disagree about which value a reader resolves for a tracked name
 /// (ADR-0095 decision 1). The columnar path stamps through the same scratch, so
 /// the two paths cannot drift.
+#[cfg(feature = "row-reference")]
 fn resolve_row(
     r: &LogRecord,
     sorted_ids: &[LogStreamId],
@@ -2741,6 +2792,11 @@ fn columnar_estimate(cell: &ravel_types::logstream::AttrValue) -> usize {
 
 /// Splits row indices into block spans by record target and an estimated
 /// uncompressed byte cap.
+///
+/// Row-builder-exclusive (ADR-2467 decision 3): only `build_object` calls
+/// this; `build_object_columnar` reproduces the same formula with its own
+/// local `row_estimate` closure over its column-major gather instead.
+#[cfg(feature = "row-reference")]
 fn chunk_blocks(rows: &[ResolvedRow], cfg: &RlogConfig) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
     let mut start = 0usize;
@@ -2762,6 +2818,10 @@ fn chunk_blocks(rows: &[ResolvedRow], cfg: &RlogConfig) -> Vec<std::ops::Range<u
 }
 
 /// A rough uncompressed byte estimate for one row, for the block byte cap.
+///
+/// Row-builder-exclusive (ADR-2467 decision 3): only [`chunk_blocks`] calls
+/// this.
+#[cfg(feature = "row-reference")]
 fn row_estimate(row: &ResolvedRow) -> usize {
     let mut est = 40; // fixed-field overhead
     est += row.body.len();
@@ -2993,6 +3053,12 @@ fn check_permutation(perm: &[usize], len: usize) -> Result<(), LogSegError> {
 
 /// `items` reordered by `perm`, refused unless `perm` names every index of
 /// `items` exactly once.
+///
+/// Row-builder-exclusive (ADR-2467 decision 3): only `build_object`'s
+/// clustered branch calls this; `build_object_columnar` reorders through a
+/// precomputed rank gather instead, sharing [`check_permutation`] for the
+/// same refusal rather than this generic reorder.
+#[cfg(feature = "row-reference")]
 fn permute<T>(items: Vec<T>, perm: &[usize]) -> Result<Vec<T>, LogSegError> {
     check_permutation(perm, items.len())?;
     let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
@@ -6410,6 +6476,7 @@ mod row_order_tests {
     }
 
     #[test]
+    #[cfg(feature = "row-reference")]
     fn permute_refuses_every_non_permutation() {
         assert_eq!(
             permute(vec!['a', 'b', 'c'], &[1, 2, 0]).expect("valid"),
