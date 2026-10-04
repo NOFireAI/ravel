@@ -383,13 +383,13 @@ pub enum CacheFetchError {
     /// ran. Its own variant so a single-flight follower is told this is a
     /// budget refusal from whichever caller computed it, not a store error it
     /// would retry; the follower's own budget was not consulted and must be
-    /// checked separately. Neither the RSEG closure below nor the RLOG/RSPAN
-    /// ones (`log_fetcher.rs`, `span_fetcher.rs`) hold a `ReadLimits` and
-    /// never produce this.
-    BudgetRefused {
-        key: String,
-        message: String,
-    },
+    /// checked separately. Carries nothing: the leader keeps its typed refusal
+    /// on its own side of the flight, and a follower needs only the fact.
+    /// The only producer is the single-flight leader's fetch closure in
+    /// `ravel_parquet`'s reader. Neither the RSEG closure below nor the
+    /// RLOG/RSPAN ones (`log_fetcher.rs`, `span_fetcher.rs`) hold a
+    /// `ReadLimits` and never produce this.
+    BudgetRefused,
 }
 
 /// Lets a `get_or_fetch` closure use `?` directly on a `store.get(..)` call
@@ -1430,15 +1430,14 @@ impl SegmentFetcher {
                 // constructs `BudgetRefused`. Handled explicitly rather than
                 // through a wildcard so a future budget check added here
                 // cannot silently fall through as a store error.
-                SingleFlightError::Upstream(CacheFetchError::BudgetRefused { key, message }) => {
-                    FetchError::Store {
-                        key,
-                        source: StoreError::Transient(format!(
-                            "cache single-flight closure reported a budget refusal, which the \
-                             RSEG funnel never produces: {message}"
-                        )),
-                    }
-                }
+                SingleFlightError::Upstream(CacheFetchError::BudgetRefused) => FetchError::Store {
+                    key: key.to_string(),
+                    source: StoreError::Transient(
+                        "cache single-flight closure reported a budget refusal, which the RSEG \
+                         funnel never produces"
+                            .to_string(),
+                    ),
+                },
                 SingleFlightError::LeaderLost => FetchError::Store {
                     key: key.to_string(),
                     source: StoreError::Transient(

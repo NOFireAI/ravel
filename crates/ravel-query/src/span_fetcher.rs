@@ -1368,16 +1368,16 @@ fn from_cache_error(
         // `BudgetRefused`. Handled explicitly rather than through a wildcard
         // so a future budget check added here cannot silently fall through
         // as a store error.
-        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::BudgetRefused {
-            message,
-            ..
-        }) => SpanFetchError::Store {
-            key: key.to_string(),
-            source: StoreError::Transient(format!(
-                "cache single-flight closure reported a budget refusal, which the RSPAN funnel \
-                 never produces: {message}"
-            )),
-        },
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::BudgetRefused) => {
+            SpanFetchError::Store {
+                key: key.to_string(),
+                source: StoreError::Transient(
+                    "cache single-flight closure reported a budget refusal, which the RSPAN \
+                     funnel never produces"
+                        .to_string(),
+                ),
+            }
+        }
         SingleFlightError::LeaderLost => SpanFetchError::Store {
             key: key.to_string(),
             source: StoreError::Transient(
