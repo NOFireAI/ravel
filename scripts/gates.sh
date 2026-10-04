@@ -239,6 +239,16 @@ echo "==> scripts/guards/check-guarded-promql-parse.sh"
 echo "==> scripts/guards/check-promql-unreachable.sh"
 "$(dirname "$0")/guards/check-promql-unreachable.sh"
 
+# Published binaries are built on the optimised release profile (issue #2528):
+# LTO and one codegen unit in [profile.release], and `cargo build --release`
+# on every build line of the shipping Dockerfile. CI tunes other profiles for
+# test speed; this is the one that must not follow them. Cases first, since
+# the guard passes everything if its anchors move. A text scan, no build.
+echo "==> scripts/guards/check-release-profile.test.sh"
+bash "$(dirname "$0")/guards/check-release-profile.test.sh"
+echo "==> scripts/guards/check-release-profile.sh"
+"$(dirname "$0")/guards/check-release-profile.sh"
+
 # A user guide must not keep a figure a later record superseded, or an operator
 # picks a flag value from a retired number (issue #1736). This scans the guides
 # tree for the retired ADR-0996 ClickBench pair. Cases first, same reason as the

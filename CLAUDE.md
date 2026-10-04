@@ -633,6 +633,19 @@ than passing for "no pull request open".
   `unreachable!` occurrences found or a missing source directory, so a rename
   or move cannot silently turn this into a no-op. Wired into `gates.sh` and
   CI's doc-scripts job; cases in `scripts/guards/check-promql-unreachable.test.sh`.
+- `scripts/guards/check-release-profile.sh`: exits non-zero when the published
+  binaries would not be built optimised. `[profile.release]` must set `lto` to
+  `"thin"` or `"fat"` and `codegen-units = 1`, with no `opt-level` other than 3
+  there or in a `[profile.release.package.*]` table; every `cargo build` in the
+  root `Dockerfile` must carry `--release` and no `--profile`; neither that
+  file nor `publish-images.yml` may set a `CARGO_PROFILE_RELEASE_*` variable;
+  and `publish-images.yml` must build the root `Dockerfile`. Test lanes are
+  free to tune `profile.ci`; this is the profile that must not follow them.
+  Exit 1 is a finding, 2 is a missing anchor (no `[profile.release]` table, no
+  `cargo build` line, no build step in the publish workflow), which is the
+  case where the scan would otherwise pass everything. Wired into `gates.sh`
+  and CI's doc-scripts job, cases first; cases in
+  `scripts/guards/check-release-profile.test.sh`.
 - `scripts/guards/check-quick-xml-entry-points.sh [Cargo.lock] [deny.toml]`:
   exits non-zero unless deny.toml's RUSTSEC-2026-0194/-0195 ignore comment
   names every direct Cargo.lock parent of an affected quick-xml version,
