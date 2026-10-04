@@ -2701,4 +2701,37 @@ mod tests {
             "the resolve must still find the one published segment with no byte cache"
         );
     }
+
+    /// `byte_cache_ram_residency` (#2488) must report the live entry count and
+    /// payload bytes a real insert charged, not a config-derived guess: the
+    /// server's `/metrics` `cache="catalog"` residency gauges (ADR-0046) read
+    /// straight off this accessor, so a wrong reading here would under- or
+    /// over-report what is actually resident.
+    #[test]
+    fn byte_cache_ram_residency_reports_bytes_a_real_insert_charged() {
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Catalog::new(store, byte_cache_catalog_config(1)).expect("catalog");
+
+        assert_eq!(
+            catalog.byte_cache_ram_residency(),
+            Some((0, 0)),
+            "an empty byte cache must report valid zeros, not a missing reading"
+        );
+
+        let payload = Bytes::from_static(b"issue-2488-residency-payload");
+        let cache_key = CacheKey::new(byte_cache_tenant().0, [0x7a; 32], 0, payload.len() as u64);
+        catalog.byte_cache().insert(cache_key, payload.clone());
+
+        assert_eq!(
+            catalog.byte_cache_ram_residency(),
+            Some((1, payload.len() as u64)),
+            "residency must reflect exactly the one entry and its payload bytes the insert \
+             charged"
+        );
+        assert_eq!(
+            catalog.byte_cache_disk_residency(),
+            None,
+            "a RAM-only byte cache (no --cache-dir) has no disk tier to report"
+        );
+    }
 }

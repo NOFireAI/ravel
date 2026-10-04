@@ -323,6 +323,8 @@ fn rendered_fold_last_success_secs(catalog: &Catalog) -> f64 {
         None,
         None,
         None,
+        None,
+        None,
         MemoryBudgetSnapshot::default(),
         true,
     );
