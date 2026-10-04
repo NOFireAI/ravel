@@ -692,10 +692,15 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
             Some(term) => term.clone(),
             None => unresolved_effective_label(&p.source).to_string(),
         },
-        match p.logs_projection_break_even_bytes_effective {
-            Some(0) => "none (routing threshold)".to_string(),
-            Some(v) => format!("{v} bytes"),
-            None => unresolved_effective_label(&p.source).to_string(),
+        // The server's startup line names the same number and source: with no
+        // derived break-even (recorded as 0) the routing threshold serves.
+        match (
+            p.logs_projection_break_even_bytes_effective,
+            p.logs_block_range_threshold_effective,
+        ) {
+            (Some(0), Some(threshold)) => format!("{threshold} bytes (routing-threshold)"),
+            (Some(v), _) if v > 0 => format!("{v} bytes (profile)"),
+            _ => unresolved_effective_label(&p.source).to_string(),
         }
     ));
     out.push_str(&format!(
@@ -1256,7 +1261,9 @@ mod tests {
 
     /// The header names the rate term and the break-even beside the request
     /// cost, so two passes whose rates came from different terms cannot read
-    /// as one configuration.
+    /// as one configuration. The break-even is the number and source the
+    /// server's startup line prints: the profile's, or with none derived the
+    /// routing threshold, 524,288 bytes under byte-minimal.
     #[test]
     fn header_stamps_the_rate_term_and_break_even() {
         let d = dataset("pre-compaction", None);
@@ -1265,16 +1272,17 @@ mod tests {
         p.logs_projection_break_even_bytes_effective = Some(31_500_000);
         let header = provenance_header(&p, &d);
         assert!(
-            header
-                .contains("  rate term  : effective=time  break-even: effective=31500000 bytes\n"),
+            header.contains(
+                "  rate term  : effective=time  break-even: effective=31500000 bytes (profile)\n"
+            ),
             "got:\n{header}"
         );
 
         p.logs_projection_break_even_bytes_effective = Some(0);
         let header = provenance_header(&p, &d);
         assert!(
-            header.contains("break-even: effective=none (routing threshold)\n"),
-            "a policy with no break-even says the routing threshold serves; got:\n{header}"
+            header.contains("break-even: effective=524288 bytes (routing-threshold)\n"),
+            "a policy with no break-even names the routing threshold; got:\n{header}"
         );
 
         p.source = "flight".to_string();
