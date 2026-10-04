@@ -125,8 +125,9 @@ directly. Decision 2's effect has not been measured at all.
 
 ## Decision
 
-Decisions 1 to 4 are parked and decisions 5 and 6 are restated for both
-builders: see the amendment of 2026-10-05 below.
+Decisions 1 to 4 are parked, decisions 5 and 6 are restated for both
+builders, and decision 7's out-of-scope list is narrowed: see the amendment
+of 2026-10-05 below.
 
 1. **A row-mode `RlogWriter` encodes through the columnar builder.** At
    `finish`, a writer that received records by `push` folds them into one
@@ -298,7 +299,8 @@ dynamic-column budget is applied. Its memory therefore grows with records
 times distinct keys. The row builder's grows with the attributes present.
 
 Records of 10 attributes each, drawn from K distinct keys; heap at its global
-maximum, input included; object bytes identical between the arms:
+maximum, input included; object bytes identical between the arms at the two
+shapes where the columnar arm ran:
 
 | Shape | Row builder | Columnar route | Ratio |
 |---|---|---|---|
@@ -309,9 +311,10 @@ maximum, input included; object bytes identical between the arms:
 
 The dense allocation measured 643.5 MB at K = 1,000 against 640.0 MB for
 rows times keys times the 32 bytes of one slot. The two largest columnar runs
-were not made: each was expected to need about 6.4 GB, and the measurement's
-own rule required twice that in available memory, which a 16 GB host did not
-have. Every shape this ADR measured before accepting decision 1, including
+were not made. The dense vector alone comes to about 6.4 GB for each. The
+measurement's own rule was to run a shape only with twice its pre-registered
+upper bound available: 14 GB for the first (upper bound 7.0 GB) and 16 GB
+for the second (8.0 GB). The host had 13.6 GiB available. Every shape this ADR measured before accepting decision 1, including
 the width gate of decision 4, had every attribute present on every record,
 so none of them exercised this. Ingest's default limits cap a record at 128
 attributes; the review found no cap on the distinct names across a flush or a
@@ -329,9 +332,13 @@ What changes:
   front of it. ADR-0109 decisions 5 and 7 stand as ADR-0109 wrote them, and
   ADR-0109 carries an amendment saying so. The width gate's result stands as
   a measurement; it gates nothing while decision 1 is parked.
-- **What would reopen decision 1.** A fold whose memory is proportional to
-  the attributes present (the batch `from_records` returns is already of that
-  shape; only the intermediate is dense), a resolution of the `VarBytes`
+- **What would reopen decision 1.** A fold with no dense value slots: the
+  intermediate inside `from_records` holds one 32-byte slot per record per
+  distinct key, where the batch it returns holds a value only for the
+  attributes present. That batch still carries a validity bitmap per column,
+  one bit per record, so a term in records times keys remains: 2.5 MB at
+  20,000 records and 1,000 keys, small at the measured shapes and unbounded
+  while distinct names are uncapped. Also a resolution of the `VarBytes`
   offset width, and a third gate beside the narrow and wide ones: the sparse
   shapes in the table above, with the columnar route's peak no higher than
   the row builder's. That is a new decision and needs its own ADR or a
