@@ -225,8 +225,9 @@ while q33 is reported as a 43rd row.
   unchanged (they fail the break-even and read whole, as today). On the
   planned route an object at or below the break-even is read whole with no
   probe, but an object above it pays the tail probe and directory reads
-  before the coverage crossover decides, so a wide statement there reads
-  such an object whole after the probe.
+  before the coverage crossover decides, so a wide statement there whose
+  surviving ranges cover at least 75% of such an object reads it whole after
+  the probe.
 - A query whose partition count exceeds its segment count no longer pays a
   directory decode per block; the striped route costs what the fast path
   costs plus one fetch-side directory read per segment.

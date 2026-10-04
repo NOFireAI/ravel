@@ -228,8 +228,9 @@ whole with no tail probe, as decision 4 measured: the plan phase reads it in
 one covering GET and hands those bytes to the scan, although the routing
 threshold is back at its 512 KiB default. Above the break-even a statement on
 the planned route probes the object's tail and directories, and a wide
-projection then reads the object whole anyway, because the planned route does
-not weigh the projected fraction. That probe is a request the saturated
+projection whose surviving ranges cover at least 75% of the object then reads
+it whole anyway (the coverage crossover), because the planned route does not
+weigh the projected fraction. That probe is a request the saturated
 threshold never issued; whether it moves decision 4's concurrent throughput on
 a corpus with objects that large is unmeasured.
 
