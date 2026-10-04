@@ -144,9 +144,7 @@ pub(crate) fn widen_request_budget(want: usize) -> Option<usize> {
     REQUEST_BUDGET
         .try_with(|budget| {
             let mut permits = budget.permits.lock();
-            budget
-                .scheduler
-                .take_free(budget.class, &mut permits, want);
+            budget.scheduler.take_free(budget.class, &mut permits, want);
             permits.len()
         })
         .ok()
@@ -1793,10 +1791,7 @@ mod tests {
             ..CountingStore::default()
         });
         let cs = ClassedStore::passthrough(Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>);
-        cs.foreground()
-            .get("e", GetRange::Full)
-            .await
-            .expect("get");
+        cs.foreground().get("e", GetRange::Full).await.expect("get");
         assert_eq!(*counting.get_budgets.lock(), vec![None]);
         assert_eq!(*counting.get_widened.lock(), vec![None]);
     }
