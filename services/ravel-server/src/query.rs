@@ -843,9 +843,27 @@ pub struct SqlSpillStartup {
     /// process's sweep tests, so the caller keeps it for the process lifetime.
     pub owner: Option<ravel_sql::spill::SpillRootOwner>,
     /// Roots under `<cache-dir>/sql-spill` the startup sweep left in place,
-    /// each logged at INFO.
-    pub left_in_place: Vec<PathBuf>,
+    /// each logged at INFO with its reason.
+    pub left_in_place: Vec<LeftSpillRoot>,
 }
+
+/// A root under `<cache-dir>/sql-spill` the startup sweep left in place.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftSpillRoot {
+    pub dir: PathBuf,
+    /// [`SPILL_ROOT_LEFT_OWNED`] or [`SPILL_ROOT_LEFT_SWEPT_ASIDE`].
+    pub reason: &'static str,
+}
+
+/// Why the sweep left a root that still carries its instance name.
+#[cfg(feature = "sql")]
+pub const SPILL_ROOT_LEFT_OWNED: &str =
+    "a live process holds its owner lock, or its ownership could not be settled";
+/// Why the sweep left a tree a sweep already moved aside for removal.
+#[cfg(feature = "sql")]
+pub const SPILL_ROOT_LEFT_SWEPT_ASIDE: &str = "a sweep moved it aside for removal and its removal \
+     failed or is still in progress in another process";
 
 /// Resolve SQL spill at startup from the process environment (ADR-0954,
 /// amended by issue #2416), log the `sql_spill_dir` and `sql_spill_max_bytes`
@@ -950,12 +968,11 @@ fn prepare_sql_spill_with(
 }
 
 /// Sweep the roots under `<cache_dir>/sql-spill` whose owner is gone, then log
-/// at INFO, and return, every root it left: one whose owner lock a live
-/// process holds, or whose ownership could not be settled. A missing
+/// at INFO, and return, every root it left with its reason. A missing
 /// `<cache_dir>/sql-spill` is neither swept nor created. Reads nothing outside
 /// `<cache-dir>/sql-spill`.
 #[cfg(feature = "sql")]
-fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<PathBuf> {
+fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
     let spill_root = cache_dir.join(ravel_sql::SQL_SPILL_SUBDIR);
     if !spill_root.is_dir() {
         return Vec::new();
@@ -972,17 +989,30 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<PathBuf> {
             return Vec::new();
         }
     };
-    let mut left: Vec<PathBuf> = entries
+    let mut left: Vec<LeftSpillRoot> = entries
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .map(|entry| entry.path())
+        .map(|entry| {
+            let swept_aside = entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(ravel_sql::spill::SWEPT_NAME_PREFIX);
+            LeftSpillRoot {
+                dir: entry.path(),
+                reason: if swept_aside {
+                    SPILL_ROOT_LEFT_SWEPT_ASIDE
+                } else {
+                    SPILL_ROOT_LEFT_OWNED
+                },
+            }
+        })
         .collect();
-    left.sort();
-    for dir in &left {
+    left.sort_by(|a, b| a.dir.cmp(&b.dir));
+    for root in &left {
         tracing::info!(
-            dir = %dir.display(),
-            "SQL spill root left in place by the startup sweep: a live process holds its \
-             owner lock, or its ownership could not be settled"
+            dir = %root.dir.display(),
+            reason = root.reason,
+            "SQL spill root left in place by the startup sweep"
         );
     }
     left
@@ -3451,7 +3481,13 @@ mod tests {
 
         assert!(live.dir().is_dir(), "a root with a live owner must survive");
         assert!(!dead.exists(), "a root whose owner is gone must be removed");
-        assert_eq!(startup.left_in_place, vec![live.dir().to_path_buf()]);
+        assert_eq!(
+            startup.left_in_place,
+            vec![LeftSpillRoot {
+                dir: live.dir().to_path_buf(),
+                reason: SPILL_ROOT_LEFT_OWNED,
+            }]
+        );
         let own = startup.owner.as_ref().expect("this process owns its root");
         assert_eq!(own.dir(), cache.path().join("sql-spill").join(INSTANCE));
         assert!(own.dir().is_dir());
@@ -3601,7 +3637,13 @@ mod tests {
 
         assert!(!orphan.exists(), "the orphan root must be swept");
         assert!(held.dir().is_dir(), "a held root must survive the sweep");
-        assert_eq!(startup.left_in_place, vec![held.dir().to_path_buf()]);
+        assert_eq!(
+            startup.left_in_place,
+            vec![LeftSpillRoot {
+                dir: held.dir().to_path_buf(),
+                reason: SPILL_ROOT_LEFT_OWNED,
+            }]
+        );
         assert_eq!(
             startup.resolved,
             ResolvedSqlSpill {
@@ -3677,6 +3719,70 @@ mod tests {
         assert!(
             !empty.path().join("sql-spill").exists(),
             "a disabled spill creates no spill root"
+        );
+    }
+
+    /// A tree a sweep already moved aside but could not remove is reported
+    /// with its own reason, not as a root a live process holds. The tree is
+    /// made unremovable with a read-only subdirectory; a process that can
+    /// remove it anyway (one with `CAP_DAC_OVERRIDE`) cannot set this up, and
+    /// the test says so and returns.
+    ///
+    /// Prove-the-test: report every left root with `SPILL_ROOT_LEFT_OWNED`
+    /// and the reason reads the live-owner text.
+    #[cfg(unix)]
+    #[test]
+    fn a_swept_aside_tree_left_in_place_has_its_own_reason() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let cache = tempfile::tempdir().expect("cache dir");
+        let swept = cache
+            .path()
+            .join("sql-spill")
+            .join(format!("{}1-0-0", ravel_sql::spill::SWEPT_NAME_PREFIX));
+        let sealed = swept.join("sealed");
+        std::fs::create_dir_all(&sealed).expect("swept tree");
+        std::fs::write(sealed.join("spill"), b"x").expect("scratch file");
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500))
+            .expect("seal the subdirectory");
+        let unremovable = std::fs::remove_file(sealed.join("spill")).is_err();
+
+        let (capture, guard) = capture_info();
+        let startup = prepare(
+            Some(cache.path()),
+            settings(false, 2 * GIB),
+            None,
+            None,
+            100 * GIB,
+        );
+        drop(guard);
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700))
+            .expect("unseal for cleanup");
+        let startup = startup.expect("spill resolves");
+        if !unremovable {
+            eprintln!("this process can remove a read-only directory's entries; skipped");
+            return;
+        }
+
+        assert_eq!(
+            startup.left_in_place,
+            vec![LeftSpillRoot {
+                dir: swept.clone(),
+                reason: SPILL_ROOT_LEFT_SWEPT_ASIDE,
+            }]
+        );
+        let lines = capture.0.lock().clone();
+        let path = format!(" dir={}", swept.display());
+        let reason = format!(" reason={SPILL_ROOT_LEFT_SWEPT_ASIDE:?}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("left in place")
+                    && line.contains(&path)
+                    && line.contains(&reason))
+                .count(),
+            1,
+            "the swept-aside tree is logged once with its reason: {lines:?}"
         );
     }
 }
