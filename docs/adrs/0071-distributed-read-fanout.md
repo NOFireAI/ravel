@@ -1533,6 +1533,9 @@ are that forward-looking work is now landed, not that any decision changed:
   skippable coverage gap (`crates/ravel-query/src/distrib/federation.rs`),
   redacted-partial under `skip_unavailable` and typed otherwise. Per-signal
   differential, erasure-property, skew, and federation tests are in place.
+  The coordinator no longer decodes a remote log or span slice in production,
+  and the log and span differentials run over a test-only decoder (see the log
+  and span coverage amendment below).
 
 **The SQL lane (T6) has landed, but is not yet wired into a running server.**
 Decision 7 puts both fan-out lanes in scope. T6 shipped in two halves — T6a
@@ -1838,3 +1841,51 @@ because it was distributed.
   or self-mapped deployment, instead of failing the query.
 - The remote failure ladder is unchanged end to end: primary, exactly one
   re-dispatch, local, and a typed failure only if local fails too.
+
+## Amendment (2026-10-04): log and span coverage without a production decoder
+
+<!-- amendment-applies: sections="Amendment: log and span distributed fan-out" pointer="log and span coverage amendment" -->
+
+Status: Accepted. Issue #1946, epic #1678.
+
+### Context
+
+"Shipped status" in the log and span fan-out amendment above records the
+per-signal fetch, merge and federation machinery as present and tested. Issue
+#1912 then removed the coordinator's only decoders for `LogRecordFrame` and
+`SpanFrame` (`decode_log_slice_frames`, `decode_span_slice_frames`), which held
+a whole slice in memory, and the differential suites that drove them over the
+loopback worker went with them. `RemoteSliceFetcher` no longer overrides
+`fetch_logs` or `fetch_spans`. The worker's log and span slice serving
+(`run_slice_logs`, `run_slice_spans`) and the coordinator's fan-out
+(`Distributed::fetch_logs`, `fetch_spans`, their fold, merge and status
+precedence) stayed in the tree with nothing exercising them end to end.
+
+### Decision
+
+1. **The end-to-end coverage comes back now.** The worker's log and span slice
+   serving and the coordinator's log and span fan-out are driven over the
+   in-process loopback worker by tests in
+   `crates/ravel-query/src/distrib/tests.rs`: property-based differentials
+   against the local read under the stated total orders, plus the status
+   precedence, worker-side erasure, both decode caps and a slice stopped at its
+   deadline.
+2. **The decoders those tests use are test support.**
+   `LogSliceStreamDecoder` and `SpanSliceStreamDecoder` mirror
+   `SliceStreamDecoder`: the same per-slice frame and wire-byte caps, the same
+   typed refusals, a typed refusal for a frame of another signal, and a
+   terminal summary that ends the slice. They are compiled only under
+   `cfg(test)`; the crate gains no public decoder for log or span frames.
+3. **Production stays unwired.** The `SliceFetcher` defaults for `fetch_logs`
+   and `fetch_spans` keep answering `Unsupported`, so a log or span slice still
+   falls back to whole-query local execution. Wiring a production caller needs
+   a production bounded decoder and is its own decision.
+
+### Consequences
+
+- A regression in the worker's log or span serving, or in the coordinator's
+  log or span fan-out, fails a test again, although no production path
+  dispatches either signal.
+- The test decoders are not a contract. A production decoder is written and
+  reviewed against `SliceStreamDecoder`'s caps on its own terms; it does not
+  inherit these by being promoted out of `cfg(test)`.
