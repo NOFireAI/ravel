@@ -44,14 +44,22 @@
 //! it starts only after the grants read and both qualification probes, so
 //! its timer expires no earlier than the outer one. A statement that runs
 //! out of time therefore reports [`DdlExecuteError::Deadline`], not the
-//! snapshot's own deadline error.
+//! snapshot's own deadline error. A deadline that expires inside
+//! [`probe_not_ravel_bucket`] drops the probe before its own delete; the
+//! probe object it wrote under `sys/pq-probe/` is then deleted by a
+//! best-effort task the statement spawns as it is dropped.
 
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use bytes::Bytes;
 use ravel_object_store::external::probe::{
     PreconditionProbeFailure, RavelBucketProbeFailure, probe_not_ravel_bucket, probe_preconditions,
 };
-use ravel_object_store::{ObjectStoreBackend, PageToken, StoreError};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
+};
 use ravel_parquet::snapshot::{
     GrantedLocation, LocationSnapshot, PARQUET_SUFFIX, SnapshotError, snapshot_location,
 };
@@ -622,6 +630,141 @@ async fn one_object_under(
     Ok(ProbeObject::PageCapReached)
 }
 
+/// Ravel's own store as [`probe_not_ravel_bucket`] sees it: every request
+/// passes through to `inner`, and the key of the probe's put is recorded for
+/// the [`ProbeObjectGuard`] sharing `put_key`.
+struct ProbeKeyRecorder {
+    inner: Arc<dyn ObjectStoreBackend>,
+    put_key: Arc<OnceLock<String>>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for ProbeKeyRecorder {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        // Recorded before the put is awaited: a put cancelled in flight may
+        // still land.
+        let _ = self.put_key.set(key.to_string());
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.inner.get(key, range).await
+    }
+
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        self.inner.get_pinned(key, range, pin).await
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        self.inner.get_with_pin(key, range).await
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        self.inner.pin_of(key).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.inner.list_after(prefix, start_after, page).await
+    }
+
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
+    }
+}
+
+/// Deletes the probe object [`probe_not_ravel_bucket`] wrote if the probe is
+/// dropped before its own delete runs, which is what the statement deadline
+/// does to it. The delete is spawned on the current tokio runtime, best
+/// effort; with no runtime it is skipped. Call [`ProbeObjectGuard::disarm`]
+/// once the probe returns: by then the probe has issued its own delete.
+struct ProbeObjectGuard {
+    store: Arc<dyn ObjectStoreBackend>,
+    put_key: Arc<OnceLock<String>>,
+    armed: bool,
+}
+
+impl ProbeObjectGuard {
+    /// The guard, and the store to pass to [`probe_not_ravel_bucket`] as
+    /// Ravel's own.
+    fn new(store: Arc<dyn ObjectStoreBackend>) -> (Self, ProbeKeyRecorder) {
+        let put_key = Arc::new(OnceLock::new());
+        let recorder = ProbeKeyRecorder {
+            inner: Arc::clone(&store),
+            put_key: Arc::clone(&put_key),
+        };
+        let guard = Self {
+            store,
+            put_key,
+            armed: true,
+        };
+        (guard, recorder)
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProbeObjectGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(key) = self.put_key.get().cloned() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(key = %key, "no runtime to delete the cancelled bucket probe's object");
+            return;
+        };
+        let store = Arc::clone(&self.store);
+        runtime.spawn(async move {
+            if let Err(e) = store.delete(&key).await {
+                tracing::warn!(
+                    key = %key,
+                    error = %e,
+                    "the cancelled bucket probe's object could not be deleted"
+                );
+            }
+        });
+    }
+}
+
 impl SqlExecutor {
     /// Execute a `CREATE [OR REPLACE] EXTERNAL TABLE` or `DROP TABLE`
     /// statement (ADR-2040 D2, D4) admitted by
@@ -769,12 +912,14 @@ impl SqlExecutor {
                         location: location.clone(),
                         source,
                     })?;
-                probe_not_ravel_bucket(&recorder.probe_store(ravel_store), &probe_external)
-                    .await
-                    .map_err(|source| DdlExecuteError::RavelBucketProbe {
-                        location: location.clone(),
-                        source,
-                    })?;
+                let (mut probe_guard, probe_ravel) =
+                    ProbeObjectGuard::new(Arc::new(recorder.probe_store(ravel_store)));
+                let probed = probe_not_ravel_bucket(&probe_ravel, &probe_external).await;
+                probe_guard.disarm();
+                probed.map_err(|source| DdlExecuteError::RavelBucketProbe {
+                    location: location.clone(),
+                    source,
+                })?;
 
                 let grant_url = grant.url();
                 let granted_location = GrantedLocation { grant, key };
@@ -1565,5 +1710,39 @@ mod tests {
             column: "c".to_string(),
         };
         assert_eq!(err.client_message(), err.to_string());
+    }
+
+    #[test]
+    fn armed_probe_guard_dropped_outside_a_runtime_does_not_panic() {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let (guard, recorder) = ProbeObjectGuard::new(store);
+        recorder
+            .put_key
+            .set("sys/pq-probe/k".to_string())
+            .expect("first key");
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn disarmed_probe_guard_deletes_nothing() {
+        let memory = Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let store: Arc<dyn ObjectStoreBackend> = memory.clone();
+        let (mut guard, recorder) = ProbeObjectGuard::new(store);
+        recorder
+            .put(
+                "sys/pq-probe/k",
+                Bytes::from_static(b"p"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put");
+        guard.disarm();
+        drop(guard);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        memory.head("sys/pq-probe/k").await.expect("still there");
     }
 }
