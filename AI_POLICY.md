@@ -22,13 +22,13 @@ By submitting code, documentation, tests, benchmarks, or other material, you tak
 
 Before submitting a change:
 
-* understand what the change is intended to do;
-* review the resulting diff;
-* run the applicable tests and repository gates;
-* verify claims about correctness, performance, compatibility, and security;
-* remove speculative, irrelevant, duplicated, or unnecessary changes.
+* understand what the change is intended to do
+* review the resulting diff
+* run the applicable tests and repository gates
+* verify claims about correctness, performance, compatibility, and security
+* remove speculative, irrelevant, duplicated, or unnecessary changes
 
-Do not claim that tests passed, a bug was reproduced, a benchmark improved, or a behavior was verified unless that actually happened.
+Do not claim that tests passed, a bug was reproduced, a benchmark improved, or a behavior was verified unless that happened.
 
 "An AI generated it" is neither an excuse for a defect nor evidence that something is correct.
 
@@ -40,7 +40,7 @@ Do not use that asymmetry to transfer work to maintainers. Large quantities of u
 
 A contribution should make the project better, not merely make the diff larger.
 
-Small, well-understood changes are usually easier to evaluate than broad changes made just because an agent was capable of producing them.
+Small, well-understood changes are usually easier to evaluate than broad changes made only because an agent could produce them.
 
 ## AI does not relax Ravel's engineering rules
 
@@ -50,7 +50,7 @@ An agent finding an easy implementation is not a reason to bypass an architectur
 
 Changes to durable formats, consistency semantics, protocols, public behavior, or other architectural contracts require the same design consideration and review they would require without AI. Where the repository requires an ADR, specification change, compatibility analysis, or particular test coverage, AI-assisted work must satisfy those requirements too.
 
-Prefer evidence over confidence: tests, fault injection, benchmarks, reproductions, and clear reasoning are more useful than an agent's assertion that a change is correct.
+Prefer evidence over confidence. Tests, fault injection, benchmarks, reproductions, and clear reasoning are more useful than an agent's assertion that a change is correct.
 
 ## Agentic contributions are welcome
 
@@ -58,7 +58,7 @@ Ravel may be developed using interactive assistants as well as autonomous or una
 
 Agents should be given bounded tasks, sufficient repository context, and objective verification criteria. Their output should be inspected and validated before it becomes part of the project.
 
-Autonomy increases the importance of verification; it does not reduce it.
+Autonomy increases the importance of verification. It does not reduce it.
 
 Repository-maintained automation may create commits, pull requests, reports, or other operational messages as part of established workflows. External automation must not be used to flood issues, pull requests, reviews, or discussions.
 
@@ -68,7 +68,7 @@ AI can help you understand review feedback, investigate a problem, or improve th
 
 Do not use it to generate high-volume or non-responsive discussion. A reply to review feedback should show that you considered the feedback and, when appropriate, that you inspected or tested the underlying code.
 
-Never invent explanations, measurements, reproductions, citations, or technical conclusions simply because a model produced plausible text.
+Never invent explanations, measurements, reproductions, citations, or technical conclusions because a model produced plausible text.
 
 Maintainer conversation is part of engineering the change, not an obstacle to automate away.
 
@@ -78,17 +78,17 @@ AI is most useful when its output can be checked objectively.
 
 Examples include:
 
-* finding and fixing bugs;
-* adding regression and property tests;
-* simplifying or deleting unnecessary code;
-* improving error handling;
-* fuzzing and fault-injection work;
-* improving build and CI tooling;
-* identifying performance regressions;
-* improving documentation;
-* analyzing concurrency or failure paths;
-* detecting inconsistencies between implementation and specification;
-* security research and defensive analysis.
+* finding and fixing bugs
+* adding regression and property tests
+* simplifying or deleting unnecessary code
+* improving error handling
+* fuzzing and fault-injection work
+* improving build and CI tooling
+* identifying performance regressions
+* improving documentation
+* analyzing concurrency or failure paths
+* detecting inconsistencies between implementation and specification
+* security research and defensive analysis
 
 Large features are welcome too, but AI does not replace design. The larger the semantic or architectural change, the more important it is to establish the design before generating the implementation.
 
@@ -114,19 +114,19 @@ You are responsible for making sure you have the legal right to contribute the m
 
 We welcome research involving Ravel and AI-assisted software engineering, including:
 
-* model comparisons and identical-task evaluations;
-* automated bug repair;
-* test generation;
-* agentic development loops;
-* reproducibility studies;
-* code-review experiments;
-* security analysis;
-* failure-injection experiments;
-* new approaches to autonomous software engineering.
+* model comparisons and identical-task evaluations
+* automated bug repair
+* test generation
+* agentic development loops
+* reproducibility studies
+* code-review experiments
+* security analysis
+* failure-injection experiments
+* new approaches to autonomous software engineering
 
 Research should preserve the same standards of safety, licensing, and repository integrity as ordinary development.
 
-If an experiment produces a genuinely useful improvement to Ravel, we welcome it as a contribution.
+If an experiment produces a useful improvement to Ravel, we welcome it as a contribution.
 
 ---
 

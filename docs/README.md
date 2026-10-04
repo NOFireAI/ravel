@@ -1,55 +1,50 @@
 # Documentation index
 
-Ravel's documentation is arranged by what you are trying to do, not by
-which part of the code implements it. Read down this page in order the
-first time: each lane assumes the ones above it. Come back to one lane
-when you have a specific question.
+Ravel's documentation is arranged by what you are trying to do. Each lane
+assumes the lanes above it, so read down the page in order the first time.
+Come back to one lane when you have a specific question.
 
 ## Start
 
-- The [README](../README.md) says what Ravel is, what it is built to do,
-  and whether it is a fit for you. It carries the support matrix, which
-  states for every surface whether it is in the published image or behind
-  a cargo feature.
+- The [README](../README.md) says what Ravel is and whether it is a fit for
+  you. Its support matrix states for every surface whether it is in the
+  published image or behind a cargo feature.
 
 ## Learn
 
-- [guides/getting-started.md](guides/getting-started.md): the one
-  recommended path from nothing to a first query, on the container
-  quickstart. It explains what each response means, how long to wait for
-  data, and when an empty result is the right answer. Building from source
-  sits at the end of the page. Read this first.
+- [guides/getting-started.md](guides/getting-started.md): the recommended
+  path from nothing to a first query, on the container quickstart. It
+  explains what each response means, how long to wait for data, and when an
+  empty result is the right answer. Building from source is at the end of
+  the page. Read this first.
 
 ## Understand
 
-The mental model, in the order it makes sense.
-
-- [concepts.md](concepts.md): the smallest set of ideas every other page
-  assumes, and the glossary. Every Ravel term has one definition here, and
-  every acronym is expanded here once.
-- [architecture.md](architecture.md): the one-page overview. Which
-  components exist, which state is durable, which processes are
-  disposable, how ingest, query and maintenance meet, what Ravel requires
-  of the object store, where the trust and failure boundaries are, and how
-  the system behaves under concurrency and after a retry.
+- [concepts.md](concepts.md): the ideas that every other page assumes, and
+  the glossary. It defines every Ravel term once and expands every acronym
+  once.
+- [architecture.md](architecture.md): the one-page overview. It covers the
+  components, the durable state, the disposable processes, and how ingest,
+  query and maintenance meet. It also covers what Ravel requires of the
+  object store, the trust and failure boundaries, and behavior under
+  concurrency and after a retry.
 - [consistency-model.md](consistency-model.md): the normative statement of
   what Ravel promises. Acknowledgement, visibility, read-your-write,
-  snapshot isolation, and the crash matrix come first; every claim on the
-  page is asserted by a test.
+  snapshot isolation, and the crash matrix come first. A test asserts every
+  claim on the page.
 - [deletion-and-gc.md](deletion-and-gc.md): how retention, erasure and the
-  sweep delete data without breaking the guarantee above. Mechanism, not
-  promise; the promise stays in the consistency model.
+  sweep delete data and keep the guarantees of the consistency model. It
+  describes the mechanism. The consistency model holds the promise.
 
 ## Use
 
-- [guides/ingest.md](guides/ingest.md): every accepted protocol and
-  endpoint, authentication, strict against buffered acknowledgement, every
-  rejection a client can see, and commit tokens. Read this to write data
-  into Ravel.
-- [guides/query.md](guides/query.md): the query routes, PromQL support and
-  its rejected constructs, budgets, SQL over the `samples`, `logs`, `spans`,
-  `alerts` and `audit` tables, and the HTTP status codes. Read this to read
-  data back.
+- [guides/ingest.md](guides/ingest.md): how to write data into Ravel. Every
+  accepted protocol and endpoint, authentication, strict and buffered
+  acknowledgement, every rejection a client can see, and commit tokens.
+- [guides/query.md](guides/query.md): how to read data back. The query
+  routes, PromQL support and its rejected constructs, budgets, SQL over the
+  `samples`, `logs`, `spans`, `alerts` and `audit` tables, and the HTTP
+  status codes.
 - [guides/traces.md](guides/traces.md): querying spans over the `spans`
   table, why one trace is a bounded read, which predicates prune, and what
   an incomplete trace is.
@@ -58,34 +53,33 @@ The mental model, in the order it makes sense.
   exemplar query and the Grafana link.
 - [guides/alerting.md](guides/alerting.md): writing a rules file, which
   process modes evaluate it, the interval and lookback settings, and the
-  four sink kinds. Alert history is queryable through the `alerts` table:
-  the page has the columns, the predicates that prune, and the query that
+  four sink kinds. Alert history is queryable through the `alerts` table.
+  The page has the columns, the predicates that prune, and the query that
   folds the history to current state per alert.
 - [guides/audit.md](guides/audit.md): what Ravel records for every executed
-  statement, every legal hold and every reshard, who writes those records
-  and how long each shard keeps them, and the `audit` table that reads them
-  back, including the note that reading the trail is itself audited.
+  statement, every legal hold and every reshard, who writes those records,
+  and how long each shard keeps them. The `audit` table reads them back,
+  and reading the trail is itself audited.
 - [guides/inspecting-data.md](guides/inspecting-data.md): `ravel-cli`
   worked examples that read segments, commit records and catalog listings
-  straight from the bucket. Read this to see what is actually stored.
+  from the bucket, to show what is stored.
 - [guides/agents.md](guides/agents.md): the MCP surface for an AI agent
-  host, how to connect, the nine tools grouped by task, the result
-  envelope field by field, budgets and cursors, and what an empty result
-  means.
+  host. How to connect, the nine tools grouped by task, the result envelope
+  field by field, budgets and cursors, and what an empty result means.
 
 ## Operate
 
 - [guides/operations.md](guides/operations.md) is the entry point to
   running a cluster, in four pages:
-  [configuration](guides/operations/configuration.md) for what to decide
-  before starting anything,
-  [deployment](guides/operations/deployment.md) for bringing a cluster up
-  against a bucket for the first time,
-  [maintenance](guides/operations/maintenance.md) for compaction, retention,
-  the sweep, the scrubber and format migration, and
-  [troubleshooting](guides/operations/troubleshooting.md) for symptom,
-  cause, confirmation and action, with the two incident runbooks at the
-  top.
+  - [configuration](guides/operations/configuration.md): what to decide
+    before you start anything.
+  - [deployment](guides/operations/deployment.md): bringing a cluster up
+    against a bucket for the first time.
+  - [maintenance](guides/operations/maintenance.md): compaction, retention,
+    the sweep, the scrubber and format migration.
+  - [troubleshooting](guides/operations/troubleshooting.md): symptom,
+    cause, confirmation and action, with the two incident runbooks at the
+    top.
 - [guides/observability.md](guides/observability.md): every metric family
   on `GET /metrics`, the closed label allowlist, how to read the per-query
   cost estimate against the actual, and three worked diagnoses.
@@ -98,12 +92,12 @@ The mental model, in the order it makes sense.
 - [guides/admission-limits.md](guides/admission-limits.md): the per-tenant
   ingest limits, their defaults, what a breach looks like to a client, and
   how to size them.
-- [guides/cost-model.md](guides/cost-model.md): why request charges, not
-  stored bytes, are the bill; the write-side formula and the levers that
-  move it; and the read-side knob that trades round trips for bytes.
+- [guides/cost-model.md](guides/cost-model.md): why request charges, and
+  not stored bytes, are the bill. The write-side formula and the levers
+  that move it, and the read-side knob that trades round trips for bytes.
 - [guides/distributed-query.md](guides/distributed-query.md): fan-out of
   one read across processes and federation across clusters, both off by
-  default: the cost gate, the fragment keys and their rotation, the remote
+  default. The cost gate, the fragment keys and their rotation, the remote
   cluster specification, and every failure an operator will observe.
 - [guides/ingest-affinity.md](guides/ingest-affinity.md): pinning each
   tenant to a small, stable subset of gateway replicas to cut request
@@ -124,8 +118,7 @@ The mental model, in the order it makes sense.
 - [reference/http-api.md](reference/http-api.md): every HTTP route the
   server exposes, with its method, what it accepts and returns, its status
   codes, whether it needs a bearer token, which modes serve it, and its
-  cargo feature gate where it has one. Derived from the router, not from
-  another page.
+  cargo feature gate where it has one. Derived from the router.
 - [reference/mcp.md](reference/mcp.md): every MCP tool, its inputs, the
   envelope blocks it uses, its bounds, and its failure classes, plus the
   shared envelope, cursor, budget, and protocol-header contracts.
@@ -137,18 +130,17 @@ The mental model, in the order it makes sense.
 - [sql-conformance.md](sql-conformance.md): every SQL construct Ravel
   claims, classified as supported, intentionally rejected, or unclassified,
   generated from the conformance suite's recorded verdicts.
-- The PromQL conformance table, generated from a Ravel-only run that measures
-  which constructs Ravel reaches and answers, is in
-  [query-engine.md](query-engine.md). Agreement with the pinned Prometheus
-  binary is a separate row there; it reads `not measured in this run` in the
-  committed table, with the differential lane's counts in its job log. See the
-  README for the full statement.
+- [query-engine.md](query-engine.md) holds the PromQL conformance table. It
+  is generated from a Ravel-only run that measures which constructs Ravel
+  reaches and answers. Agreement with the pinned Prometheus binary is a
+  separate row there. That row reads `not measured in this run` in the
+  committed table, and the differential lane's counts are in its job log.
 
 ## Deep dives
 
 Implementer contracts. Each is normative for the crate it names, and each
 cites the decision records that govern it. Read one when you need the
-exact protocol or byte layout, or when you are changing the code.
+protocol or byte layout, or when you are changing the code.
 
 - [catalog-and-mvcc.md](catalog-and-mvcc.md): the object key layout, the
   commit protocol, commit tokens, catalog folds and snapshot resolution.
@@ -178,13 +170,13 @@ exact protocol or byte layout, or when you are changing the code.
 
 - [adrs/](adrs/): one record per architectural decision, indexed in
   [adrs/README.md](adrs/README.md). A record explains why a choice was
-  made at the time it was made. It is history, not a description of the
-  current system; the pages above are.
+  made at the time it was made. It is history. The pages above describe
+  the current system.
 
 ## For people changing Ravel
 
-Not part of the user manual. Held to the same currency rule as everything
-else, and indexed here so nothing is reachable from nowhere.
+These pages are outside the user manual. They are held to the same currency
+rule as every other page.
 
 - [internal/development.md](internal/development.md): the local iteration
   loop, the gate list, and how CI shares build work.
