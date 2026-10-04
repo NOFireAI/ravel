@@ -88,9 +88,11 @@ pub(crate) fn stream_attrs_bytes_raw_scope(
     out
 }
 
-/// The deepest nesting level an attribute decoder accepts, in the units
-/// [`attr_value_fits_depth`] states. Both the `stream_attrs` decoder and the
-/// `attrs_raw` decoder enforce it, so hostile nesting cannot exhaust the stack.
+/// The deepest nesting level a writer may store, in the units
+/// [`attr_value_fits_depth`] states. The `stream_attrs` decoder enforces it
+/// too, so hostile nesting cannot exhaust the stack. The `attrs_raw` decoder
+/// reads a superset under its own, looser bounds, so values written before
+/// this rule stay readable.
 pub const MAX_ATTR_DEPTH: u32 = 32;
 
 /// Whether `value`, stored as one entry of a top-level attribute set, nests
@@ -104,11 +106,14 @@ pub const MAX_ATTR_DEPTH: u32 = 32;
 /// around a scalar fit and 16 do not; 31 nested lists around a scalar fit and
 /// 32 do not.
 ///
-/// This is the one definition: the `stream_attrs` decoder
-/// ([`decode_stream_attrs`]) and the `attrs_raw` decoder accept an encoded
+/// This is the one definition of what may be admitted and written: the
+/// `stream_attrs` decoder ([`decode_stream_attrs`]) accepts an encoded
 /// attribute set exactly when every value in it satisfies this predicate, the
-/// writer refuses a value that does not, and OTLP admission (`ravel-otlp`)
-/// rejects such an attribute before it reaches the writer.
+/// writer refuses a value that does not, in a STREAM_DIR blob or in
+/// `attrs_raw`, and OTLP admission (`ravel-otlp`) rejects such an attribute
+/// before it reaches the writer. The `attrs_raw` decoder accepts every value
+/// that satisfies it and more besides: it keeps reading values written under
+/// the older bound that predates this rule.
 pub fn attr_value_fits_depth(value: &AttrValue) -> bool {
     value_fits_at(value, 1)
 }
@@ -711,11 +716,12 @@ mod tests {
         (stream.is_ok(), raw.is_ok())
     }
 
-    /// The depth rule in the decoders' own units: 15 nested maps around a
-    /// scalar fit and decode under both decoders, 16 fit neither; 31 nested
-    /// lists fit and decode, 32 do not.
+    /// The depth rule at its boundary: 15 nested maps around a scalar fit and
+    /// decode under both decoders, 16 do not fit and the `stream_attrs`
+    /// decoder refuses them; 31 nested lists fit and decode, 32 do not. The
+    /// `attrs_raw` decoder still reads the value one level past the rule.
     #[test]
-    fn depth_rule_agrees_with_both_decoders_at_the_boundary() {
+    fn depth_rule_agrees_with_the_stream_attrs_decoder_at_the_boundary() {
         for (fits, map) in [(15usize, true), (31, false)] {
             let at = nest(fits, map, AttrValue::I64(1));
             assert!(attr_value_fits_depth(&at), "{fits} levels (map={map})");
@@ -724,7 +730,7 @@ mod tests {
             assert!(!attr_value_fits_depth(&past), "{} levels", fits + 1);
             assert_eq!(
                 decodes_under_each(&past),
-                (false, false),
+                (false, true),
                 "{} levels",
                 fits + 1
             );
@@ -772,6 +778,77 @@ mod tests {
             corrupted_message(stream),
             "stream_attrs: stream_attrs nesting too deep"
         );
+    }
+
+    /// Decodes `value`, the one attribute of a canonical set, under the
+    /// `attrs_raw` decoder and checks it reads back unchanged.
+    fn attrs_raw_reads_back(value: AttrValue) -> Result<(), LogSegError> {
+        let pairs = vec![("k".to_string(), value)];
+        let bytes = canonical_attr_bytes(&pairs);
+        let decoded = crate::reader::decode_canonical_attrs(&bytes)?;
+        assert_eq!(canonical_attr_bytes(&decoded), bytes);
+        Ok(())
+    }
+
+    /// Record attributes the write-side rule now refuses but OTLP admission
+    /// used to accept: 16 nested maps, 32 nested maps (the old map cap), and
+    /// 100 nested lists (the old admission limit). An object already in
+    /// storage may hold any of them in `attrs_raw`, so the decoder reads them.
+    #[test]
+    fn attrs_raw_reads_values_written_under_the_older_bound() {
+        for (levels, map) in [(16usize, true), (32, true), (100, false)] {
+            let value = nest(levels, map, AttrValue::I64(1));
+            assert!(!attr_value_fits_depth(&value), "{levels} (map={map})");
+            attrs_raw_reads_back(value)
+                .unwrap_or_else(|e| panic!("{levels} levels (map={map}) must decode: {e}"));
+        }
+    }
+
+    /// The `attrs_raw` decoder's two bounds: a list nest decodes up to 128
+    /// levels and is a typed error at 129 and at 5,000, without recursing past
+    /// the cap; a map past the old map cap is refused as it always was, the
+    /// lists enclosing it counted.
+    #[test]
+    fn attrs_raw_refuses_nesting_past_its_read_bounds() {
+        attrs_raw_reads_back(nest(128, false, AttrValue::I64(1))).expect("128 nested lists");
+        attrs_raw_reads_back(nest(127, false, AttrValue::List(Vec::new())))
+            .expect("128 nested lists, the innermost empty");
+
+        let pairs = vec![("k".to_string(), nest(129, false, AttrValue::I64(0)))];
+        assert_eq!(canonical_attr_bytes(&pairs), deep_list_set_bytes(129));
+        for levels in [129usize, 5_000] {
+            let err = crate::reader::decode_canonical_attrs(&deep_list_set_bytes(levels))
+                .expect_err("past the read cap");
+            assert_eq!(corrupted_message(err), "attrs_raw too deep", "{levels}");
+        }
+
+        let maps = nest(33, true, AttrValue::I64(1));
+        let map_under_lists = nest(32, false, AttrValue::Map(Vec::new()));
+        for value in [maps, map_under_lists] {
+            let err = attrs_raw_reads_back(value).expect_err("past the map cap");
+            assert_eq!(corrupted_message(err), "attrs_raw too deep");
+        }
+    }
+
+    /// What the `attrs_raw` decoder accepts, stated over a decoded value: the
+    /// bound it has always applied (a map entry set inside more than 32 maps
+    /// and lists, its own map included, is refused) plus the stack-safety cap
+    /// (more than 128 maps and lists on one path is refused). `depth` is the
+    /// number of maps and lists enclosing `value`.
+    fn attrs_raw_read_bound_accepts(value: &AttrValue, depth: u32) -> bool {
+        let inner = depth + 1;
+        match value {
+            AttrValue::List(items) => {
+                inner <= 128 && items.iter().all(|v| attrs_raw_read_bound_accepts(v, inner))
+            }
+            AttrValue::Map(entries) => {
+                inner <= 32
+                    && entries
+                        .iter()
+                        .all(|(_, v)| attrs_raw_read_bound_accepts(v, inner))
+            }
+            _ => true,
+        }
     }
 
     /// Values nested past the cap on purpose: a spine of up to 40 map or list
@@ -822,12 +899,21 @@ mod tests {
     }
 
     proptest! {
-        /// The predicate is true exactly when the encoded value decodes, under
-        /// the `stream_attrs` decoder and under the `attrs_raw` decoder.
+        /// The predicate is true exactly when the encoded value decodes under
+        /// the `stream_attrs` decoder; when it is true the value decodes under
+        /// the `attrs_raw` decoder too, which reads a superset: exactly the
+        /// values its older bound accepts.
         #[test]
-        fn depth_rule_is_exactly_what_each_decoder_accepts(value in arb_deep_value()) {
+        fn depth_rule_is_what_stream_attrs_reads_and_attrs_raw_reads_a_superset(
+            value in arb_deep_value(),
+        ) {
             let fits = attr_value_fits_depth(&value);
-            prop_assert_eq!(decodes_under_each(&value), (fits, fits));
+            let (stream, raw) = decodes_under_each(&value);
+            prop_assert_eq!(stream, fits);
+            if fits {
+                prop_assert!(raw);
+            }
+            prop_assert_eq!(raw, attrs_raw_read_bound_accepts(&value, 0));
         }
 
         #[test]

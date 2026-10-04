@@ -163,9 +163,9 @@ pub enum LogRejection {
     /// A log attribute nested past what the segment format holds is rejected
     /// at admission: at most 15 kvlists may nest around a scalar, an array
     /// level costing half a kvlist level (so 31 arrays fit). That is
-    /// [`ravel_logseg::attr_value_fits_depth`], the rule both segment decoders
-    /// enforce, so an admitted attribute is never refused when its segment is
-    /// written or read.
+    /// [`ravel_logseg::attr_value_fits_depth`], the rule the segment writer
+    /// enforces and every segment decoder accepts, so an admitted attribute is
+    /// never refused when its segment is written or read.
     ///
     /// `max` is that limit in levels,
     /// [`crate::logs_normalize::MAX_STORED_ATTRIBUTE_LEVELS`]: an array adds

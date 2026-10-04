@@ -1938,8 +1938,9 @@ fn stream_level_column_eligible(
 /// Resolves one record into storage form: dense stream ref, dynamic columns
 /// split by type, overflow attributes canonicalized into `attrs_raw`, the
 /// merged-view POSTINGS terms this record contributes, and its per-name NumStat
-/// winners. Overflow attributes nested past what the `attrs_raw` decoder reads
-/// back refuse the record with that decoder's error.
+/// winners. Overflow attributes that fail the write-side depth rule
+/// ([`crate::record::attr_value_fits_depth`]) refuse the record with the
+/// `attrs_raw` decoder's too-deep error.
 ///
 /// The last two are two projections of one merged view
 /// ([`StampScratch::finish`]), not two independently derived answers: they must

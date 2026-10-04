@@ -304,27 +304,41 @@ blob the writer stores always decodes.
 
 ### Attribute nesting depth
 
-One depth rule bounds every canonical attribute set the format stores: the
-two sets in a STREAM_DIR blob and the `attrs_raw` overflow column (FIELD_DIR,
-below). The encoding itself has no depth limit; the rule narrows what a
-writer stores and a reader accepts, not what the bytes mean. A top-level
-attribute set sits at level 0 and each of its values at level 1. A list's
-elements sit one level below the list. A map costs two levels: its entry set
-sits one level below the map, and the entry values one level below that. A
-value or entry set past level 32 (`ravel_logseg::MAX_ATTR_DEPTH`) is refused.
-So 15 maps nested around a scalar fit and 16 do not, and 31 lists nested
-around a scalar fit and 32 do not.
+The encoding itself has no depth limit. What a writer may write and what a
+reader accepts are bounded separately, and for `attrs_raw` they differ:
+objects written before the write-side rule existed hold values it refuses,
+and they stay valid.
 
-`ravel_logseg::attr_value_fits_depth` states the rule over a decoded value,
-and it is the one definition: both decoders (`decode_stream_attrs` for
-STREAM_DIR blobs, the `attrs_raw` decoder for the overflow column) refuse a
-set holding a value it rejects, with `LogSegError::Corrupted`, and stop at
-the cap rather than recursing past it, lists included. The writer refuses an
-`attrs_raw` value that does not fit with the `attrs_raw` decoder's error, on
-the row and the columnar path, before it builds any bytes, as it refuses a
-STREAM_DIR blob that does not decode. OTLP log admission applies the same
-predicate to every resource, scope and record attribute, so a value past the
-rule is rejected at ingest rather than at the flush.
+**What a writer may write.** One depth rule bounds every canonical attribute
+set a writer stores: the two sets in a STREAM_DIR blob and the `attrs_raw`
+overflow column (FIELD_DIR, below). A top-level attribute set sits at level 0
+and each of its values at level 1. A list's elements sit one level below the
+list. A map costs two levels: its entry set sits one level below the map, and
+the entry values one level below that. A value or entry set past level 32
+(`ravel_logseg::MAX_ATTR_DEPTH`) does not fit. So 15 maps nested around a
+scalar fit and 16 do not, and 31 lists nested around a scalar fit and 32 do
+not. `ravel_logseg::attr_value_fits_depth` states the rule over a decoded
+value, and it is the one definition of what may be admitted and written. The
+writer refuses an `attrs_raw` value that does not fit, with the `attrs_raw`
+decoder's "attrs_raw too deep" error, on the row and the columnar path,
+before it builds any bytes, as it refuses a STREAM_DIR blob that does not
+decode. OTLP log admission applies the same predicate to every resource,
+scope and record attribute, so a value past the rule is rejected at ingest
+rather than at the flush.
+
+**What a reader accepts.** The STREAM_DIR decoder (`decode_stream_attrs`)
+accepts a set exactly when every value in it fits the write-side rule, and
+refuses any other with `LogSegError::Corrupted`, stopping at the cap rather
+than recursing past it, lists included. The `attrs_raw` decoder accepts a
+superset: every value written under the older, looser bound that applied
+before the write-side rule. That bound counts maps and lists together: a
+map's entry set nested inside more than 32 maps and lists, its own map
+included, is refused, and lists are not otherwise bounded by it, so 32
+nested maps around a scalar decode. Its one further bound is for stack
+safety: a value nested inside more than 128 maps and lists on one path is
+refused with `LogSegError::Corrupted` ("attrs_raw too deep") instead of
+recursed into. That cap is above the 100 levels of nesting OTLP admission
+ever accepted, so no `attrs_raw` value admitted through OTLP reaches it.
 
 ## FIELD_DIR (uncompressed form)
 
@@ -1484,8 +1498,9 @@ All violations are `Corrupted`, never panics:
 - overlong or truncated varint; trailing bytes past a declared structure;
   unsorted STREAM_DIR or FIELD_DIR; entry count over the configured cap;
   unknown field type byte; unknown encoding or compression tag; a STREAM_DIR
-  attribute set or `attrs_raw` value nested past the attribute depth rule
-  ("Attribute nesting depth" above).
+  attribute set nested past the attribute depth rule, or an `attrs_raw` value
+  nested past the `attrs_raw` reader's bounds ("Attribute nesting depth"
+  above).
 - codec: id out of dictionary range; delta/double-delta accumulation
   overflow; FOR `bit_width > 64` or packed length mismatch; a codec not
   consuming exactly its bytes; a GCD i64 page with `gcd < 2`, an inner tag
