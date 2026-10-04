@@ -1205,6 +1205,87 @@ mod tests {
         }
     }
 
+    /// A monotonic clock a test sets by hand.
+    #[derive(Default)]
+    struct SetMono(std::sync::atomic::AtomicU64);
+
+    impl SetMono {
+        fn set(&self, ns: u64) {
+            self.0.store(ns, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ravel_cpu_gate::MonotonicClock for SetMono {
+        fn now_nanos(&self) -> u64 {
+            self.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// The `bypass_cache: true` HEAD re-read on the NotFound-race path neither
+    /// reads nor writes an absence: with nothing cached its NotFound caches
+    /// nothing, and with an absence cached it still GETs HEAD and leaves that
+    /// absence's stamp alone. Driven here, not through a resolve, because the
+    /// race path only runs after a cache-consulting read admitted a present
+    /// HEAD for the pair, and that insert replaces any cached absence.
+    #[tokio::test]
+    async fn bypass_head_read_neither_reads_nor_writes_an_absence() {
+        let instrumented = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let clock = Arc::new(SetMono::default());
+        let catalog = Catalog::new(instrumented.clone(), config(1))
+            .expect("catalog")
+            .with_monotonic_clock(clock.clone());
+        let tenant = tenant();
+        let head_key = head_object_key(&tenant, Signal::Metrics);
+        let ttl_ns = catalog.config().head_cache_ttl_ns;
+        let ttl_mono = u64::try_from(ttl_ns).expect("a positive TTL");
+        let accounting = QueryAccounting::new();
+        let head_gets = || instrumented.metrics().snapshot().op(StoreOp::Get).calls;
+        let cached = || {
+            catalog.head_cache().get(
+                &tenant,
+                Signal::Metrics,
+                catalog.monotonic_clock(),
+                ttl_ns,
+                &accounting,
+            )
+        };
+
+        let read = catalog
+            .read_head(&tenant, Signal::Metrics, &head_key, true, &[], &accounting)
+            .await
+            .expect("bypass read");
+        assert!(read.is_none());
+        assert_eq!(head_gets(), 1);
+        assert!(cached().is_none(), "a bypass NotFound caches no absence");
+
+        let read = catalog
+            .read_head(&tenant, Signal::Metrics, &head_key, false, &[], &accounting)
+            .await
+            .expect("cached read");
+        assert!(read.is_none());
+        assert_eq!(head_gets(), 2);
+        assert!(matches!(cached(), Some(CachedHead::Absent)));
+
+        clock.set(10);
+        let read = catalog
+            .read_head(&tenant, Signal::Metrics, &head_key, true, &[], &accounting)
+            .await
+            .expect("bypass read over a cached absence");
+        assert!(read.is_none());
+        assert_eq!(head_gets(), 3, "the bypass read GETs past the absence");
+
+        clock.set(ttl_mono);
+        assert!(
+            matches!(cached(), Some(CachedHead::Absent)),
+            "the absence stamped at 0 is served at the TTL"
+        );
+        clock.set(ttl_mono + 1);
+        assert!(
+            cached().is_none(),
+            "the bypass NotFound did not restamp the absence"
+        );
+    }
+
     /// A HEAD with one syntactically valid but unfetched part ref: enough to
     /// pass `validate_head`'s shape checks without needing a real,
     /// resolvable part object, since the tenant_hash check runs before any
