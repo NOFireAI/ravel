@@ -2046,9 +2046,6 @@ pub fn phrase_match(value: &[u8], word: &str) -> bool {
     toks.windows(query.len()).any(|w| w == query.as_slice())
 }
 
-/// Decodes canonical attribute bytes (the write-side [`canonical_attr_bytes`])
-/// back into attributes. Used for `attrs_raw` overflow. Depth-bounded against
-/// hostile nesting.
 /// The resource and scope attribute `(name, value)` pairs a STREAM_DIR blob
 /// carries, in blob order (the resource set first, then the scope set). The
 /// blob layout is `canonical_attr_bytes(resource) || len+scope_name ||
@@ -2083,7 +2080,19 @@ pub fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSeg
     Ok(pairs)
 }
 
-fn decode_canonical_attrs(bytes: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+/// Decodes canonical attribute bytes (the write-side [`canonical_attr_bytes`])
+/// back into attributes. Used for `attrs_raw` overflow.
+///
+/// This decoder reads a superset of what a writer may write. The write-side
+/// rule is [`crate::record::attr_value_fits_depth`]; values written before
+/// that rule existed were not held to it, so this decoder keeps the older,
+/// looser bound: a map entry set nested inside more than
+/// [`ATTRS_RAW_MAP_DEPTH_CAP`] maps and lists, its own map included, is
+/// refused, and lists are otherwise unbounded by it. Its one further bound is
+/// [`ATTRS_RAW_READ_DEPTH_CAP`], for stack safety.
+pub(crate) fn decode_canonical_attrs(
+    bytes: &[u8],
+) -> Result<Vec<(String, AttrValue)>, LogSegError> {
     let mut pos = 0usize;
     let out = decode_attr_set(bytes, &mut pos, 0)?;
     if pos != bytes.len() {
@@ -2092,15 +2101,49 @@ fn decode_canonical_attrs(bytes: &[u8]) -> Result<Vec<(String, AttrValue)>, LogS
     Ok(out)
 }
 
-const MAX_ATTR_DEPTH: u32 = 32;
+/// The `attrs_raw` decoder's map bound: a map entry set nested inside more
+/// than this many maps and lists, the map that holds it included, is refused.
+/// This is the read-side bound every `attrs_raw` value was written under
+/// before the write-side rule ([`crate::record::MAX_ATTR_DEPTH`], a separate
+/// constant with a stricter accounting) existed, so it must not tighten.
+const ATTRS_RAW_MAP_DEPTH_CAP: u32 = 32;
 
+/// The `attrs_raw` decoder's stack-safety bound: a value nested inside more
+/// than this many maps and lists together is refused instead of recursed
+/// into. It is above the 100 levels OTLP admission ever accepted, so no
+/// `attrs_raw` value admitted through OTLP reaches it. It is not the
+/// write-side cap ([`crate::record::MAX_ATTR_DEPTH`]).
+const ATTRS_RAW_READ_DEPTH_CAP: u32 = 128;
+
+/// The error the `attrs_raw` decoder returns for nesting past its bounds,
+/// which the writer also returns when it refuses an overflow value that fails
+/// the write-side depth rule.
+pub(crate) fn attrs_raw_too_deep() -> LogSegError {
+    LogSegError::Corrupted("attrs_raw too deep".into())
+}
+
+/// Refuses, with the `attrs_raw` decoder's own error, overflow attributes that
+/// fail the write-side depth rule ([`crate::record::attr_value_fits_depth`]).
+pub(crate) fn check_attrs_raw_depth(attrs: &[(String, AttrValue)]) -> Result<(), LogSegError> {
+    if attrs
+        .iter()
+        .all(|(_, v)| crate::record::attr_value_fits_depth(v))
+    {
+        Ok(())
+    } else {
+        Err(attrs_raw_too_deep())
+    }
+}
+
+/// `depth` is how many maps and lists enclose the set being decoded, the map
+/// that holds it included.
 fn decode_attr_set(
     bytes: &[u8],
     pos: &mut usize,
     depth: u32,
 ) -> Result<Vec<(String, AttrValue)>, LogSegError> {
-    if depth > MAX_ATTR_DEPTH {
-        return Err(LogSegError::Corrupted("attrs_raw too deep".into()));
+    if depth > ATTRS_RAW_MAP_DEPTH_CAP {
+        return Err(attrs_raw_too_deep());
     }
     use crate::varint::get_uvarint;
     let count = get_uvarint(bytes, pos)?;
@@ -2127,6 +2170,18 @@ fn decode_attr_set(
     Ok(out)
 }
 
+/// The nesting level of a map's or list's contents, given `depth`, the number
+/// of maps and lists enclosing the map or list itself; past
+/// [`ATTRS_RAW_READ_DEPTH_CAP`] it is refused before any recursion.
+fn attrs_raw_inner_depth(depth: u32) -> Result<u32, LogSegError> {
+    let inner = depth.saturating_add(1);
+    if inner > ATTRS_RAW_READ_DEPTH_CAP {
+        return Err(attrs_raw_too_deep());
+    }
+    Ok(inner)
+}
+
+/// `depth` is how many maps and lists enclose the value being decoded.
 fn decode_attr_value(bytes: &[u8], pos: &mut usize, depth: u32) -> Result<AttrValue, LogSegError> {
     use crate::varint::{get_uvarint, zigzag_decode};
     let tag = *bytes
@@ -2180,17 +2235,18 @@ fn decode_attr_value(bytes: &[u8], pos: &mut usize, depth: u32) -> Result<AttrVa
             AttrValue::Bytes(b)
         }
         6 => {
+            let inner = attrs_raw_inner_depth(depth)?;
             let n = get_uvarint(bytes, pos)?;
             if n > (1 << 20) {
                 return Err(LogSegError::Corrupted("attr list over cap".into()));
             }
             let mut items = Vec::with_capacity((n as usize).min(1 << 12));
             for _ in 0..n {
-                items.push(decode_attr_value(bytes, pos, depth + 1)?);
+                items.push(decode_attr_value(bytes, pos, inner)?);
             }
             AttrValue::List(items)
         }
-        7 => AttrValue::Map(decode_attr_set(bytes, pos, depth + 1)?),
+        7 => AttrValue::Map(decode_attr_set(bytes, pos, attrs_raw_inner_depth(depth)?)?),
         other => {
             return Err(LogSegError::Corrupted(format!("attr tag {other}")));
         }

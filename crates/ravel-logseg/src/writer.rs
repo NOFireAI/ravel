@@ -30,7 +30,7 @@ use crate::footer::{
 use crate::page::{SealedPage, seal_page};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
-use crate::reader::stream_attr_pairs;
+use crate::reader::{check_attrs_raw_depth, stream_attr_pairs};
 use crate::record::{
     COL_BODY, COL_SEVERITY_TEXT, ColumnValue, FIRST_DYNAMIC_COL, FieldType, LogRecord, ResolvedRow,
     canonical_value_bytes, resolve_value,
@@ -625,7 +625,7 @@ impl RlogWriter {
                 &stamp_index,
                 &stream_seeds,
                 &mut stamp,
-            ));
+            )?);
         }
         match &cluster {
             None => rows.sort_by(|a, b| {
@@ -1288,6 +1288,7 @@ impl RlogWriter {
         let mut g_attrs_raw: Vec<Option<Vec<u8>>> = vec![None; total_rows];
         for grow in 0..total_rows {
             if !g_overflow[grow].is_empty() {
+                check_attrs_raw_depth(&g_overflow[grow])?;
                 g_attrs_raw[grow] = Some(canonical_attr_bytes(&g_overflow[grow]));
             }
         }
@@ -1937,7 +1938,9 @@ fn stream_level_column_eligible(
 /// Resolves one record into storage form: dense stream ref, dynamic columns
 /// split by type, overflow attributes canonicalized into `attrs_raw`, the
 /// merged-view POSTINGS terms this record contributes, and its per-name NumStat
-/// winners.
+/// winners. Overflow attributes that fail the write-side depth rule
+/// ([`crate::record::attr_value_fits_depth`]) refuse the record with the
+/// `attrs_raw` decoder's too-deep error.
 ///
 /// The last two are two projections of one merged view
 /// ([`StampScratch::finish`]), not two independently derived answers: they must
@@ -1952,7 +1955,7 @@ fn resolve_row(
     index: &StampIndex,
     stream_seeds: &HashMap<LogStreamId, StreamSeed>,
     stamp: &mut StampScratch,
-) -> ResolvedRow {
+) -> Result<ResolvedRow, LogSegError> {
     // A miss cannot happen: `build_object`'s only caller builds `sorted_ids`
     // from the stream ids of this same `self.records` slice before resolving
     // any of them, so `r.stream_id` is always already a member.
@@ -1994,6 +1997,7 @@ fn resolve_row(
     let attrs_raw = if overflow.is_empty() {
         None
     } else {
+        check_attrs_raw_depth(&overflow)?;
         Some(canonical_attr_bytes(&overflow))
     };
     let mut indexed_terms: Vec<(u32, ColumnValue)> = Vec::new();
@@ -2006,7 +2010,7 @@ fn resolve_row(
             stat: &mut stat_winners,
         },
     );
-    ResolvedRow {
+    Ok(ResolvedRow {
         stream_ref,
         ts_ns: r.ts_ns,
         observed_ts_ns: r.observed_ts_ns,
@@ -2020,7 +2024,7 @@ fn resolve_row(
         columns: cols.into_iter().collect(),
         indexed_terms,
         stat_winners,
-    }
+    })
 }
 
 /// The number of distinct [`FieldType`] byte values, the stride of
@@ -4549,6 +4553,62 @@ mod tests {
             .expect("decompress");
         let fd = FieldDir::decode(&raw, 10_000).expect("decode");
         assert_eq!(fd.len(), 1000);
+    }
+
+    /// An `attrs_raw` value past the attribute depth rule is refused at finish,
+    /// on the row path and the columnar path, with the `attrs_raw` decoder's
+    /// own error, so no object carrying it is produced; the deepest value that
+    /// fits is written and reads back intact.
+    #[test]
+    fn attrs_raw_past_the_depth_rule_is_refused_at_finish() {
+        // No dynamic columns, so every attribute folds into `attrs_raw`.
+        let cfg = RlogConfig {
+            max_dynamic_columns: 0,
+            ..RlogConfig::default()
+        };
+        let nest = |levels: usize, map: bool| {
+            let mut v = AttrValue::I64(1);
+            for _ in 0..levels {
+                v = if map {
+                    AttrValue::Map(vec![("m".into(), v)])
+                } else {
+                    AttrValue::List(vec![v])
+                };
+            }
+            v
+        };
+        for columnar in [false, true] {
+            let write = |value: AttrValue| {
+                let mut r = base_record(0, 0);
+                r.stream_attrs = empty_stream_blob();
+                r.attrs = vec![("deep".into(), value)];
+                let mut w = RlogWriter::new(cfg, identity());
+                if columnar {
+                    w.push_columnar(ColumnarLogBatch::from_records(std::slice::from_ref(&r)))
+                        .expect("push_columnar");
+                } else {
+                    w.push(r).expect("push");
+                }
+                w.finish()
+            };
+            for (fits, map) in [(15usize, true), (31, false)] {
+                let value = nest(fits, map);
+                let obj = write(value.clone())
+                    .unwrap_or_else(|e| panic!("{fits} levels (map={map}) fit: {e}"));
+                let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
+                let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].attrs, vec![("deep".to_string(), value)]);
+
+                let err = write(nest(fits + 1, map)).expect_err("one level past the fit");
+                match err {
+                    LogSegError::Corrupted(msg) => {
+                        assert_eq!(msg, "attrs_raw too deep", "columnar={columnar} map={map}")
+                    }
+                    other => panic!("expected the attrs_raw decoder's error, got {other:?}"),
+                }
+            }
+        }
     }
 
     /// Decodes the SKIP_IDX of a written object through the reader's own
