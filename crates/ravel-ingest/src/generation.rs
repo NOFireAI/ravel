@@ -269,14 +269,33 @@ pub(crate) trait FlushScope<M>: Send + Sync {
     fn reread(&self, tenant: TenantHash) -> Reread;
 }
 
+/// A hand-back send that did not deliver, with the message it returns.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SendRefused<M> {
+    pub(crate) msg: M,
+    /// The mailbox is closed, so its actor will never take the message. A
+    /// `false` here is a full mailbox on a send that may not wait.
+    pub(crate) closed: bool,
+}
+
 /// Sends one hand-back message, awaiting room in the target's mailbox only
 /// when `wait` is set ([`FlushScope::may_wait_on`]). A closed or, without
 /// `wait`, full mailbox returns the message.
-pub(crate) async fn send_hand_back<M>(tx: &mpsc::Sender<M>, msg: M, wait: bool) -> Result<(), M> {
+pub(crate) async fn send_hand_back<M>(
+    tx: &mpsc::Sender<M>,
+    msg: M,
+    wait: bool,
+) -> Result<(), SendRefused<M>> {
     if wait {
-        tx.send(msg).await.map_err(|err| err.0)
+        tx.send(msg).await.map_err(|err| SendRefused {
+            msg: err.0,
+            closed: true,
+        })
     } else {
-        tx.try_send(msg).map_err(|err| err.into_inner())
+        tx.try_send(msg).map_err(|err| match err {
+            mpsc::error::TrySendError::Full(msg) => SendRefused { msg, closed: false },
+            mpsc::error::TrySendError::Closed(msg) => SendRefused { msg, closed: true },
+        })
     }
 }
 
@@ -288,6 +307,11 @@ pub(crate) struct HandedBack<B> {
     /// target was not live at the check, or the rows of every send that
     /// failed on a closed or full mailbox.
     pub(crate) kept: Option<B>,
+    /// Whether a target that left rows in `kept` is not live: not live at the
+    /// check (dead, condemned, or its mailbox closed), or closed by the send.
+    /// Such a target cannot take the rows on a later flush, which a full
+    /// mailbox can.
+    pub(crate) target_dead: bool,
 }
 
 /// Whether a buffer whose generation-mismatch hand-back already left rows
@@ -297,7 +321,8 @@ pub(crate) struct HandedBack<B> {
 /// the shard's at-cap flag reads. The flush then writes the rows in place,
 /// where readers find them, rather than keep them, and with them the
 /// deferral that would keep the shard refusing writes, for as long as the
-/// target stays full or closed.
+/// target's mailbox stays full. A target that is not live is not retried at
+/// all ([`HandedBack::target_dead`]).
 pub(crate) fn mismatch_retry_spent(
     mismatch_held_since_ns: Option<i64>,
     deferred_since_ns: Option<i64>,
@@ -1485,10 +1510,30 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<u32>(1);
         assert_eq!(send_hand_back(&tx, 1, false).await, Ok(()));
-        assert_eq!(send_hand_back(&tx, 2, false).await, Err(2));
+        assert_eq!(
+            send_hand_back(&tx, 2, false).await,
+            Err(SendRefused {
+                msg: 2,
+                closed: false
+            }),
+            "a full mailbox is not a closed one"
+        );
         assert_eq!(rx.recv().await, Some(1));
         drop(rx);
-        assert_eq!(send_hand_back(&tx, 3, true).await, Err(3));
+        assert_eq!(
+            send_hand_back(&tx, 3, true).await,
+            Err(SendRefused {
+                msg: 3,
+                closed: true
+            })
+        );
+        assert_eq!(
+            send_hand_back(&tx, 4, false).await,
+            Err(SendRefused {
+                msg: 4,
+                closed: true
+            })
+        );
     }
 
     /// Handed-back rows widen the receiving buffer's arrival bookkeeping in

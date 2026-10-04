@@ -379,9 +379,10 @@ pub struct LogIngestMetricsSnapshot {
     /// The part of `rerouted_flushes` whose reason was
     /// [`HandBackReason::GenerationMismatch`].
     pub rerouted_flushes_generation_mismatch: u64,
-    /// Hand-back episodes that left rows in the source buffer because a
-    /// target shard was not live or its mailbox was closed or full. Exported
-    /// as `ravel_ingest_hand_back_failures_total`.
+    /// Hand-back episodes that kept rows in the source buffer: a
+    /// retired-index target not live or closed, or a generation-mismatch
+    /// target's mailbox full. Exported as
+    /// `ravel_ingest_hand_back_failures_total`.
     pub hand_back_failures: u64,
     /// Teardown flushes written in place outside the scan set. Exported as
     /// `ravel_ingest_teardown_unscanned_writes_total`.

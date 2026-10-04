@@ -872,35 +872,65 @@ still drains the largest set first, and a 3-shard set handing rows up can
 reach a 4-shard actor that is inside its teardown flush. Each shard actor
 therefore closes its mailbox when it takes `Shutdown`, before its teardown
 flush, and absorbs every hand-back still queued into its own buffers, which
-that flush then writes in the owner's set. A send after the close fails as
-closed and the rows stay with the source. Any other message found queued is
-dropped after the drain, as the receiver dropped it before; through the
-router none can be, since `shutdown` consumes the router.
+that flush then writes in the owner's set. An accepted hand-back is lost only
+if the target's actor panics before writing it, as any shard death loses a
+buffer, or if its rows cannot merge into the target's buffer (a metrics
+series id already buffered under another label set, or log records in the
+other buffer layout), which drops them with an ERROR. A send after the close
+fails as closed, and the source writes the rows in place at once, as for any
+target that is not live (below). Any other message found queued is dropped
+after the drain, as the receiver dropped it before; through the router none
+can be, since `shutdown` consumes the router.
 
-Rows a mismatch hand-back could not deliver, for a full or closed mailbox or
-a target that is not live, stay in the source buffer and are retried by later
-triggers, but not without bound: a full mailbox can stay full while writers
-are queued on the target, and a buffer carrying a queued-flush deferral would
-keep the shard's at-cap flag raised. The retry stops once the buffer has
-waited the flush deferral cap (`IngestConfig::flush_deferral_cap_ns`, the
-bound that makes a shard refuse writes, 3559.8 s at the defaults), counted
-from the earlier of its first failed hand-back and its queued-flush deferral;
-the next flush then writes the rows in place. A drain does not wait for that
-bound: `flush_all` yields between its passes so a full target can take the
-rows, a `FlushNow` drain then makes one last pass over the buffers still
-holding such rows, and a teardown reaches the same point on its bypass passes;
-there a hand-back that fails again writes the rows in place. So no drain
-answers with these rows still buffered. Rows a retired-index hand-back could
-not deliver are never written in place outside a teardown, since there they
-would sit where readers do not scan.
+What happens to rows a mismatch hand-back could not deliver depends on why.
+A target that is not live, meaning dead, condemned, or with its mailbox
+closed, whether found at the liveness check or by the send, cannot take them
+on a later flush: a closed mailbox does not reopen, a condemned shard stays
+down, and a dead metrics shard is respawned only by a write routed to it that
+observes the death, which no flush or hand-back makes and nothing bounds. The
+flush that finds such a target writes the rows in place at once. Holding
+them would buy nothing and would hold acknowledged buffered-mode rows in
+memory for up to the deferral cap, against the two seconds or so they waited
+before this amendment.
+
+A full mailbox, on a send that may not wait, is transient: the rows go back
+to the source buffer and later triggers retry them, but not without bound: a
+full mailbox can stay full while writers are queued on the target, and a
+buffer carrying a queued-flush deferral would keep the shard's at-cap flag
+raised. The retry stops once the buffer has waited the flush deferral cap
+(`IngestConfig::flush_deferral_cap_ns`, the bound that makes a shard refuse
+writes, 3559.8 s at the defaults), counted from the earlier of its first
+failed hand-back and its queued-flush deferral; the next flush then writes
+the rows in place, and answers a strict waiter still on the buffer
+`Abandoned`, as the deferral path does, instead of acknowledging it from a
+flush at the cap.
+
+A drain does not wait for that bound, and its own work is bounded: at most
+`MAX_FLUSH_ALL_PASSES` (4) passes with the lag check enforced, yielding
+between them so a full target can take the rows; then, on a `FlushNow` drain,
+one last pass, still enforced, over the buffers holding rows a full mailbox
+returned, or, on a teardown, at most 4 bypass passes. A hand-back that fails
+there writes the rows in place. A drain can still answer with such rows
+buffered. On a `FlushNow` drain's last pass, an ADR-1685 lag refusal or an
+ADR-1307 regression refusal, a view still `Unknown` after the drain's re-read,
+or a verdict that flipped to a retired index whose hand-back fails keeps
+them in the buffer for a later trigger, which the running actor makes. On a
+teardown, rows a regression refusal keeps through every bypass pass are the
+residue counted on `flush_all_residue_tenants`. Across shards,
+`IngestRouter::flush_all` repeats its fan-out at most `HAND_BACK_DRAIN_PASSES`
+(3) times while a pass hands rows over, so rows handed over on its last pass
+stay buffered at their target. Rows a retired-index hand-back could not
+deliver are never written in place outside a teardown, since there they would
+sit where readers do not scan.
 
 **Residual: mismatched rows written in place.** Rows routed by one
 generation are written into an hour another generation owns in exactly these
-cases: a teardown bypass pass whose hand-back cannot deliver (a larger set
-already drained, a condemned log or span target, a dead metrics shard, or a
-full mailbox); a `FlushNow` drain's last pass whose hand-back fails again; and
-a buffer whose retries reached the deferral cap, which with a configuration
-whose cap is zero is its second attempt. A teardown that cannot trust the
+cases: any flush whose hand-back finds a target that is not live (a larger set
+already draining or drained, a condemned log or span target, a dead metrics
+shard); for a full mailbox, a teardown bypass pass whose hand-back fails, a
+`FlushNow` drain's last pass whose hand-back fails again, and a buffer whose
+retries reached the deferral cap, which with a configuration whose cap is
+zero is its second attempt. A teardown that cannot trust the
 tenant's view also writes in place unchecked, as the scan-set amendment
 describes, so it can write such rows without detecting the mismatch; that is
 counted only on `stale_provisioning_flushes`. Objects are immutable, so an hour
@@ -930,16 +960,25 @@ hour, is handed back once under the generation-mismatch reason, lands at the
 index the 3-shard generation routes each key to, and the scan rule finds every
 row once; the same buffer opening one hour after the activation writes in
 place. On a 3 to 4 increase the same buffer is handed up to the 4-shard set
-and lands at the 4-shard indices. A strict waiter on a mismatched buffer is
-answered the retryable `Abandoned`, never `Ok`. With the 4-shard set held
-inside its teardown flush by a held data PUT, a 3-shard buffer handing rows up
-to it during shutdown loses none: the send fails as closed and the source's
-teardown writes the rows in place, counted once. A teardown whose target set
-is already drained writes in place with a WARN and counts once. The
-shard-actor unit tests hold a full target mailbox: the rows come back with
-their charge, a later trigger with room hands them over, a buffer kept from a
-full mailbox is written in place once the deferral cap is reached and not
-before, and a `FlushNow` drain answers with nothing buffered.
+and lands at the 4-shard indices. A strict waiter on a mismatched buffer whose
+target is live at the liveness check is answered the retryable `Abandoned`,
+never `Ok`; when a target is not live at the check the waiter stays on the
+buffer and the in-place write answers it `Ok`, which the shard-actor unit
+tests pin. With the 4-shard set held inside its teardown flush by a held data
+PUT, a 3-shard buffer handing rows up to it during shutdown loses none: the
+target's mailbox is closed, so the source writes the rows in place on that
+flush, counted once, with no hand-back kept for a retry. A teardown whose
+target set is already drained writes in place with a WARN and counts once.
+The shard-actor unit tests, on all three pipelines, hold a full target
+mailbox: the rows come back with their charge, a later trigger with room
+hands them over, a buffer kept from a full mailbox is written in place once
+the deferral cap is reached and not before, a strict waiter still attached at
+the cap is answered `Abandoned`, and a `FlushNow` drain whose target stays
+full answers with nothing buffered. They write a mismatch whose target is not
+live at the check, or closes at the send, in place on the first flush that
+sees it, with no retry, and they queue a hand-back behind `Shutdown` and find
+its rows written exactly once by the teardown, which pins the absorb in
+`close_mailbox`.
 `generation::tests` pins the verdicts: the overlap hours, the owned hour for
 a 4-shard and a 3-shard flush, 4 to 3 to 4 where equal counts write in place,
 a 3 to 4 increase handing back up, the owner being the generation active at

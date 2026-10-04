@@ -551,17 +551,26 @@ onward routes with the new count. Guarantees:
   flush and keeps the rows. A strict write still waiting on handed-back rows
   is answered `Abandoned` (503, outcome unknown) before the rows are sent:
   they are written by a target shard or, if none can take them, by the shard
-  that held them. A target shard that is dead, whose mailbox closes before the
-  rows arrive, or, on a hand-back to a larger shard set that may not wait,
-  whose mailbox is full, leaves them with the shard that held them, which
-  retries. A hand-back a target accepted is always written: a shard closes its
-  mailbox before its shutdown flush and writes every hand-back still queued.
+  that held them. A target shard that is dead or condemned, or whose mailbox
+  closes before the rows arrive, leaves them with the shard that held them,
+  which retries. A hand-back a target accepted is written unless the target's
+  actor panics before writing it, which loses its buffer as any shard death
+  does, or the rows cannot merge into the target's buffer (a metrics series
+  id already buffered under another label set, or log records in the other
+  buffer layout, row-major against columnar), which drops them with an
+  ERROR. A shard closes its mailbox before its shutdown flush and absorbs
+  every hand-back still queued into the buffers that flush writes.
   Nor does a late flush write under an hour its routing generation does not
   own (ADR-1642 generation-mismatch amendment): when one generation owns the pinned hour alone and routes
   at another shard count, the rows are handed to that generation's shards the
   same way, so every row of an hour the query planner treats as one
   generation's sits at that generation's index. Inside the activation
-  overlap no generation owns the hour and the flush writes in place.
+  overlap no generation owns the hour and the flush writes in place. Such a
+  hand-back to a larger shard set may not wait for room, so a full target
+  mailbox leaves the rows with the shard that held them, which retries; a
+  target that is dead, condemned or closed cannot come back to take them, so
+  that shard writes them in place on the flush that found it (the second
+  exception below).
   Three exceptions remain:
   - A shutdown or channel-close drain that still cannot confirm the view after
     re-reading the provisioning record, or cannot reach a live shard of the
@@ -570,12 +579,23 @@ onward routes with the new count. Guarantees:
     stored but returned by no query, logged at ERROR with the tenant, shard
     and hour, and counted on `ravel_ingest_teardown_unscanned_writes_total`.
   - Rows handed back for an hour another generation owns are written in place
-    when the hand-back cannot deliver them in these cases: on a teardown
-    drain's bypass passes (a larger shard set already drained, a condemned
-    log or span target, a dead metrics shard, or a full mailbox); on the last
-    pass of an explicit drain (`flush_all`); and once a buffer's retries have
-    waited the flush deferral cap, counted from its first failed hand-back or
-    its queued-flush deferral, whichever is earlier. A teardown that cannot
+    when the hand-back cannot deliver them in these cases: at once, on any
+    flush, when a target is not live (a larger shard set already drained or
+    draining, a condemned log or span target, a dead metrics shard); for a
+    full mailbox, on a teardown drain's bypass passes, on the last pass of an
+    explicit drain (`flush_all`), and once a buffer's retries have waited the
+    flush deferral cap, counted from its first failed hand-back or its
+    queued-flush deferral, whichever is earlier. A strict write still waiting
+    on rows written at the cap is answered `Abandoned` (503); one whose target
+    was not live at the liveness check is still waiting and is acknowledged
+    from the in-place write, and one whose target closed only at the send was
+    already answered `Abandoned`. A drain bounds its work: at most four enforced passes,
+    then one last pass on an explicit drain or at most four bypass passes on
+    a teardown. An explicit drain can still return with such rows buffered,
+    when its last pass is refused by the clock lag or regression check, finds
+    no view it can trust, or finds the hour turned into a retired-index
+    hand-back that cannot deliver; a later flush retries them. A teardown
+    that cannot
     confirm the view, the first exception, can also write such rows without
     detecting the mismatch. Readers find these rows, since they are inside the
     scan set, but objects are immutable, so the hour stays pushdown-eligible

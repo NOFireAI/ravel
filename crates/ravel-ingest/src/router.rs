@@ -133,8 +133,10 @@ impl ShardHandle {
 
 impl LiveSender<ShardMsg> for ShardHandle {
     /// The current incarnation's mailbox unless it is closed or the shard is
-    /// condemned. A closed mailbox is left for the next write to observe and
-    /// respawn; the hand-back keeps its rows until then.
+    /// condemned. A closed mailbox is left for the next write routed to this
+    /// shard to observe and respawn. Nothing bounds when that write comes, so
+    /// a retired-index hand-back keeps its rows until then and a
+    /// generation-mismatch hand-back writes them in place at once.
     fn live_sender(&self) -> Option<mpsc::Sender<ShardMsg>> {
         let inner = self.lock();
         (!inner.condemned && !inner.tx.is_closed()).then(|| inner.tx.clone())
@@ -829,7 +831,9 @@ impl IngestRouter {
     ///
     /// A pass that handed rows back (ADR-1642 scan-set amendment) may have
     /// delivered them to a shard that had already answered its own flush, so
-    /// the fan-out repeats until a pass hands nothing back. Handed-back rows
+    /// the fan-out repeats until a pass hands nothing back, at most
+    /// `HAND_BACK_DRAIN_PASSES` (3) times; rows handed over on the last pass
+    /// stay buffered at their target for its next trigger. Handed-back rows
     /// land in the set of the generation the check named: the current one for
     /// a retired index, the hour's owner for a generation mismatch. That set's
     /// own check passes them unless the clock has meanwhile moved into an hour
@@ -837,13 +841,18 @@ impl IngestRouter {
     ///
     /// A hand-back whose send failed, on a full or closed mailbox or a target
     /// that is not live, moves no counter, so this loop cannot see it. Each
-    /// shard's own drain covers it instead: rows a generation-mismatch
-    /// hand-back left undelivered are retried there and, if the last pass
-    /// still cannot deliver them, written in place and counted
-    /// (`generation_mismatch_written_in_place`), so no shard answers this
-    /// drain with them buffered. Rows a retired-index hand-back could not
-    /// deliver stay buffered for a later flush, since written in place they
-    /// would sit where readers do not scan.
+    /// shard's own drain covers it instead. Rows a generation-mismatch
+    /// hand-back could not give a target that is not live are written in
+    /// place by the flush that found it; rows a full mailbox returned are
+    /// retried across the shard's passes and, if its last pass still cannot
+    /// deliver them, written in place, both counted on
+    /// `generation_mismatch_written_in_place`. A shard can still answer this
+    /// drain with them buffered when that last pass is refused by the clock
+    /// lag or regression check, finds no view it can trust, or finds the hour
+    /// turned into a retired-index hand-back that fails; a later trigger
+    /// retries them. Rows a retired-index hand-back could not deliver stay
+    /// buffered for a later flush, since written in place they would sit where
+    /// readers do not scan.
     pub async fn flush_all(&self) {
         for _ in 0..HAND_BACK_DRAIN_PASSES {
             let handed_back = self.metrics.rerouted_flushes();
@@ -886,12 +895,13 @@ impl IngestRouter {
     /// amendment). A retired-index hand-back always goes to a smaller set,
     /// which is still running and takes the rows. A generation-mismatch
     /// hand-back to a larger set finds that set already draining or drained:
-    /// each actor closes its mailbox before its teardown flush and writes
-    /// every hand-back it had already accepted, so such a send either landed
-    /// before the close and is written by the larger set, or fails as closed
-    /// and the source keeps the rows, writing them in place at its own
-    /// teardown. The sets are listed again after each one, since a hand-back
-    /// can construct the current generation's set during the drain.
+    /// each actor closes its mailbox before its teardown flush and absorbs
+    /// every hand-back it had already accepted into the buffers that flush
+    /// writes, so such a send either landed before the close and is written
+    /// by the larger set, or finds the target closed and the source writes
+    /// the rows in place on the flush that tried. The sets are listed again
+    /// after each one, since a hand-back can construct the current
+    /// generation's set during the drain.
     pub async fn shutdown(self) {
         let mut drained = Vec::new();
         while let Some((count, set)) = self.switch.largest_undrained_set(&drained) {

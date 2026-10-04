@@ -316,21 +316,24 @@ pub struct IngestMetrics {
     /// The part of `rerouted_flushes` handed back for
     /// [`HandBackReason::GenerationMismatch`] (issue #2429).
     rerouted_flushes_generation_mismatch: AtomicU64,
-    /// Hand-back episodes that could not deliver rows to a target shard,
-    /// because the target was dead, condemned or its mailbox closed, at the
-    /// liveness check or at the send, or its mailbox was full on a send that
-    /// may not wait. The rows stay in the source buffer and a later flush
-    /// retries, until a generation-mismatch hand-back's retry is spent
-    /// ([`crate::generation::mismatch_retry_spent`]) or a drain writes them.
-    /// Counted once per buffer until a hand-back from it delivers.
+    /// Hand-back episodes that kept rows in the source buffer for a later
+    /// flush to retry: a retired-index hand-back whose target was dead,
+    /// condemned or its mailbox closed, at the liveness check or at the send,
+    /// and a generation-mismatch hand-back whose target's mailbox was full on
+    /// a send that may not wait, until its retry is spent
+    /// ([`crate::generation::mismatch_retry_spent`]) or a drain writes the
+    /// rows. A generation-mismatch hand-back whose target is not live keeps
+    /// nothing and is not counted here. Counted once per buffer until a
+    /// hand-back from it delivers.
     hand_back_failures: AtomicU64,
     /// Flushes a teardown drain wrote in place under a shard index the read
     /// side does not scan for the hour they pinned, because a hand-back target
     /// was not live. Stored, and invisible to every query.
     teardown_unscanned_writes: AtomicU64,
     /// Buffers written in place although the flush found the hour owned by
-    /// a generation that routes at another count (issue #2429): at teardown,
-    /// or in a drain, when the hand-back could not deliver, or once a retried
+    /// a generation that routes at another count (issue #2429): on the flush
+    /// whose hand-back found a target not live, at teardown or on a drain's
+    /// last pass when a full mailbox still refused it, or once a retried
     /// hand-back reached the deferral cap. One per buffer.
     generation_mismatch_written_in_place: AtomicU64,
     /// Per-shard count of flushes the actor has handed to a spawned flush task
@@ -802,9 +805,10 @@ pub struct IngestMetricsSnapshot {
     /// [`HandBackReason::GenerationMismatch`]; the rest were
     /// [`HandBackReason::RetiredIndex`].
     pub rerouted_flushes_generation_mismatch: u64,
-    /// Hand-back episodes that left rows in the source buffer because a
-    /// target shard was not live or its mailbox was closed or full. Exported
-    /// as `ravel_ingest_hand_back_failures_total`.
+    /// Hand-back episodes that kept rows in the source buffer: a
+    /// retired-index target not live or closed, or a generation-mismatch
+    /// target's mailbox full. Exported as
+    /// `ravel_ingest_hand_back_failures_total`.
     pub hand_back_failures: u64,
     /// Teardown flushes written in place outside the scan set. Exported as
     /// `ravel_ingest_teardown_unscanned_writes_total`.
