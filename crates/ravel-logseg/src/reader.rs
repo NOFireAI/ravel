@@ -2054,7 +2054,14 @@ pub fn phrase_match(value: &[u8], word: &str) -> bool {
 /// blob layout is `canonical_attr_bytes(resource) || len+scope_name ||
 /// len+scope_version || canonical_attr_bytes(scope)` (see
 /// [`crate::record::stream_attrs_bytes`]); the two length-prefixed scope
-/// strings are positional, not key-value entries, so they are skipped over.
+/// strings are positional, not key-value entries, so they are left out of the
+/// pairs.
+///
+/// Implemented on [`crate::record::decode_stream_attrs`], the reader's decoder,
+/// so it refuses exactly the blobs that function refuses, with the same
+/// [`LogSegError`] (a scope name or version that is not UTF-8 included). The
+/// writer validates every STREAM_DIR blob through this function, which is what
+/// keeps it from writing a blob a reader cannot decode.
 ///
 /// Used by the writer's merged-view POSTINGS accumulation (to index the union
 /// of a record's stream and per-record attributes). Kept in this crate so the
@@ -2067,19 +2074,12 @@ pub fn phrase_match(value: &[u8], word: &str) -> bool {
 /// set a declared key reads. The blob grammar is frozen, so a second decoder
 /// elsewhere would be a copy that can drift from this one.
 pub fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
-    use crate::varint::get_uvarint;
-    let mut pos = 0usize;
-    let mut pairs = decode_attr_set(blob, &mut pos, 0)?;
-    for _ in 0..2 {
-        let len = get_uvarint(blob, &mut pos)?;
-        let len = usize::try_from(len)
-            .map_err(|_| LogSegError::Corrupted("stream_attrs scope string len".into()))?;
-        pos = pos
-            .checked_add(len)
-            .filter(|p| *p <= blob.len())
-            .ok_or_else(|| LogSegError::Corrupted("stream_attrs scope string".into()))?;
-    }
-    pairs.extend(decode_attr_set(blob, &mut pos, 0)?);
+    let crate::record::StreamAttrs {
+        resource: mut pairs,
+        scope_attrs,
+        ..
+    } = crate::record::decode_stream_attrs(blob)?;
+    pairs.extend(scope_attrs);
     Ok(pairs)
 }
 

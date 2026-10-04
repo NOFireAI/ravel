@@ -4219,6 +4219,56 @@ mod tests {
         }
     }
 
+    /// Stream `n`'s blob with its scope name or version replaced by bytes that
+    /// are not UTF-8: well-formed framing the reader's decoder still refuses.
+    fn non_utf8_scope_blobs(n: u8) -> [Vec<u8>; 2] {
+        let resource = [("service.name".into(), AttrValue::Str(format!("svc{n}")))];
+        let scope = [("lib".into(), AttrValue::I64(i64::from(n)))];
+        [
+            crate::record::stream_attrs_bytes_raw_scope(&resource, b"sc\xffpe", b"1.0", &scope),
+            crate::record::stream_attrs_bytes_raw_scope(&resource, b"scope", b"1.\xc3", &scope),
+        ]
+    }
+
+    /// The writer's refusal of `blob` must be the reader's decode error for it,
+    /// so an object the writer produces never carries a blob a reader refuses.
+    fn assert_refused_as_reader_would(result: Result<Vec<u8>, LogSegError>, blob: &[u8]) {
+        let want = match crate::record::decode_stream_attrs(blob) {
+            Err(LogSegError::Corrupted(msg)) => msg,
+            other => panic!("the reader must refuse this blob as Corrupted, got {other:?}"),
+        };
+        match result {
+            Err(LogSegError::Corrupted(msg)) => assert_eq!(msg, want),
+            Err(other) => panic!("expected Corrupted, got {other:?}"),
+            Ok(obj) => panic!(
+                "the writer produced a {}-byte object carrying a blob the reader refuses",
+                obj.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn row_writer_refuses_a_stream_attrs_blob_the_reader_cannot_decode() {
+        for blob in non_utf8_scope_blobs(4) {
+            let mut w = RlogWriter::new(RlogConfig::default(), identity());
+            let mut r = base_record(4, 0);
+            r.stream_attrs = blob.clone();
+            w.push(r).expect("push buffers without decoding");
+            assert_refused_as_reader_would(w.finish(), &blob);
+        }
+    }
+
+    #[test]
+    fn columnar_writer_refuses_a_stream_attrs_blob_the_reader_cannot_decode() {
+        for blob in non_utf8_scope_blobs(10) {
+            let batch = columnar_batch_with_stream_dir(vec![id(10)], vec![blob.clone()], 0);
+            let mut w = RlogWriter::new(RlogConfig::default(), identity());
+            w.push_columnar(batch)
+                .expect("push buffers without decoding");
+            assert_refused_as_reader_would(w.finish(), &blob);
+        }
+    }
+
     /// Builds a `ColumnarLogBatch` directly rather than through
     /// `ColumnarLogBatch::from_records`, which always keeps `stream_ids` and
     /// `stream_attrs` parallel: every field here is `pub`, so this is the shape
