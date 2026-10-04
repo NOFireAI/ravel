@@ -813,6 +813,8 @@ mod tests {
             "--key-source",
             "canonical-tenant",
             "--tenant-token",
+            "ok=acme",
+            "--tenant-token",
             "tok=acme;foo",
         ])
         .into_config()
@@ -821,8 +823,10 @@ mod tests {
             err.to_string().contains("--tenant-token"),
             "error names the flag: {err}"
         );
+        // The bad token is second, so a position that is off by one, or
+        // fixed at the first flag, fails this.
         assert!(
-            err.to_string().contains("position 1"),
+            err.to_string().contains("position 2"),
             "error names the offending flag's position: {err}"
         );
     }
