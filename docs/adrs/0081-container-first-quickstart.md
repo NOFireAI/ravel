@@ -306,8 +306,8 @@ each a release build of 12 minutes at the median. The job is advisory (see
 Consequences), so neither the pull request nor the merge queue waited on it:
 the cost bought a signal beside the review, not a gate. A change that touches
 only the server now skips the build on `pull_request` and `merge_group` events
-and runs it on the push, where a break is still reported against the commit
-that caused it. The other paths in decision 7, which are the quickstart's own
+and runs it on the push, where a break is reported against the merge-queue
+batch that carried it. The other paths in decision 7, which are the quickstart's own
 files, trigger the job on every event as before, so a README or compose edit
 is still checked on the pull request that makes it. If the job is promoted to
 a required check, this amendment has to be revisited first: a required check
@@ -317,10 +317,14 @@ quickstart now first fails on the push to `main`, and that run's conclusion is
 `failure`. The release gate in `publish-images.yml` reads the conclusion of the
 whole `ci` run for the tagged commit and fails closed on it, so this advisory
 job can veto a publish for a commit it did not block from merging, the same
-inversion ADR-0086 records for `coverage`. The effect is a release blocked for
-that commit until a fix lands, never an image published from a red run. The
-push run also covers every landing in its merge-queue batch, so a red run
-names the batch, not the single commit.
+inversion ADR-0086 records for `coverage`. The veto is scoped to that commit's
+own run: a tag on it does not publish, and no image is ever published from a
+red run. A tag on a later commit whose own push run does not touch the job's
+paths skips the job, concludes green, and publishes, whether or not the
+quickstart is still broken on `main`. That was already true while the job ran
+on pull requests, since an advisory job never stopped a merge; what changed is
+only where the break is first seen. The push run covers every landing in its
+merge-queue batch, so a red run names the batch, not the single commit.
 Tracked in issue #2520.
 
 One thing outside this ADR that A2 exposes: `scripts/demo.sh` passes no
