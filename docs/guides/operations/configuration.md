@@ -1,16 +1,14 @@
 # Configuration (day 0)
 
-Everything you decide before you start a process for the first time. Some of
-these choices are permanent for the lifetime of a bucket (the tenant hash
-scheme, a tenant's shard count), and some are a restart away (cache sizes,
-admission limits). The permanent ones are called out where they appear.
+Make these decisions before you start a process for the first time. You can
+change some of them with a restart (cache sizes, admission limits). Others are
+permanent for the lifetime of a bucket (the tenant hash scheme, a tenant's
+shard count), and each section says which.
 
-The exhaustive list of what every flag is called, its environment variable and
-its default lives in [the generated server flag reference](../../reference/ravel-server-flags.md)
+For the name, the environment variable and the default of every flag, see
+[the generated server flag reference](../../reference/ravel-server-flags.md)
 and [the generated CLI flag reference](../../reference/ravel-cli-flags.md).
-Those pages are rendered from the binaries' own command definitions and a test
-fails when they drift. This page explains how to choose a value, not what the
-flags are.
+The sections below tell you how to choose a value.
 
 - [Process modes](#process-modes)
 - [Storage backend and credentials](#storage-backend-and-credentials)
@@ -18,6 +16,7 @@ flags are.
 - [Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms)
 - [Admission limits](#admission-limits)
 - [Read cache tiers](#read-cache-tiers)
+- [SQL spill](#sql-spill)
 - [Retention and garbage-collection configuration](#retention-and-garbage-collection-configuration)
 - [Tenancy setup](#tenancy-setup)
 - [Durable shard count](#durable-shard-count)
@@ -27,9 +26,8 @@ flags are.
 
 ## Process modes
 
-`--mode` decides which jobs a process runs. It is the single most consequential
-flag on this page, because a deployment missing a mode is missing the work that
-mode does, silently.
+`--mode` decides which jobs a process runs. A deployment that lacks a mode
+lacks the work of that mode, and nothing reports the gap.
 
 | Mode | Runs |
 |---|---|
@@ -38,184 +36,207 @@ mode does, silently.
 | `query` | The query API, alert evaluation, and the on-demand fold route. No scheduled catalog fold. |
 | `maintain` | Compaction, retention, the sweeper, the at-rest scrubber, and the catalog fold over the tenants it owns. No ingest, no query API. It still binds `--listen-http` for liveness, and it needs a backend that reports the `multipart` capability. |
 
-The scheduled catalog fold runs in `maintain` and `all`; a `maintain` fleet
-divides it across replicas by ownership. Every maintenance
-loop runs only in `maintain`. A deployment made of `all` processes alone
-therefore folds its catalog but never compacts, never applies retention and
-deletes no durable data (its one delete is the admission reconcile's reap of
-dead ingest processes' admission snapshots), and a deployment made of `gateway` and `query`
-processes alone folds nothing on a timer. Read
-[Maintenance](maintenance.md) before you decide you do not need a `maintain`
-process.
+- The scheduled catalog fold runs in `maintain` and `all`. A `maintain` fleet
+  divides it across replicas by ownership.
+- Every maintenance loop runs only in `maintain`.
+- A deployment of `all` processes alone folds its catalog. It never compacts,
+  never applies retention and deletes no durable data. Its one delete is the
+  admission reconcile's reap of dead ingest processes' admission snapshots.
+- A deployment of `gateway` and `query` processes alone folds nothing on a
+  timer.
+
+Read [Maintenance](maintenance.md) before you decide that you do not need a
+`maintain` process.
 
 ## Storage backend and credentials
 
-`--store memory` is an in-process store for tests and local experiments.
-Nothing survives process exit. `--store s3` is the only durable choice.
+`--store s3` is the only durable store. `--store memory` is an in-process
+store for tests and local experiments, and nothing in it survives process
+exit.
 
-Ravel does not use the AWS credential chain (profiles, `AWS_ACCESS_KEY_ID`,
-`~/.aws/config`). It reads the `RAVEL_S3_*` environment variables and their
-matching flags, and nothing else. `force_path_style` is not configurable: the
-client always uses path-style addressing.
+Ravel reads the `RAVEL_S3_*` environment variables and their matching flags,
+and nothing else. It does not use the AWS credential chain (profiles,
+`AWS_ACCESS_KEY_ID`, `~/.aws/config`). `force_path_style` is not configurable:
+the client always uses path-style addressing.
 
-### Plaintext endpoints
-
-The client speaks plaintext HTTP only when `--s3-endpoint` itself says
-`http://`. An `https://` endpoint, and real AWS S3 with no endpoint at all,
-never fall back to plaintext, so a redirect or a misconfigured proxy cannot
-downgrade the connection.
-
-A plaintext endpoint puts every object this process writes and reads, and the
-credentials signing those requests, on the network in the clear. Startup
-therefore refuses an `http://` endpoint whose host is not loopback unless
-`--s3-allow-http` (`RAVEL_S3_ALLOW_HTTP`) is set. The refusal names the flag.
-
-- `http://127.0.0.1:9000`, `http://localhost:9000`, `http://[::1]:9000`:
-  allowed with no flag. The traffic never leaves the host.
-- `http://rustfs:9000`, `http://rustfs.ravel-system.svc:9000`, or any other
-  name or address on the network: refused unless the flag is passed. A
-  container or a pod reaches its object store over the network, never over
-  loopback, so a plaintext in-cluster RustFS or floci needs the flag even
-  though the traffic stays inside the cluster.
-- `https://...`: unaffected, and the flag does nothing.
-- `rustfs:9000`, or any endpoint written with no scheme: refused at startup.
-  An endpoint that begins with neither `https://` nor `http://` is not a
-  usable URL, so the refusal quotes the endpoint as it was written and asks
-  for the scheme. `--s3-allow-http` does not accept it: the flag chooses
-  between TLS and plaintext, and an endpoint with no scheme has asked for
-  neither. The scheme itself is matched without regard to case, so
-  `HTTPS://rustfs:9000` is an `https` endpoint.
-
-`ravel-cli` applies the same rule from the same code, with the same
-`--s3-allow-http` flag and `RAVEL_S3_ALLOW_HTTP` variable. It ships in the
-server image and talks to the same bucket with the same credentials, so a
-`ravel-cli` command against a plaintext non-loopback endpoint is refused
-unless the flag is passed, and an `https://` endpoint never enables plaintext
-there either.
-
-Under the Kubernetes operator the same decision is `spec.storage.s3.allowHttp`
-on the `RavelCluster` (default `false`), which renders the flag into every
-server container's arguments and `RAVEL_S3_ALLOW_HTTP=true` into the
-store-qualification Job that runs `ravel-cli store qualify` before any server
-pod exists. A cluster with a plaintext in-cluster endpoint therefore needs
-`allowHttp: true` for qualification to run at all.
-
-Prefer terminating TLS at the object store over setting the flag. The flag is
-for a development backend that speaks no TLS, not for a production one whose
-certificate is inconvenient.
-
-RustFS, for local development (loopback, so no flag):
+RustFS, for local development (a loopback endpoint, so it needs no
+`--s3-allow-http`):
 
 ```sh
 --store s3 --s3-endpoint http://127.0.0.1:9000 --s3-bucket ravel-dev \
 --s3-access-key ravel --s3-secret-key ravel-dev-secret
 ```
 
-AWS S3, with a static key pair (omit `--s3-endpoint`, which is what selects real
-S3):
+AWS S3, with a static key pair. Omit `--s3-endpoint` to select real S3:
 
 ```sh
 --store s3 --s3-bucket my-ravel-bucket --s3-region us-west-2 \
 --s3-access-key AKIA... --s3-secret-key ...
 ```
 
-A `--store s3` process with no bucket or no credentials fails at startup with an
-error naming the missing one. It never starts in a half-configured state.
+A `--store s3` process with no bucket or no credentials fails at startup with
+an error that names the missing one.
+
+### Plaintext endpoints
+
+The client uses TLS for an `https://` endpoint and for real AWS S3 with no
+endpoint. Those never fall back to plaintext, so a redirect or a misconfigured
+proxy cannot downgrade the connection. The client speaks plaintext HTTP only
+when `--s3-endpoint` itself says `http://`.
+
+A plaintext endpoint puts every object that the process writes and reads on
+the network in the clear, with the credentials that sign those requests. So
+startup refuses an `http://` endpoint whose host is not loopback unless
+`--s3-allow-http` (`RAVEL_S3_ALLOW_HTTP`) is set. The refusal names the flag.
+
+| Endpoint | Result |
+|---|---|
+| `http://127.0.0.1:9000`, `http://localhost:9000`, `http://[::1]:9000` | Allowed with no flag. The traffic never leaves the host. |
+| `http://rustfs:9000`, `http://rustfs.ravel-system.svc:9000`, or any other name or address on the network | Refused unless the flag is passed. |
+| `https://...` | Unaffected. The flag does nothing. |
+| `rustfs:9000`, or any endpoint written with no scheme | Refused at startup. `--s3-allow-http` does not accept it. |
+
+- A container or a pod reaches its object store over the network, never over
+  loopback. So a plaintext in-cluster RustFS or floci needs the flag, although
+  the traffic stays inside the cluster.
+- An endpoint that begins with neither `https://` nor `http://` is not a
+  usable URL. The refusal quotes the endpoint as it was written and asks for
+  the scheme. The flag chooses between TLS and plaintext, and an endpoint with
+  no scheme asked for neither.
+- The scheme is matched without regard to case, so `HTTPS://rustfs:9000` is an
+  `https` endpoint.
+
+`ravel-cli` ships in the server image and applies the same rule, with the
+same `--s3-allow-http` flag and `RAVEL_S3_ALLOW_HTTP` variable.
+
+Under the Kubernetes operator, set `spec.storage.s3.allowHttp` on the
+`RavelCluster` (default `false`). The operator renders the flag into the
+arguments of every server container. It also renders
+`RAVEL_S3_ALLOW_HTTP=true` into the store-qualification Job, which runs
+`ravel-cli store qualify` before any server pod exists. So a cluster with a
+plaintext in-cluster endpoint needs `allowHttp: true` for qualification to
+run.
+
+Terminate TLS at the object store in preference to the flag. The flag is for
+a development backend that speaks no TLS. It is not for a production backend
+whose certificate is inconvenient.
 
 ### Upload and read checksums
 
-Every PUT carries a CRC64-NVME checksum (`x-amz-checksum-crc64nvme`) by
-default, including those from the per-tenant stores `--tenant-kms-config`
-routes to. An object of any size up to S3's 5 GiB single-request limit is
-sent as one checksummed PUT rather than in parts. The endpoint verifies the body against it and rejects a PUT whose
-bytes changed on the way, so a corrupted object never becomes visible, and it
-stores the checksum with the object. Every request except a LIST also asks the
-endpoint to return that stored checksum (`x-amz-checksum-mode: ENABLED`), and a
-full-object read is verified against it before the bytes are used. A mismatch is an error,
-not a wrong answer. This is the only check a commit record gets: it is a bare
-protobuf with no checksum of its own.
+By default every PUT carries a CRC64-NVME checksum
+(`x-amz-checksum-crc64nvme`), and every full-object read is verified against
+the stored checksum.
 
-- `--s3-upload-integrity` (`RAVEL_S3_UPLOAD_INTEGRITY`): `crc64nvme` (the
-  default), `sha256`, or `off`. `sha256` is verified by the endpoint on upload
-  only: Ravel cannot recompute it on read, so a read of an object stored with
-  it counts as unverified.
-- `--s3-request-stored-checksum` (`RAVEL_S3_REQUEST_STORED_CHECKSUM`): `true`
-  (the default) or `false`, written `--s3-request-stored-checksum=false`.
-  Turned off, no request asks for the stored checksum, and every full-object
-  read is served unverified and counted.
+On a write:
 
-AWS S3 and RustFS accept both headers. An endpoint that does not accept the
-upload checksum header fails every PUT with the endpoint's error. Startup
-writes nothing to an existing bucket, so the process can report ready first
-and fail at its first flush. The remedy is `--s3-upload-integrity off`, and
-its cost is that every object the process writes, commit records included,
-has no transport checksum to verify against. An endpoint that rejects the
-checksum-mode request header needs `--s3-request-stored-checksum=false`. Both
-flags are ignored under `--store memory`. The per-tenant stores that
-`--tenant-kms-config` routes to apply both flags exactly as the default store
-does.
+- The default also applies to PUTs from the per-tenant stores that
+  `--tenant-kms-config` routes to.
+- An object of any size up to S3's 5 GiB single-request limit is sent as one
+  checksummed PUT, not in parts.
+- The endpoint verifies the body against the checksum and rejects a PUT whose
+  bytes changed on the way. So a corrupted object never becomes visible.
+- The endpoint stores the checksum with the object.
 
-A read that finds no stored checksum it can check is served, never refused, and
-counted in `ravel_store_get_unverified_total` (see
-[Observability](../observability.md)). Objects written before upload checksums
-were on carry none, so the counter moves on an upgraded bucket until retention
-or a rewrite replaces them. An object larger than one request body (8 MiB by
-default) is read in several responses, none of which covers the whole object,
-so every whole read of one is counted too: scrub, compaction and quarantine
-read large data objects whole, and the counter keeps growing on an honest
-endpoint. The counter does not separate that case from an endpoint that
-returns no stored checksum: a count that grows while no scrub, compaction or
-quarantine pass is reading, on a bucket written with `crc64nvme`, points at
-the endpoint.
+On a read:
+
+- Every request except a LIST asks the endpoint to return the stored checksum
+  (`x-amz-checksum-mode: ENABLED`).
+- A full-object read is verified against the stored checksum before the bytes
+  are used. A mismatch is an error, not a wrong answer.
+- This is the only check that a commit record gets. A commit record is a bare
+  protobuf with no checksum of its own.
+
+Two flags change the defaults:
+
+| Flag | Environment variable | Values |
+|---|---|---|
+| `--s3-upload-integrity` | `RAVEL_S3_UPLOAD_INTEGRITY` | `crc64nvme` (the default), `sha256`, or `off` |
+| `--s3-request-stored-checksum` | `RAVEL_S3_REQUEST_STORED_CHECKSUM` | `true` (the default) or `false`, written `--s3-request-stored-checksum=false` |
+
+- With `sha256`, the endpoint verifies on upload only. Ravel cannot recompute
+  it on read, so a read of an object stored with it counts as unverified.
+- With `--s3-request-stored-checksum=false`, no request asks for the stored
+  checksum. Every full-object read is served unverified and counted.
+- Both flags are ignored under `--store memory`.
+- The per-tenant stores that `--tenant-kms-config` routes to apply both flags
+  as the default store does.
+
+AWS S3 and RustFS accept both headers. For an endpoint that does not:
+
+| The endpoint rejects | Result | Remedy |
+|---|---|---|
+| The upload checksum header | Every PUT fails with the endpoint's error. Startup writes nothing to an existing bucket, so the process can report ready first and fail at its first flush. | `--s3-upload-integrity off`. Every object that the process writes, commit records included, then has no transport checksum to verify against. |
+| The checksum-mode request header | | `--s3-request-stored-checksum=false` |
+
+A read that finds no stored checksum that it can check is served, never
+refused. It is counted in `ravel_store_get_unverified_total` (see
+[Observability](../observability.md)). The counter moves in three cases:
+
+- Objects written before upload checksums were on carry none. The counter
+  moves on an upgraded bucket until retention or a rewrite replaces them.
+- An object larger than one request body (8 MiB by default) is read in
+  several responses, and none covers the whole object. So every whole read of
+  such an object is counted. Scrub, compaction and quarantine read large data
+  objects whole, and the counter keeps growing on an honest endpoint.
+- The endpoint returns no stored checksum. The counter does not separate this
+  case from the large-object case. A count that grows while no scrub,
+  compaction or quarantine pass is reading, on a bucket written with
+  `crc64nvme`, points at the endpoint.
 
 Under the Kubernetes operator the same two settings are
 `spec.storage.s3.uploadIntegrity` and `spec.storage.s3.requestStoredChecksum`
 on the `RavelCluster`. They also govern the operator's own S3 client.
-`ravel-cli` takes the same two options with the same defaults; see
-[Upload checksums](#upload-checksums) under its store options.
+`ravel-cli` takes the same two options with the same defaults. See
+[Upload checksums](#upload-checksums).
 
 ### Choosing a credential source
 
-`--s3-auth` picks where the credentials come from.
+`--s3-auth` selects where the credentials come from.
 
-- `static` (the default) takes the access key and secret key from the flags or
-  the environment. Both are required.
-- `instance-role` takes short-lived credentials from the EC2 instance metadata
-  service instead, so nothing static is stored on the instance, in the
-  environment, or in logs. Only `--s3-bucket` is then required, and passing any
-  of `--s3-access-key`, `--s3-secret-key`, `--s3-session-token` or
-  `--s3-credentials-file` alongside it is a startup error naming the conflict
-  rather than a precedence rule to reason about. An exported
-  `RAVEL_S3_ACCESS_KEY` counts. The first credential fetch happens at startup,
-  so a misconfigured instance role fails to start rather than failing its first
-  request.
+| Value | Source | Required |
+|---|---|---|
+| `static` (the default) | The access key and secret key from the flags or the environment. | Both keys. |
+| `instance-role` | Short-lived credentials from the EC2 instance metadata service. Nothing static is stored on the instance, in the environment, or in logs. | Only `--s3-bucket`. |
 
-On EC2, attach the instance role and start with no credential flags at all:
+Under `instance-role`:
+
+- Any of `--s3-access-key`, `--s3-secret-key`, `--s3-session-token` or
+  `--s3-credentials-file` is a startup error that names the conflict. No
+  precedence rule applies. An exported `RAVEL_S3_ACCESS_KEY` counts.
+- The first credential fetch happens at startup. So a misconfigured instance
+  role fails to start, and does not fail on its first request.
+
+On EC2, attach the instance role and start with no credential flags:
 
 ```sh
 ravel-server --store s3 --s3-bucket my-bucket --s3-region us-east-1 \
   --s3-auth instance-role
 ```
 
-Under `static` there are two further sources, both for credentials that rotate:
+Under `static`, two further sources serve credentials that rotate:
 
-- `--s3-session-token` pairs a temporary token with the key and secret for
-  credentials issued by a token service.
+- `--s3-session-token` pairs a temporary token with the key and secret, for
+  credentials that a token service issues.
 - `--s3-credentials-file` names a JSON file of `access_key_id`,
-  `secret_access_key` and an optional `session_token` that an external process
-  rewrites on disk. It wins over the inline flags, including the session token.
-  It is read once at startup, so an unreadable or malformed file fails startup;
-  after that it is re-read on the request path only when its modification time
-  changes, and a parse failure during a rotation keeps serving the last good
-  credential with a rate-limited warning.
+  `secret_access_key` and an optional `session_token`. An external process
+  rewrites the file on disk.
+  - The file wins over the inline flags, including the session token.
+  - It is read once at startup, so an unreadable or malformed file fails
+    startup.
+  - After startup it is re-read on the request path only when its
+    modification time changes.
+  - A parse failure during a rotation keeps serving the last good credential,
+    with a rate-limited warning.
+
+### Store options in ravel-cli
 
 `ravel-cli` accepts the same store flags and environment variables, including
-`--s3-auth`, with one gap: it has no `--s3-kms-key` and never sets a key id on
-its writes.
+`--s3-auth`. It has one gap: it has no `--s3-kms-key` and never sets a key id
+on its writes.
 
-`--store` unset means `memory`, and the fallback is not silent. Every
-`ravel-cli` command that walks tenant data opens its report with the store it
-resolved:
+With `--store` unset, `ravel-cli` uses `memory` and reports it. Every
+`ravel-cli` command that walks tenant data opens its report with the store
+that it resolved:
 
 ```
 store: memory (default)
@@ -223,8 +244,8 @@ store: memory
 store: s3
 ```
 
-On the defaulted memory store only, a walk that reaches no data at all is
-refused rather than reported as a healthy zero:
+On the defaulted memory store only, a walk that reaches no data is refused.
+It is not reported as a healthy zero:
 
 ```
 --store defaulted to memory, which holds no data for tenant "clickbench";
@@ -233,50 +254,51 @@ healthy zero-work result. Pass --store s3 (with RAVEL_S3_BUCKET and its
 credentials) to run against the real bucket, or load data first.
 ```
 
-An explicit `--store memory` keeps the zero-count report: that store was
-chosen, so an empty result is an answer.
+An explicit `--store memory` keeps the zero-count report.
 
 ### Upload checksums
 
 `ravel-cli --store s3` attaches a server-verified checksum to every PUT and
-asks for the stored one back on every read:
+asks for the stored one on every read, as the server does (see
+[Upload and read checksums](#upload-and-read-checksums)).
 
 - `--s3-upload-integrity` (`RAVEL_S3_UPLOAD_INTEGRITY`): `crc64nvme`, the
-  default, attaches `x-amz-checksum-crc64nvme`; `sha256` attaches
-  `x-amz-checksum-sha256`; `off` attaches none. The endpoint verifies the body
-  against the checksum, rejects a PUT whose bytes do not match, and stores the
-  checksum with the object. An endpoint that does not support the header fails
-  the first write loudly; `off` is the remedy there, and commit records written
-  under it are unverified. With a checksum on, every object goes out as one
-  PUT rather than in parts, so an overwrite above S3's 5 GiB single-request
-  limit is refused (with `off` named as the remedy); no `ravel-cli` write
-  comes near that size.
+  default, attaches `x-amz-checksum-crc64nvme`. `sha256` attaches
+  `x-amz-checksum-sha256`. `off` attaches none.
+- An endpoint that does not support the header fails the first write. `off`
+  is the remedy there, and commit records written under it are unverified.
+- With a checksum on, every object goes out as one PUT, not in parts. So an
+  overwrite above S3's 5 GiB single-request limit is refused, and the refusal
+  names `off` as the remedy. No `ravel-cli` write comes near that size.
 - `--s3-request-stored-checksum` (`RAVEL_S3_REQUEST_STORED_CHECKSUM`): on by
-  default, it sends `x-amz-checksum-mode: ENABLED`, so a whole-object read is
+  default, it sends `x-amz-checksum-mode: ENABLED`. A whole-object read is
   checked against a returned CRC-64/NVME or CRC-32C checksum before its bytes
-  are used, and a mismatch is an error. A read that comes back with no
-  checksum, or with a SHA-256 one, is served unverified.
-  `--s3-request-stored-checksum=false` stops sending the header, for an
+  are used, and a mismatch is an error.
+- A read that returns no checksum, or a SHA-256 one, is served unverified.
+- `--s3-request-stored-checksum=false` stops sending the header, for an
   endpoint that rejects it.
 
 `ravel-cli store qualify` reports whether the endpoint returns the stored
-checksum; see [qualify the store](deployment.md#qualify-the-store).
+checksum. See [qualify the store](deployment.md#qualify-the-store).
 
 ## Storage credential roles
 
-Every Ravel process holds one S3 credential and uses it for every object-store
-call it makes. With a single bucket-wide credential, a leak from any one process
-can read, overwrite or delete anything in the bucket. Scoping the credential to
-the job the process actually does means a leaked credential can only do what
-that job legitimately does, and only one of the four can delete durable data.
+You can give each process an S3 credential that is scoped to its job. A
+leaked scoped credential can do only what that job does, and only one of the
+four storage credential roles can delete durable data.
 
-This is enforced entirely at the storage backend's own policy layer (AWS IAM,
-or whatever policy layer an S3-compatible store exposes). Ravel's code plays no part in it: there
-is no in-process authorization check and no change to the `RAVEL_S3_*` contract.
-You provision a narrower credential per role and attach the policy.
+Every Ravel process holds one S3 credential and uses it for every
+object-store call. With a single bucket-wide credential, a leak from any one
+process can read, overwrite or delete anything in the bucket.
 
-Using one credential for everything is still supported, and it is the right
-choice for a development or single-operator deployment.
+The policy layer of the storage backend enforces the scope (AWS IAM, or the
+policy layer that an S3-compatible store exposes). Ravel has no in-process
+authorization check, and the `RAVEL_S3_*` contract does not change. You
+provision a narrower credential for each storage credential role and attach
+the policy.
+
+One credential for everything is still supported. It is the right choice for
+a development or single-operator deployment.
 
 ### The four roles
 
@@ -287,98 +309,114 @@ choice for a development or single-operator deployment.
 | Maintain | `--mode maintain` | Compaction, retention and the sweeper. Runs the scheduled catalog fold, so it also writes catalog snapshot parts, `HEAD`, and index objects (name postings and column stats). The only role that deletes durable data: L0 and L1 segments, commit records, idempotency markers, the query-audit shard, erasure requests (`del/*.dreq`) and superseded Parquet table manifests under `t/<hash>/pq/t/`. It also deletes superseded catalog snapshot parts and index objects, quarantined copies and dead worker records. `ravel-cli parquet sweep`, `ravel-cli parquet repair --delete` and `--delete-version`, `ravel-cli maintain compact-bucket` and `ravel-cli maintain compact-tenant` run under this credential. Reads each tenant's config record `t/<hash>/config` to resolve the retention window, and the alert state memo `t/<hash>/a/state/latest` for alert retention. |
 | Admin | `ravel-cli` | One-off bootstrap and mutation commands. Invoked by an operator or a CI job, never by a long-running server. The broadest of the four. Writes each tenant's config record `t/<hash>/config` (`typed-attr-column`, `clustering-key` and `bloom-scope` set commands) and Parquet location grants record `t/<hash>/pq/grants` (`tenant parquet-grant add` and `remove`; `add` also writes and deletes a probe object under `sys/pq-probe/`). See [the Admin credential](deployment.md#the-admin-credential). |
 
-Under `--tenant-kms-config`, Gateway, Query and Maintain also read and write each
-configured tenant's key-epoch record `t/<hash>/enc` at startup.
+Under `--tenant-kms-config`, Gateway, Query and Maintain also read and write
+the key-epoch record `t/<hash>/enc` of each configured tenant at startup.
 
 Maintain runs the scheduled catalog fold and Query runs the on-demand fold
-route, so both hold the catalog write grants. Gateway runs no fold, but
-`gateway.json` still carries the same catalog grants from when it did.
+route, so both hold the catalog write grants.
 
 ### The shipped policy documents
 
-One policy document per role lives in [`deploy/iam/`](../../../deploy/iam/)
-rather than being transcribed here, so a policy edit is a diff that a test
-checks against the real object-key layout in CI. Replace `my-ravel-bucket` with
-your bucket in each file, then attach each document to the principal whose
-access key that role's deployment uses.
+[`deploy/iam/`](../../../deploy/iam/) holds one policy document for each
+storage credential role.
 
-The KMS statement's `Resource` value is a JSON array, shipped with exactly one
-entry: the placeholder `arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID`.
-That single-entry array is correct as shipped only for a deployment with one
-KMS key. Two independent flags put keys in play (see
-[Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms)), and each
-role's policy must authorize every key its own writes and reads can reach, so
-that array needs an exact ARN for each of:
+1. In each file, replace `my-ravel-bucket` with your bucket.
+2. Set the KMS key ARNs, as described below.
+3. Attach each document to the principal whose access key the deployment of
+   that role uses.
 
-- the key configured with `--s3-kms-key`, if the deployment sets it. It is
-  applied to the default store, so it encrypts every PUT the process makes that
-  no per-tenant key overrides. Omit it and Gateway, Query and Maintain PUTs fail
-  with `AccessDenied`, and reads of objects already written under it fail KMS
-  decryption for every role including Admin.
-- every key configured in the `--tenant-kms-config` file, one entry each.
+**KMS key ARNs.** The `Resource` value of the KMS statement is a JSON array.
+It ships with one entry, the placeholder
+`arn:aws:kms:us-east-1:111122223333:key/REPLACE-WITH-TENANT-KEY-ID`. One entry
+is correct only for a deployment with one KMS key.
 
-Add each ARN as its own entry, rather than replacing the single placeholder with
-your one key and calling it done. A configured key missing from the array
-does not fail at startup: the process starts normally, and the gap surfaces
-only when a request first uses that key, as `AccessDenied` on that KMS call, at
-runtime rather than at deploy time.
+Two independent flags put keys in play (see
+[Encrypting objects with SSE-KMS](#encrypting-objects-with-sse-kms)). The
+policy of each role must authorize every key that its own writes and reads
+can reach. So the array needs an exact ARN for each of these keys:
 
-Three facts about those documents are worth knowing before you edit them.
+- The key configured with `--s3-kms-key`, if the deployment sets it. This key
+  is applied to the default store, so it encrypts every PUT that no
+  per-tenant key overrides. If you omit it, Gateway, Query and Maintain PUTs
+  fail with `AccessDenied`. Reads of objects already written under it fail
+  KMS decryption for every role, including Admin.
+- Every key configured in the `--tenant-kms-config` file, one entry each.
 
-**Every role denies delete on the protected prefixes.** Query's one delete
-grant covers only its own bucket-probe scratch objects under
-`sys/pq-probe/*`, Gateway's one delete grant covers only its dead processes'
-admission snapshots, and Admin's two cover only the scratch prefixes
-`sys/qualify/*` and `sys/pq-probe/*`. All three still carry the same explicit `Deny` on
-`s3:DeleteObject` and `s3:DeleteObjectVersion` over the protected control
-prefixes. An explicit `Deny` overrides any `Allow`, so those prefixes are
-undeletable even by Maintain.
+Add each ARN as its own entry. A configured key that is missing from the
+array does not fail at startup. The process starts normally, and the first
+request that uses that key fails with `AccessDenied` on that KMS call.
 
-**The audit prefix has two shards that are treated differently.** The legal-hold
-shard (`t/*/u/*/0000/*`) is deny-delete for every role including Maintain, so a
-legal hold cannot be destroyed. The query-audit shard (`t/*/u/*/0001/*`) is
-compacted and age-swept on a 90-day window by the Maintain process, so Maintain
-alone grants delete on it. The two shard paths are disjoint, but Maintain's
-level-based delete grants are not confined to them: an audit object is keyed
+Know three facts before you edit the documents.
+
+**Every role denies delete on the protected prefixes.**
+
+| Role | Delete grants |
+|---|---|
+| Query | One: its own bucket-probe scratch objects under `sys/pq-probe/*`. |
+| Gateway | One: the admission snapshots of its dead processes. |
+| Admin | Two: the scratch prefixes `sys/qualify/*` and `sys/pq-probe/*`. |
+
+All three still carry the same explicit `Deny` on `s3:DeleteObject` and
+`s3:DeleteObjectVersion` over the protected control prefixes. An explicit
+`Deny` overrides any `Allow`, so those prefixes are undeletable even by
+Maintain.
+
+**The audit prefix has two shards with different treatment.**
+
+- The legal-hold shard (`t/*/u/*/0000/*`) is deny-delete for every role
+  including Maintain, so a legal hold cannot be destroyed.
+- The query-audit shard (`t/*/u/*/0001/*`) is compacted and age-swept on a
+  90-day window by the Maintain process, so only Maintain grants delete on
+  it.
+
+The two shard paths are disjoint, but the level-based delete grants of
+Maintain are not confined to them. An audit object is keyed
 `t/<hash>/u/<level>/<shard>/...`, so `t/*/*/l0/*`, `t/*/*/c/*` and
-`t/*/*/l1/*` match legal-hold keys too. What keeps a legal hold safe is the
-explicit `Deny`, which names both `s3:DeleteObject` and
-`s3:DeleteObjectVersion` on that shard, and a `Deny` overrides an `Allow` only
-for the actions it names. If you edit these policies, keep the deny's action
-list at least as wide as every delete action an `Allow` grants on those keys.
+`t/*/*/l1/*` match legal-hold keys too.
+
+The explicit `Deny` keeps a legal hold safe. It names both `s3:DeleteObject`
+and `s3:DeleteObjectVersion` on that shard, and a `Deny` overrides an `Allow`
+only for the actions that it names. If you edit these policies, keep the
+action list of the deny at least as wide as every delete action that an
+`Allow` grants on those keys.
 
 **Tenant discovery needs a bare prefix entry.** Discovery lists the bare,
-delimited `t/` prefix rather than a per-tenant subpath, and under AWS
-`StringLike` none of the `t/*/...` wildcards match the literal string `t/`.
-Every role that performs discovery (Gateway, Query and Maintain) therefore needs
-a separate `t/` entry in its `ListBucket` condition alongside the per-key
-wildcards. This does not widen what those roles can read: listing a prefix
-enumerates keys, it does not grant `GetObject` on them.
+delimited `t/` prefix and not a per-tenant subpath. Under AWS `StringLike`,
+none of the `t/*/...` wildcards match the literal string `t/`. So every role
+that performs discovery (Gateway, Query and Maintain) needs a separate `t/`
+entry in its `ListBucket` condition, beside the per-key wildcards. This entry
+does not widen what those roles can read: a prefix listing enumerates keys
+and does not grant `GetObject` on them.
 
-One more note for anyone reading the policies: create-if-absent, compare-and-set
-and plain overwrite are all `s3:PutObject` at the policy layer. The difference
-between them is a request precondition header, not a separate action. So a
-role's write grant is a `PutObject` allow on its write prefixes, and the
-create-only and compare-and-set semantics are enforced by Ravel's own request.
-The key-layout the policies reference is documented normatively in
-[the catalog and MVCC contract](../../catalog-and-mvcc.md).
+**Every write is `s3:PutObject`.** Create-if-absent, compare-and-set and
+plain overwrite are all `s3:PutObject` at the policy layer. The difference
+between them is a request precondition header, not a separate action. So the
+write grant of a role is a `PutObject` allow on its write prefixes, and
+Ravel's own request enforces the create-only and compare-and-set semantics.
+
+[The catalog and MVCC contract](../../catalog-and-mvcc.md) is the normative
+document for the key layout that the policies reference.
 
 ### Subject-erasure grants
 
-Selective subject erasure adds one object prefix, `t/<hash>/<sig>/del/`, holding
-an erasure request (`<request_id>.dreq`, which contains the subject identifier)
-and its completion marker (`<request_id>.done`, which does not). The rewrite
-pass and physical sweep that erasure drives touch only prefixes Maintain already
-has, so only the new prefix needs grants:
+Selective subject erasure adds one object prefix, `t/<hash>/<sig>/del/`. The
+prefix holds two kinds of object:
+
+- an erasure request (`<request_id>.dreq`), which contains the subject
+  identifier
+- its completion marker (`<request_id>.done`), which does not
+
+The rewrite pass and the physical sweep that erasure drives touch only
+prefixes that Maintain already has. So only the new prefix needs grants:
 
 - Admin creates the request and deletes nothing.
 - Query and Maintain read the prefix, to attach pending predicates at resolve
   time and to scope the rewrite pass.
-- Maintain deletes the request only, after its completion marker exists and the
-  protection horizon passes.
-- No role, Maintain included, may delete a completion marker.
+- Maintain deletes the request only, after its completion marker exists and
+  the protection horizon passes.
+- No role, Maintain included, can delete a completion marker.
 
-Add each statement to the same policy file as the rest of that role's grants.
+Add each statement to the same policy file as the other grants of that role.
 The request and completion suffixes are disjoint key paths, so the Maintain
 delete allow and the completion deny never overlap.
 
@@ -418,37 +456,37 @@ delete allow and the completion deny never overlap.
 }
 ```
 
-Add `t/*/*/del/*` to the Query and Maintain `ListBucket` prefix conditions as
-well, and add the completion deny to all four policy documents.
+Also add `t/*/*/del/*` to the Query and Maintain `ListBucket` prefix
+conditions, and add the completion deny to all four policy documents.
 
 ### S3-compatible stores
 
-The four documents under `deploy/iam/` are ordinary S3 policy JSON: the same
-actions, the same `arn:aws:s3:::<bucket>/<prefix>` resources, the same explicit
-`Deny` semantics. A store that exposes an S3-compatible policy layer takes them
-unchanged; load them with that store's own administrative tooling, and attach
-one credential per role.
+A store that exposes an S3-compatible policy layer takes the four documents
+under `deploy/iam/` unchanged. They are ordinary S3 policy JSON: the same
+actions, the same `arn:aws:s3:::<bucket>/<prefix>` resources, the same
+explicit `Deny` semantics. Load them with the administrative tooling of that
+store, and attach one credential for each role.
 
-The local development and CI object store here is RustFS, provisioned with a
-single shared credential across every process, deliberately: the per-role split
-is a production hardening, and neither environment needs it. Ravel does not
-depend on any store-specific admin API, so nothing in this repository drives
-one.
+The local development and CI object store in this repository is RustFS, with
+one shared credential for every process. The per-role split is a production
+hardening, and neither environment needs it. Ravel depends on no
+store-specific admin API, so nothing in this repository drives one.
 
 ## Encrypting objects with SSE-KMS
 
-Two independent flags, both off by default.
+Two independent flags encrypt objects with SSE-KMS. Both are off by default.
 
-`--s3-kms-key <arn>` encrypts every PUT the process makes with one key. There is
-no routing and no new object: the single store every deployment already builds
-is constructed with that key id.
+`--s3-kms-key <arn>` encrypts every PUT that the process makes with one key.
+It adds no routing and no new object. The single store that every deployment
+builds is constructed with that key id.
 
-`--tenant-kms-config <path>` names a TOML file of per-tenant keys. Only this
-flag inserts the routing decorator into the store chain. It routes writes for a
-configured tenant's keyspace to a lazily built store constructed with that
-tenant's own key; every other tenant, and every read, falls through to the
-default store unchanged. It requires `--store s3` and refuses to start under
-`--store memory`.
+`--tenant-kms-config <path>` names a TOML file of per-tenant keys.
+
+- Only this flag inserts the routing decorator into the store chain.
+- It routes writes for the keyspace of a configured tenant to a lazily built
+  store, which is constructed with the key of that tenant.
+- Every other tenant, and every read, goes to the default store unchanged.
+- It requires `--store s3` and refuses to start under `--store memory`.
 
 ```toml
 # --tenant-kms-config kms-tenants.toml
@@ -457,27 +495,38 @@ acme = "arn:aws:kms:us-east-1:111122223333:key/acme-key"
 other = "arn:aws:kms:us-east-1:111122223333:key/other-key"
 ```
 
-The first time a tenant's key is configured, and on every later rotation to a
-different key, startup bootstraps that tenant's key-epoch history at
-`t/<hash>/enc`. Epoch 0 records an empty key (the deployment-default
-convention) with an activation time at the start of Unix time, which is at or
-before any tenant's earliest live object, so the custody check never meets an
-object that predates epoch 0. Epoch 1 follows immediately with the real key and
-the activation time of the moment of configuration. A restart with the same key
-is a no-op; a restart with a different key appends a rotation epoch. The epoch
-record is written before routing is switched to the new key, so a crash between
-the two can never leave data flowing through a key with no epoch record.
+### Key epochs
+
+Startup bootstraps the key-epoch history of a tenant at `t/<hash>/enc`. It
+does so the first time the tenant's key is configured, and on every later
+rotation to a different key.
+
+- Epoch 0 records an empty key (the deployment-default convention) with an
+  activation time at the start of Unix time. That time is at or before the
+  earliest live object of any tenant, so the custody check never meets an
+  object that predates epoch 0.
+- Epoch 1 follows immediately, with the real key and the activation time of
+  the moment of configuration.
+- A restart with the same key is a no-op. A restart with a different key
+  appends a rotation epoch.
+- Startup writes the epoch record before it switches routing to the new key.
+  So a crash between the two cannot leave data flowing through a key with no
+  epoch record.
+
+### Key grants
 
 **Both halves of the grant are required.** The key policy grants usage to the
-principal, and the principal's own policy must allow the action, or the request
-is denied before it reaches the key policy at all. Without both, the first
-encrypted PUT a role makes for a configured tenant fails closed with
-`AccessDenied`: once a tenant is named in the file, its writes route through
-that key unconditionally and there is no fallback to the default key.
+principal, and the principal's own policy must allow the action. If it does
+not, the request is denied before it reaches the key policy.
 
-A minimal per-tenant key policy, scoped to the roles that deployment actually
-runs. Every principal added here widens the blast radius the key policy exists
-to narrow.
+Without both, the first encrypted PUT that a role makes for a configured
+tenant fails closed with `AccessDenied`. After a tenant is named in the file,
+its writes always route through that key, with no fallback to the default
+key.
+
+A minimal per-tenant key policy follows, scoped to the roles that the
+deployment runs. Every principal that you add widens the blast radius that
+the key policy narrows.
 
 ```json
 {
@@ -508,83 +557,112 @@ to narrow.
 ```
 
 The matching role-side statement in each `deploy/iam/*.json` template holds a
-placeholder tenant key ARN that you must replace with your own (see
-[the shipped policy documents](#the-shipped-policy-documents)), scoped to real
-keys rather than to every key. Replace it with the exact ARN configured with
-`--s3-kms-key`, if the deployment sets that flag, plus one exact ARN for every
-key in the `--tenant-kms-config` file. The two flags are independent: the
-`--s3-kms-key` ARN covers every PUT that no per-tenant key overrides, and its
-absence from a role's array fails that role's PUTs, and every role's reads of
-objects written under it, with `AccessDenied`. With the keys in place:
+placeholder tenant key ARN. Replace it with the exact ARNs of your real keys,
+not with every key. [The shipped policy documents](#the-shipped-policy-documents)
+lists which ARNs each array needs. With the keys in place:
 
-- Gateway and Maintain write tenant data through the routing store and read some
-  of what they write, so they hold encrypt, generate-data-key and decrypt.
+- Gateway and Maintain write tenant data through the routing store and read
+  some of what they write. They hold encrypt, generate-data-key and decrypt.
 - Query reads tenant data and writes routed objects under `t/<hash>/`: the
-  catalog snapshot, `HEAD` and index objects its fold publishes, query-audit
-  records under `u/`, the `enc` key-epoch record, and the alert evaluator's
-  lease, state memo and transition objects. It holds encrypt,
+  catalog snapshot, `HEAD` and index objects that its fold publishes,
+  query-audit records under `u/`, the `enc` key-epoch record, and the lease,
+  state memo and transition objects of the alert evaluator. It holds encrypt,
   generate-data-key and decrypt.
-- Admin holds decrypt only, deliberately without generate-data-key: granting it
-  would let a leaked Admin credential mint ciphertext under tenant keys it has
+- Admin holds decrypt only, without generate-data-key. With that grant, a
+  leaked Admin credential can mint ciphertext under tenant keys that it has
   no write role for.
 
-`ravel-cli` separates tenant data from control records. The commands that
-write tenant data under the Maintain credential take the same
-`--tenant-kms-config` flag, read the same file, and route the same way the
-server does: `maintain compact-bucket`, `maintain compact-tenant` and
-`maintain migrate` (L1 segments and compaction records, and for `migrate` its
-cursor and the floor raise in `prov`) and `catalog fold` (catalog snapshot
-parts, `HEAD` and index objects). Pass them the file the servers use. For a
-tenant the file names, the command first reads that tenant's `t/<hash>/enc`
-key-epoch record. When its current key is the file's the command leaves it
-alone. When the record is absent, or its current key differs, the command
-refuses before any write, because only server startup records a configured or
-changed key and the record is append-only: start the server with the file
-first, then run the command. No `ravel-cli` command creates the record; the
-one write a command makes to it completes a record holding only the bootstrap
-epoch 0, which a server began and did not finish. The command then writes its
-data under `t/<hash>/` under the tenant's key. The epoch record itself is a
-control record, written under the bucket's default encryption. The command
-applies only the entry for its own `--tenant`. A tenant the file does not
-name is written under the bucket's default encryption, as the server writes
-it. The flag requires `--store s3`. A `--dry-run` validates the file, reads
-the key-epoch record and refuses as the real run would, prints the same
-routing line, and writes nothing. Maintain already holds encrypt and generate-data-key on the tenant
-keys and the `t/*/enc` write, so this needs no new grant.
+The `t/<hash>/enc` epoch record has its own grant. Gateway, Query and
+Maintain read and write it, because startup bootstraps it in every mode.
+Admin reads it for `verify-custody`. Every template denies its deletion.
 
-Admin stays decrypt-only, so no Admin command takes the flag, and what Admin
-writes under `t/<hash>/` stays under the bucket's default encryption whatever
-the file says: provisioning records, legal holds, reconstructed commit
-records, erasure requests, the tenant config record and the Parquet location
-grants record. These are control records, not tenant data. Admin's missing
-generate-data-key refuses none of these writes unless the bucket's default
-encryption is itself a customer-managed KMS key, in which case Admin needs
-generate-data-key on that key. `maintain verify-custody` checks write times
-against the key-epoch history, not the key each object is encrypted under, so
-it reports none of these records; for a tenant with a recorded epoch it prints
-a `control records:` line saying so.
+### SSE-KMS in ravel-cli
 
-Two other `ravel-cli` writers under `t/<hash>/` take no `--tenant-kms-config`
-and write under the bucket's default encryption. `maintain sweep` runs under
-the Maintain credential and writes only unnamed-since markers there; the
-quarantine copies it writes are outside `t/` and so would not route in the
-server either. `load`, the bulk loader, writes L0 segments, their commit
-records and, through `validate_or_adopt`, the tenant's provisioning record; a
-deployment that needs bulk-loaded data under a tenant's own key
-cannot get that from `ravel-cli` today.
-The `t/<hash>/enc` epoch record has its own grant: Gateway, Query and Maintain
-read and write it, because startup bootstraps it in every mode, and Admin reads
-it for `verify-custody`. Every template denies its deletion.
+`ravel-cli` separates tenant data from control records.
 
-Bytes written to the local read cache are not covered by any of this. See
+**Commands that route.** The commands that write tenant data under the
+Maintain credential take the same `--tenant-kms-config` flag, read the same
+file, and route as the server does:
+
+| Command | Writes |
+|---|---|
+| `maintain compact-bucket`, `maintain compact-tenant`, `maintain migrate` | L1 segments and compaction records. `migrate` also writes its cursor and the floor raise in `prov`. |
+| `catalog fold` | Catalog snapshot parts, `HEAD` and index objects. |
+
+Pass these commands the file that the servers use. The flag requires
+`--store s3`.
+
+- The command applies only the entry for its own `--tenant`.
+- A tenant that the file does not name is written under the bucket's default
+  encryption, as the server writes it.
+- For a tenant that the file names, the command first reads the
+  `t/<hash>/enc` key-epoch record of that tenant.
+
+| Key-epoch record | Result |
+|---|---|
+| Its current key is the key in the file | The command leaves the record alone and writes its data under `t/<hash>/` under the tenant's key. |
+| It is absent, or its current key differs | The command refuses before any write. Start the server with the file first, then run the command. |
+
+The command refuses because only server startup records a configured or
+changed key, and the record is append-only. No `ravel-cli` command creates
+the record. The one write that a command makes to it completes a record that
+holds only the bootstrap epoch 0, which a server began and did not finish.
+
+The epoch record itself is a control record, written under the bucket's
+default encryption.
+
+A `--dry-run` validates the file, reads the key-epoch record, refuses as the
+real run refuses, prints the same routing line, and writes nothing.
+
+Maintain already holds encrypt and generate-data-key on the tenant keys, and
+the `t/*/enc` write. So these commands need no new grant.
+
+**Admin commands.** Admin stays decrypt-only, so no Admin command takes the
+flag. What Admin writes under `t/<hash>/` stays under the bucket's default
+encryption, whatever the file says:
+
+- provisioning records
+- legal holds
+- reconstructed commit records
+- erasure requests
+- the tenant config record
+- the Parquet location grants record
+
+These are control records, not tenant data. The missing generate-data-key
+grant refuses none of these writes, with one exception. If the bucket's
+default encryption is itself a customer-managed KMS key, Admin needs
+generate-data-key on that key.
+
+`maintain verify-custody` checks write times against the key-epoch history,
+not the key that each object is encrypted under. So it reports none of these
+records. For a tenant with a recorded epoch, it prints a `control records:`
+line that says so.
+
+**Commands that do not route.** Two other `ravel-cli` writers under
+`t/<hash>/` take no `--tenant-kms-config` and write under the bucket's
+default encryption:
+
+- `maintain sweep` runs under the Maintain credential and writes only
+  unnamed-since markers there. The quarantine copies that it writes are
+  outside `t/`, so the server does not route them either.
+- `load`, the bulk loader, writes L0 segments, their commit records and,
+  through `validate_or_adopt`, the provisioning record of the tenant. A
+  deployment that needs bulk-loaded data under a tenant's own key cannot get
+  that from `ravel-cli` today.
+
+SSE-KMS does not cover bytes written to the local read cache. See
 [read cache tiers](#read-cache-tiers).
 
 ## Admission limits
 
 `--limits-file` names a TOML file with a `[defaults]` table and zero or more
-`[tenants.<id>]` override tables. Every field is optional and independently
-overridable: a tenant table only needs the fields that differ from
-`[defaults]`, which only needs the fields that differ from the shipped defaults.
+`[tenants.<id>]` override tables. With no `--limits-file`, every tenant gets
+the shipped defaults.
+
+Every field is optional, and you can override each one independently. A
+tenant table needs only the fields that differ from `[defaults]`. The
+`[defaults]` table needs only the fields that differ from the shipped
+defaults.
 
 | Field | Meaning |
 |---|---|
@@ -593,17 +671,21 @@ overridable: a tenant table only needs the fields that differ from
 | `ingest_bytes_per_sec` / `ingest_byte_burst` | Token-bucket rate and burst for ingested bytes. |
 | `series_creation_rate_per_sec` / `series_creation_burst` | Token-bucket rate and burst for new series and stream creation. |
 
-Any of the four count or rate fields, but not the two burst-only fields, accepts
-the literal string `"unlimited"` in place of a number, to opt a tenant out of
-that cap. With no `--limits-file`, every tenant gets the shipped defaults.
+Each of the four count or rate fields accepts the literal string
+`"unlimited"` in place of a number, to opt a tenant out of that cap. The two
+burst-only fields do not.
 
-Validation is fail-closed. The process refuses to start, rather than quietly
-keeping the shipped defaults, on a file that is not valid TOML, an unknown key
-in any table, an empty tenant id, a count or rate of zero or below, a burst set
-without a rate to pair with, or a burst set alongside `unlimited` for the same
-rate.
+Validation is fail-closed. The process refuses to start, and does not fall
+back to the shipped defaults, on any of these:
 
-### Shipped defaults, and what they cost in memory
+- a file that is not valid TOML
+- an unknown key in any table
+- an empty tenant id
+- a count or rate of zero or below
+- a burst set without a rate to pair with
+- a burst set alongside `unlimited` for the same rate
+
+### Shipped defaults and memory cost
 
 ```
 max_active_series            = 200000
@@ -614,158 +696,195 @@ series_creation_rate_per_sec = 10000
 series_creation_burst        = 100000
 ```
 
-The two active-count caps are the ones to size deliberately, because each
-tracked identity costs resident memory. Measured entry cost, including hash-table
-slot overhead, power-of-two table sizing at 7/8 load and allocator headroom, is
-35 to 56 bytes, not the roughly 16 bytes a naive estimate gives. The admission
-controller tracks active series and active streams in a two-epoch rotating set,
-so both epochs can be live at once:
+Size the two active-count caps with care, because each tracked identity costs
+resident memory. The measured entry cost is 35 to 56 bytes. That figure
+includes hash-table slot overhead, power-of-two table sizing at 7/8 load and
+allocator headroom. A naive estimate gives approximately 16 bytes.
+
+The admission controller tracks active series and active streams in a
+two-epoch rotating set, so both epochs can be live at once:
 
 ```
 cap x bytes_per_entry x 2 epochs x 2 signals (series + streams)
 ```
 
-At the shipped 200,000 caps that is 27 to 43 MiB per fully active tenant, so ten
-simultaneously fully active tenants cost 267 to 427 MiB in the worst case. At a
-1,000,000 cap the same arithmetic gives 134 to 214 MiB per tenant, and 1.3 to
-2.1 GiB for ten. Raise a tenant's ceiling explicitly in its own table when it
-needs one, sized against this formula.
+| Cap | One fully active tenant | Ten fully active tenants at once, worst case |
+|---|---|---|
+| 200,000 (shipped) | 27 to 43 MiB | 267 to 427 MiB |
+| 1,000,000 | 134 to 214 MiB | 1.3 to 2.1 GiB |
+
+When a tenant needs a higher ceiling, raise it in the table of that tenant
+and size it against this formula.
 
 ### Transient decompression memory
 
-Accepting gzip on OTLP over HTTP adds a second, transient memory demand that the
-ingest buffer budget does not account for. A gzip request is decompressed into a
-fresh buffer bounded by the 64 MiB decompressed cap, held only while the request
-holds an ingest concurrency permit:
+Gzip on OTLP over HTTP adds a second, transient memory demand that the ingest
+buffer budget does not account for. A gzip request is decompressed into a
+fresh buffer, bounded by the 64 MiB decompressed cap. The buffer is held only
+while the request holds an ingest concurrency permit:
 
 ```
 max_inflight_ingest_requests x 64 MiB
 ```
 
-At the default 1024 permits that is a 64 GiB worst case, far past what a small
-host has. Size `--max-inflight-ingest-requests` down so this product fits the
-headroom you have alongside the ingest buffer budget and the active-identity
-memory above. The three are additive and none bounds the others. The gRPC path
-is bounded at 16 MiB per in-flight request instead, so the same arithmetic
-applies with a 16 MiB factor.
+At the default 1024 permits that is a 64 GiB worst case, far more than a
+small host has. Lower `--max-inflight-ingest-requests` until this product
+fits your headroom, beside the ingest buffer budget and the active-identity
+memory above. The three are additive and none bounds the others.
+
+The gRPC path is bounded at 16 MiB per in-flight request, so the same
+arithmetic applies with a 16 MiB factor.
 
 ## Read cache tiers
 
-The read cache has a RAM tier, on unless `--disable-cache` is set or its
-ceiling resolves to `0` (what a gateway resolves when no ceiling flag is
-set), and an opt-in
-local-disk tier. `--cache-dir <path>` attaches the disk tier at that
-directory to both the query fetcher cache and the catalog byte cache, so a RAM
-eviction is served from local disk instead of paying the object-store round trip
-again:
+The read cache has a RAM tier and an opt-in local-disk tier.
+
+| Tier | State |
+|---|---|
+| RAM tier | On, unless `--disable-cache` is set or its ceiling resolves to `0`. A gateway resolves `0` when no ceiling flag is set. |
+| Disk tier | Off, unless `--cache-dir <path>` is set. |
+
+`--cache-dir <path>` attaches the disk tier at that directory to both the
+query fetcher cache and the catalog byte cache. A RAM eviction is then served
+from local disk and does not pay the object-store round trip again:
 
 ```sh
 ravel-server --store s3 --s3-bucket my-bucket --cache-dir /var/cache/ravel
 ```
 
-There is no separate capacity flag for the disk tier. Each tier is bounded by
-that cache's own resolved RAM ceiling, read once at startup with no live
+The disk tier has no separate capacity flag. Each tier is bounded by the
+resolved RAM ceiling of its own cache, read once at startup with no live
 resize.
 
-The fetcher cache and the catalog byte cache are two independent LRU caches
-with their own flags: `--cache-max-bytes` bounds the fetcher cache only, and
-`--catalog-cache-max-bytes` bounds the catalog byte cache only. Unset, the two
-derive separately from the process memory budget (see "Per-query budgets"
-below): the fetcher cache at 25% of it, or a larger 40% against a loopback
-`--s3-endpoint`, and the catalog byte cache always at a smaller 5%
-(`7516192768` and `1503238553` on the 30 GiB reference host at the 25% share).
-Startup refuses to start, rather than silently clamping, if the two resolved
-hard caps together reach or exceed the process memory budget (never in
-`--mode gateway`, which derives no budget). Both ceilings are LRU
-caps, not reservations: neither pre-allocates, each holds only the bytes it
-has admitted, and the sum of the two cache ceilings and the SQL memory pools
-(which derive from raw host memory, not the process memory budget) may
-exceed physical RAM by design (the caches fill only under a working set that
-large, and a SQL query aborts rather than growing past its own pool).
-`--disable-cache` turns both off and holds no read-cache memory.
+### Cache ceilings
 
-The disk tier is disposable by design. The directory is created lazily on first
+The fetcher cache and the catalog byte cache are two independent LRU caches.
+Each flag bounds only its own cache.
+
+| Cache | Flag | Unset, derives from the process memory budget |
+|---|---|---|
+| Fetcher cache | `--cache-max-bytes` | 25%, or a larger 40% against a loopback `--s3-endpoint`. `7516192768` on the 30 GiB reference host at the 25% share. |
+| Catalog byte cache | `--catalog-cache-max-bytes` | Always a smaller 5%. `1503238553` on the 30 GiB reference host. |
+
+[Per-query budgets](#per-query-budgets) describes the process memory budget.
+
+- Startup refuses to start, and does not clamp, if the two resolved hard caps
+  together reach or exceed the process memory budget. This never happens in
+  `--mode gateway`, which derives no budget.
+- Both ceilings are LRU caps, not reservations. Neither cache pre-allocates,
+  and each holds only the bytes that it admitted.
+- The sum of the two cache ceilings and the SQL memory pools can exceed
+  physical RAM by design. The SQL pools derive from raw host memory, not from
+  the process memory budget. The caches fill only under a working set that
+  large, and a SQL query aborts before it grows past its own pool.
+- `--disable-cache` turns both caches off and holds no read-cache memory.
+
+### Disk tier behaviour
+
+The disk tier is disposable. The directory is created lazily on first
 admission and is never required to exist. A missing, full or corrupt cache
-directory degrades to a store read, never to a query error, so a node whose
-cache directory is deleted while it is running answers every query correctly and
-only more slowly. SQL spill under the same directory is the exception: it is
-checked at startup, as described in "SQL spill" below.
+directory degrades to a store read, never to a query error. So a node whose
+cache directory is deleted while it runs answers every query correctly, only
+more slowly.
+
+SQL spill under the same directory is the exception: it is checked at
+startup. See [SQL spill](#sql-spill).
 
 **Cache bytes are not encrypted by SSE-KMS.** Server-side encryption protects
-object bytes at rest in the store, not the bytes this process writes to
-`--cache-dir`. An operator who needs encryption at rest for the cache directory
-provides it at the filesystem or volume layer, for example by mounting an
-encrypted volume there.
+object bytes at rest in the store, not the bytes that this process writes to
+`--cache-dir`. To encrypt the cache directory at rest, use the filesystem or
+volume layer, for example an encrypted volume mounted there.
 
-Once a disk tier is configured, each cache's counters gain a tier label
-alongside the existing cache label, so RAM and disk hit rates are reported
-separately. With no `--cache-dir` no tier label appears at all. See
-[the caching guide](../caching.md) for the full metric list and sizing advice.
+With a disk tier configured, the counters of each cache gain a tier label
+beside the cache label, so RAM and disk hit rates are reported separately.
+With no `--cache-dir`, no tier label appears. See
+[the caching guide](../caching.md) for the full metric list and sizing
+advice.
 
 ## SQL spill
 
 In a build with SQL, a query whose memory pool fills can spill its working
-state to local disk and finish, instead of failing with a resources-exhausted
-error, when its plan qualifies: an aggregation built only from `COUNT`, `SUM`
-over integers and `AVG` over integers, with no float `GROUP BY` key, optionally
-under an `ORDER BY` placed directly over it (see the end of this section). Any
-other aggregate (`MIN`, `MAX`, or `SUM` or `AVG` over
-floats) keeps the query on the existing refusal. Spilled files belong to one
-query and are removed when it ends. Nothing reads them afterwards.
+state to local disk and finish, when its plan qualifies. A query that does
+not qualify fails with a resources-exhausted error.
+
+- A plan qualifies when it is an aggregation built only from `COUNT`, `SUM`
+  over integers and `AVG` over integers, with no float `GROUP BY` key.
+- The aggregation can have an `ORDER BY` placed directly over it. See
+  [sort order over an aggregation](#sort-order-over-an-aggregation).
+- Any other aggregate (`MIN`, `MAX`, or `SUM` or `AVG` over floats) keeps the
+  query on the refusal.
+
+Spilled files belong to one query and are removed when it ends. Nothing reads
+them afterwards.
+
+### Spill settings
 
 The server takes the spill settings from the first of these sources that is
 configured:
 
-1. `--sql-spill off` disables spill whatever the other two sources say. Use
+1. `--sql-spill off` disables spill, whatever the other two sources say. Use
    it on a node with no safe local scratch storage. The other value, `auto`,
    is the default.
-2. `RAVEL_SQL_SPILL_DIR` and `RAVEL_SQL_SPILL_MAX_BYTES`, both set: spill goes
-   under that directory, and the process's queries together may hold at most
-   that many bytes of spill at once. The directory must already exist; the
-   server does not create it.
+2. `RAVEL_SQL_SPILL_DIR` and `RAVEL_SQL_SPILL_MAX_BYTES`, both set: spill
+   goes under that directory. The queries of the process together can hold at
+   most that many bytes of spill at once. The directory must already exist.
+   The server does not create it.
 3. `--cache-dir` set and `RAVEL_SQL_SPILL_DIR` unset: spill goes under
    `<cache-dir>/sql-spill/<instance-id>`, with a derived ceiling.
-   `RAVEL_SQL_SPILL_MAX_BYTES` set on its own replaces the derived ceiling.
-4. None of the above: spill is off and a query that outgrows its pool fails
-   as it always has.
+   `RAVEL_SQL_SPILL_MAX_BYTES` set alone replaces the derived ceiling.
+4. None of the above: spill is off, and a query that outgrows its pool fails.
 
-`RAVEL_SQL_SPILL_DIR` without `RAVEL_SQL_SPILL_MAX_BYTES`, or
-`RAVEL_SQL_SPILL_MAX_BYTES` alone with no `--cache-dir`, refuses startup with
-an error naming the missing variable.
+Two combinations refuse startup with an error that names the missing
+variable:
 
-The derived ceiling starts from the free bytes on the volume backing
-`<cache-dir>/sql-spill`, measured once at startup, less the most the read
-cache's disk tier in the same directory may hold (`cache_max_bytes` plus
-`catalog_cache_max_bytes` in the startup log, or nothing under
-`--disable-cache`). It is half of that, capped at four times the process
-memory budget (`memory_budget_bytes` in the startup log), and raised to
-1 GiB when that cap is below 1 GiB:
+- `RAVEL_SQL_SPILL_DIR` without `RAVEL_SQL_SPILL_MAX_BYTES`
+- `RAVEL_SQL_SPILL_MAX_BYTES` alone with no `--cache-dir`
+
+### Derived ceiling
+
+The derived ceiling is computed once at startup:
+
+1. Start from the free bytes on the volume that backs `<cache-dir>/sql-spill`.
+2. Subtract the most that the read cache's disk tier in the same directory
+   can hold. That is `cache_max_bytes` plus `catalog_cache_max_bytes` in the
+   startup log, or nothing under `--disable-cache`.
+3. Take half of the result.
+4. Cap it at four times the process memory budget (`memory_budget_bytes` in
+   the startup log).
+5. If that cap is below 1 GiB, raise the ceiling to 1 GiB.
 
 ```text
 min((free_bytes - read_cache_bytes) / 2, 4 * memory_budget_bytes), at least 1 GiB
 ```
 
-When `(free_bytes - read_cache_bytes) / 2` is below 1 GiB, spill is off
-instead: both startup lines read `value=none
-source=cache-dir-insufficient-space` and a WARN line says why. A derived
-ceiling is therefore never below 1 GiB and never more than half of what the
-read cache leaves free. The `sql_spill_max_bytes` line carries the two
-figures it was derived from as `free_bytes` and `read_cache_bytes`. On a
-volume with 200 GiB free and the defaults of a 30 GiB host (a
-30,064,771,072-byte budget, a 9,019,431,321-byte read cache), that is
-102,864,466,739 bytes: half of what the read cache leaves, below the
-120,259,084,288-byte cap.
+When `(free_bytes - read_cache_bytes) / 2` is below 1 GiB, spill is off. Both
+startup lines then read `value=none source=cache-dir-insufficient-space`, and
+a WARN line says why. So a derived ceiling is never below 1 GiB and never
+more than half of what the read cache leaves free. The `sql_spill_max_bytes`
+line carries the two figures that it was derived from, as `free_bytes` and
+`read_cache_bytes`.
 
-The ceiling is one budget for the whole process. A qualifying query reserves
-its own spill limit out of it before it starts: the ceiling, or whatever is
-left of it if that is less. When less than 64 MiB is left (or, under a
-ceiling smaller than 64 MiB, less than the whole ceiling), the query runs
-with spill off and a WARN line says why. The reservation is returned when
-the query ends. A query that starts while no other holds a reservation takes
-the whole ceiling, so a second qualifying query that starts while it runs
-gets no spill. There is no per-tenant spill quota, and nothing adds up the
-ceilings of several processes sharing one cache volume, so give each spilling
-process its own volume.
+For example, take a volume with 200 GiB free and the defaults of a 30 GiB
+host (a 30,064,771,072-byte budget, a 9,019,431,321-byte read cache). The
+ceiling is 102,864,466,739 bytes. That is half of what the read cache leaves,
+and it is below the 120,259,084,288-byte cap.
+
+The ceiling is one budget for the whole process:
+
+- A qualifying query reserves its own spill limit from the ceiling before it
+  starts. The limit is the ceiling, or what is left of it if that is less.
+- When less than 64 MiB is left, the query runs with spill off and a WARN
+  line says why. Under a ceiling smaller than 64 MiB, the threshold is the
+  whole ceiling.
+- The reservation is returned when the query ends.
+- A query that starts while no other holds a reservation takes the whole
+  ceiling. So a second qualifying query that starts while it runs gets no
+  spill.
+- Spill has no per-tenant quota, and nothing adds up the ceilings of several
+  processes that share one cache volume. Give each spilling process its own
+  volume.
+
+### Startup log
 
 Startup logs the result on two `performance default resolved` lines, in the
 same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
@@ -775,6 +894,8 @@ same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
 | `sql_spill_dir` | the spill directory, or `none` | `env`, `cache-dir`, `cache-dir-insufficient-space`, `flag-off` or `unset` |
 | `sql_spill_max_bytes` | the process spill ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `cache-dir-insufficient-space`, `flag-off` or `unset` |
 
+### Spill directory
+
 Under `--cache-dir` the layout is:
 
 ```text
@@ -782,69 +903,108 @@ Under `--cache-dir` the layout is:
 <cache-dir>/sql-spill/<instance-id>/ravel-spill-<pid>-<nonce>-<n>/   one per spilling query
 ```
 
-`<instance-id>` is the process's worker id, a UUID drawn at each start in
-every mode (a `maintain`-mode process also heartbeats under it), so every
-process and every restart gets its own directory. When spill resolves under
-`--cache-dir`, the process creates its directory before it serves a query and
-holds an exclusive lock on `.owner.lock` until it shuts down; the operating
-system releases the lock however the process exits.
+`<instance-id>` is the worker id of the process, a UUID drawn at each start
+in every mode. A `maintain`-mode process also heartbeats under it. So every
+process and every restart gets its own directory.
 
-A process that serves SQL sweeps `<cache-dir>/sql-spill` once at startup
-when `--cache-dir` is set, `--sql-spill` is not `off`, and
-`<cache-dir>/sql-spill` already exists; a `maintain` or `gateway` process
-does not sweep. The sweep runs before the free space is measured and before spill is resolved,
-so it also runs when spill resolves to the `RAVEL_SQL_SPILL_DIR` pair's
-directory or resolves off for lack of space, and the free space measured
-afterwards includes what it reclaimed: a volume whose free space was below
-the derived ceiling's 1 GiB floor only because of directories a crashed
-process left behind gets spill back at that start. The sweep does not create
-`<cache-dir>/sql-spill`, and it runs before the process creates its own
-directory. A directory under
-`<cache-dir>/sql-spill` is deleted only when this process can take that
-directory's lock itself, which means its owner is gone. A directory whose
-lock is held, or that has no `.owner.lock`, is left in place. The sweep logs
-nothing for a held lock and a WARN with the path for a directory whose
-ownership it cannot settle (no `.owner.lock`, or any other error taking the
-lock); after the sweep, every directory still left there is logged at INFO
-with its path and a reason. A `.swept-` directory, which an earlier sweep
-moved aside and did not finish deleting, is deleted without a lock check; if
-it is still there afterwards, its INFO line says its removal failed or is
-still in progress in another process. The sweep removes only what it lists
-under `<cache-dir>/sql-spill`; do not make that directory a symbolic link,
-because the sweep follows it. A process under `--sql-spill off` does not
-sweep at all.
+When spill resolves under `--cache-dir`, the process creates its directory
+before it serves a query. It holds an exclusive lock on `.owner.lock` until
+it shuts down. The operating system releases the lock however the process
+exits.
 
-Put `--cache-dir` on a local volume unless `--sql-spill off` is set: the
-sweep runs even when spill resolves elsewhere. The lock only
-proves ownership between processes on the same host. On a network mount
-whose locks are local to each client (NFS mounted with `nolock` or
-`local_lock`), a process on one host can take the lock of a directory a
-process on another host is still using, and its sweep then deletes that
-live directory.
+The spill directory is checked at startup, unlike the read cache. With
+`--cache-dir` set and spill resolving there, the server refuses to start if
+it cannot create `<cache-dir>/sql-spill`, measure its free space, or take the
+lock of its own directory. `--sql-spill off` starts without touching it.
 
-Unlike the read cache, the spill directory is checked at startup: with
-`--cache-dir` set and spill resolving there, the server refuses to start if it
-cannot create `<cache-dir>/sql-spill`, measure its free space, or take its own
-directory's lock. `--sql-spill off` starts without touching it.
+### Startup sweep
 
-An `ORDER BY` placed directly over an aggregation built only from `COUNT`,
-`SUM` and `AVG`, with no float `GROUP BY` column (or over the select list
-directly above it), gets the aggregation's `GROUP BY` columns appended as
-trailing tiebreak terms, ascending with nulls last, whatever the spill
+A process that serves SQL sweeps `<cache-dir>/sql-spill` once at startup when
+all of these hold:
+
+- `--cache-dir` is set.
+- `--sql-spill` is not `off`.
+- `<cache-dir>/sql-spill` already exists.
+
+A `maintain` or `gateway` process does not sweep. A process under
+`--sql-spill off` does not sweep.
+
+When the sweep runs:
+
+- It runs before the free space is measured and before spill is resolved. So
+  it also runs when spill resolves to the directory of the
+  `RAVEL_SQL_SPILL_DIR` pair, or resolves off for lack of space.
+- The free space measured afterwards includes what the sweep reclaimed.
+  Consider a volume whose free space was below the 1 GiB floor of the derived
+  ceiling only because of directories that a crashed process left behind.
+  That volume gets spill back at that start.
+- The sweep does not create `<cache-dir>/sql-spill`, and it runs before the
+  process creates its own directory.
+
+What the sweep deletes:
+
+- It deletes a directory under `<cache-dir>/sql-spill` only when this process
+  can take the lock of that directory itself, which means that its owner is
+  gone.
+- It leaves in place a directory whose lock is held, or that has no
+  `.owner.lock`.
+- It deletes a `.swept-` directory without a lock check. An earlier sweep
+  moved such a directory aside and did not finish deleting it.
+- It removes only what it lists under `<cache-dir>/sql-spill`. Do not make
+  that directory a symbolic link, because the sweep follows it.
+
+What the sweep logs:
+
+- Nothing for a held lock.
+- A WARN with the path for a directory whose ownership it cannot settle (no
+  `.owner.lock`, or any other error taking the lock).
+- After the sweep, an INFO line with the path and a reason for every
+  directory still left there.
+- For a `.swept-` directory that is still there afterwards, the INFO line
+  says that its removal failed or is still in progress in another process.
+
+Put `--cache-dir` on a local volume unless `--sql-spill off` is set, because
+the sweep runs even when spill resolves elsewhere. The lock proves ownership
+only between processes on the same host. On a network mount whose locks are
+local to each client (NFS mounted with `nolock` or `local_lock`), a process
+on one host can take the lock of a directory that a process on another host
+still uses. Its sweep then deletes that live directory.
+
+### Sort order over an aggregation
+
+An `ORDER BY` gets the `GROUP BY` columns of an aggregation appended as
+trailing tiebreak terms when both of these hold:
+
+- The aggregation is built only from `COUNT`, `SUM` and `AVG`, with no float
+  `GROUP BY` column.
+- The `ORDER BY` is placed directly over the aggregation, or over the select
+  list directly above it.
+
+The terms are ascending with nulls last. They are appended whatever the spill
 setting and whatever the types of the aggregated columns. The order is then
-total, so a qualifying statement returns the same rows in the same order
-with spill forced, with spill off, and in memory. A `GROUP BY` column the
-select list renames is matched under its new name, one it leaves out is
-carried to the sort and dropped again, and an alias that only shares a
-`GROUP BY` column's name is not taken for it. An `ORDER BY` over any other
-aggregate (such as `MAX` or `MIN`), over a float `GROUP BY` column, over
-grouping sets, over a `HAVING` filter, or over a nested subquery is left as
-written, and the query does not spill.
+total. So a qualifying statement returns the same rows in the same order with
+spill forced, with spill off, and in memory.
+
+- A `GROUP BY` column that the select list renames is matched under its new
+  name.
+- A `GROUP BY` column that the select list leaves out is carried to the sort
+  and dropped again.
+- An alias that only shares the name of a `GROUP BY` column is not taken for
+  it.
+
+An `ORDER BY` is left as written, and the query does not spill, when it is
+over any of these:
+
+- any other aggregate (such as `MAX` or `MIN`)
+- a float `GROUP BY` column
+- grouping sets
+- a `HAVING` filter
+- a nested subquery
 
 ## Retention and garbage-collection configuration
 
-These values govern when a deleted object's bytes actually go away, and they must
-agree with each other or a reader can lose a segment out from under it. The
+These values govern when the bytes of a deleted object go away. They must
+agree with each other, or a reader can lose a segment while it reads. The
 governing inequalities are:
 
 ```
@@ -853,85 +1013,104 @@ protection_horizon >= max_compaction_lifetime + 4 * clock_skew_allowance
 ```
 
 `max_compaction_lifetime` is compiled in (1h). The second bound keeps a late
-compaction or erasure-rewrite run from changing which inputs a sweep may delete
-after their horizon has passed.
+compaction or erasure-rewrite run from changing which inputs a sweep can
+delete after their horizon passed.
 
 The first three values are recorded once, deployment-wide, in a durable
-`sys/gc` object at the bucket root, and every mode validates itself against it
-at startup. That is what stops three independently deployed process
-configurations from drifting apart with nothing checking the constraint. The
-`clock_skew_allowance` term is not stored in `sys/gc`: it is an input to the
-check, taken from `gc-config set`'s own `--clock-skew-allowance` at write time
-and from the running sweeper's allowance (default 5m) at maintain startup, so a
-horizon that does not cover the sweeper's clock skew can neither be written nor
-run against. [Deletion and garbage collection](../../deletion-and-gc.md) has the
-argument.
+`sys/gc` object at the bucket root. Every mode validates itself against that
+object at startup. So independently deployed process configurations cannot
+drift apart unchecked.
 
-**Bootstrap never blocks a fresh deployment under a credential that may
+`clock_skew_allowance` is not stored in `sys/gc`. It is an input to the check:
+
+- At write time it comes from the `--clock-skew-allowance` of
+  `gc-config set`.
+- At maintain startup it comes from the allowance of the running sweeper
+  (default 5m).
+
+So a horizon that does not cover the sweeper's clock skew can neither be
+written nor run against. [Deletion and garbage collection](../../deletion-and-gc.md)
+has the argument.
+
+### Bootstrap on a fresh bucket
+
+**Bootstrap never blocks a fresh deployment under a credential that can
 create the object.** The first such process to touch a fresh bucket writes
-`sys/gc` from the maintain defaults, which satisfy the
-constraint by construction, then validates against the object it just wrote. If
-several processes start together against one empty bucket, one wins the create
-and the others read and validate against the winner's object. Under the
-per-role storage credentials only the Maintain and Admin roles may create the
-object, so on a fresh bucket start the `maintain` process first, or create it
-with `ravel-cli gc-config set` under Admin; see
-[the first deployment](deployment.md#the-first-deployment-against-a-fresh-bucket).
-With per-role credential Secrets the Kubernetes operator applies the maintain
-Deployment first on a fresh cluster and holds the gateway and query
-Deployments until maintain reports a ready replica, so no manual step is
-needed; with `maintain.enabled: false` it still applies both, their pods
-restart until `sys/gc` exists, and the cluster reports `Degraded=True` until
-you create the object under Admin. The Kubernetes guide describes the
-conditions the operator records while it waits.
+`sys/gc` from the maintain defaults, which satisfy the constraint by
+construction. It then validates against the object that it wrote. If several
+processes start together against one empty bucket, one wins the create. The
+others read and validate against the object of the winner.
 
-**What each mode validates:**
+Under the per-role storage credentials, only the Maintain and Admin roles can
+create the object. So on a fresh bucket, start the `maintain` process first,
+or create the object with `ravel-cli gc-config set` under Admin. See
+[the first deployment](deployment.md#the-first-deployment-against-a-fresh-bucket).
+
+With per-role credential Secrets, the Kubernetes operator does this:
+
+| Maintain | Operator behaviour on a fresh cluster |
+|---|---|
+| Enabled | It applies the maintain Deployment first. It holds the gateway and query Deployments until maintain reports a ready replica. No manual step is needed. |
+| `maintain.enabled: false` | It still applies the gateway and query Deployments. Their pods restart until `sys/gc` exists, and the cluster reports `Degraded=True` until you create the object under Admin. |
+
+The Kubernetes guide describes the conditions that the operator records while
+it waits.
+
+### What each mode validates
 
 - `maintain`: its configured protection horizon and grace must **equal** the
-  stored values. They are must-match, not independent knobs. A flag value that
-  satisfies the inequality but differs from the durable value still refuses to
-  start.
-- query-serving modes (`query`, `all`): the engine deadline must be less than or
-  equal to the stored `max_query_duration`, and the HEAD cache TTL the catalog
-  runs on must be less than or equal to the stored `head_cache_ttl`. A
-  format version 1 `sys/gc` records no `head_cache_ttl`, and the compiled
-  default (30 s) applies; `gc-config set --head-cache-ttl` writes format
-  version 2, which records one. The
-  [maintenance guide](maintenance.md#upgrading-sysgc-to-format-version-2) gives
-  the upgrade order.
+  stored values. They are must-match values, not independent settings. A flag
+  value that satisfies the inequality but differs from the durable value
+  still refuses to start.
+- Query-serving modes (`query`, `all`): the engine deadline must be less than
+  or equal to the stored `max_query_duration`. The HEAD cache TTL that the
+  catalog runs on must be less than or equal to the stored `head_cache_ttl`.
+  - A format version 1 `sys/gc` records no `head_cache_ttl`, and the compiled
+    default (30 s) applies.
+  - `gc-config set --head-cache-ttl` writes format version 2, which records
+    one. The
+    [maintenance guide](maintenance.md#upgrading-sysgc-to-format-version-2)
+    gives the upgrade order.
 - Flight SQL, in a build that has it: the ticket time-to-live ceiling must be
   less than or equal to `protection_horizon - grace`. The server reads that
-  ceiling from `sys/gc` rather than a compiled-in default, so it tracks the
-  durable authority automatically.
+  ceiling from `sys/gc` and not from a compiled-in default, so it tracks the
+  durable object automatically.
 
-### The flags, and the order to change them in
+### Flags and change order
 
-Each knob has a `ravel-server` flag, a humantime duration defaulting to its
-shipped value:
+Each value has a `ravel-server` flag. Each flag takes a humantime duration
+and defaults to its shipped value.
 
 - `--gc-protection-horizon` and `--gc-grace` feed the maintain compactor and
-  must **equal** the durable values. Set them to whatever the last
+  must **equal** the durable values. Set them to what the last
   `gc-config set` wrote.
 - `--gc-max-query-duration` sets the enforced deadline for every query engine
-  the process builds, and must stay at or below the durable
+  that the process builds. It must stay at or below the durable
   `max_query_duration` (default 1h). A value above it is rejected at startup,
   never clamped down.
-- `--gc-max-flush-lifetime` sets the compactor's flush lifetime, which is the
-  seal margin, the orphan age gate, and the retention floor. It is not part of
-  the must-match set, but it has its own floor: the process refuses to start,
-  and `gc-config set` refuses to write, a value below the ingest pipeline's
-  own compiled-in `max_flush_lifetime` (fixed at 1h; there is no flag to
-  change it). A lower value would call a bucket sealed before a real writer's
-  flush interlock has actually elapsed, letting the erasure completion gate
-  report a pending erasure request complete while a flush that can still
-  publish into that bucket is in flight.
+- `--gc-max-flush-lifetime` sets the flush lifetime of the compactor, which is
+  the seal margin, the orphan age gate, and the retention floor. It is not in
+  the must-match set, but it has its own floor.
+  - The floor is the compiled-in `max_flush_lifetime` of the ingest pipeline.
+    It is fixed at 1h, and no flag changes it.
+  - The process refuses to start with a value below the floor, and
+    `gc-config set` refuses to write one.
+  - A lower value calls a bucket sealed before the flush interlock of a real
+    writer has elapsed. The erasure completion gate can then report a pending
+    erasure request complete while a flush that can still publish into that
+    bucket is in flight.
 
 Each flag feeds both the startup validation and the real compactor or query
-engine, so a value that passes validation is the value actually enforced. The
-practical consequence of the must-match rule: changing a horizon is not a
-rolling config change. Change the durable object first, then bring every
-process's flags into line, and expect a process started against the old value to
-refuse rather than to run with it.
+engine, so a value that passes validation is the value enforced.
+
+Because of the must-match rule, a horizon change is not a rolling
+configuration change:
+
+1. Change the durable object.
+2. Bring the flags of every process into line.
+
+A process started against the old value refuses to start. It does not run
+with the old value.
 
 ```sh
 ravel-cli gc-config show
@@ -939,177 +1118,215 @@ ravel-cli gc-config set --protection-horizon 25h5m --grace 24h \
   --max-query-duration 1h --max-flush-lifetime 1h
 ```
 
-`gc-config set` is the single mutation path. It enforces the inequality at write
-time, refusing a violating proposal without writing anything, and swaps the
-object with a compare-and-set so a concurrent `gc-config set` is a reported
-conflict rather than a silent overwrite. Every value must be strictly positive:
-an all-zero configuration would satisfy the inequality trivially and be
-impossible for any mode to match, so it is rejected.
+`gc-config set` is the single mutation path:
 
-The Kubernetes operator carries a `spec.gc` block with `protectionHorizon` and
-`grace` for exactly this case. On a fresh bucket with a shared credential the
-first pod bootstraps `sys/gc` from the shipped defaults and every pod validates
-trivially; with per-role credential Secrets the operator applies the maintain
-Deployment first and its pod creates the object, as above. On a bucket whose
-stored protection horizon or grace was set to a non-default value with
-`gc-config set`, set `spec.gc.protectionHorizon` and `spec.gc.grace` to the
-stored values, which you read with `ravel-cli gc-config show`, and the operator
-renders `--gc-protection-horizon` and `--gc-grace` onto the maintain pods so
-they satisfy the must-match rule and start. Leave the block, or either field,
-unset to keep the shipped default; the other two stored values do not affect
-startup.
+- It enforces the inequality at write time. It refuses a violating proposal
+  and writes nothing.
+- It swaps the object with a compare-and-set. So a concurrent `gc-config set`
+  is a reported conflict, not a silent overwrite.
+- Every value must be strictly positive. An all-zero configuration satisfies
+  the inequality trivially and no mode can match it, so it is rejected.
+
+The Kubernetes operator carries a `spec.gc` block with `protectionHorizon`
+and `grace`:
+
+| Bucket | What to do |
+|---|---|
+| Fresh bucket, shared credential | Nothing. The first pod bootstraps `sys/gc` from the shipped defaults and every pod validates trivially. |
+| Fresh bucket, per-role credential Secrets | Nothing. The operator applies the maintain Deployment first and its pod creates the object. |
+| Stored protection horizon or grace set to a non-default value with `gc-config set` | Set `spec.gc.protectionHorizon` and `spec.gc.grace` to the stored values. Read them with `ravel-cli gc-config show`. The operator renders `--gc-protection-horizon` and `--gc-grace` onto the maintain pods, so they satisfy the must-match rule and start. |
+
+Leave the block, or either field, unset to keep the shipped default. The
+other two stored values do not affect startup.
 
 ### Age-based retention
 
-Retention is a separate concept from the GC safety horizons above, and it is off
-by default. `--retention-default <duration>` sets the window applied to every
-tenant with no override, and `--retention-tenant TENANT=DURATION` overrides it
-per tenant. Both take a humantime duration (`30d`, `720h`). Omitting both means
-nothing is age-deleted at all.
+Age-based retention is off by default. It is a separate concept from the GC
+safety horizons above.
 
-A window is validated at startup against a floor of
-`max_ingest_lag + max_flush_lifetime + clock_skew_allowance` plus one bucket
-span, so a bucket can never be tombstoned before it is sealed. A window below
-the floor fails startup rather than being clamped up to it.
+| Flag | Sets |
+|---|---|
+| `--retention-default <duration>` | The window applied to every tenant with no override. |
+| `--retention-tenant TENANT=DURATION` | The window for one tenant, which overrides the default. |
 
-Both retention flags are read only in `--mode maintain`. Setting them on a
-process that runs no maintenance loop configures nothing.
+Both flags take a humantime duration (`30d`, `720h`). With neither set,
+nothing is age-deleted.
+
+- Startup validates a window against a floor of
+  `max_ingest_lag + max_flush_lifetime + clock_skew_allowance` plus one
+  bucket span. So a bucket can never be tombstoned before it is sealed.
+- A window below the floor fails startup. It is not clamped up to the floor.
+- Both flags are read only in `--mode maintain`. On a process that runs no
+  maintenance loop, they configure nothing.
 
 Query-audit records have their own window, independent of tenant data
 retention. `--audit-retention <duration>` sets the age past which the
-maintenance loop deletes a query-audit record, measured from the newest event
-the record logs; the default is `90d`. Set it to your audit retention
-obligation. `0` keeps every query-audit record forever. Any nonzero window is
-accepted: every flush writes its own immutable record, and the sweep deletes a
-record only once every event in it is older than the window, so a short window
-never deletes an event younger than itself. A record is also kept until it is
-past the protection horizon, so a window shorter than the horizon behaves as
-the horizon. A legal hold covering the query-audit shard blocks the delete
-whatever the window. Like the tenant retention flags, it takes effect only in
-`--mode maintain`, but an unparseable value fails startup in every mode.
+maintenance loop deletes a query-audit record. The age is measured from the
+newest event that the record logs. The default is `90d`. Set it to your audit
+retention obligation.
+
+- `0` keeps every query-audit record forever.
+- Any nonzero window is accepted. Every flush writes its own immutable
+  record, and the sweep deletes a record only after every event in it is
+  older than the window. So a short window never deletes an event younger
+  than itself.
+- A record is also kept until it is past the protection horizon. So a window
+  shorter than the horizon behaves as the horizon.
+- A legal hold that covers the query-audit shard blocks the delete, whatever
+  the window.
+- The flag takes effect only in `--mode maintain`, as the tenant retention
+  flags do. An unparseable value fails startup in every mode.
 
 ## Tenancy setup
 
-Repeated `--tenant-token TOKEN=TENANT` flags configure tenants entirely. There is
-no tenant database and no admin API. To add, remove or rotate a token, restart
-with a different flag set. That is safe: every process is stateless, so a
-restart has no data migration to do. With no `--tenant-token`, no
-`--tenant-token-file`, and no OIDC or mTLS resolver configured, every request
-to a tenant-protected route is rejected; the health and `/metrics` routes
-carry no tenant, and `--dev-insecure-tenant-header` on a loopback listener is
-the development exception.
+Repeated `--tenant-token TOKEN=TENANT` flags configure tenants completely.
+Ravel has no tenant database and no admin API. To add, remove or rotate a
+token, restart with a different flag set. Every process is stateless, so a
+restart has no data migration to do.
 
-`--tenant-token-file PATH` (env `RAVEL_TENANT_TOKEN_FILE` for the path only,
-never a token value) is a file-based alternative to repeating `--tenant-token`,
-so a token never has to sit in argv or a process listing: one `TOKEN=TENANT`
-pair per line, blank lines and `#` comments skipped, each line split on the
-first `=` the same way `--tenant-token` is. A leading UTF-8 byte order mark is
-stripped before parsing. `--tenant-token` and `--tenant-token-file` are
-mutually exclusive; startup refuses if both are set. An empty or
-comment-only file parses to an empty map, the same as passing no
-`--tenant-token` at all: that authenticates nothing, and unless
-`--maintain-tenant` names tenants, background fold, compaction and retention
-widen to every tenant storage discovers rather than refusing startup. A Secret
-mount that failed to populate produces exactly this, with no error at startup.
+With no `--tenant-token`, no `--tenant-token-file`, and no OIDC or mTLS
+resolver configured, every request to a tenant-protected route is rejected.
+The health and `/metrics` routes carry no tenant.
+`--dev-insecure-tenant-header` on a loopback listener is the development
+exception.
 
 Tenant identity affects only key prefixing and authorization. It carries no
 other per-tenant configuration.
 
-A `TENANT` ending in `;ddl` (the tenant is the text before the LAST `;`)
-grants that token the `ddl` capability: absent by default, and the only thing
-that reads it is `CREATE EXTERNAL TABLE` and `DROP TABLE` over
-`POST /api/v1/sql`. Any other suffix, or an
-empty tenant before the `;`, refuses startup naming the flag position or the
-token file's line number, never the pair's text. A tenant with no `;` is
-unchanged and never carries the capability. See [Background](#background)
-for the decision behind this.
+### Token file
 
-`ravel-ingest-router` accepts the same `--tenant-token` spelling and strips the
-`;ddl` suffix, so it routes `acme;ddl` by the tenant `acme`; it never grants
-the capability. Tokens in the durable `sys/auth` map cannot carry `ddl`: the
-map is read without suffix parsing, so an entry written as `acme;ddl` names a
-tenant literally called `acme;ddl`, with no capability and no error. Grant
-`ddl` only through `--tenant-token`, `--tenant-token-file` or
-`--oidc-ddl-claim`.
+`--tenant-token-file PATH` is a file-based alternative to repeated
+`--tenant-token` flags, so that a token never sits in argv or a process
+listing. The environment variable `RAVEL_TENANT_TOKEN_FILE` carries the path
+only, never a token value.
+
+- The file has one `TOKEN=TENANT` pair per line.
+- Blank lines and `#` comments are skipped.
+- Each line is split on the first `=`, as `--tenant-token` is.
+- A leading UTF-8 byte order mark is stripped before parsing.
+
+`--tenant-token` and `--tenant-token-file` are mutually exclusive. Startup
+refuses if both are set.
+
+An empty or comment-only file parses to an empty map, the same as no
+`--tenant-token` at all. That authenticates nothing. Unless
+`--maintain-tenant` names tenants, background fold, compaction and retention
+then widen to every tenant that storage discovers, and startup does not
+refuse. A Secret mount that failed to populate produces this state, with no
+error at startup.
+
+### The ddl capability
+
+A `TENANT` that ends in `;ddl` grants that token the `ddl` capability. The
+tenant is the text before the LAST `;`. The capability is absent by default.
+Only `CREATE EXTERNAL TABLE` and `DROP TABLE` over `POST /api/v1/sql` read
+it.
+
+- Any other suffix, or an empty tenant before the `;`, refuses startup. The
+  error names the flag position or the line number in the token file, never
+  the text of the pair.
+- A tenant with no `;` is unchanged and never carries the capability.
+- [Background](#background) links the decision behind this.
+
+`ravel-ingest-router` accepts the same `--tenant-token` spelling and strips
+the `;ddl` suffix, so it routes `acme;ddl` by the tenant `acme`. It never
+grants the capability.
+
+Tokens in the durable `sys/auth` map cannot carry `ddl`. The map is read
+without suffix parsing, so an entry written as `acme;ddl` names a tenant
+literally called `acme;ddl`, with no capability and no error. Grant `ddl`
+only through `--tenant-token`, `--tenant-token-file` or `--oidc-ddl-claim`.
 
 ### Production authentication
 
-Two additive resolvers join the same first-success chain. Enabling them does not
-disable the bearer resolver, which stays the local and development path.
+Two additive resolvers join the same first-success chain. They do not disable
+the bearer resolver, which stays the local and development path.
 
-**OIDC.** Set `--oidc-issuer` and `--oidc-jwks-url` together; setting one
-without the other refuses to start. At least one `--oidc-audience` is also
-required, and OIDC with none set fails startup: without an audience, any
-correctly signed unexpired token from that issuer authenticates regardless of
-which relying party it was minted for. Every request's bearer token is verified
-against the issuer's key set: signature, issuer, expiry and audience. The
-signature algorithm is pinned from the key that
-verifies the token, never from the token's own header, so `alg: none` and
-algorithm-confusion tokens are rejected. A symmetric key in the key set is
-rejected outright, because a key set is a public document and a symmetric key
-inside one is a published verification secret. The tenant is read from
-`--oidc-tenant-claim` (default `tenant`) as a string, with no fallback to any
-other claim. `--oidc-ddl-claim <CLAIM>` names a second, optional claim that
-grants the same `ddl` capability the `;ddl` tenant-token suffix grants: the
-capability is present only when the verified token carries that claim as
-the JSON boolean `true`, never for a string, a number, an array, or a
-missing claim. Unset (the default), OIDC never grants the capability. The
-key set is cached in memory and refreshed on
-`--oidc-jwks-refresh-interval-secs`, so the request path never makes a network
-call, and the fetch is bounded by a timeout so a stalled host cannot wedge the
-refresh loop or the readiness gate. The first fetch must succeed before the
-server reports ready. A plaintext `http://` key-set URL to a non-loopback host
-is refused at startup: that response is the entire trust root for verification,
-and fetching it in plaintext lets anyone on the path substitute their own keys.
+**OIDC.**
+
+- Set `--oidc-issuer` and `--oidc-jwks-url` together. One without the other
+  refuses to start.
+- Set at least one `--oidc-audience`. OIDC with none set fails startup.
+  Without an audience, any correctly signed unexpired token from that issuer
+  authenticates, whatever relying party it was minted for.
+- The bearer token of every request is verified against the key set of the
+  issuer: signature, issuer, expiry and audience.
+- The signature algorithm is pinned from the key that verifies the token,
+  never from the token's own header. So `alg: none` and algorithm-confusion
+  tokens are rejected.
+- A symmetric key in the key set is rejected. A key set is a public document,
+  and a symmetric key inside one is a published verification secret.
+- The tenant is read from `--oidc-tenant-claim` (default `tenant`) as a
+  string, with no fallback to any other claim.
+- `--oidc-ddl-claim <CLAIM>` names a second, optional claim that grants the
+  same `ddl` capability as the `;ddl` tenant-token suffix. The capability is
+  present only when the verified token carries that claim as the JSON boolean
+  `true`. A string, a number, an array, or a missing claim never grants it.
+  Unset (the default), OIDC never grants the capability.
+- The key set is cached in memory and refreshed on
+  `--oidc-jwks-refresh-interval-secs`, so the request path never makes a
+  network call. A timeout bounds the fetch, so a stalled host cannot block
+  the refresh loop or the readiness gate.
+- The first fetch must succeed before the server reports ready.
+- A plaintext `http://` key-set URL to a non-loopback host is refused at
+  startup. That response is the whole trust root for verification, and a
+  plaintext fetch lets anyone on the path substitute their own keys.
 
 **mTLS, forwarded by a proxy.** Ravel does not terminate TLS or verify client
-certificates itself. `--mtls-enabled` reads a header (default
-`x-ravel-client-cert-cn`, override with `--mtls-header`) that a TLS-terminating
-reverse proxy sets to the already-verified certificate CN or SAN. This is a
-forwarded-header trust boundary: it is authoritative only because a trusted hop
-set it, and forgeable by anyone if that hop is absent.
+certificates itself. `--mtls-enabled` reads a header that a TLS-terminating
+reverse proxy sets to the already-verified certificate CN or SAN. The header
+is `x-ravel-client-cert-cn` by default, and `--mtls-header` overrides it.
 
-The resolver is installed on its own dedicated listener and nowhere else, so
-`--mtls-enabled` requires `--mtls-listener <addr>` and refuses to start without
-it. The public HTTP and gRPC listeners never consult the header at all, and the
-mTLS address must differ from every other listener address, which is checked at
-startup. Put the verifying proxy in front of the mTLS listener only, and have it
-strip or overwrite any client-supplied value of the header before forwarding.
-Binding `--mtls-listener` to the same address as a `--listen-http` that has
-`--dev-insecure-tenant-header` set is also refused, so the mTLS surface cannot
-inherit the development bypass. Enabling mTLS logs a startup warning naming the
-trusted header.
+This is a forwarded-header trust boundary. The header is authoritative only
+because a trusted hop set it, and anyone can forge it if that hop is absent.
+
+- The resolver is installed on its own dedicated listener and nowhere else.
+  So `--mtls-enabled` requires `--mtls-listener <addr>` and refuses to start
+  without it.
+- The public HTTP and gRPC listeners never consult the header.
+- The mTLS address must differ from every other listener address. Startup
+  checks this.
+- Put the verifying proxy in front of the mTLS listener only. Configure the
+  proxy to strip or overwrite any client-supplied value of the header before
+  it forwards.
+- Startup also refuses a `--mtls-listener` bound to the same address as a
+  `--listen-http` that has `--dev-insecure-tenant-header` set. So the mTLS
+  surface cannot inherit the development bypass.
+- With mTLS enabled, startup logs a warning that names the trusted header.
 
 `--mtls-listener` must bind a loopback address unless
-`--mtls-trust-forwarded-header` is also passed. Loopback is the one bind where
-the topology itself proves that only a local proxy can supply the header; on any
-other address, whether the header is trustworthy depends on a proxy Ravel cannot
-see. The flag turns nothing on and grants the resolver no trust it did not
-already have. It records that the operator chose the non-loopback bind
-deliberately and has a verifying proxy in front of it.
+`--mtls-trust-forwarded-header` is also passed.
 
-This is a behavior change for an existing deployment: a proxy-fronted mTLS
-listener bound to anything other than loopback (`0.0.0.0:9443`, a pod IP, a
-host address) now fails startup with a message naming the address and the flag.
-Add `--mtls-trust-forwarded-header` to the argument vector to keep it starting.
-Nothing else about the deployment changes. A loopback-bound mTLS listener is
-unaffected.
+- On loopback, the topology proves that only a local proxy can supply the
+  header. On any other address, trust in the header depends on a proxy that
+  Ravel cannot see.
+- The flag turns nothing on and grants the resolver no trust that it did not
+  already have. It records that you chose the non-loopback bind and have a
+  verifying proxy in front of it.
+- A proxy-fronted mTLS listener bound to anything other than loopback
+  (`0.0.0.0:9443`, a pod IP, a host address) fails startup without the flag.
+  The message names the address and the flag. Add
+  `--mtls-trust-forwarded-header` to the argument vector to keep such a
+  deployment starting. Nothing else about the deployment changes.
+- A loopback-bound mTLS listener is unaffected.
 
-Dependent flags fail fast: `--oidc-tenant-claim`, `--oidc-ddl-claim`, or
-`--oidc-audience` without OIDC enabled, `--mtls-header` or `--mtls-listener`
-without `--mtls-enabled`,
-`--mtls-enabled` without `--mtls-listener`, and `--mtls-trust-forwarded-header`
-without `--mtls-listener`, all refuse to start rather than quietly doing
-nothing.
+Dependent flags fail fast. Each of these combinations refuses to start:
 
-### The tenant hash scheme is permanent per bucket
+- `--oidc-tenant-claim`, `--oidc-ddl-claim`, or `--oidc-audience` without
+  OIDC enabled
+- `--mtls-header` or `--mtls-listener` without `--mtls-enabled`
+- `--mtls-enabled` without `--mtls-listener`
+- `--mtls-trust-forwarded-header` without `--mtls-listener`
 
-The object-key prefix for a tenant is a hash of the tenant id, pinned per bucket
-at the bucket's birth by a `sys/tenancy` marker. One binary carries both
-schemes and selects one at startup:
+### Tenant hash scheme
 
-- **v1 unkeyed**: a plain hash of the tenant id. Tenant names are not in keys,
-  but anyone with list access can confirm a guessed tenant id offline.
+The tenant hash scheme is permanent for a bucket. The object-key prefix for a
+tenant is a hash of the tenant id. A `sys/tenancy` marker pins the scheme for
+the bucket when the bucket is first used. One binary carries both schemes and
+selects one at startup:
+
+- **v1 unkeyed**: a plain hash of the tenant id. Tenant names are not in
+  keys, but anyone with list access can confirm a guessed tenant id offline.
 - **v2 keyed**, the default for new buckets: the prefix is keyed by a 32-byte
   deployment key loaded from `--tenant-hash-key-file`. It is a file, never an
   inline value, so the secret never appears in a process listing. Without the
@@ -1117,84 +1334,85 @@ schemes and selects one at startup:
 
 Startup pinning:
 
-- A fresh bucket refuses to start with no key unless `--tenant-hash-unkeyed` is
-  passed explicitly. Keyed is the default and the choice is permanent.
-- An existing keyed bucket refuses to start when the configured key's
-  fingerprint disagrees with the marker. A wrong key is a failed deploy, not a
-  silent parallel namespace. `ravel-cli tenancy show --tenant-hash-key-file
-  <path>` verifies a key against a bucket offline.
-- A bucket with data and no marker is adopted as v1 unkeyed once, logged and
-  counted at `/metrics` as `ravel_tenancy_v1_unkeyed_adoptions_total`. Its
-  existing prefixes are unchanged.
+- A fresh bucket refuses to start with no key unless `--tenant-hash-unkeyed`
+  is passed explicitly. Keyed is the default and the choice is permanent.
+- An existing keyed bucket refuses to start when the fingerprint of the
+  configured key disagrees with the marker. A wrong key is a failed deploy,
+  and it does not create a parallel namespace.
+  `ravel-cli tenancy show --tenant-hash-key-file <path>` verifies a key
+  against a bucket offline.
+- A bucket with data and no marker is adopted as v1 unkeyed once. The
+  adoption is logged and counted at `/metrics` as
+  `ravel_tenancy_v1_unkeyed_adoptions_total`. Its existing prefixes are
+  unchanged.
 
-**Key custody.** For a keyed bucket the deployment key is durable state that
-lives outside the object store, and losing it makes every tenant prefix
+**Key custody.** For a keyed bucket, the deployment key is durable state that
+lives outside the object store. If you lose it, every tenant prefix is
 unattributable. Bucket plus key is always enough to recover the full mapping
 from tenant id to prefix, through the per-tenant recovery manifests under
-`sys/t/`; the bucket alone reveals nothing.
+`sys/t/`. The bucket alone reveals nothing.
 
-There is no migration between the two schemes. Moving a bucket between them
-would relocate every object and is not built. A deployment that needs to change
-schemes starts a new bucket and drains into it.
+No migration between the two schemes is possible. A move between them
+relocates every object and is not built. To change schemes, start a new
+bucket and drain into it.
 
 ## Durable shard count
 
-`--shards` is a default for tenants that have not yet been provisioned. It is
-not a per-tenant setting you can change after the fact for existing data:
-generation 0's shard count is fixed forever once a tenant's data for a signal
-is written across it. The flag sets both the ingest router's shard count and
-the query-side catalog's shard count for new tenants, which is why there is no
-separate query-side flag.
+`--shards` is the default shard count for tenants that are not yet
+provisioned. You cannot change the shard count of existing data with it. The
+shard count of generation 0 is fixed permanently after the data of a tenant
+for a signal is written across it.
 
-The first write for a tenant and signal records its shard count as generation 0
-of a durable, append-only shard-generation history in a provisioning record at
-`t/<tenant_hash>/<signal>/prov`. Every later ingest, query, and maintenance
-touch reads that history and routes each hour over the shard count active for
-that hour, not over a single fixed count: `ravel-cli provision reshard` appends
-a new generation with a different shard count, taking effect at a future
-activation hour, without moving or re-keying existing data. Relying on
-generation 0's count alone misses any later reshard; always route from the
-persisted generation history.
+The flag sets both the shard count of the ingest router and the shard count
+of the query-side catalog for new tenants. So the query side has no separate
+flag.
 
-An already-provisioned tenant keeps its own generation history: changing the
-global `--shards` default (for example, lowering it for new tenants) does not
-affect a tenant that already has a record, and does not refuse startup, fail its
-queries, or skip its maintenance. This drift between a tenant's generation-0
-recorded count and the live default is expected and is surfaced as an
-informational metric, not an error.
+The first write for a tenant and signal records its shard count as
+generation 0 of a durable, append-only shard-generation history. The history
+is in a provisioning record at `t/<tenant_hash>/<signal>/prov`. Every later
+ingest, query, and maintenance touch reads that history. It routes each hour
+over the shard count that is active for that hour, not over a single fixed
+count.
 
-The one case still refused is a record whose shard count would hide existing
-data if adopted, and an unreadable (corrupt or future-format) record whose true
-shard count cannot be trusted; both fail closed.
+`ravel-cli provision reshard` appends a new generation with a different shard
+count. The generation takes effect at a future activation hour, and existing
+data is not moved or re-keyed. Always route from the persisted generation
+history: the count of generation 0 alone misses any later reshard.
 
-A brand-new tenant with no prior writes has no record yet, so a fresh
-deployment, including an operator-managed cluster that starts with zero data and
-configured tokens, starts normally. The record is created on the tenant's first
-write and pins the live `--shards` default as that tenant's count.
+| Tenant | Behaviour |
+|---|---|
+| Already provisioned | It keeps its own generation history. A change to the global `--shards` default (for example, lowering it for new tenants) does not affect it. Startup does not refuse, its queries do not fail, and its maintenance is not skipped. The drift between the generation-0 recorded count and the live default is expected. It is reported as an informational metric, not an error. |
+| New, with no prior writes | It has no record yet, so a fresh deployment starts normally. This includes an operator-managed cluster that starts with zero data and configured tokens. The first write of the tenant creates the record and pins the live `--shards` default as the count of that tenant. |
+| Its record has a shard count that hides existing data if adopted | Refused. It fails closed. |
+| Its record is unreadable (corrupt or future-format), so its true shard count cannot be trusted | Refused. It fails closed. |
 
-**Adopting data written before the record existed.** A tenant and signal that
-already had data is adopted the first time a server ingests or maintains it, or
-deliberately ahead of a rollout:
+**Adopt data written before the record existed.** A tenant and signal that
+already had data is adopted the first time a server ingests or maintains it.
+You can also adopt it ahead of a rollout:
 
 ```sh
 ravel-cli provision adopt --tenant <name> --shards <n>
 ```
 
 Adoption writes the record only when every observed shard index is below
-`--shards`. If any observed index is at or above it, adoption refuses and writes
-nothing, because that value is provably hiding data. Run `provision adopt` before
-rolling out a version that enforces the record, so a refusal surfaces as a CLI
-error you can act on rather than as a server that will not start mid-rollout.
+`--shards`. If any observed index is at or above it, adoption refuses and
+writes nothing, because that value hides data.
+
+Run `provision adopt` before you roll out a version that enforces the record.
+A refusal then shows as a CLI error that you can act on, and not as a server
+that does not start mid-rollout.
 
 ## Logs fetch policy and store cost profile
 
-The logs read path chooses, per object, whether to fetch the whole object in one
-request or to fetch only the projected byte ranges. On an intra-region S3
-deployment transfer is free and the bill is requests, so a ranged read spends a
-billed request to save bytes that cost nothing. Elsewhere the reverse holds.
-Three flags size this, all read at startup only.
+For each object, the logs read path either fetches the whole object in one
+request or fetches only the projected byte ranges. Three flags size this
+choice, and all three are read at startup only.
 
-`--logs-fetch-policy` takes one of four values, spelled exactly as here.
+On an intra-region S3 deployment, transfer is free and the bill is requests.
+A ranged read there spends a billed request to save bytes that cost nothing.
+Elsewhere the reverse holds.
+
+`--logs-fetch-policy` takes one of four values, spelled as in the table.
 Unset, it resolves `cost-based` on every deployment, including a `--store s3`
 deployment against a loopback `--s3-endpoint`.
 
@@ -1203,50 +1421,69 @@ deployment against a loopback `--s3-endpoint`.
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
 | `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
 | `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved at startup from the profile's prices and its measured request timings. | You want the shape the deployment's own prices and timings imply. At the reference intra-region profile, on every store including a loopback one, a request costs 6,300,000 bytes (its time term), so a projection that skips more than 18,900,000 bytes of an object reads ranged and every object of 18,900,000 bytes or less reads whole. |
-| `latency-first` | Fewest transferred bytes, exactly like `byte-minimal`. An intent, not a tuning constant: it says spend requests to save wall time, and leaves how up to the concurrency you configure. | Cold wall-clock matters more than the request bill, and you are willing to raise the object-store GET concurrency and the SQL scan width explicitly to cash in the trade: measured over 3 reps on a 42-statement reference corpus, true cold in the warm-up-empty state, at GET concurrency 256: 5.30x the GET requests (570,752 against 107,781) for 52% less cold time, with a per-rep range of 50.3% to 54.2%. That ratio is a measurement of two code paths at one point in the project's history, not a property of the policy, and it has already moved once as the cost-based side changed; the decision record for the fetch objective names the exact build it was taken on. Re-measure against the build you run rather than treating it as a constant. |
+| `latency-first` | Fewest transferred bytes, as `byte-minimal`. It states an intent: spend requests to save wall time. The concurrency that you configure decides how. | Cold wall-clock matters more than the request bill, and you will raise the object-store GET concurrency and the SQL scan width explicitly. See [the latency-first trade](#the-latency-first-trade). |
 
-For any policy value a query returns exactly the same rows. Only request counts
-and timing differ.
+For any policy value a query returns the same rows. Only request counts and
+timing differ.
 
-`latency-first` resolves `--store-get-concurrency`, `--sql-partition-count`,
-and `--promql-fetch-fanout` the same way every other policy does -- it sets no
-default of its own. The measured trade above only pays off once you raise
-the GET permits and the SQL scan width together to the concurrency the
-measurement used; `--fetch-concurrency` raises all three at once. Selecting
-the policy on its own is not inert: the byte quantities change immediately, so
-a logs read is routed the way `byte-minimal` routes it, taking ranged reads
-wherever they save more bytes than a request costs and whole-object reads
-where they do not. On the reference corpus against real S3 that shape at the
-default concurrency measured slower than the default policy, not faster. Treat the
-concurrency as a precondition, not a suggestion. The startup line says which
-side of it this process is on, and it reports the precondition met only when
-both the GET permits and the scan width have been raised.
-Raising concurrency also raises in-flight fetch memory, and that memory is not
-yet bounded by a process-wide budget: watch process memory yourself when
-trying this policy, since an under-provisioned raise can end in an
-out-of-memory kill instead of a faster query.
-
-The policy is an operator surface only. It is never derivable from query text, a
-header or a ticket: under request billing, a tenant that could force
-`byte-minimal` per query would multiply the deployment's request bill by the
+The policy is an operator setting only. It is never derived from query text,
+a header or a ticket. Under request billing, a tenant that can force
+`byte-minimal` per query multiplies the request bill of the deployment by the
 measured amplification factor. The running engine also never changes its own
-policy. If a measurement shows the default is wrong for a deployment, set
-`--logs-fetch-policy` explicitly.
+policy. If a measurement shows that the default is wrong for a deployment,
+set `--logs-fetch-policy` explicitly.
 
-The resolved policy's source -- `flag` (explicit) or `default` (unset) -- is
-logged at startup alongside the policy itself on the `logs fetch policy
-resolved` line. Unset always means `default`/`cost-based`, on every store
-including a loopback one: an operator does not need to know which store this
-process is against to know what an unset flag resolved to.
+Startup logs the resolved policy and its source on the
+`logs fetch policy resolved` line. The source is `flag` (explicit) or
+`default` (unset). Unset always means `default`/`cost-based`, on every store
+including a loopback one.
+
+### The latency-first trade
+
+`latency-first` against the default policy, as measured:
+
+| Item | Figure |
+|---|---|
+| Conditions | 3 reps on a 42-statement reference corpus, true cold in the warm-up-empty state, at GET concurrency 256 |
+| GET requests | 5.30x (570,752 against 107,781) |
+| Cold time | 52% less, with a per-rep range of 50.3% to 54.2% |
+
+That ratio is a measurement of two code paths on one build, not a property of
+the policy. It has already moved once as the cost-based side changed. The
+decision record for the fetch objective names the build that it was taken on.
+Measure again on the build that you run, and do not treat the ratio as a
+constant.
+
+- `latency-first` resolves `--store-get-concurrency`,
+  `--sql-partition-count`, and `--promql-fetch-fanout` as every other policy
+  does. It sets no default of its own.
+- The measured trade pays off only after you raise the GET permits and the
+  SQL scan width together to the concurrency that the measurement used.
+  `--fetch-concurrency` raises all three at once.
+- The policy alone is not inert. The byte quantities change immediately, so a
+  logs read is routed as `byte-minimal` routes it. It takes ranged reads
+  where they save more bytes than a request costs, and whole-object reads
+  where they do not.
+- On the reference corpus against real S3, that shape at the default
+  concurrency measured slower than the default policy.
+- Treat the concurrency as a precondition. The startup line says which side
+  of it this process is on. It reports the precondition met only when both
+  the GET permits and the scan width are raised.
+- A concurrency raise also raises in-flight fetch memory, and no process-wide
+  budget bounds that memory yet. Watch process memory when you try this
+  policy. An under-provisioned raise can end in an out-of-memory kill.
 
 ### The store cost profile
 
-`--store-cost-profile <path>` names a TOML file of this deployment's
-object-store prices and, optionally, two request timings measured from its
-hosts. It is read only when resolving `cost-based`; no price ever
-reaches the fetch layer, which runs on byte quantities alone. The same file is
-read by `ravel-bench`, so the engine and the ledger price a run the same way.
-Omitted, the reference profile `s3-intra-region-2026` is used.
+`--store-cost-profile <path>` names a TOML file with the object-store prices
+of this deployment and, optionally, two request timings measured from its
+hosts.
+
+- The file is read only to resolve `cost-based`. No price reaches the fetch
+  layer, which runs on byte quantities alone.
+- `ravel-bench` reads the same file, so the engine and the ledger price a run
+  the same way.
+- Omitted, the reference profile `s3-intra-region-2026` is used.
 
 ```toml
 name = "s3-intra-region-2026"
@@ -1260,34 +1497,46 @@ per_connection_throughput_bytes_per_s = 90000000  # optional; set with the laten
 timings_measured = "measured on the reference box of the reference suite, intra-region against the object store"
 ```
 
-Prices are integer nanodollars, never floats, because they are exact decimal
-contract figures. The reference values model S3 standard intra-region 2026 list
-prices: PUT class $5.00 per million requests, GET class $0.40 per million,
-transfer and retrieval free. One PUT costs 12.5 GETs at those prices. Every
-price is a modeled figure under a named profile, not a billed amount, and the
-same run under a different profile reprices to different numbers.
+**Prices.** Prices are integer nanodollars, never floats, because they are
+exact decimal contract figures. The reference values model S3 standard
+intra-region 2026 list prices: PUT class $5.00 per million requests, GET
+class $0.40 per million, transfer and retrieval free. One PUT costs 12.5 GETs
+at those prices. Every price is a modeled figure under a named profile, not a
+billed amount. The same run under a different profile reprices to different
+numbers.
 
-The two timings are measured constants, not prices: the latency of one request
-from the deployment's hosts and the bytes one connection transfers per second,
-with `timings_measured` a free-text note of their provenance that nothing
-derives a figure from. The reference values were measured on the reference box
-of the reference suite, intra-region against the object store, and the
-reference profile's note says so and records no date. They are optional, and
-set together or not at all.
+**Timings.** The two timings are measured constants, not prices: the latency
+of one request from the hosts of the deployment, and the bytes that one
+connection transfers per second. They are optional, and you set both or
+neither.
 
-Every field except `delete_class_nanodollars` and the three timing fields is
-required. Loading is fail-closed: an unreadable file, invalid TOML, an unknown
-or misspelled key, one timing without the other (the error names the missing
-one), or a blank name refuses startup with an error naming the flag. There is no silent
-fallback to the reference prices, because a deployment that named a profile and
-got the reference prices instead would stamp one profile into its reports while
-resolving its fetch policy from another.
+`timings_measured` is a free-text note of their provenance, and nothing
+derives a figure from it. The reference values were measured on the reference
+box of the reference suite, intra-region against the object store. The note
+of the reference profile says so and records no date.
+
+**Validation.** Every field is required except `delete_class_nanodollars` and
+the three timing fields. Loading is fail-closed. Each of these refuses
+startup with an error that names the flag:
+
+- an unreadable file
+- invalid TOML
+- an unknown or misspelled key
+- one timing without the other (the error names the missing one)
+- a blank name
+
+Ravel never falls back to the reference prices. With a fallback, a deployment
+stamps one profile into its reports while it resolves its fetch policy from
+another.
 
 **How `cost-based` resolves.** It converts the profile into the one byte
-quantity the fetch layer runs on: how many transferred bytes one saved request
-is worth. Two terms can answer that, and the larger one is the rate. The price
-term is what a request costs in bytes at the profile's prices; the time term is
-the bytes one connection could have moved during the request's latency.
+quantity that the fetch layer runs on: how many transferred bytes one saved
+request is worth. Two terms can answer that, and the larger one is the rate.
+
+- The price term is what a request costs in bytes at the prices of the
+  profile.
+- The time term is the bytes that one connection can move during the latency
+  of the request.
 
 ```
 price term = get_class_nanodollars x BYTES_PER_GIB
@@ -1296,177 +1545,210 @@ time term  = request_latency_micros x per_connection_throughput_bytes_per_s / 1,
 request_cost_bytes = the larger of the two terms
 ```
 
-`BYTES_PER_GIB` is 2^30, and the arithmetic multiplies before it divides in
-128-bit so a sub-nanodollar per-byte price does not truncate to zero. Retrieval
-is a per-byte charge exactly like transfer and enters the denominator the same
-way, so a profile with free transfer but priced retrieval still routes
-byte-minimally rather than reporting retrieval dollars a request-minimal plan
-would never have spent. The result is floor-rounded, held at a minimum of one
-byte, and clamped to the coalescing-gap and routing-threshold floors. Two cases
-saturate the price term: a zero denominator, where no per-byte cost exists, and
-quotient overflow from a near-free but nonzero per-byte price. A saturated
-price term yields to the time term, so the rate itself saturates, meaning "read
-whole always", only on a profile with neither per-byte prices nor timings; that
-is logged at startup naming the profile. The startup line's `rate_term` field
-says which term the rate came from: `price`, `time` or `saturated` (or `flag`
-when `--logs-request-cost-bytes` set it).
+- `BYTES_PER_GIB` is 2^30. The arithmetic multiplies before it divides, in
+  128-bit, so a sub-nanodollar per-byte price does not truncate to zero.
+- Retrieval is a per-byte charge, as transfer is, and enters the denominator
+  the same way. So a profile with free transfer but priced retrieval still
+  routes byte-minimally. It does not report retrieval dollars that a
+  request-minimal plan never spends.
+- The result is floor-rounded, held at a minimum of one byte, and clamped to
+  the coalescing-gap and routing-threshold floors.
+- Two cases saturate the price term: a zero denominator, where no per-byte
+  cost exists, and quotient overflow from a near-free but nonzero per-byte
+  price.
+- A saturated price term yields to the time term. So the rate itself
+  saturates, which means "read whole always", only on a profile with neither
+  per-byte prices nor timings. Startup logs that case and names the profile.
+- The `rate_term` field of the startup line says which term the rate came
+  from: `price`, `time` or `saturated` (or `flag` when
+  `--logs-request-cost-bytes` set it).
 
-At the reference profile both per-byte prices are zero, so the price term
-saturates and the rate is the time term: 70,000 microseconds at 90,000,000
-bytes per second, 6,300,000 bytes. At egress list prices (GET class $0.40 per
-million against $0.09 per GiB transfer plus $0.01 per GiB retrieval) and no
-timings it resolves to 4,294 bytes, which the floors then clamp.
+Two worked cases:
 
-Under `cost-based`, and only there, a finite rate derived from the profile also
-sets the projection break-even: the bytes a narrow projection must save before it is read ranged
-instead of whole, the larger of the routing threshold
+| Profile | Result |
+|---|---|
+| The reference profile | Both per-byte prices are zero, so the price term saturates and the rate is the time term: 70,000 microseconds at 90,000,000 bytes per second, 6,300,000 bytes. |
+| Egress list prices (GET class $0.40 per million against $0.09 per GiB transfer plus $0.01 per GiB retrieval) and no timings | It resolves to 4,294 bytes, which the floors then clamp. |
+
+**The projection break-even.** Under `cost-based`, and only there, a finite
+rate derived from the profile also sets the projection break-even. That is
+the number of bytes that a narrow projection must save before it is read
+ranged and not whole. It is the larger of the routing threshold
 (`--logs-block-range-threshold`, 524,288 bytes by default) and three request
-costs. At the reference profile that is 18,900,000 bytes, so a one-column read
-of a 35 MB object reads its column ranges while every object of 18,900,000
-bytes or less, such as a 3 MB flush object, still reads whole. The same figure
-is the object size at or below which the ranged fetch reads the whole object
-anyway. The startup line reports the break-even in force as
-`projection_break_even_bytes` with `break_even_source="profile"`; under the
-other policies and when `--logs-request-cost-bytes` is set, which keep the
-routing threshold as the break-even, it reports that threshold with
-`break_even_source="routing-threshold"`: 524,288 bytes by default, but under
-`request-minimal`, and under a `cost-based` resolution whose profile prices
-bytes at zero and records no timings, the threshold is saturated and the line prints
-18446744073709551615. The
-coalescing gap, the largest hole between two wanted ranges that one request
-reads through, stays one request cost (at least 64 KiB) under every policy, so
-at the reference profile it is 6,300,000 bytes.
+costs. Three, because a ranged read of a narrow projection issues about four
+GETs per object against one for a whole read, so it pays only when the bytes
+it skips exceed the cost of the three extra requests.
 
-### The covering-read bound and flag precedence
+At the reference profile the break-even is 18,900,000 bytes. So a one-column
+read of a 35 MB object reads its column ranges, while every object of
+18,900,000 bytes or less, such as a 3 MB flush object, still reads whole. The
+same figure is the object size at or below which the ranged fetch reads the
+whole object anyway.
 
-`--logs-max-fetch-run-bytes` caps the length of one covering request. Its
-default is 64 MiB, it applies under every policy, and zero is refused with an
-error because the segmented fallback divides the object size by it. An object at
-or under the bound is read in one covering request; an object above it is read
-as sequential block-aligned covering sub-ranges, so no single request moves more
-than the bound however large an object grows.
+The startup line reports the break-even in force as
+`projection_break_even_bytes`:
 
-`--logs-request-cost-bytes`, when set explicitly, wins over the policy-derived
-rate. The policy is the intent layer and this is the expert escape hatch, so a
-deployment can select `cost-based` and still pin the one derived quantity when
-it has measured a better value.
+| Case | `break_even_source` | Value |
+|---|---|---|
+| `cost-based` with a finite rate from the profile | `break_even_source="profile"` | The break-even above. |
+| The other policies, and when `--logs-request-cost-bytes` is set. These keep the routing threshold as the break-even. | `break_even_source="routing-threshold"` | The routing threshold: 524,288 bytes by default. |
+| `request-minimal`, and a `cost-based` resolution whose profile prices bytes at zero and records no timings | `break_even_source="routing-threshold"` | The threshold is saturated and the line prints 18446744073709551615. |
 
-A saturated rate additionally overrides an explicitly set
-`--logs-block-range-threshold`: `request-minimal`, and `cost-based` on a
+The coalescing gap is the largest hole between two wanted ranges that one
+request reads through. It stays one request cost (at least 64 KiB) under
+every policy, so at the reference profile it is 6,300,000 bytes.
+
+### Covering-read bound and precedence
+
+`--logs-max-fetch-run-bytes` caps the length of one covering request.
+
+- Its default is 64 MiB, and it applies under every policy.
+- Zero is refused with an error, because the segmented fallback divides the
+  object size by it.
+- An object at or under the bound is read in one covering request.
+- An object above the bound is read as sequential block-aligned covering
+  sub-ranges. So no single request moves more than the bound, however large
+  an object grows.
+
+`--logs-request-cost-bytes`, when set explicitly, wins over the
+policy-derived rate. So a deployment can select `cost-based` and still pin
+the one derived quantity when it has measured a better value.
+
+A saturated rate also overrides an explicitly set
+`--logs-block-range-threshold`. `request-minimal`, and `cost-based` on a
 profile with neither per-byte prices nor timings, saturate both routing
-thresholds regardless of that flag, and a set-but-overridden threshold is
-logged at startup so the override is visible. Otherwise that flag keeps its
-normal role, including under `cost-based` at the reference profile.
+thresholds whatever that flag says. Startup logs a set-but-overridden
+threshold, so the override is visible. In every other case that flag keeps
+its normal function, including under `cost-based` at the reference profile.
 
-### What this does not touch
+### What these flags cover
 
 The fetch policy and the cost profile govern the logs read path only. Metrics
-fetching consults neither: its suffix probe window, coalescing gap, whole-object
-threshold and concurrency limit are compiled-in constants. An operator tuning
-metrics fetch behavior will not find a knob here, because there is none.
+fetching consults neither. Its suffix probe window, coalescing gap,
+whole-object threshold and concurrency limit are compiled-in constants, so
+metrics fetch behavior has no setting to tune.
 
-Any report carrying a request or modeled-cost figure stamps the active profile,
-all its prices, and the resolved policy, split into what was requested and what
-actually governed the run. A lane that cannot know what governed its fetches
-stamps its effective value as `n/a` rather than echoing the request as if it
-were confirmed. Two request or dollar figures are comparable only once both are
-known to have priced the run the same way.
+Any report that carries a request or modeled-cost figure stamps the active
+profile, all its prices, and the resolved policy. The policy is split into
+what was requested and what governed the run. A lane that cannot know what
+governed its fetches stamps its effective value as `n/a`, and does not echo
+the request as confirmed. Two request or dollar figures are comparable only
+when both are known to have priced the run the same way.
 
 ## Indexed fields and typed attribute columns
 
-Two per-tenant declarations that change query cost, and in one case the SQL
-schema. Both are day-0 decisions because changing them later means a restart or
-a durable record write.
+Two per-tenant declarations change query cost, and one of them also changes
+the SQL schema. Decide both on day 0, because a later change means a restart
+or a durable record write.
 
 ### Indexed fields
 
-Block-level pruning for an attribute equality predicate on logs is driven by an
-index over named fields. `--indexed-field FIELD`, repeated, names the fields for
-every tenant with no override, and `--indexed-field-tenant TENANT=field1,field2`
-replaces that list for one tenant. An empty list for a tenant
-(`--indexed-field-tenant acme=`) turns the index off for it.
+An index over named fields drives block-level pruning for an attribute
+equality predicate on logs.
+
+| Flag | Effect |
+|---|---|
+| `--indexed-field FIELD`, repeated | Names the fields for every tenant with no override. |
+| `--indexed-field-tenant TENANT=field1,field2` | Replaces that list for one tenant. An empty list for a tenant (`--indexed-field-tenant acme=`) turns the index off for it. |
 
 The shipped default list is `service.name`, `k8s.namespace.name` and
-`http.status_code`. **Any value you pass replaces that list rather than adding
-to it.** Indexing is opt-in per field, an unindexed field still works through
-the bloom filter and the exact scan, and a missing index changes query cost, not
+`http.status_code`. **Any value that you pass replaces that list. It does not
+add to it.**
+
+Indexing is opt-in per field. An unindexed field still works through the
+bloom filter and the exact scan. A missing index changes query cost, not
 query correctness.
 
 ### Typed attribute columns
 
-The `logs` SQL table exposes every attribute through one merged
-`attrs: Map(Utf8, Utf8)` column, so a numeric or boolean comparison over an
-attribute is a cast over a stringified value. Declaring an attribute key
-promotes it to a native typed column, appended after `attrs` in declaration
-order, and the same value then reads back as a real `Int64`, `Boolean`,
-`Dictionary(Int32, Utf8)` or `Binary` Arrow column.
+You can declare an attribute key to promote it to a native typed column. The
+column is appended after `attrs` in declaration order. The value then reads
+back as an `Int64`, `Boolean`, `Dictionary(Int32, Utf8)` or `Binary` Arrow
+column.
 
-A promoted `str` column is dictionary-encoded and stays a dictionary over the
-Flight SQL wire. HTTP JSON row values are unchanged, one string per row, but the
-JSON envelope's column type reads `Dictionary(Int32, Utf8)` rather than
-`Utf8`, and the Arrow IPC schema and batch columns carry the dictionary type
-verbatim. Both are client-visible changes a consumer must expect. The key still
-appears in `attrs` as well, so `SELECT attrs` and `SELECT *` keep working.
+Without a declaration, the `logs` SQL table exposes every attribute through
+one merged `attrs: Map(Utf8, Utf8)` column. A numeric or boolean comparison
+over an attribute is then a cast over a stringified value.
 
-There are two ways to declare, with one resolution order:
+A promoted key still appears in `attrs`, so `SELECT attrs` and `SELECT *`
+keep working. A promoted `str` column is dictionary-encoded, and a consumer
+must expect two client-visible changes:
 
-- `--typed-attr-column KEY:TYPE` and `--typed-attr-column-tenant TENANT:KEY:TYPE`
-  are the deployment default and its per-tenant override. Changing them is a
-  restart. `TYPE` is one of `str`, `i64`, `bool` or `bytes`, case-insensitive.
-  There is no shipped default, because a promotion changes the SQL schema a
-  tenant's queries see.
+- The column stays a dictionary over the Flight SQL wire. The Arrow IPC
+  schema and batch columns carry the dictionary type verbatim.
+- HTTP JSON row values are unchanged, one string per row. But the column
+  type in the JSON envelope reads `Dictionary(Int32, Utf8)` and not `Utf8`.
+
+You can declare in two ways, with one resolution order:
+
+- `--typed-attr-column KEY:TYPE` and
+  `--typed-attr-column-tenant TENANT:KEY:TYPE` are the deployment default and
+  its per-tenant override. A change to them needs a restart. `TYPE` is one of
+  `str`, `i64`, `bool` or `bytes`, case-insensitive. They have no shipped
+  default, because a promotion changes the SQL schema that the queries of a
+  tenant see.
 - The durable per-tenant record, written by `ravel-cli typed-attr-column set`,
-  is the no-restart path. When present it replaces the flag-derived declaration
-  for that tenant outright, **including when it is present and empty**. An empty
-  declaration means "this tenant promotes nothing", which is a different state
-  from having no override, in which case the flags apply.
+  needs no restart. When present, it replaces the flag-derived declaration
+  for that tenant completely, **including when it is present and empty**. An
+  empty declaration means "this tenant promotes nothing". With no override
+  at all, the flags apply.
 
 ```sh
 ravel-cli typed-attr-column show <tenant>
 ravel-cli typed-attr-column set <tenant> http.status_code:i64 user.id:str
 ```
 
-`set` replaces the tenant's declaration wholesale. It is not additive and there
-is no per-key remove, so pass the full intended list. It validates on the same
-rules the flags do (an empty key, a duplicate key, the same key with two types,
-or a key colliding with one of the nine fixed logs columns `ts`, `observed_ts`,
-`severity_num`, `severity_text`, `body`, `trace_id`, `span_id`, `flags`,
-`attrs`), then swaps the record with a compare-and-set so a concurrent write is
-a reported conflict rather than a silent overwrite.
+`set` replaces the whole declaration of the tenant. It is not additive and
+has no per-key remove, so pass the full intended list.
 
-**Staleness.** A query-serving process reads the durable override per tenant on
-a 60-second staleness horizon, so a `set` takes effect within 60 seconds and
-during that window two replicas can answer the same query against different
-declarations. A failed read never fails a query: the process serves the last
-declaration it resolved, or the flag-derived one if it never resolved for that
-tenant, and a failed read is not retried for one second, so a degraded config
-store costs at most one failed request per tenant per second. That fallback is a
-real degradation, so it is counted rather than silent, in
-`ravel_typed_attr_columns_stale_fallback_total`.
+`set` validates on the same rules as the flags. It rejects an empty key, a
+duplicate key, the same key with two types, and a key that collides with one
+of the nine fixed logs columns (`ts`, `observed_ts`, `severity_num`,
+`severity_text`, `body`, `trace_id`, `span_id`, `flags`, `attrs`). It then
+swaps the record with a compare-and-set, so a concurrent write is a reported
+conflict and not a silent overwrite.
 
-**Cost note.** A predicate on a promoted column prunes blocks before decode: an
-`i64` or `bool` comparison through the skip index, and a `str` or `bytes`
-equality through the same POSTINGS index that `attrs['k'] = 'v'` uses. Promote
-for typed comparisons and aggregates (`k > 5`, `SUM(k)`), which are impossible
-over the map; an equality that already prunes gains nothing from promotion.
+**Staleness.** A query-serving process reads the durable override per tenant
+on a 60-second staleness horizon.
 
-There is also a per-object budget on how many distinct attribute name and type
-pairs get a real column at write time. Pairs beyond the budget fold into an
+- A `set` takes effect within 60 seconds. During that window two replicas can
+  answer the same query against different declarations.
+- A failed read never fails a query. The process serves the last declaration
+  that it resolved, or the flag-derived one if it never resolved for that
+  tenant.
+- A failed read is not retried for one second. So a degraded config store
+  costs at most one failed request per tenant per second.
+- The fallback is a real degradation, and
+  `ravel_typed_attr_columns_stale_fallback_total` counts it.
+
+**Cost note.** A predicate on a promoted column prunes blocks before decode.
+An `i64` or `bool` comparison prunes through the skip index. A `str` or
+`bytes` equality prunes through the same POSTINGS index that
+`attrs['k'] = 'v'` uses. Promote for typed comparisons and aggregates
+(`k > 5`, `SUM(k)`), which are impossible over the map. An equality that
+already prunes gains nothing from promotion.
+
+A per-object budget also limits how many distinct attribute name and type
+pairs get a real column at write time. Pairs beyond the budget go into an
 overflow column and lose columnar access. Watch for that in
 [the observability guide](../observability.md).
 
 ## Per-query budgets
 
-Six flags bound what one query may spend. Unset, each resolves at startup, but
-only some resolve from host resources: `--store-get-concurrency`,
-`--sql-partition-count`, and `--promql-fetch-fanout` (or the legacy
-`--fetch-concurrency`, which sets all three) follow the core count, and the two
-SQL ceilings follow memory (shares of `MemTotal`, capped by the cgroup memory
-limit when the process runs in a container), while `--max-segments` is a fixed
-1,000,000 on every host. Set, the flag value is used verbatim, with one
-reconciliation: the per-query SQL pool is clamped to an explicit per-tenant
-ceiling set below it, and the startup log says so. The reference-host column
-is a 16-core, 30 GB host, the shape the published ClickBench run used.
+Six flags bound what one query can spend. Unset, each resolves at startup:
+
+| Flags | Unset, resolves from |
+|---|---|
+| `--store-get-concurrency`, `--sql-partition-count`, and `--promql-fetch-fanout` (or the legacy `--fetch-concurrency`, which sets all three) | The core count. |
+| The two SQL ceilings | Memory: shares of `MemTotal`, capped by the cgroup memory limit when the process runs in a container. |
+| `--max-segments` | No host resource. It is a fixed 1,000,000 on every host. |
+
+Set, the flag value is used verbatim, with one reconciliation. The per-query
+SQL pool is clamped to an explicit per-tenant ceiling set below it, and the
+startup log says so.
+
+The reference-host column is a 16-core, 30 GB host, the shape that the
+published ClickBench run used.
 
 | Flag | Default (unset) | Reference host | Choose against |
 |---|---|---|---|
@@ -1478,199 +1760,252 @@ is a 16-core, 30 GB host, the shape the published ClickBench run used.
 | `--sql-max-query-bytes` | derived: 50% of MemTotal, 256 MiB if memory is unknown | 16,106,127,360 | Per-query SQL memory pool ceiling. Process-wide, not per-tenant. The derived value equals the tenant's whole SQL share, so a lone statement may use all of it; concurrent statements still share the per-tenant ceiling. To keep the earlier split, set this flag to half of `--sql-tenant-max-bytes`, 25% of MemTotal. Held at or below `--sql-tenant-max-bytes`: an explicit value here raises a non-explicit (derived or fallback) tenant ceiling to fit, but an explicit tenant ceiling clamps this down and warns. |
 | `--sql-tenant-max-bytes` | derived: 50% of MemTotal, 1 GiB if memory is unknown | 16,106,127,360 | The multi-tenant isolation bound: SQL memory one tenant may hold across its concurrent queries. Process-wide, and not itself per-tenant-overridable. |
 
-The two SQL ceilings derive to the same 50% share of `MemTotal`. The per-query
-pool nests inside the per-tenant pool, so the tenant's total is unchanged by the
-per-query share: statements running together share the tenant ceiling, and a
-statement that arrives while another holds most of it gets what is left, not a
-reserved quarter. One tenant's SQL memory is therefore still at most 50% of
-`MemTotal`. The two caches carve the memory budget (`MemTotal` less the
-overhead reserve, 2 GiB from 8 GiB of memory up and scaled down below it at
-the default ingest ceiling, as described below) rather than `MemTotal`, so the three ceilings together come to about
-78% of `MemTotal` on the reference host (25,125,558,681 of 32,212,254,720),
-and more on a loopback store, where the fetcher cache derives at 40%.
+`--sql-max-query-bytes` and `--sql-tenant-max-bytes` are meaningful only in a
+build with the `sql` feature. See
+[the query guide](../query.md#operator-configurable-budgets-server-flags) for
+worked sizing.
 
 A value of `0` in any of `--fetch-concurrency`, `--store-get-concurrency`,
-`--sql-partition-count`, or `--promql-fetch-fanout` is a startup error naming
-that flag, raised before any fetcher, engine, or SQL session exists.
+`--sql-partition-count`, or `--promql-fetch-fanout` is a startup error that
+names that flag. Startup raises it before any fetcher, engine, or SQL session
+exists.
 
-`--catalog-resolve-concurrency` derives from the same startup resolution, but
-from query concurrency rather than from cores or memory directly, and it
-bounds the process rather than one query. It is the ceiling on every
-object-store request the catalog resolve path keeps in flight across every
-concurrent query: prefix LISTs, commit-record GETs, snapshot-part GETs, and
-the postings and column-stats reads that go with them. Unset, it resolves to
-`clamp(Q * 128, 128, 4096)` held at an interim 1,024, where `Q` is
-`--max-concurrent-queries` when that flag bounds queries and the same
-`max(8, 2 x cores)` the flags above use when queries are unbounded. That flag
-is the fleet-wide query ceiling, not a per-replica one, so with several
-replicas each one sizes its resolve ceiling for the whole fleet's queries and
-is correspondingly generous. 128 is
-what one shard-hour prefix sustains, so `Q` concurrent resolves over `Q`
-different shard-hours each get one prefix's worth. Worked examples:
-`--max-concurrent-queries 1` resolves to 128, `--max-concurrent-queries 4` to
-512, and an unbounded 8-core host to 1,024 (its `Q` of 16 derives 2,048, held
-at the interim cap). Set explicitly, the flag value is used verbatim and the
-interim cap does not apply to it; `0` and any value above 4,096 are startup
-errors. A second bound the flag does not reach holds each individual key
+### SQL ceilings
+
+The two SQL ceilings derive to the same 50% share of `MemTotal`. The
+per-query pool nests inside the per-tenant pool, so the per-query share does
+not change the total of the tenant.
+
+- Statements that run together share the tenant ceiling.
+- A statement that arrives while another holds most of the ceiling gets what
+  is left, not a reserved quarter.
+- So the SQL memory of one tenant is still at most 50% of `MemTotal`.
+
+The two caches carve the memory budget (`MemTotal` less the overhead reserve:
+2 GiB from 8 GiB of memory up, scaled down below it at the default ingest
+ceiling, as described below), not `MemTotal`. So the three ceilings together come to about 78% of
+`MemTotal` on the reference host (25,125,558,681 of 32,212,254,720). They
+come to more on a loopback store, where the fetcher cache derives at 40%.
+
+### Catalog resolve concurrency
+
+`--catalog-resolve-concurrency` bounds the process, not one query. It is the
+ceiling on every object-store request that the catalog resolve path keeps in
+flight across every concurrent query: prefix LISTs, commit-record GETs,
+snapshot-part GETs, and the postings and column-stats reads that go with
+them.
+
+It derives from the same startup resolution, but from query concurrency and
+not from cores or memory directly. Unset, it resolves to
+`clamp(Q * 128, 128, 4096)` held at an interim 1,024.
+
+- `Q` is `--max-concurrent-queries` when that flag bounds queries.
+- `Q` is the same `max(8, 2 x cores)` that the flags above use when queries
+  are unbounded.
+- `--max-concurrent-queries` is the fleet-wide query ceiling, not a
+  per-replica one. So with several replicas, each one sizes its resolve
+  ceiling for the queries of the whole fleet and is correspondingly generous.
+- 128 is what one shard-hour prefix sustains. So `Q` concurrent resolves over
+  `Q` different shard-hours each get the worth of one prefix.
+
+| Configuration | Resolves to |
+|---|---|
+| `--max-concurrent-queries 1` | 128 |
+| `--max-concurrent-queries 4` | 512 |
+| Unbounded, 8-core host | 1,024. Its `Q` of 16 derives 2,048, held at the interim cap. |
+
+Set explicitly, the flag value is used verbatim and the interim cap does not
+apply to it. `0` and any value above 4,096 are startup errors.
+
+A second bound, which the flag does not reach, holds each individual key
 prefix to 128 requests whatever this ceiling is. Every resolve-path request
-is bounded this way, keyed by its own key prefix: a commit record by its
-shard-hour prefix, a snapshot's parts by the one directory they share, its
-postings and column stats by theirs, and a LIST by the prefix it lists. So
-raising this ceiling adds breadth across prefixes and never depth within one.
+is bounded this way, keyed by its own key prefix:
 
-Three more settings are derived the same way: `--cache-max-bytes` (fetcher
-cache, 25% normally or 40% against a loopback `--s3-endpoint`),
-`--catalog-cache-max-bytes` (catalog byte cache, always a separate 5%
-ceiling; 256 MiB each if memory is unknown and `--memory-budget-bytes` is
-unset) and `--gc-max-query-duration` (11
-minutes). Each cache flag bounds only its own cache; setting one never
-changes the other. Memory is read from `/proc/meminfo`'s
-`MemTotal` on Linux and is "unknown" everywhere else; cores come from the
-process's available parallelism, floored at 1. Percentages truncate.
+- a commit record by its shard-hour prefix
+- the parts of a snapshot by the one directory that they share
+- its postings and column stats by theirs
+- a LIST by the prefix that it lists
 
-Unlike the two SQL ceilings above, `--cache-max-bytes` does not derive from
-raw `MemTotal`: it derives from a process-wide memory budget, which starts
-from available memory rather than raw total whenever that is possible: with
-no cgroup memory limit
-and a readable `MemAvailable` (Linux's own `/proc/meminfo` estimate of memory
-a new allocation could claim without swapping), the budget is
-`min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`,
-every subtraction saturating at zero. `RESERVE` is the overhead reserve,
-`max(min(2 GiB, memory / 4), held)` of the memory the budget starts from
-(`MemTotal`, or the cgroup memory limit when one applies), where `held` is
-what the process holds outside the budget: a provisional, uncalibrated
-256 MiB baseline, plus the `--max-ingest-buffer-bytes` ceiling in
-`--mode all`, or 2 GiB when that flag is `0`, since an unbounded buffer
-cannot be accounted. `held` wins over the 2 GiB cap, so the budget, the
-ingest ceiling and the baseline fit in memory at every bounded ceiling. At
-an ingest ceiling of 1.75 GiB or less the reserve is a fixed 2 GiB from
-8 GiB up. A larger ceiling makes the reserve the ceiling plus 256 MiB at
-every size: at `--max-ingest-buffer-bytes 3221225472` it is 3.25 GiB, so an
-8 GiB host derives a budget of at most 4,864 MiB. Below 8 GiB, a t3a.small (`MemTotal`
-1,912 MiB) reserves 768 MiB in `--mode all` at the default 512 MiB ingest
-ceiling, for a budget of at most 1,144 MiB, and 478 MiB, a quarter, in
-`--mode query` and `--mode maintain`, for at most 1,434 MiB. `FLOOR` is a 1 GiB
-floor under the `MemAvailable + own RSS - RESERVE` term only, not under the
-final budget: binding it logs at `WARN` with the `MemAvailable` reading that
-hit it and `--memory-budget-bytes` named as the remedy, but the outer `min`
-against `MemTotal - RESERVE` keeps the final budget at or below that figure.
-A derived budget below 256 MiB refuses to start, with a message naming
-`MemTotal` (or the cgroup limit), the reserve, the budget and
-`--memory-budget-bytes`, and `--max-ingest-buffer-bytes` when the ingest
-ceiling set the reserve; a host or container needs 512 MiB of memory to
-clear it in `--mode query` or `--mode maintain`, and in `--mode all` a
-bounded ingest ceiling plus 512 MiB: 1 GiB at the default ingest ceiling.
-The process's own resident set counts as available because the kernel does
-not call a process's own resident pages "available" even though this
-process may reuse them rather than compete with them. A cgroup memory
-limit, when present, keeps the pre-amendment rule instead: the limit is
-already this process's whole share, so a whole-host `MemAvailable` would
-only be wrong to consult, and the budget is that limit minus the reserve.
-With no cgroup limit, a readable `MemTotal`, and no readable `MemAvailable`
-(an unusual Linux kernel or container runtime whose `/proc/meminfo` parses
-`MemTotal` but not `MemAvailable`), the budget is `MemTotal` minus the
-reserve, same as before the amendment. A host with neither a readable
-`MemTotal` nor a cgroup limit (every non-Linux build, or a Linux host with no
-cgroup limit whose `/proc/meminfo` cannot be read) derives no budget at all:
-the budget is unlimited, same as before this amendment existed. When
-`/proc/meminfo` cannot be read but a cgroup limit is set, the limit is the
-memory figure and the source is `derived-cgroup`. Set `--memory-budget-bytes` to
-override every one of these branches outright; it still goes through the
-same startup refusal as a derived budget (below). This is the one setting
-to reach for on a host where this process shares memory with another one it
-cannot see: the available-memory derivation reads `MemAvailable` once at
-startup and cannot anticipate a sibling process claiming memory afterward.
-Whatever of the resulting budget the two resolved cache ceilings do not
-claim sizes a shared memory accountant the SQL executor's per-tenant
-tracking reserves against, so raising `--cache-max-bytes` on a
-memory-constrained host leaves less headroom for concurrent SQL queries
-even though the two are configured by separate flags. A derived (not
-explicit-flag) `--sql-max-query-bytes` or `--sql-tenant-max-bytes` is
-additionally held at or below 90% of that remainder: the two SQL ceilings
-above derive from raw `MemTotal` and so can otherwise outrun what the
-budget actually leaves once the caches are carved out. The cap binds on
-every deployment whose store is on loopback, where the 40% fetch-cache share
-leaves a remainder whose 90% is below 50% of `MemTotal`. It also binds on an
-S3 deployment whose effective memory is below about 9.7 GiB, cgroup pods
-included, and on a host with co-resident processes where available memory is
-well below total. An explicit flag on either is never capped this way. This budget, its two
-cache carves, the SQL cap, and the remainder are computed once at startup
-from the host profile observed at that moment; nothing about it changes
-while the process runs, and a container whose cgroup limit or available
-memory changes later is not noticed until the next restart. Startup refuses outright when
-the two cache ceilings leave no strictly positive remainder, naming both
-figures; `--disable-cache` is exempt, because a process that builds neither
-cache claims nothing against the budget and the remainder is all of it.
-`--mode gateway` derives no budget at all: it builds no query surface and
-runs no fold, so nothing in it reads through either cache or reserves
-against the accountant. No overhead reserve is subtracted for it, so it
-starts under any cgroup memory limit, including one of 2 GiB or less. Every
-mode that buffers ingest (`all` and `gateway`) holds its ingest buffers
-outside the memory budget, bounded by `--max-ingest-buffer-bytes` (512 MiB by
-default), plus allocator and runtime overhead. In `--mode all` the overhead
-reserve covers that bound; a gateway reserves nothing, so size its limit
-above it. On a small host, lowering `--max-ingest-buffer-bytes` is the lever
-in both: it lowers what a gateway's limit must hold, and in `--mode all` it
-lowers the reserve and leaves a larger budget. A gateway's startup log prints one
-line saying the memory budget is
-not applicable in gateway mode, and its `ravel_memory_budget_bytes` reads
-`u64::MAX`. Unless `--catalog-cache-max-bytes` is set, a gateway builds no
-catalog byte cache, so its `/metrics` carries no `cache="catalog"` series
-for `ravel_cache_hits_total`, `ravel_cache_misses_total`,
-`ravel_cache_resident_entries`, `ravel_cache_resident_bytes` or
-`ravel_cache_max_bytes`. Likewise, unless `--cache-max-bytes` is set, a
-gateway builds no fetcher cache, and under `--cache-dir` no disk tier for it,
-so its `/metrics` carries no `cache="fetch"` series for any of those
-families. With neither flag set, no `ravel_cache_*` family renders at all.
+So a higher ceiling adds breadth across prefixes and never depth within one.
+
+### Other derived settings
+
+Three more settings are derived the same way:
+
+| Setting | Derived value |
+|---|---|
+| `--cache-max-bytes` (fetcher cache) | 25% normally, or 40% against a loopback `--s3-endpoint`. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
+| `--catalog-cache-max-bytes` (catalog byte cache) | Always a separate 5% ceiling. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
+| `--gc-max-query-duration` | 11 minutes. |
+
+- Memory is read from the `MemTotal` of `/proc/meminfo` on Linux and is
+  "unknown" everywhere else.
+- Cores come from the available parallelism of the process, floored at 1.
+- Percentages truncate.
+
+### Process memory budget
+
+`--cache-max-bytes` does not derive from raw `MemTotal`, as the two SQL
+ceilings do. It derives from a process-wide memory budget. Where possible,
+the budget starts from available memory and not from raw total.
+
+| Host | Budget | Logged source |
+|---|---|---|
+| No cgroup memory limit, and a readable `MemAvailable` | `min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`, every subtraction saturating at zero | `derived-available` |
+| A cgroup memory limit is present | That limit minus the reserve. `MemAvailable` is not consulted. | `derived-cgroup` |
+| No cgroup limit, a readable `MemTotal`, and no readable `MemAvailable` (an unusual Linux kernel or container runtime whose `/proc/meminfo` parses `MemTotal` but not `MemAvailable`) | `MemTotal` minus the reserve | `derived` |
+| Neither a readable `MemTotal` nor a cgroup limit (every non-Linux build, or a Linux host with no cgroup limit whose `/proc/meminfo` cannot be read) | No budget is derived: the budget is unlimited | `fallback` |
+| `/proc/meminfo` cannot be read but a cgroup limit is set | The limit is the memory figure | `derived-cgroup` |
+| `--memory-budget-bytes` is set | The flag value. It overrides every branch above. | `flag` |
+
+Terms in the first row:
+
+- `MemAvailable` is the estimate in `/proc/meminfo` on Linux of the memory
+  that a new allocation can claim without swapping.
+- `RESERVE` is the overhead reserve: `max(min(2 GiB, memory / 4), held)` of
+  the memory the budget starts from (`MemTotal`, or the cgroup memory limit
+  when one applies). `held` is what the process holds outside the budget: a
+  provisional, uncalibrated 256 MiB baseline, plus the
+  `--max-ingest-buffer-bytes` ceiling in `--mode all`, or 2 GiB when that flag
+  is `0`, since an unbounded buffer cannot be accounted. `held` wins over the
+  2 GiB cap, so the budget, the ingest ceiling and the baseline fit in memory
+  at every bounded ceiling.
+- At an ingest ceiling of 1.75 GiB or less, the reserve is a fixed 2 GiB from
+  8 GiB of memory up. A larger ceiling makes the reserve the ceiling plus
+  256 MiB at every size: at `--max-ingest-buffer-bytes 3221225472` it is
+  3.25 GiB, so an 8 GiB host derives a budget of at most 4,864 MiB.
+- Below 8 GiB, a t3a.small (`MemTotal` 1,912 MiB) reserves 768 MiB in
+  `--mode all` at the default 512 MiB ingest ceiling, for a budget of at most
+  1,144 MiB. In `--mode query` and `--mode maintain` it reserves 478 MiB, a
+  quarter, for a budget of at most 1,434 MiB.
+- `FLOOR` is a 1 GiB floor under the `MemAvailable + own RSS - RESERVE` term
+  only, not under the final budget. When the floor binds, startup logs at
+  `WARN` with the `MemAvailable` reading that hit it, and names
+  `--memory-budget-bytes` as the remedy.
+- The outer `min` against `MemTotal - RESERVE` still applies after the floor,
+  and keeps the final budget at or below that figure.
+- A derived budget below 256 MiB refuses to start. The message names
+  `MemTotal` (or the cgroup limit), the reserve, the budget and
+  `--memory-budget-bytes`, and `--max-ingest-buffer-bytes` when the ingest
+  ceiling set the reserve. A host or container needs 512 MiB of memory to
+  clear it in `--mode query` or `--mode maintain`. In `--mode all` it needs a
+  bounded ingest ceiling plus 512 MiB: 1 GiB at the default ingest ceiling.
+- The resident set of the process counts as available. The kernel does not
+  call the resident pages of a process "available", but this process can
+  reuse them and does not compete with them.
+
+A cgroup limit is already the whole share of this process, so a whole-host
+`MemAvailable` is the wrong figure to consult there.
+
+`--memory-budget-bytes` still goes through the same startup refusal as a
+derived budget (below). Use it on a host where this process shares memory
+with another process that it cannot see. The available-memory derivation
+reads `MemAvailable` once at startup and cannot anticipate a sibling process
+that claims memory afterward.
+
+What the budget feeds:
+
+- The part of the budget that the two resolved cache ceilings do not claim
+  sizes a shared memory accountant. The per-tenant tracking of the SQL
+  executor reserves against that accountant. So a higher `--cache-max-bytes`
+  on a memory-constrained host leaves less headroom for concurrent SQL
+  queries, although separate flags configure the two.
+- A derived (not explicit-flag) `--sql-max-query-bytes` or
+  `--sql-tenant-max-bytes` is also held at or below 90% of that remainder.
+  The two SQL ceilings derive from raw `MemTotal`, so without the cap they
+  can exceed what the budget leaves after the caches are carved out. An
+  explicit flag on either is never capped this way.
+
+The 90% cap binds in these cases:
+
+- Every deployment whose store is on loopback. There the 40% fetch-cache
+  share leaves a remainder whose 90% is below 50% of `MemTotal`.
+- An S3 deployment whose effective memory is below about 9.7 GiB, cgroup pods
+  included.
+- A host with co-resident processes where available memory is well below
+  total.
+
+The budget, its two cache carves, the SQL cap, and the remainder are computed
+once at startup from the host profile observed at that moment. Nothing about
+them changes while the process runs. A container whose cgroup limit or
+available memory changes later is not noticed until the next restart.
+
+Startup refuses when the two cache ceilings leave no strictly positive
+remainder, and the error names both figures. `--disable-cache` is exempt: a
+process that builds neither cache claims nothing against the budget, and the
+remainder is all of it.
+
+Every mode except gateway (`all`, `query`, `maintain`) needs a derived budget
+of at least 256 MiB after the overhead reserve, plus room for what its two
+cache ceilings claim.
+
+### Gateway mode memory
+
+`--mode gateway` derives no budget. It builds no query surface and runs no
+fold, so nothing in it reads through either cache or reserves against the
+accountant.
+
+- No overhead reserve is subtracted for it. So it starts under any cgroup
+  memory limit, including one of 2 GiB or less.
+- Every mode that buffers ingest (`all` and `gateway`) holds its ingest
+  buffers outside the memory budget, bounded by `--max-ingest-buffer-bytes`
+  (512 MiB by default), plus allocator and runtime overhead. In `--mode all`
+  the overhead reserve covers that bound. A gateway reserves nothing, so size
+  its limit above it.
+- On a small host, lowering `--max-ingest-buffer-bytes` is the lever in both
+  modes: it lowers what a gateway's limit must hold, and in `--mode all` it
+  lowers the reserve and leaves a larger budget.
+- Its startup log prints one line that says the memory budget is not
+  applicable in gateway mode, and its `ravel_memory_budget_bytes` reads
+  `u64::MAX`.
+- Unless `--catalog-cache-max-bytes` is set, a gateway builds no catalog byte
+  cache. Its `/metrics` then carries no `cache="catalog"` series for
+  `ravel_cache_hits_total`, `ravel_cache_misses_total`,
+  `ravel_cache_resident_entries`, `ravel_cache_resident_bytes` or
+  `ravel_cache_max_bytes`.
+- Unless `--cache-max-bytes` is set, a gateway builds no fetcher cache, and
+  under `--cache-dir` no disk tier for it. Its `/metrics` then carries no
+  `cache="fetch"` series for any of those families.
+- With neither flag set, no `ravel_cache_*` family renders at all.
+
 In any mode, a `--cache-max-bytes` of `0` builds no fetcher cache.
-Every other mode (`all`, `query`, `maintain`) still needs
-a derived budget of at least 256 MiB after the overhead reserve, plus room
-for whatever its two cache ceilings claim. The current state is visible
-live at `/metrics`: `ravel_memory_budget_bytes` (the ceiling of that shared
-accountant, which is the startup log's `memory_remainder_bytes`, the budget
-MINUS the two cache ceilings, not the pre-carve `memory_budget_bytes` figure
-logged beside it; `u64::MAX` means unlimited, which is what any host with
-unreadable memory reports regardless of the caps set on it),
-`ravel_memory_reserved_bytes` split by a
-`component` label (`fetch` is the bytes held by fetch reservations on the
-PromQL and SQL paths, including distributed fragment slices and the startup
-cache warm pass; `sql` is the rest of the reserved total, what the SQL
-executor's per-tenant accountants hold), and
-`ravel_memory_handoff_overlap_bytes` (the part of the `fetch` share whose
-bytes went through the read cache, hit or miss, whether or not the cache
-kept them; `0` when no read cache is configured).
-`--cache-max-bytes` changes less than it used to about how many times a logs
-statement moves a given object's bytes: a query's plan-phase whole-object
-read (the `has_word`/text and other skip-index-undecidable fallback) is now
-carried into the scan for a bounded number of segments regardless of cache
-size, so those objects cross the wire once. The bound is the SQL partition
-count times object size, not the corpus, so undersizing this flag can
-still turn the remaining segments' one wire GET into two; removing that
-residual duplication needs the carry to stream per partition instead of
-being held at the plan barrier, which is a separate, not-yet-shipped change.
 
-Every resolved value is logged once at startup with the source it came from:
-`flag` (the operator set it, used verbatim), `legacy-flag` (no flag for this
-setting, but the legacy `--fetch-concurrency` was set and its value is used),
-`derived` (computed from the host profile, or from a host-independent rule),
-`derived-available` (`memory_budget_bytes` only: no cgroup limit, derived
-from `MemAvailable` per the available-memory branch above),
-`derived-cgroup` (`memory_budget_bytes` only: a cgroup memory limit is
-present, so the budget is that limit minus the reserve, ignoring
-`MemAvailable`), `budget-carve` (a fixed share of `memory_budget_bytes`
-rather than of raw `MemTotal`, which is what the two cache ceilings resolve
-to on a host whose memory could be read or whose budget was set with
-`--memory-budget-bytes`), `budget-carve-loopback` (the
-fetcher cache's larger 40% share, resolved instead of `budget-carve` when
-the store is `s3` against a loopback endpoint and `--cache-max-bytes` is
-unset), or `fallback` (no flag and no readable `MemTotal`, so the
-compiled-in constant is used). `memory_budget_bytes` resolved with source
-`flag` means `--memory-budget-bytes` won over every derivation branch. A
-`flag` or `fallback` budget subtracts no overhead reserve, so the
-`memory_overhead_reserve_bytes` line is printed only on a derived source. So
-`journalctl -u ravel-server | grep
-'performance default resolved'` answers "what is this process actually running
-with" without reading the unit file:
+### Memory metrics
+
+The current state is visible live at `/metrics`:
+
+| Metric | Meaning |
+|---|---|
+| `ravel_memory_budget_bytes` | The ceiling of the shared accountant. It is the `memory_remainder_bytes` of the startup log: the budget MINUS the two cache ceilings. It is not the pre-carve `memory_budget_bytes` figure logged beside it. `u64::MAX` means unlimited, which is what any host with unreadable memory reports regardless of the caps set on it. |
+| `ravel_memory_reserved_bytes` | The reserved total, split by a `component` label. `fetch` is the bytes held by fetch reservations on the PromQL and SQL paths, including distributed fragment slices and the startup cache warm pass. `sql` is the rest of the reserved total: what the per-tenant accountants of the SQL executor hold. |
+| `ravel_memory_handoff_overlap_bytes` | The part of the `fetch` share whose bytes went through the read cache, hit or miss, whether or not the cache kept them. `0` when no read cache is configured. |
+
+`--cache-max-bytes` has a limited effect on how many times a logs statement
+moves the bytes of a given object. The plan-phase whole-object read of a
+query (the `has_word`/text and other skip-index-undecidable fallback) is
+carried into the scan for a bounded number of segments, whatever the cache
+size. Those objects cross the wire once. The bound is the SQL partition count
+times object size, not the corpus. So an undersized `--cache-max-bytes` can
+still turn the one wire GET of the remaining segments into two.
+
+### Resolved values at startup
+
+Every resolved value is logged once at startup with the source that it came
+from:
+
+| Source | Meaning |
+|---|---|
+| `flag` | The operator set it, and it is used verbatim. On `memory_budget_bytes`, it means that `--memory-budget-bytes` won over every derivation branch. A `flag` or `fallback` budget subtracts no overhead reserve, so the `memory_overhead_reserve_bytes` line is printed only on a derived source. |
+| `legacy-flag` | No flag for this setting, but the legacy `--fetch-concurrency` was set and its value is used. |
+| `derived` | Computed from the host profile, or from a host-independent rule. |
+| `derived-available` | `memory_budget_bytes` only: no cgroup limit, derived from `MemAvailable`. |
+| `derived-cgroup` | `memory_budget_bytes` only: a cgroup memory limit is present, so the budget is that limit minus the reserve, ignoring `MemAvailable`. |
+| `budget-carve` | A fixed share of `memory_budget_bytes` and not of raw `MemTotal`. The two cache ceilings resolve to this on a host whose memory could be read or whose budget was set with `--memory-budget-bytes`. |
+| `budget-carve-loopback` | The larger 40% share of the fetcher cache. It is resolved in place of `budget-carve` when the store is `s3` against a loopback endpoint and `--cache-max-bytes` is unset. |
+| `fallback` | No flag and no readable `MemTotal`, so the compiled-in constant is used. |
+
+To see what a process runs with, without reading the unit file, run
+`journalctl -u ravel-server | grep 'performance default resolved'`:
 
 ```
 INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
@@ -1689,32 +2024,26 @@ INFO performance default resolved setting="sql_tenant_max_bytes" value=161061273
 INFO performance default resolved setting="gc_max_query_duration" value_ms=660000 source="derived"
 ```
 
-`source="derived"` on `memory_budget_bytes` above means this host's `MemTotal`
-was readable but its `MemAvailable` was not (an unusual Linux kernel or
-container runtime): the budget is plain `MemTotal` minus the reserve, the
-pre-amendment rule. A non-Linux build, or a Linux host with no cgroup limit
-whose `/proc/meminfo` cannot be read, never reaches this source: `MemTotal`
-itself is unknown there, so the source reads `fallback` and the budget is
-unlimited (with a cgroup limit set, that host reads `derived-cgroup` instead),
-regardless of any cache or SQL caps set on it. On a Linux host with a
-readable `MemAvailable` and no cgroup memory limit, the source instead reads
-`derived-available` and the value comes from the available-memory formula above;
+In this example, `source="derived"` on `memory_budget_bytes` means that
+`MemTotal` was readable on this host but `MemAvailable` was not. The budget
+is `MemTotal` minus the reserve.
+[Process memory budget](#process-memory-budget) lists the other sources. A
+`fallback` budget is unlimited, regardless of any cache or SQL caps set on
+the host.
+
+For the `derived-available` case,
 [`docs/internal/clickbench.md`](../../internal/clickbench.md#deriving-the-reference-sizes)
 has a worked example from a real measured host, including the SQL-pool cap at
-90% of the remainder. When a cgroup memory limit is present, the source reads
-`derived-cgroup` and `MemAvailable` is not consulted at all: the limit minus the
-reserve is used directly, unchanged from before the amendment. When
-`MemAvailable` plus this process's own resident set would collapse the budget
-below the 1 GiB floor, one extra line appears inside the block above, after
-the `memory_remainder_bytes` line and before the two SQL pool lines:
+90% of the remainder.
+
+When `MemAvailable` plus the resident set of this process puts the budget
+below the 1 GiB floor, one extra line appears inside the block above. It
+comes after the `memory_remainder_bytes` line and before the two SQL pool
+lines:
 
 ```
 WARN memory_budget_bytes was held at MEMORY_BUDGET_FLOOR_BYTES: MemAvailable plus this process's own resident set left little or no room after the overhead reserve, most likely a co-resident process claiming most of the host; the subsequent min against MemTotal less the overhead reserve can still clip memory_budget_bytes below this floor on a small host; set --memory-budget-bytes to size the budget explicitly memory_budget_bytes=1073741824 mem_available_bytes=2147483648 own_rss_bytes=0
 ```
-
-The last two flags are meaningful only in a build with the `sql` feature. See
-[the query guide](../query.md#operator-configurable-budgets-server-flags) for
-worked sizing.
 
 ## Background
 
