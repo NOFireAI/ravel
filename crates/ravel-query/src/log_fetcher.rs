@@ -1347,7 +1347,9 @@ impl LogSegmentFetcher {
     /// ([`Self::with_projection_break_even_bytes`], cost-based only, ADR-2414
     /// decision A3) the saving is compared against it instead, and the fetch
     /// layer's size crossover reads the same value, so an object routed ranged
-    /// here is not read whole one layer down.
+    /// here is not read whole one layer down. The cost-based resolution sets it
+    /// at three request costs, not [`WHOLE_OBJECT_REQUEST_MULTIPLE`]
+    /// ([`crate::COST_BASED_RANGED_REQUESTS`]).
     ///
     /// At or below [`Self::block_range_threshold`] the answer is always false:
     /// there [`tenant_bytes`](Self::tenant_bytes) reads the whole object
@@ -3615,6 +3617,10 @@ pub const DEFAULT_LOG_COALESCE_GAP: u64 = 64 * 1024;
 /// GETs/object measured on q20), so it cannot save enough bytes to pay for
 /// itself until the object exceeds this many request-costs. 5 x 1.8 MiB ~= 8.9
 /// MiB reproduces q20's measured whole-object break-even.
+///
+/// This is ADR-0904's derived crossover. The cost-based projection break-even
+/// does not use it: [`crate::resolve_logs_fetch`] sets that one at three
+/// request costs ([`crate::COST_BASED_RANGED_REQUESTS`], issue #2555).
 pub const WHOLE_OBJECT_REQUEST_MULTIPLE: u64 = 5;
 
 /// Floor on the size-threshold pre-probe crossover, under the
@@ -11406,8 +11412,8 @@ mod ranged_projection_cost_tests {
             .with_projection_break_even_bytes(r.projection_break_even_bytes)
     }
 
-    /// ADR-2414 decision A3: under cost-based the break-even is five request
-    /// costs of the time term, 31,500,000 bytes, not the 512 KiB routing
+    /// ADR-2414 decision A3: under cost-based the break-even is three request
+    /// costs of the time term, 18,900,000 bytes, not the 512 KiB routing
     /// threshold. A 35 MB object at a 3% projection saves 33,950,000 bytes and
     /// reads ranged; a 3 MB object saves 2,910,000 and reads whole. Under
     /// byte-minimal the routing threshold stays the break-even, so the same
@@ -11416,7 +11422,7 @@ mod ranged_projection_cost_tests {
     /// Prove-the-test, each shown failing: a break-even of the routing
     /// threshold alone (`with_projection_break_even_bytes` ignored) flips the
     /// 3 MB cost-based assertion; resolving a break-even under byte-minimal too
-    /// (`max(threshold, 5 * 1,887,437)` = 9,437,185) flips the byte-minimal
+    /// (`max(threshold, 3 * 1,887,437)` = 5,662,311) flips the byte-minimal
     /// one.
     #[test]
     fn the_projection_break_even_governs_only_cost_based() {
@@ -11509,7 +11515,7 @@ mod ranged_projection_cost_tests {
 mod projection_break_even_crossover_tests {
     //! ADR-2414 decision A3 at the ranged fetch's size crossover: under
     //! cost-based the object size is weighed against the projection
-    //! break-even (31,500,000 bytes on the reference profile), not against the
+    //! break-even (18,900,000 bytes on the reference profile), not against the
     //! 512 KiB routing threshold `with_block_range_threshold` pins, so an
     //! object the fast path's route judged too small to range is read whole
     //! here too.
@@ -11608,7 +11614,7 @@ mod projection_break_even_crossover_tests {
 
     /// The fetcher the engine builds from a cost-based resolution at the
     /// reference profile: routing threshold 524,288, request cost 6,300,000,
-    /// break-even 31,500,000.
+    /// break-even 18,900,000.
     fn cost_based(store: Arc<MemoryStore>) -> LogSegmentFetcher {
         let r = crate::resolve_logs_fetch(
             crate::LogsFetchPolicy::CostBased,
@@ -11618,7 +11624,7 @@ mod projection_break_even_crossover_tests {
             DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             None,
         );
-        assert_eq!(r.projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(r.projection_break_even_bytes, Some(18_900_000));
         LogSegmentFetcher::new(store)
             .with_block_range_threshold(r.block_range_threshold)
             .with_request_cost_bytes(r.request_cost_bytes)
@@ -11649,33 +11655,39 @@ mod projection_break_even_crossover_tests {
     }
 
     /// An object under the break-even is one whole-object GET; one above it
-    /// takes the ranged protocol and moves a small fraction of its bytes.
+    /// takes the ranged protocol and moves a small fraction of its bytes. The
+    /// larger object sits between three and five request costs, so it reads
+    /// ranged only at the three-request-cost break-even.
     ///
     /// Prove-the-test: a crossover that reads the configured routing
     /// threshold verbatim (`effective_whole_object_threshold` at the size
     /// crossover) ranges the smaller object too, and its GET count is no
-    /// longer 1.
+    /// longer 1; a break-even of five request costs reads the larger one
+    /// whole in 1 GET.
     #[tokio::test]
     async fn the_size_crossover_reads_the_projection_break_even() {
-        let (store, small) = object(490).await;
+        let (store, small) = object(290).await;
         assert!(
-            small.object_size > 29_000_000 && small.object_size <= 31_500_000,
-            "fixture precondition: about 30 MB, under the break-even: {}",
+            small.object_size > 17_000_000 && small.object_size <= 18_900_000,
+            "fixture precondition: about 18 MB, under the break-even: {}",
             small.object_size
         );
         let (gets, bytes) = ranged_open(&cost_based(store), &small).await;
         assert_eq!(gets, 1, "one whole-object GET");
         assert_eq!(bytes, small.object_size);
 
-        let (store, large) = object(570).await;
+        let (store, large) = object(490).await;
         assert!(
-            large.object_size > 31_500_000 && large.object_size <= 36_000_000,
-            "fixture precondition: about 35 MB, over the break-even: {}",
+            large.object_size > 18_900_000 && large.object_size <= 31_500_000,
+            "fixture precondition: about 30 MB, over three request costs and \
+             under five: {}",
             large.object_size
         );
+        // 490 records at 16 per block is 31 blocks, one row group of the
+        // default 32, so one fewer run GET than a two-row-group object.
         let (gets, bytes) = ranged_open(&cost_based(store), &large).await;
         assert_eq!(
-            gets, 6,
+            gets, 5,
             "the ranged protocol's probe, directory and run GETs"
         );
         assert!(

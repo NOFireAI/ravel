@@ -1241,9 +1241,10 @@ mod tests {
     /// At default flags against the reference (intra-region) profile, the bench
     /// resolves the same shape a stock server resolves, loopback endpoint or
     /// not (ADR-2023 decision 1): the time term's request cost, the configured
-    /// routing threshold, and a projection break-even of five request costs
-    /// (ADR-2414 decision A3), so a narrow projection of an object above
-    /// 31,500,000 bytes reads ranged and every smaller object reads whole.
+    /// routing threshold, and a projection break-even of three request costs
+    /// (ADR-2414 decision A3, amended by issue #2555), so a narrow projection
+    /// that skips more than 18,900,000 bytes of an object reads ranged and
+    /// every object of that size or less reads whole.
     #[test]
     fn default_flags_resolve_the_time_term_at_the_reference_profile() {
         let resolved = resolution_from(&["sql_latency_bench", "--generate"]);
@@ -1255,7 +1256,7 @@ mod tests {
             ravel_query::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
             "a finite rate leaves the routing threshold at its configured value"
         );
-        assert_eq!(resolved.projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(resolved.projection_break_even_bytes, Some(18_900_000));
         assert_eq!(resolved.saturated_profile, None);
     }
 
@@ -1269,11 +1270,11 @@ mod tests {
         let d = dataset("pre-compaction", None);
         let mut p = provenance_with_cost(6_300_000);
         p.logs_rate_term_effective = Some("time".to_string());
-        p.logs_projection_break_even_bytes_effective = Some(31_500_000);
+        p.logs_projection_break_even_bytes_effective = Some(18_900_000);
         let header = provenance_header(&p, &d);
         assert!(
             header.contains(
-                "  rate term  : effective=time  break-even: effective=31500000 bytes (profile)\n"
+                "  rate term  : effective=time  break-even: effective=18900000 bytes (profile)\n"
             ),
             "got:\n{header}"
         );
@@ -1349,8 +1350,8 @@ mod tests {
         assert_eq!(default_policy.overridden_block_range_threshold, None);
         assert_eq!(
             default_policy.projection_break_even_bytes,
-            Some(31_500_000),
-            "the break-even is five request costs above a smaller threshold"
+            Some(18_900_000),
+            "the break-even is three request costs above a smaller threshold"
         );
     }
 

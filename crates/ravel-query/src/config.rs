@@ -450,6 +450,20 @@ impl RateTerm {
     }
 }
 
+/// Requests a narrow projection's ranged read issues per object, the `k` of
+/// the cost-based projection break-even (ADR-2414 decision A3, amended by
+/// issue #2555). A whole read costs one request and `S` bytes; a ranged read
+/// costs `k` requests and `b` bytes; at a rate of `r` bytes per request the
+/// ranged read pays when `(k - 1) * r + b < S`, that is when the bytes it
+/// skips exceed `(k - 1) * r`. Measured on the reference tenant for a
+/// one-column projection: 4.19 GETs per object under latency-first (918 over
+/// 219 objects) and 4.40 under cost-based for the 107 objects that read
+/// ranged. So [`resolve_logs_fetch`] sets the break-even at
+/// `(COST_BASED_RANGED_REQUESTS - 1)` request costs, three.
+/// [`crate::WHOLE_OBJECT_REQUEST_MULTIPLE`], ADR-0904's derived crossover,
+/// is a separate constant and stays 5.
+pub const COST_BASED_RANGED_REQUESTS: u64 = 4;
+
 /// A resolved fetch policy: the byte quantities and routing decisions the fetch
 /// layer runs on (ADR-0996 decision 2), plus the facts a startup path logs.
 ///
@@ -480,7 +494,8 @@ pub struct ResolvedLogsFetch {
     /// The projection break-even when a cost-based derivation produced a
     /// finite rate ([`Self::rate_term`] is `Price` or `Time`, ADR-2414
     /// decision A3): `max(block_range_threshold,
-    /// WHOLE_OBJECT_REQUEST_MULTIPLE * request_cost_bytes)`, the bytes a
+    /// (COST_BASED_RANGED_REQUESTS - 1) * request_cost_bytes)`, three request
+    /// costs ([`COST_BASED_RANGED_REQUESTS`]), the bytes a
     /// narrow projection must save before the fast path reads it ranged and
     /// the object size at or below which the ranged fetch reads the object
     /// whole ([`EngineConfig::logs_projection_break_even_bytes`]). `None`
@@ -556,8 +571,10 @@ impl ResolvedLogsFetch {
 /// applied downstream in the fetch layer.
 ///
 /// When the cost-based derivation produces a finite rate, the projection
-/// break-even is `max(block_range_threshold, WHOLE_OBJECT_REQUEST_MULTIPLE *
-/// request_cost_bytes)`: the routing threshold bounds which objects take the
+/// break-even is
+/// `max(block_range_threshold, (COST_BASED_RANGED_REQUESTS - 1) * request_cost_bytes)`,
+/// three request costs ([`COST_BASED_RANGED_REQUESTS`] carries the
+/// derivation): the routing threshold bounds which objects take the
 /// block-range path at all, and the break-even bounds which narrow
 /// projections are worth a ranged read. Every other resolution keeps the
 /// routing threshold as the break-even, including an explicit
@@ -611,7 +628,7 @@ pub fn resolve_logs_fetch(
     let projection_break_even_bytes = matches!(rate_term, Some(RateTerm::Price | RateTerm::Time))
         .then(|| {
             block_range_threshold
-                .max(request_cost_bytes.saturating_mul(crate::WHOLE_OBJECT_REQUEST_MULTIPLE))
+                .max(request_cost_bytes.saturating_mul(COST_BASED_RANGED_REQUESTS - 1))
         });
 
     ResolvedLogsFetch {
@@ -955,7 +972,7 @@ mod tests {
 
     /// ADR-2414 decision A3: the reference profile's rate is the time term,
     /// the routing threshold keeps its configured value, and the break-even
-    /// is the larger of that threshold and five request costs.
+    /// is the larger of that threshold and three request costs.
     ///
     /// Prove-the-test, each shown failing: a price-only rate reads u64::MAX
     /// at the first assertion; a rate from the latency alone reads 70,000 (or
@@ -971,14 +988,14 @@ mod tests {
         assert_eq!(r.saturated_profile, None);
         assert_eq!(r.block_range_threshold, 524_288);
         assert_eq!(r.overridden_block_range_threshold, None);
-        assert_eq!(r.projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(r.projection_break_even_bytes, Some(18_900_000));
 
         // An explicit routing threshold below the break-even is kept, and the
-        // break-even is still five request costs.
+        // break-even is still three request costs.
         let r = cost_based(&reference, Some(2_000_000));
         assert_eq!(r.block_range_threshold, 2_000_000);
         assert_eq!(r.overridden_block_range_threshold, None);
-        assert_eq!(r.projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(r.projection_break_even_bytes, Some(18_900_000));
 
         // One above it is the break-even itself.
         let r = cost_based(&reference, Some(64_000_000));
@@ -1006,7 +1023,7 @@ mod tests {
         let r = cost_based(&priced_high, None);
         assert_eq!(r.request_cost_bytes, 10_000_004);
         assert_eq!(r.rate_term, Some(RateTerm::Price));
-        assert_eq!(r.projection_break_even_bytes, Some(50_000_020));
+        assert_eq!(r.projection_break_even_bytes, Some(30_000_012));
 
         // Egress prices and no timings: the price term alone, as before A3.
         let r = cost_based(&egress_untimed(), None);
@@ -1015,7 +1032,7 @@ mod tests {
         assert_eq!(
             r.projection_break_even_bytes,
             Some(crate::DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD),
-            "five request costs under the threshold leave the threshold as the break-even"
+            "three request costs under the threshold leave the threshold as the break-even"
         );
 
         // Zero prices and no timings: saturated exactly as before A3.

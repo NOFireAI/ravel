@@ -6546,7 +6546,7 @@ mod tests {
 
     /// A logs statement's dependency depth reads the bound `plan_segment`
     /// routes on, `plan_whole_object_bound`: a 1,000,000 byte object above the
-    /// 524,288 byte routing threshold and under the 31,500,000 byte
+    /// 524,288 byte routing threshold and under the 18,900,000 byte
     /// projection break-even is read whole with no probe, depth 1. Fails
     /// against feeding `block_range_threshold()`, which reports the probe
     /// chain's depth 4.
@@ -6559,8 +6559,8 @@ mod tests {
         let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("cat"));
         let log_fetcher = LogSegmentFetcher::new(store.clone())
             .with_block_range_threshold(524_288)
-            .with_projection_break_even_bytes(Some(31_500_000));
-        assert_eq!(log_fetcher.plan_whole_object_bound(), 31_500_000);
+            .with_projection_break_even_bytes(Some(18_900_000));
+        assert_eq!(log_fetcher.plan_whole_object_bound(), 18_900_000);
         let exec = SqlExecutor::new(
             catalog,
             SegmentFetcher::new(store.clone()),
