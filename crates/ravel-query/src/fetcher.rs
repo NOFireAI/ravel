@@ -3189,17 +3189,27 @@ impl<'a> RunPlanCursor<'a> {
         series_id: &SeriesId,
         run_index: usize,
     ) -> Option<&'a ravel_segment::PlannedRunRange> {
-        let candidate = self.planned.get(self.pos)?;
-        #[cfg(test)]
-        {
-            self.steps += 1;
-        }
+        let candidate = self.entry(self.pos)?;
         if &candidate.series_id == series_id && candidate.run_index == run_index {
             self.pos += 1;
             Some(candidate)
         } else {
             None
         }
+    }
+
+    /// The only path through which `next` may read a plan entry. Counts as
+    /// one examined entry in test builds, so `steps` means "plan entries
+    /// examined" by construction rather than by convention: a lookup that
+    /// reads an entry without going through this accessor cannot increment
+    /// it, and one that examines more entries than it needs cannot hide that
+    /// from the counter.
+    fn entry(&mut self, i: usize) -> Option<&'a ravel_segment::PlannedRunRange> {
+        #[cfg(test)]
+        {
+            self.steps += 1;
+        }
+        self.planned.get(i)
     }
 }
 
@@ -3551,14 +3561,24 @@ mod tests {
         assert!(swapped.next(&id1, 0).is_none());
     }
 
-    /// Resolving every entry of an N-entry plan costs exactly one examined
-    /// entry per call, at 1,000 and 8,000 plan entries, so a lookup that
-    /// scans the plan per call (quadratic) fails the bound at both sizes. No
-    /// wall-clock assertions.
+    /// Resolving every run of an N-entry plan in order, via `next`, examines
+    /// exactly N plan entries: one per call, at 1,002 and 8,004 plan entries
+    /// (501 and 4,002 series respectively, run counts cycling 1, 2, 3). The
+    /// count comes from `RunPlanCursor::entry`, the only place `steps` is
+    /// incremented, so this pins both failure modes a review found possible
+    /// under the old counter (which incremented once per call to `next`
+    /// regardless of what the call examined):
+    ///
+    /// - a lookup that re-scans the plan from the front on every call, going
+    ///   through `entry` for each element it checks, drives the count to
+    ///   roughly N^2/2 over the full walk, far above the exact bound below;
+    /// - a lookup that bypasses `entry` entirely (for example
+    ///   `self.planned.iter().find(...)`) leaves `steps` at 0, which fails
+    ///   the exact equality below (the old bound, `steps <= 2 * entries`,
+    ///   cannot tell this apart from a linear walk, since 0 satisfies it
+    ///   too).
     #[test]
     fn run_plan_lookup_step_count_is_linear_in_plan_size() {
-        // Run counts cycle 1, 2, 3: a series count divisible by 3 gives
-        // exactly 2 entries per series on average.
         for &(n_series, entries) in &[(501usize, 1_002usize), (4_002usize, 8_004usize)] {
             let (planned, series) = build_planned(n_series);
             assert_eq!(planned.len(), entries);
@@ -3570,10 +3590,29 @@ mod tests {
             }
             assert_eq!(
                 cursor.steps, entries,
-                "an in-order walk examines exactly one entry per call"
+                "an in-order walk of an {entries}-entry plan must examine exactly {entries} entries"
             );
-            assert!(cursor.steps <= 2 * entries);
         }
+    }
+
+    /// After `next` misses (a mismatching series or run index), the cursor's
+    /// position must not have moved: the following call for the entry that
+    /// was actually next must still succeed. A cursor that advances `pos` on
+    /// a miss would skip that entry and either return the wrong range on a
+    /// later call or report `None` for a run the plan does have.
+    #[test]
+    fn run_plan_lookup_does_not_advance_on_a_miss() {
+        let (planned, series) = build_planned(5);
+        let (id0, _) = series[0];
+        let (id1, _) = series[1];
+
+        let mut cursor = RunPlanCursor::new(&planned);
+        // The plan's next entry is (id0, 0); ask for a mismatching series.
+        assert!(cursor.next(&id1, 0).is_none());
+        // The cursor must not have advanced past (id0, 0): asking for it now
+        // still succeeds.
+        let resolved = cursor.next(&id0, 0);
+        assert_eq!(resolved.map(|p| (p.series_id, p.run_index)), Some((id0, 0)));
     }
 
     /// Writes a real RSEG segment with two series: one whose values compress
