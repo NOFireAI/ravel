@@ -234,8 +234,11 @@ while q33 is reported as a 43rd row.
 - Narrow projections on S3 move their columns' bytes and finish in the time
   those bytes take, on objects where the bytes they skip exceed the
   break-even (three request costs since the three-request-cost amendment below).
-  On the whole-segment fast path wide statements are
-  unchanged (they fail the break-even and read whole, as today). On the
+  On the whole-segment fast path a wide statement reads
+  an object whole when it fails the break-even, as before; under the
+  three-request-cost amendment below fewer objects fail it (at half the
+  columns by count, an object above 37.8 MB now routes ranged, where five
+  request costs needed 63 MB). On the
   planned route an object at or below the break-even is read whole with no
   probe, but an object above it pays the tail probe and directory reads
   before the coverage crossover decides, so a wide statement there whose
@@ -310,14 +313,22 @@ from the 5.46 GETs per object measured on q20 on an older layout, the figure
 `WHOLE_OBJECT_REQUEST_MULTIPLE` records. On the reference tenant a
 one-column projection measured 4.19 GETs per object under `latency-first`
 (918 over 219 objects) and 4.40 under `cost-based` for the 107 objects that
-read ranged, moving 0.89 to 0.95 MB per object. So k = 4
-(`COST_BASED_RANGED_REQUESTS`), and the break-even is three request costs.
+read ranged, moving 0.89 to 0.95 MB per object. With those figures the
+inequality puts the break-even between 3.19 and 3.40 request costs (20.1 to
+21.4 MB). The constant is a whole number of requests, and k = 4
+(`COST_BASED_RANGED_REQUESTS`, three request costs) was chosen over k = 5 by
+its outcome on the reference tenant's sizes, not derived: at four request
+costs about 51 objects still read whole and the statement moves 14 to 16
+percent of the corpus, and at two request costs only 3 to 5 more objects
+flip than at three.
 
 **What five request costs produced.** At 31,500,000 bytes on the reference
 profile, the 112 of those 219 objects at or below about 32.4 MB (the size at
-which a 3-of-114 projection skips 31,500,000 bytes) read whole: 583 GETs and
-2,919,327,365 wire bytes, 37.7 percent of the 7,741,962,796-byte corpus,
-where the ranged read of all 219 objects moves 194,213,453.
+which a 3-of-114 projection skips 31,500,000 bytes) read whole. The
+statement as a whole, those 112 whole reads plus the ranged reads of the
+other 107 objects, issued 583 GETs and moved 2,919,327,365 wire bytes, 37.7
+percent of the 7,741,962,796-byte corpus, where the ranged read of all 219
+objects moves 194,213,453.
 
 **The new break-even.** When `cost-based` takes its rate from the profile
 (its price term or its time term), the break-even is

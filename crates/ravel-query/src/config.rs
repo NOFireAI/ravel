@@ -458,8 +458,10 @@ impl RateTerm {
 /// skips exceed `(k - 1) * r`. Measured on the reference tenant for a
 /// one-column projection: 4.19 GETs per object under latency-first (918 over
 /// 219 objects) and 4.40 under cost-based for the 107 objects that read
-/// ranged. So [`resolve_logs_fetch`] sets the break-even at
-/// `(COST_BASED_RANGED_REQUESTS - 1)` request costs, three.
+/// ranged, which puts the inequality's break-even between 3.19 and 3.40
+/// request costs. [`resolve_logs_fetch`] sets it at
+/// `(COST_BASED_RANGED_REQUESTS - 1)` request costs, three: the whole number
+/// below that range, chosen over four by its outcome on the reference tenant.
 /// [`crate::WHOLE_OBJECT_REQUEST_MULTIPLE`], ADR-0904's derived crossover,
 /// is a separate constant and stays 5.
 pub const COST_BASED_RANGED_REQUESTS: u64 = 4;
