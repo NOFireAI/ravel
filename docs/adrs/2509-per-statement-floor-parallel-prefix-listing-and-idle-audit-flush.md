@@ -125,7 +125,7 @@ sequenceDiagram
     end
     S->>S: plan and execute
     S->>A: submit(audit event)
-    Note over A: (new) flush at once when the queue is idle and no flush is in flight
+    Note over A: (new) flush at once if idle: nothing queued, no flush in flight, previous event at least max_age ago
     A->>O: PUT audit data object
     A->>O: PUT audit commit record
     A-->>S: durable
@@ -153,31 +153,60 @@ sequenceDiagram
   itself does not vary, because a window whose total page count exceeds the
   cap is refused on every run.
 - The shard results are merged in shard order before step 2 partitions them,
-  so the resolved key set and its total order are unchanged. ADR-0056's "both
-  traversals produce the identical key set" still holds.
-- **Amendments.** ADR-0056 and `docs/catalog-and-mvcc.md` (the prefix-scan
-  bullet under the resolve steps) get an amendment that replaces "drain
-  sequentially ... refused deterministically" with this rule. The amendment
-  uses the marker syntax `scripts/guards/check-amendment-integrity.sh`
-  checks.
+  so the resolved key set and its total order are unchanged.
+  `docs/catalog-and-mvcc.md`'s "Both traversals produce the identical key set"
+  still holds. ADR-0056 itself makes the narrower claim that the prefix path
+  lists a superset and the resolved snapshots converge. Concurrency changes
+  neither.
+- **Docs this changes.**
+  - The retired wording, "drain sequentially ... refused deterministically",
+    lives only in `docs/catalog-and-mvcc.md` (the prefix-scan bullet under
+    the resolve steps). That is a normative doc, not an ADR, so it is edited
+    in place to state this rule.
+  - What changes in ADR-0056 is its runtime-cap bullet:
+    `WindowTooWide { estimate: <pages issued> }` now reports the pages
+    reserved when the cap was reached, and that number is no longer stable
+    between runs. ADR-0056 gets an amendment naming that bullet, with an
+    inline pointer from the bullet, in the marker syntax
+    `scripts/guards/check-amendment-integrity.sh` checks.
 
 ### 2. The audit pipeline flushes when it is idle
 
-- `run_flush_loop` starts a flush as soon as the queue is empty and no flush
-  is in flight, instead of waiting out `max_age`.
-- Events that arrive while a flush is in flight wait for that flush to
-  finish, then form the next batch together. They flush when that flush
-  completes, when they reach `max_batch`, or when `max_age` elapses,
-  whichever comes first.
-- So under concurrency the pipeline still group-commits: a burst arriving
-  during a flush shares the next pair of PUTs. It never degenerates to one
-  pair per event.
-- `max_age` remains the upper bound on how long an event waits once a batch
-  is open behind an in-flight flush.
+- **The idle trigger.** An event that `run_flush_loop` receives when the
+  pipeline is idle flushes at once instead of opening a `max_age` window.
+  Idle means all three of:
+  - nothing else is queued;
+  - no flush is in flight;
+  - the loop received its previous event at least `max_age` earlier.
+- **Every other event batches exactly as today.** It opens or joins a
+  window that flushes at `max_batch` or `max_age`, whichever comes first.
+  That includes events arriving during a flush, or within `max_age` of the
+  previous event.
+- **Why the third condition.** Without it, steady traffic on a fast store
+  would degenerate to one PUT pair per event. Take a RustFS PUT pair of
+  about 8 ms with statements every 10 to 25 ms: the queue would be empty and
+  no flush in flight each time the loop came round. That one-pair-per-event
+  outcome is the `max_batch=1` configuration ADR-0062 rejects on object
+  count. With the condition:
+  - traffic arriving more often than once per `max_age` never triggers the
+    idle path, and batches exactly as it does today;
+  - only the first event after a gap of at least `max_age` flushes alone.
+- **The cost bound.** Compared with today's loop on the same arrival
+  schedule:
+  - each idle trigger adds at most one PUT pair (the triggering event flushes
+    alone instead of sharing a window with the events right behind it);
+  - idle triggers are at least `max_age` apart.
+  So the pair count is at most twice today's, and at most one extra pair per
+  `max_age` of wall time (40 per second at the 25 ms default). Steady traffic
+  adds none.
+- **Sequential statements always qualify.** The next one is submitted only
+  after the previous response, which takes longer than `max_age` here, so
+  each submission finds the pipeline idle.
 - ADR-0062's contract is untouched: every submitter still awaits its batch's
   durable flush before its response is released, in `required` and
   `best-effort` alike. ADR-0062 gets an amendment, marker `none` with a
-  reason, recording the idle trigger and these numbers.
+  reason, recording the idle trigger, the cost bound and these numbers,
+  against ADR-0062's PUT-spend rationale.
 
 ### 3. A missing catalog HEAD is cached on the resolve path
 
@@ -197,6 +226,11 @@ sequenceDiagram
   - ADR-1133's delete gate does not consult it either.
 - A GET that fails for any reason other than NotFound is not cached. It still
   falls back to listing, as today.
+- **Capacity.** An absence counts as one entry against
+  `head_cache_capacity`, like a present HEAD. It is never inserted if
+  inserting it would evict a present HEAD: when the cache is full, the
+  absence is simply not cached. So never-folded tenants cannot push folded
+  tenants' HEADs out.
 
 ### What this moves, pre-registered
 
@@ -214,7 +248,8 @@ The implementing tasks' acceptance stamps are measured the same way as Stage 0:
 | GET per q1 | 2 | 1 | 2 |
 | audit wait beyond the two PUTs | about 25 ms | under 3 ms | above 10 ms |
 | PUT per q1, sequential traffic | 2 | 2 | anything other than 2 |
-| PUT pairs for 64 statements submitted while one flush is held | 1 (one `max_age` batch) | 1 or 2 (the held flush, then one batch) | more than 2, which means the idle flush stopped batching |
+| PUT pairs for steady traffic, one event every 5 ms for 2 s, store PUT about 1 ms | today's loop on the same schedule, about 77 | today's count, plus at most 1 | more than today's count + 1, which means steady traffic reached the idle path |
+| PUT pairs for events submitted while one flush is held | one batch per `max_batch` or `max_age` | unchanged | any change |
 | q1 hot, RustFS entry, end to end | 0.44 s (upstream) | 0.12-0.25 s (from the model) | above 0.30 s |
 
 **How the end-to-end bands are derived.**
@@ -314,11 +349,13 @@ does not move it. See "Deferred" below.
 - **The `WindowTooWide` error.** It names the pages reserved when the cap was
   hit, which can differ between runs of the same over-wide query. Tests
   assert the refusal and the bound, not the exact count.
-- **The audit pipeline.** Under sequential traffic it no longer waits
-  `max_age`. Under concurrent traffic, batching is preserved by the
-  in-flight-flush rule. A test with a held `FaultStore` flush asserts a burst
-  shares one PUT pair. `max_age` and `max_batch` keep their meaning as upper
-  bounds.
+- **The audit pipeline.**
+  - Sequential traffic no longer waits `max_age`.
+  - Traffic arriving more often than once per `max_age` batches exactly as
+    it does today.
+  - The PUT-pair count is at most twice today's on any arrival schedule, and
+    at most one extra pair per `max_age` of wall time.
+  - `max_age` and `max_batch` keep their meaning.
 - **HEAD visibility.** An unfolded catalog's first published HEAD is picked
   up by queries up to `head_cache_ttl` late. Until then the resolve keeps
   listing the whole window, which is correct and only slower.
@@ -329,8 +366,8 @@ does not move it. See "Deferred" below.
     - a check-then-increment counter, which overshoots the cap;
     - a still-sequential loop.
   - The audit tests must fail against:
-    - an idle flush that never batches (a burst during a flush gives one PUT
-      pair per event);
-    - an idle flush that still waits `max_age`.
+    - an idle trigger without the previous-event condition (steady 5 ms
+      traffic on a fast store gives one PUT pair per event);
+    - a loop that still waits `max_age` for an idle event.
   - A reachability test drives the SQL HTTP handler end to end and asserts
     the request counts.
