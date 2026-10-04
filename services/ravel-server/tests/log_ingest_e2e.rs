@@ -362,3 +362,138 @@ async fn buffered_mode_header_is_honored() {
     assert_eq!(records.len(), 1, "shutdown must flush the buffered record");
     assert_is_the_exported_record(&records[0], "buffered log line", ts_ns);
 }
+
+/// The deepest kvlist nest the log segment format holds around a scalar
+/// (`ravel_logseg::attr_value_fits_storage`: a kvlist costs two of its 31
+/// levels).
+const FITTING_KVLISTS: usize = 15;
+
+/// `layers` single-entry kvlists nested around an int, as OTLP and as the
+/// `AttrValue` it stores as.
+fn nested_kvlist(layers: usize) -> (AnyValue, AttrValue) {
+    use opentelemetry_proto::tonic::common::v1::KeyValueList;
+    let mut otlp = AnyValue {
+        value: Some(AnyValueVariant::IntValue(7)),
+    };
+    let mut stored = AttrValue::I64(7);
+    for _ in 0..layers {
+        otlp = AnyValue {
+            value: Some(AnyValueVariant::KvlistValue(KeyValueList {
+                values: vec![KeyValue {
+                    key: "m".to_string(),
+                    value: Some(otlp),
+                    ..Default::default()
+                }],
+            })),
+        };
+        stored = AttrValue::Map(vec![("m".to_string(), stored)]);
+    }
+    (otlp, stored)
+}
+
+fn resource_logs(resource_attrs: Vec<KeyValue>, body: &str, ts_ns: i64) -> ResourceLogs {
+    let mut request = export_request(body, ts_ns);
+    let mut resource_logs = request.resource_logs.remove(0);
+    resource_logs.resource = Some(Resource {
+        attributes: resource_attrs,
+        ..Default::default()
+    });
+    resource_logs
+}
+
+/// A resource attribute at the deepest nest the segment format holds is
+/// admitted, flushed and read back intact; one a kvlist level deeper is
+/// rejected at admission: its request reports one rejected record with the
+/// depth message. Once both exports return, the durable records are the
+/// fitting one and the sibling resource's from the rejected request. The two
+/// requests are sent concurrently, but nothing here makes them share a flush
+/// batch, so this does not show that a refused value would have failed a
+/// batch.
+#[tokio::test]
+async fn resource_attribute_depth_is_checked_at_admission_not_at_flush() {
+    let (running, store) = start_test_server().await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+    let ts_ns = now_ns();
+
+    let (fit_otlp, fit_stored) = nested_kvlist(FITTING_KVLISTS);
+    let (past_otlp, _) = nested_kvlist(FITTING_KVLISTS + 1);
+    let deep_kv = |value: AnyValue| KeyValue {
+        key: "deep".to_string(),
+        value: Some(value),
+        ..Default::default()
+    };
+    let fit_request = ExportLogsServiceRequest {
+        resource_logs: vec![resource_logs(
+            vec![string_kv("service.name", "fit"), deep_kv(fit_otlp)],
+            "fit",
+            ts_ns,
+        )],
+    };
+    let past_request = ExportLogsServiceRequest {
+        resource_logs: vec![
+            resource_logs(
+                vec![string_kv("service.name", "past"), deep_kv(past_otlp)],
+                "past",
+                ts_ns,
+            ),
+            resource_logs(vec![string_kv("service.name", "sibling")], "sibling", ts_ns),
+        ],
+    };
+
+    let send = |request: ExportLogsServiceRequest| {
+        client
+            .post(format!("{base}/v1/logs"))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/x-protobuf")
+            .body(request.encode_to_vec())
+            .send()
+    };
+    let (fit_response, past_response) = tokio::join!(send(fit_request), send(past_request));
+    let decode = |bytes: &[u8]| {
+        ExportLogsServiceResponse::decode(bytes).expect("response is an ExportLogsServiceResponse")
+    };
+
+    let fit_response = fit_response.expect("fit export completes");
+    assert_eq!(fit_response.status(), 200);
+    let fit_body = decode(&fit_response.bytes().await.expect("response body"));
+    assert!(
+        fit_body.partial_success.is_none(),
+        "{:?}",
+        fit_body.partial_success
+    );
+
+    let past_response = past_response.expect("past export completes");
+    assert_eq!(past_response.status(), 200);
+    let past_body = decode(&past_response.bytes().await.expect("response body"));
+    let partial = past_body
+        .partial_success
+        .expect("the over-nested resource is reported");
+    assert_eq!(partial.rejected_log_records, 1);
+    assert!(
+        partial
+            .error_message
+            .contains("attribute deep nests more than 31 levels deep"),
+        "{}",
+        partial.error_message
+    );
+
+    let records = scan_durable_log_records(store.as_ref()).await;
+    let mut bodies: Vec<&str> = records.iter().map(|r| r.body.as_str()).collect();
+    bodies.sort_unstable();
+    assert_eq!(bodies, vec!["fit", "sibling"]);
+    let fit = records
+        .iter()
+        .find(|r| r.body == "fit")
+        .expect("fit record");
+    let decoded = ravel_logseg::record::decode_stream_attrs(&fit.stream_attrs)
+        .expect("the stored resource attributes decode");
+    let deep = decoded
+        .resource
+        .iter()
+        .find(|(key, _)| key == "deep")
+        .expect("the fitting resource attribute survived");
+    assert_eq!(deep.1, fit_stored);
+
+    running.shutdown().await.expect("graceful shutdown");
+}

@@ -2046,9 +2046,6 @@ pub fn phrase_match(value: &[u8], word: &str) -> bool {
     toks.windows(query.len()).any(|w| w == query.as_slice())
 }
 
-/// Decodes canonical attribute bytes (the write-side [`canonical_attr_bytes`])
-/// back into attributes. Used for `attrs_raw` overflow. Depth-bounded against
-/// hostile nesting.
 /// The resource and scope attribute `(name, value)` pairs a STREAM_DIR blob
 /// carries, in blob order (the resource set first, then the scope set). The
 /// blob layout is `canonical_attr_bytes(resource) || len+scope_name ||
@@ -2083,7 +2080,27 @@ pub fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSeg
     Ok(pairs)
 }
 
-fn decode_canonical_attrs(bytes: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+/// Decodes canonical attribute bytes (the write-side [`canonical_attr_bytes`])
+/// back into attributes. Used for `attrs_raw` overflow.
+///
+/// Its bounds, applied to every attribute set and value it decodes:
+///
+/// * a map entry set nested inside more than [`ATTRS_RAW_MAP_DEPTH_CAP`] maps
+///   and lists, the map that holds it included, is refused;
+/// * a map or list nested inside [`ATTRS_RAW_READ_DEPTH_CAP`] maps and lists
+///   is refused before its entry count is read, so an empty one there is
+///   refused too; a scalar there is read;
+/// * an attribute set or list with more than
+///   [`crate::record::MAX_ATTR_ENTRIES`] entries is refused.
+///
+/// These are looser than the admission rule
+/// ([`crate::record::attr_value_fits_storage`]) because objects written under
+/// the older bound exist in storage and must stay readable and rewritable.
+/// The writer holds `attrs_raw` to these bounds and no others
+/// ([`check_attrs_raw_decodable`]).
+pub(crate) fn decode_canonical_attrs(
+    bytes: &[u8],
+) -> Result<Vec<(String, AttrValue)>, LogSegError> {
     let mut pos = 0usize;
     let out = decode_attr_set(bytes, &mut pos, 0)?;
     if pos != bytes.len() {
@@ -2092,21 +2109,100 @@ fn decode_canonical_attrs(bytes: &[u8]) -> Result<Vec<(String, AttrValue)>, LogS
     Ok(out)
 }
 
-const MAX_ATTR_DEPTH: u32 = 32;
+/// The `attrs_raw` decoder's map bound: a map entry set nested inside more
+/// than this many maps and lists, the map that holds it included, is refused.
+/// This is the read-side bound every `attrs_raw` value was written under
+/// before the admission rule ([`crate::record::MAX_ATTR_DEPTH`], a separate
+/// constant with a stricter accounting) existed, so it must not tighten.
+const ATTRS_RAW_MAP_DEPTH_CAP: u32 = 32;
 
+/// The `attrs_raw` decoder's stack-safety bound: a map or list nested inside
+/// this many maps and lists is refused, before its entry count is read,
+/// instead of recursed into. It is above the 100 levels OTLP admission ever
+/// accepted, so no `attrs_raw` value admitted through OTLP reaches it. It is
+/// not the admission cap ([`crate::record::MAX_ATTR_DEPTH`]).
+const ATTRS_RAW_READ_DEPTH_CAP: u32 = 128;
+
+/// The error the `attrs_raw` decoder returns for nesting past its bounds,
+/// which the writer also returns when it refuses an overflow value nested
+/// past them.
+pub(crate) fn attrs_raw_too_deep() -> LogSegError {
+    LogSegError::Corrupted("attrs_raw too deep".into())
+}
+
+/// Refuses overflow attributes the `attrs_raw` decoder would refuse: `Ok`
+/// exactly when [`decode_canonical_attrs`] decodes
+/// `canonical_attr_bytes(attrs)`, and otherwise the error that decoder
+/// returns for the first refused value in `attrs` order (the encoding sorts
+/// entries, so with several refused values the decoder may name another).
+///
+/// It walks the values through the decoder's own checks, in the decoder's
+/// order, instead of encoding and decoding them. The decoder's other refusals
+/// (truncation, an unknown tag, a key or string that is not UTF-8, trailing
+/// bytes) cannot arise from encoding an [`AttrValue`]. Recursion stops at
+/// [`ATTRS_RAW_READ_DEPTH_CAP`], as the decoder's does.
+pub(crate) fn check_attrs_raw_decodable(attrs: &[(String, AttrValue)]) -> Result<(), LogSegError> {
+    check_attrs_raw_set(attrs, 0)
+}
+
+fn check_attrs_raw_set(attrs: &[(String, AttrValue)], depth: u32) -> Result<(), LogSegError> {
+    attrs_raw_set_depth(depth)?;
+    attrs_raw_set_count(attrs.len() as u64)?;
+    attrs
+        .iter()
+        .try_for_each(|(_, v)| check_attrs_raw_value(v, depth))
+}
+
+fn check_attrs_raw_value(value: &AttrValue, depth: u32) -> Result<(), LogSegError> {
+    match value {
+        AttrValue::List(items) => {
+            let inner = attrs_raw_inner_depth(depth)?;
+            attrs_raw_list_count(items.len() as u64)?;
+            items
+                .iter()
+                .try_for_each(|v| check_attrs_raw_value(v, inner))
+        }
+        AttrValue::Map(entries) => check_attrs_raw_set(entries, attrs_raw_inner_depth(depth)?),
+        _ => Ok(()),
+    }
+}
+
+/// The map bound for an attribute set at `depth`, the number of maps and
+/// lists enclosing it, the map that holds it included.
+fn attrs_raw_set_depth(depth: u32) -> Result<(), LogSegError> {
+    if depth > ATTRS_RAW_MAP_DEPTH_CAP {
+        return Err(attrs_raw_too_deep());
+    }
+    Ok(())
+}
+
+/// The entry cap for an attribute set of `count` entries.
+fn attrs_raw_set_count(count: u64) -> Result<(), LogSegError> {
+    if count > crate::record::MAX_ATTR_ENTRIES {
+        return Err(LogSegError::Corrupted("attrs_raw count over cap".into()));
+    }
+    Ok(())
+}
+
+/// The entry cap for a list of `n` elements.
+fn attrs_raw_list_count(n: u64) -> Result<(), LogSegError> {
+    if n > crate::record::MAX_ATTR_ENTRIES {
+        return Err(LogSegError::Corrupted("attr list over cap".into()));
+    }
+    Ok(())
+}
+
+/// `depth` is how many maps and lists enclose the set being decoded, the map
+/// that holds it included.
 fn decode_attr_set(
     bytes: &[u8],
     pos: &mut usize,
     depth: u32,
 ) -> Result<Vec<(String, AttrValue)>, LogSegError> {
-    if depth > MAX_ATTR_DEPTH {
-        return Err(LogSegError::Corrupted("attrs_raw too deep".into()));
-    }
+    attrs_raw_set_depth(depth)?;
     use crate::varint::get_uvarint;
     let count = get_uvarint(bytes, pos)?;
-    if count > (1 << 20) {
-        return Err(LogSegError::Corrupted("attrs_raw count over cap".into()));
-    }
+    attrs_raw_set_count(count)?;
     let mut out = Vec::with_capacity((count as usize).min(1 << 12));
     for _ in 0..count {
         let klen = usize::try_from(get_uvarint(bytes, pos)?)
@@ -2127,6 +2223,18 @@ fn decode_attr_set(
     Ok(out)
 }
 
+/// The nesting level of a map's or list's contents, given `depth`, the number
+/// of maps and lists enclosing the map or list itself; past
+/// [`ATTRS_RAW_READ_DEPTH_CAP`] it is refused before any recursion.
+fn attrs_raw_inner_depth(depth: u32) -> Result<u32, LogSegError> {
+    let inner = depth.saturating_add(1);
+    if inner > ATTRS_RAW_READ_DEPTH_CAP {
+        return Err(attrs_raw_too_deep());
+    }
+    Ok(inner)
+}
+
+/// `depth` is how many maps and lists enclose the value being decoded.
 fn decode_attr_value(bytes: &[u8], pos: &mut usize, depth: u32) -> Result<AttrValue, LogSegError> {
     use crate::varint::{get_uvarint, zigzag_decode};
     let tag = *bytes
@@ -2180,17 +2288,16 @@ fn decode_attr_value(bytes: &[u8], pos: &mut usize, depth: u32) -> Result<AttrVa
             AttrValue::Bytes(b)
         }
         6 => {
+            let inner = attrs_raw_inner_depth(depth)?;
             let n = get_uvarint(bytes, pos)?;
-            if n > (1 << 20) {
-                return Err(LogSegError::Corrupted("attr list over cap".into()));
-            }
+            attrs_raw_list_count(n)?;
             let mut items = Vec::with_capacity((n as usize).min(1 << 12));
             for _ in 0..n {
-                items.push(decode_attr_value(bytes, pos, depth + 1)?);
+                items.push(decode_attr_value(bytes, pos, inner)?);
             }
             AttrValue::List(items)
         }
-        7 => AttrValue::Map(decode_attr_set(bytes, pos, depth + 1)?),
+        7 => AttrValue::Map(decode_attr_set(bytes, pos, attrs_raw_inner_depth(depth)?)?),
         other => {
             return Err(LogSegError::Corrupted(format!("attr tag {other}")));
         }
