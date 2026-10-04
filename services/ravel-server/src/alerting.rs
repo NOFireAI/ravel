@@ -5543,7 +5543,9 @@ mod tick_tests {
     /// the metrics it evaluates, pinned here so they cannot drift into the
     /// alerting figures unnoticed. They are not identical across the two ticks
     /// (the second reads one object fewer, from a warm query-engine cache), which
-    /// is exactly why the two keyspaces are counted apart.
+    /// is exactly why the two keyspaces are counted apart. Neither tick GETs
+    /// the metrics catalog's HEAD: the tenant never folds, and tick 1's
+    /// NotFound stays cached for `head_cache_ttl` (ADR-2509 decision 3).
     #[tokio::test]
     async fn one_steady_state_tick_costs_its_lease_memo_and_tail_calls_exactly() {
         let tenant = TenantId::new(TENANT).hash();
@@ -5606,7 +5608,9 @@ mod tick_tests {
                 alert_gets: 4,
                 alert_puts: 3,
                 alert_lists: 1,
-                other_gets: 3,
+                // No catalog HEAD GET: tick 1 cached the metrics catalog's
+                // NotFound HEAD (ADR-2509 decision 3).
+                other_gets: 2,
                 other_puts: 0,
                 other_lists: 2,
             },
@@ -5627,7 +5631,8 @@ mod tick_tests {
                 alert_gets: 2,
                 alert_puts: 2,
                 alert_lists: 1,
-                other_gets: 2,
+                // No catalog HEAD GET, as in tick 2: its NotFound is cached.
+                other_gets: 1,
                 other_puts: 0,
                 other_lists: 2,
             },

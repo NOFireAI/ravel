@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use ravel_catalog::{Catalog, CatalogConfig};
@@ -198,13 +199,75 @@ fn harness_with_sql_deadline(
     federation: Option<ravel_query::distrib::Federation>,
     sql_max_deadline: Duration,
 ) -> Harness {
+    let catalog = Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog");
+    harness_over_catalog(
+        catalog,
+        store,
+        limit,
+        audit_sink,
+        federation,
+        sql_max_deadline,
+    )
+}
+
+/// [`harness`] over a catalog whose HEAD cache never serves an entry, so every
+/// resolve pays its own catalog HEAD GET, including a repeat resolve of a
+/// tenant whose NotFound HEAD would otherwise stay cached for `head_cache_ttl`
+/// (ADR-2509 decision 3).
+fn harness_without_head_cache(store: Arc<dyn ObjectStoreBackend>) -> Harness {
+    let config = CatalogConfig::default();
+    let clock = Arc::new(TtlSteppingClock::new(config.head_cache_ttl_ns));
+    let catalog = Catalog::new(Arc::clone(&store), config)
+        .expect("catalog")
+        .with_monotonic_clock(clock);
+    harness_over_catalog(
+        catalog,
+        store,
+        QueryConcurrencyLimit::Unlimited,
+        Arc::new(NoopQueryAuditSink),
+        None,
+        Duration::from_secs(30),
+    )
+}
+
+/// A monotonic clock that moves one nanosecond past `head_cache_ttl` on every
+/// reading, so a cached HEAD entry has expired by the next time the cache reads
+/// the clock.
+struct TtlSteppingClock {
+    now_ns: AtomicU64,
+    step_ns: u64,
+}
+
+impl TtlSteppingClock {
+    fn new(head_cache_ttl_ns: i64) -> Self {
+        let ttl_ns = u64::try_from(head_cache_ttl_ns).expect("a non-negative TTL");
+        Self {
+            now_ns: AtomicU64::new(0),
+            step_ns: ttl_ns + 1,
+        }
+    }
+}
+
+impl ravel_cpu_gate::MonotonicClock for TtlSteppingClock {
+    fn now_nanos(&self) -> u64 {
+        self.now_ns.fetch_add(self.step_ns, Ordering::SeqCst) + self.step_ns
+    }
+}
+
+fn harness_over_catalog(
+    catalog: Catalog,
+    store: Arc<dyn ObjectStoreBackend>,
+    limit: QueryConcurrencyLimit,
+    audit_sink: Arc<dyn QueryAuditSink>,
+    federation: Option<ravel_query::distrib::Federation>,
+    sql_max_deadline: Duration,
+) -> Harness {
     // The SQL surface is behind a feature; without it there is no state to
     // carry the ceiling.
     #[cfg(not(feature = "sql"))]
     let _ = sql_max_deadline;
 
-    let catalog =
-        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let catalog = Arc::new(catalog);
     let config = EngineConfig::default();
     let engine = QueryEngine::new(Arc::clone(&catalog), Arc::clone(&store), config);
     let engine = match federation {
@@ -892,12 +955,10 @@ async fn usage_on_cancel_sums_every_selector_of_a_series_request() {
     // listing is the request's fifth.
     let gate: GateHandle =
         fault_store.hold(Op::List, None, Occurrence::Nth(2 * LISTS_PER_RESOLVE + 1));
-    let h = harness(
-        fault_store,
-        QueryConcurrencyLimit::Unlimited,
-        Arc::new(NoopQueryAuditSink),
-        None,
-    );
+    // Every selector pays its own HEAD GET, so each part of the sum below is a
+    // whole resolve rather than a warm one after the first selector's cached
+    // NotFound (ADR-2509 decision 3).
+    let h = harness_without_head_cache(fault_store);
 
     let request = ravel_query::http::MetadataRequest {
         selectors: vec!["up".to_string(), "down".to_string(), "other".to_string()],
@@ -940,12 +1001,10 @@ async fn usage_on_cancel_sums_both_attempts_of_a_retry() {
     // The first attempt resolves and then 404s on its fetch, so the second
     // attempt's first listing is the query's third.
     let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(LISTS_PER_RESOLVE + 1));
-    let h = harness(
-        Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>,
-        QueryConcurrencyLimit::Unlimited,
-        Arc::new(NoopQueryAuditSink),
-        None,
-    );
+    // Each attempt pays its own HEAD GET, so the second attempt is a whole
+    // resolve rather than a warm one after the first attempt's cached NotFound
+    // (ADR-2509 decision 3).
+    let h = harness_without_head_cache(Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>);
 
     let request = range_request("up");
     let mut query = Box::pin(h.service.promql_range(h.tenant_hash, &request));
