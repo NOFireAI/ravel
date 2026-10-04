@@ -71,12 +71,15 @@ use ravel_object_store::{
     PageToken, PutOptions, PutOutcome, StoreError,
 };
 use ravel_query::{
-    BlockRangeFetcher, CacheFetchError, LogFetchError, LogSegmentFetcher, PhaseAccounting,
+    BlockRangeFetcher, CacheFetchError, DEFAULT_LOG_REQUEST_COST_BYTES,
+    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, LogFetchError, LogSegmentFetcher, LogsFetchPolicy,
+    PhaseAccounting, resolve_logs_fetch,
 };
 use ravel_sql::{
     DeclaredColumn, DeclaredType, FIRST_DECLARED_COL, LOG_COL_ATTRS, LOG_COL_TS, LogsTableProvider,
 };
 use ravel_types::TenantHash;
+use ravel_types::cost_profile::StoreCostProfile;
 use uuid::Uuid;
 
 const TENANT: [u8; 16] = [7u8; 16];
@@ -157,7 +160,7 @@ fn declared_columns() -> Vec<DeclaredColumn> {
         .collect()
 }
 
-fn record(seg: usize, blk: usize) -> LogRecord {
+fn record(seg: usize, blk: usize, declared_bytes: usize) -> LogRecord {
     let resource = vec![(
         "service.name".to_string(),
         AttrValue::Str("svc".to_string()),
@@ -168,7 +171,7 @@ fn record(seg: usize, blk: usize) -> LogRecord {
             let seed = (seg as u64) << 40 | (blk as u64) << 20 | k as u64;
             (
                 declared_key(k),
-                AttrValue::Str(filler(seed, DECLARED_BYTES)),
+                AttrValue::Str(filler(seed, declared_bytes)),
             )
         })
         .collect();
@@ -225,8 +228,11 @@ async fn write_segment(
     store: &dyn ObjectStoreBackend,
     seg: usize,
     version: RlogVersion,
+    declared_bytes: usize,
 ) -> SegmentRef {
-    let recs: Vec<LogRecord> = (0..BLOCKS_PER_SEG).map(|b| record(seg, b)).collect();
+    let recs: Vec<LogRecord> = (0..BLOCKS_PER_SEG)
+        .map(|b| record(seg, b, declared_bytes))
+        .collect();
     let mut w = RlogWriter::new(one_record_blocks(), identity((seg + 1) as u64));
     for r in &recs {
         w.push(r.clone()).expect("push");
@@ -271,7 +277,7 @@ async fn write_segment(
 async fn build_snapshot(store: &dyn ObjectStoreBackend, version: RlogVersion) -> Snapshot {
     let mut segments = Vec::with_capacity(SEGMENTS);
     for s in 0..SEGMENTS {
-        segments.push(write_segment(store, s, version).await);
+        segments.push(write_segment(store, s, version, DECLARED_BYTES).await);
     }
     Snapshot {
         segments,
@@ -466,9 +472,23 @@ async fn measure_versioned(
     };
     let counting = CountingStore::new(base);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
-    let prov = Arc::new(provider(snapshot, fetcher(store, threshold)));
+    let fetcher = fetcher(store, threshold);
+    run_shape(snapshot, fetcher, &counting, projection, PARTS).await
+}
 
-    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(PARTS));
+/// Scan `projection` over `snapshot` at `partitions` with `fetcher`, whose
+/// store is `counting`, and report the exact wire cost.
+async fn run_shape(
+    snapshot: Snapshot,
+    fetcher: LogSegmentFetcher,
+    counting: &CountingStore,
+    projection: Option<Vec<usize>>,
+    partitions: usize,
+) -> Shape {
+    let prov = Arc::new(provider(snapshot, fetcher));
+
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(partitions));
     let plan = TableProvider::scan(prov.as_ref(), &ctx.state(), projection.as_ref(), &[], None)
         .await
         .expect("scan");
@@ -832,4 +852,139 @@ fn assert_unsupported_version(err: &datafusion::error::DataFusionError, version:
         ),
         other => panic!("expected SqlError::LogFetch(Corrupt), got {other:?}"),
     }
+}
+
+/// Bytes in each declared column's value, per record, for the one-segment
+/// fixture of [`a_30mb_object_reads_ranged_narrow_and_whole_wide`]: eight
+/// times [`DECLARED_BYTES`], so the object clears the 512 KiB default routing
+/// threshold the cost-based resolution keeps.
+const CROSSOVER_DECLARED_BYTES: usize = 8 * DECLARED_BYTES;
+
+/// `ts` and the first eight declared columns: with the always-decoded
+/// `stream_ref`, ten object columns of twenty, a projected fraction of one
+/// half.
+fn half_projection() -> Vec<usize> {
+    let mut proj = vec![LOG_COL_TS];
+    proj.extend((0..8).map(|k| FIRST_DECLARED_COL + k));
+    proj
+}
+
+/// Run `projection` over a one-segment fixture of size `S` under a cost-based
+/// resolution whose time-term rate is `S * 21 / 100`, so the object is about
+/// 4.76 request costs: above the three-request-cost break-even of `0.63 S`
+/// and under five request costs. Returns the shape and `S`.
+async fn measure_between_three_and_five_request_costs(projection: Vec<usize>) -> (Shape, u64) {
+    let base = Arc::new(MemoryStore::new());
+    let seg = write_segment(
+        base.as_ref(),
+        0,
+        RlogVersion::Current,
+        CROSSOVER_DECLARED_BYTES,
+    )
+    .await;
+    let size = seg.object_size;
+    // The suffix probe is sized from the fixture's own footer to cover every
+    // section after BLOCKS (SKIP_IDX, PAGE_DIR, BLOOM) and the footer, which
+    // at this object size outgrow `SUFFIX_LEN`.
+    let object = base
+        .get(&seg.data_object_key, GetRange::Full)
+        .await
+        .expect("get")
+        .data;
+    let footer = ravel_logseg::footer::open(&object).expect("footer");
+    let blocks = footer
+        .sections
+        .iter()
+        .find(|s| s.kind == ravel_logseg::footer::kind::BLOCKS)
+        .expect("a BLOCKS section");
+    let tail_len = size - (blocks.offset + blocks.len);
+    let resolved = resolve_logs_fetch(
+        LogsFetchPolicy::CostBased,
+        &StoreCostProfile {
+            request_latency_micros: Some(size * 21 / 100),
+            per_connection_throughput_bytes_per_s: Some(1_000_000),
+            ..StoreCostProfile::reference()
+        },
+        None,
+        DEFAULT_LOG_REQUEST_COST_BYTES,
+        DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        None,
+    );
+    assert_eq!(resolved.request_cost_bytes, size * 21 / 100);
+    assert!(
+        size > resolved.block_range_threshold,
+        "fixture precondition: {size} bytes clears the routing threshold"
+    );
+
+    let counting = CountingStore::new(base);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>;
+    let block_range = BlockRangeFetcher::new(Arc::clone(&store))
+        .with_suffix_len(tail_len)
+        .with_coalesce_gap(0);
+    let fetcher = LogSegmentFetcher::new(store)
+        .with_block_range(block_range)
+        .with_cache(read_cache())
+        .with_block_range_threshold(resolved.block_range_threshold)
+        .with_request_cost_bytes(resolved.request_cost_bytes)
+        .with_projection_break_even_bytes(resolved.projection_break_even_bytes);
+    let snapshot = Snapshot {
+        segments: vec![seg],
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    };
+    // One segment, one partition: the fast path's `relevant_segments >=
+    // target_partitions` conjunct holds.
+    let shape = run_shape(snapshot, fetcher, &counting, Some(projection), 1).await;
+    (shape, size)
+}
+
+/// Issue #2555, fetch half (the predicate half is the test of the same name
+/// in ravel-query's `log_fetch_bound.rs`): an object between three and five
+/// request costs reads ranged for a narrow projection and whole for a scan of
+/// half its columns.
+///
+/// The narrow scan (`ts` and `d00`, three object columns of twenty) skips an
+/// estimated 0.85 S against a break-even of 0.63 S and reads ranged. Its GET
+/// count comes from the fixture: one suffix probe, sized from the footer to
+/// cover every section after BLOCKS and the footer; one range GET over STREAM_DIR
+/// and FIELD_DIR; and, with six blocks in one row group and a zero coalescing
+/// gap, one run per projected column chunk, three. So 0 full, 1 suffix and 4
+/// range GETs. The half scan skips an estimated 0.5 S and reads whole: 1 full
+/// GET, no probe.
+///
+/// Prove-the-test, each shown failing: the multiple left at 5 (break-even
+/// 1.05 S) reads the narrow scan whole in 1 GET; deciding on object size
+/// alone routes the half scan ranged, which pays a probe and a directory GET
+/// before the coverage crossover reads it whole; lowering only `ranged_projection_pays`
+/// to three request costs while the stored break-even stays at five routes
+/// the narrow scan ranged and the size crossover then reads it whole in 1
+/// full GET.
+#[tokio::test]
+async fn a_30mb_object_reads_ranged_narrow_and_whole_wide() {
+    let (narrow, size) = measure_between_three_and_five_request_costs(narrow_projection()).await;
+    assert_eq!(
+        (narrow.full_gets, narrow.suffix_gets, narrow.range_gets),
+        (0, 1, 4),
+        "the narrow scan reads ranged: 1 suffix probe, 1 directory GET, 3 column runs"
+    );
+    assert_eq!(
+        (narrow.ranged_segments, narrow.whole_object_segments),
+        (1, 0)
+    );
+    assert!(
+        narrow.bytes * 4 < size,
+        "the narrow scan moves under a quarter of the object: {} of {size}",
+        narrow.bytes
+    );
+    assert_eq!(narrow.rows, BLOCKS_PER_SEG);
+
+    let (half, size) = measure_between_three_and_five_request_costs(half_projection()).await;
+    assert_eq!(
+        (half.full_gets, half.suffix_gets, half.range_gets),
+        (1, 0, 0),
+        "the half scan reads whole in 1 GET with no probe"
+    );
+    assert_eq!(half.bytes, size);
+    assert_eq!((half.ranged_segments, half.whole_object_segments), (0, 1));
+    assert_eq!(half.rows, BLOCKS_PER_SEG);
 }

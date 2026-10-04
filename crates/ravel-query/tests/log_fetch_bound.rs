@@ -1175,6 +1175,13 @@ async fn plan_counts(
 ///
 /// The scan that follows the under-the-break-even plan opens on the carried
 /// bytes and issues no GET of its own.
+///
+/// Under a resolved rate (issue #2555) the plan probes an object of 4 request
+/// costs and reads one of 2.5 request costs whole. Prove-the-test, each shown
+/// failing: the three-request-cost inequality on the fast path only, with the
+/// stored break-even left at five request costs, reads the 4-request-cost
+/// object whole with no probe; the plan bound on the routing threshold makes
+/// the 2.5-request-cost plan probe.
 #[tokio::test]
 async fn the_planned_route_reads_an_object_under_the_break_even_whole() {
     let (records, bytes) = above_threshold_object();
@@ -1294,4 +1301,177 @@ async fn the_planned_route_reads_an_object_under_the_break_even_whole() {
         (0, 1),
         "plan and scan together read the object once"
     );
+
+    // Issue #2555 on the planned route: the plan bound is the resolved
+    // three-request-cost break-even. At a rate that makes the object 4 request
+    // costs the break-even is three quarters of it, so the plan probes; at 2.5
+    // request costs it is 1.2 times the object, so the plan reads it whole.
+    for (name, query) in [("fast", &fast), ("skip", &skip)] {
+        let four_costs = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &timed_profile(size / 4),
+            None,
+            DEFAULT_LOG_REQUEST_COST_BYTES,
+            DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        let (probes, _, max_get, footer, carried) = plan_counts(
+            &format!("logs/be-4rc-{name}.rlog"),
+            &bytes,
+            &records,
+            query,
+            |f| {
+                f.with_block_range_threshold(four_costs.block_range_threshold)
+                    .with_request_cost_bytes(four_costs.request_cost_bytes)
+                    .with_projection_break_even_bytes(four_costs.projection_break_even_bytes)
+            },
+        )
+        .await;
+        assert_eq!(probes, 1, "{name}: at 4 request costs the plan probes once");
+        assert!(
+            max_get < size && footer && !carried,
+            "{name}: at 4 request costs the plan reads no whole object, got a \
+             largest GET of {max_get} bytes of {size}"
+        );
+
+        let two_and_a_half_costs = resolve_logs_fetch(
+            LogsFetchPolicy::CostBased,
+            &timed_profile(size * 2 / 5),
+            None,
+            DEFAULT_LOG_REQUEST_COST_BYTES,
+            DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+            None,
+        );
+        let at_two_and_a_half = plan_counts(
+            &format!("logs/be-2.5rc-{name}.rlog"),
+            &bytes,
+            &records,
+            query,
+            |f| {
+                f.with_block_range_threshold(two_and_a_half_costs.block_range_threshold)
+                    .with_request_cost_bytes(two_and_a_half_costs.request_cost_bytes)
+                    .with_projection_break_even_bytes(
+                        two_and_a_half_costs.projection_break_even_bytes,
+                    )
+            },
+        )
+        .await;
+        assert_eq!(
+            at_two_and_a_half,
+            (0, 1, size, false, true),
+            "{name}: at 2.5 request costs the plan reads whole in 1 GET, no probe"
+        );
+    }
+}
+
+/// A profile whose rate is the time term `rate` bytes: zero byte prices, so the
+/// price term saturates, and a throughput of 1,000,000 bytes per second, so a
+/// latency of `rate` microseconds is `rate` bytes per request.
+fn timed_profile(rate: u64) -> StoreCostProfile {
+    StoreCostProfile {
+        request_latency_micros: Some(rate),
+        per_connection_throughput_bytes_per_s: Some(1_000_000),
+        ..StoreCostProfile::reference()
+    }
+}
+
+/// The share of a ClickBench-shaped object a projection of `columns` of its
+/// 114 columns reads, as the SQL layer's count ratio estimates it.
+fn of_114(columns: u32) -> f64 {
+    f64::from(columns) / 114.0
+}
+
+/// Issue #2555: a 3 MB L0 object reads whole at the reference profile, since
+/// one request cost, 6,300,000 bytes, already exceeds it. The fixture half
+/// reproduces that ratio: a rate 2.1 times the object's size puts it at
+/// 1 / 2.1 of a request cost, as 3,000,000 is of 6,300,000, and both the fast
+/// path's ranged entry and the planned route read it in 1 GET with no probe.
+///
+/// Prove-the-test, each shown failing: the routing threshold as the
+/// break-even (`with_projection_break_even_bytes` ignored) routes both halves
+/// ranged and the fetch probes; deciding on the skipped bytes alone
+/// (`saved > 0`) makes both predicates true; the break-even dropped from the
+/// plan path (`plan_whole_object_bound` returning the routing threshold)
+/// makes the plan probe.
+#[tokio::test]
+async fn a_3mb_l0_object_reads_whole_on_the_reference_profile() {
+    let reference = fetcher_from(&cost_based_at_reference(), Arc::new(MemoryStore::new()));
+    assert!(
+        !reference.ranged_projection_pays(3_000_000, of_114(3)),
+        "a 3 MB object at 3 of 114 columns skips under 3 MB, short of 18,900,000"
+    );
+
+    let (records, bytes) = above_threshold_object();
+    let size = bytes.len() as u64;
+    assert!(
+        size > 524_288,
+        "the fixture must clear the routing threshold"
+    );
+    let resolved = resolve_logs_fetch(
+        LogsFetchPolicy::CostBased,
+        &timed_profile(size * 21 / 10),
+        None,
+        DEFAULT_LOG_REQUEST_COST_BYTES,
+        DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD,
+        None,
+    );
+    assert_eq!(resolved.block_range_threshold, 524_288);
+
+    let (seg, counting, store) = counted_store("logs/l0-fetch.rlog", &bytes, &records).await;
+    let fetcher = fetcher_from(&resolved, store);
+    assert!(
+        !fetcher.ranged_projection_pays(size, of_114(3)),
+        "the fast path routes the fixture whole"
+    );
+    let scan = fetcher
+        .scan_accounted_with_tenant(
+            &seg,
+            TENANT,
+            &LogQuery::new(i64::MIN, i64::MAX),
+            &ravel_logseg::ColumnSelection::fixed_only(),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("scan")
+        .expect("relevant");
+    drop(scan);
+    assert_eq!(
+        (counting.get_count(), counting.probe_count()),
+        (1, 0),
+        "the ranged entry reads the object whole in 1 GET with no probe"
+    );
+
+    let (seg, counting, store) = counted_store("logs/l0-plan.rlog", &bytes, &records).await;
+    fetcher_from(&resolved, store)
+        .plan_segment(
+            &seg,
+            TENANT,
+            &coded_query(0, 1_000),
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("plan")
+        .expect("relevant");
+    assert_eq!(
+        (counting.get_count(), counting.probe_count()),
+        (1, 0),
+        "the planned route reads the object whole in 1 GET with no probe"
+    );
+}
+
+/// Issue #2555, predicate half: a 30 MB object sits between three and five
+/// request costs on the reference profile. A 3-of-114 projection skips about
+/// 29.2 MB, past the 18,900,000-byte break-even, and reads ranged; a 57-of-114
+/// projection skips 15 MB and reads whole. The fetch half, with exact GET
+/// counts, is the test of the same name in ravel-sql's
+/// `logs_fast_path_projection_routing.rs`.
+///
+/// Prove-the-test, each shown failing: the multiple left at 5 (a 31,500,000
+/// break-even) reads the narrow projection whole; deciding on object size
+/// alone reads the wide one ranged.
+#[test]
+fn a_30mb_object_reads_ranged_narrow_and_whole_wide() {
+    let f = fetcher_from(&cost_based_at_reference(), Arc::new(MemoryStore::new()));
+    assert!(f.ranged_projection_pays(30_000_000, of_114(3)));
+    assert!(!f.ranged_projection_pays(30_000_000, of_114(57)));
 }

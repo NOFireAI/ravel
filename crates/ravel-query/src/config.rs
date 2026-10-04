@@ -1060,6 +1060,39 @@ mod tests {
         }
     }
 
+    /// Issue #2555: the cost-based projection break-even is three request
+    /// costs, `(COST_BASED_RANGED_REQUESTS - 1) * request_cost_bytes`, so
+    /// 18,900,000 bytes on the reference profile. A fetcher built from that
+    /// resolution routes a projection ranged only when it skips strictly more,
+    /// and its plan phase reads an object of that size or less whole.
+    ///
+    /// Prove-the-test, each shown failing: the multiple left at 5 reads
+    /// Some(31,500,000); a multiple of 4 (`k * r` instead of `(k - 1) * r`)
+    /// reads Some(25,200,000); `>=` in place of `>` in `ranged_projection_pays`
+    /// routes the 18,900,000-byte object ranged.
+    #[test]
+    fn the_cost_based_break_even_is_three_request_costs() {
+        let r = cost_based(&StoreCostProfile::reference(), None);
+        assert_eq!(r.request_cost_bytes, 6_300_000);
+        assert_eq!(r.projection_break_even_bytes, Some(18_900_000));
+
+        let f = crate::LogSegmentFetcher::new(std::sync::Arc::new(
+            ravel_object_store::memory::MemoryStore::new(),
+        ))
+        .with_block_range_threshold(r.block_range_threshold)
+        .with_request_cost_bytes(r.request_cost_bytes)
+        .with_projection_break_even_bytes(r.projection_break_even_bytes);
+        assert!(
+            !f.ranged_projection_pays(18_900_000, 0.0),
+            "skipping exactly the break-even does not pay"
+        );
+        assert!(
+            f.ranged_projection_pays(18_900_001, 0.0),
+            "skipping one byte more does"
+        );
+        assert_eq!(f.plan_whole_object_bound(), 18_900_000);
+    }
+
     #[test]
     fn rate_term_label_names_the_source_of_the_rate() {
         let reference = StoreCostProfile::reference();
