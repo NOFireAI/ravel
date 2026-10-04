@@ -653,10 +653,15 @@ and holds that lock until its shutdown completes; the kernel releases it on
 any exit, including a crash. It then sweeps once: a sibling root under
 `<cache-dir>/sql-spill` is removed only when this process can take that
 root's lock itself. A sibling whose lock is held, or whose ownership cannot
-be settled (no owner file, any other lock error), is left in place and
-logged at INFO with its path. Nothing outside `<cache-dir>/sql-spill` is
-read or removed, and a process whose spill is disabled or rooted by the
-environment elsewhere does not sweep. A process that cannot take its own
+be settled (no owner file, any other lock error), is left in place. The
+sweep logs nothing for a held lock and a WARN with the path and the error
+for an unsettled one; after the sweep, `ravel-server` lists
+`<cache-dir>/sql-spill` again and logs each sibling still there at INFO
+with its path. A `.swept-` tree an earlier sweep moved aside but did not
+finish deleting (see below) is deleted without a lock check: the sweep
+creates that name only while it holds the orphan's lock. Nothing outside
+`<cache-dir>/sql-spill` is read or removed, and a process whose spill is
+disabled or rooted by the environment elsewhere does not sweep. A process that cannot take its own
 root's lock refuses startup with an error naming the path. Orphans live
 until the next process start on that cache directory, as requirement 7's
 orphan-lifetime rule already allows.
