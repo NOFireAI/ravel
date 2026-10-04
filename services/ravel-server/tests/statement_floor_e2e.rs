@@ -470,7 +470,7 @@ async fn sql_prefix_listing_runs_shards_concurrently_through_http() {
     wait_for_lists(
         &fx.log,
         &others,
-        "shards 1..4 must be listed while shard 0's LIST is held",
+        "shards 1 to 3 must be listed while shard 0's LIST is held",
     )
     .await;
     assert!(
