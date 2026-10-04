@@ -313,6 +313,23 @@ name = "logseg_peak_by_site"
 path = "src/bin/logseg_peak_by_site.rs"
 bench = false
 
+# Stage 1 width gate (issue #2563, epic #2467, ADR-2467 decision 4): true-peak
+# heap on a 105-dynamic-attribute corpus, restricted to the row and
+# col_dropped arms. `wide_corpus.rs` is included via #[path] and is not a
+# [[bin]] target on its own.
+[[bin]]
+name = "logseg_peak_by_site_wide"
+path = "src/bin/logseg_peak_by_site_wide.rs"
+bench = false
+
+# Stage 1 width gate (issue #2563): wall time (row vs columnar, with
+# from_records sub-timed) plus the byte-identity/row-count/FIELD_DIR
+# correctness assertions, over both the control and wide corpora.
+[[bin]]
+name = "logseg_width_gate_time"
+path = "src/bin/logseg_width_gate_time.rs"
+bench = false
+
 [[bin]]
 name = "histogram_size"
 path = "src/bin/histogram_size.rs"
