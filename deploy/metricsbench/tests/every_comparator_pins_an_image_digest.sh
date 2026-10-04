@@ -142,8 +142,9 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # free-disk-space step is the same local `./.github/actions/...` action this
 # scan does not count, and its `report` job uses no action at all. Raised
 # 107->108 when ci.yml's `tla` job gained a second download-artifact step
-# that retries the marker download.
-WORKFLOW_EXPECTED_ACTION_COUNT=108
+# that retries the marker download. Raised 108->110 when ci.yml gained the
+# `all-features` job (issue #1925): a checkout and a rust-cache.
+WORKFLOW_EXPECTED_ACTION_COUNT=110
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
