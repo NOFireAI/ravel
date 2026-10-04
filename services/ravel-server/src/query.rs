@@ -611,6 +611,10 @@ pub const SQL_SPILL_SOURCE_ENV_OVERRIDE: &str = "env-override";
 /// `source` of a `sql_spill_max_bytes` line whose ceiling is
 /// [`ravel_sql::derive_spill_max_bytes`]'s.
 pub const SQL_SPILL_SOURCE_DERIVED: &str = "derived";
+/// `source` of both spill lines when spill would resolve under `--cache-dir`
+/// with a derived ceiling, but half the volume's free space is below the
+/// 1 GiB floor ([`ravel_sql::derive_spill_max_bytes`] returns `None`).
+pub const SQL_SPILL_SOURCE_INSUFFICIENT_SPACE: &str = "cache-dir-insufficient-space";
 /// `source` of both spill lines under `--sql-spill off`.
 pub const SQL_SPILL_SOURCE_FLAG_OFF: &str = "flag-off";
 /// `source` of both spill lines when no source configures spill.
@@ -711,6 +715,13 @@ impl ResolvedSqlSpill {
                     source = self.max_bytes_source,
                     "performance default resolved"
                 );
+                if self.max_bytes_source == SQL_SPILL_SOURCE_INSUFFICIENT_SPACE {
+                    tracing::warn!(
+                        "SQL spill is off: half the free space under --cache-dir is below the \
+                         1 GiB floor of a derived spill ceiling; free space on that volume, or \
+                         set RAVEL_SQL_SPILL_MAX_BYTES to choose the ceiling"
+                    );
+                }
             }
         }
     }
@@ -722,7 +733,8 @@ impl ResolvedSqlSpill {
 /// [`ravel_sql::SpillConfig::resolve`] precedence
 /// `SqlConfig::with_spill_resolved` applies: `--sql-spill off` first, then the
 /// full env pair, then the cache directory (with `RAVEL_SQL_SPILL_MAX_BYTES`
-/// alone replacing the derived ceiling), else disabled.
+/// alone replacing the derived ceiling, and disabled when the derivation finds
+/// too little free space), else disabled.
 ///
 /// A half-set env pair that no cache directory completes is an error naming
 /// the variable that is missing.
@@ -758,7 +770,14 @@ pub fn resolve_sql_spill(
         ),
         other => anyhow::Error::new(other),
     })?;
+    // With a cache directory and no env directory, `resolve` returns `None`
+    // only when the derived ceiling finds too little free space: a bare env
+    // quota there always enables spill.
     let (dir_source, max_bytes_source) = match (&config, env_dir.is_some(), env_quota.is_some()) {
+        (None, false, _) if inputs.cache_dir.is_some() => (
+            SQL_SPILL_SOURCE_INSUFFICIENT_SPACE,
+            SQL_SPILL_SOURCE_INSUFFICIENT_SPACE,
+        ),
         (None, _, _) => (SQL_SPILL_SOURCE_UNSET, SQL_SPILL_SOURCE_UNSET),
         (Some(_), true, _) => (SQL_SPILL_SOURCE_ENV, SQL_SPILL_SOURCE_ENV),
         (Some(_), false, true) => (SQL_SPILL_SOURCE_CACHE_DIR, SQL_SPILL_SOURCE_ENV_OVERRIDE),
@@ -2773,8 +2792,9 @@ mod tests {
 
     /// `--cache-dir` alone derives the ceiling from the free bytes measured at
     /// startup and the memory budget `--sql-spill`'s settings carry: half the
-    /// free space, capped at four times the budget, floored at 1 GiB. One case
-    /// per clause, each pinned to the byte, through the same
+    /// free space, capped at four times the budget, the cap raised to 1 GiB
+    /// when it is below that. One case per clause, each pinned to the byte,
+    /// through the same
     /// `prepare_sql_spill_with` `start` runs, so the measured figure and the
     /// budget are the ones that reach the derivation.
     ///
@@ -2788,7 +2808,7 @@ mod tests {
         for (label, free_bytes, memory_budget_bytes, expected) in [
             ("half of free binds", 6 * GIB, 2 * GIB, 3 * GIB),
             ("four times the budget binds", 100 * GIB, 2 * GIB, 8 * GIB),
-            ("the 1 GiB floor binds", GIB, GIB / 8, GIB),
+            ("the 1 GiB floor binds", 2 * GIB, GIB / 8, GIB),
         ] {
             let cache = tempfile::tempdir().expect("cache dir");
             let startup = prepare(
@@ -2816,6 +2836,85 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// Too little free space for the derived ceiling's 1 GiB floor resolves
+    /// spill off, not to a ceiling the volume cannot hold: at 800 MiB and at 0
+    /// free both halves read `cache-dir-insufficient-space`, no root is
+    /// taken, and the executor gets no spill; at exactly 2 GiB free (half =
+    /// 1 GiB) spill is on with a 1 GiB ceiling. A bare
+    /// `RAVEL_SQL_SPILL_MAX_BYTES` is the operator's own ceiling and still
+    /// enables spill at 0 free.
+    ///
+    /// Prove-the-test: restore the floor-last clamp in
+    /// `ravel_sql::derive_spill_max_bytes` and the 800 MiB row reads a 1 GiB
+    /// derived ceiling; map a `None` config to `SQL_SPILL_SOURCE_UNSET` in
+    /// `resolve_sql_spill` and the 800 MiB row reads `unset`.
+    #[test]
+    fn too_little_free_space_resolves_spill_off_with_its_own_source() {
+        assert_spill_env_unset();
+        for free_bytes in [800 * 1024 * 1024, 0] {
+            let cache = tempfile::tempdir().expect("cache dir");
+            let startup = prepare(
+                Some(cache.path()),
+                settings(false, 2 * GIB),
+                None,
+                None,
+                free_bytes,
+            )
+            .expect("too little space is not a startup error");
+            assert_eq!(
+                startup.resolved,
+                ResolvedSqlSpill {
+                    config: None,
+                    dir_source: SQL_SPILL_SOURCE_INSUFFICIENT_SPACE,
+                    max_bytes_source: SQL_SPILL_SOURCE_INSUFFICIENT_SPACE,
+                },
+                "free_bytes={free_bytes}"
+            );
+            assert!(startup.owner.is_none(), "free_bytes={free_bytes}");
+            assert_eq!(
+                executor_spill(&startup.inputs),
+                None,
+                "free_bytes={free_bytes}"
+            );
+        }
+
+        let cache = tempfile::tempdir().expect("cache dir");
+        let at_floor = prepare(
+            Some(cache.path()),
+            settings(false, 2 * GIB),
+            None,
+            None,
+            2 * GIB,
+        )
+        .expect("spill resolves");
+        assert_eq!(
+            at_floor.resolved,
+            ResolvedSqlSpill {
+                config: Some(ravel_sql::SpillConfig {
+                    dir: cache.path().join("sql-spill").join(INSTANCE),
+                    max_bytes: GIB,
+                }),
+                dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
+                max_bytes_source: SQL_SPILL_SOURCE_DERIVED,
+            }
+        );
+        drop(at_floor);
+
+        let cache = tempfile::tempdir().expect("cache dir");
+        let quota = prepare(
+            Some(cache.path()),
+            settings(false, 2 * GIB),
+            None,
+            os("777"),
+            0,
+        )
+        .expect("spill resolves");
+        assert_eq!(
+            quota.resolved.config.map(|config| config.max_bytes),
+            Some(777)
+        );
     }
 
     /// The production measurement is the volume's FREE space, not its size:
@@ -3081,12 +3180,14 @@ mod tests {
 
     /// The startup lines: `sql_spill_dir` and `sql_spill_max_bytes` each
     /// appear exactly once, on the `performance default resolved` layout, with
-    /// the value and source of the cache-dir, env and off cases.
+    /// the value and source of the cache-dir, env, off and insufficient-space
+    /// cases.
     ///
     /// Prove-the-test: label the cache-dir ceiling `SQL_SPILL_SOURCE_ENV` in
     /// `resolve_sql_spill` and the cache-dir row reads `source="env"`; drop
     /// the `None` arm's two lines in `ResolvedSqlSpill::emit` and the off row
-    /// finds no line.
+    /// finds no line; drop the insufficient-space arm in `resolve_sql_spill`
+    /// and that row reads `source="unset"`.
     #[test]
     fn startup_lines_carry_the_spill_dir_and_ceiling_with_their_sources() {
         let cache = tempfile::tempdir().expect("cache dir");
@@ -3098,6 +3199,7 @@ mod tests {
                 false,
                 None,
                 None,
+                100 * GIB,
                 format!(
                     " value={:?} source=\"cache-dir\"",
                     root.display().to_string()
@@ -3109,6 +3211,7 @@ mod tests {
                 false,
                 os(explicit.to_str().expect("utf-8 temp path")),
                 os("4096"),
+                100 * GIB,
                 format!(" value={:?} source=\"env\"", explicit.display().to_string()),
                 " value=4096 source=\"env\"".to_string(),
             ),
@@ -3117,18 +3220,28 @@ mod tests {
                 true,
                 os(explicit.to_str().expect("utf-8 temp path")),
                 os("4096"),
+                100 * GIB,
                 " value=\"none\" source=\"flag-off\"".to_string(),
                 " value=\"none\" source=\"flag-off\"".to_string(),
             ),
+            (
+                "insufficient space",
+                false,
+                None,
+                None,
+                GIB,
+                " value=\"none\" source=\"cache-dir-insufficient-space\"".to_string(),
+                " value=\"none\" source=\"cache-dir-insufficient-space\"".to_string(),
+            ),
         ];
-        for (label, off, env_dir, env_quota, dir_fields, max_fields) in cases {
+        for (label, off, env_dir, env_quota, free_bytes, dir_fields, max_fields) in cases {
             let (capture, guard) = capture_info();
             let startup = prepare(
                 Some(cache.path()),
                 settings(off, 2 * GIB),
                 env_dir,
                 env_quota,
-                100 * GIB,
+                free_bytes,
             )
             .expect("spill resolves");
             drop(guard);
