@@ -1093,12 +1093,9 @@ mod tests {
             landed_notify: tokio::sync::Notify::new(),
         };
         let cleanup: Arc<dyn ObjectStoreBackend> = memory.clone();
+        let candidate = MemoryStore::new();
 
-        let mut probe = Box::pin(probe_not_ravel_bucket(
-            &ravel,
-            &cleanup,
-            &MemoryStore::new(),
-        ));
+        let mut probe = Box::pin(probe_not_ravel_bucket(&ravel, &cleanup, &candidate));
         tokio::select! {
             verdict = &mut probe => panic!("a hanging put cannot complete: {verdict:?}"),
             () = ravel.landed_notify.notified() => {}
