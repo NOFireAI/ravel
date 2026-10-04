@@ -9,7 +9,10 @@
 //! that set does. Rust cannot list which trait methods a planner overrides, so
 //! each `ExprPlanner` method that corresponds to SQL syntax gets one canary
 //! statement here with the outcome it has today. A DataFusion upgrade that
-//! teaches a registered planner a new syntax, or drops one, flips a row.
+//! teaches a registered planner a new syntax under one of these methods, or
+//! drops one, flips a row. A method ADDED to the trait has no row and flips
+//! nothing: the table covers the 13 methods of DataFusion 54.1, so an upgrade
+//! that grows the trait needs a new row here.
 //!
 //! Every statement goes through `SqlExecutor::execute`, the entry point an
 //! `/api/v1/sql` request takes, and a refusal is matched on its `SqlError`

@@ -49,7 +49,13 @@
 //!   [`ADMITTED_TABLE_FUNCTIONS`]). This backstops the subset check in
 //!   crate::validate and fails closed under DataFusion upgrades -- a newly added
 //!   default function in any registry is excluded by default rather than
-//!   silently reachable. `avg`/`mean` are admitted (ADR-0022 decisions 3, 4):
+//!   silently reachable by name. The allowlist governs name resolution only:
+//!   syntax that a registered `ExprPlanner` rewrites reaches its target
+//!   function without passing it, because the planner builds the call from
+//!   the function value. That path is guarded by the planner-set pin
+//!   (`registered_expr_planners_are_pinned_for_every_table`) and by
+//!   `tests/expr_planner_surface.rs`, and by re-reading each registered
+//!   planner on upgrade. `avg`/`mean` are admitted (ADR-0022 decisions 3, 4):
 //!   they stay in the admitted set so the deregistration loop keeps them, and
 //!   their built-in accumulator is then replaced by the sequential-fold UDAF
 //!   (crate::avg), the same registry-replacement pattern min/max use.
