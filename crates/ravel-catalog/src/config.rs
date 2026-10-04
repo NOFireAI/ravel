@@ -405,10 +405,13 @@ pub const DEFAULT_FRONTIER_RECONCILE_MAX_HOURS: u32 = 168;
 /// shard, resuming strictly after the watermark via `start_after`, so both
 /// cost `O(objects above the watermark / page_size)` and neither pages
 /// through a shard's below-watermark history. The remaining difference is only
-/// how each drains a shard: the non-prefix path fans the shards out
-/// concurrently and stops each at the first hour past the window; the prefix
-/// scan drains them sequentially under a page-by-page request cap, which is
-/// what a very wide window wants. 720 is thirty days of hourly buckets at
+/// how each drains a shard: the non-prefix path stops each shard at the first
+/// hour past the window; the prefix scan has every page reserve a slot in one
+/// resolve-wide request cap before it is issued, which is what a very wide
+/// window wants. Both list their shards concurrently (ADR-2509), and under the
+/// reservation the prefix scan's bound stays exact: a window over the cap is
+/// refused on every run, though which shard reaches it can vary. 720 is thirty
+/// days of hourly buckets at
 /// `shard_count = 1`. Purely a performance heuristic -- both paths return
 /// identical snapshots and both respect [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`],
 /// so any value is correct.
@@ -570,13 +573,16 @@ pub struct CatalogConfig {
     /// re-fetches the stats object with no reuse and no eviction accounting.
     /// Default [`DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES`].
     pub column_stats_cache_max_bytes: u64,
-    /// Ceiling on the pre-execution catalog-request estimate (ADR-0044
-    /// decision 3). A resolve whose
-    /// estimate ([`Catalog::estimated_catalog_requests`](crate::Catalog::estimated_catalog_requests))
-    /// exceeds this is refused with [`CatalogError::WindowTooWide`](crate::CatalogError::WindowTooWide)
-    /// before any LIST is issued, so an unbounded client window cannot make a
-    /// single request fan out to hundreds of thousands of LISTs. Fail-closed:
-    /// over the ceiling the query is refused, never silently narrowed. Default
+    /// Ceiling on catalog LISTs per resolve (ADR-0044 decision 3, as amended
+    /// by ADR-0056). A window whose pre-execution estimate
+    /// ([`Catalog::estimated_catalog_requests`](crate::Catalog::estimated_catalog_requests))
+    /// exceeds this is not refused before listing: it is routed to the prefix
+    /// scan, where every page reserves a slot against this ceiling before it is
+    /// issued and a refused reservation fails the resolve with
+    /// [`CatalogError::WindowTooWide`](crate::CatalogError::WindowTooWide). So
+    /// the prefix scan of one resolve never issues more than this many LISTs,
+    /// however many shards it lists concurrently. Fail-closed: over the ceiling
+    /// the query is refused, never silently narrowed. Default
     /// [`DEFAULT_MAX_CATALOG_LIST_REQUESTS`].
     pub max_catalog_list_requests: u64,
     /// Crossover, in `(shard, hour)` bucket units, at which `Catalog::resolve`
@@ -586,9 +592,12 @@ pub struct CatalogConfig {
     /// used. Both paths issue one bounded `list_after` per shard, resuming
     /// strictly after the watermark, so neither pages through a shard's
     /// below-watermark history; narrower windows keep the non-prefix path,
-    /// which fans the shards out concurrently and stops each at the first hour
-    /// past the window, while the prefix scan drains them sequentially under a
-    /// page-by-page request cap. A performance heuristic only: both paths
+    /// which stops each shard at the first hour past the window, while the
+    /// prefix scan has every page reserve a slot in a resolve-wide request cap
+    /// before it is issued. Both list their shards concurrently, and the
+    /// reservation keeps the prefix scan's bound exact: a window over the cap is
+    /// refused on every run, though which shard reaches it can vary. A
+    /// performance heuristic only: both paths
     /// return identical snapshots and both respect
     /// [`max_catalog_list_requests`](Self::max_catalog_list_requests). Default
     /// [`DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS`].
