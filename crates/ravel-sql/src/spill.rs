@@ -348,7 +348,7 @@ const OWNER_LOCK_FILE_NAME: &str = ".owner.lock";
 /// deletion. A sweep creates such a name only while it holds the orphan's
 /// lock, so the tree under it belongs to no live process: a later sweep
 /// deletes it without a lock check.
-const SWEPT_NAME_PREFIX: &str = ".swept-";
+pub const SWEPT_NAME_PREFIX: &str = ".swept-";
 
 /// `remove_dir_all`, where a tree that is already gone counts as removed: two
 /// sweeps may delete the same moved-aside tree at once.
