@@ -982,13 +982,13 @@ jobs:
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: SQL endpoint tests
-        run: cargo nextest run --locked -p ravel-server --features sql
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-server --features sql
       - name: Differential correctness gate
         env:
           # Well above the in-file default so CI explores far more of the
           # float edge-case and multi-segment-overlap space than a local run.
           PROPTEST_CASES: 512
-        run: cargo nextest run --locked -p ravel-sql --test differential
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-sql --test differential
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
@@ -1042,7 +1042,12 @@ jobs:
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Flight SQL tests
-        run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
+        # The `ci` profile, as in `check-shard` (issue #2519): it is dev without
+        # debug info. On the default profile this lane wrote about 76 GiB and
+        # linked that debug info into 159 test binaries. Every cargo command
+        # in the `sql`, `features-lane` and `features-otap` jobs uses it too,
+        # so each job builds in one target subtree.
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-server -p ravel-sql --features flight-sql
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
@@ -1147,26 +1152,26 @@ jobs:
       # with the same selection.
       - name: Test ravel-bench --features parquet-baseline
         if: matrix.lane == 'parquet-baseline'
-        run: cargo nextest run --locked -p ravel-bench --features parquet-baseline
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-bench --features parquet-baseline
         # The read-accounting module and its integration tests exist only
         # under this feature, so their tests run here or nowhere. No test
         # filter: a filter that matches nothing still exits 0. This also
         # builds everything a `cargo check` of the feature would.
       - name: Doctests ravel-bench --features parquet-baseline
         if: matrix.lane == 'parquet-baseline'
-        run: cargo test --locked --doc -p ravel-bench --features parquet-baseline
+        run: cargo test --locked --doc --profile ci -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress
         if: matrix.lane == 'parquet-baseline'
-        run: cargo check --locked -p ravel-bench --features flight-egress
+        run: cargo check --locked --profile ci -p ravel-bench --features flight-egress
       - name: Check ravel-bench --features profiling
         if: matrix.lane == 'parquet-baseline'
-        run: cargo check --locked -p ravel-bench --features profiling
+        run: cargo check --locked --profile ci -p ravel-bench --features profiling
       - name: Check ravel-bench --features flight-lane
         if: matrix.lane == 'parquet-baseline'
-        run: cargo check --locked -p ravel-bench --features flight-lane
+        run: cargo check --locked --profile ci -p ravel-bench --features flight-lane
       - name: Check ravel-bench --features sql-latency
         if: matrix.lane == 'sql-latency'
-        run: cargo check --locked -p ravel-bench --features sql-latency --all-targets
+        run: cargo check --locked --profile ci -p ravel-bench --features sql-latency --all-targets
         # The one lane here that also RUNS its tests. A compile probe is the
         # right trade for a bench binary that only has to keep linking. It is
         # the wrong trade for the SQL corpus, whose deliverable IS a
@@ -1176,19 +1181,19 @@ jobs:
         # flight-sql note above describes.
       - name: Test ravel-bench --features sql-latency
         if: matrix.lane == 'sql-latency'
-        run: cargo nextest run --locked -p ravel-bench --features sql-latency
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-bench --features sql-latency
       - name: Doctests ravel-bench --features sql-latency
         if: matrix.lane == 'sql-latency'
-        run: cargo test --locked --doc -p ravel-bench --features sql-latency
+        run: cargo test --locked --doc --profile ci -p ravel-bench --features sql-latency
       - name: Test ravel-bench --features sql-latency,profiling,flight-lane
         if: matrix.lane == 'sql-latency-wide'
-        run: cargo nextest run --locked -p ravel-bench --features sql-latency,profiling,flight-lane
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-bench --features sql-latency,profiling,flight-lane
       - name: Doctests ravel-bench --features sql-latency,profiling,flight-lane
         if: matrix.lane == 'sql-latency-wide'
-        run: cargo test --locked --doc -p ravel-bench --features sql-latency,profiling,flight-lane
+        run: cargo test --locked --doc --profile ci -p ravel-bench --features sql-latency,profiling,flight-lane
       - name: Check ravel-bench --features stage-timing
         if: matrix.lane == 'stage-timing'
-        run: cargo check --locked -p ravel-bench --features stage-timing --all-targets
+        run: cargo check --locked --profile ci -p ravel-bench --features stage-timing --all-targets
         # RUN the stage-timing acceptance test, not merely compile it (ADR-0104
         # decision 2b). The test drives the default-built `ingest_bench` binary
         # as a subprocess and asserts it emits the per-stage breakdown, so this
@@ -1199,13 +1204,13 @@ jobs:
         # the crate that declares the feature.
       - name: Test ravel-bench --features stage-timing
         if: matrix.lane == 'stage-timing'
-        run: cargo nextest run --locked -p ravel-bench --features stage-timing
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-bench --features stage-timing
       - name: Doctests ravel-bench --features stage-timing
         if: matrix.lane == 'stage-timing'
-        run: cargo test --locked --doc -p ravel-bench --features stage-timing
+        run: cargo test --locked --doc --profile ci -p ravel-bench --features stage-timing
       - name: Clippy ravel-logseg + ravel-ingest --features stage-timing
         if: matrix.lane == 'stage-timing'
-        run: cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings
+        run: cargo clippy --locked --profile ci -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings
         # The step above enables ravel-logseg/stage-timing and
         # ravel-ingest/stage-timing transitively, so it does type-check their
         # production code. It cannot reach their TESTS: `-p ravel-bench` builds
@@ -1222,10 +1227,10 @@ jobs:
         # unrelated to the seam.
       - name: Test ravel-logseg + ravel-ingest --features stage-timing
         if: matrix.lane == 'stage-timing'
-        run: cargo nextest run --locked -p ravel-logseg -p ravel-ingest --features stage-timing
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-logseg -p ravel-ingest --features stage-timing
       - name: Doctests ravel-logseg + ravel-ingest --features stage-timing
         if: matrix.lane == 'stage-timing'
-        run: cargo test --locked --doc -p ravel-logseg -p ravel-ingest --features stage-timing
+        run: cargo test --locked --doc --profile ci -p ravel-logseg -p ravel-ingest --features stage-timing
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
@@ -1338,7 +1343,7 @@ jobs:
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy ravel-server --features otap
-        run: cargo clippy --locked -p ravel-server --features otap --all-targets -- -D warnings
+        run: cargo clippy --locked --profile ci -p ravel-server --features otap --all-targets -- -D warnings
         # `--lib`, not the whole test set: `tests/cli_reference.rs` asserts
         # `docs/reference/ravel-server-flags.md` matches the flags of a build
         # with NO optional features, and that page says in its own header that
@@ -1346,7 +1351,7 @@ jobs:
         # binary grows `--otap` and that test fails by construction, on any
         # tree. `--all-targets` on the clippy step above still compiles it.
       - name: Test ravel-server --features otap
-        run: cargo test --locked -p ravel-server --features otap --lib
+        run: cargo test --locked --profile ci -p ravel-server --features otap --lib
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
