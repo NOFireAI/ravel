@@ -647,9 +647,18 @@ pub struct DiskPeekGateForTest {
 
 impl DiskPeekGateForTest {
     /// Resolves once the gated lookup has reached the gate and parked on it.
+    ///
+    /// # Panics
+    ///
+    /// If the gate is dropped without being entered (it was replaced by a
+    /// later [`DiskCache::block_peek_for_test`], or the cache was dropped),
+    /// since the interleaving the test waits for can then never happen.
     #[doc(hidden)]
+    #[allow(clippy::expect_used)]
     pub async fn entered(&mut self) {
-        let _ = (&mut self.entered_rx).await;
+        (&mut self.entered_rx)
+            .await
+            .expect("peek gate dropped before a lookup entered it");
     }
 
     /// Releases the parked lookup to proceed with its real disk read.
@@ -820,10 +829,14 @@ impl Inner {
 
     /// Consumes and parks on a [`PeekGate`] armed for `key` by
     /// [`DiskCache::block_peek_for_test`], if one is currently armed for it.
-    /// Runs on the calling thread: `get`/`get_uncounted` only reach disk via
-    /// `spawn_blocking` (issue #1702), so blocking here never parks an async
-    /// runtime worker. A no-op in production, where nothing ever arms the
-    /// gate.
+    /// Runs on, and parks, the calling thread. The off-worker paths
+    /// (`TieredCache::get_off_worker`, `peek_uncounted_off_worker`, and the
+    /// `get_or_fetch` disk consult) reach it under `spawn_blocking` (issue
+    /// #1702), but `TieredCache::get` reads the disk tier inline on its
+    /// caller's thread, so a test arming the gate must read through
+    /// `get_off_worker` or `peek_uncounted_off_worker` to keep the park off
+    /// an async runtime worker. A no-op in production, where nothing ever
+    /// arms the gate.
     fn wait_for_peek_gate(&self, key: &CacheKey) {
         let gate = {
             let mut slot = self.peek_gate.lock();
