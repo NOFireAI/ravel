@@ -306,6 +306,10 @@ pub enum Label {
     /// `pinned_window`.
     /// Shares the `reason` key with the other reason variants.
     SupersededHeldReason(crate::maintain::SupersededHeldReason),
+    /// Why compaction left an input object out of its merge (issue #2554):
+    /// `unwritable_stream_attrs`. Shares the `reason` key with the other
+    /// reason variants.
+    CompactionInputSkipReason(ravel_maintain::CompactionInputSkipReason),
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
@@ -552,6 +556,7 @@ impl Label {
             Label::ScrubUnreadableReason(_) => "reason",
             Label::AlertRetentionSkipReason(_) => "reason",
             Label::SupersededHeldReason(_) => "reason",
+            Label::CompactionInputSkipReason(_) => "reason",
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
@@ -594,6 +599,7 @@ impl Label {
             Label::ScrubUnreadableReason(reason) => reason.as_str().to_string(),
             Label::AlertRetentionSkipReason(reason) => reason.name().to_string(),
             Label::SupersededHeldReason(reason) => reason.name().to_string(),
+            Label::CompactionInputSkipReason(reason) => reason.name().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
@@ -3817,6 +3823,12 @@ pub struct MaintenanceSafetySnapshot {
     /// order. Rendered as further `signal` samples of the superseded refusal
     /// and hold families, after `signals`' own.
     pub unmaintained_superseded: Vec<(Signal, crate::maintain::UnmaintainedSupersededCounts)>,
+    /// Input objects compaction left out of its merge since process start,
+    /// each counted once (issue #2554): one entry per
+    /// [`ravel_maintain::COMPACTION_INPUT_SKIP_SIGNALS`] member and
+    /// [`ravel_maintain::CompactionInputSkipReason::ALL`] member, signals
+    /// outermost, in those orders.
+    pub compaction_inputs_skipped: Vec<(Signal, ravel_maintain::CompactionInputSkipReason, u64)>,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -3849,6 +3861,7 @@ impl MaintenanceSafetySnapshot {
                 .iter()
                 .map(|&signal| (signal, metrics.unmaintained_superseded(signal)))
                 .collect(),
+            compaction_inputs_skipped: compaction_inputs_skipped(),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
                 .map(|&signal| MaintenanceSafetySignalSnapshot {
@@ -3889,6 +3902,25 @@ impl MaintenanceSafetySnapshot {
                 .collect(),
         }
     }
+}
+
+/// [`MaintenanceSafetySnapshot::compaction_inputs_skipped`], read from the
+/// process-wide counter ravel-maintain's compaction keeps.
+fn compaction_inputs_skipped() -> Vec<(Signal, ravel_maintain::CompactionInputSkipReason, u64)> {
+    ravel_maintain::COMPACTION_INPUT_SKIP_SIGNALS
+        .iter()
+        .flat_map(|&signal| {
+            ravel_maintain::CompactionInputSkipReason::ALL
+                .iter()
+                .map(move |&reason| {
+                    (
+                        signal,
+                        reason,
+                        ravel_maintain::compaction_inputs_skipped_total(signal, reason),
+                    )
+                })
+        })
+        .collect()
 }
 
 /// No `tenant_hash` label on any series here. ADR-0048 decision 4 names
@@ -3935,6 +3967,30 @@ fn render_maintain_safety_family(
             out,
             "ravel_alert_retention_skipped_total",
             &[Label::Mode(mode), Label::AlertRetentionSkipReason(reason)],
+            value,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_compaction_inputs_skipped_total",
+        "Input objects compaction left out of its merge instead of failing on them, by signal \
+         and reason, each object counted once per process since process start (issue #2554). \
+         reason=\"unwritable_stream_attrs\": a log object carrying a stream_attrs blob the RLOG \
+         writer refuses. The rest of the bucket is merged when at least min_compaction_inputs \
+         inputs remain; the skipped object stays in storage and is not named by any compaction \
+         record. A warn log line names its key. Resets on restart: alert on an increase.",
+        "counter",
+    );
+    for &(signal, reason, value) in &snapshot.compaction_inputs_skipped {
+        write_sample(
+            out,
+            "ravel_maintain_compaction_inputs_skipped_total",
+            &[
+                Label::Mode(mode),
+                Label::Signal(signal),
+                Label::CompactionInputSkipReason(reason),
+            ],
             value,
         );
     }
@@ -8048,6 +8104,9 @@ mod tests {
             Label::ScrubUnreadableReason(UnreadableReason::AccessDenied),
             Label::AlertRetentionSkipReason(crate::maintain::AlertRetentionSkipReason::Absent),
             Label::SupersededHeldReason(crate::maintain::SupersededHeldReason::Named),
+            Label::CompactionInputSkipReason(
+                ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
+            ),
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
@@ -8081,6 +8140,7 @@ mod tests {
                 Label::ScrubUnreadableReason(_) => "reason",
                 Label::AlertRetentionSkipReason(_) => "reason",
                 Label::SupersededHeldReason(_) => "reason",
+                Label::CompactionInputSkipReason(_) => "reason",
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
@@ -8141,6 +8201,9 @@ mod tests {
                 "reason",
                 // SupersededHeldReason (issue #2221) reuses the `reason` key.
                 "reason",
+                // CompactionInputSkipReason (issue #2554) reuses the `reason`
+                // key.
+                "reason",
                 "cache",
                 "tier",
                 "kind",
@@ -8174,8 +8237,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            29,
-            "exactly 29 label variants every build has, 21 distinct keys (sql adds DdlKind, \
+            30,
+            "exactly 30 label variants every build has, 21 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
@@ -10776,6 +10839,7 @@ mod tests {
             alert_retention_skipped: Vec::new(),
             unmaintained_orphan_breaker_trips: vec![(Signal::Alerts, 14), (Signal::Audit, 0)],
             unmaintained_superseded: Vec::new(),
+            compaction_inputs_skipped: Vec::new(),
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -12163,6 +12227,18 @@ mod tests {
                     )
                 })
                 .collect(),
+            compaction_inputs_skipped: vec![
+                (
+                    Signal::Logs,
+                    ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
+                    1,
+                ),
+                (
+                    Signal::Audit,
+                    ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
+                    1,
+                ),
+            ],
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
@@ -12243,7 +12319,9 @@ mod tests {
                     || line.starts_with("ravel_maintain_units_scan_failed")
                 {
                     vec!["mode", "signal"]
-                } else if line.starts_with("ravel_maintain_superseded_inputs_held_total") {
+                } else if line.starts_with("ravel_maintain_superseded_inputs_held_total")
+                    || line.starts_with("ravel_maintain_compaction_inputs_skipped_total")
+                {
                     vec!["mode", "signal", "reason"]
                 } else if line.starts_with("ravel_maintain_objects_deleted_total") {
                     vec!["mode", "kind"]
@@ -12320,6 +12398,59 @@ mod tests {
                 "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"unsupported_version\"} 3",
                 "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"watermark_below_floor\"} 4",
                 "ravel_alert_retention_skipped_total{mode=\"maintain\",reason=\"store_error\"} 5",
+            ]
+        );
+    }
+
+    /// `ravel_maintain_compaction_inputs_skipped_total` renders one sample per
+    /// signal whose compaction can skip an input and per reason, each from
+    /// zero, carrying exactly `mode`, `signal` and `reason` (issue #2554). The
+    /// snapshot constructor reads the process-wide counter ravel-maintain
+    /// keeps, and on a process that skipped nothing every sample is 0.
+    #[test]
+    fn compaction_inputs_skipped_renders_each_signal_and_reason() {
+        use ravel_maintain::CompactionInputSkipReason as Reason;
+        let from_process = MaintenanceSafetySnapshot::from_metrics(
+            &crate::maintain::MaintenanceSafetyMetrics::default(),
+        );
+        assert_eq!(
+            from_process.compaction_inputs_skipped,
+            vec![
+                (Signal::Logs, Reason::UnwritableStreamAttrs, 0),
+                (Signal::Audit, Reason::UnwritableStreamAttrs, 0),
+            ]
+        );
+
+        let snapshot = MaintenanceSafetySnapshot {
+            compaction_inputs_skipped: vec![
+                (Signal::Logs, Reason::UnwritableStreamAttrs, 3),
+                (Signal::Audit, Reason::UnwritableStreamAttrs, 0),
+            ],
+            ..from_process
+        };
+        let mut body = String::new();
+        render_maintain_safety_family(&mut body, Mode::Maintain, &snapshot);
+
+        let family = "ravel_maintain_compaction_inputs_skipped_total";
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter\n")).count(),
+            1,
+            "{body}"
+        );
+        assert_eq!(
+            body.matches(&format!("# HELP {family} ")).count(),
+            1,
+            "{body}"
+        );
+        let samples: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with(&format!("{family}{{")))
+            .collect();
+        assert_eq!(
+            samples,
+            vec![
+                "ravel_maintain_compaction_inputs_skipped_total{mode=\"maintain\",signal=\"logs\",reason=\"unwritable_stream_attrs\"} 3",
+                "ravel_maintain_compaction_inputs_skipped_total{mode=\"maintain\",signal=\"audit\",reason=\"unwritable_stream_attrs\"} 0",
             ]
         );
     }

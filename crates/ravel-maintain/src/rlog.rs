@@ -258,6 +258,7 @@ use ravel_types::declared_stats::{DeclaredColumnStat, DeclaredStatType, Declared
 use crate::bucket::Bucket;
 use crate::build::{BuiltPart, put_part_with_ledger};
 use crate::codec::SegmentCodec;
+use crate::compact::CompactionInputSkipReason;
 use crate::config::{AdmissionMode, CompactorConfig, MergeMemoryTracker};
 use crate::error::{MaintainError, MergeCursorBudgetSite, Result};
 use crate::read::InputRecord;
@@ -407,6 +408,26 @@ impl SegmentCodec for RlogCodec {
     ) -> Result<Self::Catalog> {
         let object_key = keys::reconstruct_data_key(&input.record)?;
         load_catalog_from_object(store, config, object_key, true).await
+    }
+
+    /// An input whose STREAM_DIR holds a blob the writer refuses at finish:
+    /// [`RlogWriter`] validates every `stream_attrs` blob with
+    /// [`stream_attr_pairs`], so this asks the same question of the input's
+    /// blobs before the merge carries them into a part. Only an object written
+    /// before that validation existed can answer `Some` (issue #2548).
+    fn unwritable_input(catalog: &Self::Catalog) -> Option<(CompactionInputSkipReason, String)> {
+        catalog
+            .reader
+            .stream_dir()
+            .entries()
+            .iter()
+            .find_map(|entry| stream_attr_pairs(&entry.blob).err())
+            .map(|err| {
+                (
+                    CompactionInputSkipReason::UnwritableStreamAttrs,
+                    err.to_string(),
+                )
+            })
     }
 
     async fn build_parts(
