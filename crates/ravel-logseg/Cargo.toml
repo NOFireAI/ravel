@@ -16,6 +16,11 @@ rust-version.workspace = true
 # `ravel-ingest` to fold into its `LogStage::Bloom` accumulator. Enabled
 # transitively by `ravel-ingest/stage-timing`.
 stage-timing = []
+# Test-only (issue #2548): adds `RlogWriter::with_unchecked_stream_attrs`, which
+# lets a test store a `stream_attrs` blob the reader cannot decode so the
+# reader's refusal can be exercised. Off by default; only dev-dependencies may
+# enable it, never a production crate.
+test-support = []
 
 [dependencies]
 bytes = { workspace = true }

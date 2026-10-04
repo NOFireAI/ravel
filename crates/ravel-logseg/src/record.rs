@@ -69,6 +69,25 @@ pub fn stream_attrs_bytes(
     out
 }
 
+/// [`stream_attrs_bytes`] with the scope name and version taken as raw bytes,
+/// so a test can build the non-UTF-8 blob a malformed producer could hand the
+/// writer.
+#[cfg(test)]
+pub(crate) fn stream_attrs_bytes_raw_scope(
+    resource_attrs: &[(String, AttrValue)],
+    scope_name: &[u8],
+    scope_version: &[u8],
+    scope_attrs: &[(String, AttrValue)],
+) -> Vec<u8> {
+    let mut out = canonical_attr_bytes(resource_attrs);
+    put_uvarint(&mut out, scope_name.len() as u64);
+    out.extend_from_slice(scope_name);
+    put_uvarint(&mut out, scope_version.len() as u64);
+    out.extend_from_slice(scope_version);
+    out.extend_from_slice(&canonical_attr_bytes(scope_attrs));
+    out
+}
+
 /// Depth cap when decoding a stream_attrs blob, so hostile nesting cannot
 /// exhaust the stack.
 const MAX_ATTR_DEPTH: u32 = 32;
@@ -93,7 +112,13 @@ pub struct StreamAttrs {
 /// exactly, including a nested `List`/`Map` and an `F64`'s exact bit pattern (a
 /// NaN payload or -0.0 survives, since the encoding stores `to_bits` verbatim).
 /// Corrupt input (a truncated blob, an over-long length prefix, an unknown
-/// value tag) is a typed [`LogSegError::Corrupted`], never a panic.
+/// value tag, a key, string value, scope name or scope version that is not
+/// UTF-8) is a typed [`LogSegError::Corrupted`], never a panic.
+///
+/// This is the one definition of a valid blob:
+/// [`crate::reader::stream_attr_pairs`] is implemented on it and refuses
+/// exactly what it refuses, with the same error, and the writer validates every
+/// STREAM_DIR blob through that function.
 pub fn decode_stream_attrs(blob: &[u8]) -> Result<StreamAttrs, LogSegError> {
     let mut pos = 0usize;
     let resource = decode_attr_set(blob, &mut pos, 0)?;
@@ -576,6 +601,48 @@ mod tests {
         assert!(matches!(err, LogSegError::Corrupted(_)), "got {err:?}");
     }
 
+    fn corrupted_message(err: LogSegError) -> String {
+        match err {
+            LogSegError::Corrupted(msg) => msg,
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
+    }
+
+    /// `stream_attr_pairs` refuses `blob` with exactly the error
+    /// `decode_stream_attrs` returns for it.
+    fn assert_both_refuse(blob: &[u8]) {
+        let want = corrupted_message(decode_stream_attrs(blob).expect_err("decode_stream_attrs"));
+        let got = corrupted_message(
+            crate::reader::stream_attr_pairs(blob)
+                .expect_err("stream_attr_pairs must refuse what decode_stream_attrs refuses"),
+        );
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn stream_attr_pairs_refuses_a_non_utf8_scope_name() {
+        let blob = stream_attrs_bytes_raw_scope(&resource(), b"sc\xff", b"1", &scope_attrs());
+        assert_both_refuse(&blob);
+    }
+
+    #[test]
+    fn stream_attr_pairs_refuses_a_non_utf8_scope_version() {
+        let blob = stream_attrs_bytes_raw_scope(&resource(), b"sc", b"1\xc3", &scope_attrs());
+        assert_both_refuse(&blob);
+    }
+
+    /// The nesting cap counts every map and list level, the same in both
+    /// functions: 20 nested maps is past `MAX_ATTR_DEPTH` for the decoder.
+    #[test]
+    fn stream_attr_pairs_refuses_nesting_past_the_depth_cap() {
+        let mut nested = AttrValue::I64(1);
+        for _ in 0..20 {
+            nested = AttrValue::Map(vec![("m".into(), nested)]);
+        }
+        let blob = stream_attrs_bytes(&[("deep".into(), nested)], "sc", "1", &[]);
+        assert_both_refuse(&blob);
+    }
+
     fn arb_value() -> impl Strategy<Value = AttrValue> {
         let leaf = prop_oneof![
             ".*".prop_map(AttrValue::Str),
@@ -622,5 +689,82 @@ mod tests {
                 canonical_attr_bytes(&scope_attrs)
             );
         }
+
+        /// Every blob the encoder produces decodes under both functions, and
+        /// `stream_attr_pairs` yields the resource entries then the scope
+        /// attributes, in decoded order.
+        #[test]
+        fn encoded_stream_attrs_decode_under_both_functions(
+            resource in arb_attrs(),
+            scope_name in ".{0,8}",
+            scope_version in ".{0,8}",
+            scope_attrs in arb_attrs(),
+        ) {
+            let blob = stream_attrs_bytes(&resource, &scope_name, &scope_version, &scope_attrs);
+            let decoded = decode_stream_attrs(&blob).expect("decode_stream_attrs");
+            let pairs = crate::reader::stream_attr_pairs(&blob).expect("stream_attr_pairs");
+            let mut want = decoded.resource;
+            want.extend(decoded.scope_attrs);
+            prop_assert_eq!(canonical_attr_bytes(&pairs), canonical_attr_bytes(&want));
+            let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+            let want_keys: Vec<&str> = want.iter().map(|(k, _)| k.as_str()).collect();
+            prop_assert_eq!(keys, want_keys);
+        }
+
+        /// Arbitrary bytes in the scope name and version: both functions accept
+        /// exactly when both strings are UTF-8, and refuse with the same error
+        /// otherwise.
+        #[test]
+        fn stream_attr_decoders_agree_on_arbitrary_scope_bytes(
+            resource in arb_attrs(),
+            scope_name in proptest::collection::vec(any::<u8>(), 0..12),
+            scope_version in proptest::collection::vec(any::<u8>(), 0..12),
+            scope_attrs in arb_attrs(),
+        ) {
+            let blob =
+                stream_attrs_bytes_raw_scope(&resource, &scope_name, &scope_version, &scope_attrs);
+            let valid = std::str::from_utf8(&scope_name).is_ok()
+                && std::str::from_utf8(&scope_version).is_ok();
+            prop_assert_eq!(decode_stream_attrs(&blob).is_ok(), valid);
+            assert_decoders_agree(&blob)?;
+        }
+
+        /// Arbitrary byte sequences, and encoded blobs with one byte
+        /// overwritten: the two functions agree on Ok versus Err, and on the
+        /// error.
+        #[test]
+        fn stream_attr_decoders_agree_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+            resource in arb_attrs(),
+            scope_attrs in arb_attrs(),
+            at in any::<proptest::sample::Index>(),
+            byte in any::<u8>(),
+        ) {
+            assert_decoders_agree(&bytes)?;
+            let mut blob = stream_attrs_bytes(&resource, "scope", "1.0", &scope_attrs);
+            let i = at.index(blob.len());
+            blob[i] = byte;
+            assert_decoders_agree(&blob)?;
+        }
+    }
+
+    fn assert_decoders_agree(blob: &[u8]) -> Result<(), TestCaseError> {
+        match (
+            decode_stream_attrs(blob),
+            crate::reader::stream_attr_pairs(blob),
+        ) {
+            (Ok(_), Ok(_)) => {}
+            (Err(LogSegError::Corrupted(want)), Err(LogSegError::Corrupted(got))) => {
+                prop_assert_eq!(got, want);
+            }
+            (want, got) => {
+                return Err(TestCaseError::fail(format!(
+                    "decoders disagree: decode_stream_attrs {:?}, stream_attr_pairs {:?}",
+                    want.map(|_| ()),
+                    got.map(|_| ())
+                )));
+            }
+        }
+        Ok(())
     }
 }

@@ -112,6 +112,9 @@ pub struct RlogWriter {
     sort_descriptor: Option<SortDescriptor>,
     clustering_generation: u64,
     bloom_scope: BloomScope,
+    /// Set by [`RlogWriter::with_unchecked_stream_attrs`].
+    #[cfg(feature = "test-support")]
+    unchecked_stream_attrs: bool,
 }
 
 /// Which string columns BLOOM covers (ADR-2135 decision 5). A column outside
@@ -218,7 +221,31 @@ impl RlogWriter {
             sort_descriptor: None,
             clustering_generation: 0,
             bloom_scope: BloomScope::All,
+            #[cfg(feature = "test-support")]
+            unchecked_stream_attrs: false,
         }
+    }
+
+    /// Test-only: makes [`RlogWriter::finish`] and
+    /// [`RlogWriter::finish_compacted`] write a `stream_attrs` blob the reader
+    /// cannot decode instead of refusing it, so a test can put such a blob in
+    /// storage and exercise the reader's refusal. A blob that does not decode
+    /// contributes no stream-level columns. Exists only with the
+    /// `test-support` feature, which no production path may enable.
+    #[cfg(feature = "test-support")]
+    pub fn with_unchecked_stream_attrs(mut self) -> Self {
+        self.unchecked_stream_attrs = true;
+        self
+    }
+
+    /// The resource and scope pairs of one STREAM_DIR blob. A blob the reader
+    /// cannot decode is refused, so the writer never stores one.
+    fn stream_pairs(&self, blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+        #[cfg(feature = "test-support")]
+        if self.unchecked_stream_attrs {
+            return Ok(stream_attr_pairs(blob).unwrap_or_default());
+        }
+        stream_attr_pairs(blob)
     }
 
     /// Orders the object's records by `descriptor` and records it in the
@@ -487,7 +514,7 @@ impl RlogWriter {
         // `stream_attrs` can fail on a corrupt blob; that is propagated rather
         // than silently under-indexing.
         for blob in streams.values() {
-            for (k, v) in stream_attr_pairs(blob)? {
+            for (k, v) in self.stream_pairs(blob)? {
                 let (ty, _) = resolve_value(&v);
                 if stream_level_column_eligible(k.as_str(), ty, &indexed_names) {
                     distinct.insert((k, ty.to_u8()));
@@ -576,7 +603,7 @@ impl RlogWriter {
         if !tracked_names.is_empty() {
             for (id, blob) in &streams {
                 let seed =
-                    StreamSeed::build(stream_attr_pairs(blob)?, &tracked_slot, stamp_index.slots());
+                    StreamSeed::build(self.stream_pairs(blob)?, &tracked_slot, stamp_index.slots());
                 stream_seeds.insert(*id, seed);
             }
         }
@@ -1057,7 +1084,7 @@ impl RlogWriter {
             }
         }
         for blob in streams.values() {
-            for (k, v) in stream_attr_pairs(blob)? {
+            for (k, v) in self.stream_pairs(blob)? {
                 let (ty, _) = resolve_value(&v);
                 if stream_level_column_eligible(k.as_str(), ty, &indexed_names) {
                     distinct.insert((k, ty.to_u8()));
@@ -1117,7 +1144,7 @@ impl RlogWriter {
         if !tracked_names.is_empty() {
             for (id, blob) in &streams {
                 let seed =
-                    StreamSeed::build(stream_attr_pairs(blob)?, &tracked_slot, stamp_index.slots());
+                    StreamSeed::build(self.stream_pairs(blob)?, &tracked_slot, stamp_index.slots());
                 stream_seeds.insert(*id, seed);
             }
         }
@@ -4216,6 +4243,56 @@ mod tests {
                 );
             }
             other => panic!("expected InconsistentStreamAttrs, got {other:?}"),
+        }
+    }
+
+    /// Stream `n`'s blob with its scope name or version replaced by bytes that
+    /// are not UTF-8: well-formed framing the reader's decoder still refuses.
+    fn non_utf8_scope_blobs(n: u8) -> [Vec<u8>; 2] {
+        let resource = [("service.name".into(), AttrValue::Str(format!("svc{n}")))];
+        let scope = [("lib".into(), AttrValue::I64(i64::from(n)))];
+        [
+            crate::record::stream_attrs_bytes_raw_scope(&resource, b"sc\xffpe", b"1.0", &scope),
+            crate::record::stream_attrs_bytes_raw_scope(&resource, b"scope", b"1.\xc3", &scope),
+        ]
+    }
+
+    /// The writer's refusal of `blob` must be the reader's decode error for it,
+    /// so an object the writer produces never carries a blob a reader refuses.
+    fn assert_refused_as_reader_would(result: Result<Vec<u8>, LogSegError>, blob: &[u8]) {
+        let want = match crate::record::decode_stream_attrs(blob) {
+            Err(LogSegError::Corrupted(msg)) => msg,
+            other => panic!("the reader must refuse this blob as Corrupted, got {other:?}"),
+        };
+        match result {
+            Err(LogSegError::Corrupted(msg)) => assert_eq!(msg, want),
+            Err(other) => panic!("expected Corrupted, got {other:?}"),
+            Ok(obj) => panic!(
+                "the writer produced a {}-byte object carrying a blob the reader refuses",
+                obj.len()
+            ),
+        }
+    }
+
+    #[test]
+    fn row_writer_refuses_a_stream_attrs_blob_the_reader_cannot_decode() {
+        for blob in non_utf8_scope_blobs(4) {
+            let mut w = RlogWriter::new(RlogConfig::default(), identity());
+            let mut r = base_record(4, 0);
+            r.stream_attrs = blob.clone();
+            w.push(r).expect("push buffers without decoding");
+            assert_refused_as_reader_would(w.finish(), &blob);
+        }
+    }
+
+    #[test]
+    fn columnar_writer_refuses_a_stream_attrs_blob_the_reader_cannot_decode() {
+        for blob in non_utf8_scope_blobs(10) {
+            let batch = columnar_batch_with_stream_dir(vec![id(10)], vec![blob.clone()], 0);
+            let mut w = RlogWriter::new(RlogConfig::default(), identity());
+            w.push_columnar(batch)
+                .expect("push buffers without decoding");
+            assert_refused_as_reader_would(w.finish(), &blob);
         }
     }
 
