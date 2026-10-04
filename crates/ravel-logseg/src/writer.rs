@@ -38,7 +38,7 @@ use crate::record::{
 use crate::rlog_bloom::encode_rlog_bloom_section;
 use crate::rlog_codec::{MAX_DICT_ENTRIES, encode_dict_ids, encode_dict_page};
 use crate::skip_index::{Level0Entry, SkipIndex};
-use crate::stream_dir::{StreamDir, StreamEntry};
+use crate::stream_dir::{BorrowedStreamEntry, StreamDir};
 use crate::tokenizer::tokens;
 
 /// Writer configuration and format constants (docs/log-segment-format.md).
@@ -627,6 +627,8 @@ impl RlogWriter {
                 &mut stamp,
             )?);
         }
+        // Last read: every record resolved against its stream's seed above.
+        drop(stream_seeds);
         match &cluster {
             None => rows.sort_by(|a, b| {
                 a.stream_ref
@@ -803,16 +805,24 @@ impl RlogWriter {
             blocks.push(out);
         }
 
-        // STREAM_DIR.
+        // Block accounting is done; everything from here only needs the row
+        // count (FIELD_DIR null counts below, the footer's `record_count`).
+        let record_count = rows.len() as u64;
+        drop(rows);
+
+        // STREAM_DIR, encoded directly from the blobs `streams` already
+        // borrows from `self.records` (ADR-2467 decision 5): no owned
+        // `StreamEntry` is built, and the directory bytes are produced right
+        // before the section is written.
         let total_blocks = block_spans.len() as u32;
-        let stream_entries: Vec<StreamEntry> = streams
+        let stream_dir_entries: Vec<BorrowedStreamEntry<'_>> = streams
             .iter()
             .enumerate()
             .map(|(i, (id, blob))| {
                 let r = i as u32;
-                StreamEntry {
+                BorrowedStreamEntry {
                     stream_id: *id,
-                    blob: blob.to_vec(),
+                    blob,
                     first_blk: first_blk.get(&r).copied().unwrap_or(0),
                     last_blk: last_blk
                         .get(&r)
@@ -821,14 +831,19 @@ impl RlogWriter {
                 }
             })
             .collect();
-        let stream_dir = StreamDir::new(stream_entries);
+        // Last read of the per-stream block-range maps and of `streams`
+        // itself: `stream_dir_entries` holds plain `&[u8]` copies borrowed
+        // from `self.records`, not from the `streams` map container.
+        drop(first_blk);
+        drop(last_blk);
+        drop(streams);
 
         // FIELD_DIR: one entry per in-budget column, sorted by (name, type).
         let field_entries: Vec<FieldEntry> = columns
             .iter()
             .map(|(name, ty, cid)| {
                 let present = col_present.get(cid).copied().unwrap_or(0);
-                let null_count = (rows.len() as u64).saturating_sub(present);
+                let null_count = record_count.saturating_sub(present);
                 FieldEntry {
                     name: name.clone(),
                     ty: *ty,
@@ -870,6 +885,9 @@ impl RlogWriter {
                 postings_fields.insert(cid, FieldTerms::Terms(map));
             }
         }
+        // Last read of the postings accumulators.
+        drop(postings_terms);
+        drop(postings_capped);
 
         // Assemble sections in kind order.
         let mut object = Vec::new();
@@ -879,14 +897,19 @@ impl RlogWriter {
             &mut object,
             &mut sections,
             kind::STREAM_DIR,
-            &compress(&stream_dir.encode(), self.cfg.zstd_level)?,
+            &compress(
+                &StreamDir::encode_borrowed(&stream_dir_entries),
+                self.cfg.zstd_level,
+            )?,
         );
+        drop(stream_dir_entries);
         push_section(
             &mut object,
             &mut sections,
             kind::FIELD_DIR,
             &compress(&field_dir.encode(), self.cfg.zstd_level)?,
         );
+        drop(field_dir);
         push_section(
             &mut object,
             &mut sections,
@@ -899,6 +922,7 @@ impl RlogWriter {
             kind::SKIP_IDX,
             &compress(&skip.encode(), self.cfg.zstd_level)?,
         );
+        drop(skip);
         // PAGE_DIR is mandatory (ADR-0699 decision 2). Compressed as a whole
         // section under the section crc, like SKIP_IDX: it is read whole on
         // every open.
@@ -908,12 +932,14 @@ impl RlogWriter {
             kind::PAGE_DIR,
             &compress(&page_dir.encode(), self.cfg.zstd_level)?,
         );
+        drop(page_dir);
         push_section(
             &mut object,
             &mut sections,
             kind::BLOOM,
             &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
         );
+        drop(bloom_entries);
         let mut postings_bytes_len: u64 = 0;
         if !indexed_column_ids.is_empty() {
             let postings_bytes = encode_postings_section(
@@ -940,7 +966,7 @@ impl RlogWriter {
             max_ts_ns: max_ts,
             min_observed_ts_ns: min_obs,
             max_observed_ts_ns: max_obs,
-            record_count: rows.len() as u64,
+            record_count,
             block_count: u64::from(total_blocks),
             stream_count: sorted_ids.len() as u64,
             sections,
@@ -1729,16 +1755,30 @@ impl RlogWriter {
             blocks.push(out);
         }
 
-        // STREAM_DIR.
+        // Per-block scratch is read for the last time in the loop above
+        // (stream_seeds via the per-row stamp finish, the flat stat and
+        // indexed-term arrays via the drains and the postings pass, the
+        // stamp scratch via `stamp.begin`/`stamp.finish`).
+        drop(stream_seeds);
+        drop(stamp);
+        drop(blk_indexed);
+        drop(blk_indexed_ends);
+        drop(blk_stat);
+        drop(blk_stat_ends);
+
+        // STREAM_DIR, encoded directly from the blobs `streams` already
+        // borrows from the batches (ADR-2467 decision 5): no owned
+        // `StreamEntry` is built, and the directory bytes are produced right
+        // before the section is written.
         let total_blocks = spans.len() as u32;
-        let stream_entries: Vec<StreamEntry> = streams
+        let stream_dir_entries: Vec<BorrowedStreamEntry<'_>> = streams
             .iter()
             .enumerate()
             .map(|(i, (id, blob))| {
                 let r = i as u32;
-                StreamEntry {
+                BorrowedStreamEntry {
                     stream_id: *id,
-                    blob: blob.to_vec(),
+                    blob,
                     first_blk: first_blk.get(&r).copied().unwrap_or(0),
                     last_blk: last_blk
                         .get(&r)
@@ -1747,7 +1787,12 @@ impl RlogWriter {
                 }
             })
             .collect();
-        let stream_dir = StreamDir::new(stream_entries);
+        // Last read of the per-stream block-range maps and of `streams`
+        // itself: `stream_dir_entries` holds plain `&[u8]` copies, not a
+        // borrow of the `streams` map container.
+        drop(first_blk);
+        drop(last_blk);
+        drop(streams);
 
         // FIELD_DIR.
         let field_entries: Vec<FieldEntry> = columns
@@ -1786,6 +1831,9 @@ impl RlogWriter {
                 postings_fields.insert(cid, FieldTerms::Terms(map));
             }
         }
+        // Last read of the postings accumulators.
+        drop(postings_terms);
+        drop(postings_capped);
 
         // Assemble sections in kind order.
         let mut object = Vec::new();
@@ -1794,14 +1842,19 @@ impl RlogWriter {
             &mut object,
             &mut sections,
             kind::STREAM_DIR,
-            &compress(&stream_dir.encode(), self.cfg.zstd_level)?,
+            &compress(
+                &StreamDir::encode_borrowed(&stream_dir_entries),
+                self.cfg.zstd_level,
+            )?,
         );
+        drop(stream_dir_entries);
         push_section(
             &mut object,
             &mut sections,
             kind::FIELD_DIR,
             &compress(&field_dir.encode(), self.cfg.zstd_level)?,
         );
+        drop(field_dir);
         push_section(
             &mut object,
             &mut sections,
@@ -1814,6 +1867,7 @@ impl RlogWriter {
             kind::SKIP_IDX,
             &compress(&skip.encode(), self.cfg.zstd_level)?,
         );
+        drop(skip);
         // PAGE_DIR is mandatory (ADR-0699 decision 2). Compressed as a whole
         // section under the section crc, like SKIP_IDX: it is read whole on
         // every open.
@@ -1823,12 +1877,14 @@ impl RlogWriter {
             kind::PAGE_DIR,
             &compress(&page_dir.encode(), self.cfg.zstd_level)?,
         );
+        drop(page_dir);
         push_section(
             &mut object,
             &mut sections,
             kind::BLOOM,
             &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
         );
+        drop(bloom_entries);
         let mut postings_bytes_len: u64 = 0;
         if !indexed_column_ids.is_empty() {
             let postings_bytes = encode_postings_section(
