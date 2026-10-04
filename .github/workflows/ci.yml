@@ -886,12 +886,13 @@ jobs:
       - name: Test
         run: cargo nextest run --locked --workspace --cargo-profile ci-opt --partition hash:${{ matrix.shard }}/${{ strategy.job-total }}
       # nextest does not run doctests; keep them covered separately, in one
-      # leg, since they are not partitioned. Same `ci` profile as the step
-      # above (ADR-0053 D4, and what scripts/gates.sh has always run): on the
-      # default profile this is a second target subtree and so a second build
-      # of the workspace inside one job. profile.ci inherits dev, so
-      # debug_assertions and overflow checks are unchanged and only debug info
-      # is dropped.
+      # leg, since they are not partitioned. Same profile as the step above
+      # (ADR-0053 D4): on another profile this is a second target subtree and
+      # so a second build of the workspace inside one job. That profile is
+      # `ci-opt`, not the `ci` that scripts/gates.sh runs locally: it inherits
+      # `ci`, so workspace crates keep debug_assertions and overflow checks
+      # with no debug info, and it builds third-party dependencies at
+      # opt-level 2 (issue #2524).
       - name: Doctests
         if: matrix.shard == 1
         run: cargo test --locked --doc --profile ci-opt --workspace
@@ -1057,8 +1058,9 @@ jobs:
           # Names the cargo profile, as in `sql` above.
           key: ci-profile
       - name: Flight SQL tests
-        # The `ci` profile, as in `check-shard` (issue #2519): it is dev without
-        # debug info. On the default profile this lane wrote about 76 GiB and
+        # The `ci` profile (issue #2519): it is dev without debug info.
+        # `check-shard` runs `ci-opt`, which adds optimised dependencies; this
+        # lane does not. On the default profile this lane wrote about 76 GiB and
         # linked that debug info into 159 test binaries. Every cargo command
         # in the `sql`, `features-lane` and `features-otap` jobs uses it too,
         # so each job builds in one target subtree.
