@@ -182,8 +182,8 @@ properties of the instance, not of the store, and that putting them into a
 profile of store prices is a category error. ADR-2414 records them as measured
 constants instead, with an optional note of the date and host they were
 measured on (the reference profile: 70 ms per request and 90 MB/s per
-connection, measured on 2026-10-03 from the 32 GB reference box, intra-region
-against S3), and a profile without them keeps the price-only rate. The
+connection, measured on the reference box of the reference suite,
+intra-region against the object store), and a profile without them keeps the price-only rate. The
 `cost-based` rate is the larger of the price term and the time term, and the
 default stays `cost-based`; what the default now does at the reference profile
 is read a narrow projection of a large object ranged, where it read every

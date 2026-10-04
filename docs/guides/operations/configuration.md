@@ -1257,7 +1257,7 @@ transfer_nanodollars_per_gib = 0      # egress, per GiB
 retrieval_nanodollars_per_gib = 0     # per-GiB retrieval on classes that bill it
 request_latency_micros = 70000        # optional; one request's latency
 per_connection_throughput_bytes_per_s = 90000000  # optional; set with the latency
-timings_measured = "2026-10-03, the 32 GB reference box of the reference suite, intra-region against S3"
+timings_measured = "measured on the reference box of the reference suite, intra-region against the object store"
 ```
 
 Prices are integer nanodollars, never floats, because they are exact decimal
@@ -1269,9 +1269,10 @@ same run under a different profile reprices to different numbers.
 
 The two timings are measured constants, not prices: the latency of one request
 from the deployment's hosts and the bytes one connection transfers per second,
-with `timings_measured` naming when and where they were measured. The
-reference values were measured on 2026-10-03 from the 32 GB reference box,
-intra-region against S3. They are optional, and set together or not at all.
+with `timings_measured` naming when and where they were measured. The reference
+values were measured on the reference box of the reference suite,
+intra-region against the object store. They are optional, and set together
+or not at all.
 
 Every field except `delete_class_nanodollars` and the three timing fields is
 required. Loading is fail-closed: an unreadable file, invalid TOML, an unknown
