@@ -367,13 +367,6 @@ fn judge(
     let number = statement.number;
     let sql = &statement.sql;
     let column_match = over.map_or(ColumnMatch::Positional, StatementOverride::column_match);
-    let (reference_columns, subject_columns) = match column_match {
-        ColumnMatch::Positional => (Vec::new(), Vec::new()),
-        ColumnMatch::ByName => (
-            column_names(reference).ok_or("reference returned no batches")?,
-            column_names(subject).ok_or("ravel returned no batches")?,
-        ),
-    };
     let tie = if let Some(over) = over.filter(|o| o.is_cardinality_only()) {
         resolve_tie_spec(number, sql, None, over.reason.as_deref())
     } else if let Some(names) = over.and_then(|o| o.order_key_columns.as_deref()) {
@@ -392,6 +385,17 @@ fn judge(
         resolve_tie_spec(number, sql, over.and_then(|o| o.order_key.as_deref()), None)
     }
     .map_err(|e| format!("tie spec: {e}"))?;
+    // By-name matching pairs columns by these names, and cardinality mode
+    // compares their counts; a positional statement with a key needs neither.
+    let (reference_columns, subject_columns) =
+        if column_match == ColumnMatch::ByName || tie.is_cardinality_only() {
+            (
+                column_names(reference).ok_or("reference returned no batches")?,
+                column_names(subject).ok_or("ravel returned no batches")?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
     let reference_rows =
         comparator::rows_from_arrow(reference).map_err(|e| format!("reference rows: {e}"))?;
     let subject_rows =
@@ -604,7 +608,9 @@ async fn parquet_lane_runs_the_upstream_suite_verbatim() {
     // The totals are exact: they count rows reduced at a cut and float cells
     // compared, which depend on the fixture (FIXTURE_SEED) and not on float
     // bits. A comparator that stops reducing ties or comparing floats on any
-    // statement-arm changes them.
+    // statement-arm changes them. The tie total includes cut nominees dropped
+    // for having no counterpart; on this fixture every nominee pairs, so all
+    // 624 are paired rows.
     assert_eq!(
         totals.0, 624,
         "summed tie_rows_reduced across both arms changed"
