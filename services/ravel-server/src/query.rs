@@ -842,15 +842,21 @@ pub struct SqlSpillStartup {
     /// spill resolved there. Its lock is the proof of liveness every other
     /// process's sweep tests, so the caller keeps it for the process lifetime.
     pub owner: Option<ravel_sql::spill::SpillRootOwner>,
-    /// Sibling roots the startup sweep left in place, each logged at INFO.
+    /// Roots under `<cache-dir>/sql-spill` the startup sweep left in place,
+    /// each logged at INFO.
     pub left_in_place: Vec<PathBuf>,
 }
 
 /// Resolve SQL spill at startup from the process environment (ADR-0954,
 /// amended by issue #2416), log the `sql_spill_dir` and `sql_spill_max_bytes`
 /// lines, and, when spill resolved under `--cache-dir`, take ownership of
-/// `<cache-dir>/sql-spill/<instance_id>` and sweep sibling roots whose owner
-/// is gone (requirement 7). Call before serving any query.
+/// `<cache-dir>/sql-spill/<instance_id>` (requirement 7). Call before serving
+/// any query.
+///
+/// Whenever `--cache-dir` is set, `--sql-spill` is not off, and
+/// `<cache-dir>/sql-spill` already exists, roots there whose owner is gone are
+/// swept first, before the free space is measured and whatever spill then
+/// resolves to, so the measurement sees the bytes the sweep reclaimed.
 ///
 /// Fails, refusing startup, on a spill configuration error, when the free
 /// space under `--cache-dir` cannot be measured, or when this process cannot
@@ -885,6 +891,10 @@ fn prepare_sql_spill_with(
     use anyhow::Context as _;
     use ravel_sql::spill::SpillRootOwner;
 
+    let left_in_place = match cache_dir {
+        Some(cache_dir) if !settings.off => sweep_spill_roots(cache_dir),
+        _ => Vec::new(),
+    };
     let cache_dir_inputs = match cache_dir {
         Some(cache_dir) if !settings.off && env_dir.is_none() => {
             let spill_root = cache_dir.join(ravel_sql::SQL_SPILL_SUBDIR);
@@ -918,20 +928,18 @@ fn prepare_sql_spill_with(
     resolved.emit();
 
     let mut owner = None;
-    let mut left_in_place = Vec::new();
     if let (Some(cache), Some(config)) = (&inputs.cache_dir, &resolved.config)
         && config.dir == ravel_sql::cache_spill_dir(&cache.cache_dir, &cache.instance_id)
     {
-        let acquired =
+        owner = Some(
             SpillRootOwner::acquire(&cache.cache_dir, &cache.instance_id).with_context(|| {
                 format!(
                     "could not take ownership of the SQL spill root {} (another live process \
                      holds its owner lock, or the directory is not writable)",
                     config.dir.display()
                 )
-            })?;
-        left_in_place = sweep_spill_roots(&acquired);
-        owner = Some(acquired);
+            })?,
+        );
     }
     Ok(SqlSpillStartup {
         inputs,
@@ -941,17 +949,19 @@ fn prepare_sql_spill_with(
     })
 }
 
-/// Run `owner`'s orphan sweep, then log at INFO, and return, every sibling
-/// root it left: one whose owner lock a live process holds, or whose
-/// ownership could not be settled. Reads nothing outside
+/// Sweep the roots under `<cache_dir>/sql-spill` whose owner is gone, then log
+/// at INFO, and return, every root it left: one whose owner lock a live
+/// process holds, or whose ownership could not be settled. A missing
+/// `<cache_dir>/sql-spill` is neither swept nor created. Reads nothing outside
 /// `<cache-dir>/sql-spill`.
 #[cfg(feature = "sql")]
-fn sweep_spill_roots(owner: &ravel_sql::spill::SpillRootOwner) -> Vec<PathBuf> {
-    owner.sweep_orphaned_spill_roots();
-    let Some(spill_root) = owner.dir().parent() else {
+fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<PathBuf> {
+    let spill_root = cache_dir.join(ravel_sql::SQL_SPILL_SUBDIR);
+    if !spill_root.is_dir() {
         return Vec::new();
-    };
-    let entries = match std::fs::read_dir(spill_root) {
+    }
+    ravel_sql::spill::sweep_orphaned_spill_roots_under(cache_dir);
+    let entries = match std::fs::read_dir(&spill_root) {
         Ok(entries) => entries,
         Err(err) => {
             tracing::warn!(
@@ -966,7 +976,6 @@ fn sweep_spill_roots(owner: &ravel_sql::spill::SpillRootOwner) -> Vec<PathBuf> {
         .flatten()
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| entry.path())
-        .filter(|path| path != owner.dir())
         .collect();
     left.sort();
     for dir in &left {
@@ -3001,11 +3010,13 @@ mod tests {
         assert!(ceiling >= GIB, "the 1 GiB floor holds");
     }
 
-    /// The source precedence: the full env pair wins over `--cache-dir` (and
-    /// nothing under the cache dir is swept); `RAVEL_SQL_SPILL_MAX_BYTES` alone
-    /// keeps the cache-dir root under the env ceiling; `--sql-spill off` wins
-    /// over both; neither source disables spill; a half-set pair that no
-    /// cache dir completes is an error naming the missing variable.
+    /// The source precedence: the full env pair wins over `--cache-dir`;
+    /// `RAVEL_SQL_SPILL_MAX_BYTES` alone keeps the cache-dir root under the
+    /// env ceiling; `--sql-spill off` wins over both; neither source disables
+    /// spill; a half-set pair that no cache dir completes is an error naming
+    /// the missing variable. What each row sweeps is pinned by
+    /// `an_env_spill_dir_start_sweeps_the_cache_dir_roots` and
+    /// `sql_spill_off_touches_nothing`.
     ///
     /// Prove-the-test: move the `inputs.off` early return in
     /// `resolve_sql_spill` below the `SpillConfig::resolve` call and keep
@@ -3016,7 +3027,6 @@ mod tests {
     fn spill_sources_resolve_in_precedence_order() {
         let cache = tempfile::tempdir().expect("cache dir");
         let explicit = cache.path().join("explicit");
-        let dead = dead_sibling(cache.path(), "inst-dead");
 
         let env = prepare(
             Some(cache.path()),
@@ -3039,10 +3049,6 @@ mod tests {
             }
         );
         assert!(env.inputs.cache_dir.is_none() && env.owner.is_none());
-        assert!(
-            dead.is_dir(),
-            "an env-rooted spill never sweeps the cache dir"
-        );
 
         let off = prepare(
             Some(cache.path()),
@@ -3062,7 +3068,6 @@ mod tests {
             }
         );
         assert!(off.inputs.off && off.inputs.cache_dir.is_none() && off.owner.is_none());
-        assert!(dead.is_dir(), "a disabled spill never sweeps");
 
         let half_set_off = prepare(Some(cache.path()), settings(true, GIB), None, os("x"), GIB)
             .expect("off ignores even an unparseable env half");
@@ -3417,10 +3422,10 @@ mod tests {
     /// and the one whose lock nobody holds (made just now) is removed. This
     /// process's own root survives and stays locked.
     ///
-    /// Prove-the-test: replace `owner.sweep_orphaned_spill_roots()` in
-    /// `sweep_spill_roots` with a removal of every sibling older than an hour
-    /// and the live root is gone; with a removal of every sibling that is not
-    /// `owner.dir()` the live root is gone.
+    /// Prove-the-test: replace `sweep_orphaned_spill_roots_under(cache_dir)`
+    /// in `sweep_spill_roots` with a removal of every sibling older than an
+    /// hour and the live root is gone; with a removal of every root the live
+    /// root is gone.
     #[test]
     fn startup_sweep_removes_only_roots_whose_owner_lock_is_free() {
         let cache = tempfile::tempdir().expect("cache dir");
@@ -3467,12 +3472,12 @@ mod tests {
     }
 
     /// Startup refuses, naming the path, when its own root's lock is already
-    /// held, and sweeps nothing first.
+    /// held. The sweep that precedes the refusal leaves that held root in
+    /// place and removes only the root whose lock it took.
     ///
     /// Prove-the-test: make the `SpillRootOwner::acquire` failure in
-    /// `prepare_sql_spill_with` non-fatal (sweeping only when an owner was
-    /// taken) and startup returns `Ok`; drop the path from its context and
-    /// the refusal no longer names the root.
+    /// `prepare_sql_spill_with` non-fatal and startup returns `Ok`; drop the
+    /// path from its context and the refusal no longer names the root.
     #[test]
     fn startup_refuses_when_its_own_spill_root_is_locked() {
         let cache = tempfile::tempdir().expect("cache dir");
@@ -3494,6 +3499,184 @@ mod tests {
             err.to_string().contains(&own.display().to_string()),
             "the refusal names the root: {err}"
         );
-        assert!(dead.is_dir(), "a refused startup sweeps nothing");
+        assert!(own.is_dir(), "the sweep leaves a root whose lock is held");
+        assert!(
+            !dead.exists(),
+            "the sweep removes a root whose lock it took"
+        );
+    }
+
+    /// Startup with `--cache-dir` set, `--sql-spill` not off, and
+    /// `<cache-dir>/sql-spill` present, injecting a measurement that reads
+    /// `free_bytes(orphan exists)` and records each call's view of `orphan`.
+    fn prepare_measuring(
+        cache_dir: &std::path::Path,
+        env_dir: Option<&std::ffi::OsStr>,
+        env_quota: Option<&std::ffi::OsStr>,
+        orphan: &std::path::Path,
+        free_bytes: impl Fn(bool) -> u64,
+        seen: &mut Vec<bool>,
+    ) -> anyhow::Result<SqlSpillStartup> {
+        prepare_sql_spill_with(
+            Some(cache_dir),
+            settings(false, u64::MAX),
+            INSTANCE,
+            env_dir,
+            env_quota,
+            |_| {
+                let present = orphan.exists();
+                seen.push(present);
+                Ok(free_bytes(present))
+            },
+        )
+    }
+
+    /// A volume under the derived ceiling's floor only because of an orphan
+    /// root resolves spill on at this start: the sweep removes the orphan
+    /// before the free space is measured. The injected measurement reads
+    /// 1 GiB free while the orphan exists (half is below the floor) and
+    /// 10 GiB once it is gone, whose half is the 5 GiB ceiling asserted.
+    ///
+    /// Prove-the-test: move the `sweep_spill_roots` call in
+    /// `prepare_sql_spill_with` below the measurement and the resolution
+    /// reads `cache-dir-insufficient-space` with the measurement seeing the
+    /// orphan; sweep only once a config resolved under the cache dir and the
+    /// orphan survives.
+    #[test]
+    fn an_orphan_root_is_swept_before_free_space_is_measured() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let orphan = dead_sibling(cache.path(), "inst-dead");
+        let mut seen = Vec::new();
+        let startup = prepare_measuring(
+            cache.path(),
+            None,
+            None,
+            &orphan,
+            |present| if present { GIB } else { 10 * GIB },
+            &mut seen,
+        )
+        .expect("spill resolves");
+
+        assert!(!orphan.exists(), "the orphan root must be swept");
+        assert_eq!(
+            seen,
+            vec![false],
+            "measured once, after the orphan was removed"
+        );
+        assert_eq!(
+            startup.resolved,
+            ResolvedSqlSpill {
+                config: Some(ravel_sql::SpillConfig {
+                    dir: cache.path().join("sql-spill").join(INSTANCE),
+                    max_bytes: 5 * GIB,
+                }),
+                dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
+                max_bytes_source: SQL_SPILL_SOURCE_DERIVED,
+                space: Some(SpillSpace {
+                    free_bytes: 10 * GIB,
+                    read_cache_bytes: 0,
+                }),
+            }
+        );
+        assert!(startup.owner.is_some(), "this process owns its root");
+    }
+
+    /// A start that resolves spill off for lack of space still sweeps: the
+    /// orphan goes, a root whose owner lock this test holds stays and is
+    /// reported, and no root of this process's own is taken.
+    ///
+    /// Prove-the-test: return early from `prepare_sql_spill_with`'s sweep
+    /// when the volume is under the floor and the orphan survives; replace
+    /// `sweep_orphaned_spill_roots_under` with a removal of every root and
+    /// the held root is gone.
+    #[test]
+    fn an_insufficient_space_start_still_sweeps_orphans() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let orphan = dead_sibling(cache.path(), "inst-dead");
+        let held =
+            ravel_sql::spill::SpillRootOwner::acquire(cache.path(), "inst-held").expect("acquire");
+        let mut seen = Vec::new();
+        let startup = prepare_measuring(cache.path(), None, None, &orphan, |_| GIB, &mut seen)
+            .expect("too little space is not a startup error");
+
+        assert!(!orphan.exists(), "the orphan root must be swept");
+        assert!(held.dir().is_dir(), "a held root must survive the sweep");
+        assert_eq!(startup.left_in_place, vec![held.dir().to_path_buf()]);
+        assert_eq!(
+            startup.resolved,
+            ResolvedSqlSpill {
+                config: None,
+                dir_source: SQL_SPILL_SOURCE_INSUFFICIENT_SPACE,
+                max_bytes_source: SQL_SPILL_SOURCE_INSUFFICIENT_SPACE,
+                space: Some(SpillSpace {
+                    free_bytes: GIB,
+                    read_cache_bytes: 0,
+                }),
+            }
+        );
+        assert!(startup.owner.is_none());
+        assert_eq!(seen, vec![false]);
+    }
+
+    /// An env pair resolves spill outside `--cache-dir`, and the roots an
+    /// earlier run left under `--cache-dir` are still swept.
+    ///
+    /// Prove-the-test: sweep only when the resolved directory is the
+    /// cache-dir root and the orphan survives.
+    #[test]
+    fn an_env_spill_dir_start_sweeps_the_cache_dir_roots() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let elsewhere = tempfile::tempdir().expect("env spill dir");
+        let orphan = dead_sibling(cache.path(), "inst-dead");
+        let mut seen = Vec::new();
+        let startup = prepare_measuring(
+            cache.path(),
+            os(elsewhere.path().to_str().expect("utf-8 temp path")),
+            os("4096"),
+            &orphan,
+            |_| 100 * GIB,
+            &mut seen,
+        )
+        .expect("the env pair resolves");
+
+        assert!(
+            !orphan.exists(),
+            "the cache dir's orphan root must be swept"
+        );
+        assert_eq!(
+            (
+                startup.resolved.dir_source,
+                startup.resolved.max_bytes_source
+            ),
+            (SQL_SPILL_SOURCE_ENV, SQL_SPILL_SOURCE_ENV)
+        );
+        assert!(startup.owner.is_none());
+        assert!(seen.is_empty(), "an env-rooted spill measures nothing");
+    }
+
+    /// `--sql-spill off` leaves an orphan root under `--cache-dir` in place,
+    /// and on a cache dir without `sql-spill` creates none.
+    ///
+    /// Prove-the-test: drop the `!settings.off` guard on the sweep in
+    /// `prepare_sql_spill_with` and the orphan is gone; create
+    /// `<cache-dir>/sql-spill` before the sweep's existence check and the
+    /// empty cache dir gains it.
+    #[test]
+    fn sql_spill_off_touches_nothing() {
+        let cache = tempfile::tempdir().expect("cache dir");
+        let orphan = dead_sibling(cache.path(), "inst-dead");
+        let off = prepare(Some(cache.path()), settings(true, 2 * GIB), None, None, 0)
+            .expect("off never errors");
+        assert!(off.resolved.config.is_none());
+        assert!(orphan.is_dir(), "a disabled spill sweeps nothing");
+        assert!(off.left_in_place.is_empty());
+
+        let empty = tempfile::tempdir().expect("cache dir");
+        prepare(Some(empty.path()), settings(true, 2 * GIB), None, None, 0)
+            .expect("off never errors");
+        assert!(
+            !empty.path().join("sql-spill").exists(),
+            "a disabled spill creates no spill root"
+        );
     }
 }
