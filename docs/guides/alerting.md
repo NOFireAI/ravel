@@ -1,30 +1,29 @@
 # Alerting
 
-Ravel evaluates alert rules on a schedule, compares each rule's query result
-against a condition, and posts a notification to a sink when the rule changes
-state. A rule is either an observability alert (a PromQL query plus a numeric
-threshold) or a security detection (a SQL query plus a returns-any-row
-condition). There is one rule engine for both.
+Ravel evaluates alert rules on a schedule. It compares the result of each
+rule's query against a condition. When a rule changes state, Ravel posts a
+notification to a sink. One rule engine serves two kinds of rule:
 
-## Turning evaluation on, and where it runs
+- An observability alert is a PromQL query plus a numeric threshold.
+- A security detection is a SQL query plus a returns-any-row condition.
 
-Alert evaluation is off by default. It turns on when `--alert-rules-file` names
-a JSON file that holds at least one rule. With the flag absent, or the file
-empty of rules, no evaluator runs and no alert can fire.
+## Turn evaluation on
 
-Evaluation runs only in a process that builds a query engine, which is
-`--mode all` or `--mode query`. A `gateway` or `maintain` process ignores the
-rules file entirely. It does not fail: it logs a warning at startup naming the
-mode and stating that the rules will never be evaluated and no alert will ever
-fire. So an operator who puts the rules file on a gateway or maintain
-deployment gets no alerts and no error. Put the rules file on the process that
-answers queries.
+Alert evaluation is off by default. To turn it on, pass `--alert-rules-file`
+with a JSON file that holds at least one rule. If the flag is absent or the
+file holds no rules, no evaluator runs and no alert can fire.
 
-Alert state transitions are written durably to object storage under their own
-signal prefix, and they are read back through the `alerts` SQL table. Alerts
-reach you through the sinks below as they happen, and the same transitions stay
-queryable afterwards, so a dashboard or an investigation can read Ravel's own
-alert history. See [Querying alert history](#querying-alert-history).
+Put the rules file on the process that answers queries. Evaluation runs only
+in `--mode all` or `--mode query`, the modes that build a query engine.
+
+A `gateway` or `maintain` process ignores the rules file and does not fail.
+At startup it logs a warning that names the mode. The warning states that the
+rules will never be evaluated and that no alert will ever fire.
+
+Ravel writes each alert state transition durably to object storage, under its
+own signal prefix. The sinks deliver each transition as it happens. The
+`alerts` SQL table serves the same transitions afterwards. See
+[Querying alert history](#querying-alert-history).
 
 ## The rules file
 
@@ -53,210 +52,270 @@ The file is JSON with a top-level `rules` array. Each entry is one rule:
 }
 ```
 
-Fields on a rule:
+A rule has these fields:
 
-- `tenant` (required): the tenant id this rule belongs to, matching a
+- `tenant` (required): the tenant id that the rule belongs to. It matches a
   `--tenant-token` or `--tenant-token-file` tenant.
-- `rule_id` (required): a stable operator-chosen identifier, unique within a
-  tenant. Together with each alert's label set it forms that alert's identity,
-  so keep it stable across restarts.
-- Exactly one of `promql` or `sql` (required): the query text. Naming both, or
-  neither, fails startup.
+- `rule_id` (required): a stable identifier that the operator chooses, unique
+  within a tenant. The `rule_id` and the label set of an alert form the
+  identity of that alert, so keep the `rule_id` stable across restarts.
+- `promql` or `sql` (required): the query text. Name one of the two. A rule
+  that names both, or neither, fails startup.
 - `condition` (required): a tagged object.
-  - `{"type": "threshold", "op": "gt", "value": 0.9}` for a PromQL rule. Every
-    series whose value satisfies `value <op> threshold` raises its own alert;
-    see [One alert per matching series](#one-alert-per-matching-series). `op`
+  - `{"type": "threshold", "op": "gt", "value": 0.9}` for a PromQL rule. Each
+    series whose value satisfies `value <op> threshold` raises its own alert.
+    See [One alert per matching series](#one-alert-per-matching-series). `op`
     is one of `gt`, `ge`, `lt`, `le`, `eq`, `ne`.
-  - `{"type": "non_empty_result"}` for a SQL rule. The rule fires when the query
-    returns at least one row, so write the query to return no rows when
-    nothing matched: a bare aggregate such as `count(*)` always returns one
-    row and would fire on every tick.
-  - A PromQL query takes a `threshold` condition and a SQL query takes a
-    `non_empty_result` condition. The other pairing fails startup, not once per
-    tick.
-- `labels` (optional): a string map attached to every alert the rule produces.
-  A rule label replaces a series label of the same name. Part of every alert's
+  - `{"type": "non_empty_result"}` for a SQL rule. The rule fires when the
+    query returns at least one row. Write the query so that it returns no
+    rows when nothing matches. A bare aggregate such as `count(*)` always
+    returns one row, so it fires on every tick.
+  - A PromQL query takes a `threshold` condition. A SQL query takes a
+    `non_empty_result` condition. The other pairing fails startup.
+- `labels` (optional): a string map attached to every alert that the rule
+  produces. A rule label replaces a series label of the same name. The labels
+  are part of the identity of every alert.
+- `annotations` (optional): a string map that the notification carries, for
+  example a summary or a runbook link. Annotations are not part of the
   identity.
-- `annotations` (optional): a string map carried on the notification (a summary,
-  a runbook link). Not part of identity.
-- `for` (optional): a humantime duration (`5m`, `30s`), the pending-before-firing
-  delay. Omitted, the rule fires on the first tick its condition holds; set, the
-  condition must hold continuously for that long first.
-- `repeat_interval` (optional): a humantime duration for how often an alert
-  that stays firing re-notifies its sinks. Omitted uses a one-minute default;
-  `0s` disables repeats for that rule. The interval applies to each of the
-  rule's alerts separately, each counted from its own firing record, so a rule
+- `for` (optional): a humantime duration (`5m`, `30s`). The condition must
+  hold continuously for that long before the rule fires. If `for` is omitted,
+  the rule fires on the first tick that its condition holds.
+- `repeat_interval` (optional): a humantime duration. It sets how often an
+  alert that stays firing notifies its sinks again. The default is one minute.
+  `0s` disables repeats for that rule. The interval applies to each alert of
+  the rule separately, counted from the firing record of that alert. A rule
   with 500 firing series sends 500 repeat notifications per interval to every
   sink.
-- `max_alert_generation` (optional): a per-rule override of the alerts-on-alerts
-  generation circuit breaker.
+- `max_alert_generation` (optional): a per-rule override of the
+  alerts-on-alerts generation circuit breaker.
 
-Validation is strict and happens once at startup, not every tick: an unknown
-field, a rule naming neither or both query languages, an unparseable `for` or
-`repeat_interval`, a condition that cannot apply to its query shape, or two
-rules in one tenant sharing a `rule_id` all fail the process at load time. A
-`rule_id` must be unique within its tenant even when the rules carry different
-labels, because the evaluator resolves every alert of a `rule_id` that its
-query no longer matches, so two rules sharing one would resolve each other's
-alerts on every tick.
+Ravel validates the rules file once, at startup. Each of these fails the
+process at load time:
+
+- an unknown field
+- a rule that names neither or both query languages
+- a `for` or `repeat_interval` that does not parse
+- a condition that cannot apply to its query shape
+- two rules in one tenant that share a `rule_id`
+
+A `rule_id` must be unique within its tenant even when the rules carry
+different labels. The evaluator resolves every alert of a `rule_id` that the
+rule's query no longer matches. With a shared `rule_id`, each rule resolves
+the alerts of the other on every tick.
 
 ## One alert per matching series
 
-A PromQL rule raises one alert per series that satisfies its condition. The
-guide's `max by (instance) (cpu_usage)` example raises one alert per hot
-instance, not one alert for the whole rule, and each alert moves through
-pending, firing, and resolved on its own.
+A PromQL rule raises one alert for each series that satisfies its condition.
+The example rule `max by (instance) (cpu_usage)` raises one alert per hot
+instance. Each alert moves through pending, firing, and resolved separately.
 
-- **Identity.** An alert's label set is the series labels without `__name__`,
-  overlaid by the rule's `labels`, with the rule label winning when both name
-  the same label. Its `alert_id` is the hash of the `rule_id` and that label
-  set, and the same set is what the notification carries, so Alertmanager
-  grouping and silences match on the series labels. The Alertmanager sink sets
-  `alertname` to the `rule_id`, or to the rule's own `alertname` label when the
-  rule sets one. A series label named `alertname` (a recording rule's output,
-  say) stays in the alert's identity and in the webhook payload, but never
-  replaces the Alertmanager `alertname`: when the rule sets no `alertname`,
-  the Alertmanager payload carries the series value as `exported_alertname`
-  (or `exported_exported_alertname` when the series already has an
-  `exported_alertname`, following Prometheus' conflict rule), so two series
-  that differ only in that label stay two alerts in Alertmanager. A rule's
-  own `alertname` label replaces the series one outright and nothing is
-  exported. A query that returns a scalar has no series labels, so its one
-  alert carries the rule labels alone. A SQL rule has no series either: it
-  raises one alert with the rule labels.
-- **Two series with one identity.** If two matched series produce the same
-  label set, for example two metric names that differ only in the dropped
-  `__name__`, the rule fails that tick with `DuplicateAlertIdentity` rather than
-  let one alert hide the other. Aggregate or add a distinguishing label.
-- **Resolution.** An alert whose series stops matching, because its value no
-  longer satisfies the condition or because the series stopped reporting,
-  resolves on the next tick. The other alerts of the rule are unaffected.
-- **The cap.** A rule may raise at most 1000 alerts per evaluation. The cap
-  counts matching series, not the size of the query result. A rule that
-  matches more fails the tick with `TooManyAlerts`: it writes no record, its
-  existing alerts keep their state, `ravel_alert_rules_failed_total` rises,
-  and the warning names the count and the limit. Narrow the selector or
-  aggregate. The cap is fixed, not a flag.
-- **Churning labels.** The evaluator keeps one state entry per alert identity
-  it has ever seen, and nothing prunes those entries yet. A rule over a label
-  whose values churn, such as a pod name or a request id, adds an entry for
-  every series that comes and goes. Per-series rules over churning label sets
-  wait on alert state pruning (see [Background](#background)); until it lands,
-  aggregate the churning label away instead. A sink that keeps failing grows
-  the evaluator's in-memory retry queue the same way, one notification per
-  identity that fires or resolves, until it accepts them;
-  `ravel_alert_undelivered_notifications` reports that queue's size.
-- **The per-tick delivery deadline.** Delivery to the sinks is bounded to half
-  the evaluation interval on each tick, so a slow or unresponsive sink cannot
-  make the delivery phase grow with the queue behind it. The deadline is
-  checked before each attempt, not during one, and the first attempt of a tick
-  is unconditional, so the delivery phase ends at the latest at
+Two cases raise one alert that carries the rule labels alone:
+
+- A PromQL query that returns a scalar, which has no series labels.
+- A SQL rule, which has no series.
+
+### Alert identity
+
+The label set of an alert is the series labels without `__name__`, overlaid
+by the rule's `labels`. The rule label wins when both name the same label.
+The `alert_id` is the hash of the `rule_id` and that label set. The
+notification carries the same label set, so Alertmanager grouping and
+silences match on the series labels.
+
+The Alertmanager sink sets `alertname` to the `rule_id`, or to the rule's own
+`alertname` label when the rule sets one.
+
+A series label named `alertname` (for example, the output of a recording
+rule) stays in the identity of the alert and in the webhook payload. It never
+replaces the Alertmanager `alertname`:
+
+- If the rule sets no `alertname`, the Alertmanager payload carries the
+  series value as `exported_alertname`. Two series that differ only in that
+  label stay two alerts in Alertmanager.
+- If the series already has an `exported_alertname`, the payload carries the
+  value as `exported_exported_alertname`. This is Prometheus' conflict rule.
+- If the rule sets `alertname`, the rule label replaces the series label and
+  nothing is exported.
+
+### Duplicate identity
+
+If two matched series produce the same label set, the rule fails that tick
+with `DuplicateAlertIdentity`. One alert cannot hide the other. An example is
+two metric names that differ only in the dropped `__name__`. To correct the
+rule, aggregate, or add a label that tells the series apart.
+
+### Resolution
+
+An alert resolves on the next tick after its series stops matching. The
+series stops matching when its value no longer satisfies the condition, or
+when the series stops reporting. The other alerts of the rule do not change.
+
+### The alert cap
+
+A rule can raise at most 1000 alerts per evaluation. The cap counts matching
+series, not the size of the query result. The cap is fixed and has no flag.
+
+A rule that matches more series fails the tick with `TooManyAlerts`:
+
+- The rule writes no record.
+- Its existing alerts keep their state.
+- `ravel_alert_rules_failed_total` rises.
+- The warning names the count and the limit.
+
+To correct the rule, narrow the selector or aggregate.
+
+### Churning labels
+
+The evaluator keeps one state entry per alert identity that it has ever seen.
+Nothing prunes those entries yet. A rule over a label whose values churn,
+such as a pod name or a request id, adds an entry for every series that comes
+and goes. Per-series rules over churning label sets wait on alert state
+pruning (see [Background](#background)). Until it lands, aggregate the
+churning label away.
+
+A sink that keeps failing grows the in-memory retry queue of the evaluator
+the same way. The queue gains one notification per identity that fires or
+resolves, until the sink accepts them.
+`ravel_alert_undelivered_notifications` reports the size of that queue.
+
+### The delivery deadline
+
+On each tick, delivery to the sinks is bounded to half the evaluation
+interval. A slow or unresponsive sink cannot make the delivery phase grow
+with the queue behind it.
+
+How the deadline applies:
+
+- The evaluator checks the deadline before each attempt, not during one.
+- The first attempt of a tick is unconditional.
+- One whole attempt is the number of configured sinks times the 10-second
+  sink HTTP timeout.
+- The delivery phase ends at the latest at
   `max(tick start + half the interval, start of delivery)` plus one whole
-  attempt, which is the number of configured sinks times the 10-second sink
-  HTTP timeout. The half interval is measured from the start of the tick, not
-  from the start of delivery, so everything that precedes delivery in the same
-  tick spends it too: the history read, the lease acquire, and on the lease
-  holder rule evaluation, the repeat pass and the alert state memo write. On a
-  tick whose history read failed, or where another replica holds the lease,
-  delivery follows that store read or lease acquire directly, with no rule
-  evaluation. What the deadline does not bound is any of that earlier work,
-  which runs as long as its queries and store calls take, and so it does not
-  bound the tick as a whole either. A tick that overruns its interval delays
-  the next tick rather than overlapping it, because the evaluator sleeps for a
-  jittered interval, up to 10% longer than the configured one, after a tick
-  returns rather than running on a fixed schedule.
-  Notifications not attempted before the deadline stay queued and keep
-  their place at the front; `ravel_alert_notifications_deferred_total` counts
-  them once per notification per tick, so a notification deferred on several
-  consecutive ticks is counted on each. A rising value has two causes: a sink
-  too slow to drain the queue within a tick, or a tick whose work before
-  delivery already ran past the deadline. In the second case every
-  notification after the first is deferred even when every sink answers at
-  once, so even healthy sinks receive one notification per tick until the
-  ticks get faster; a slow rule query or store looks like a slow sink here.
-  Because a tick both raises new alerts and resolves alerts that stopped
-  matching, the per-tick publish worst case for one rule is twice the cap: up to
-  1000 new transitions plus up to 1000 resolutions, so one tick publishes up to
-  2000 records and queues up to 2000 notifications for each sink. That bound
-  is on what one tick publishes and queues, not on what one tick delivers.
-- **Delivery order, and what one dead sink costs the others.** The queue is
-  served in the order notifications were queued, not by how old the transition
-  they carry is. A notification some sink refused goes to the back of the queue
-  after the attempt, and one the deadline never reached keeps its place, so the
-  pass rotates over the whole queue instead of spending every tick's budget on
-  the same few entries. A notification leaves the queue only once *every*
-  configured sink has accepted it. That is the remaining cost of a dead sink:
-  while one sink is blackholed the queue never drains, so total delivery for
-  *every* sink, healthy ones included, is throttled to what fits in one tick's
-  budget. What the rotation guarantees is that a healthy sink receives every
-  notification eventually rather than the same few forever. Watch
-  `ravel_alert_undelivered_notifications`: a queue that only grows means one
-  sink is refusing, and every other sink is paying for it. Remove a sink that
-  is down rather than leaving it configured.
+  attempt.
 
-The labels a rule's query returns are retained with every alert record it
-writes, alongside the rule's own labels, and no erasure path reaches alert
-history today.
+The half interval starts at the start of the tick, not at the start of
+delivery. The work that precedes delivery in the same tick spends it too:
 
-### Upgrading from one alert per rule
+- the history read
+- the lease acquire
+- on the lease holder, rule evaluation, the repeat pass, and the alert state
+  memo write
 
-Releases before per-series evaluation raised one alert per rule, carrying the
+On a tick whose history read failed, delivery follows that store read
+directly, with no rule evaluation. The same applies after the lease acquire
+when another replica holds the lease.
+
+The deadline does not bound that earlier work, which runs as long as its
+queries and store calls take. So the deadline does not bound the whole tick.
+A tick that overruns its interval delays the next tick and does not overlap
+it. The evaluator does not run on a fixed schedule. After a tick returns, it
+sleeps for a jittered interval, up to 10% longer than the configured one.
+
+Notifications that the evaluator did not attempt before the deadline stay
+queued and keep their place at the front.
+`ravel_alert_notifications_deferred_total` counts them once per notification
+per tick. A notification deferred on several consecutive ticks is counted on
+each. A rising value has two causes:
+
+- A sink is too slow to drain the queue within a tick.
+- The work before delivery already ran past the deadline. Then every
+  notification after the first is deferred, even when every sink answers at
+  once. Healthy sinks receive one notification per tick until the ticks get
+  faster. A slow rule query or a slow store looks like a slow sink here.
+
+A tick both raises new alerts and resolves alerts that stopped matching. So
+the worst case for one rule in one tick is twice the cap: up to 1000 new
+transitions plus up to 1000 resolutions. One tick publishes up to 2000
+records and queues up to 2000 notifications for each sink. That bound is on
+what one tick publishes and queues, not on what one tick delivers.
+
+### Delivery order
+
+The evaluator serves the queue in the order that notifications were queued,
+not by the age of the transition that they carry.
+
+- A notification that some sink refused goes to the back of the queue after
+  the attempt.
+- A notification that the deadline never reached keeps its place.
+- A notification leaves the queue only when *every* configured sink has
+  accepted it.
+
+The pass therefore rotates over the whole queue and does not spend the budget
+of every tick on the same few entries. A healthy sink receives every
+notification eventually.
+
+While one sink is blackholed, the queue never drains. Total delivery for
+*every* sink, healthy ones included, is then throttled to what fits in the
+budget of one tick. Watch `ravel_alert_undelivered_notifications`. A queue
+that only grows means that one sink refuses notifications and slows every
+other sink. Remove a sink that is down from the configuration.
+
+### Retained labels
+
+Every alert record keeps the labels that the rule's query returns, and the
+rule's own labels. No erasure path reaches alert history today.
+
+### Upgrade from per-rule alerts
+
+Releases before per-series evaluation raised one alert per rule, with the
 rule labels only. Four things change for an existing rules file on upgrade:
 
-- **A notification burst on the first tick.** A PromQL rule whose matching
-  series carry labels besides `__name__` that the rule labels do not override
-  gets a new identity for each series. If its single rule-level alert is
-  pending or firing at upgrade, that tick writes one Resolved transition for
-  it and one new transition per matching series. The webhook sink receives a
-  notification for every one of them, and the Alertmanager sink for every one
-  except a pending transition (a rule with a nonzero `for` starts its new
-  alerts pending).
+- **A notification burst on the first tick.** A PromQL rule gets a new
+  identity for each matching series that carries a label, other than
+  `__name__`, that the rule labels do not override. If the single rule-level
+  alert is pending or firing at upgrade, that tick writes one Resolved
+  transition for it and one new transition per matching series. The webhook
+  sink receives a notification for every one of them. The Alertmanager sink
+  receives every one except a pending transition. A rule with a nonzero `for`
+  starts its new alerts pending.
 - **Rules that fire today can start failing every tick.** A rule fails with
-  `DuplicateAlertIdentity` when two matching series merge to one label set,
-  for example a selector over several metric names (`{__name__=~"a|b"}`)
-  whose series differ only in `__name__`, or a rule label that overrides the
-  series label that told them apart. It fails with `TooManyAlerts` when more
-  than 1000 series match. On every tick it fails, the rule writes no record,
-  its existing alerts keep their state, and `ravel_alert_rules_failed_total`
-  rises. Check that counter and the evaluator's warnings after upgrading.
-- **Duplicate rule ids fail startup.** Two rules of one tenant sharing a
+  `DuplicateAlertIdentity` when two matching series merge to one label set.
+  One example is a selector over several metric names (`{__name__=~"a|b"}`)
+  whose series differ only in `__name__`. Another is a rule label that
+  overrides the series label that told them apart. A rule fails with
+  `TooManyAlerts` when more than 1000 series match. On every tick that it
+  fails, `ravel_alert_rules_failed_total` rises. After the upgrade, read that
+  counter and the warnings of the evaluator.
+- **Duplicate rule ids fail startup.** Two rules of one tenant that share a
   `rule_id` stop the process at load with `rule id "<id>" is used by more than
-  one rule in tenant "<tenant>"`. Give each rule its own `rule_id` before
-  upgrading.
+  one rule in tenant "<tenant>"`. Before the upgrade, give each rule its own
+  `rule_id`.
 - **Repeat notifications multiply by the firing series.** `repeat_interval`
-  now applies to each alert, not to the rule, so a rule with 500 firing series
-  sends 500 repeat notifications per interval to every sink where it used to
-  send one. Raise `repeat_interval`, or set it to `0s`, on rules that match
-  many series.
+  now applies to each alert, not to the rule. A rule sends one repeat per
+  firing series per interval to every sink, where it sent one before. On
+  rules that match many series, raise `repeat_interval` or set it to `0s`.
 
-A SQL detection rule reads the same tables the `POST /api/v1/sql` endpoint
-serves (`samples`, `logs`, `spans`, `audit`), under the same
+## SQL detection rules
+
+A SQL detection rule reads the same tables that the `POST /api/v1/sql`
+endpoint serves (`samples`, `logs`, `spans`, `audit`), under the same
 one-signal-per-query rule. See the [query guide](query.md) for the query
-languages themselves.
+languages.
 
 A rule that reads `alerts`, so that an alert fires on other alerts, is not
-usable yet. The table is queryable from the endpoint, but the evaluator passes
-no consumed generations to the recursion guard, so every record such a rule
-produced would sit at generation 1 and the `max_alert_generation` circuit
-breaker could never trip. Until that is wired, write rules against the other
-four tables.
+usable yet. The endpoint can query the table. But the evaluator passes no
+consumed generations to the recursion guard. Every record from such a rule
+stays at generation 1, and the `max_alert_generation` circuit breaker can
+never trip. Until that is wired, write rules against the other four tables.
 
-## Evaluation cadence and the SQL lookback
+## Cadence and SQL lookback
 
-- `--alert-eval-interval-secs` (default `60`): how often each tenant's evaluator
-  wakes to evaluate every rule configured for that tenant.
-- `--alert-sql-lookback` (default `5m`): the event-time window a SQL detection
-  rule's query resolves over, ending at the tick's clock reading. It bounds only
-  which segments the query lists; the statement's own `WHERE` still applies above
-  the scan. A PromQL rule evaluates as an instant query and does not use this
-  window.
+- `--alert-eval-interval-secs` (default `60`): how often the evaluator of
+  each tenant wakes and evaluates every rule configured for that tenant.
+- `--alert-sql-lookback` (default `5m`): the event-time window that the query
+  of a SQL detection rule resolves over. The window ends at the clock reading
+  of the tick. It bounds only which segments the query lists. The statement's
+  own `WHERE` still applies above the scan. A PromQL rule evaluates as an
+  instant query and does not use this window.
 
 ## Reading back the loaded rules
 
-`GET /api/v1/rules` returns the rules the process loaded for the calling
-tenant, in the shape Prometheus's rules API uses. It reads configuration, not
-data, so it is the way to confirm that the rules file a process was started
-with is the one it parsed:
+`GET /api/v1/rules` returns the rules that the process loaded for the calling
+tenant, in the shape that Prometheus's rules API uses. It reads
+configuration, not data. Use it to confirm that the process parsed the rules
+file that you started it with:
 
 ```sh
 curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
@@ -290,40 +349,42 @@ curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
 }
 ```
 
-The tenant comes from the credential, so a token for a tenant with no rules of
-its own gets `{"status": "success", "data": {"groups": []}}`. Every rule in the
-file for one tenant renders in a single group named `ravel-alert-rules`, whose
-`interval` is `--alert-eval-interval-secs`; the rules file has no group blocks
-to take a name or a `file` from. A rule's `query` is its whole firing
-expression, so a PromQL rule shows its threshold comparison appended to the
-query text, and a SQL detection rule shows its statement alone.
+How to read the response:
 
-`health` and `state` are reported as `unknown`, and a rule carries no `alerts`
-array: this endpoint serves the loaded rule set and reads no evaluation
-outcome, so it reports no firing state it has not checked. For what rules
-actually did, query the `alerts` table (below). Prometheus's companion
-`/api/v1/alerts` endpoint is not served.
+- The tenant comes from the credential. A token for a tenant with no rules
+  gets `{"status": "success", "data": {"groups": []}}`.
+- Every rule in the file for one tenant renders in one group named
+  `ravel-alert-rules`. Its `interval` is `--alert-eval-interval-secs`. The
+  rules file has no group blocks to take a name or a `file` from.
+- The `query` of a rule is its whole firing expression. A PromQL rule shows
+  its threshold comparison appended to the query text. A SQL detection rule
+  shows its statement alone.
+- `health` and `state` are `unknown`, and a rule carries no `alerts` array.
+  The endpoint serves the loaded rule set and reads no evaluation outcome.
+  For what the rules did, query the `alerts` table. See
+  [Querying alert history](#querying-alert-history).
+- Prometheus's companion `/api/v1/alerts` endpoint is not served.
 
 ## Notification sinks
 
-A sink is where a transition is delivered. Every sink flag is repeatable, and a
-transition is posted to every configured sink after its record is durably
-written. There are four kinds, in two pairs.
+A sink is the destination of a transition. Ravel posts each transition to
+every configured sink after it writes the record durably. Every sink flag is
+repeatable. There are four kinds of sink:
 
-- Unauthenticated webhook: `--alert-webhook-url URL`. Each transition is POSTed
-  as JSON to every configured URL.
-- Unauthenticated Alertmanager: `--alertmanager-url URL`. The URL is either an
-  Alertmanager base URL (`http://alertmanager:9093`) or its full
-  `/api/v2/alerts` endpoint; the well-known path is appended when it is missing.
-- Authenticated webhook: `--alert-webhook SPEC`, a comma-separated `key=value`
-  spec. `url=...` is required, plus exactly one credential, given as either
-  `bearer-file=PATH` or `basic-user=NAME,basic-pass-file=PATH`. The secret is
-  read from a file, never inline, so it never appears in a process listing.
-- Authenticated Alertmanager: `--alertmanager SPEC`, the same spec as
-  `--alert-webhook`; its `url` may be a base URL or the full `/api/v2/alerts`
-  endpoint.
+| Sink | Flag | Value |
+|---|---|---|
+| Unauthenticated webhook | `--alert-webhook-url URL` | Ravel POSTs each transition as JSON to every configured URL. |
+| Unauthenticated Alertmanager | `--alertmanager-url URL` | An Alertmanager base URL (`http://alertmanager:9093`) or its full `/api/v2/alerts` endpoint. Ravel appends the well-known path when it is missing. |
+| Authenticated webhook | `--alert-webhook SPEC` | A comma-separated `key=value` spec. |
+| Authenticated Alertmanager | `--alertmanager SPEC` | The same spec as `--alert-webhook`. Its `url` can be a base URL or the full `/api/v2/alerts` endpoint. |
 
-For a webhook that needs a bearer token whose value lives in `/etc/ravel/hook.token`:
+A spec requires `url=...` and one credential, no more. The credential is
+either `bearer-file=PATH` or `basic-user=NAME,basic-pass-file=PATH`. Ravel
+reads the secret from a file, never inline, so the secret never appears in a
+process listing.
+
+For a webhook that needs a bearer token whose value is in
+`/etc/ravel/hook.token`:
 
 ```sh
 ravel-server --mode all \
@@ -335,12 +396,12 @@ ravel-server --mode all \
 The full flag list, with defaults and help, is in
 [ravel-server-flags.md](../reference/ravel-server-flags.md).
 
-## Watching the pipeline itself
+## Evaluator metrics
 
-The evaluator exports its own figures on `/metrics`, so a pipeline that
-evaluates nothing, writes nothing, or delivers nothing is visible before the
-symptom is. Without them the first sign of a broken evaluator is an alert that
-never arrived, which is indistinguishable from a condition that never occurred.
+The evaluator exports its own figures on `/metrics`. They show a pipeline
+that evaluates nothing, writes nothing, or delivers nothing. Without them,
+the first sign of a broken evaluator is an alert that never arrived. That
+looks the same as a condition that never occurred.
 
 | Metric | Meaning |
 |---|---|
@@ -355,32 +416,30 @@ never arrived, which is indistinguishable from a condition that never occurred.
 | `ravel_alert_ticks_total` | Evaluation ticks, split by an `outcome` label: `evaluated`, `lease_not_held`, `lease_unavailable`, `history_unavailable`. |
 | `ravel_alert_last_tick_completed_timestamp_seconds` | Unix time this process last completed a tick. Its age is the liveness signal. |
 
-Two of these need reading with their semantics in hand.
-
-`outcome="lease_not_held"` is healthy. Only the replica holding a tenant's
-alert lease evaluates rules; every other replica ticks, skips evaluation, and
-reports this outcome forever. It is a separate outcome from the two
-store-failure ones (`lease_unavailable`, `history_unavailable`) precisely so an
-alert rule can leave the steady state alone.
+`outcome="lease_not_held"` is healthy. Only the replica that holds the alert
+lease of a tenant evaluates rules. Every other replica ticks, skips
+evaluation, and reports this outcome forever. The two store-failure outcomes
+(`lease_unavailable`, `history_unavailable`) are separate from it, so an
+alert rule can ignore the steady state.
 
 `ravel_alert_last_tick_completed_timestamp_seconds` is the only figure that
-moves when the loop stops rather than when it runs. Every counter above is
-cumulative, so a dead evaluator freezes them at values that look exactly like a
-healthy deployment whose rules never fire. A tick that skipped evaluation
-because a peer held the lease still stamps this gauge: that replica is alive.
+shows a stopped loop. Every counter in the table is cumulative. A dead
+evaluator freezes the counters at values that look like a healthy deployment
+whose rules never fire. A tick that skipped evaluation because a peer held
+the lease still stamps this gauge, because that replica is alive.
 
-The whole family is absent from a process that built no evaluator (no
-`--alert-rules-file`, or a file with no rules), rather than exporting a row of
-zeros. Ready-made `for:`-guarded PromQL rules over these series, including a
-dead-loop rule and a notifications-failing-to-every-sink rule, are in the
-[observability guide](observability.md#alert-evaluation-ravel_alert_).
+A process that built no evaluator (no `--alert-rules-file`, or a file with no
+rules) exports none of these metrics, and no row of zeros. The
+[observability guide](observability.md#alert-evaluation-ravel_alert_) has
+ready-made `for:`-guarded PromQL rules over these series. They include a
+dead-loop rule and a notifications-failing-to-every-sink rule.
 
 ## Querying alert history
 
-Every transition an evaluator writes is a row in the `alerts` table, served by
-`POST /api/v1/sql` and by Flight SQL. It is one of the five tables the SQL
-surface exposes (`samples`, `logs`, `spans`, `alerts`, `audit`), under the same
-one-signal-per-query rule as the rest: a query names exactly one of them, and a
+Every transition that an evaluator writes is a row in the `alerts` table.
+`POST /api/v1/sql` and Flight SQL serve the table. It is one of the five
+tables that the SQL surface exposes (`samples`, `logs`, `spans`, `alerts`,
+`audit`). The one-signal-per-query rule applies: a query names one table. A
 query that names two is rejected with a 400 before any listing.
 
 The table has these columns:
@@ -397,42 +456,47 @@ The table has these columns:
 | `writer_seq`   | `UInt64`            | write identity from the record's commit record      |
 | `attrs`        | `Map(Utf8, Utf8)`   | every attribute of the record, merged into one map  |
 
-`alert_id` is the stable hash of the rule id and the alert's label set, so every
-record for one alert (one matching series of one rule) carries the same value
-across restarts and across rule reloads. The record's severity mirrors `state` (firing at the ERROR
-level, pending at WARN, resolved and suppressed at INFO), but the table exposes
-no severity column: filter on `state` itself.
+`alert_id` is the stable hash of the rule id and the label set of the alert.
+Every record for one alert (one matching series of one rule) carries the same
+value across restarts and across rule reloads.
 
-`attrs` carries the four promoted keys above plus the alert's labels and the
-rule's annotations: one entry per alert label under `label.<name>` (the series
-labels and the rule labels, merged as described in
-[One alert per matching series](#one-alert-per-matching-series)), and one per
-annotation under `annotation.<name>`. Read a single one with a subscript, for
-example `attrs['label.instance'] = 'host-1'` or `attrs['annotation.summary']`.
-The label and annotation key sets are per-rule and open-ended, which is why they
-are a map and not columns.
+The severity of a record mirrors `state`: firing at the ERROR level, pending
+at WARN, resolved and suppressed at INFO. The table exposes no severity
+column, so filter on `state`.
 
-### One row per transition, and how to fold it
+`attrs` carries the four promoted keys above, plus the labels of the alert
+and the annotations of the rule:
 
-A record is written when an alert changes state, never on a tick that changes
-nothing, and each transition is one immutable object. So the table is history:
-it holds what happened and when, and it never holds a folded "current state"
-row. You compute current state with a query.
+- one entry per alert label under `label.<name>`. These are the series labels
+  and the rule labels, merged as
+  [One alert per matching series](#one-alert-per-matching-series) describes.
+- one entry per annotation under `annotation.<name>`.
 
-Each row also carries the identity of the write that produced it: `writer_id`,
-`writer_epoch`, and `writer_seq`, stamped from the object's commit record. They
-are there because `ts_ns` alone is not a total order. Two evaluators can overlap
-briefly at a lease handover and write the same `alert_id` at the same `ts_ns`,
-and ordering by timestamp alone would leave two rows tied for "latest". Ordering
-by `ts_ns DESC, writer_epoch DESC, writer_seq DESC, writer_id DESC` is a total
-order, so the fold below returns exactly one row per alert.
+Read one entry with a subscript, for example
+`attrs['label.instance'] = 'host-1'` or `attrs['annotation.summary']`. The
+label and annotation key sets are per-rule and open-ended, so they are a map
+and not columns.
 
-One caveat on what that order means. `writer_epoch` is a constant today, not a
-lease term, and each evaluator's `writer_seq` restarts at 1, so across a
-handover the key picks the departing evaluator's record rather than the later
-write. The result is still exactly one current row per alert, and it is the
-same row the evaluator's own fold picks, so the table agrees with the writer.
-Do not read the order as causal ordering between evaluators.
+### One row per transition
+
+The evaluator writes a record when an alert changes state, never on a tick
+that changes nothing. Each transition is one immutable object. The table is
+history: it holds what happened and when, and it never holds a current-state
+row. Compute the current state with a query.
+
+Each row carries the identity of the write that produced it: `writer_id`,
+`writer_epoch`, and `writer_seq`, from the commit record of the object.
+`ts_ns` alone is not a total order. Two evaluators can overlap briefly at a
+lease handover and write the same `alert_id` at the same `ts_ns`. An order by
+`ts_ns DESC, writer_epoch DESC, writer_seq DESC, writer_id DESC` is a total
+order, so the query below returns one row per alert.
+
+Do not read that order as causal ordering between evaluators. `writer_epoch`
+is a constant today, not a lease term, and the `writer_seq` of each evaluator
+restarts at 1. Across a handover, the key picks the record of the departing
+evaluator, not the later write. The result is still one current row per
+alert. It is the same row that the evaluator's own fold picks, so the table
+agrees with the writer.
 
 ```sql
 SELECT *
@@ -448,15 +512,14 @@ FROM (
 WHERE rn = 1;
 ```
 
-That row carries its transition's `state`, `generation`, labels, and
-annotations together, so filtering it by `state` answers "what is true now"
-rather than "what changed recently".
+That row carries the `state`, `generation`, labels, and annotations of its
+transition together. Filter it by `state` to answer what is true now.
 
 ### Which predicates prune
 
-All pushdown is widen-only. DataFusion re-applies the original `WHERE`
-predicate above the scan, so a query never returns a wrong row; pruning only
-decides how much is read.
+All pushdown is widen-only. DataFusion applies the original `WHERE` predicate
+again above the scan, so a query never returns a wrong row. Pruning only
+decides how much the query reads.
 
 - `ts_ns` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and `BETWEEN`) fold
   into one time window that prunes objects and blocks.
@@ -466,8 +529,8 @@ decides how much is read.
   re-checks every surviving row.
 
 Every other predicate, including any `attrs['k'] = 'v'` subscript, prunes
-nothing and is evaluated exactly above the scan. The pruning shapes must be
-top-level `AND` conjuncts: an `OR` inside a conjunct drops that conjunct from
+nothing. DataFusion evaluates it above the scan. The pruning shapes must be
+top-level `AND` conjuncts. An `OR` inside a conjunct drops that conjunct from
 pruning.
 
 ### Worked queries
@@ -489,8 +552,8 @@ FROM (
 WHERE rn = 1 AND state = 'firing';
 ```
 
-The `rule_id` equality is inside the subquery on purpose: it prunes the scan,
-and the fold then runs over that rule's records only.
+The `rule_id` equality is inside the subquery so that it prunes the scan. The
+fold then runs over the records of that rule only.
 
 Every transition one alert went through, oldest first:
 
@@ -514,46 +577,57 @@ ORDER BY transitions DESC;
 
 ### Cost and retention
 
-An `alerts` query reads through the same fetcher the `logs` table reads
-through, so its bytes are cached by the same tiers that fetcher runs, the RAM
-tier always and the local-disk tier when `--cache-dir` is set, and accounted
-through the same funnel. Alert records are not folded into the catalog and not
-compacted, so a query lists the tenant's alert commit records for its window on
-every call, one bounded listing per shard. One object per transition keeps that
-listing small.
+An `alerts` query reads through the same fetcher as the `logs` table. The
+tiers of that fetcher cache its bytes: the RAM tier always, and the
+local-disk tier when `--cache-dir` is set. The same funnel accounts for them.
 
-Alert history is swept by the maintenance loop. A transition older than
-`--alert-retention`, 90 days by default, is deleted, both its commit record and
-its object, with one exception: each alert identity's current-state record is
-kept whatever its age. A rule that has been firing for a year keeps the one
-record that says so, and a rule deleted a year ago keeps the one `resolved`
-record carrying its last generation. So an `alerts` query answers for the
-retention window plus every identity's current state, and the prefix a query
-lists holds one window's transitions plus one record per identity rather than
-the whole life of the deployment.
+Alert records are not folded into the catalog and not compacted. A query
+lists the alert commit records of the tenant for its window on every call,
+one bounded listing per shard. One object per transition keeps that listing
+small.
 
-The sweep runs on the process that owns the tenant's alert unit, on the ordinary
-maintenance tick. It learns which record is each identity's current state from
-the tenant's alert state memo, which the evaluator rewrites on every tick it
-runs. A tenant whose memo is missing, unreadable, or too far behind the window
-is not swept at all that tick rather than swept without that protection;
-`ravel_alert_retention_skipped_total` counts those ticks by `reason`, and the
+The maintenance loop sweeps alert history. It deletes a transition older than
+`--alert-retention`, 90 days by default: both its commit record and its
+object. There is one exception. The current-state record of each alert
+identity is kept whatever its age:
+
+- A rule that fires for a year keeps the one record that says so.
+- A rule deleted a year ago keeps the one `resolved` record that carries its
+  last generation.
+
+An `alerts` query therefore answers for the retention window plus the current
+state of every identity. The prefix that a query lists holds the transitions
+of one window plus one record per identity, not the whole life of the
+deployment.
+
+The sweep runs on the process that owns the alert unit of the tenant, on the
+ordinary maintenance tick. It learns which record is the current state of
+each identity from the alert state memo of the tenant. The evaluator rewrites
+that memo on every tick that it runs. If the memo of a tenant is missing,
+unreadable, or too far behind the window, the sweep skips that tenant for
+that tick. It never sweeps without that protection.
+`ravel_alert_retention_skipped_total` counts those ticks by `reason`. The
 [observability guide](observability.md#alert-retention-skips-ravel_alert_retention_skipped_total)
 lists each reason and where to look for its remedy.
 
-Set `--alert-retention` to a longer window before upgrading if you need more
-history, or `--alert-retention 0` to keep every transition forever, which is
-what deployments did before the sweep existed. `0` turns off the retention
-sweep and its memo read only. The alerts shard's orphan sweep still runs on the
-same tick whatever the window: the evaluator abandons a transition whose write
-outlived the ingest writers' `max_flush_lifetime`, and that sweep is what
-reclaims the data object it leaves behind. A mass-orphan breaker trip on the
-alerts shard counts under
-`ravel_maintain_orphan_breaker_tripped_total{signal="alerts"}`, the same family
-and alert as every other signal's trips. A nonzero window shorter than one
-hour plus the memo's seal margin (three evaluation intervals plus the query
-deadline, so 1 h 3 m 30 s at the defaults) is refused at startup: the sweep could
-never run under it, and every tick would report a skip.
+To change the window, set `--alert-retention`:
+
+- If you need more history, set a longer window before you upgrade.
+- To keep every transition forever, set `--alert-retention 0`. Deployments
+  did this before the sweep existed.
+- Startup refuses a nonzero window shorter than one hour plus the seal margin
+  of the memo. The seal margin is three evaluation intervals plus the query
+  deadline, so the minimum is 1 h 3 m 30 s at the defaults. Under a shorter
+  window the sweep can never run, and every tick reports a skip.
+
+`0` turns off the retention sweep and its memo read only. The orphan sweep of
+the alerts shard still runs on the same tick, whatever the window. The
+evaluator abandons a transition whose write outlived the `max_flush_lifetime`
+of the ingest writers. The orphan sweep reclaims the data object that the
+abandoned transition leaves behind. A mass-orphan breaker trip on the alerts
+shard counts under
+`ravel_maintain_orphan_breaker_tripped_total{signal="alerts"}`, the same
+family and alert as the trips of every other signal.
 
 ## Background
 
