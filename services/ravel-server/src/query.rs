@@ -3661,10 +3661,13 @@ mod tests {
     }
 
     /// An env pair resolves spill outside `--cache-dir`, and the roots an
-    /// earlier run left under `--cache-dir` are still swept.
+    /// earlier run left under `--cache-dir` are still swept; a cache dir with
+    /// no `sql-spill` gains none.
     ///
     /// Prove-the-test: sweep only when the resolved directory is the
-    /// cache-dir root and the orphan survives.
+    /// cache-dir root and the orphan survives; create `<cache-dir>/sql-spill`
+    /// in `sweep_spill_roots` before its existence check and the empty cache
+    /// dir gains it.
     #[test]
     fn an_env_spill_dir_start_sweeps_the_cache_dir_roots() {
         let cache = tempfile::tempdir().expect("cache dir");
@@ -3694,6 +3697,20 @@ mod tests {
         );
         assert!(startup.owner.is_none());
         assert!(seen.is_empty(), "an env-rooted spill measures nothing");
+
+        let empty = tempfile::tempdir().expect("cache dir");
+        prepare(
+            Some(empty.path()),
+            settings(false, 2 * GIB),
+            os(elsewhere.path().to_str().expect("utf-8 temp path")),
+            os("4096"),
+            100 * GIB,
+        )
+        .expect("the env pair resolves");
+        assert!(
+            !empty.path().join("sql-spill").exists(),
+            "the sweep creates no spill root under --cache-dir"
+        );
     }
 
     /// `--sql-spill off` leaves an orphan root under `--cache-dir` in place,
