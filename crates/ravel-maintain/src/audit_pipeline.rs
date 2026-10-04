@@ -1058,6 +1058,46 @@ mod tests {
         pipeline.shutdown().await.expect("shutdown");
     }
 
+    /// An event submitted while a flush is in flight is not idle, even when it
+    /// is the only one queued and the previous event is more than `max_age`
+    /// old by the time the loop receives it: it waits for its window.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_submitted_during_a_flush_waits_its_window() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+        let tenant = TenantHash([52u8; 16]);
+        let max_age = Duration::from_millis(20);
+        let pipeline = Arc::new(AuditPipeline::spawn(
+            store.clone(),
+            pipeline_config(1000, max_age),
+        ));
+
+        let first = tokio::spawn({
+            let pipeline = pipeline.clone();
+            async move { pipeline.submit(test_event(tenant, 31_000, 7)).await }
+        });
+        gate.wait_until_held(1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let queued = enqueue(&pipeline, vec![test_event(tenant, 31_001, 7)]).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let held = gate.held();
+        assert_eq!(held.len(), 1, "exactly the first flush's data PUT is held");
+        let released_at = Instant::now();
+        assert!(gate.release(held[0]));
+
+        first.await.expect("submit task").expect("first event ok");
+        for result in await_all(queued).await {
+            result.expect("queued event ok");
+        }
+        assert_eq!(
+            released_at.elapsed(),
+            max_age,
+            "the event submitted during the flush opened a max_age window"
+        );
+        assert_eq!(commit_record_count(store.as_ref(), &tenant).await, 2);
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
     /// `required` mode: a batch whose PUT fails fails every submitter in it,
     /// and the batches before and after it are unaffected.
     #[tokio::test(start_paused = true)]
