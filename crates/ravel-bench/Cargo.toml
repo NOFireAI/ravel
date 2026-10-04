@@ -330,6 +330,23 @@ name = "logseg_width_gate_time"
 path = "src/bin/logseg_width_gate_time.rs"
 bench = false
 
+# Stage 2 sparse-input measurement (issue #2585, epic #2467): true-peak heap
+# over a corpus of few-attributes-per-record drawn from many distinct keys.
+# `sparse_corpus.rs` is included via #[path] and is not a [[bin]] target on
+# its own.
+[[bin]]
+name = "logseg_peak_by_site_sparse"
+path = "src/bin/logseg_peak_by_site_sparse.rs"
+bench = false
+
+# Stage 2 sparse-input measurement (issue #2585): wall time (row vs columnar,
+# with from_records sub-timed) plus correctness assertions, over the sparse
+# (many-distinct-keys) corpus.
+[[bin]]
+name = "logseg_sparse_gate_time"
+path = "src/bin/logseg_sparse_gate_time.rs"
+bench = false
+
 [[bin]]
 name = "histogram_size"
 path = "src/bin/histogram_size.rs"
