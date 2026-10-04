@@ -757,15 +757,17 @@ process and every restart gets its own directory. When spill resolves under
 holds an exclusive lock on `.owner.lock` until it shuts down; the operating
 system releases the lock however the process exits.
 
-Startup sweeps `<cache-dir>/sql-spill` once when `--cache-dir` is set,
-`--sql-spill` is not `off`, and `<cache-dir>/sql-spill` already exists. The
-sweep runs before the free space is measured and before spill is resolved,
+A process that serves SQL sweeps `<cache-dir>/sql-spill` once at startup
+when `--cache-dir` is set, `--sql-spill` is not `off`, and
+`<cache-dir>/sql-spill` already exists; a `maintain` or `gateway` process
+does not sweep. The sweep runs before the free space is measured and before spill is resolved,
 so it also runs when spill resolves to the `RAVEL_SQL_SPILL_DIR` pair's
 directory or resolves off for lack of space, and the free space measured
 afterwards includes what it reclaimed: a volume whose free space was below
 the derived ceiling's 1 GiB floor only because of directories a crashed
-process left behind gets spill back at that start. The sweep does not create `<cache-dir>/sql-spill`, and it runs before
-the process creates its own directory. A directory under
+process left behind gets spill back at that start. The sweep does not create
+`<cache-dir>/sql-spill`, and it runs before the process creates its own
+directory. A directory under
 `<cache-dir>/sql-spill` is deleted only when this process can take that
 directory's lock itself, which means its owner is gone. A directory whose
 lock is held, or that has no `.owner.lock`, is left in place. The sweep logs
@@ -775,8 +777,9 @@ lock); after the sweep, every directory still left there is logged at INFO
 with its path and a reason. A `.swept-` directory, which an earlier sweep
 moved aside and did not finish deleting, is deleted without a lock check; if
 it is still there afterwards, its INFO line says its removal failed or is
-still in progress in another process. The sweep touches nothing outside
-`<cache-dir>/sql-spill`, and a process under `--sql-spill off` does not
+still in progress in another process. The sweep removes only what it lists
+under `<cache-dir>/sql-spill`; do not make that directory a symbolic link,
+because the sweep follows it. A process under `--sql-spill off` does not
 sweep at all.
 
 Put `--cache-dir` on a local volume unless `--sql-spill off` is set: the

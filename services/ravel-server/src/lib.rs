@@ -3082,9 +3082,10 @@ pub async fn start_with_heartbeat(
             // startup in `main`) rather than a second read of the durable
             // object here.
             let ddl_min_grace_ms = query::ddl_min_grace_ms(config.gc.max_query_duration_ns)?;
-            // ADR-0954, amended by issue #2416: resolve spill, log its two
-            // startup lines, and take and sweep the `--cache-dir` spill root
-            // before the executor that writes under it exists.
+            // ADR-0954, amended by issue #2416: sweep the orphan roots under
+            // `--cache-dir`, resolve spill, log its two startup lines, and
+            // take this process's own spill root before the executor that
+            // writes under it exists.
             let sql_spill = query::prepare_sql_spill(
                 config.cache_dir.as_deref(),
                 config.query_budgets.sql_spill,

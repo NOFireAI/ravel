@@ -655,9 +655,11 @@ an exclusive `flock` on an owner file inside it before it serves any query,
 and holds that lock until its shutdown completes; the kernel releases it on
 any exit, including a crash.
 
-Startup sweeps `<cache-dir>/sql-spill` once, whenever three conditions
-hold: `--cache-dir` is set, `--sql-spill` is not `off`, and
-`<cache-dir>/sql-spill` already exists. The sweep runs first, before the
+The startup of a process that serves SQL (a query-serving mode, in a build
+with the `sql` feature) sweeps `<cache-dir>/sql-spill` once, whenever three
+conditions hold: `--cache-dir` is set, `--sql-spill` is not `off`, and
+`<cache-dir>/sql-spill` already exists. A `maintain` or `gateway` process
+does not sweep. The sweep runs first, before the
 free space under `--cache-dir` is measured and whatever spill then resolves
 to: it also runs when spill resolves to the `RAVEL_SQL_SPILL_DIR` pair's
 directory, or resolves off because that free space is too little. The
@@ -674,12 +676,16 @@ again and logs each directory still there at INFO with its path and a
 reason, which for a `.swept-` tree says its removal failed or is still in
 progress in another process. A `.swept-` tree an earlier sweep moved aside
 but did not finish deleting (see below) is deleted without a lock check:
-the sweep creates that name only while it holds the orphan's lock. Nothing
-outside `<cache-dir>/sql-spill` is read or removed, and a process under
+the sweep creates that name only while it holds the orphan's lock. The
+sweep lists `<cache-dir>/sql-spill` and removes only entries of that
+listing; it does not check that `sql-spill` or a root's lock file is not a
+symbolic link, so the guarantee that nothing outside it is touched holds
+for a directory the server itself created. A process under
 `--sql-spill off` does not sweep. A process that cannot take its own root's
 lock refuses startup with an error naming the path, after the sweep has
-run. Orphans live until the next process start on that cache directory
-with spill not off, as requirement 7's orphan-lifetime rule already allows.
+run. Orphans live until the next start of a SQL-serving process on that
+cache directory with spill not off, as requirement 7's orphan-lifetime rule
+already allows.
 
 The ownership check and the removal happen under one hold of the orphan's
 lock. Holding it, the sweep checks that the root's lock path still names
