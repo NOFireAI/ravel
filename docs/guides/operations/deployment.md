@@ -287,9 +287,9 @@ the roles that create them. The steps:
    `sys/gc` without starting `maintain`, run `ravel-cli gc-config set` under
    the Admin credential with the values described above.
 
-The per-tenant objects need no step of their own. A process started with
-`--tenant-kms-config` creates each named tenant's key-epoch record at startup
-if it is absent. The gateway creates a tenant's provisioning record on the
+The per-tenant objects need no step of their own. A server process started
+with `--tenant-kms-config` creates each named tenant's key-epoch record at
+startup if it is absent; `ravel-cli` never creates it. The gateway creates a tenant's provisioning record on the
 tenant's first write and its metric metadata record on the first metadata
 flush. A tenant with no config record runs on the deployment defaults, and a
 keyed bucket with no `sys/auth` has no durable tokens yet.
@@ -347,9 +347,11 @@ operator credential rather than a service credential:
   four of those that write tenant data: `maintain compact-bucket`,
   `maintain compact-tenant`, `maintain migrate` and `catalog fold`. They route
   their data writes through the tenant's key exactly as the servers do. They
-  never record a key change: when the tenant's key-epoch record names a
-  different current key than the file, the command refuses before writing
-  anything, so roll a new key out to the servers first. Without
+  never record a tenant's key: when the tenant's key-epoch record is absent,
+  or names a different current key than the file, the command refuses before
+  writing anything, so roll a key out to the servers first and run these
+  commands with the file the servers run with. A `--dry-run` reads the record
+  and refuses the same way. Without
   the flag they write under the bucket's default encryption, and nothing
   fails: only the encryption key of what they wrote differs. The control
   records the Admin credential writes stay under the bucket's default

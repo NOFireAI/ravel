@@ -493,11 +493,13 @@ named by `spec.storage.s3.credentials_secret_ref` rather than any of these
 templates. The tenant config record `t/<tenant_hash>/config` is likewise
 written only by `ravel-cli` under Admin, never by a server role. The Maintain
 role reads the alert state memo and writes neither it nor the lease, and no role
-deletes either; nothing releases the lease. The four `ravel-cli` commands
-that take `--tenant-kms-config` write `t/<tenant_hash>/enc` under the Maintain
-credential, and only when it is absent: they create a tenant's first epochs
-and never append to an existing record (see "Which credential each
-`ravel-cli` command takes" below). Nothing lists it.
+deletes either; nothing releases the lease. No `ravel-cli` command creates
+`t/<tenant_hash>/enc` or records a key in it: the four that take
+`--tenant-kms-config` refuse a tenant whose record is absent or names a
+different current key. Their one write to it, under the Maintain credential,
+completes a record holding only the bootstrap epoch 0 that a server began
+(see "Which credential each `ravel-cli` command takes" below). Nothing lists
+it.
 
 `sys/auth`, `sys/t/*` and `t/*/enc` are also deny-delete in every template (see
 the delete-grant section above): no role deletes any of them, a deleted
@@ -545,12 +547,15 @@ Under `--tenant-kms-config`, the Maintain-credential commands that write
 tenant data take the same flag as the servers and route the same way:
 `maintain compact-bucket`, `maintain compact-tenant`, `maintain migrate` and
 `catalog fold`. Each builds the servers' KMS routing store and reads its own
-tenant's `t/<tenant_hash>/enc` epoch record first. When the record is absent
-it writes the tenant's first epochs (`MaintainWrite` `t/*/enc`), under the
-bucket default like every control record. When the record's current key is
-the file's it writes nothing to it. When the record's current key differs it
-refuses the whole command before any write: only ravel-server's startup
-records a key change (ADR-0062 decision 1b), and the record is append-only.
+tenant's `t/<tenant_hash>/enc` epoch record first. When the record's current
+key is the file's it writes nothing to it. When the record is absent, or its
+current key differs, it refuses the whole command before any write: only
+ravel-server's startup records a configured or changed key (ADR-0062 decision
+1b), and the record is append-only, so start ravel-server with the file
+first. A `--dry-run` reads the record and refuses the same way. The one write
+a command makes to the record (`MaintainWrite` `t/*/enc`, under the bucket
+default like every control record) completes a record holding only the
+bootstrap epoch 0, a first configuration a server began and did not finish.
 It then writes that tenant's L1 segments, compaction records, catalog
 snapshot parts, `HEAD` and index objects, and `maintain migrate`'s cursor and
 floor raise in `prov`, under the tenant's key (`MaintainTenantKms`, which

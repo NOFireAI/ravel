@@ -1827,6 +1827,12 @@ fn install_tenant_hash_scheme(scheme: ravel_types::TenantHashScheme) -> anyhow::
 }
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    run_logged(cli, &mut std::io::stderr()).await
+}
+
+/// [`run`], writing the `--tenant-kms-config` routing line to `log` rather
+/// than stderr.
+async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
     // Before running any subcommand that computes a tenant hash, resolve the
     // bucket's real tenant-hash scheme from `sys/tenancy` and install it
     // process-wide. Without this a hashing command would silently use the
@@ -1964,7 +1970,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     tenant_kms,
                 },
         } => catalog::fold(
-            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?)
+            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
                 .await?,
             cli.store.selection(),
             &tenant,
@@ -2027,6 +2033,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     &tenant,
                     dry_run,
                     now_ns()?,
+                    log,
                 )
                 .await?,
                 cli.store.selection(),
@@ -2062,8 +2069,15 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     tenant_kms,
                 },
         } => maintain::compact_tenant(
-            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, dry_run, now_ns()?)
-                .await?,
+            store::build_tenant_data_store(
+                &cli.store,
+                &tenant_kms,
+                &tenant,
+                dry_run,
+                now_ns()?,
+                log,
+            )
+            .await?,
             cli.store.selection(),
             &tenant,
             signal,
@@ -2172,6 +2186,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                     &tenant,
                     dry_run,
                     now_ns()?,
+                    log,
                 )
                 .await?,
                 cli.store.selection(),
@@ -5339,11 +5354,12 @@ mod cli_reference_tests {
 mod fake_s3;
 
 /// `--tenant-kms-config` driven through [`run`], the function `main` calls,
-/// for each command that takes it: a real run's data writes under the
-/// tenant's prefix carry the tenant key, and a dry run writes nothing under
-/// that prefix, not even the key-epoch record. These pin each call site's
-/// `dry_run` argument, which the library tests of `build_tenant_data_store`
-/// cannot see.
+/// for each command that takes it, against a key-epoch record ravel-server's
+/// startup already wrote with the file's key: a real run's data writes under
+/// the tenant's prefix carry the tenant key and no key epoch is written, and
+/// a dry run logs the routing line and writes nothing under that prefix.
+/// These pin each call site's `dry_run` argument, which the library tests of
+/// `build_tenant_data_store` cannot see.
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tenant_kms_dispatch_tests {
@@ -5355,7 +5371,7 @@ mod tenant_kms_dispatch_tests {
 
     use super::fake_s3::seed::{self, NS_PER_HOUR};
     use super::fake_s3::{Echo, FakeS3, SeenPut, spawn};
-    use super::{Cli, run, store};
+    use super::{Cli, run_logged, store};
 
     const TENANT: &str = "acme";
     const TENANT_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-key";
@@ -5394,17 +5410,38 @@ mod tenant_kms_dispatch_tests {
     }
 
     /// Parse `command` after the global store flags, with the KMS file, and
-    /// run it exactly as `main` does.
+    /// run it exactly as `main` does, returning what it logged in place of
+    /// stderr.
+    async fn run_command_logged(
+        endpoint: &str,
+        file: &tempfile::NamedTempFile,
+        command: &[&str],
+    ) -> (anyhow::Result<()>, String) {
+        let mut argv = store_flags(endpoint);
+        argv.extend(command.iter().map(|arg| arg.to_string()));
+        argv.push("--tenant-kms-config".to_string());
+        argv.push(file.path().display().to_string());
+        let mut log = Vec::new();
+        let result = run_logged(Cli::try_parse_from(argv).expect("command parses"), &mut log).await;
+        (result, String::from_utf8(log).expect("utf-8 log"))
+    }
+
     async fn run_command(
         endpoint: &str,
         file: &tempfile::NamedTempFile,
         command: &[&str],
     ) -> anyhow::Result<()> {
-        let mut argv = store_flags(endpoint);
-        argv.extend(command.iter().map(|arg| arg.to_string()));
-        argv.push("--tenant-kms-config".to_string());
-        argv.push(file.path().display().to_string());
-        run(Cli::try_parse_from(argv).expect("command parses")).await
+        run_command_logged(endpoint, file, command).await.0
+    }
+
+    fn routing_line() -> String {
+        format!("tenant-kms: tenant \"{TENANT}\" writes are encrypted under {TENANT_KEY}\n")
+    }
+
+    /// The key-epoch record as ravel-server's startup leaves it for the
+    /// file's key.
+    async fn seed_server_epochs(endpoint: &str) {
+        seed::key_epochs(plain_store(endpoint).as_ref(), TENANT, TENANT_KEY).await;
     }
 
     fn tenant_prefix() -> String {
@@ -5420,20 +5457,14 @@ mod tenant_kms_dispatch_tests {
             .collect()
     }
 
-    /// The epoch record went out twice under the default (the first
-    /// configuration), and every other write under the tenant's prefix
-    /// carried the tenant key. Returns those routed keys.
-    fn assert_routed(puts: &[SeenPut]) -> Vec<String> {
+    /// The command wrote no key epoch, and every write under the tenant's
+    /// prefix carried the tenant key. Returns those routed keys.
+    fn assert_routed(data: &[SeenPut]) -> Vec<String> {
         let enc = format!("{}enc", tenant_prefix());
-        let (epoch, data): (Vec<&SeenPut>, Vec<&SeenPut>) =
-            puts.iter().partition(|put| put.key == enc);
         assert_eq!(
-            epoch
-                .iter()
-                .map(|put| put.sse_kms_key_id.as_deref())
-                .collect::<Vec<_>>(),
-            vec![None, None],
-            "the first configuration writes epochs 0 and 1 before the key routes"
+            data.iter().filter(|put| put.key == enc).count(),
+            0,
+            "ravel-cli writes no key epoch"
         );
         let unrouted: Vec<(&str, Option<&str>)> = data
             .iter()
@@ -5452,11 +5483,12 @@ mod tenant_kms_dispatch_tests {
         assert_eq!(
             tenant_puts_since(fake, start),
             Vec::new(),
-            "a dry run writes nothing under the tenant's prefix, not even enc"
+            "nothing is written under the tenant's prefix, not even enc"
         );
     }
 
     async fn seeded_logs(endpoint: &str) {
+        seed_server_epochs(endpoint).await;
         seed::two_l0_logs(plain_store(endpoint).as_ref(), TENANT, 0, HOUR).await;
     }
 
@@ -5491,8 +5523,8 @@ mod tenant_kms_dispatch_tests {
     ];
 
     /// Non-vacuity: pass `true` for `dry_run` at the compact-bucket call site
-    /// in `run` and the routed-write assertion fails: no epoch record and
-    /// every L1 part unrouted.
+    /// in `run_logged` and the routed-write assertion fails: every L1 part
+    /// unrouted.
     #[tokio::test]
     async fn compact_bucket_real_run_routes_through_the_tenant_key() {
         let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
@@ -5506,7 +5538,7 @@ mod tenant_kms_dispatch_tests {
     }
 
     /// Non-vacuity: pass `false` for `dry_run` at the compact-bucket call site
-    /// and the epoch record is written.
+    /// and the routed store is built, so the compaction writes its L1 parts.
     #[tokio::test]
     async fn compact_bucket_dry_run_writes_nothing() {
         let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
@@ -5514,9 +5546,33 @@ mod tenant_kms_dispatch_tests {
         let start = fake.puts().len();
         let mut command = COMPACT_BUCKET.to_vec();
         command.push("--dry-run");
-        run_command(&endpoint, &kms_file(), &command)
+        let (result, log) = run_command_logged(&endpoint, &kms_file(), &command).await;
+        result.expect("compact-bucket dry run");
+        assert_eq!(
+            log,
+            routing_line(),
+            "a dry run logs the real run's routing line"
+        );
+        assert_nothing_written(&fake, start);
+    }
+
+    /// A dry run refuses a differing recorded key with the real run's message.
+    ///
+    /// Non-vacuity: drop the `check_tenant_kms_records` call from the dry-run
+    /// branch of `build_tenant_data_store` and the dry run succeeds.
+    #[tokio::test]
+    async fn compact_bucket_dry_run_refuses_a_differing_recorded_key() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        let plain = plain_store(&endpoint);
+        seed::key_epochs(plain.as_ref(), TENANT, RECORDED_KEY).await;
+        seed::two_l0_logs(plain.as_ref(), TENANT, 0, HOUR).await;
+        let start = fake.puts().len();
+        let mut command = COMPACT_BUCKET.to_vec();
+        command.push("--dry-run");
+        let err = run_command(&endpoint, &kms_file(), &command)
             .await
-            .expect("compact-bucket dry run");
+            .expect_err("a differing recorded key refuses the dry run");
+        assert_eq!(err.to_string(), differing_key_refusal());
         assert_nothing_written(&fake, start);
     }
 
@@ -5539,9 +5595,9 @@ mod tenant_kms_dispatch_tests {
         let start = fake.puts().len();
         let mut command = COMPACT_TENANT.to_vec();
         command.push("--dry-run");
-        run_command(&endpoint, &kms_file(), &command)
-            .await
-            .expect("compact-tenant dry run");
+        let (result, log) = run_command_logged(&endpoint, &kms_file(), &command).await;
+        result.expect("compact-tenant dry run");
+        assert_eq!(log, routing_line());
         assert_nothing_written(&fake, start);
     }
 
@@ -5557,6 +5613,7 @@ mod tenant_kms_dispatch_tests {
         )
         .await
         .expect("provision");
+        seed::key_epochs(plain.as_ref(), TENANT, TENANT_KEY).await;
         seed::two_l0_logs(plain.as_ref(), TENANT, 0, HOUR).await;
     }
 
@@ -5584,9 +5641,9 @@ mod tenant_kms_dispatch_tests {
         let start = fake.puts().len();
         let mut command = MIGRATE.to_vec();
         command.push("--dry-run");
-        run_command(&endpoint, &kms_file(), &command)
-            .await
-            .expect("migrate dry run");
+        let (result, log) = run_command_logged(&endpoint, &kms_file(), &command).await;
+        result.expect("migrate dry run");
+        assert_eq!(log, routing_line());
         assert_nothing_written(&fake, start);
     }
 
@@ -5603,6 +5660,7 @@ mod tenant_kms_dispatch_tests {
             now - 3 * NS_PER_HOUR,
         )
         .await;
+        seed_server_epochs(&endpoint).await;
         let start = fake.puts().len();
         run_command(
             &endpoint,
@@ -5618,34 +5676,64 @@ mod tenant_kms_dispatch_tests {
         assert!(routed.contains(&head), "{routed:?}");
     }
 
+    const RECORDED_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-old-key";
+
+    fn differing_key_refusal() -> String {
+        format!(
+            "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): tenant \
+             \"{TENANT}\" has key \"{RECORDED_KEY}\" recorded as its current key epoch at \
+             t/{}/enc, but --tenant-kms-config names \"{TENANT_KEY}\": a key change is recorded \
+             by ravel-server at startup, never by this command. Refusing before any write; \
+             start ravel-server with the new key first, or run this command with the file the \
+             servers run with",
+            TenantId::new(TENANT).hash().to_hex()
+        )
+    }
+
     /// The refusal reaches the operator as the command's error, before the
     /// command writes anything under the tenant's prefix.
     #[tokio::test]
     async fn a_differing_recorded_key_refuses_the_command() {
-        const RECORDED_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-old-key";
         let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
         let plain = plain_store(&endpoint);
-        let hash = TenantId::new(TENANT).hash();
-        ravel_catalog::record_key_epoch(plain.as_ref(), &hash, "", 0, 500)
-            .await
-            .expect("epoch 0");
-        ravel_catalog::record_key_epoch(plain.as_ref(), &hash, RECORDED_KEY, 500, 500)
-            .await
-            .expect("epoch 1");
+        seed::key_epochs(plain.as_ref(), TENANT, RECORDED_KEY).await;
         seed::two_l0_logs(plain.as_ref(), TENANT, 0, HOUR).await;
         let start = fake.puts().len();
 
         let err = run_command(&endpoint, &kms_file(), &COMPACT_BUCKET)
             .await
             .expect_err("a differing recorded key refuses");
-        assert!(
-            err.to_string().contains(&format!(
-                "tenant \"{TENANT}\" has key \"{RECORDED_KEY}\" recorded as its current key \
-                 epoch at t/{}/enc, but --tenant-kms-config names \"{TENANT_KEY}\": a key \
-                 change is recorded by ravel-server at startup",
-                hash.to_hex()
-            )),
-            "{err}"
+        assert_eq!(err.to_string(), differing_key_refusal());
+        assert_nothing_written(&fake, start);
+    }
+
+    /// A tenant with no key-epoch record refuses the command: ravel-cli
+    /// records no key, so the operator starts ravel-server with the file
+    /// first. Nothing is written under the tenant's prefix, enc included.
+    ///
+    /// Non-vacuity: make `epoch_action` return `Ok(EpochAction::Bootstrap)`
+    /// for an absent record under `KeyChangePolicy::Refuse` and the command
+    /// runs, writing epochs 0 and 1 and its L1 parts.
+    #[tokio::test]
+    async fn an_absent_key_epoch_record_refuses_the_command() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        seed::two_l0_logs(plain_store(&endpoint).as_ref(), TENANT, 0, HOUR).await;
+        let start = fake.puts().len();
+
+        let err = run_command(&endpoint, &kms_file(), &COMPACT_BUCKET)
+            .await
+            .expect_err("an absent record refuses");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): tenant \
+                 \"{TENANT}\" has no key-epoch record at t/{}/enc, but --tenant-kms-config \
+                 names \"{TENANT_KEY}\" for it: a tenant's key epochs are recorded by \
+                 ravel-server at startup, never by this command. Refusing before any write; \
+                 start ravel-server with this --tenant-kms-config file first, then rerun this \
+                 command",
+                TenantId::new(TENANT).hash().to_hex()
+            )
         );
         assert_nothing_written(&fake, start);
     }

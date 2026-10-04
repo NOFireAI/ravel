@@ -99,18 +99,37 @@ pub enum TenantKmsError {
         recorded_key: String,
         configured_key: String,
     },
+    #[error(
+        "tenant {tenant:?} has no key-epoch record at t/{hash_hex}/enc, but \
+         --tenant-kms-config names {configured_key:?} for it: a tenant's key epochs are \
+         recorded by ravel-server at startup, never by this command. Refusing before any \
+         write; start ravel-server with this --tenant-kms-config file first, then rerun this \
+         command"
+    )]
+    EpochRecordAbsent {
+        tenant: String,
+        hash_hex: String,
+        configured_key: String,
+    },
 }
 
 /// What [`configure_tenant_kms_with_policy`] does when a tenant's key-epoch
-/// record already exists and its current key differs from the configured one.
+/// record is absent, or exists and its current key differs from the
+/// configured one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyChangePolicy {
-    /// Append a new epoch at `now_ns` (ADR-0062 decision 1b). Server startup
-    /// alone records a key change, so only ravel-server uses this.
+    /// Bootstrap an absent record, and append a new epoch at `now_ns` for a
+    /// differing key (ADR-0062 decision 1b). Server startup alone records a
+    /// configured or changed key, so only ravel-server uses this.
     RecordRotation,
-    /// Refuse with [`TenantKmsError::KeyChangeRefused`] and write nothing.
-    /// The `t/<hash>/enc` record is append-only and deny-delete, so an epoch
-    /// a command records from a stale file could never be removed.
+    /// Record no key: an absent record is refused with
+    /// [`TenantKmsError::EpochRecordAbsent`] and a differing key with
+    /// [`TenantKmsError::KeyChangeRefused`], both before any write. The
+    /// `t/<hash>/enc` record is append-only and deny-delete, so a key a
+    /// command recorded from a file the servers do not run with could never
+    /// be removed. The one write this policy still makes completes a record
+    /// holding only the bootstrap epoch 0: a first configuration a server
+    /// began and did not finish, whose epoch 1 is the key the file names.
     Refuse,
 }
 
@@ -175,9 +194,9 @@ pub async fn configure_tenant_kms(
 }
 
 /// [`configure_tenant_kms`] with an explicit [`KeyChangePolicy`] for a record
-/// whose current key differs from the configured one. The absent-record
-/// bootstrap and the same-key no-op are identical under both policies; a
-/// refused tenant's key is never registered.
+/// that is absent or whose current key differs from the configured one. The
+/// same-key no-op and the completion of an unfinished bootstrap are identical
+/// under both policies; a refused tenant's key is never registered.
 pub async fn configure_tenant_kms_with_policy(
     kms: &KmsRoutingStore,
     store: &dyn ObjectStoreBackend,
@@ -193,11 +212,86 @@ pub async fn configure_tenant_kms_with_policy(
     Ok(())
 }
 
+/// The read-only half of [`configure_tenant_kms_with_policy`] under
+/// [`KeyChangePolicy::Refuse`], for a dry run: reads each configured tenant's
+/// key-epoch record and returns the refusal the real run would return. It
+/// writes nothing and registers no key. A record holding only the bootstrap
+/// epoch 0 passes, since the real run completes it.
+pub async fn check_tenant_kms_records(
+    store: &dyn ObjectStoreBackend,
+    config: &TenantKmsConfig,
+) -> Result<(), TenantKmsError> {
+    for (tenant, key_arn) in config.iter() {
+        let hash = tenant.hash();
+        let existing = read_epochs_from_store(store, &hash)
+            .await
+            .map_err(|error| TenantKmsError::ReadEpochs {
+                tenant: tenant.as_str().to_string(),
+                error,
+            })?;
+        epoch_action(
+            tenant,
+            &hash,
+            existing.as_deref(),
+            key_arn,
+            KeyChangePolicy::Refuse,
+        )?;
+    }
+    Ok(())
+}
+
 /// A record holding only the epoch-0 deployment-default entry is a first
 /// configuration whose epoch 1 was never written (a lost CAS race or a crash
 /// between the two puts), not a key a server recorded.
 fn is_unfinished_bootstrap(epochs: &[KeyEpoch]) -> bool {
     matches!(epochs, [only] if only.epoch == 0 && only.key_arn.is_empty() && only.activated_ns == 0)
+}
+
+/// What a tenant's key-epoch record needs before `key_arn` routes.
+enum EpochAction {
+    /// The record's current key is `key_arn`: nothing to write.
+    Current,
+    /// No record: epoch 0 (deployment default), then `key_arn`.
+    Bootstrap,
+    /// Append `key_arn` as the next epoch.
+    Append,
+}
+
+fn epoch_action(
+    tenant: &TenantId,
+    hash: &TenantHash,
+    existing: Option<&[KeyEpoch]>,
+    key_arn: &str,
+    policy: KeyChangePolicy,
+) -> Result<EpochAction, TenantKmsError> {
+    let Some(epochs) = existing else {
+        return match policy {
+            KeyChangePolicy::RecordRotation => Ok(EpochAction::Bootstrap),
+            KeyChangePolicy::Refuse => Err(TenantKmsError::EpochRecordAbsent {
+                tenant: tenant.as_str().to_string(),
+                hash_hex: hash.to_hex(),
+                configured_key: key_arn.to_string(),
+            }),
+        };
+    };
+    let Some(last) = epochs.last() else {
+        return Err(TenantKmsError::EmptyEpochHistory {
+            tenant: tenant.as_str().to_string(),
+            hash_hex: hash.to_hex(),
+        });
+    };
+    if last.key_arn == key_arn {
+        Ok(EpochAction::Current)
+    } else if policy == KeyChangePolicy::Refuse && !is_unfinished_bootstrap(epochs) {
+        Err(TenantKmsError::KeyChangeRefused {
+            tenant: tenant.as_str().to_string(),
+            hash_hex: hash.to_hex(),
+            recorded_key: last.key_arn.clone(),
+            configured_key: key_arn.to_string(),
+        })
+    } else {
+        Ok(EpochAction::Append)
+    }
 }
 
 async fn bootstrap_tenant_epoch(
@@ -216,35 +310,17 @@ async fn bootstrap_tenant_epoch(
             }
         })?;
 
-        let outcome = match existing {
-            None => match record_key_epoch(store, hash, "", 0, now_ns).await {
+        let outcome = match epoch_action(tenant, hash, existing.as_deref(), key_arn, policy)? {
+            EpochAction::Current => Ok(()),
+            EpochAction::Bootstrap => match record_key_epoch(store, hash, "", 0, now_ns).await {
                 Ok(_) => record_key_epoch(store, hash, key_arn, now_ns, now_ns)
                     .await
                     .map(|_| ()),
                 Err(err) => Err(err),
             },
-            Some(epochs) => {
-                let Some(last) = epochs.last() else {
-                    return Err(TenantKmsError::EmptyEpochHistory {
-                        tenant: tenant.as_str().to_string(),
-                        hash_hex: hash.to_hex(),
-                    });
-                };
-                if last.key_arn == key_arn {
-                    Ok(())
-                } else if policy == KeyChangePolicy::Refuse && !is_unfinished_bootstrap(&epochs) {
-                    return Err(TenantKmsError::KeyChangeRefused {
-                        tenant: tenant.as_str().to_string(),
-                        hash_hex: hash.to_hex(),
-                        recorded_key: last.key_arn.clone(),
-                        configured_key: key_arn.to_string(),
-                    });
-                } else {
-                    record_key_epoch(store, hash, key_arn, now_ns, now_ns)
-                        .await
-                        .map(|_| ())
-                }
-            }
+            EpochAction::Append => record_key_epoch(store, hash, key_arn, now_ns, now_ns)
+                .await
+                .map(|_| ()),
         };
 
         match outcome {
@@ -491,10 +567,23 @@ mod tests {
             .expect("epoch history exists")
     }
 
+    fn absent_record_message(key_arn: &str) -> String {
+        format!(
+            "tenant \"acme\" has no key-epoch record at t/{}/enc, but --tenant-kms-config names \
+             \"{key_arn}\" for it: a tenant's key epochs are recorded by ravel-server at \
+             startup, never by this command. Refusing before any write; start ravel-server \
+             with this --tenant-kms-config file first, then rerun this command",
+            TenantId::new("acme").hash().to_hex()
+        )
+    }
+
+    /// Non-vacuity: make `epoch_action` return `Ok(EpochAction::Bootstrap)`
+    /// for an absent record under `Refuse` too and the call succeeds, writing
+    /// epochs 0 and 1.
     #[tokio::test]
-    async fn cli_policy_bootstraps_an_absent_record() {
+    async fn cli_policy_refuses_an_absent_record_and_writes_nothing() {
         let store = InstrumentedStore::new(MemoryStore::new());
-        configure_tenant_kms_with_policy(
+        let err = configure_tenant_kms_with_policy(
             &routing_store(),
             &store,
             &acme_with(FIRST_KEY),
@@ -502,22 +591,65 @@ mod tests {
             CLI,
         )
         .await
-        .expect("an absent record is bootstrapped");
+        .expect_err("an absent record is refused");
 
-        let epochs = epochs_of(&store).await;
-        assert_eq!(
-            epochs
-                .iter()
-                .map(|e| (e.epoch, e.key_arn.as_str(), e.activated_ns))
-                .collect::<Vec<_>>(),
-            vec![(0, "", 0), (1, FIRST_KEY, 1_000)],
-            "the first configuration: the default epoch, then the file's key"
+        let hash_hex = TenantId::new("acme").hash().to_hex();
+        assert!(
+            matches!(
+                &err,
+                TenantKmsError::EpochRecordAbsent { tenant, hash_hex: h, configured_key }
+                    if tenant == "acme" && *h == hash_hex && configured_key == FIRST_KEY
+            ),
+            "{err:?}"
         );
-        assert_eq!(
-            puts(&store),
-            2,
-            "one put per epoch of the first configuration"
+        assert_eq!(err.to_string(), absent_record_message(FIRST_KEY));
+        assert_eq!(puts(&store), 0, "no key epoch is written");
+        assert!(
+            read_epochs_from_store(&store, &TenantId::new("acme").hash())
+                .await
+                .expect("read back")
+                .is_none(),
+            "the record is still absent"
         );
+    }
+
+    /// The dry run's check reaches the real run's verdict for every record
+    /// shape and writes nothing.
+    ///
+    /// Non-vacuity: pass `KeyChangePolicy::RecordRotation` in
+    /// `check_tenant_kms_records` and the absent and differing records pass.
+    #[tokio::test]
+    async fn the_read_only_check_reaches_the_cli_verdict_and_writes_nothing() {
+        let absent = InstrumentedStore::new(MemoryStore::new());
+        let err = check_tenant_kms_records(&absent, &acme_with(FIRST_KEY))
+            .await
+            .expect_err("an absent record is refused");
+        assert_eq!(err.to_string(), absent_record_message(FIRST_KEY));
+        assert_eq!(puts(&absent), 0);
+
+        let recorded = recorded_with(FIRST_KEY).await;
+        check_tenant_kms_records(&recorded, &acme_with(FIRST_KEY))
+            .await
+            .expect("a matching record passes");
+        let err = check_tenant_kms_records(&recorded, &acme_with(SECOND_KEY))
+            .await
+            .expect_err("a differing record is refused");
+        assert!(
+            matches!(err, TenantKmsError::KeyChangeRefused { .. }),
+            "{err:?}"
+        );
+        assert_eq!(puts(&recorded), 0);
+
+        let inner = MemoryStore::new();
+        record_key_epoch(&inner, &TenantId::new("acme").hash(), "", 0, 500)
+            .await
+            .expect("epoch 0 alone");
+        let unfinished = InstrumentedStore::new(inner);
+        check_tenant_kms_records(&unfinished, &acme_with(FIRST_KEY))
+            .await
+            .expect("an unfinished bootstrap passes: the real run completes it");
+        assert_eq!(puts(&unfinished), 0);
+        assert_eq!(epochs_of(&unfinished).await.len(), 1);
     }
 
     #[tokio::test]

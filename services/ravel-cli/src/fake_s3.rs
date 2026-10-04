@@ -566,6 +566,20 @@ pub(crate) mod seed {
 
     pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
+    /// The key-epoch record `t/<hash>/enc` as ravel-server's startup leaves it
+    /// for a tenant its `--tenant-kms-config` names: epoch 0 under the
+    /// deployment default, then `key_arn` as the current key. ravel-cli
+    /// writes no epoch, so a routed command needs this in place first.
+    pub(crate) async fn key_epochs(store: &dyn ObjectStoreBackend, tenant: &str, key_arn: &str) {
+        let tenant_hash = TenantId::new(tenant).hash();
+        ravel_catalog::record_key_epoch(store, &tenant_hash, "", 0, 500)
+            .await
+            .expect("epoch 0");
+        ravel_catalog::record_key_epoch(store, &tenant_hash, key_arn, 500, 500)
+            .await
+            .expect("epoch 1");
+    }
+
     fn logs_record(stream: u8, ts_ns: i64) -> LogRecord {
         let mut id = [0u8; 16];
         id[0] = stream;

@@ -81,22 +81,23 @@ fn tenant_puts_since(fake: &FakeS3, start: usize, tenant: &str) -> Vec<SeenPut> 
         .collect()
 }
 
-/// Every PUT the command made under the tenant's prefix carried the tenant's
-/// key, except the key-epoch record: it is written before the key is
-/// registered, exactly as ravel-server's startup writes it, and is asserted
-/// to be written once under the default. Returns the routed keys.
+/// The tenant's key-epoch record as ravel-server's startup leaves it, with
+/// the file's key current: the state a routed command requires, since
+/// ravel-cli writes no key epoch.
+async fn seed_server_epochs(store: &dyn ObjectStoreBackend) {
+    seed::key_epochs(store, TENANT, TENANT_KEY).await;
+}
+
+/// The command wrote no key epoch, and every PUT it made under the tenant's
+/// prefix carried the tenant's key. Returns the routed keys.
 fn assert_tenant_writes_routed(puts: &[SeenPut]) -> BTreeSet<String> {
     let enc = format!("{}enc", tenant_prefix(TENANT));
-    let (epoch, data): (Vec<&SeenPut>, Vec<&SeenPut>) = puts.iter().partition(|put| put.key == enc);
     assert_eq!(
-        epoch
-            .iter()
-            .map(|put| put.sse_kms_key_id.as_deref())
-            .collect::<Vec<_>>(),
-        vec![None, None],
-        "the first configuration writes epoch 0 then epoch 1, both before the key routes"
+        puts.iter().filter(|put| put.key == enc).count(),
+        0,
+        "ravel-cli writes no key epoch"
     );
-    let unrouted: Vec<(&str, Option<&str>)> = data
+    let unrouted: Vec<(&str, Option<&str>)> = puts
         .iter()
         .filter(|put| put.sse_kms_key_id.as_deref() != Some(TENANT_KEY))
         .map(|put| (put.key.as_str(), put.sse_kms_key_id.as_deref()))
@@ -105,7 +106,7 @@ fn assert_tenant_writes_routed(puts: &[SeenPut]) -> BTreeSet<String> {
         unrouted.is_empty(),
         "every tenant write must carry {TENANT_KEY}; these did not: {unrouted:?}"
     );
-    data.iter().map(|put| put.key.clone()).collect()
+    puts.iter().map(|put| put.key.clone()).collect()
 }
 
 /// No PUT anywhere carried the other tenant's key, and none landed under its
@@ -119,7 +120,7 @@ fn assert_other_tenant_untouched(fake: &FakeS3) {
     );
     assert!(
         tenant_puts_since(fake, 0, "globex").is_empty(),
-        "the other tenant's epoch record is not bootstrapped by a command that writes acme"
+        "nothing is written under the other tenant's prefix by a command that writes acme"
     );
 }
 
@@ -156,21 +157,30 @@ fn assert_compaction_output_routed(routed: &BTreeSet<String>, records: &[String]
 /// `maintain compact-bucket`: the L1 parts and the compaction record go out
 /// under the tenant's key.
 ///
-/// Non-vacuity: make `build_tenant_data_store` return `build_store(args)` in
-/// place of `Ok(kms)` and `assert_tenant_writes_routed` fails, naming every
+/// Non-vacuity: make the real-run branch of `build_tenant_data_store` yield
+/// `build_store(args)?` in place of `kms` and `assert_tenant_writes_routed`
+/// fails, naming every
 /// L1 part and the compaction record with `None` as their key.
 #[tokio::test]
 async fn compact_bucket_writes_l1_parts_and_its_record_under_the_tenant_key() {
     let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
     let args = s3_args(&endpoint);
     let plain = build_store(&args).expect("plain store");
+    seed_server_epochs(plain.as_ref()).await;
     seed_two_l0_logs(plain.as_ref()).await;
     let start = fake.puts().len();
     let file = kms_file();
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
-        .await
-        .expect("routed store");
+    let store = build_tenant_data_store(
+        &args,
+        &kms_args(&file),
+        TENANT,
+        REAL_RUN,
+        1_000,
+        &mut std::io::sink(),
+    )
+    .await
+    .expect("routed store");
     maintain::compact(
         store,
         S3,
@@ -200,13 +210,21 @@ async fn compact_tenant_writes_l1_parts_and_its_records_under_the_tenant_key() {
     let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
     let args = s3_args(&endpoint);
     let plain = build_store(&args).expect("plain store");
+    seed_server_epochs(plain.as_ref()).await;
     seed_two_l0_logs(plain.as_ref()).await;
     let start = fake.puts().len();
     let file = kms_file();
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
-        .await
-        .expect("routed store");
+    let store = build_tenant_data_store(
+        &args,
+        &kms_args(&file),
+        TENANT,
+        REAL_RUN,
+        1_000,
+        &mut std::io::sink(),
+    )
+    .await
+    .expect("routed store");
     maintain::compact_tenant(
         store,
         S3,
@@ -290,12 +308,20 @@ async fn migrate_reencode_writes_l1_parts_and_its_record_under_the_tenant_key() 
         )
         .await
         .expect("overwrite the fixture record");
+    seed_server_epochs(plain.as_ref()).await;
     let start = fake.puts().len();
     let file = kms_file();
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
-        .await
-        .expect("routed store");
+    let store = build_tenant_data_store(
+        &args,
+        &kms_args(&file),
+        TENANT,
+        REAL_RUN,
+        1_000,
+        &mut std::io::sink(),
+    )
+    .await
+    .expect("routed store");
     let mut out = Vec::new();
     // The superseded record's part keeps the floor down until a sweep, so the
     // run reports stragglers and exits nonzero after writing its output.
@@ -349,12 +375,20 @@ async fn catalog_fold_writes_its_snapshot_under_the_tenant_key() {
     let plain = build_store(&args).expect("plain store");
     let now = crate::now_ns().expect("wall clock");
     seed::metrics_l0(plain.as_ref(), TENANT, SHARD, 1, now - 3 * NS_PER_HOUR).await;
+    seed_server_epochs(plain.as_ref()).await;
     let start = fake.puts().len();
     let file = kms_file();
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
-        .await
-        .expect("routed store");
+    let store = build_tenant_data_store(
+        &args,
+        &kms_args(&file),
+        TENANT,
+        REAL_RUN,
+        1_000,
+        &mut std::io::sink(),
+    )
+    .await
+    .expect("routed store");
     crate::catalog::fold(store, S3, TENANT, 1, SignalArg::Metrics, None, now, false)
         .await
         .expect("fold runs");
@@ -384,9 +418,16 @@ async fn a_tenant_the_file_does_not_name_writes_under_the_bucket_default() {
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     write!(file, "[tenants]\nglobex = \"{OTHER_KEY}\"\n").expect("write kms file");
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
-        .await
-        .expect("routed store");
+    let store = build_tenant_data_store(
+        &args,
+        &kms_args(&file),
+        TENANT,
+        REAL_RUN,
+        1_000,
+        &mut std::io::sink(),
+    )
+    .await
+    .expect("routed store");
     let key = format!("{}l/l1/probe", tenant_prefix(TENANT));
     store
         .put(&key, Bytes::from_static(b"x"), PutOptions::default())
@@ -404,24 +445,70 @@ async fn a_tenant_the_file_does_not_name_writes_under_the_bucket_default() {
     assert_other_tenant_untouched(&fake);
 }
 
-/// A dry run reads and validates the file and writes nothing, not even the
-/// key-epoch record.
+/// The refusal for a tenant with no key-epoch record, as the command reports
+/// it.
+fn absent_record_refusal() -> String {
+    format!(
+        "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): tenant \
+         \"{TENANT}\" has no key-epoch record at t/{}/enc, but --tenant-kms-config names \
+         \"{TENANT_KEY}\" for it: a tenant's key epochs are recorded by ravel-server at startup, \
+         never by this command. Refusing before any write; start ravel-server with this \
+         --tenant-kms-config file first, then rerun this command",
+        TenantId::new(TENANT).hash().to_hex()
+    )
+}
+
+/// A dry run validates the file and checks the key-epoch record as the real
+/// run would: an absent record is refused, a record holding the file's key
+/// logs the routing line. Neither writes anything.
+///
+/// Non-vacuity: drop the `check_tenant_kms_records` call from the dry-run
+/// branch of `build_tenant_data_store` and the absent-record dry run
+/// succeeds.
 #[tokio::test]
-async fn a_dry_run_validates_the_file_and_writes_nothing() {
+async fn a_dry_run_checks_the_record_and_writes_nothing() {
     let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
     let args = s3_args(&endpoint);
     let file = kms_file();
-    build_tenant_data_store(&args, &kms_args(&file), TENANT, DRY_RUN, 1_000)
+    let err = build_tenant_data_store(
+        &args,
+        &kms_args(&file),
+        TENANT,
+        DRY_RUN,
+        1_000,
+        &mut std::io::sink(),
+    )
+    .await
+    .err()
+    .expect("an absent record fails a dry run too");
+    assert_eq!(err.to_string(), absent_record_refusal());
+    assert!(fake.puts().is_empty(), "a refused dry run writes nothing");
+
+    seed_server_epochs(build_store(&args).expect("plain store").as_ref()).await;
+    let start = fake.puts().len();
+    let mut log = Vec::new();
+    build_tenant_data_store(&args, &kms_args(&file), TENANT, DRY_RUN, 1_000, &mut log)
         .await
         .expect("a dry run builds the plain store");
-    assert!(fake.puts().is_empty(), "a dry run writes nothing");
+    assert_eq!(fake.puts().len(), start, "a dry run writes nothing");
+    assert_eq!(
+        String::from_utf8(log).expect("utf-8 log"),
+        format!("tenant-kms: tenant \"{TENANT}\" writes are encrypted under {TENANT_KEY}\n")
+    );
 
     let mut bad = tempfile::NamedTempFile::new().expect("temp file");
     write!(bad, "[tenants]\n{TENANT} = \"\"\n").expect("write kms file");
-    let err = build_tenant_data_store(&args, &kms_args(&bad), TENANT, DRY_RUN, 1_000)
-        .await
-        .err()
-        .expect("an invalid file fails a dry run too");
+    let err = build_tenant_data_store(
+        &args,
+        &kms_args(&bad),
+        TENANT,
+        DRY_RUN,
+        1_000,
+        &mut std::io::sink(),
+    )
+    .await
+    .err()
+    .expect("an invalid file fails a dry run too");
     assert!(
         err.to_string().starts_with(&format!(
             "invalid --tenant-kms-config {}",
@@ -446,12 +533,7 @@ async fn a_recorded_key_that_differs_from_the_file_refuses_the_command() {
     let args = s3_args(&endpoint);
     let plain = build_store(&args).expect("plain store");
     let tenant_hash = TenantId::new(TENANT).hash();
-    ravel_catalog::record_key_epoch(plain.as_ref(), &tenant_hash, "", 0, 500)
-        .await
-        .expect("epoch 0");
-    ravel_catalog::record_key_epoch(plain.as_ref(), &tenant_hash, RECORDED_KEY, 500, 500)
-        .await
-        .expect("epoch 1 under another key");
+    seed::key_epochs(plain.as_ref(), TENANT, RECORDED_KEY).await;
     seed_two_l0_logs(plain.as_ref()).await;
     let start = fake.puts().len();
     let enc = format!("{}enc", tenant_prefix(TENANT));
@@ -459,8 +541,15 @@ async fn a_recorded_key_that_differs_from_the_file_refuses_the_command() {
     let file = kms_file();
 
     let err = async {
-        let store =
-            build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000).await?;
+        let store = build_tenant_data_store(
+            &args,
+            &kms_args(&file),
+            TENANT,
+            REAL_RUN,
+            1_000,
+            &mut std::io::sink(),
+        )
+        .await?;
         maintain::compact(
             store,
             S3,
@@ -503,16 +592,78 @@ async fn a_recorded_key_that_differs_from_the_file_refuses_the_command() {
     assert_other_tenant_untouched(&fake);
 }
 
+/// A tenant with no key-epoch record refuses the command: ravel-cli records
+/// no key, so a file that reaches a job before the servers run with it
+/// cannot leave a permanent epoch the servers are not using. Nothing is
+/// written under the tenant's prefix, neither an epoch nor any compaction
+/// output.
+///
+/// Non-vacuity: make `epoch_action` return `Ok(EpochAction::Bootstrap)` for
+/// an absent record under `KeyChangePolicy::Refuse` and the compaction runs,
+/// writing epochs 0 and 1 and its L1 parts.
+#[tokio::test]
+async fn an_absent_key_epoch_record_refuses_the_command() {
+    let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+    let args = s3_args(&endpoint);
+    let plain = build_store(&args).expect("plain store");
+    seed_two_l0_logs(plain.as_ref()).await;
+    let start = fake.puts().len();
+    let file = kms_file();
+
+    let err = async {
+        let store = build_tenant_data_store(
+            &args,
+            &kms_args(&file),
+            TENANT,
+            REAL_RUN,
+            1_000,
+            &mut std::io::sink(),
+        )
+        .await?;
+        maintain::compact(
+            store,
+            S3,
+            TENANT,
+            SignalArg::Logs,
+            SHARD,
+            HOUR,
+            false,
+            None,
+            None,
+            &ClaimOptions::fresh(),
+        )
+        .await
+    }
+    .await
+    .expect_err("an absent record refuses the command");
+
+    assert_eq!(err.to_string(), absent_record_refusal());
+    assert_eq!(
+        tenant_puts_since(&fake, start, TENANT),
+        Vec::new(),
+        "nothing is written under the tenant's prefix"
+    );
+    assert!(compaction_record_keys(plain.as_ref()).await.is_empty());
+    assert_other_tenant_untouched(&fake);
+}
+
 /// The same refusal ravel-server's `Cli::validate` makes: the routing store
 /// builds a real `S3Store` per tenant, which `--store memory` cannot.
 #[tokio::test]
 async fn the_flag_under_store_memory_is_refused() {
     let args = StoreArgs::try_parse_from(["ravel-cli", "--store", "memory"]).expect("flags parse");
     let file = kms_file();
-    let err = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
-        .await
-        .err()
-        .expect("memory plus the flag is refused");
+    let err = build_tenant_data_store(
+        &args,
+        &kms_args(&file),
+        TENANT,
+        REAL_RUN,
+        1_000,
+        &mut std::io::sink(),
+    )
+    .await
+    .err()
+    .expect("memory plus the flag is refused");
     assert_eq!(
         err.to_string(),
         "--tenant-kms-config requires --store s3: KmsRoutingStore's per-tenant builder always \

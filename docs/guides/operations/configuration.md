@@ -536,17 +536,20 @@ server does: `maintain compact-bucket`, `maintain compact-tenant` and
 cursor and the floor raise in `prov`) and `catalog fold` (catalog snapshot
 parts, `HEAD` and index objects). Pass them the file the servers use. For a
 tenant the file names, the command first reads that tenant's `t/<hash>/enc`
-key-epoch record. When the record is absent the command creates it, as server
-startup does; when its current key is the file's the command leaves it alone;
-when its current key differs the command refuses before any write, because
-only server startup records a key change and the record is append-only. It
-then writes its data under `t/<hash>/` under the tenant's key. The epoch
-record itself is a control record, written under the bucket's default
-encryption. The command applies only the entry for its own `--tenant`. A
-tenant the file does not name is written under the bucket's default
-encryption, as the server writes it. The flag requires
-`--store s3`, and a `--dry-run` reads and validates the file and writes
-nothing. Maintain already holds encrypt and generate-data-key on the tenant
+key-epoch record. When its current key is the file's the command leaves it
+alone. When the record is absent, or its current key differs, the command
+refuses before any write, because only server startup records a configured or
+changed key and the record is append-only: start the server with the file
+first, then run the command. No `ravel-cli` command creates the record; the
+one write a command makes to it completes a record holding only the bootstrap
+epoch 0, which a server began and did not finish. The command then writes its
+data under `t/<hash>/` under the tenant's key. The epoch record itself is a
+control record, written under the bucket's default encryption. The command
+applies only the entry for its own `--tenant`. A tenant the file does not
+name is written under the bucket's default encryption, as the server writes
+it. The flag requires `--store s3`. A `--dry-run` validates the file, reads
+the key-epoch record and refuses as the real run would, prints the same
+routing line, and writes nothing. Maintain already holds encrypt and generate-data-key on the tenant
 keys and the `t/*/enc` write, so this needs no new grant.
 
 Admin stays decrypt-only, so no Admin command takes the flag, and what Admin

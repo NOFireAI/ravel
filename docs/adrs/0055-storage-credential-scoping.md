@@ -1706,15 +1706,20 @@ fold`, take the servers' `--tenant-kms-config` flag and file. The parser and
 the key-epoch bootstrap moved from `ravel-server` into
 `ravel_catalog::tenant_kms`, which both binaries call, and each command wraps
 its S3 store in the same `KmsRoutingStore` the servers build. For the tenant
-it writes, it reads that tenant's `t/<hash>/enc` record first. An absent
-record is created with the tenant's first epochs, as server startup creates
-it; a record whose current key is the file's is left alone; a record whose
-current key differs refuses the whole command before any write. Only server
-startup records a key change (ADR-0062 decision 1b): the record is
-append-only and deny-delete, so an epoch a command recorded from a stale file
-could never be removed. The command then writes its data under `t/<hash>/`
-under the tenant's key; the epoch record itself is a control record under the
-bucket default. A tenant the file does not name is written under the bucket
+it writes, it reads that tenant's `t/<hash>/enc` record first. A record
+whose current key is the file's routes with no write to it. An absent record,
+or one whose current key differs, refuses the whole command before any write,
+with a message telling the operator to start `ravel-server` with the file
+first. Only server startup records a configured or changed key (ADR-0062
+decision 1b): the record is append-only and deny-delete, so an epoch a command
+recorded from a file that reached its job before the servers ran with it
+could never be removed. No `ravel-cli` command creates the record or records a
+key in it. The one write a command makes to it completes a record holding
+only the bootstrap epoch 0, a first configuration a server began and did not
+finish, with the file's key as epoch 1. The command then writes its data
+under `t/<hash>/` under the tenant's key; the epoch record itself is a control
+record under the bucket default. A `--dry-run` reads the record and refuses
+the same way, and writes nothing. A tenant the file does not name is written under the bucket
 default, as the servers write it. Routing is opt-in through the flag: without
 it these commands write under the bucket default as before. Maintain already
 holds `kms:Encrypt` and `kms:GenerateDataKey*` on the

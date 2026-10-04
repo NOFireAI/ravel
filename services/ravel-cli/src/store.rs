@@ -534,15 +534,15 @@ pub struct TenantKmsArgs {
     /// mapping tenant name to KMS key ARN. When the file names the command's
     /// `--tenant`, every data object this command writes under that tenant's
     /// `t/<tenant_hash>/` prefix is encrypted under that key. The tenant's
-    /// key-epoch record `t/<tenant_hash>/enc` is a control record written
-    /// under the bucket default: when it is absent the command creates it
-    /// first, as ravel-server's startup does; when it records a different
-    /// current key the command refuses before any write, because only
-    /// ravel-server's startup records a key change. A tenant the file does not
-    /// name is written under the bucket's default encryption, as ravel-server
-    /// writes it. Requires `--store s3`. A dry run reads and validates the
-    /// file and writes nothing. Absent (the default): every write uses the
-    /// bucket's default encryption.
+    /// key-epoch record `t/<tenant_hash>/enc` is a control record that only
+    /// ravel-server's startup records a key in: when it is absent, or records
+    /// a different current key, the command refuses before any write; start
+    /// ravel-server with the file first. A tenant the file does not name is
+    /// written under the bucket's default encryption, as ravel-server writes
+    /// it. Requires `--store s3`. A dry run validates the file, reads the
+    /// key-epoch record and refuses as the real run would, and writes
+    /// nothing. Absent (the default): every write uses the bucket's default
+    /// encryption.
     #[arg(
         long = "tenant-kms-config",
         env = "RAVEL_TENANT_KMS_CONFIG",
@@ -578,17 +578,21 @@ fn load_tenant_kms_config(
 /// the S3 store is wrapped in a [`KmsRoutingStore`] the way ravel-server's
 /// `build_store` wraps its own, and the file's entry for `tenant` is applied
 /// with [`KeyChangePolicy::Refuse`](ravel_catalog::tenant_kms::KeyChangePolicy::Refuse):
-/// an absent key-epoch record is bootstrapped, a record whose current key is
-/// the file's is left alone, and a record whose current key differs refuses
-/// the command before any write, since only ravel-server's startup records a
-/// key change (ADR-0062 decision 1b). The key is then registered, so every
-/// later data write under `t/<tenant_hash>/` is encrypted under it. Only
-/// `tenant`'s entry is applied: this command writes no other tenant's data.
-/// A tenant the file does not name routes nowhere, exactly as in ravel-server:
-/// its writes go to the default store.
+/// a record whose current key is the file's routes with no write, and an
+/// absent record or one whose current key differs refuses the command before
+/// any write, since only ravel-server's startup records a configured or
+/// changed key (ADR-0062 decision 1b). A record holding only the bootstrap
+/// epoch 0, a first configuration a server began and did not finish, is
+/// completed. The key is then registered, so every later data write under
+/// `t/<tenant_hash>/` is encrypted under it. Only `tenant`'s entry is applied:
+/// this command writes no other tenant's data. A tenant the file does not
+/// name routes nowhere, exactly as in ravel-server: its writes go to the
+/// default store.
 ///
-/// For a dry run the file is still read and validated, so a bad one fails
-/// before the real run, but nothing is bootstrapped and the plain store is
+/// For a dry run the file is read and validated and the key-epoch record is
+/// read and checked the same way, so a bad file, an absent record or a
+/// differing key fails before the real run, and the same routing line is
+/// written to `log`; nothing is written to the store and the plain store is
 /// returned.
 ///
 /// Must run after the tenant-hash scheme is installed, since it hashes
@@ -599,53 +603,62 @@ pub async fn build_tenant_data_store(
     tenant: &str,
     dry_run: bool,
     now_ns: i64,
+    log: &mut (dyn std::io::Write + Send),
 ) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
     let Some(path) = kms_args.tenant_kms_config.as_deref() else {
         return build_store(args);
     };
     let config = load_tenant_kms_config(args, path)?;
     let tenant_id = TenantId::new(tenant);
-    let key_arn = config.key_for(&tenant_id).map(str::to_string);
-    if dry_run {
-        return build_store(args);
-    }
+    let only_this_tenant = config.restricted_to(&tenant_id);
+    let routing_failed = |err: ravel_catalog::tenant_kms::TenantKmsError| {
+        anyhow::anyhow!(
+            "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): {err}"
+        )
+    };
 
-    let s3 = s3_config(args)?;
-    let http = args.s3_http_config();
-    let metrics = Arc::new(StoreMetrics::default());
-    let base =
-        S3Store::with_http_config_and_metrics(s3.clone(), http.clone(), Arc::clone(&metrics))
-            .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
-    let kms = Arc::new(KmsRoutingStore::new(
-        Arc::new(base) as Arc<dyn ObjectStoreBackend>,
-        s3,
-        http,
-        metrics,
-    ));
-    match key_arn {
-        Some(key_arn) => {
-            let only_this_tenant = config.restricted_to(&tenant_id);
-            ravel_catalog::tenant_kms::configure_tenant_kms_with_policy(
-                kms.as_ref(),
-                kms.as_ref(),
-                &only_this_tenant,
-                now_ns,
-                ravel_catalog::tenant_kms::KeyChangePolicy::Refuse,
-            )
+    let store: Arc<dyn ObjectStoreBackend> = if dry_run {
+        let plain = build_store(args)?;
+        ravel_catalog::tenant_kms::check_tenant_kms_records(plain.as_ref(), &only_this_tenant)
             .await
-            .map_err(|err| {
-                anyhow::anyhow!(
-                    "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): {err}"
-                )
-            })?;
-            eprintln!("tenant-kms: tenant {tenant:?} writes are encrypted under {key_arn}");
-        }
-        None => eprintln!(
+            .map_err(routing_failed)?;
+        plain
+    } else {
+        let s3 = s3_config(args)?;
+        let http = args.s3_http_config();
+        let metrics = Arc::new(StoreMetrics::default());
+        let base =
+            S3Store::with_http_config_and_metrics(s3.clone(), http.clone(), Arc::clone(&metrics))
+                .map_err(|err| anyhow::anyhow!("failed to build S3 store: {err}"))?;
+        let kms = Arc::new(KmsRoutingStore::new(
+            Arc::new(base) as Arc<dyn ObjectStoreBackend>,
+            s3,
+            http,
+            metrics,
+        ));
+        ravel_catalog::tenant_kms::configure_tenant_kms_with_policy(
+            kms.as_ref(),
+            kms.as_ref(),
+            &only_this_tenant,
+            now_ns,
+            ravel_catalog::tenant_kms::KeyChangePolicy::Refuse,
+        )
+        .await
+        .map_err(routing_failed)?;
+        kms
+    };
+    match config.key_for(&tenant_id) {
+        Some(key_arn) => writeln!(
+            log,
+            "tenant-kms: tenant {tenant:?} writes are encrypted under {key_arn}"
+        )?,
+        None => writeln!(
+            log,
             "tenant-kms: --tenant-kms-config names no key for tenant {tenant:?}; its writes use \
              the bucket's default encryption, as ravel-server's do"
-        ),
+        )?,
     }
-    Ok(kms)
+    Ok(store)
 }
 
 /// [`build_store_with_list_page_size`], keeping the concrete S3 store
