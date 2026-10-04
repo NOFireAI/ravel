@@ -26,7 +26,7 @@
 #![cfg(feature = "flight-sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod util;
+use crate::util;
 
 use proptest::prelude::*;
 use ravel_types::TenantId;

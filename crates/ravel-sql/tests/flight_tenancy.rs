@@ -25,7 +25,7 @@
 #![cfg(feature = "flight-sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod util;
+use crate::util;
 
 use arrow_flight::Ticket;
 use arrow_flight::sql::server::FlightSqlService;

@@ -58,7 +58,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod util;
+use crate::util;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

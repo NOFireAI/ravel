@@ -14,7 +14,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod util;
+use crate::util;
 
 use std::sync::Arc;
 use std::time::Duration;

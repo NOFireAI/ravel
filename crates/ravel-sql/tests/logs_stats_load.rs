@@ -44,7 +44,7 @@ use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
-mod util;
+use crate::util;
 use util::CountingStore;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
