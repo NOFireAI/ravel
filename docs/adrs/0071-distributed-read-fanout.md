@@ -1867,19 +1867,24 @@ precedence) stayed in the tree with nothing exercising them end to end.
    serving and the coordinator's log and span fan-out are driven over the
    in-process loopback worker by tests in
    `crates/ravel-query/src/distrib/tests.rs`: property-based differentials
-   against the local read under the stated total orders, plus the status
-   precedence, worker-side erasure, both decode caps and a slice stopped at its
-   deadline.
+   against the local read under the stated total orders, run on every signal
+   the worker serves through `run_slice_logs` (Logs, Alerts, Audit) and on
+   Spans; a byte-identical record and a byte-identical span in two segments on
+   two shards, both copies kept by the merge as `docs/consistency-model.md`
+   requires; plus the status precedence, worker-side erasure, both decode caps
+   and a slice stopped at its deadline.
 2. **The decoders those tests use are test support.**
    `LogSliceStreamDecoder` and `SpanSliceStreamDecoder` mirror
    `SliceStreamDecoder`: the same per-slice frame and wire-byte caps, the same
    typed refusals, a typed refusal for a frame of another signal, and a
    terminal summary that ends the slice. They are compiled only under
    `cfg(test)`; the crate gains no public decoder for log or span frames.
-3. **Production stays unwired.** The `SliceFetcher` defaults for `fetch_logs`
-   and `fetch_spans` keep answering `Unsupported`, so a log or span slice still
-   falls back to whole-query local execution. Wiring a production caller needs
-   a production bounded decoder and is its own decision.
+3. **Production stays unwired.** No production caller dispatches
+   `Distributed::fetch_logs` or `fetch_spans`: a log or span query runs
+   locally and never becomes a slice. The `SliceFetcher` defaults for
+   `fetch_logs` and `fetch_spans` keep answering `Unsupported`. Wiring a
+   production caller needs a production bounded decoder and is its own
+   decision.
 
 ### Consequences
 
