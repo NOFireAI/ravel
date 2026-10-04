@@ -871,8 +871,14 @@ impl IngestRouter {
     ///
     /// Sets drain largest first, each finished before the next is signalled:
     /// a retiring set's drain may hand rows back (ADR-1642 scan-set
-    /// amendment), always to a smaller set, which must still be running to
-    /// take them. The sets are listed again after each one, since a hand-back
+    /// amendment). A retired-index hand-back always goes to a smaller set,
+    /// which is still running and takes the rows. A generation-mismatch
+    /// hand-back to a larger set finds that set already draining or drained:
+    /// each actor closes its mailbox before its teardown flush and writes
+    /// every hand-back it had already accepted, so such a send either landed
+    /// before the close and is written by the larger set, or fails as closed
+    /// and the source keeps the rows, writing them in place at its own
+    /// teardown. The sets are listed again after each one, since a hand-back
     /// can construct the current generation's set during the drain.
     pub async fn shutdown(self) {
         let mut drained = Vec::new();

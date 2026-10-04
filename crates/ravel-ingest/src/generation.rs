@@ -699,10 +699,13 @@ impl<H> GenerationSwitch<H> {
     }
 
     /// The largest live shard-actor set whose count is not in `drained`, for a
-    /// shutdown that drains one set at a time. A hand-back always goes from a
-    /// set to a strictly smaller one, and may construct that set mid-drain, so
-    /// the caller asks again after each set rather than draining a list taken
-    /// once: every set is drained, and none before a larger one.
+    /// shutdown that drains one set at a time. A retired-index hand-back
+    /// always goes to a strictly smaller set, which is drained after the
+    /// source; a generation-mismatch hand-back to a larger set reaches one
+    /// that is draining or drained, whose closed mailbox refuses it and leaves
+    /// the rows with the source. A hand-back may construct its target set
+    /// mid-drain, so the caller asks again after each set rather than draining
+    /// a list taken once: every set is drained, and none before a larger one.
     pub(crate) fn largest_undrained_set(&self, drained: &[u32]) -> Option<(u32, Arc<Vec<H>>)> {
         let inner = self.lock();
         inner

@@ -754,8 +754,10 @@ impl SpanShardActor {
                             let _ = done.send(());
                         }
                         Some(SpanShardMsg::Shutdown { done }) => {
+                            let unprocessed = self.close_mailbox().await;
                             self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
                                 .await;
+                            drop(unprocessed);
                             let _ = done.send(());
                             break;
                         }
@@ -792,6 +794,27 @@ impl SpanShardActor {
                 }
             }
         }
+    }
+
+    /// Closes this actor's mailbox before its teardown flush and absorbs every
+    /// hand-back already queued; see `shard::ShardActor::close_mailbox`.
+    async fn close_mailbox(&mut self) -> Vec<SpanShardMsg> {
+        self.rx.close();
+        let mut unprocessed = Vec::new();
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                SpanShardMsg::HandBack {
+                    tenant,
+                    spans,
+                    charges,
+                    arrival,
+                } => {
+                    self.absorb_spans(&tenant, spans, charges, arrival);
+                }
+                other => unprocessed.push(other),
+            }
+        }
+        unprocessed
     }
 
     async fn handle_write(

@@ -100,7 +100,13 @@ struct Counters {
     stale: u64,
     deferred: u64,
     in_flight: u64,
+    hand_back_failures: u64,
+    unscanned: u64,
 }
+
+/// Reads a router's counters through a shared metrics handle, so a case can
+/// read them after `shutdown` consumed the router.
+type CounterSource = Box<dyn Fn() -> Counters + Send + Sync>;
 
 /// What a case needs from one pipeline's router.
 trait Pipe: Send + Sync + Sized + 'static {
@@ -120,11 +126,12 @@ trait Pipe: Send + Sync + Sized + 'static {
     ) -> JoinHandle<String>;
     /// The shard row `i` of `tenant` routes to under `count` shards.
     fn shard_of(tenant: &TenantId, i: usize, count: u32) -> u32;
-    fn counters(&self) -> Counters;
+    fn counter_source(&self) -> CounterSource;
+    fn counters(&self) -> Counters {
+        (self.counter_source())()
+    }
     fn flush(&self) -> impl Future<Output = ()> + Send;
     fn shutdown(self) -> impl Future<Output = ()> + Send + 'static;
-    /// Reads the teardown-unscanned-writes counter, usable after `shutdown`.
-    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static;
     /// Event times of every row in one data object.
     fn rows(data: &[u8]) -> Vec<i64>;
 }
@@ -172,26 +179,29 @@ impl Pipe for IngestRouter {
         shard_for(&metric_point(tenant, i).series_id, count)
     }
 
-    fn counters(&self) -> Counters {
-        let snap = self.metrics().snapshot();
-        Counters {
-            buffered: snap.buffered_points_total,
-            rerouted: snap.rerouted_flushes,
-            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
-            stale: snap.stale_provisioning_flushes,
-            deferred: self
-                .metrics()
-                .shard_skew_by_shard()
-                .into_iter()
-                .map(|(_, s)| s.flush_trigger_deferred)
-                .sum(),
-            in_flight: self
-                .metrics()
-                .in_flight_flushes_by_shard()
-                .into_iter()
-                .map(|(_, n)| n)
-                .sum(),
-        }
+    fn counter_source(&self) -> CounterSource {
+        let metrics = self.metrics_handle();
+        Box::new(move || {
+            let snap = metrics.snapshot();
+            Counters {
+                buffered: snap.buffered_points_total,
+                rerouted: snap.rerouted_flushes,
+                rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
+                stale: snap.stale_provisioning_flushes,
+                deferred: metrics
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flush_trigger_deferred)
+                    .sum(),
+                in_flight: metrics
+                    .in_flight_flushes_by_shard()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+                hand_back_failures: snap.hand_back_failures,
+                unscanned: snap.teardown_unscanned_writes,
+            }
+        })
     }
 
     async fn flush(&self) {
@@ -200,11 +210,6 @@ impl Pipe for IngestRouter {
 
     fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
         Self::shutdown(self)
-    }
-
-    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
-        let metrics = self.metrics_handle();
-        move || metrics.snapshot().teardown_unscanned_writes
     }
 
     fn rows(data: &[u8]) -> Vec<i64> {
@@ -279,26 +284,29 @@ impl Pipe for LogIngestRouter {
         shard_for_log(&log_record(i).stream_id, count)
     }
 
-    fn counters(&self) -> Counters {
-        let snap = self.metrics().snapshot();
-        Counters {
-            buffered: snap.buffered_records_total,
-            rerouted: snap.rerouted_flushes,
-            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
-            stale: snap.stale_provisioning_flushes,
-            deferred: self
-                .metrics()
-                .shard_skew_by_shard()
-                .into_iter()
-                .map(|(_, s)| s.flush_trigger_deferred)
-                .sum(),
-            in_flight: self
-                .metrics()
-                .in_flight_flushes_by_shard()
-                .into_iter()
-                .map(|(_, n)| n)
-                .sum(),
-        }
+    fn counter_source(&self) -> CounterSource {
+        let metrics = self.metrics_handle();
+        Box::new(move || {
+            let snap = metrics.snapshot();
+            Counters {
+                buffered: snap.buffered_records_total,
+                rerouted: snap.rerouted_flushes,
+                rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
+                stale: snap.stale_provisioning_flushes,
+                deferred: metrics
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flush_trigger_deferred)
+                    .sum(),
+                in_flight: metrics
+                    .in_flight_flushes_by_shard()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+                hand_back_failures: snap.hand_back_failures,
+                unscanned: snap.teardown_unscanned_writes,
+            }
+        })
     }
 
     async fn flush(&self) {
@@ -307,11 +315,6 @@ impl Pipe for LogIngestRouter {
 
     fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
         Self::shutdown(self)
-    }
-
-    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
-        let metrics = self.metrics_handle();
-        move || metrics.snapshot().teardown_unscanned_writes
     }
 
     fn rows(data: &[u8]) -> Vec<i64> {
@@ -356,26 +359,29 @@ impl Pipe for SpanIngestRouter {
         shard_for_span(&span(i).trace_id, count)
     }
 
-    fn counters(&self) -> Counters {
-        let snap = self.metrics().snapshot();
-        Counters {
-            buffered: snap.buffered_spans_total,
-            rerouted: snap.rerouted_flushes,
-            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
-            stale: snap.stale_provisioning_flushes,
-            deferred: self
-                .metrics()
-                .shard_skew_by_shard()
-                .into_iter()
-                .map(|(_, s)| s.flush_trigger_deferred)
-                .sum(),
-            in_flight: self
-                .metrics()
-                .in_flight_flushes_by_shard()
-                .into_iter()
-                .map(|(_, n)| n)
-                .sum(),
-        }
+    fn counter_source(&self) -> CounterSource {
+        let metrics = self.metrics_handle();
+        Box::new(move || {
+            let snap = metrics.snapshot();
+            Counters {
+                buffered: snap.buffered_spans_total,
+                rerouted: snap.rerouted_flushes,
+                rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
+                stale: snap.stale_provisioning_flushes,
+                deferred: metrics
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flush_trigger_deferred)
+                    .sum(),
+                in_flight: metrics
+                    .in_flight_flushes_by_shard()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+                hand_back_failures: snap.hand_back_failures,
+                unscanned: snap.teardown_unscanned_writes,
+            }
+        })
     }
 
     async fn flush(&self) {
@@ -384,11 +390,6 @@ impl Pipe for SpanIngestRouter {
 
     fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
         Self::shutdown(self)
-    }
-
-    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
-        let metrics = self.metrics_handle();
-        move || metrics.snapshot().teardown_unscanned_writes
     }
 
     fn rows(data: &[u8]) -> Vec<i64> {
@@ -458,8 +459,19 @@ fn span(i: usize) -> NormalizedSpan {
 /// The first `n` row keys of `tenant` on shard `shard` of the 4-shard set,
 /// skipping `skip` matches so two tenants of one case never share a key.
 fn rows_on<P: Pipe>(tenant: &TenantId, shard: u32, skip: usize, n: usize) -> Vec<usize> {
+    rows_on_count::<P>(tenant, OLD_COUNT, shard, skip, n)
+}
+
+/// [`rows_on`] for a set of `count` shards.
+fn rows_on_count<P: Pipe>(
+    tenant: &TenantId,
+    count: u32,
+    shard: u32,
+    skip: usize,
+    n: usize,
+) -> Vec<usize> {
     (0..10_000)
-        .filter(|&i| P::shard_of(tenant, i, OLD_COUNT) == shard)
+        .filter(|&i| P::shard_of(tenant, i, count) == shard)
         .skip(skip)
         .take(n)
         .collect()
@@ -618,6 +630,8 @@ struct World<P> {
     router: Arc<P>,
     parked: TenantId,
     deferred: TenantId,
+    /// Generation 0's shard count, the router's configured `shard_count`.
+    initial: u32,
 }
 
 impl<P: Pipe> World<P> {
@@ -626,6 +640,7 @@ impl<P: Pipe> World<P> {
     }
 
     async fn with_config(config: IngestConfig) -> Self {
+        let initial = config.shard_count;
         let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = fault.clone();
         let clock = TestClock::new(T0_NS);
@@ -637,7 +652,7 @@ impl<P: Pipe> World<P> {
                 store.as_ref(),
                 &t.hash(),
                 P::SIGNAL,
-                OLD_COUNT,
+                initial,
                 T0_NS,
                 AbsentPolicy::CreateFromConfig,
             )
@@ -658,23 +673,30 @@ impl<P: Pipe> World<P> {
             router,
             parked,
             deferred,
+            initial,
         }
     }
 
     /// Appends the 3-shard successor to both tenants' records. The router has
     /// already read generation 0 and is not told.
     async fn reshard_down(&self) {
+        self.reshard_to(NEW_COUNT).await;
+    }
+
+    /// Appends a `count`-shard generation 1, activating at `ACTIVATION_HOUR`,
+    /// to both tenants' records, without telling the router.
+    async fn reshard_to(&self, count: u32) {
         for t in [&self.parked, &self.deferred] {
             append_generation(
                 self.store.as_ref(),
                 &t.hash(),
                 P::SIGNAL,
-                NEW_COUNT,
+                count,
                 ACTIVATION_HOUR,
                 self.clock.now(),
             )
             .await
-            .expect("append the 3-shard generation");
+            .expect("append generation 1");
         }
     }
 
@@ -695,7 +717,7 @@ impl<P: Pipe> World<P> {
         let gate = self
             .fault
             .hold(Op::Put, Some(parked_data), Occurrence::Nth(1));
-        let parked_key = rows_on::<P>(&self.parked, shard, 0, 1)[0];
+        let parked_key = rows_on_count::<P>(&self.parked, self.initial, shard, 0, 1)[0];
         let parked = self
             .router
             .send_row(&self.parked, parked_key, WriteMode::Buffered);
@@ -1223,10 +1245,14 @@ async fn shutdown_drains_the_largest_set_first<P: Pipe>() {
         ..
     } = world;
     let router = Arc::into_inner(router).expect("sole router owner");
-    let unscanned = router.unscanned_writes();
+    let counters = router.counter_source();
     router.shutdown().await;
 
-    assert_eq!(unscanned(), 0, "nothing was written outside the scan set");
+    assert_eq!(
+        counters().unscanned,
+        0,
+        "nothing was written outside the scan set"
+    );
     assert_eq!(
         keys_under_shard(store.as_ref(), &deferred, P::SIGNAL, RETIRED_SHARD).await,
         Vec::<String>::new()
@@ -1332,6 +1358,142 @@ async fn strict_waiter_on_a_handed_back_buffer_is_abandoned<P: Pipe>() {
     );
 }
 
+/// The increase cases start at 3 shards and reshard up to 4.
+const UP_FROM: u32 = NEW_COUNT;
+const UP_TO: u32 = OLD_COUNT;
+
+fn up_config() -> IngestConfig {
+    IngestConfig {
+        shard_count: UP_FROM,
+        ..config()
+    }
+}
+
+/// The 4-shard index whose teardown flush the race case holds.
+const HELD_SHARD: u32 = 1;
+/// The 3-shard index the race case's late buffer sits on. Its rows route to
+/// `HELD_SHARD` under 4 shards.
+const SOURCE_SHARD: u32 = 2;
+
+/// A hand-back sent to a set that is shutting down is never lost. Shutdown
+/// drains the 4-shard set first; one of its actors is held inside its teardown
+/// flush by a held data PUT. Meanwhile a 3-shard buffer whose flush opens in an
+/// hour the 4-shard generation owns hands its rows up to exactly that actor.
+/// The actor closed its mailbox before the teardown flush, so the send fails as
+/// closed, the rows stay with the source, and the source's own teardown writes
+/// them. Every acknowledged row is stored exactly once.
+///
+/// Guard: the `self.rx.close()` call in each actor's `close_mailbox`. Without
+/// it the send is accepted into a mailbox nothing reads again, the source
+/// gives the rows up, and they are lost when the actor's receiver drops.
+async fn a_hand_back_to_a_draining_set_is_never_lost<P: Pipe>() {
+    let world = World::<P>::with_config(up_config()).await;
+    let keys: Vec<usize> = (0..10_000)
+        .filter(|&i| {
+            P::shard_of(&world.deferred, i, UP_FROM) == SOURCE_SHARD
+                && P::shard_of(&world.deferred, i, UP_TO) == HELD_SHARD
+        })
+        .take(3)
+        .collect();
+    assert_eq!(keys.len(), 3);
+    let parked_key = rows_on_count::<P>(&world.parked, UP_TO, HELD_SHARD, 0, 1)[0];
+    for &i in &keys {
+        let write = world
+            .router
+            .send_row(&world.deferred, i, WriteMode::Buffered);
+        assert_eq!(write.await.expect("write task"), "ok");
+    }
+    world.reshard_to(UP_TO).await;
+    // The late buffer's flush finds its view past the trust horizon and stays
+    // closed until this re-read is released, inside the drain window.
+    let prov = ravel_catalog::provisioning_key(&world.deferred.hash(), P::SIGNAL);
+    let reread = world
+        .fault
+        .hold(Op::Get, Some(prov.clone()), Occurrence::Nth(1));
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    assert!(
+        drive(&world.clock, || world.router.counters().stale == 1).await,
+        "the late flush stays closed on the held re-read, counters {:?}",
+        world.router.counters()
+    );
+    let held_gets = held(&reread, Op::Get, &prov);
+    assert_eq!(held_gets.len(), 1, "the re-read is held");
+
+    let parked_data = format!(
+        "t/{}/{}/l0/",
+        world.parked.hash().to_hex(),
+        P::SIGNAL.key_prefix()
+    );
+    let put = world
+        .fault
+        .hold(Op::Put, Some(parked_data.clone()), Occurrence::Nth(1));
+    let write = world
+        .router
+        .send_row(&world.parked, parked_key, WriteMode::Buffered);
+    assert_eq!(write.await.expect("write task"), "ok");
+
+    let World {
+        router,
+        store,
+        clock,
+        parked,
+        deferred,
+        ..
+    } = world;
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let counters = router.counter_source();
+    let shutdown = tokio::spawn(router.shutdown());
+    assert!(
+        settle(|| !held(&put, Op::Put, &parked_data).is_empty()).await,
+        "the 4-shard set's teardown flush reaches its data PUT"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "the 4-shard set is held in its teardown flush"
+    );
+
+    assert!(reread.release(held_gets[0]));
+    assert!(
+        drive(&clock, || {
+            let c = counters();
+            c.rerouted + c.hand_back_failures > 0
+        })
+        .await,
+        "the late flush hands its rows up while the 4-shard set drains, counters {:?}",
+        counters()
+    );
+    let held_puts = held(&put, Op::Put, &parked_data);
+    assert_eq!(held_puts.len(), 1, "the teardown flush is still held");
+    assert!(put.release(held_puts[0]));
+    shutdown.await.expect("shutdown task");
+
+    let store = store.as_ref();
+    assert_eq!(
+        scanned_rows::<P>(store, &deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "every acknowledged row of the late buffer is stored exactly once, counters {:?}",
+        counters()
+    );
+    assert_eq!(
+        scanned_rows::<P>(store, &parked, H0..=pin_hour + 1).await,
+        expected(&[parked_key]),
+        "the held teardown flush lands"
+    );
+    let c = counters();
+    assert_eq!(c.rerouted, 0, "the draining set accepted nothing");
+    assert_eq!(
+        c.hand_back_failures, 1,
+        "the closed mailbox refused the send"
+    );
+    assert_eq!(c.unscanned, 0);
+    assert_eq!(
+        rows_at::<P>(store, &deferred, SOURCE_SHARD, pin_hour).await,
+        expected(&keys),
+        "the source's teardown wrote the rows in place"
+    );
+}
+
 macro_rules! scan_set_cases {
     ($pipe:ty, $($name:ident => $case:ident),+ $(,)?) => {
         $(
@@ -1355,6 +1517,7 @@ scan_set_cases!(
     metrics_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
     metrics_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     metrics_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
+    metrics_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
 );
 
 scan_set_cases!(
@@ -1369,6 +1532,7 @@ scan_set_cases!(
     logs_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
     logs_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     logs_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
+    logs_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
 );
 
 scan_set_cases!(
@@ -1383,4 +1547,5 @@ scan_set_cases!(
     spans_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
     spans_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     spans_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
+    spans_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
 );

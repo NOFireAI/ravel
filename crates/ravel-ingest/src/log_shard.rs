@@ -1259,8 +1259,10 @@ impl LogShardActor {
                             let _ = done.send(());
                         }
                         Some(LogShardMsg::Shutdown { done }) => {
+                            let unprocessed = self.close_mailbox().await;
                             self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
                                 .await;
+                            drop(unprocessed);
                             let _ = done.send(());
                             break;
                         }
@@ -1297,6 +1299,27 @@ impl LogShardActor {
                 }
             }
         }
+    }
+
+    /// Closes this actor's mailbox before its teardown flush and absorbs every
+    /// hand-back already queued; see `shard::ShardActor::close_mailbox`.
+    async fn close_mailbox(&mut self) -> Vec<LogShardMsg> {
+        self.rx.close();
+        let mut unprocessed = Vec::new();
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                LogShardMsg::HandBack {
+                    tenant,
+                    payload,
+                    charges,
+                    arrival,
+                } => {
+                    self.absorb_records(&tenant, payload, charges, arrival);
+                }
+                other => unprocessed.push(other),
+            }
+        }
+        unprocessed
     }
 
     /// Buffers `records` for `tenant` and opens a size-triggered flush if the

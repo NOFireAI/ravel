@@ -1144,8 +1144,10 @@ impl ShardActor {
                             let _ = done.send(());
                         }
                         Some(ShardMsg::Shutdown { done }) => {
+                            let unprocessed = self.close_mailbox().await;
                             self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
                                 .await;
+                            drop(unprocessed);
                             let _ = done.send(());
                             break;
                         }
@@ -1187,6 +1189,33 @@ impl ShardActor {
                 }
             }
         }
+    }
+
+    /// Closes this actor's mailbox before its teardown flush, so every later
+    /// send fails as closed and its sender keeps the message, and absorbs every
+    /// hand-back already queued: a hand-back this mailbox accepted is written
+    /// by this drain. Any other message still queued is returned for the
+    /// caller to drop after the drain, which is when the receiver dropped it
+    /// before this existed. A `Write` cannot be queued here through the
+    /// router, whose `shutdown` consumes it.
+    async fn close_mailbox(&mut self) -> Vec<ShardMsg> {
+        self.rx.close();
+        let mut unprocessed = Vec::new();
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                ShardMsg::HandBack {
+                    tenant,
+                    points,
+                    exemplars,
+                    charges,
+                    arrival,
+                } => {
+                    self.absorb_rows(&tenant, points, exemplars, charges, arrival);
+                }
+                other => unprocessed.push(other),
+            }
+        }
+        unprocessed
     }
 
     /// Merges one write into its tenant buffer and opens a size-triggered flush
