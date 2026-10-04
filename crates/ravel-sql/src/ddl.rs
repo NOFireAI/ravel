@@ -707,28 +707,32 @@ impl ObjectStoreBackend for ProbeKeyRecorder {
     }
 }
 
-/// Deletes the probe object [`probe_not_ravel_bucket`] wrote if the probe is
-/// dropped before its own delete runs, which is what the statement deadline
-/// does to it. The delete is spawned on the current tokio runtime, best
-/// effort; with no runtime it is skipped. Call [`ProbeObjectGuard::disarm`]
-/// once the probe returns: by then the probe has issued its own delete.
+/// Deletes the probe object [`probe_not_ravel_bucket`] wrote if the guard is
+/// dropped while armed. The delete is spawned on the current tokio runtime,
+/// best effort; with no runtime it is skipped. It goes through `delete_store`,
+/// which the statement's cost does not count: the task outlives the statement,
+/// so whether its request landed before the cost was read would be a race.
+/// [`guarded_ravel_bucket_probe`] says when the guard is disarmed.
 struct ProbeObjectGuard {
-    store: Arc<dyn ObjectStoreBackend>,
+    delete_store: Arc<dyn ObjectStoreBackend>,
     put_key: Arc<OnceLock<String>>,
     armed: bool,
 }
 
 impl ProbeObjectGuard {
     /// The guard, and the store to pass to [`probe_not_ravel_bucket`] as
-    /// Ravel's own.
-    fn new(store: Arc<dyn ObjectStoreBackend>) -> (Self, ProbeKeyRecorder) {
+    /// Ravel's own: `probe_store`, with the key of its put recorded.
+    fn new(
+        probe_store: Arc<dyn ObjectStoreBackend>,
+        delete_store: Arc<dyn ObjectStoreBackend>,
+    ) -> (Self, ProbeKeyRecorder) {
         let put_key = Arc::new(OnceLock::new());
         let recorder = ProbeKeyRecorder {
-            inner: Arc::clone(&store),
+            inner: probe_store,
             put_key: Arc::clone(&put_key),
         };
         let guard = Self {
-            store,
+            delete_store,
             put_key,
             armed: true,
         };
@@ -752,7 +756,7 @@ impl Drop for ProbeObjectGuard {
             tracing::warn!(key = %key, "no runtime to delete the cancelled bucket probe's object");
             return;
         };
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.delete_store);
         runtime.spawn(async move {
             if let Err(e) = store.delete(&key).await {
                 tracing::warn!(
@@ -763,6 +767,29 @@ impl Drop for ProbeObjectGuard {
             }
         });
     }
+}
+
+/// [`probe_not_ravel_bucket`] with its probe object guarded on the two paths
+/// where the probe itself never deletes it: the future is dropped mid-probe
+/// (the statement deadline), and the probe's put is reported as failed, which
+/// a put that timed out after the object landed also is. On every other
+/// return the probe has issued its own delete and the guard is disarmed.
+/// `probe_store` serves the probe's requests and `delete_store` the guard's
+/// delete.
+async fn guarded_ravel_bucket_probe(
+    probe_store: Arc<dyn ObjectStoreBackend>,
+    delete_store: Arc<dyn ObjectStoreBackend>,
+    candidate_store: &dyn ObjectStoreBackend,
+) -> Result<(), RavelBucketProbeFailure> {
+    let (mut guard, probe_ravel) = ProbeObjectGuard::new(probe_store, delete_store);
+    let probed = probe_not_ravel_bucket(&probe_ravel, candidate_store).await;
+    if !matches!(
+        probed,
+        Err(RavelBucketProbeFailure::ProbeWriteFailed { .. })
+    ) {
+        guard.disarm();
+    }
+    probed
 }
 
 impl SqlExecutor {
@@ -912,11 +939,13 @@ impl SqlExecutor {
                         location: location.clone(),
                         source,
                     })?;
-                let (mut probe_guard, probe_ravel) =
-                    ProbeObjectGuard::new(Arc::new(recorder.probe_store(ravel_store)));
-                let probed = probe_not_ravel_bucket(&probe_ravel, &probe_external).await;
-                probe_guard.disarm();
-                probed.map_err(|source| DdlExecuteError::RavelBucketProbe {
+                guarded_ravel_bucket_probe(
+                    Arc::new(recorder.probe_store(ravel_store)),
+                    Arc::clone(ravel_store),
+                    &probe_external,
+                )
+                .await
+                .map_err(|source| DdlExecuteError::RavelBucketProbe {
                     location: location.clone(),
                     source,
                 })?;
@@ -1716,7 +1745,7 @@ mod tests {
     fn armed_probe_guard_dropped_outside_a_runtime_does_not_panic() {
         let store: Arc<dyn ObjectStoreBackend> =
             Arc::new(ravel_object_store::memory::MemoryStore::new());
-        let (guard, recorder) = ProbeObjectGuard::new(store);
+        let (guard, recorder) = ProbeObjectGuard::new(Arc::clone(&store), store);
         recorder
             .put_key
             .set("sys/pq-probe/k".to_string())
@@ -1729,7 +1758,7 @@ mod tests {
     async fn disarmed_probe_guard_deletes_nothing() {
         let memory = Arc::new(ravel_object_store::memory::MemoryStore::new());
         let store: Arc<dyn ObjectStoreBackend> = memory.clone();
-        let (mut guard, recorder) = ProbeObjectGuard::new(store);
+        let (mut guard, recorder) = ProbeObjectGuard::new(Arc::clone(&store), store);
         recorder
             .put(
                 "sys/pq-probe/k",
@@ -1744,5 +1773,50 @@ mod tests {
             tokio::task::yield_now().await;
         }
         memory.head("sys/pq-probe/k").await.expect("still there");
+    }
+
+    /// A probe put that lands and is then reported as failed (a timeout after
+    /// the write) returns through the probe's one path that issues no delete.
+    /// The guard stays armed on that path and deletes the object. Mutation
+    /// that fails it: disarming the guard on every return.
+    #[tokio::test]
+    async fn a_probe_write_that_landed_and_was_reported_failed_is_deleted() {
+        use ravel_object_store::fault::{
+            FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
+        };
+        use ravel_object_store::memory::MemoryStore;
+
+        let ravel = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(Rule::new(Op::Put, ScriptedFault::DuplicateDelivery)),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        let candidate = MemoryStore::new();
+
+        let failure = guarded_ravel_bucket_probe(Arc::clone(&store), store, &candidate)
+            .await
+            .expect_err("a put reported as failed fails the probe");
+        let key = match failure {
+            RavelBucketProbeFailure::ProbeWriteFailed { key, .. } => key,
+            other => panic!("expected ProbeWriteFailed, got {other:?}"),
+        };
+        assert_eq!(
+            ravel.fault_count(Op::Put, FaultKind::DuplicateDelivery),
+            1,
+            "the put must have landed and been reported as failed"
+        );
+
+        // `MemoryStore` never yields, so the guard's spawned delete has not
+        // run yet: the object is there, which is what makes this a leak.
+        let mut present = ravel.inner().head(&key).await.is_ok();
+        assert!(present, "the reported-failed put must have landed {key}");
+        for _ in 0..100 {
+            if !present {
+                break;
+            }
+            tokio::task::yield_now().await;
+            present = ravel.inner().head(&key).await.is_ok();
+        }
+        assert!(!present, "the probe object {key} must be deleted");
     }
 }
