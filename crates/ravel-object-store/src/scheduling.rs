@@ -69,6 +69,17 @@
 //! every wrapper in between (instrumentation, KMS routing) without each of
 //! them forwarding a new method.
 //!
+//! A whole-object read ([`GetRange::Full`]) on [`S3Store`] fans out too, but
+//! only once its first response shows the object is larger than one request
+//! carries; most whole-object reads (commit records, footers, index objects)
+//! are one request. So the handle's `get`, `get_pinned` and `get_with_pin`
+//! take one permit and run the inner read under a budget of it, and the store
+//! widens that budget (`widen_request_budget`) at the point it knows how many
+//! ranged GETs remain, toward that count capped at its own concurrency, with
+//! the same never-waiting rule. Permits taken that way stay with the read
+//! until it returns. A read the store never splits, a ranged or suffix read
+//! included, holds its one permit throughout.
+//!
 //! [`S3Store::put`]: crate::s3::S3Store
 //! [`S3Store`]: crate::s3::S3Store
 //!
@@ -102,16 +113,43 @@ use crate::{
 };
 
 tokio::task_local! {
-    /// How many store requests the op running in this scope may have in
-    /// flight at once: the permits its [`ScheduledHandle`] holds.
-    static REQUEST_BUDGET: usize;
+    /// The permits the op running in this scope holds from its
+    /// [`ScheduledHandle`]: how many store requests it may have in flight at
+    /// once.
+    static REQUEST_BUDGET: RequestBudget;
+}
+
+/// The permits one scheduled op holds, and the class it takes more from.
+struct RequestBudget {
+    permits: parking_lot::Mutex<Vec<Permit>>,
+    scheduler: Arc<RequestScheduler>,
+    class: RequestClass,
 }
 
 /// The number of store requests the current op may have in flight at once,
 /// when a scheduled handle admitted it; `None` when no scheduler is in the
 /// call path, so the store applies its own bound.
 pub(crate) fn request_budget() -> Option<usize> {
-    REQUEST_BUDGET.try_with(|budget| *budget).ok()
+    REQUEST_BUDGET
+        .try_with(|budget| budget.permits.lock().len())
+        .ok()
+}
+
+/// Raise the current op's request budget toward `want` with the permits
+/// admission grants right now, never waiting, and return the budget after.
+/// `None` when no scheduler is in the call path. For an op whose fan-out the
+/// store learns only partway through; see "Ops that fan out" in the
+/// [module docs](self).
+pub(crate) fn widen_request_budget(want: usize) -> Option<usize> {
+    REQUEST_BUDGET
+        .try_with(|budget| {
+            let mut permits = budget.permits.lock();
+            budget
+                .scheduler
+                .take_free(budget.class, &mut permits, want);
+            permits.len()
+        })
+        .ok()
 }
 
 /// How many requests one `put` of `len` bytes under `mode` can have in flight
@@ -317,13 +355,19 @@ impl RequestScheduler {
     /// fewer than one permit, nor more than `want` (when `want >= 1`).
     async fn acquire_up_to(&self, class: RequestClass, want: usize) -> Vec<Permit> {
         let mut permits = vec![self.acquire(class).await];
+        self.take_free(class, &mut permits, want);
+        permits
+    }
+
+    /// Add permits of `class` to `permits` that admission grants without
+    /// waiting, until it holds `want` or none is free.
+    fn take_free(&self, class: RequestClass, permits: &mut Vec<Permit>, want: usize) {
         while permits.len() < want {
             match self.try_acquire_now(class) {
                 Some(permit) => permits.push(permit),
                 None => break,
             }
         }
-        permits
     }
 
     /// One more permit of `class` if admission would grant it immediately:
@@ -608,6 +652,17 @@ impl ScheduledHandle {
         self.metrics
             .record_op(op, elapsed, bytes, result.as_ref().err());
     }
+
+    /// Run `op` under a request budget of `permits`, which it holds, along
+    /// with any it adds by widening, until it finishes.
+    async fn under_budget<T>(&self, permits: Vec<Permit>, op: impl Future<Output = T>) -> T {
+        let budget = RequestBudget {
+            permits: parking_lot::Mutex::new(permits),
+            scheduler: Arc::clone(&self.scheduler),
+            class: self.class,
+        };
+        REQUEST_BUDGET.scope(budget, op).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -627,17 +682,22 @@ impl ObjectStoreBackend for ScheduledHandle {
         let want = put_permits_wanted(&self.inner.capabilities(), data.len(), &opts.mode);
         let permits = self.scheduler.acquire_up_to(self.class, want).await;
         let start = self.clock.now_nanos();
-        let result = REQUEST_BUDGET
-            .scope(permits.len(), self.inner.put(key, data, opts))
+        let result = self
+            .under_budget(permits, self.inner.put(key, data, opts))
             .await;
         self.record(StoreOp::Put, start, bytes, &result);
         result
     }
 
+    /// Takes one permit and runs the inner read under a request budget of it,
+    /// which a whole-object read the store splits widens with free permits.
+    /// See "Ops that fan out" in the [module docs](self).
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        let _permit = self.scheduler.acquire(self.class).await;
+        let permit = self.scheduler.acquire(self.class).await;
         let start = self.clock.now_nanos();
-        let result = self.inner.get(key, range).await;
+        let result = self
+            .under_budget(vec![permit], self.inner.get(key, range))
+            .await;
         let bytes = result
             .as_ref()
             .map_or(0, |outcome| outcome.data.len() as u64);
@@ -653,9 +713,11 @@ impl ObjectStoreBackend for ScheduledHandle {
         range: GetRange,
         pin: &crate::Pin,
     ) -> Result<crate::PinnedRead, StoreError> {
-        let _permit = self.scheduler.acquire(self.class).await;
+        let permit = self.scheduler.acquire(self.class).await;
         let start = self.clock.now_nanos();
-        let result = self.inner.get_pinned(key, range, pin).await;
+        let result = self
+            .under_budget(vec![permit], self.inner.get_pinned(key, range, pin))
+            .await;
         let bytes = result
             .as_ref()
             .map_or(0, |read| read.outcome.data.len() as u64);
@@ -670,9 +732,11 @@ impl ObjectStoreBackend for ScheduledHandle {
         key: &str,
         range: GetRange,
     ) -> Result<crate::PinnedRead, StoreError> {
-        let _permit = self.scheduler.acquire(self.class).await;
+        let permit = self.scheduler.acquire(self.class).await;
         let start = self.clock.now_nanos();
-        let result = self.inner.get_with_pin(key, range).await;
+        let result = self
+            .under_budget(vec![permit], self.inner.get_with_pin(key, range))
+            .await;
         let bytes = result
             .as_ref()
             .map_or(0, |read| read.outcome.data.len() as u64);
@@ -887,6 +951,12 @@ mod tests {
         deletes: AtomicU64,
         /// The request budget each `put` ran under, in call order.
         put_budgets: parking_lot::Mutex<Vec<Option<usize>>>,
+        /// The request budget each `get` started under, in call order.
+        get_budgets: parking_lot::Mutex<Vec<Option<usize>>>,
+        /// When nonzero, each `get` widens its budget toward this many permits
+        /// and records the result in `get_widened`.
+        get_widen_to: usize,
+        get_widened: parking_lot::Mutex<Vec<Option<usize>>>,
         /// Declared as [`Capabilities::upload_checksum`].
         upload_checksum: bool,
     }
@@ -909,6 +979,12 @@ mod tests {
 
         async fn get(&self, _key: &str, _range: GetRange) -> Result<GetOutcome, StoreError> {
             self.gets.fetch_add(1, Ordering::SeqCst);
+            self.get_budgets.lock().push(request_budget());
+            if self.get_widen_to > 0 {
+                self.get_widened
+                    .lock()
+                    .push(widen_request_budget(self.get_widen_to));
+            }
             Ok(GetOutcome {
                 data: Bytes::new(),
                 etag: crate::Etag("fake".into()),
@@ -1668,6 +1744,61 @@ mod tests {
             .await
             .expect("put");
         assert_eq!(*counting.put_budgets.lock(), vec![None]);
+    }
+
+    /// A read starts under a budget of the one permit its handle takes (issue
+    /// #2493), through `get` and `get_with_pin` alike and however many
+    /// permits are free. A store widening that budget gets the free permits of
+    /// the read's class up to what it asks for, and only those, never
+    /// waiting: four in an idle foreground class, two in a background class of
+    /// two, three with five of eight held elsewhere, and its own one with
+    /// seven held. Every permit comes back when the read returns, background
+    /// floor slots included, and passthrough has no budget to widen.
+    #[tokio::test]
+    async fn a_get_runs_under_a_budget_it_can_widen_with_free_permits() {
+        let counting = Arc::new(CountingStore {
+            get_widen_to: 4,
+            ..CountingStore::default()
+        });
+        let cs = ClassedStore::scheduled(
+            Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>,
+            SchedulerConfig::new(8, 2, 1),
+        );
+        let fg = cs.foreground();
+        let bg = cs.background();
+        fg.get("a", GetRange::Full).await.expect("get");
+        fg.get_with_pin("b", GetRange::Range(0, 1))
+            .await
+            .expect("get_with_pin");
+        bg.get("c", GetRange::Full).await.expect("get");
+        for elsewhere in [5, 7] {
+            let held = scheduler(&cs)
+                .acquire_up_to(RequestClass::Foreground, elsewhere)
+                .await;
+            assert_eq!(held.len(), elsewhere);
+            fg.get("d", GetRange::Full).await.expect("get");
+        }
+        assert_eq!(*counting.get_budgets.lock(), vec![Some(1); 5]);
+        assert_eq!(
+            *counting.get_widened.lock(),
+            vec![Some(4), Some(4), Some(2), Some(3), Some(1)]
+        );
+        let sched = scheduler(&cs);
+        assert_eq!(sched.global.available_permits(), 8);
+        assert_eq!(sched.bg_sem.available_permits(), 2);
+        assert_eq!(sched.bg_committed.load(Ordering::SeqCst), 0);
+
+        let counting = Arc::new(CountingStore {
+            get_widen_to: 4,
+            ..CountingStore::default()
+        });
+        let cs = ClassedStore::passthrough(Arc::clone(&counting) as Arc<dyn ObjectStoreBackend>);
+        cs.foreground()
+            .get("e", GetRange::Full)
+            .await
+            .expect("get");
+        assert_eq!(*counting.get_budgets.lock(), vec![None]);
+        assert_eq!(*counting.get_widened.lock(), vec![None]);
     }
 
     /// A large overwrite over a `MemoryStore`, which never splits a put, holds
