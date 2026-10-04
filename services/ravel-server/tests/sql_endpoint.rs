@@ -635,6 +635,25 @@ fn build_router_accounted(
     parquet: Option<ravel_sql::ParquetSources>,
     query_accounting: Arc<ravel_server::metrics::QueryAccountingMetrics>,
 ) -> Router {
+    build_router_admitted(
+        store,
+        principals,
+        audit_sink,
+        parquet,
+        query_accounting,
+        ravel_query::QueryConcurrencyLimit::Unlimited,
+    )
+}
+
+/// [`build_router_accounted`] under a caller-chosen admission `limit`.
+fn build_router_admitted(
+    store: Arc<dyn ObjectStoreBackend>,
+    principals: HashMap<String, Principal>,
+    audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
+    parquet: Option<ravel_sql::ParquetSources>,
+    query_accounting: Arc<ravel_server::metrics::QueryAccountingMetrics>,
+    limit: ravel_query::QueryConcurrencyLimit,
+) -> Router {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
@@ -656,9 +675,7 @@ fn build_router_accounted(
         clock: Arc::new(FixedClock),
         max_deadline: Duration::from_secs(30),
         query_accounting,
-        query_admission: ravel_query::QueryAdmissionController::shared(
-            ravel_query::QueryConcurrencyLimit::Unlimited,
-        ),
+        query_admission: ravel_query::QueryAdmissionController::shared(limit),
         audit_sink,
     })
 }
@@ -1767,6 +1784,152 @@ async fn a_failed_attempted_record_refuses_before_any_store_call() {
         sink.take(),
         Vec::<(String, String, String)>::new(),
         "the failed submission leaves nothing durable"
+    );
+}
+
+/// Sends `CREATE_CLICKS` through `ddl_app` and checks it is refused with 503
+/// `unavailable`, after a `SELECT` through `read_app` has populated
+/// `ravel_query_*`; both routers record into `query_accounting`. The refusal
+/// moves `ravel_sql_ddl_statements_total{kind="create",outcome="error"}` by
+/// exactly one, adds nothing to any `ravel_sql_ddl_store_*` sample, and leaves
+/// every `ravel_query_*` line unchanged.
+async fn assert_refused_ddl_counts_one_error(
+    ddl_app: &Router,
+    read_app: &Router,
+    query_accounting: Arc<ravel_server::metrics::QueryAccountingMetrics>,
+) {
+    let metrics = ddl_metrics_router(Arc::new(MemoryStore::new()), query_accounting);
+    let (status, value) = post_json(read_app, "read-token", "SELECT 1").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let before = scrape_metrics(&metrics).await;
+    assert!(
+        query_family_lines(&before)
+            .iter()
+            .any(|line| line.starts_with("ravel_query_queries_total{")),
+        "the SELECT must have populated ravel_query_*:\n{before}"
+    );
+
+    let (status, value) = post_json(ddl_app, "ddl-token", CREATE_CLICKS).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["errorType"], "unavailable", "{value}");
+    let after = scrape_metrics(&metrics).await;
+
+    assert_eq!(
+        series_delta(
+            &before,
+            &after,
+            "ravel_sql_ddl_statements_total{mode=\"all\",tenant_hash=\"other\",\
+             kind=\"create\",outcome=\"error\"}"
+        ),
+        1
+    );
+    let ddl_store_total = |scrape: &str| -> u64 {
+        scrape
+            .lines()
+            .filter(|line| line.starts_with("ravel_sql_ddl_store_"))
+            .map(|line| {
+                line.rsplit(' ')
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .expect("integer sample")
+            })
+            .sum()
+    };
+    assert_eq!(
+        ddl_store_total(&after),
+        ddl_store_total(&before),
+        "a refused statement carries zero cost"
+    );
+    assert_eq!(
+        query_family_lines(&after),
+        query_family_lines(&before),
+        "a refused statement must leave every ravel_query_* line unchanged"
+    );
+}
+
+/// A failed `attempted` submission refuses the statement and counts it once
+/// as `error` with zero cost, outside the `ravel_query_*` family.
+#[tokio::test]
+async fn a_failed_attempted_record_counts_one_ddl_error_and_no_query() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let query_accounting = Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+        std::collections::HashSet::new(),
+    ));
+    let sink = Arc::new(FailingAuditSink::new(1));
+    let ddl_app = build_router_accounted(
+        Arc::clone(&store),
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant: tenant.clone(),
+                ddl: true,
+            },
+        )]),
+        sink.clone(),
+        None,
+        Arc::clone(&query_accounting),
+    );
+    let read_app = build_router_accounted(
+        store,
+        HashMap::from([("read-token".to_string(), Principal { tenant, ddl: false })]),
+        Arc::new(ravel_maintain::NoopQueryAuditSink),
+        None,
+        Arc::clone(&query_accounting),
+    );
+
+    assert_refused_ddl_counts_one_error(&ddl_app, &read_app, query_accounting).await;
+    assert_eq!(
+        sink.calls.load(Ordering::SeqCst),
+        1,
+        "the attempted submission is the only one, and it failed"
+    );
+    assert_eq!(sink.take(), Vec::<(String, String, String)>::new());
+}
+
+/// A statement refused by admission inside the spawned DDL task counts once
+/// as `error` with zero cost, outside the `ravel_query_*` family. A
+/// `Bounded(0)` limit refuses every admission.
+#[tokio::test]
+async fn an_admission_refusal_counts_one_ddl_error_and_no_query() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let query_accounting = Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+        std::collections::HashSet::new(),
+    ));
+    let sink = Arc::new(RecordingAuditSink::default());
+    let ddl_app = build_router_admitted(
+        Arc::clone(&store),
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant: tenant.clone(),
+                ddl: true,
+            },
+        )]),
+        sink.clone(),
+        None,
+        Arc::clone(&query_accounting),
+        ravel_query::QueryConcurrencyLimit::Bounded(0),
+    );
+    let read_app = build_router_accounted(
+        store,
+        HashMap::from([("read-token".to_string(), Principal { tenant, ddl: false })]),
+        Arc::new(ravel_maintain::NoopQueryAuditSink),
+        None,
+        Arc::clone(&query_accounting),
+    );
+
+    assert_refused_ddl_counts_one_error(&ddl_app, &read_app, query_accounting).await;
+    let statuses: Vec<String> = sink
+        .take()
+        .into_iter()
+        .map(|(_, status, _)| status)
+        .collect();
+    assert_eq!(
+        statuses,
+        vec!["attempted".to_string(), "error".to_string()],
+        "the refusal comes after the attempted record, inside the task"
     );
 }
 
