@@ -1023,34 +1023,26 @@ jobs:
   # toward a shared cap. `flight-sql` was similarly probed here once and moved
   # to its own job.
   #
-  # This job is a required check (main's protect-main ruleset lists it), so a
+  # `features` is a required check (main's protect-main ruleset lists it), so a
   # break here blocks a merge. A feature added to ravel-bench therefore
   # belongs in the list above in the same change that adds the feature.
-  features:
+  #
+  # One matrix leg per compile configuration (issue #1793). The configurations
+  # share no workspace artifacts, so as one job they ran back to back: 23.7
+  # minutes at the median with a warm cache, the longest job in the workflow.
+  # The required check is the `features` job below, which reports on the whole
+  # matrix under the name the ruleset already lists.
+  features-lane:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    # 45m, measured (issue #1793). The ravel-bench probes are separate,
-    # mutually non-sharing compile configurations (arrow, parquet,
-    # object_store, datafusion, arrow-flight all appear across them), so this
-    # job pays a full build per lane and a cache miss is expensive:
-    #
-    #   warm cache  15m43s  (main run 34839481011)
-    #   cold cache  28m35s  (main run 34882054056, "No cache found")
-    #               30m15s  (PR #1783, same, over the old 30m and reported as
-    #                        `cancelled` rather than as a timeout)
-    #
-    # The old 30m covered the warm case only, so every cache eviction was a
-    # coin flip on a required check. 45m covers the measured cold run with
-    # margin. The spread is cache state, not growth: between the two runs
-    # above every compile step scaled by roughly the same factor.
-    #
-    # Two steps carry over half of a cold run (Test sql-latency 7m41s, Test
-    # sql-latency,profiling,flight-lane 7m07s). Splitting them into their own
-    # job would let both halves fit, and would also need the new job added to
-    # the required-checks set or it drops out of the merge gate; #1793 holds
-    # that.
-    timeout-minutes: 45
+    # 30m per leg. The whole job measured 28m35s to 38m on a cold cache when
+    # it was one job, and no leg carries more than about a third of it.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [parquet-baseline, sql-latency, sql-latency-wide, stage-timing]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1063,27 +1055,61 @@ jobs:
           background: "true"
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
+      - name: Install nextest
+        uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+        with:
+          tool: nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          # The automatic key names the job, not the matrix entry, so without
+          # this every leg would restore whichever leg saved first and build
+          # the rest of its own dependencies cold.
+          key: ${{ matrix.lane }}
           # Restore everywhere, save only on main: a cache written on a PR ref
           # is readable only by that same pull request's later runs, one on a
           # queue ref by nothing at all, and both die with the ref while
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Every step below is gated on one matrix entry. A leg whose name matches
+      # none of them would skip every step and report success, so the name is
+      # checked first.
+      - name: Assert the lane is one this job knows
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          case "$LANE" in
+            parquet-baseline|sql-latency|sql-latency-wide|stage-timing)
+              echo "lane: $LANE" ;;
+            *)
+              echo "::error::unknown features lane '$LANE'; no step would run for it"
+              exit 1 ;;
+          esac
+      # Tests run under nextest, which runs test binaries in parallel; under
+      # `cargo test` they ran one binary at a time and took 849 s of the job.
+      # nextest does not run doctests, so each test step keeps a doctest step
+      # with the same selection.
       - name: Test ravel-bench --features parquet-baseline
-        run: cargo test --locked -p ravel-bench --features parquet-baseline
+        if: matrix.lane == 'parquet-baseline'
+        run: cargo nextest run --locked -p ravel-bench --features parquet-baseline
         # The read-accounting module and its integration tests exist only
         # under this feature, so their tests run here or nowhere. No test
         # filter: a filter that matches nothing still exits 0. This also
         # builds everything a `cargo check` of the feature would.
+      - name: Doctests ravel-bench --features parquet-baseline
+        if: matrix.lane == 'parquet-baseline'
+        run: cargo test --locked --doc -p ravel-bench --features parquet-baseline
       - name: Check ravel-bench --features flight-egress
+        if: matrix.lane == 'parquet-baseline'
         run: cargo check --locked -p ravel-bench --features flight-egress
       - name: Check ravel-bench --features profiling
+        if: matrix.lane == 'parquet-baseline'
         run: cargo check --locked -p ravel-bench --features profiling
       - name: Check ravel-bench --features flight-lane
+        if: matrix.lane == 'parquet-baseline'
         run: cargo check --locked -p ravel-bench --features flight-lane
       - name: Check ravel-bench --features sql-latency
+        if: matrix.lane == 'sql-latency'
         run: cargo check --locked -p ravel-bench --features sql-latency --all-targets
         # The one lane here that also RUNS its tests. A compile probe is the
         # right trade for a bench binary that only has to keep linking. It is
@@ -1091,13 +1117,21 @@ jobs:
         # test-enforced gate: every construct a corpus entry names must exist
         # in the conformance registry as supported. A compile-only probe would
         # let that gate rot while this lane stayed green, the same failure the
-        # flight-sql note above describes. The compile cost is already paid by
-        # the step above (same feature set, same target dir).
+        # flight-sql note above describes.
       - name: Test ravel-bench --features sql-latency
-        run: cargo test --locked -p ravel-bench --features sql-latency
+        if: matrix.lane == 'sql-latency'
+        run: cargo nextest run --locked -p ravel-bench --features sql-latency
+      - name: Doctests ravel-bench --features sql-latency
+        if: matrix.lane == 'sql-latency'
+        run: cargo test --locked --doc -p ravel-bench --features sql-latency
       - name: Test ravel-bench --features sql-latency,profiling,flight-lane
-        run: cargo test --locked -p ravel-bench --features sql-latency,profiling,flight-lane
+        if: matrix.lane == 'sql-latency-wide'
+        run: cargo nextest run --locked -p ravel-bench --features sql-latency,profiling,flight-lane
+      - name: Doctests ravel-bench --features sql-latency,profiling,flight-lane
+        if: matrix.lane == 'sql-latency-wide'
+        run: cargo test --locked --doc -p ravel-bench --features sql-latency,profiling,flight-lane
       - name: Check ravel-bench --features stage-timing
+        if: matrix.lane == 'stage-timing'
         run: cargo check --locked -p ravel-bench --features stage-timing --all-targets
         # RUN the stage-timing acceptance test, not merely compile it (ADR-0104
         # decision 2b). The test drives the default-built `ingest_bench` binary
@@ -1108,8 +1142,13 @@ jobs:
         # constructor param would break: it proves the CALLERS link, not just
         # the crate that declares the feature.
       - name: Test ravel-bench --features stage-timing
-        run: cargo test --locked -p ravel-bench --features stage-timing
+        if: matrix.lane == 'stage-timing'
+        run: cargo nextest run --locked -p ravel-bench --features stage-timing
+      - name: Doctests ravel-bench --features stage-timing
+        if: matrix.lane == 'stage-timing'
+        run: cargo test --locked --doc -p ravel-bench --features stage-timing
       - name: Clippy ravel-logseg + ravel-ingest --features stage-timing
+        if: matrix.lane == 'stage-timing'
         run: cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings
         # The step above enables ravel-logseg/stage-timing and
         # ravel-ingest/stage-timing transitively, so it does type-check their
@@ -1126,12 +1165,53 @@ jobs:
         # issue #1522, so including it would make this lane red for a reason
         # unrelated to the seam.
       - name: Test ravel-logseg + ravel-ingest --features stage-timing
-        run: cargo test --locked -p ravel-logseg -p ravel-ingest --features stage-timing
+        if: matrix.lane == 'stage-timing'
+        run: cargo nextest run --locked -p ravel-logseg -p ravel-ingest --features stage-timing
+      - name: Doctests ravel-logseg + ravel-ingest --features stage-timing
+        if: matrix.lane == 'stage-timing'
+        run: cargo test --locked --doc -p ravel-logseg -p ravel-ingest --features stage-timing
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
         with:
           phase: report
+
+  # The required check for the matrix above, under the name main's
+  # protect-main ruleset lists. Runs whatever the matrix did, because a skipped
+  # required check passes: a cancelled leg, or a matrix that never started
+  # because `changes` failed, would otherwise read as green.
+  features:
+    needs: [changes, features-lane]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Decide the features lanes
+        env:
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          LANES_RESULT: ${{ needs.features-lane.result }}
+        run: |
+          echo "docs_only=$DOCS_ONLY changes=$CHANGES_RESULT features-lane=$LANES_RESULT"
+          if [ "$CHANGES_RESULT" != "success" ]; then
+            echo "::error::the changes job did not succeed ($CHANGES_RESULT); the feature lanes cannot be judged"
+            exit 1
+          fi
+          if [ "$DOCS_ONLY" = "true" ]; then
+            # A docs-only change. The matrix is expected to have skipped; any
+            # other result means the gating itself is wrong.
+            if [ "$LANES_RESULT" != "skipped" ]; then
+              echo "::error::docs_only is true but features-lane reported $LANES_RESULT"
+              exit 1
+            fi
+            echo "docs-only change; no feature lane applies"
+            exit 0
+          fi
+          if [ "$LANES_RESULT" != "success" ]; then
+            echo "::error::features-lane reported $LANES_RESULT; the feature lanes are not green"
+            exit 1
+          fi
+          echo "every feature lane passed"
 
   # The `ravel-server --features otap` lane (issue #1590), split out of
   # `features` above so no single job carries every feature lane. This links

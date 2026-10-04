@@ -143,8 +143,11 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # scan does not count, and its `report` job uses no action at all. Raised
 # 107->108 when ci.yml's `tla` job gained a second download-artifact step
 # that retries the marker download. Raised 108->110 when ci.yml gained the
-# `all-features` job (issue #1925): a checkout and a rust-cache.
-WORKFLOW_EXPECTED_ACTION_COUNT=110
+# `all-features` job (issue #1925): a checkout and a rust-cache. Raised 110->111
+# when ci.yml's `features` job became the `features-lane` matrix (issue #1793):
+# the matrix job adds a nextest install (taiki-e/install-action), and the
+# `features` job that reports on it uses no action at all.
+WORKFLOW_EXPECTED_ACTION_COUNT=111
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
