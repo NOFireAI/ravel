@@ -34,6 +34,10 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
+# The `--tenant-kms-config` file (`tenant_kms`), parsed here so ravel-server
+# and ravel-cli share one parser. Same pin as both binaries' own direct
+# dependency; adds no new crate to Cargo.lock.
+toml = "1"
 
 [dev-dependencies]
 proptest = { workspace = true }

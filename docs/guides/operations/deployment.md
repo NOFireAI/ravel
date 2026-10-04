@@ -287,9 +287,9 @@ the roles that create them. The steps:
    `sys/gc` without starting `maintain`, run `ravel-cli gc-config set` under
    the Admin credential with the values described above.
 
-The per-tenant objects need no step of their own. A process started with
-`--tenant-kms-config` creates each named tenant's key-epoch record at startup
-if it is absent. The gateway creates a tenant's provisioning record on the
+The per-tenant objects need no step of their own. A server process started
+with `--tenant-kms-config` creates each named tenant's key-epoch record at
+startup if it is absent; `ravel-cli` never creates it. The gateway creates a tenant's provisioning record on the
 tenant's first write and its metric metadata record on the first metadata
 flush. A tenant with no config record runs on the deployment defaults, and a
 keyed bucket with no `sys/auth` has no durable tokens yet.
@@ -330,22 +330,33 @@ operator credential rather than a service credential:
   `gc-config set`, `provision adopt`, legal holds, `tenant parquet-grant add`
   and `remove`, and the read-only inspection subcommands. No continuously
   running process should hold it.
-- Five `ravel-cli` commands take the Maintain credential instead:
+- Six `ravel-cli` commands take the Maintain credential instead:
   `parquet sweep`, which deletes superseded Parquet table manifests;
   `maintain compact-bucket` and `maintain compact-tenant`, which take
   compaction claims under `sys/maintain/claims/compaction/` and write L1
-  segments and compaction records; `maintain sweep`, which deletes superseded
-  and expired segments and commit records and quarantines orphans; and
-  `catalog fold`, which writes the catalog objects the scheduled fold writes
-  (the Query credential also works for it). Admin holds none of those
-  grants, so run these five with the `RAVEL_S3_*` values of the Maintain
-  role.
-- `maintain migrate` runs under none of the shipped templates: the Maintain
-  role lacks the delete of the migrate cursor and the `prov` write that
-  raises the format floor, which end a walk that finishes within its
-  budget. See
+  segments and compaction records; `maintain migrate`, which rewrites L1
+  segments and compaction records, deletes its cursor and raises the format
+  floor; `maintain sweep`, which deletes superseded and expired segments and
+  commit records and quarantines orphans; and `catalog fold`, which writes the
+  catalog objects the scheduled fold writes (the Query credential also works
+  for it). Admin holds none of those grants, so run these six with the
+  `RAVEL_S3_*` values of the Maintain role. See
   [the IAM templates](../../../deploy/iam/README.md#which-credential-each-ravel-cli-command-takes)
-  for the two grants it needs.
+  for each grant.
+- On a deployment that runs `--tenant-kms-config`, pass the same file to the
+  four of those that write tenant data: `maintain compact-bucket`,
+  `maintain compact-tenant`, `maintain migrate` and `catalog fold`. They route
+  their data writes through the tenant's key exactly as the servers do. They
+  never record a tenant's key: when the tenant's key-epoch record is absent,
+  or names a different current key than the file, the command refuses before
+  writing anything, so roll a key out to the servers first and run these
+  commands with the file the servers run with. A `--dry-run` reads the record
+  and refuses the same way. Without
+  the flag they write under the bucket's default encryption, and nothing
+  fails: only the encryption key of what they wrote differs. The control
+  records the Admin credential writes stay under the bucket's default
+  encryption by design, since Admin is decrypt-only on the tenant keys. See
+  [Encrypting objects with SSE-KMS](configuration.md#encrypting-objects-with-sse-kms).
 - Even Admin cannot delete any of the protected prefixes. Its two delete
   grants cover only scratch: `AdminQualifyDelete` the `sys/qualify/*` objects
   `store qualify` writes, and `AdminProbeDelete` the `sys/pq-probe/*` object
