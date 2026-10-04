@@ -65,7 +65,7 @@ Named non-goals (unchanged gaps, referenced not re-litigated): the ADR-0046 loca
 
 Failure semantics: if the flush fails, every query in the batch fails (HTTP 503 / Flight `Unavailable`), `audit_mode=required` being the default. During an S3 outage queries fail closed instead of running unaudited — the precise inversion of the lossiness gap. `audit_mode=best-effort` remains available as an explicit, documented opt-out (dev, single-tenant labs); choosing it is visible configuration, per "approximation is opt-in and visible."
 
-Cost and latency: the response tail gains up to `max_age` plus one dual-PUT round trip (S3 PUT p50 ~10-30 ms). PUT count drops from 2/query to 2/flush — at 100 queries/s and 25 ms batching, from 200 PUTs/s to <=80/s worst case (at most 160 PUTs/s under the idle-flush amendment below) and far fewer under load, directly shrinking the keyspace growth rate before retention even runs.
+Cost and latency: the response tail gains up to `max_age` plus one dual-PUT round trip (S3 PUT p50 ~10-30 ms); an event submitted while a flush is in flight waits out that flush first, which the idle-flush amendment below makes more common for the event right behind an idle one. PUT count drops from 2/query to 2/flush — at 100 queries/s and 25 ms batching, from 200 PUTs/s to <=80/s worst case (at most 160 PUTs/s under the idle-flush amendment below) and far fewer under load, directly shrinking the keyspace growth rate before retention even runs.
 
 **2c. Bounded keyspace: maintain the query-audit shard.** `Signal::Audit` shard `QUERY_AUDIT_SHARD=1` joins the maintained set as a fourth maintenance target with its own policy knob: RLOG compaction (existing machinery, new signal/shard parameter) and a dedicated `audit_retention` window (default 90 d, configurable; deployments with regulatory retention set it to their obligation). Sweep remains horizon-gated and passes through `LegalHoldCheck`, so a placed legal hold protects audit evidence exactly as it protects data. Legal-hold shard 0 stays excluded from maintenance (its growth is per operator action, not per query) and stays deny-delete forever.
 
@@ -268,6 +268,32 @@ one pair per query. That is a bound, not the expected rate: 100 queries/s
 arriving evenly, every 10 ms, and received without a `max_age` stall, does
 not take the idle path after its first event and stays at the window-only
 loop's rate.
+
+**Latency: who pays.** The idle event itself saves `max_age`. The event
+right behind it can pay more than before. Take two queries submitted 1 ms
+apart to a quiet pipeline, with `max_age` 25 ms and a dual PUT of about
+98 ms on S3:
+
+| | first event durable at | second event durable at |
+|---|---|---|
+| window-only loop | about 123 ms | about 123 ms (it joins the first event's window) |
+| with the idle trigger | about 98 ms | about 221 ms |
+
+With the idle trigger, the first event flushes alone. The second was
+submitted during that flush, so it is not idle: the loop receives it when the
+flush returns, opens a full window, and flushes again. Its response tail is
+`max_age` plus two dual-PUT round trips instead of one.
+
+The window-only loop has the same shape for any event submitted while a
+flush is in flight, because the loop awaits each flush inline. What the idle
+trigger changes is that a flush now starts `max_age` earlier on a quiet
+pipeline, so an event arriving within `max_age` of an idle one falls into
+that case where it used to share a window.
+
+This decision accepts that trade: sequential traffic, the measured case,
+gains 25 ms per statement, and a close second arrival on a quiet pipeline
+loses up to one dual-PUT round trip. Reducing it is issue #2561, not part
+of this amendment.
 
 **The durability contract is unchanged.** An idle event is written by the
 same flush path as a batch: one data object, then its commit record, in the
