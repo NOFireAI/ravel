@@ -6,6 +6,469 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-10-05
+
+### Changed
+
+- **SQL spill is on by default when `ravel-server` runs with `--cache-dir`**
+  (ADR-0954 amendment, issue #2416). With no spill environment set, an
+  eligible query that outgrows its memory pool now spills under
+  `<cache-dir>/sql-spill/<instance-id>`, with a ceiling of half of what is
+  left of the free bytes measured at startup on that volume once the read
+  cache's disk-tier bound is subtracted, capped at four times the process
+  memory budget and raised to 1 GiB when that cap is below 1 GiB. When that
+  half is below 1 GiB, spill stays off, and both startup lines give the
+  source `cache-dir-insufficient-space`. The
+  ceiling, derived or configured, now bounds
+  all of the process's queries together: each qualifying query reserves its
+  spill limit from it, and one that cannot reserve 64 MiB (or the whole of a
+  smaller ceiling) runs with spill off. `RAVEL_SQL_SPILL_DIR` with
+  `RAVEL_SQL_SPILL_MAX_BYTES` still wins, and `RAVEL_SQL_SPILL_MAX_BYTES` set
+  alone replaces the derived ceiling. The new `--sql-spill off` flag disables
+  spill whatever the environment or `--cache-dir` says. Startup logs two more
+  `performance default resolved` lines, `sql_spill_dir` and
+  `sql_spill_max_bytes`, each with its source. The startup of a process that
+  serves SQL first sweeps orphaned spill directories under
+  `<cache-dir>/sql-spill`, whenever
+  `--cache-dir` is set, `--sql-spill` is not `off` and that directory exists:
+  it removes each directory whose owner lock it can take and leaves and logs
+  any whose owner still holds it. The sweep runs before the free space is
+  measured, so it also runs when spill then resolves to the
+  `RAVEL_SQL_SPILL_DIR` pair's directory or off for lack of space. A process
+  whose spill resolves under `--cache-dir` then takes an exclusive lock on
+  its own spill directory before serving. With spill resolving under
+  `--cache-dir`, startup now refuses to start when it cannot create
+  `<cache-dir>/sql-spill`, measure its free space, or lock its own
+  directory, and a half-set spill environment names the missing variable.
+  The lock only proves ownership on one host, so `--cache-dir` must be a
+  local volume unless `--sql-spill off` is set: the sweep runs wherever
+  spill resolves.
+- **An `ORDER BY` over a spill-eligible aggregation can now spill** (ADR-0954
+  amendment, issue #2416). Previously any `Sort` kept a query from spilling.
+  Whenever a statement's plan has a `Sort` directly over an aggregation of
+  only `COUNT`, `SUM` and `AVG` with no float `GROUP BY` column (or over a
+  projection directly over it), its sort key gets the aggregation's
+  `GROUP BY` columns appended as trailing tiebreak terms, ascending with
+  nulls last, whatever the spill setting and whatever the types of the
+  aggregated columns. The order is then total, and a
+  spill-eligible statement returns the same rows in the same order with
+  spill forced, with spill off, and in memory, including one whose `AVG`
+  reads a 32-bit integer column. A group column the projection renames is
+  matched under its new name, one it drops is carried through to the sort
+  and removed again, and a select-list alias that only shares a group
+  column's name is not taken for it. A `Sort` over any other aggregate, over
+  a float group column, over grouping sets, over a `HAVING` filter, or over
+  nested projections is left as written and still keeps the query from
+  spilling.
+- **A logs statement that stripes a segment across SQL partitions now decodes
+  the segment's directories once and deals whole row groups (ADR-2414 decision
+  A1, issue #2417).** The plan phase decodes STREAM_DIR, FIELD_DIR, SKIP_IDX and
+  PAGE_DIR once per relevant segment and every partition's open reuses them, so
+  the per-phase `decompressed_bytes` of such a statement moves from the scan
+  phase to the plan phase: the plan phase carries the four sections' decoded
+  length and the scan phase only the projected block pages. A partition reads
+  only the pages of the row groups it owns, and the chunk-run reads of
+  partitions sharing one object no longer overlap, so the block bytes they move
+  for it sum to at most its BLOCKS section. A partition sharing an object never
+  reads it whole: its coverage crossover weighs its runs against its own span
+  and collapses them to that span, split only where another partition's pages
+  lie inside it. Request counts change with it: on
+  the 8-segment selective-scan fixture the q37 and q20 shapes issue 48 GETs
+  where they issued 56, and a segment whose carried plan result was dropped to
+  bound memory is reopened with 4 chunk-run GETs where it was reopened with 1
+  block-data GET. The carried directories are reserved against the fetch memory
+  budget, for segments that have a surviving block, from the plan phase until
+  every partition that owns one of the segment's row groups has finished it.
+  The plan phase reserves all of them before the scan starts, so the peak is
+  the decoded directories of every segment with a surviving block, and a
+  statement can now fail with the fetch memory error where it did not before.
+  An open whose own pruning disagrees with the plan's survivor list fails with a
+  survivor-mismatch error instead of reading a subset of what the plan counted.
+  A statement that late-materializes rows through the whole-segment fast path
+  fails with the same error, rather than returning another block's rows, when
+  that path's open has pruned a block the catalog's bounds placed inside the
+  window ahead of a block it stamps.
+- **The whole-segment fast path pipelines a partition's ranged opens** (issue
+  #2418). While a partition drains a segment it opened ranged, it opens its
+  next owned segments ahead of their turn, up to max(2, store GET concurrency
+  / SQL partition count) segments at once, and emits them in owned order, so a
+  partition's ranged reads overlap instead of costing its round trips one
+  after another. Rows and accounting are unchanged while the fetch memory
+  budget refuses none of those opens. When it refuses a partition's current
+  open, the statement's pipeline turns off, every partition's unconsumed
+  prefetches are dropped (their segments open again at their turns, in owned
+  order), and the refused open is retried once, at once, without waiting for
+  any other partition. Within one statement a current open is reported
+  refused only if the budget refused it twice, the second time after every
+  unconsumed prefetch of every partition had been dropped; across statements
+  the budget stays fail-fast, and that refusal is typed. The scan counts the
+  retries in `prefetch_memory_reopens` and the dropped prefetches in
+  `prefetch_revocations`; rows are unchanged, and the requests the dropped
+  opens already made are counted on top.
+- **The default fetch policy reads narrow projections of large log objects
+  ranged on the intra-region profile** (issue #2418). The store cost profile
+  gains two optional measured timings, `request_latency_micros` and
+  `per_connection_throughput_bytes_per_s` (set together or not at all), and
+  `cost-based` takes the larger of its price term and their product. The
+  reference profile records 70 ms and 90 MB/s, so its request cost is 6,300,000
+  bytes instead of saturating, and a projection is read ranged only when it
+  skips more than the projection break-even, the larger of the routing threshold
+  and three request costs (18,900,000 bytes by default, issue #2555: a ranged
+  read of a narrow projection was measured at about four GETs per object, so it
+  pays when the bytes it skips exceed three request costs); every object at or
+  below that is still read whole, a 3 MB flush object included, and with no tail
+  probe on the planned route (a statement the whole-segment fast path refuses)
+  and on the log-series route's stream-directory read. An explicit
+  `--logs-block-range-threshold` is no longer overridden on that profile. The
+  `logs fetch policy resolved` startup line gains `rate_term`,
+  `projection_break_even_bytes` (the break-even in force, the routing threshold
+  when the policy derives none) and `break_even_source` (`profile` or
+  `routing-threshold`); on the reference profile it reads
+  `projection_break_even_bytes=18900000 break_even_source="profile"`. An
+  explicit `--logs-request-cost-bytes`, the other fetch policies, the coverage
+  crossover and the coalescing gap are unchanged. Above the break-even the
+  planned route still probes an object before its coverage crossover reads it
+  whole for a wide projection, since it does not weigh the projected fraction;
+  that is left to a follow-up.
+- **`ravel-server`'s process memory budget now starts from available memory,
+  not raw total (ADR-1170, amended 2026-10-03 by issue #2367, issue #2483).**
+  With no cgroup memory limit and a readable `MemAvailable` in
+  `/proc/meminfo`, `memory_budget_bytes` resolves to `min(MemTotal - RESERVE,
+  max(FLOOR, MemAvailable + own RSS - RESERVE))`, logged with
+  `source="derived-available"`. `FLOOR` is 1 GiB and floors only the
+  `MemAvailable + own RSS - RESERVE` term; when it binds, a `WARN` names the
+  `MemAvailable` reading and `--memory-budget-bytes` as the remedy. The outer
+  `min` keeps the budget at or below `MemTotal - RESERVE`, so a host whose
+  `MemTotal` is at or below the reserve still derives 0 and is refused at
+  startup, as before. A cgroup memory limit keeps the pre-amendment rule
+  (`source="derived-cgroup"`, `MemAvailable` not consulted), including when
+  `/proc/meminfo` cannot be read, since the limit is then the memory figure.
+  An unreadable `MemAvailable` on a host whose `MemTotal` parses keeps the
+  `MemTotal`-minus-reserve rule (`source="derived"`). With neither a readable
+  `MemTotal` nor a cgroup limit (every non-Linux build, for example) no budget
+  is derived: `source="fallback"`, budget unlimited, as before. The new
+  `--memory-budget-bytes` flag overrides every derivation except gateway mode,
+  which claims no budget, and is still subject to the existing startup refusal.
+  A derived (not explicit-flag) `--sql-max-query-bytes` or
+  `--sql-tenant-max-bytes` is now capped at 90% of the shared SQL/fetch
+  remainder, logged per pool as `remainder_capped`; an explicit flag on either
+  is never capped. The cap binds on every stock deployment whose store is on
+  loopback (its larger fetch-cache share leaves a remainder whose 90% is below
+  50% of `MemTotal`), and on an S3 deployment whose effective memory is below
+  about 9.7 GiB, cgroup pods included: those deployments resolve smaller SQL
+  pools than before. A host with co-resident processes now also derives a
+  smaller budget, and smaller caches with it.
+- **An SQL result the JSON encoding cannot hold is a client error naming the
+  column** (issue #2514). A timestamp or duration past the i64 nanosecond
+  range, a date outside years 0000 to 9999, a `Date64` that is not a whole
+  day, a time of day outside one day, or a column type with no JSON encoding
+  now fails
+  `/api/v1/sql` with 422 `execution` and the message `column "<name>" of type
+  <type> cannot be encoded as JSON: <reason>; request the Arrow IPC format to
+  read it exactly`. The message never carries the value. These used to answer
+  422 `execution` with the fixed `internal query engine error` message, which
+  named neither the column nor the remedy; the reference documented them as
+  500 `internal`, which the server never returned. The same query sent with
+  `Accept: application/vnd.apache.arrow.stream` reads every such column
+  exactly.
+- **A wide-window resolve now lists its shards concurrently on the prefix path
+  (ADR-2509 decision 1, issue #2538).** Up to `resolve_get_concurrency` shards
+  list at once instead of one after another, so the prefix scan's serial LIST
+  depth falls from the sum of the shards' page counts toward the largest one.
+  Every page reserves a slot in the resolve-wide `max_catalog_list_requests`
+  cap before it is issued, so the cap stays exact: a window over it is still
+  refused with `WindowTooWide` (`estimate` the cap plus one, `limit` the cap)
+  on every run, though which shard reaches the cap, and how many LISTs were
+  issued before the refusal, can now differ between runs. The resolved
+  snapshot is unchanged.
+- **A query against a tenant that has never folded no longer GETs the catalog
+  HEAD on every statement (ADR-2509 decision 3, issue #2538).** The resolve
+  caches a HEAD `NotFound` for `head_cache_ttl` (default 30 s), so such a
+  tenant costs one HEAD GET per TTL and a HEAD the first fold publishes is
+  picked up within that TTL. Other HEAD GET errors are not cached. A cached
+  absence counts against `head_cache_capacity` but is not cached when the
+  cache is full of unexpired entries, and it never replaces or evicts a
+  present HEAD; a HEAD inserted into a full cache evicts the oldest absence
+  first. Folds read HEAD from the store and are unaffected.
+- **A query audit record that finds the pipeline idle is written at once**
+  (ADR-2509 decision 2, ADR-0062 amendment, issue #2539). The query-audit
+  pipeline used to hold a record for up to `--audit-max-age` (25 ms by default)
+  waiting for others to batch with, so sequential queries paid the full wait on
+  every response. A record is now written without waiting when nothing else is
+  queued, it was not submitted while a write was in progress, and the previous
+  record arrived at least `--audit-max-age` earlier. Steady traffic arriving
+  more often than once per `--audit-max-age` batches as before, and the pipeline
+  writes at most twice as many objects as before on any arrival pattern. Every
+  query still waits for its audit record to be durable before its response is
+  released, and a failed write still fails the query in `--audit-mode required`.
+- **Compaction skips a log object whose `stream_attrs` blob the writer refuses**
+  (issue #2554). The writer refuses such a blob as of this release (issue #2548,
+  under Fixed), so a bucket holding an object an earlier version wrote with one
+  would fail every compaction and every maintenance tick of its shard.
+  Compaction instead leaves that object out of the merge, counts it once per
+  process on
+  `ravel_maintain_compaction_inputs_skipped_total{reason="unwritable_stream_attrs"}`
+  and warns once with its key. When at least `min_compaction_inputs` inputs
+  remain it merges them under a compaction record that does not name the object;
+  when fewer remain it publishes nothing and reports the bucket below the
+  minimum with the count of inputs left. The object stays in storage. The same
+  process does not read it again, and a later evaluation of a bucket left below
+  the minimum by its skipped objects returns before taking the bucket's claim.
+  Format migration still fails on such an object.
+
+### Fixed
+
+- **CI lints the workspace with every feature on at once** (issue #1925). A new
+  `all-features` job runs `cargo clippy --workspace --all-targets
+  --all-features`, so a feature-gated call site that only the union of features
+  reaches no longer compiles nowhere; `scripts/gates.sh` does not run it,
+  because on a 4-core executor it is a second near-full compile (859 s cold)
+  beside the default-feature workspace clippy (about 710 s).
+- **A Parquet table's footer read refuses a store that ignores `Range`**
+  (issue #2287). On a store without suffix reads, `CREATE EXTERNAL TABLE`
+  places its first footer read from the listed size and discards that read's
+  response when the listing was stale. The discarded response was never
+  length-checked, so an endpoint answering with the whole object held it
+  against a reservation sized for the requested range. A first footer read
+  that returns more bytes than its range now refuses the statement as a
+  corrupt file, naming it, before any retry.
+- **A `CREATE EXTERNAL TABLE` cut off by its deadline no longer leaks its
+  bucket-probe object** (issue #2287). When the statement deadline expired
+  while the not-Ravel's-bucket probe was in flight, the probe was dropped
+  before it deleted the object it had written under
+  `sys/pq-probe/` in Ravel's own bucket, and that object stayed until a bucket
+  lifecycle rule removed it. The statement now deletes it from a best-effort
+  background task as it is dropped. A probe write that is reported as failed
+  after the object landed is deleted by the probe itself before it returns
+  (issue #2575, below). The background delete is not counted in the statement's
+  reported store cost.
+- **A large S3 put under `--store-scheduling` keeps no more requests in
+  flight than the permits it holds** (issue #2327). A `put()` above the 16 MiB
+  multipart threshold took one scheduler permit and then uploaded up to four
+  parts at once below the scheduler. With upload integrity off, the class
+  handle now takes one permit plus as many free ones of its class as the
+  upload can use, without waiting for any, and the upload keeps at most that
+  many parts in flight. A class with no spare permit uploads the parts one at
+  a time. With upload integrity on (the `--s3-upload-integrity` default), every
+  put is a single PUT and takes one permit.
+- **Per-role credentials start a fresh AWS S3 bucket without a shared-credential
+  first boot** (issue #2332). AWS answers a read of an absent key with 403
+  unless the caller may list that key, so the gateway, query and maintain
+  templates in `deploy/iam/` now grant a list on exactly the bootstrap keys each
+  process reads where absence is normal (such as `sys/tenancy`, `sys/gc` and a
+  tenant's config record), and on nothing else.
+- **`ravel-cli` Maintain-credential data writes can go out under the tenant's
+  KMS key** (issue #2363). `maintain compact-bucket`, `compact-tenant`,
+  `migrate` and `catalog fold` take ravel-server's `--tenant-kms-config` flag
+  and, when it is given, route their data writes through the tenant's key the
+  way the servers do; without the flag they still write under the bucket's
+  default encryption. A command never records a tenant's key: when the
+  tenant's key-epoch record is absent, or its current key differs from the
+  file's, it refuses before any write and tells the operator to start
+  ravel-server with the file first, since only ravel-server startup records a
+  configured or changed key. A `--dry-run` reads the record and refuses the
+  same way. The key-epoch record itself, `maintain sweep`'s unnamed-since
+  markers, `load`'s writes and the Admin control records stay under the bucket
+  default, and the `commit reconstruct` access-denied error now says so for
+  the Admin records.
+- **The SQL endpoint's JSON output encodes the column types a Parquet table
+  produces** (issue #2390). An `Int8`, `Int16`, `UInt16`, `Date32`, `Date64`,
+  second, millisecond or microsecond `Timestamp`, `Decimal128`, `LargeBinary`
+  or `BinaryView` column used to fail a JSON response with 422 `execution`
+  and the fixed `internal query engine error` message; Arrow IPC was
+  unaffected. Integers are JSON numbers, every timestamp is an
+  integer count of nanoseconds since the epoch as `Timestamp(ns)` already was,
+  dates are `YYYY-MM-DD` strings, a decimal is a string of its exact decimal
+  text, and binary values are lowercase hex. A timestamp with no i64
+  nanosecond count, a date outside years 0000 to 9999, or a `Date64` that is
+  not a whole day fails the response with 422 `execution` naming the column
+  and its type (issue #2514) rather than returning a wrong value.
+- **A forged Parquet table manifest version above 2^32, or a manifest key
+  that names no version, no longer wedges a table** (issue #2430). Manifest
+  versions are bounded at 2^32: DDL refuses to write a version above it with a
+  422. A version above the bound, and a `.pqm` key under a table's `v/` prefix
+  whose slot is not a version number (the wrong length, an extra path segment
+  such as `.../v/q/v/<20 digits>.pqm`, too large for a `u64`, zero, or not
+  digits), is skipped by
+  every reader, counted and logged as a warning naming the table, excluded
+  from `ravel-cli parquet sweep`'s pairing, and flagged by
+  `ravel-cli parquet repair --tenant <t> --table <name>`, whose `--delete`,
+  run under the Maintain credential, deletes exactly the flagged keys. A
+  forged version at or below the bound still blocks DDL, or serves as the
+  table, until an operator removes it with `parquet repair --delete-version N`
+  after checking the DDL audit log for a statement that wrote it. Narrowing
+  the Query role's manifest grant remains the root fix.
+- **`ravel_server::start` refuses a flush cadence that leaves the flush
+  deferral cap at 0, not only the command line** (issue #2438). A
+  `ServerConfig` built in code with such a cadence, or with an idle delay past
+  the `FLUSH_BOUND_SLACK_HOURS` slack, now fails startup with the typed
+  `FlushCadenceError` and the same message `Cli::validate` gives, instead of
+  starting and then refusing every write from the first deferred flush trigger.
+- **`EXTRACT(field FROM expr)` now plans, as `date_part`.** Previously it
+  failed to plan on every SQL surface (logs, spans, samples and Parquet
+  tables) with `This feature is not implemented: Extract not supported by
+  ExprPlanner`, which included ClickBench Q19's exact text.
+- **A malformed columnar log batch is refused with a clear error instead of
+  corrupting or crashing** (issue #2460). `ColumnarLogBatch::validate` now runs
+  first in `RlogWriter::push_columnar` and `LogIngestRouter::write_columnar` and
+  refuses: a per-row field whose length is not `num_rows`; a trace or span id
+  buffer that does not match its present rows; mismatched or repeated stream ids
+  and a stream reference past the end of the batch; a dynamic column whose
+  validity or cell count disagrees with the batch, or one of whose cells has a
+  type other than the column's; a dictionary list of the wrong length, with the
+  wrong number of ids, or with an id past its distinct values; and a dictionary
+  entry that differs from its `Str` cell or non-`List`/`Map` `Bytes` cell. A
+  repeated `(name, type)` dynamic column, more than 4 GiB of text in one column,
+  and dictionary contents for `List`/`Map` cells are not checked.
+- **Keyed log and span dedup now finds its markers on S3, and a failed lookup
+  fails the keyed write instead of writing a duplicate** (issue #2462). The
+  lookup listed a prefix ending mid-segment, which the S3 adapter extends with
+  `/`, so on S3 it never found a marker and a retry of an acknowledged keyed
+  write was stored twice. It now GETs the exact marker key for each hour of the
+  dedup window: the hour ahead, the current hour and the one before it together
+  first, so a hit there costs 3 GETs and about one round trip, then the other 23
+  hours at most 8 at a time (26 GETs on a miss at the default window). A probe
+  that fails with a store error other than not-found at a newer hour than any
+  marker found, or a lookup still running at half of the request's
+  `ack_deadline`, now fails the write with a retryable 503 / `UNAVAILABLE`
+  before its data is written, counted on
+  `ravel_ingest_idempotency_lookup_failures_total`; previously the gateway
+  logged a warning and wrote anyway. The lookup and the write share that one
+  `ack_deadline`, and the lookup may use only half of it, so it can no longer
+  leave the write without a budget: a strict write left none could time out
+  after its records were enqueued, flush durably with no marker, and be stored
+  again by the retry. Writes without a key do no lookup and keep the whole
+  `ack_deadline`. Every marker GET the lookup issues, hit or miss, is counted on
+  the new `ravel_ingest_idempotency_probe_gets_total`, by signal. The gateway
+  template in `deploy/iam/` lists no idempotency prefix; it grants a list of
+  exactly the marker key so that on AWS S3 a probe of an absent marker answers
+  404, not 403. Apply the updated gateway policy before rolling out this version
+  on AWS: under the previous policy an absent marker answers 403, so every keyed
+  log and span write is refused with 503 until the policy is updated.
+- **PromQL queries over many series per segment no longer spend time
+  quadratic in the series count finding each series' pages.**
+- **A high-cardinality `GROUP BY` with an exact integer `AVG` no longer holds
+  roughly 1.7x-2.6x the peak memory of the same query with `COUNT(*)`.**
+  (Measured across 8 and 32 partitions, 1.5M groups, five `--release` runs each
+  on the same host before and after this fix.) The exact integer `AVG`
+  accumulator could not convert input rows to partial state, so
+  `skip_partial_aggregation` never applied to it and the emitted partial state
+  sat in the exchange outside the SQL memory reservation. It now converts rows
+  to state: for a `GROUP BY` whose cardinality crosses the configured
+  `skip_partial_aggregation` threshold, the partial `AggregateExec`'s
+  `skipped_aggregation_rows` metric is nonzero and results are unchanged, the
+  same behavior `COUNT` and `SUM` already had (issue #2488, follow-up of #2367).
+- **A large S3 whole-object read under `--store-scheduling` keeps no more
+  requests in flight than the permits it holds** (issue #2493). A
+  `GetRange::Full` read above the per-request body bound took one scheduler
+  permit and then fetched up to four ranges at once below the scheduler. The
+  read still takes one permit; once its first response shows ranges remain, it
+  takes free permits of its class until it holds one per range left to fetch, at
+  most four, without waiting for any, and keeps no more ranged requests in
+  flight than the permits it holds. A class with no spare permit fetches the
+  ranges one at a time. A read that fits in one response, and a ranged or suffix
+  read, holds one permit.
+- **The SQL endpoint's JSON output encodes Parquet's remaining decimal,
+  `Float16`, time-of-day and duration columns** (issue #2496). A
+  `Decimal32`, `Decimal64` or `Decimal256` (a Parquet DECIMAL whose embedded
+  Arrow schema names that width, or one of precision 39 or more), `Float16`,
+  `Time32`, `Time64` or `Duration` column used to fail a JSON response with
+  422 `execution` and the fixed `internal query engine error` message. Every
+  decimal width is a string of its exact decimal
+  text as `Decimal128` already was, a `Float16` follows the float rules
+  including the `"NaN"`, `"+Inf"` and `"-Inf"` strings, a time of any unit is
+  an integer count of nanoseconds since midnight, and a duration of any unit
+  is a signed integer count of nanoseconds. A time that is negative or a
+  whole day or more, or a duration with no i64 nanosecond count, fails the
+  response with 422 `execution` naming the column and its type (issue #2514)
+  rather than returning a wrong value.
+- **The SQL endpoint's JSON output encodes interval, list and dictionary
+  columns of every layout** (issue #2512). An `Interval` column of any unit, a
+  `LargeList`, `FixedSizeList`, `ListView` or `LargeListView` column, and a
+  `Dictionary` keyed by any integer type other than `Int32` used to fail a
+  JSON response with an error; Arrow IPC was unaffected. An interval is now an
+  object with all three integer fields `months`, `days` and `nanoseconds`,
+  every list layout is a JSON array encoded like `List`, and a dictionary cell
+  is its value.
+- **PromQL over logs excludes records erased through a resource or scope
+  attribute** (issue #2541). `ravel_log_lines` and `ravel_log_bytes` now match
+  pending erasure predicates against the merged resource, scope and record
+  view, as the SQL `logs` scan does, so a predicate on an attribute such as
+  `host.name` drops the matching records instead of counting them. The match
+  decodes each record's `stream_attrs` blob, so a blob that does not decode
+  fails the query with a typed error rather than being counted or skipped.
+- **The RLOG writer refuses a `stream_attrs` blob the reader cannot decode**
+  (issue #2548). A log flush now fails with a segment build error, instead of
+  writing a segment whose every merged-view read fails, when a resource or
+  scope attribute nests past the decoder's depth cap of 32 (which counts map
+  and value levels alike, about 15 nested maps, and now bounds lists too) or
+  when a scope name or version is not UTF-8. OTLP admission rejects an
+  attribute nested past that rule before it reaches the writer (the next
+  entry), so a sender cannot trigger this refusal with a deep attribute.
+- **A log attribute the segment format cannot hold is rejected at OTLP
+  admission** (issues #2554, #2553). A resource or scope attribute 16 to 99
+  kvlists deep or 32 to 99 arrays deep, or holding an array or kvlist of more
+  than 2^20 entries (for example 2^20 + 1 empty arrays, which the value-length
+  limit counts as zero bytes), used to be admitted and written into a segment
+  whose every merged-view read then failed. It is now rejected with
+  `AttributeTooDeeplyNested` (at most 15 kvlists around a value, an array level
+  costing half a kvlist level) or the new `AttributeTooManyEntries`, the rule
+  the RLOG `stream_attrs` decoder applies, exported as
+  `ravel_logseg::attr_value_fits_storage`. A record attribute that fails it is
+  dropped on its own and its record kept. This narrows what is stored for record
+  attributes: one nested 16 to 32 kvlists deep, or 32 to 99 arrays deep, used to
+  be written and read back intact and is now dropped with
+  `AttributeTooDeeplyNested`. The RLOG writer holds `attrs_raw` overflow values
+  to the bounds of the `attrs_raw` decoder, not to this stricter rule, so values
+  stored under the older bound stay readable and compaction and erasure rewrites
+  can write them again. The `attrs_raw` decoder's one new depth limit refuses a
+  list or map nested inside 128 lists and maps instead of overflowing the stack;
+  that is above the 100 levels OTLP ever admitted. A list or map value stored in
+  a dynamic `Bytes` column is not checked by the writer and is read back as
+  bytes.
+- **`ravel-cli tenant parquet-grant add` no longer leaks its bucket-probe
+  object when the probe write is reported as failed** (issue #2575). The
+  cleanup now lives in `probe_not_ravel_bucket`, which deletes the object
+  before it returns on that path too, so every caller gets it, not only
+  `CREATE EXTERNAL TABLE`. The same function's drop guard also covers an
+  in-process cancellation, such as the statement deadline of
+  `CREATE EXTERNAL TABLE`. A process killed mid-probe still leaves the
+  object behind; the lifecycle rule on `sys/pq-probe/` bounds that.
+
+### Added
+
+- **A runnable ClickBench Parquet lane** (issue #2055).
+  `clickbench_parquet_bench`
+  (in `ravel-bench`, `sql-latency` feature) runs the 43 upstream statements
+  through a running `ravel-server` over the upstream Parquet files, compares
+  every answer with datafusion-cli 54.1.0's, writes a report stamped with the
+  server's resolved settings, and exits 1 when the report misses the bar
+  pre-registered in `benchmarks/clickbench/parquet/prereg.toml`. It reads the
+  bearer token from the environment variable `--token-env` names, never from
+  the command line. With `--concurrency-seconds`, the report's concurrency
+  block carries queries per second over the measured window and two error
+  ratios, all errors and errors outside the registered failures, and the bar
+  is judged on the second; a concurrency phase that fails once started is
+  recorded in the report, which is still written, and the bench exits 1.
+  `benchmarks/clickbench/parquet/make-reference.sh` writes
+  the datafusion-cli reference and refuses any other datafusion-cli version.
+  The runbook is the "ClickBench Parquet lane" section of
+  `docs/internal/clickbench.md`.
+- **DDL statements report their object-store cost** (issue #2374).
+  `CREATE EXTERNAL TABLE` and `DROP TABLE` over `POST /api/v1/sql` now count
+  on `/metrics` in three families: `ravel_sql_ddl_statements_total` by
+  `kind` and `outcome`, `ravel_sql_ddl_store_requests_total` by `phase`
+  (`grant`, `probe`, `snapshot`, `write`) and `op`, and
+  `ravel_sql_ddl_store_bytes_total` by `phase`, each with `tenant_hash` folded
+  like the per-query cost family. A failed statement reports the cost it
+  accrued before it failed. DDL cost stays out of the `ravel_query_*` family
+  and the usage record. The families and the byte definition are in the
+  observability guide.
+- **`/metrics` now exposes `ravel_cache_resident_entries` and
+  `ravel_cache_resident_bytes` for `cache="catalog"`.** Previously only the
+  fetch-family read cache reported live residency; the catalog byte cache's RAM
+  and disk tiers (ADR-0046) were tracked internally but never rendered.
+
 ## [0.21.0] - 2026-10-03
 
 ### Changed
