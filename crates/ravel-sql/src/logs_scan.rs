@@ -10207,67 +10207,82 @@ mod fast_path_prefetch_tests {
             .enable_all()
             .build()
             .expect("runtime");
+        // The body runs on a worker so the timeout below still fires if a
+        // refused open retried forever inside one poll; the shutdown then
+        // abandons that worker instead of waiting for it.
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             rt.block_on(async {
-                let fits_1 = fits_1().await;
-                let fits_2 = fits_2(None).await;
-                let off = run_statement(fits_2, 2, None, false, Drive::Lockstep)
-                    .await
-                    .expect("pipeline off fits");
-                let spawned = run_statement(fits_2, 2, None, true, Drive::Spawned)
-                    .await
-                    .expect("both spawned partitions complete");
-                let sorted = |rows: &[Vec<i64>]| {
-                    let mut all: Vec<i64> = rows.concat();
-                    all.sort_unstable();
-                    all
-                };
-                assert_eq!(sorted(&spawned.rows), sorted(&off.rows));
-                assert_eq!(
-                    spawned.rows, off.rows,
-                    "each partition's own rows, in order"
-                );
-                assert_eq!(spawned.metric("segments_opened"), 6);
-
-                let err = run_statement(fits_1 - 1, 2, None, true, Drive::Spawned)
-                    .await
-                    .err()
-                    .expect("one byte below the one-partition fit refuses");
-                assert!(is_fetch_memory_refusal(&err), "typed refusal: {err}");
-
-                let (store, segments) = fixture(None).await;
-                let budget = Arc::new(ravel_memory::MemoryBudget::new(CEILING));
-                let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
-                let exec = exec_with(fetcher, &segments, 2, PhaseAccounting::new());
-                let mut streams: Vec<SendableRecordBatchStream> = (0..2)
-                    .map(|p| {
-                        exec.execute(p, Arc::new(TaskContext::default()))
-                            .expect("execute")
-                    })
-                    .collect();
-                for stream in &mut streams {
-                    stream
-                        .next()
-                        .await
-                        .expect("a first batch")
-                        .expect("first batch");
+                let body = tokio::spawn(spawned_partitions());
+                match tokio::time::timeout(Duration::from_secs(60), body).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+                    Ok(Err(e)) => panic!("test body task: {e}"),
+                    Err(_) => panic!("the test body never ended"),
                 }
-                assert!(
-                    holds_open_prefetch(&exec, 0) && holds_open_prefetch(&exec, 1),
-                    "each slot holds an open prefetch when the streams are dropped"
-                );
-                drop(streams);
-                assert_eq!(
-                    budget.reserved(),
-                    0,
-                    "dropped streams release their prefetches with the plan still alive"
-                );
             });
         }));
         rt.shutdown_timeout(Duration::from_secs(1));
         if let Err(panic) = outcome {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// The body of
+    /// [`all_partitions_spawned_match_the_sequential_walk_below_the_pipelined_peak`].
+    async fn spawned_partitions() {
+        let fits_1 = fits_1().await;
+        let fits_2 = fits_2(None).await;
+        let off = run_statement(fits_2, 2, None, false, Drive::Lockstep)
+            .await
+            .expect("pipeline off fits");
+        let spawned = run_statement(fits_2, 2, None, true, Drive::Spawned)
+            .await
+            .expect("both spawned partitions complete");
+        let sorted = |rows: &[Vec<i64>]| {
+            let mut all: Vec<i64> = rows.concat();
+            all.sort_unstable();
+            all
+        };
+        assert_eq!(sorted(&spawned.rows), sorted(&off.rows));
+        assert_eq!(
+            spawned.rows, off.rows,
+            "each partition's own rows, in order"
+        );
+        assert_eq!(spawned.metric("segments_opened"), 6);
+
+        let err = run_statement(fits_1 - 1, 2, None, true, Drive::Spawned)
+            .await
+            .err()
+            .expect("one byte below the one-partition fit refuses");
+        assert!(is_fetch_memory_refusal(&err), "typed refusal: {err}");
+
+        let (store, segments) = fixture(None).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(CEILING));
+        let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
+        let exec = exec_with(fetcher, &segments, 2, PhaseAccounting::new());
+        let mut streams: Vec<SendableRecordBatchStream> = (0..2)
+            .map(|p| {
+                exec.execute(p, Arc::new(TaskContext::default()))
+                    .expect("execute")
+            })
+            .collect();
+        for stream in &mut streams {
+            stream
+                .next()
+                .await
+                .expect("a first batch")
+                .expect("first batch");
+        }
+        assert!(
+            holds_open_prefetch(&exec, 0) && holds_open_prefetch(&exec, 1),
+            "each slot holds an open prefetch when the streams are dropped"
+        );
+        drop(streams);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "dropped streams release their prefetches with the plan still alive"
+        );
     }
 
     /// Partition 1 alone is polled until it holds its current open and a
