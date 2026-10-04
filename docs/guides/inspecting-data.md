@@ -1,12 +1,15 @@
 # Inspecting data
 
 `ravel-cli` reads segments and commit records directly from the object
-store. Nothing here needs `ravel-server` running. No published image carries
-`ravel-cli`: build it from source with `cargo build -p ravel-cli --release`,
-which leaves the binary at `target/release/ravel-cli`. The examples below
-invoke it as `ravel-cli`, so put `target/release` on your `PATH` or spell the
-path out. They run against the bucket that `make demo` writes
-to ([getting started](getting-started.md#building-from-source)). Every command
+store. It does not need a running `ravel-server`.
+
+No published image carries `ravel-cli`. Build it from source with
+`cargo build -p ravel-cli --release`, which leaves the binary at
+`target/release/ravel-cli`. The examples invoke it as `ravel-cli`, so put
+`target/release` on your `PATH` or type the full path.
+
+The examples run against the bucket that `make demo` writes to
+([getting started](getting-started.md#building-from-source)). Every command
 needs the same store flags:
 
 ```sh
@@ -28,22 +31,24 @@ t/<tenant_hash>/m/l0/<shard>/<writer_id>.<epoch>.<seq>.<hash16>.rseg   segment (
 t/<tenant_hash>/m/c/<shard>/<ingest_hour>/<writer_id>.<epoch>.<seq>.cmt commit record
 ```
 
-`tenant_hash` is a hex-encoded BLAKE3 hash of the tenant name. Under the
-default posture it is a keyed hash: a fresh bucket refuses to start unless the
-server either names a deployment key with `--tenant-hash-key-file` or opts out
-with `--tenant-hash-unkeyed`, which selects the plain unkeyed hash instead. The
-bucket pins the choice permanently on first use. `m` is the signal
-letter for metrics; logs use `l` and spans use `s`. Logs have their own RLOG
-object format and an `rlog inspect`
-walkthrough further down this guide; spans have the RSPAN format
-([span-segment-format.md](../span-segment-format.md)) and a SQL
-query path over the `spans` table. `shard` is
-the ingest shard, zero-padded to 4 digits. `ingest_hour` is the UTC hour the
-commit landed in (`YYYYMMDDTHH`). This lets the catalog find recent
-commits by listing a small, bounded set of prefixes instead of the whole
-bucket.
+- `tenant_hash` is a hex-encoded BLAKE3 hash of the tenant name. Under the
+  default posture it is a keyed hash. A fresh bucket refuses to start unless
+  the server names a deployment key with `--tenant-hash-key-file` or opts out
+  with `--tenant-hash-unkeyed`, which selects the plain unkeyed hash. The
+  bucket pins the choice permanently on first use.
+- `m` is the signal letter for metrics. Logs use `l` and spans use `s`.
+  - Logs have their own RLOG object format. See [`rlog inspect`](#rlog-inspect).
+  - Spans have the RSPAN format
+    ([span-segment-format.md](../span-segment-format.md)) and a SQL query path
+    over the `spans` table.
+- `shard` is the ingest shard, zero-padded to 4 digits.
+- `ingest_hour` is the UTC hour that the commit landed in (`YYYYMMDDTHH`).
+  With it, the catalog finds recent commits by listing a small, bounded set of
+  prefixes instead of the whole bucket.
 
-## `catalog list`: what's visible right now
+## `catalog list`
+
+The command shows which segments are visible now.
 
 ```sh
 ravel-cli catalog list --tenant demo-tenant --hours 1
@@ -54,20 +59,23 @@ t/3f2a.../m/l0/0000/6a9c....rseg shard=0 samples=120 series=3 min_event_ts_ns=17
 1 segment(s)
 ```
 
-This resolves the same catalog snapshot that a query would, over the last
-`--hours` hours (default 1) and `--shards` shards (default 4; it must match
-the shard count the writer used, `4` for `make demo`). Each line is
-one committed segment. It shows the data object key it is stored under, its
-shard, sample and series counts, its event-time span, and when the flush that
-created it ran (`created_unix_ns`). This is the fastest way to get a real
-key to feed into `segment inspect` or `commit decode`.
+The command resolves the same catalog snapshot that a query resolves, over
+the last `--hours` hours (default 1) and `--shards` shards (default 4).
+`--shards` must match the shard count that the writer used, which is `4` for
+`make demo`.
 
-## `segment inspect`: what's inside one segment
+Each line is one committed segment. It shows the data object key that the
+segment is stored under, its shard, its sample and series counts, its
+event-time span, and when the flush that created it ran (`created_unix_ns`).
+Use this command to get a real key for `segment inspect` or `commit decode`.
+
+## `segment inspect`
+
+The command shows what one segment contains.
 
 ![RSEG layout](../diagrams/rseg-layout.svg)
 
-Every segment is RSEG v7; Ravel supports one segment version at a time. The
-command is:
+Every segment is RSEG v7. Ravel supports one segment version at a time.
 
 ```sh
 ravel-cli segment inspect \
@@ -121,14 +129,14 @@ Field by field:
 
 - `total_size`, `trailer_offset`, `footer_offset`: the byte layout of the
   object. RSEG segments are footer-first-readable. The 16-byte trailer at
-  the very end gives the footer's length and checksum. A reader therefore
+  the very end gives the length and checksum of the footer. A reader therefore
   needs one suffix GET to find and validate the footer before it fetches
   anything else.
 - `version`: the trailer format version, always `7`. A non-7 version gets a
-  typed error; Ravel never half-parses it.
+  typed error. Ravel never half-parses it.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
-  identity components embedded in the object's key and its commit token. They
-  let you confirm that a segment and a commit token or record agree on what
+  identity components embedded in the object's key and its commit token. Use
+  them to confirm that a segment and a commit token or record agree on what
   wrote it.
 - `min/max_event_ts_ns`: the span of sample timestamps inside the segment.
 - `min/max_ingest_ts_ns`: when this server received those points.
@@ -138,55 +146,62 @@ Field by field:
   minimum run creation time, the base that the per-run `created_unix_ns`
   deltas reconstruct against.
 - `sample_count`, `series_count (footer)`: the totals that the footer claims.
-- `sections`: the object's sections and byte ranges. `kind=1` `LABEL_DICT`
-  (the string table), `kind=5` `SERIES_IDS` (the sorted ids), `kind=6`
-  `SERIES_META` (the run-major catalog: each series' schema, value kind,
-  and per-run provenance and page ranges), `kind=3` `TS_PAGES`, `kind=4`
-  `VAL_PAGES` (scalar values), `kind=7` `HIST_PAGES` (histogram values). A
-  large object (`series_count >= 4096`) instead carries `kind=8`
-  `SERIES_IDX` and `kind=9` `SERIES_META_CHUNKS` in place of the whole
-  `SERIES_META`: the sparse catalog. `VAL_PAGES` is absent when no series
-  is scalar, and `HIST_PAGES` when none is a histogram. `comp` is the raw wire
-  integer (`0` none, `1` lz4, `2` zstd).
+- `sections`: the sections of the object and their byte ranges:
+  - `kind=1` `LABEL_DICT`: the string table.
+  - `kind=5` `SERIES_IDS`: the sorted ids.
+  - `kind=6` `SERIES_META`: the run-major catalog. It holds the schema, value
+    kind, and per-run provenance and page ranges of each series.
+  - `kind=3` `TS_PAGES`.
+  - `kind=4` `VAL_PAGES`: scalar values. Absent when no series is scalar.
+  - `kind=7` `HIST_PAGES`: histogram values. Absent when no series is a
+    histogram.
+  - `kind=8` `SERIES_IDX` and `kind=9` `SERIES_META_CHUNKS`: the sparse
+    catalog. A large object (`series_count >= 4096`) carries these two in
+    place of the whole `SERIES_META`.
+  - `kind=10` `EXEMPLARS`: the exemplars that samples in this object
+    carried. The section is present only when at least one sample carried
+    one. The example above shows no `kind=10` line, because its samples
+    carried none. An absent `EXEMPLARS` section is normal and is not an
+    error.
 
-  `kind=10` `EXEMPLARS` holds the exemplars that samples in this object
-  carried. The section is present only when at least one sample carried
-  one. The example above shows no `kind=10` line, because its samples
-  carried none. An absent `EXEMPLARS` section is normal and is not an
-  error.
+  `comp` is the raw wire integer (`0` none, `1` lz4, `2` zstd).
 - `schema_count (derived)` / `schema[N]:`: SERIES_META groups series by
-  distinct label-*name* set (a "schema"). Each line lists that schema's
-  names, resolved through `LABEL_DICT`. `ravel-cli` derives this from the
+  distinct label-*name* set (a "schema"). Each line lists the names of that
+  schema, resolved through `LABEL_DICT`. `ravel-cli` derives this from the
   decoded per-series label sets.
 - `series`: one line per series: id, resolved labels, sample count,
   event-timestamp bounds, `value_kind` (`VAL_SCALAR` or `HIST_SPANS`), and
-  `run_count`. Each series then prints one `run[N]` line per run. Each
-  `run[N]` line gives its provenance (`created_unix_ns`, `writer_epoch`,
-  `writer_seq`), sample count, and the **absolute** byte ranges of that run's
-  TS and VAL-or-HIST pages (`ts_range`/`val_range`/`hist_range`, half-open
-  `[start, end)`). `ravel-cli` reconstructs these from SERIES_META the way
-  the reader does before it fetches the bytes. An L0 flush produces one run
-  per series; a compacted object can carry several.
+  `run_count`. Each series then prints one `run[N]` line per run:
+  - Each `run[N]` line gives its provenance (`created_unix_ns`,
+    `writer_epoch`, `writer_seq`), its sample count, and the **absolute** byte
+    ranges of the TS and VAL-or-HIST pages of that run
+    (`ts_range`/`val_range`/`hist_range`, half-open `[start, end)`).
+  - `ravel-cli` reconstructs these ranges from SERIES_META the way the reader
+    does before it fetches the bytes.
+  - An L0 flush produces one run per series. A compacted object can carry
+    several.
 - Every `HIST_SPANS` run is followed by one `hist[N]:` line per decoded
   histogram sample. Each line gives `scale`, `zero_threshold`, `sum` (`none`
   if absent), and `reset_hint`, then `count_kind` (`INT`/`FLOAT`) with
-  `zero_count`/`count`, then the positive and negative sides' spans
-  (`(offset, length)` pairs) and bucket counts, in stored order.
-- `series_count (decoded)`: the series count from decoding the catalog, not
-  just from trusting the footer. If it matches `series_count (footer)`, the
-  segment is internally consistent.
+  `zero_count`/`count`, then the spans (`(offset, length)` pairs) and bucket
+  counts of the positive and negative sides, in stored order.
+- `series_count (decoded)`: the series count from a decode of the catalog,
+  which does not trust the footer alone. If it matches
+  `series_count (footer)`, the segment is internally consistent.
 
+## `rlog inspect`
 
-## `rlog inspect`: what's inside one log segment
+The command shows what one log segment contains.
 
 Log data lives in RLOG objects (`.rlog`), the columnar log segment format
 ([docs/log-segment-format.md](../log-segment-format.md), trailer version 5).
-RLOG is a sibling of RSEG: it shares the 16-byte trailer, the protobuf footer,
-and the crc32c discipline, and has its own sections. The ingest path writes
-RLOG objects, the `logs` SQL table on `POST /api/v1/sql` reads them back, and
-maintenance compacts and retains them. The object below was written directly
-by the format's writer, not through the ingest path, to show the format in
-isolation. The command is:
+RLOG shares the 16-byte trailer, the protobuf footer, and the crc32c
+discipline with RSEG, and it has its own sections. The ingest path writes RLOG
+objects. The `logs` SQL table on `POST /api/v1/sql` reads them back.
+Maintenance compacts and retains them.
+
+The writer of the format wrote the object below directly, not through the
+ingest path, to show the format in isolation.
 
 ```sh
 ravel-cli rlog inspect "t/abab.../l/l0/0000/....rlog"
@@ -241,17 +256,17 @@ bloom_coverage (3 column(s)):
 Field by field:
 
 - `total_size`, `version`, `signal`: the byte length of the object, the
-  trailer format version (`5`; the reader accepts exactly this one version,
-  and anything else gets a typed error), and the signal byte (`2` = logs). Like
-  RSEG, the object is footer-first-readable. The 16-byte trailer at the end
-  gives the footer's length and crc. A reader therefore validates the footer
-  in one suffix GET before it fetches anything else.
+  trailer format version, and the signal byte (`2` = logs). The version is
+  `5`. The reader accepts only this one version, and any other version gets a
+  typed error. Like RSEG, the object is footer-first-readable: the 16-byte
+  trailer at the end gives the length and crc of the footer, and a reader
+  validates the footer in one suffix GET before it fetches anything else.
 - `tenant_hash`, `shard`, `writer_id`, `writer_epoch`, `writer_seq`: the
   identity components. They must match the commit record that the reader
   resolved the object from. `writer_id` and `tenant_hash` are printed as hex.
 - `min/max_ts_ns`: the span of record event timestamps.
   `min/max_observed_ts_ns`: the span of observed (ingest-side) timestamps.
-  These four values plus the counts are the skip index's level 2, the
+  These four values plus the counts are level 2 of the skip index, the
   whole-object summary in the footer.
 - `record_count`, `block_count`, `stream_count`: the totals that the footer
   claims.
@@ -259,91 +274,108 @@ Field by field:
   the same convention that RSEG uses. An L0 flush object (every object shown in
   this guide) stamps the sentinels `level=0`, empty `input_set_hash`, and
   `part_index=0`. An L1 compacted object carries real values.
-- `sort_descriptor`, `clustering_generation`: the clustering key the object's
-  records were sorted by and the tenant clustering generation it
-  was written under. `none` means the default order, each stream's records by
-  `ts`; with generation `0` the tenant never set a key or a bloom scope, and
-  with a nonzero generation the key was cleared, or the tenant never set one
-  and a bloom scope or declared-column change gave it a generation. A
-  clustered object prints `sort_descriptor: bucket_width=6h key_columns=2`
-  followed by one `key[i] name=... type=...` line per key column.
-- `sections`: the mandatory sections and their byte ranges. `kind=1`
-  `STREAM_DIR` (stream_id to canonical resource+scope blob and block range),
-  `kind=2` `FIELD_DIR` (dynamic attribute columns), `kind=3` `BLOCKS` (the
-  columnar row blocks, in row groups), `kind=4` `SKIP_IDX`
-  (the multi-level min/max index), `kind=8` `PAGE_DIR` (per row group, per
-  column chunk, per page: offset, length, encoding, and crc32c),
-  `kind=5` `BLOOM` (per-block token blooms). `kind=6` `POSTINGS` is
-  optional and present here because the object declared an indexed field.
-  STREAM_DIR, FIELD_DIR, SKIP_IDX, and PAGE_DIR use whole-section zstd
-  (`comp=zstd`). BLOCKS and BLOOM are containers that a reader reads entry by
-  entry, so they are `comp=none`. `comp` is printed by name (`none`/`zstd`).
+- `sort_descriptor`, `clustering_generation`: the clustering key that the
+  records of the object were sorted by, and the tenant clustering generation
+  that the object was written under.
+  - `none` means the default order: the records of each stream by `ts`.
+  - With generation `0`, the tenant never set a key or a bloom scope.
+  - With a nonzero generation, the key was cleared. Or the tenant never set
+    one, and a bloom scope or declared-column change gave it a generation.
+  - A clustered object prints `sort_descriptor: bucket_width=6h key_columns=2`
+    followed by one `key[i] name=... type=...` line per key column.
+- `sections`: the mandatory sections and their byte ranges:
+  - `kind=1` `STREAM_DIR`: stream_id to canonical resource+scope blob and
+    block range.
+  - `kind=2` `FIELD_DIR`: dynamic attribute columns.
+  - `kind=3` `BLOCKS`: the columnar row blocks, in row groups.
+  - `kind=4` `SKIP_IDX`: the multi-level min/max index.
+  - `kind=8` `PAGE_DIR`: per row group, per column chunk, per page: offset,
+    length, encoding, and crc32c.
+  - `kind=5` `BLOOM`: per-block token blooms.
+
+  `kind=6` `POSTINGS` is optional and present here because the object declared
+  an indexed field. STREAM_DIR, FIELD_DIR, SKIP_IDX, and PAGE_DIR use
+  whole-section zstd (`comp=zstd`). BLOCKS and BLOOM are containers that a
+  reader reads entry by entry, so they are `comp=none`. `comp` is printed by
+  name (`none`/`zstd`).
 - `skip_index level 0`: one line per row block. Each line gives its byte
   `offset` (into BLOCKS) and `len`, the `crc32c` that the reader verifies
-  before it decodes the block, `record_count`, and the block's `ts_range` and
-  `stream_ref_range` (both inclusive). The skip index prunes on those two
-  ranges. `offset` and `len` describe the block's
-  *page span* rather than a contiguous block: the pages of a row group are
-  stored column-major, so consecutive blocks' spans overlap and the `crc32c`
-  covers the block's pages concatenated in column-id order rather than a
-  contiguous byte range. The pages themselves are located through `PAGE_DIR`.
-  Under each block line is one `stat` line per numeric column the
-  block's records resolve a value for: `column_id`, `type`
+  before it decodes the block, `record_count`, and the `ts_range` and
+  `stream_ref_range` of the block (both inclusive). The skip index prunes on
+  those two ranges.
+
+  `offset` and `len` describe the *page span* of the block, not a contiguous
+  block. The pages of a row group are stored column-major, so the spans of
+  consecutive blocks overlap. The `crc32c` covers the pages of the block
+  concatenated in column-id order, not a contiguous byte range. The pages
+  themselves are located through `PAGE_DIR`.
+
+  Under each block line is one `stat` line per numeric column that the records
+  of the block resolve a value for: `column_id`, `type`
   (`i64`/`f64`/`bool`/`bytes`), `min_bits`/`max_bits`, `null_count`, and
-  `has_nan`. `min_bits`/`max_bits`
-  are the bit pattern that the min/max are stored as: two's complement for
-  i64, and `to_bits` for f64, so f64 comparison is bit-exact. In the example,
-  both blocks carry column 10 (`code`), an i64 attribute. The string column
-  `svc` is not numeric and so has no stat. A stat
-  bounds the value each row *resolves* for the column's attribute name, not
-  whatever sits in the column's value page. Resolution is what a query sees:
-  the record's resource and scope attributes, overridden by the record's own,
-  with a record carrying `code` twice (two types, or a duplicate that spilled
-  into `attrs_raw`) reduced to the one value a read reports. A row whose
-  resolved value is of another type, or which resolves the name to nothing,
-  counts in `null_count` instead. Three things follow that look odd until you
-  know the rule: a `stat`'s `null_count` can exceed the same column's
-  `field_dir` `null_count`, which counts raw column presence; the bounds can
-  exclude a value stored in the block; and a stat can appear for a column the
-  block has no page for at all, when its records resolve the name off their
-  resource or scope rather than carrying it themselves.
-- `stream_dir`: one line per stream, in the object's sorted stream_id order.
-  The line number is the `stream_ref` used everywhere else (the entry's
-  0-based ordinal). `stream_id` is the 16-byte identity in hex. `blob_len` is
-  the length of the canonical resource+scope attribute blob. `blocks` is the
-  inclusive block range that holds that stream's records, printed half-open.
+  `has_nan`. `min_bits`/`max_bits` are the bit pattern that the min/max are
+  stored as: two's complement for i64, and `to_bits` for f64, so f64
+  comparison is bit-exact. In the example, both blocks carry column 10
+  (`code`), an i64 attribute. The string column `svc` is not numeric and so
+  has no stat.
+
+  A stat bounds the value that each row *resolves* for the column's attribute
+  name, not the content of the column's value page. Resolution is what a query
+  sees: the record's resource and scope attributes, overridden by the record's
+  own. A record that carries `code` twice (two types, or a duplicate that
+  spilled into `attrs_raw`) is reduced to the one value that a read reports. A row whose resolved value is
+  of another type, or which resolves the name to nothing, counts in
+  `null_count` instead. Three consequences follow from this rule:
+
+  - The `null_count` of a `stat` can exceed the `field_dir` `null_count` of
+    the same column, which counts raw column presence.
+  - The bounds can exclude a value stored in the block.
+  - A stat can appear for a column that the block has no page for at all. This
+    happens when its records resolve the name off their resource or scope and
+    do not carry it themselves.
+- `stream_dir`: one line per stream, in the sorted stream_id order of the
+  object. The line number is the `stream_ref` used everywhere else (the
+  0-based ordinal of the entry). `stream_id` is the 16-byte identity in hex.
+  `blob_len` is the length of the canonical resource+scope attribute blob.
+  `blocks` is the inclusive block range that holds the records of that stream,
+  printed half-open.
 - `field_dir`: one line per dynamic attribute column: `column_id` (dynamic
   columns start at 10; fixed columns 0..=9 are implicit and never listed),
   `name`, `type`, `present_blocks` (blocks with at least one value), and the
   object-wide `null_count`. A key seen with two value types appears as two
   entries (per-type splitting).
-- `bloom_coverage`: the columns BLOOM's filters cover, named through
-  FIELD_DIR (`kind=fixed` for the fixed columns, otherwise the attribute
-  column's type). The default scope covers `body`, `severity_text`, and every
-  string attribute column; a word or equality predicate on a column the list
-  omits is never bloom-pruned.
+- `bloom_coverage`: the columns that the filters of BLOOM cover, named through
+  FIELD_DIR (`kind=fixed` for the fixed columns, otherwise the type of the
+  attribute column). The default scope covers `body`, `severity_text`, and
+  every string attribute column. A word or equality predicate on a column that
+  the list omits is never bloom-pruned.
 
 A corrupt object never inspects as a success. The footer open protocol and
-every section decode return a typed `Corrupted` error with a non-zero exit;
-the lines printed before the failing section stay on stdout. A corrupt
-SKIP_IDX in particular is loud, not a degrade, because its level-0 entries
-are the only source of block byte ranges and per-block checksums. BLOOM is
-read with its whole-section crc verified, so a damaged BLOOM fails `rlog
-inspect` even though a query scan over the same object at worst prunes fewer
-blocks and still answers exactly.
+every section decode return a typed `Corrupted` error with a non-zero exit.
+The lines printed before the failing section stay on stdout.
 
-## `rlog footprint`: where a log segment's bytes go
+- A corrupt SKIP_IDX is an error, not a degrade. Its level-0 entries are the
+  only source of block byte ranges and per-block checksums.
+- BLOOM is read with its whole-section crc verified, so a damaged BLOOM fails
+  `rlog inspect`. A query scan over the same object at worst prunes fewer
+  blocks and still answers exactly.
 
-`rlog footprint` attributes every stored byte of one or more RLOG objects to a
-section, a column, and an encoding. It takes either object keys or local paths,
-or `--tenant <id>`, which measures every logs data object the catalog resolves
-for that tenant over all time (live L0 flush and L1 compacted segments). Per object
-it fetches four ranges: the 16-byte trailer, the footer, FIELD_DIR, and
-PAGE_DIR. It never fetches page bodies, so the cost does not grow with the
-BLOCKS section. `--json` prints the same report as one JSON document, with the
-per-object figures under `objects` and the sums under `total`. The figures
-below come from one small example object; yours differ, and under version 5
-the BLOOM figure includes the covered-column list and its crc32c.
+## `rlog footprint`
+
+The command attributes every stored byte of one or more RLOG objects to a
+section, a column, and an encoding.
+
+- It takes object keys or local paths. It also takes `--tenant <id>`, which
+  measures every logs data object that the catalog resolves for that tenant
+  over all time (live L0 flush and L1 compacted segments).
+- Per object it fetches four ranges: the 16-byte trailer, the footer,
+  FIELD_DIR, and PAGE_DIR. It never fetches page bodies, so the cost does not
+  grow with the BLOCKS section.
+- `--json` prints the same report as one JSON document, with the per-object
+  figures under `objects` and the sums under `total`.
+
+The figures below come from one small example object, and yours differ. Under
+version 5 the BLOOM figure includes the covered-column list and its crc32c.
 
 ```sh
 ravel-cli rlog footprint a.rlog
@@ -387,26 +419,34 @@ columns:
     enc=for_bitpack pages=3 stored_bytes=12 uncompressed_bytes=12
 ```
 
-The figures reconcile exactly, per object, or the command prints no report.
-The `sections` bytes, including the `FOOTER` and `TRAILER` rows, plus
-`gap_bytes` (bytes no section covers) sum to `total_bytes`, and
-`page_stored_bytes`, the sum of every column's `stored_bytes`, equals the
-`BLOCKS` section length. An object that breaks either, for example two
-sections whose byte ranges overlap, is refused with an error naming the object
-and the two figures that differ, and the command exits non-zero. A section's `uncompressed_bytes` is its
-length before whole-section zstd, and equals `bytes` for a `comp=none`
-section. A column's `stored_bytes` is its page bytes as stored (a page of at least
-512 bytes is stored zstd-compressed when that is smaller) and
-`uncompressed_bytes` is the same pages before compression, so the `body` column
-above shows 4144 bytes of text stored in 159. Fixed columns appear by name and
-dynamic columns by their FIELD_DIR name and type; a column PAGE_DIR has no
-chunk for is not listed. A column stores one value page per block that
-carries it, and no page for a block where it is absent from every row. A
-block where it is present on only some rows adds a presence bitmap page
-(`enc=bitmap`) before that value page, so its `pages` count is the number of
-blocks carrying it plus the number of those where it is only partly present.
+The figures reconcile per object, or the command prints no report:
 
-## `commit decode`: what a commit record says
+- The `sections` bytes, including the `FOOTER` and `TRAILER` rows, plus
+  `gap_bytes` (bytes that no section covers) sum to `total_bytes`.
+- `page_stored_bytes`, the sum of the `stored_bytes` of every column, equals
+  the `BLOCKS` section length.
+
+The command refuses an object that breaks either rule, for example two
+sections whose byte ranges overlap. The error names the object and the two
+figures that differ, and the command exits non-zero.
+
+- The `uncompressed_bytes` of a section is its length before whole-section
+  zstd. It equals `bytes` for a `comp=none` section.
+- The `stored_bytes` of a column is its page bytes as stored. A page of at
+  least 512 bytes is stored zstd-compressed when that is smaller.
+  `uncompressed_bytes` is the same pages before compression. The `body` column
+  above shows 4144 bytes of text stored in 159.
+- Fixed columns appear by name. Dynamic columns appear by their FIELD_DIR name
+  and type. A column that PAGE_DIR has no chunk for is not listed.
+- A column stores one value page per block that carries it, and no page for a
+  block where it is absent from every row. A block where it is present on only
+  some rows adds a presence bitmap page (`enc=bitmap`) before that value page.
+  The `pages` count of a column is therefore the number of blocks that carry
+  it plus the number of those blocks where it is only partly present.
+
+## `commit decode`
+
+The command shows what a commit record says.
 
 ```sh
 ravel-cli commit decode \
@@ -435,19 +475,23 @@ created_unix_ns: 1732400060123456789
 ingest_hour_bucket: 2025112718
 ```
 
-A commit record never holds sample data itself. It is a small pointer plus
-enough metadata to prune without opening the segment. `object_key` and
-`object_size` name the segment that this record publishes. `content_hash` is
-the blake3 hash embedded in that segment's own key (`hash16` above,
-extended here to the full hash). It lets a retried commit PUT tell two cases
-apart: "already published, same content" (safe) and "already published,
-different content" (a fatal split-brain, because two different segments
-should never share a `(writer_id, epoch, seq)`). `signal` is the
-numeric signal code (`1` = metrics). `ingest_hour_bucket` is the same hour
-encoded in the object's own key, and it is what the catalog groups listings
-by.
+A commit record never holds sample data. It is a small pointer plus enough
+metadata to prune without opening the segment.
 
-## `inspect cstat`: what a column-statistics object declares
+- `object_key` and `object_size` name the segment that this record publishes.
+- `content_hash` is the blake3 hash embedded in the key of that segment
+  (`hash16` in the key layout, extended here to the full hash). With it, a
+  retried commit PUT can tell two cases apart:
+  - "already published, same content", which is safe
+  - "already published, different content", which is a fatal split-brain. Two
+    different segments must never share a `(writer_id, epoch, seq)`.
+- `signal` is the numeric signal code (`1` = metrics).
+- `ingest_hour_bucket` is the same hour that the key of the object encodes.
+  The catalog groups listings by it.
+
+## `inspect cstat`
+
+The command shows what a column-statistics object declares.
 
 ```sh
 ravel-cli inspect cstat \
@@ -469,38 +513,41 @@ over_ceiling (body_uncompressed_len > 268435456): false
 ```
 
 A `.cstat` object carries the per-column minimum, maximum, count, sum and
-value dictionary a query uses to skip segments it cannot match.
+value dictionary that a query uses to skip segments it cannot match.
 
 `signal` is the raw numeric code from the header, not a word: 1 is metrics,
 2 is spans, 3 is logs. `part_blake3` is comma-joined when a header covers
 more than one part.
 
-`body_uncompressed_len` against the `over_ceiling` verdict is the pair worth
-reading first. A reader refuses any object declaring more than 256 MiB
-**before** decompressing it, so an over-ceiling object is undecodable by
-every reader and nothing is using its statistics, however healthy the object
-looks in a listing. That is why the verdict is computed from the header
-alone: the objects most worth diagnosing are exactly the ones a full decode
-refuses. For those, the command says so instead of failing:
+Read `body_uncompressed_len` and the `over_ceiling` verdict first. A reader
+refuses any object that declares more than 256 MiB **before** it decompresses
+the object. An over-ceiling object is therefore undecodable by every reader,
+and nothing uses its statistics, however healthy the object looks in a
+listing. The command computes the verdict from the header alone, so it can
+report on an object that a full decode refuses:
 
 ```
 over_ceiling (body_uncompressed_len > 268435456): true
 dictionary_present listing: unavailable, body_uncompressed_len exceeds the decode ceiling and no reader can decompress this object
 ```
 
-Under the ceiling, one `segment ... column=... dictionary_present=` line is
-printed per column per segment. `dictionary_present=false` means the fold
-dropped that column's value dictionary to bring the part under the ceiling;
-it drops whole dictionaries, largest first, and never truncates one, so a
-column either has its full dictionary or none of it. A run of `false` on an
-object that is itself under the ceiling means the statistics survived but
-most of the dictionaries did not, and predicate pruning falls back to
-min/max for those columns.
+Under the ceiling, the command prints one
+`segment ... column=... dictionary_present=` line per column per segment.
+
+- `dictionary_present=false` means that the fold dropped the value dictionary
+  of that column to bring the part under the ceiling. The fold drops whole
+  dictionaries, largest first, and never truncates one. A column has its full
+  dictionary or none of it.
+- A run of `false` on an object that is itself under the ceiling means that
+  the statistics survived but most of the dictionaries did not. Predicate
+  pruning falls back to min/max for those columns.
 
 A truncated, bad-magic, wrong-version or checksum-mismatched object fails
-with the specific reason rather than a generic error.
+with the specific reason, not a generic error.
 
-## `idem inspect`: what an idempotency marker says
+## `idem inspect`
+
+The command shows what an idempotency marker says.
 
 ```sh
 ravel-cli idem inspect \
@@ -515,18 +562,20 @@ written_count: 42
 commit_tokens: [v2:token-abc, v2:token-def]
 ```
 
-An idempotency marker is the receipt a keyed log or
-span ingest request writes after a successful flush, so a retry of the same
-request replays this receipt instead of re-ingesting. `written_count` is the
-row or span count the original request wrote; `commit_tokens` is the full
-`x-ravel-commit-token` set the ack carried, one token per shard the
-request's points flushed through.
+An idempotency marker is the receipt that a keyed log or span ingest request
+writes after a successful flush. A retry of the same request replays this
+receipt and does not ingest again.
+
+- `written_count` is the row or span count that the original request wrote.
+- `commit_tokens` is the full `x-ravel-commit-token` set that the ack carried,
+  one token per shard that the points of the request flushed through.
 
 A truncated, bad-magic, wrong-version, checksum-mismatched, or malformed
-marker fails with the specific reason instead of a generic error or a
-silent `valid`-looking report -- this command decodes through the same
-function the ingest path itself uses to interpret a marker (there is
-exactly one decoder for this format), so its verdict always matches what a
-retried request would actually experience: a marker this command reports as
-corrupt is a marker the ingest path also treats as a miss (fail-open to
-at-least-once), never the reverse.
+marker fails with the specific reason, not a generic error or a report that
+looks `valid`.
+
+The command decodes through the one decoder for this format, the function
+that the ingest path uses. Its verdict therefore always matches what a retried
+request experiences. A marker that this command reports as corrupt is one that
+the ingest path also treats as a miss (fail-open to at-least-once), never the
+reverse.
