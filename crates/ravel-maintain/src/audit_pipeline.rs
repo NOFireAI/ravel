@@ -9,7 +9,9 @@
 //! batches submitted [`AuditEvent`]s and flushes on `max_batch` records or
 //! `max_age` (default 25 ms), whichever comes first, as one
 //! [`write_audit_batch`] call - one object, one commit record, per tenant
-//! represented in the batch.
+//! represented in the batch. An event that arrives to an idle pipeline flushes
+//! at once instead of waiting `max_age` (see `run_flush_loop`), so sequential
+//! queries do not pay the batching wait.
 //!
 //! # Tenancy
 //!
@@ -133,6 +135,9 @@ impl QueryAuditSink for NoopQueryAuditSink {
 struct Submission {
     record: AuditRecord,
     done: oneshot::Sender<Result<()>>,
+    /// When `submit` enqueued it, so the flush task can tell whether it
+    /// arrived while a flush was in flight.
+    submitted_at: Instant,
 }
 
 /// Group-commit audit pipeline (ADR-0062 §2b). Holds a background flush task
@@ -234,6 +239,7 @@ impl AuditPipeline {
             .send(Submission {
                 record: event,
                 done: done_tx,
+                submitted_at: Instant::now(),
             })
             .await
             .is_err()
@@ -336,6 +342,14 @@ impl QueryAuditSink for AuditPipeline {
 
 /// The background flush loop: accumulate a batch until `max_batch` records or
 /// `max_age`, flush it, repeat, until a stop signal or the channel closing.
+///
+/// An event that finds the pipeline idle flushes at once instead of opening a
+/// window (ADR-2509 decision 2): nothing else is queued, it was not submitted
+/// while a flush was in flight, and the loop received the previous event at
+/// least `max_age` earlier. The last condition keeps steady traffic batching:
+/// idle flushes are at least `max_age` apart, so each adds at most one PUT
+/// pair over the window-only loop, and traffic faster than `max_age` never
+/// takes this path.
 async fn run_flush_loop(
     mut rx: mpsc::Receiver<Submission>,
     store: Arc<dyn ObjectStoreBackend>,
@@ -345,6 +359,10 @@ async fn run_flush_loop(
     put_retries: Arc<AtomicU64>,
     rng: Arc<dyn RngSource>,
 ) {
+    let mut last_received: Option<Instant> = None;
+    // Every flush is awaited inline, so a submission stamped before this
+    // instant was enqueued while the previous flush was in flight.
+    let mut last_flush_end: Option<Instant> = None;
     loop {
         // Wait for the first submission of a new batch, or a stop signal.
         let first = tokio::select! {
@@ -368,11 +386,17 @@ async fn run_flush_loop(
             },
         };
 
+        let received_at = Instant::now();
+        let idle = rx.is_empty()
+            && last_flush_end.is_none_or(|end| first.submitted_at >= end)
+            && last_received.is_none_or(|prev| received_at - prev >= config.max_age);
+        last_received = Some(received_at);
+
         let mut batch = vec![first];
-        let deadline = Instant::now() + config.max_age;
+        let deadline = received_at + config.max_age;
         let mut stop = false;
 
-        while batch.len() < config.max_batch {
+        while !idle && batch.len() < config.max_batch {
             tokio::select! {
                 biased;
                 _ = shutdown.notified() => {
@@ -386,7 +410,10 @@ async fn run_flush_loop(
                     break;
                 }
                 recv = rx.recv() => match recv {
-                    Some(submission) => batch.push(submission),
+                    Some(submission) => {
+                        last_received = Some(Instant::now());
+                        batch.push(submission);
+                    }
                     // Senders dropped mid-batch: flush what we have, then exit.
                     None => {
                         stop = true;
@@ -406,6 +433,7 @@ async fn run_flush_loop(
             batch,
         )
         .await;
+        last_flush_end = Some(Instant::now());
         if stop {
             return;
         }
