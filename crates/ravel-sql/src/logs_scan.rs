@@ -1336,6 +1336,11 @@ struct BlockMetrics {
     /// from [`Self::open_elapsed`] so a fallback's second open is visible.
     reopen_elapsed: Time,
     reopens: Count,
+    /// Ranged fast-path opens the fetch memory budget refused while this
+    /// partition's pipeline held other opens, each reopened sequentially at
+    /// its segment's turn with the pipeline turned off (ADR-2414 decision A2).
+    /// At most one per partition: after it the partition walks sequentially.
+    prefetch_memory_reopens: Count,
     /// Wall time in the synchronous decode and Arrow build sites inside
     /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
     /// columnar path, `next_block` on the row path. Nothing nested is timed
@@ -1372,6 +1377,8 @@ impl BlockMetrics {
             segments_opened: MetricBuilder::new(metrics).counter("segments_opened", partition),
             reopen_elapsed: MetricBuilder::new(metrics).subset_time("reopen_elapsed", partition),
             reopens: MetricBuilder::new(metrics).counter("reopens", partition),
+            prefetch_memory_reopens: MetricBuilder::new(metrics)
+                .counter("prefetch_memory_reopens", partition),
             decode_build_elapsed: MetricBuilder::new(metrics)
                 .subset_time("decode_build_elapsed", partition),
             emit_elapsed: MetricBuilder::new(metrics).subset_time("emit_elapsed", partition),
@@ -2799,6 +2806,7 @@ impl ExecutionPlan for LogsScanExec {
             prefetch_share,
             prefetched: VecDeque::new(),
             current_by_chunk: false,
+            current_prefetched: false,
             segments: Arc::clone(&self.segments),
             work,
             reservation,
@@ -3628,6 +3636,19 @@ fn fast_path_prefetch_share(store_get_concurrency: usize, partitions: usize) -> 
     (store_get_concurrency / partitions.max(1)).max(2)
 }
 
+/// Whether `e` is the fetcher's memory budget refusing a reservation
+/// ([`LogFetchError::FetchMemoryExhausted`]), as an open surfaces it.
+fn is_fetch_memory_refusal(e: &DataFusionError) -> bool {
+    matches!(
+        e,
+        DataFusionError::External(inner)
+            if matches!(
+                inner.downcast_ref::<SqlError>(),
+                Some(SqlError::LogFetch(LogFetchError::FetchMemoryExhausted { .. }))
+            )
+    )
+}
+
 /// A ranged fast-path open issued ahead of this partition's turn to drain
 /// its segment (ADR-2414 decision A2). It is the same [`open_segment_fast`]
 /// future the sequential open would build, polled from
@@ -3636,8 +3657,9 @@ fn fast_path_prefetch_share(store_get_concurrency: usize, partitions: usize) -> 
 /// reported for the segment that produced it and only once the segments
 /// before it have been emitted.
 struct Prefetch {
-    seg: SegmentRef,
-    ordinal: usize,
+    /// The owned work item the open was issued for, kept whole so a memory
+    /// refusal can hand it back to the sequential walk.
+    owned: OwnedSeg,
     /// When the open was issued: the start of this segment's `open_elapsed`.
     issued: Instant,
     open: PrefetchOpen,
@@ -3905,6 +3927,10 @@ struct LogScanStream {
     /// Whether the current fast-path segment was opened ranged, the
     /// precondition for prefetching behind it.
     current_by_chunk: bool,
+    /// Whether the current segment's open was issued ahead of its turn, so a
+    /// memory refusal of it is one the sequential walk might not have met
+    /// ([`Self::reopen_after_memory_refusal`]).
+    current_prefetched: bool,
     /// Every segment in the snapshot, snapshot order, shared with the exec. The
     /// owned-work computation indexes this by segment position.
     segments: Arc<Vec<SegmentRef>>,
@@ -4075,8 +4101,7 @@ impl LogScanStream {
             self.mark_segment_at(next.ordinal, "seg_open_start_offset");
             let open = open_segment_fast(Arc::clone(&self.ctx), next.seg.clone(), true);
             self.prefetched.push_back(Prefetch {
-                seg: next.seg,
-                ordinal: next.ordinal,
+                owned: next,
                 issued: Instant::now(),
                 open: PrefetchOpen::InFlight(open),
             });
@@ -4097,12 +4122,52 @@ impl LogScanStream {
                     opened: Box::new(opened),
                     at: Instant::now(),
                 };
-                ready.push(prefetch.ordinal);
+                ready.push(prefetch.owned.ordinal);
             }
         }
         for ordinal in ready {
             self.mark_segment_at(ordinal, "seg_open_ready_offset");
         }
+    }
+
+    /// Handles the current segment's failed open on the ranged fast path. A
+    /// fetch memory refusal of an open the pipeline issued ahead of its turn,
+    /// or of the current open while the pipeline holds opens behind it, is
+    /// one the sequential walk might not have met: the partition turns its
+    /// pipeline off, releases the opens it holds behind the current segment
+    /// (their segments go back to the front of `work`, in owned order, and
+    /// open sequentially at their turns), and reopens the current segment the
+    /// way the sequential walk does. Returns the error untouched when it is
+    /// any other error, or when the pipeline is already off, so a refusal of
+    /// that sequential reopen fails the query.
+    fn reopen_after_memory_refusal(&mut self, e: DataFusionError) -> Result<(), DataFusionError> {
+        let pipelined = self.current_prefetched || !self.prefetched.is_empty();
+        if !(self.fast_whole_segment
+            && self.current_by_chunk
+            && self.prefetch_share > 1
+            && pipelined
+            && is_fetch_memory_refusal(&e))
+        {
+            return Err(e);
+        }
+        let Some(seg) = self.current_seg.clone() else {
+            return Err(e);
+        };
+        self.prefetch_share = 1;
+        while let Some(prefetch) = self.prefetched.pop_back() {
+            self.work.push_front(prefetch.owned);
+        }
+        self.current_prefetched = false;
+        self.blocks.prefetch_memory_reopens.add(1);
+        tracing::debug!(
+            partition = self.partition,
+            segment = self.current_seg_ordinal,
+            error = %e,
+            "ranged prefetch refused by the fetch memory budget; reopening sequentially"
+        );
+        self.open_started.get_or_insert_with(Instant::now);
+        self.state = LogScanState::Opening(open_segment_fast(Arc::clone(&self.ctx), seg, true));
+        Ok(())
     }
 
     /// The surviving-block index of the block just decoded, or `None` when
@@ -4381,8 +4446,7 @@ impl LogScanStream {
                 // turn and in owned order; every prefetch is a ranged open.
                 LogScanState::NextSegment if !this.prefetched.is_empty() => {
                     let Some(Prefetch {
-                        seg,
-                        ordinal,
+                        owned: OwnedSeg { seg, ordinal, .. },
                         issued,
                         open,
                     }) = this.prefetched.pop_front()
@@ -4397,6 +4461,7 @@ impl LogScanStream {
                     this.current_dirs = None;
                     this.current_whole_object = None;
                     this.current_by_chunk = true;
+                    this.current_prefetched = true;
                     this.block_cursor = 0;
                     this.consecutive_fallbacks = 0;
                     this.blocks.segments_opened.add(1);
@@ -4422,7 +4487,11 @@ impl LogScanStream {
                                     };
                                 }
                                 Ok(None) => this.finish_segment(),
-                                Err(e) => return this.fail(e),
+                                Err(e) => {
+                                    if let Err(e) = this.reopen_after_memory_refusal(e) {
+                                        return this.fail(e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -4453,6 +4522,7 @@ impl LogScanStream {
                         // charges `add_bytes_reused` twice for one buffer
                         // (issue #835 follow-up).
                         this.current_whole_object = whole_object;
+                        this.current_prefetched = false;
                         this.block_cursor = 0;
                         this.consecutive_fallbacks = 0;
                         this.blocks.segments_opened.add(1);
@@ -4522,7 +4592,11 @@ impl LogScanStream {
                         }
                         this.finish_segment();
                     }
-                    Poll::Ready(Err(e)) => return this.fail(e),
+                    Poll::Ready(Err(e)) => {
+                        if let Err(e) = this.reopen_after_memory_refusal(e) {
+                            return this.fail(e);
+                        }
+                    }
                     Poll::Pending => {
                         this.blocks.open_pending_polls.add(1);
                         return Poll::Pending;
@@ -9059,15 +9133,35 @@ mod fast_path_prefetch_tests {
         permits: usize,
         accounting: PhaseAccounting,
     ) -> LogsScanExec {
+        exec_with(
+            ranged_fetcher(store, permits),
+            segments,
+            partitions,
+            accounting,
+        )
+    }
+
+    /// The fetcher [`exec`] scans with: `permits` GET permits, every segment
+    /// routed ranged.
+    fn ranged_fetcher(store: &Arc<FaultStore<MemoryStore>>, permits: usize) -> LogSegmentFetcher {
         let store = Arc::clone(store) as Arc<dyn ObjectStoreBackend>;
-        let fetcher = LogSegmentFetcher::new(Arc::clone(&store))
+        LogSegmentFetcher::new(Arc::clone(&store))
             .with_block_range(
                 BlockRangeFetcher::new(store)
                     .with_suffix_len(256)
                     .with_whole_object_threshold(0),
             )
             .with_block_range_threshold(0)
-            .with_max_concurrent_gets(permits);
+            .with_max_concurrent_gets(permits)
+    }
+
+    /// [`exec`] over a caller-built fetcher.
+    fn exec_with(
+        fetcher: LogSegmentFetcher,
+        segments: &[SegmentRef],
+        partitions: usize,
+        accounting: PhaseAccounting,
+    ) -> LogsScanExec {
         LogsScanExec::new(
             TENANT,
             fetcher,
@@ -9360,5 +9454,123 @@ mod fast_path_prefetch_tests {
             err.to_string().contains(&key(2)),
             "the error names segment 2: {err}"
         );
+    }
+
+    /// What partition 0 produced under a fetch memory budget of `limit`
+    /// bytes: its rows, `segments_opened`, `fast_path_ranged_segments`,
+    /// `prefetch_memory_reopens`, and the scan phase's data objects touched,
+    /// or the error the stream ended with. `pipelined: false` turns the
+    /// pipeline off the way [`sequential`] does.
+    async fn budgeted(
+        limit: u64,
+        pipelined: bool,
+    ) -> Result<(Vec<i64>, usize, usize, usize, u64), DataFusionError> {
+        let (store, segments) = fixture(None).await;
+        let accounting = PhaseAccounting::new();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
+        let exec = Arc::new(exec_with(fetcher, &segments, 2, accounting.clone()));
+        let plan: Arc<dyn ExecutionPlan> = if pipelined {
+            exec
+        } else {
+            exec.with_fetch(Some(usize::MAX)).expect("fetch pushdown")
+        };
+        let mut stream = plan
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute");
+        let mut rows = Vec::new();
+        let drained = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(item) = stream.next().await {
+                rows.extend(timestamps(&[item?]));
+            }
+            Ok::<(), DataFusionError>(())
+        })
+        .await
+        .expect("the scan ends rather than retrying a refused open forever");
+        drop(stream);
+        drained?;
+        assert_eq!(budget.reserved(), 0, "every fetch reservation is released");
+        Ok((
+            rows,
+            metric_total(plan.as_ref(), "segments_opened"),
+            metric_total(plan.as_ref(), "fast_path_ranged_segments"),
+            metric_total(plan.as_ref(), "prefetch_memory_reopens"),
+            accounting.scan().snapshot().data_objects_touched,
+        ))
+    }
+
+    /// A ranged prefetch the fetch memory budget refuses does not fail a
+    /// query the sequential walk runs: at the smallest budget the sequential
+    /// walk completes in, the pipelined walk (share 2) holds two opens at
+    /// once, is refused, turns its pipeline off and reopens the refused
+    /// segment sequentially, and returns the sequential walk's rows,
+    /// segments opened, ranged-route count and data objects touched, with
+    /// the fallback counted exactly once. One byte below that budget the
+    /// sequential reopen is refused too, and the query fails with the typed
+    /// refusal instead of retrying.
+    ///
+    /// Fails against failing the query on the prefetch's refusal (the first
+    /// pipelined run errors), against a reopen that keeps the opens behind
+    /// the refused one in flight (they hold the bytes the reopen needs, so it
+    /// is refused again), and against retrying every refusal (the run one
+    /// byte short never ends, and the timeout fires).
+    #[tokio::test]
+    async fn a_prefetch_refused_by_the_memory_budget_reopens_sequentially() {
+        assert_eq!(fast_path_prefetch_share(4, 2), 2);
+        let ceiling: u64 = 1 << 24;
+        assert!(
+            budgeted(ceiling, false).await.is_ok(),
+            "the ceiling fits the sequential walk"
+        );
+        // The smallest budget the sequential walk completes in.
+        let (mut lo, mut hi) = (0u64, ceiling);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if budgeted(mid, false).await.is_ok() {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let fits = hi;
+
+        let unlimited = budgeted(ceiling, true)
+            .await
+            .expect("pipelined, no pressure");
+        assert_eq!(unlimited.3, 0, "no refusal, no fallback reopen");
+
+        let sequential = budgeted(fits, false).await.expect("sequential fits");
+        let pipelined = budgeted(fits, true)
+            .await
+            .expect("the pipelined walk falls back instead of failing");
+        assert_eq!(
+            sequential.0,
+            (0..BLOCKS)
+                .chain(200..200 + BLOCKS)
+                .chain(400..400 + BLOCKS)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            (&pipelined.0, pipelined.1, pipelined.2, pipelined.4),
+            (&sequential.0, sequential.1, sequential.2, sequential.4),
+            "rows, segments opened, ranged opens and data objects touched match \
+             the sequential walk"
+        );
+        assert_eq!((sequential.1, sequential.2, sequential.4), (3, 3, 3));
+        assert_eq!(
+            (sequential.3, pipelined.3),
+            (0, 1),
+            "the fallback is counted once, on the pipelined run only"
+        );
+
+        for pipelined in [false, true] {
+            let err = budgeted(fits - 1, pipelined)
+                .await
+                .expect_err("one byte short refuses the sequential open too");
+            assert!(
+                is_fetch_memory_refusal(&err),
+                "the typed refusal surfaces (pipelined {pipelined}): {err}"
+            );
+        }
     }
 }
