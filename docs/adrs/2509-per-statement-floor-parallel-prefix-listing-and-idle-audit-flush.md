@@ -213,7 +213,8 @@ sequenceDiagram
   outcome is the `max_batch=1` configuration ADR-0062 rejects on object
   count. With the condition:
   - traffic arriving more often than once per `max_age` never triggers the
-    idle path, and batches exactly as it does today;
+    idle path, and batches exactly as it does today (this is stated at the
+    wrong instant: see the idle-condition correction below);
   - only the first event after a gap of at least `max_age` flushes alone.
 - **The cost bound.** Compared with today's loop on the same arrival
   schedule:
@@ -392,7 +393,8 @@ does not move it. See "Deferred" below.
 - **The audit pipeline.**
   - Sequential traffic no longer waits `max_age`.
   - Traffic arriving more often than once per `max_age` batches exactly as
-    it does today.
+    it does today. (Stated at the wrong instant, and silent on latency: see
+    the idle-condition correction below.)
   - The PUT-pair count is at most twice today's on any arrival schedule, and
     at most one extra pair per `max_age` of wall time.
   - `max_age` and `max_batch` keep their meaning.
@@ -490,3 +492,34 @@ for other reasons:
 pages until every other shard has drained, asserts that it did, and checks the
 resolved snapshot against the bounded path's. ADR-0056's reserved-cap
 amendment and `docs/catalog-and-mvcc.md` are corrected in place.
+
+## Correction (2026-10-04): where the idle conditions are measured, and who pays
+
+<!-- amendment-applies: sections="2. The audit pipeline flushes when it is idle|Consequences" pointer="idle-condition correction" -->
+
+Found in review of the implementation (#2560). Two things in decision 2 and
+its Consequences bullet are imprecise.
+
+**The conditions are measured at the loop, not at arrival.** The
+implementation (`run_flush_loop`, `crates/ravel-maintain/src/audit_pipeline.rs`)
+treats an event as idle when:
+- nothing else is queued at the moment the loop takes it;
+- it was not submitted while a flush was in flight (its own submission
+  timestamp against the end of the last flush);
+- the loop received its previous event at least `max_age` earlier.
+
+So "traffic arriving more often than once per `max_age` never triggers the
+idle path" holds for traffic the loop receives that often. A loop wake
+delayed by `max_age` or more can make the next event idle even when arrivals
+were closer together. The PUT-pair bound is unaffected: idle flushes are
+still at least `max_age` apart, because the gap is measured between receipts.
+
+**Decision 2 gives the PUT cost and not the latency cost.** An event
+submitted while an idle flush is in flight is not idle. The loop receives it
+when that flush returns, opens a full `max_age` window, and flushes again.
+Take two queries submitted 1 ms apart to a quiet pipeline, with `max_age`
+25 ms and a dual PUT of about 98 ms. They are durable at about 98 ms and
+221 ms, where the previous loop gave about 123 ms for both. Sequential
+traffic, the measured case, gains the 25 ms. The ADR-0062 idle-flush
+amendment carries the full statement, and issue #2561 tracks reducing the
+second event's wait.
