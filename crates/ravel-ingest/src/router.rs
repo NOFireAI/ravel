@@ -63,6 +63,9 @@ struct ShardHandle {
     /// it before enqueue, which is the only place a buffered-mode write can be
     /// refused, since that write is acknowledged at enqueue.
     cap_flag: DeferralCapFlag,
+    /// The flush scope of this shard's set, handed to every incarnation of the
+    /// actor so a respawn keeps the set's shard count.
+    scope: Arc<dyn FlushScope<ShardMsg>>,
 }
 
 /// Supervisor state guarded together so a death observation, the respawn that
@@ -95,6 +98,7 @@ impl ShardHandle {
         tx: mpsc::Sender<ShardMsg>,
         flush_floor_ns: Arc<AtomicI64>,
         cap_flag: DeferralCapFlag,
+        scope: Arc<dyn FlushScope<ShardMsg>>,
     ) -> Self {
         ShardHandle {
             inner: Mutex::new(ShardInner {
@@ -106,6 +110,7 @@ impl ShardHandle {
             }),
             flush_floor_ns,
             cap_flag,
+            scope,
         }
     }
 
@@ -259,7 +264,7 @@ impl IngestRouter {
         // Each generation's shard-actor set gets a fresh writer identity, so
         // two sets never collide on a commit key for the same shard index.
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<ShardHandle>>| {
-            let scope: Arc<dyn FlushScope<ShardMsg>> = Arc::new(SwitchScope::new(weak.clone()));
+            let weak = weak.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -270,6 +275,8 @@ impl IngestRouter {
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
             let factory = move |shard_count: u32| -> Vec<ShardHandle> {
+                let scope: Arc<dyn FlushScope<ShardMsg>> =
+                    Arc::new(SwitchScope::new(weak.clone(), shard_count));
                 let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
@@ -299,7 +306,7 @@ impl IngestRouter {
                             Arc::clone(&stage_timings),
                         );
                         tokio::spawn(actor.run());
-                        ShardHandle::new(tx, flush_floor_ns, cap_flag)
+                        ShardHandle::new(tx, flush_floor_ns, cap_flag, Arc::clone(&scope))
                     })
                     .collect()
             };
@@ -747,6 +754,7 @@ impl IngestRouter {
             shard,
             Arc::clone(&handle.flush_floor_ns),
             handle.cap_flag.clone(),
+            Arc::clone(&handle.scope),
         );
     }
 
@@ -765,6 +773,7 @@ impl IngestRouter {
         shard: u32,
         flush_floor_ns: Arc<AtomicI64>,
         cap_flag: DeferralCapFlag,
+        scope: Arc<dyn FlushScope<ShardMsg>>,
     ) -> mpsc::Sender<ShardMsg> {
         let writer_id = self.rng.new_uuid();
         let epoch =
@@ -784,7 +793,7 @@ impl IngestRouter {
             flush_floor_ns,
             self.backstop_ceiling.clone(),
             cap_flag,
-            Arc::new(SwitchScope::new(Arc::downgrade(&self.switch))),
+            scope,
             #[cfg(feature = "stage-timing")]
             Arc::clone(&self.stage_timings),
         );
@@ -821,8 +830,20 @@ impl IngestRouter {
     /// A pass that handed rows back (ADR-1642 scan-set amendment) may have
     /// delivered them to a shard that had already answered its own flush, so
     /// the fan-out repeats until a pass hands nothing back. Handed-back rows
-    /// land in the tenant's current generation, which does not hand them back
-    /// again, so the bound is never what ends it in practice.
+    /// land in the set of the generation the check named: the current one for
+    /// a retired index, the hour's owner for a generation mismatch. That set's
+    /// own check passes them unless the clock has meanwhile moved into an hour
+    /// a third generation owns, which only the pass bound covers.
+    ///
+    /// A hand-back whose send failed, on a full or closed mailbox or a target
+    /// that is not live, moves no counter, so this loop cannot see it. Each
+    /// shard's own drain covers it instead: rows a generation-mismatch
+    /// hand-back left undelivered are retried there and, if the last pass
+    /// still cannot deliver them, written in place and counted
+    /// (`generation_mismatch_written_in_place`), so no shard answers this
+    /// drain with them buffered. Rows a retired-index hand-back could not
+    /// deliver stay buffered for a later flush, since written in place they
+    /// would sit where readers do not scan.
     pub async fn flush_all(&self) {
         for _ in 0..HAND_BACK_DRAIN_PASSES {
             let handed_back = self.metrics.rerouted_flushes();
@@ -862,8 +883,14 @@ impl IngestRouter {
     ///
     /// Sets drain largest first, each finished before the next is signalled:
     /// a retiring set's drain may hand rows back (ADR-1642 scan-set
-    /// amendment), always to a smaller set, which must still be running to
-    /// take them. The sets are listed again after each one, since a hand-back
+    /// amendment). A retired-index hand-back always goes to a smaller set,
+    /// which is still running and takes the rows. A generation-mismatch
+    /// hand-back to a larger set finds that set already draining or drained:
+    /// each actor closes its mailbox before its teardown flush and writes
+    /// every hand-back it had already accepted, so such a send either landed
+    /// before the close and is written by the larger set, or fails as closed
+    /// and the source keeps the rows, writing them in place at its own
+    /// teardown. The sets are listed again after each one, since a hand-back
     /// can construct the current generation's set during the drain.
     pub async fn shutdown(self) {
         let mut drained = Vec::new();
