@@ -195,8 +195,8 @@ For the query routes, the status codes come from one shared error mapping:
   shard-generation or format-floor history, or carries a format version below
   the lowest this build supports, a supersession chain of compaction or
   rewrite records that is cyclic, deeper than the resolver's fixed bound, or
-  names a predecessor with a different input set, a segment decode job that
-  panicked, a non-monotonic run). It is not retryable, and its
+  names a predecessor with a different input set, a non-monotonic run). It is
+  not retryable, and its
   message is fixed so no object key or tenant hash leaks.
 - 503 `unavailable`: a transient storage fault, an invalidated snapshot, a
   catalog object (commit, compaction or rewrite record, erasure request, HEAD,
@@ -205,9 +205,8 @@ For the query routes, the status codes come from one shared error mapping:
   snapshot part entry level), which a peer on a newer build can read during a
   rolling upgrade, a provisioning record written in a format version above
   the highest this build reads, a Parquet table's manifest or grants record
-  written in a format version above the highest this build reads, a segment
-  decode job the read CPU gate cancelled at shutdown, or an unsatisfiable
-  `min_commit_token`. Retryable. A store fault that is a checksum mismatch
+  written in a format version above the highest this build reads, or an
+  unsatisfiable `min_commit_token`. Retryable. A store fault that is a checksum mismatch
   answers 500 instead, on a catalog read as on a segment fetch and on a SQL
   read of a Parquet table's manifest, grants record or data file. A Parquet
   table's manifest or grants record written in a format version below the

@@ -4,7 +4,8 @@
 //! The query role never deletes that record: the maintain role reaps it.
 //!
 //! These drive a real in-process server over real sockets. Automatic
-//! time-based flushes are disabled (a very long `max_flush_delay`) so the only
+//! time-based flushes are disabled (buffered-mode writes under a very long
+//! `max_flush_delay_idle`) so the only
 //! thing that can flush a buffered record is the shutdown drain itself: an
 //! object appearing under the tenant's metrics prefix after `shutdown()` proves
 //! the drain ran, not a background timer.
@@ -136,13 +137,19 @@ async fn start_server_configured(
         max_inflight_flushes: 1,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
-        // Long enough that no time-based flush ever fires during a test: the
-        // shutdown drain is the only thing that can flush the buffered record.
-        // 3599s rather than 3600s: an hour of trigger delay plus the hour of
-        // flush lifetime leaves no flush deferral cap, which `start` refuses.
-        max_flush_delay: Duration::from_secs(3599),
+        // Every write here is one buffered-mode record, far below
+        // `min_flush_bytes`, so no buffer gets the fast clock and only the
+        // idle delay can fire an automatic flush: long enough that none does
+        // during a test, so the shutdown drain is the only thing that can
+        // flush the buffered record. 3599s rather than 3600s: an hour of
+        // trigger delay plus the hour of flush lifetime leaves no flush
+        // deferral cap, which `start` refuses. The fast delay and
+        // `min_flush_bytes` stay at their defaults, since `start` also
+        // refuses a fast delay whose strict visibility budget reaches 3s and
+        // a `min_flush_bytes` at or above `target_bytes`.
+        max_flush_delay: Duration::from_secs(2),
         max_flush_delay_idle: Duration::from_secs(3599),
-        min_flush_bytes: 1024 * 1024 * 1024,
+        min_flush_bytes: 256 * 1024,
         idle_flush_byte_floor: 0,
         mode,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),

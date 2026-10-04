@@ -172,6 +172,15 @@ async fn metrics_served_in_every_mode() {
             body.contains("ravel_catalog_interlock_violations_total"),
             "metrics body missing catalog family in mode {mode:?}:\n{body}"
         );
+        for name in [
+            "ravel_catalog_column_stats_decode_refusals_total",
+            "ravel_catalog_column_stats_decode_panics_total",
+        ] {
+            assert!(
+                body.contains(&format!("{name}{{mode=")),
+                "metrics body missing {name} in mode {mode:?}:\n{body}"
+            );
+        }
 
         running.shutdown().await.expect("graceful shutdown");
     }
