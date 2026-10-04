@@ -308,23 +308,31 @@ pub struct IngestMetrics {
     /// rather than fleet-wide-outed.
     grace_extended_stale_flushes: AtomicU64,
     /// Flushes that would have written under a shard index outside the scan
-    /// set of the hour they pinned, and handed their rows back to be routed
-    /// under the tenant's current generation instead (ADR-1642 scan-set
-    /// amendment).
+    /// set of the hour they pinned, or into an hour another generation owns,
+    /// and handed their rows to that hour's shard set instead (ADR-1642
+    /// scan-set amendment). One per flush attempt that delivered rows to at
+    /// least one target.
     rerouted_flushes: AtomicU64,
     /// The part of `rerouted_flushes` handed back for
     /// [`HandBackReason::GenerationMismatch`] (issue #2429).
     rerouted_flushes_generation_mismatch: AtomicU64,
-    /// Hand-back episodes that could not deliver rows to a target shard of the
-    /// tenant's current generation, because the target was dead, condemned or
-    /// its mailbox closed, at the liveness check or at the send. The rows stay
-    /// in the source buffer and the next flush attempt retries the hand-back.
+    /// Hand-back episodes that could not deliver rows to a target shard,
+    /// because the target was dead, condemned or its mailbox closed, at the
+    /// liveness check or at the send, or its mailbox was full on a send that
+    /// may not wait. The rows stay in the source buffer and a later flush
+    /// retries, until a generation-mismatch hand-back's retry is spent
+    /// ([`crate::generation::mismatch_retry_spent`]) or a drain writes them.
     /// Counted once per buffer until a hand-back from it delivers.
     hand_back_failures: AtomicU64,
     /// Flushes a teardown drain wrote in place under a shard index the read
     /// side does not scan for the hour they pinned, because a hand-back target
     /// was not live. Stored, and invisible to every query.
     teardown_unscanned_writes: AtomicU64,
+    /// Buffers written in place although the flush found the hour owned by
+    /// a generation that routes at another count (issue #2429): at teardown,
+    /// or in a drain, when the hand-back could not deliver, or once a retried
+    /// hand-back reached the deferral cap. One per buffer.
+    generation_mismatch_written_in_place: AtomicU64,
     /// Per-shard count of flushes the actor has handed to a spawned flush task
     /// and that have not yet finished, counted from the moment the buffer
     /// leaves the actor: a task still waiting for its `max_inflight_flushes`
@@ -795,12 +803,15 @@ pub struct IngestMetricsSnapshot {
     /// [`HandBackReason::RetiredIndex`].
     pub rerouted_flushes_generation_mismatch: u64,
     /// Hand-back episodes that left rows in the source buffer because a
-    /// target shard was not live. Exported as
-    /// `ravel_ingest_hand_back_failures_total`.
+    /// target shard was not live or its mailbox was closed or full. Exported
+    /// as `ravel_ingest_hand_back_failures_total`.
     pub hand_back_failures: u64,
     /// Teardown flushes written in place outside the scan set. Exported as
     /// `ravel_ingest_teardown_unscanned_writes_total`.
     pub teardown_unscanned_writes: u64,
+    /// Buffers written in place into an hour another generation owns, after
+    /// a generation-mismatch hand-back could not deliver. Not exported.
+    pub generation_mismatch_written_in_place: u64,
     /// `ingest_metadata_flush_gets_total` (ADR-0085 decision 1).
     pub metadata_flush_gets_total: u64,
     /// `ingest_metadata_flush_puts_total` (ADR-0085 decision 1). Counts PUT
@@ -1174,6 +1185,12 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One buffer written in place into an hour another generation owns.
+    pub(crate) fn record_generation_mismatch_written_in_place(&self) {
+        self.generation_mismatch_written_in_place
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One metadata-record GET issued by a flush window (ADR-0085 decision 1).
     pub(crate) fn record_metadata_flush_get(&self) {
         self.metadata_flush_gets.fetch_add(1, Ordering::Relaxed);
@@ -1237,6 +1254,9 @@ impl IngestMetrics {
                 .load(Ordering::Relaxed),
             hand_back_failures: self.hand_back_failures.load(Ordering::Relaxed),
             teardown_unscanned_writes: self.teardown_unscanned_writes.load(Ordering::Relaxed),
+            generation_mismatch_written_in_place: self
+                .generation_mismatch_written_in_place
+                .load(Ordering::Relaxed),
             metadata_flush_gets_total: self.metadata_flush_gets.load(Ordering::Relaxed),
             metadata_flush_puts_total: self.metadata_flush_puts.load(Ordering::Relaxed),
             metadata_flush_dropped_total: self.metadata_flush_dropped.load(Ordering::Relaxed),

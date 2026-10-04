@@ -830,8 +830,20 @@ impl IngestRouter {
     /// A pass that handed rows back (ADR-1642 scan-set amendment) may have
     /// delivered them to a shard that had already answered its own flush, so
     /// the fan-out repeats until a pass hands nothing back. Handed-back rows
-    /// land in the tenant's current generation, which does not hand them back
-    /// again, so the bound is never what ends it in practice.
+    /// land in the set of the generation the check named: the current one for
+    /// a retired index, the hour's owner for a generation mismatch. That set's
+    /// own check passes them unless the clock has meanwhile moved into an hour
+    /// a third generation owns, which only the pass bound covers.
+    ///
+    /// A hand-back whose send failed, on a full or closed mailbox or a target
+    /// that is not live, moves no counter, so this loop cannot see it. Each
+    /// shard's own drain covers it instead: rows a generation-mismatch
+    /// hand-back left undelivered are retried there and, if the last pass
+    /// still cannot deliver them, written in place and counted
+    /// (`generation_mismatch_written_in_place`), so no shard answers this
+    /// drain with them buffered. Rows a retired-index hand-back could not
+    /// deliver stay buffered for a later flush, since written in place they
+    /// would sit where readers do not scan.
     pub async fn flush_all(&self) {
         for _ in 0..HAND_BACK_DRAIN_PASSES {
             let handed_back = self.metrics.rerouted_flushes();

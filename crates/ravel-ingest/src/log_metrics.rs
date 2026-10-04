@@ -207,6 +207,8 @@ pub struct LogIngestMetrics {
     hand_back_failures: AtomicU64,
     /// The counterpart of `IngestMetrics::teardown_unscanned_writes`.
     teardown_unscanned_writes: AtomicU64,
+    /// The counterpart of `IngestMetrics::generation_mismatch_written_in_place`.
+    generation_mismatch_written_in_place: AtomicU64,
     /// Flushes whose per-tenant indexed-field list resolved from a stale cached
     /// value or a failed-re-read/validation fallback rather than a fresh durable
     /// `TenantConfig` read this tick (ADR-0079 deliverable 6). Degraded, not
@@ -378,12 +380,15 @@ pub struct LogIngestMetricsSnapshot {
     /// [`HandBackReason::GenerationMismatch`].
     pub rerouted_flushes_generation_mismatch: u64,
     /// Hand-back episodes that left rows in the source buffer because a
-    /// target shard was not live. Exported as
-    /// `ravel_ingest_hand_back_failures_total`.
+    /// target shard was not live or its mailbox was closed or full. Exported
+    /// as `ravel_ingest_hand_back_failures_total`.
     pub hand_back_failures: u64,
     /// Teardown flushes written in place outside the scan set. Exported as
     /// `ravel_ingest_teardown_unscanned_writes_total`.
     pub teardown_unscanned_writes: u64,
+    /// Buffers written in place into an hour another generation owns, after
+    /// a generation-mismatch hand-back could not deliver. Not exported.
+    pub generation_mismatch_written_in_place: u64,
     pub indexed_fields_stale_fallbacks: u64,
     pub postings_objects: u64,
     pub postings_bytes_total: u64,
@@ -782,6 +787,12 @@ impl LogIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One buffer written in place into an hour another generation owns.
+    pub(crate) fn record_generation_mismatch_written_in_place(&self) {
+        self.generation_mismatch_written_in_place
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// One flush resolved its indexed-field list from a stale cached value or a
     /// failed-re-read/validation fallback rather than a fresh durable read
     /// (ADR-0079 deliverable 6). Called from `run_flush` on the overlay's
@@ -880,6 +891,9 @@ impl LogIngestMetrics {
                 .load(Ordering::Relaxed),
             hand_back_failures: self.hand_back_failures.load(Ordering::Relaxed),
             teardown_unscanned_writes: self.teardown_unscanned_writes.load(Ordering::Relaxed),
+            generation_mismatch_written_in_place: self
+                .generation_mismatch_written_in_place
+                .load(Ordering::Relaxed),
             indexed_fields_stale_fallbacks: self
                 .indexed_fields_stale_fallbacks
                 .load(Ordering::Relaxed),

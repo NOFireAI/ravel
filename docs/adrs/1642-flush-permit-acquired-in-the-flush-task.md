@@ -834,11 +834,16 @@ buffer, the flush writes nothing under its index and hands the rows back,
 reason `generation_mismatch`, to the owner's set. The routing generation is
 identified by its count because the shard-actor sets are keyed by count and
 two generations with one count route every row alike, which is the property
-the planner needs. The owner is the generation active at the flush-open
-reading whenever the pinned hour is that reading's hour, so the target is the
-tenant's current generation, as for a retired index; the owner's set is the
-target in every case, so the receiving flush's own check passes the rows when
-it pins the same hour. Everything else is the scan-set amendment's
+the planner needs. The owner is always the generation active at the
+flush-open reading: the pinned hour comes from the flush-open stamp, which the
+ADR-1307 floor holds at most `MAX_FLUSH_CLOCK_HOLD_NS` (300 s) ahead of the
+reading, so it is the reading's hour or the next one, while an owned hour is
+at least `DEFAULT_SCAN_SLACK_HOURS` (3) hours past its owner's activation and
+before its successor's. The target is therefore the tenant's current
+generation, as for a retired index, and `generation::tests` pins that this
+follows from those two constants. The owner's set is the target in every
+case, so the receiving flush's own check passes the rows when it pins the
+same hour. Everything else is the scan-set amendment's
 mechanism unchanged: liveness first, the outcome-unknown `Abandoned` for a
 strict waiter (with its own message), a clone of every charge to each target,
 the fail-closed unknown view, and the episode WARN, which now names the
@@ -859,20 +864,64 @@ another's down could each wait on the other's full mailbox. A hand-back
 therefore awaits a target's mailbox only when the target set is strictly
 smaller than its own; any other send succeeds only into a mailbox with room,
 and a full one returns the rows to the source buffer exactly as a closed one
-does, counted on `hand_back_failures` once per buffer, for the next trigger to
-retry. `shutdown` still drains the largest set first, so a set handing rows up
-during shutdown can find its target already drained: the teardown bypass then
-writes those rows in place with a WARN, and does not count them on
-`teardown_unscanned_writes`, because they are inside the scan set and every
-reader finds them; a pushdown over that hour can still split their series.
+does, counted on `hand_back_failures` once per buffer.
 
-**Observability.** `rerouted_flushes` keeps counting every hand-back, and
-each pipeline's snapshot adds `rerouted_flushes_generation_mismatch`, the part
-handed back for this reason. `HandBackReason::label` gives the values of the
-`reason` label for the exported counter, `retired_index` and
-`generation_mismatch`. `ravel-server` still exports
-`ravel_ingest_rerouted_flushes_total` by signal only; carrying the label onto
-it is a change to that crate.
+The strict waiter is answered before the rows are sent, and the source counts
+the hand-back, so a message a target accepts must be processed. `shutdown`
+still drains the largest set first, and a 3-shard set handing rows up can
+reach a 4-shard actor that is inside its teardown flush. Each shard actor
+therefore closes its mailbox when it takes `Shutdown`, before its teardown
+flush, and absorbs every hand-back still queued into its own buffers, which
+that flush then writes in the owner's set. A send after the close fails as
+closed and the rows stay with the source. Any other message found queued is
+dropped after the drain, as the receiver dropped it before; through the
+router none can be, since `shutdown` consumes the router.
+
+Rows a mismatch hand-back could not deliver, for a full or closed mailbox or
+a target that is not live, stay in the source buffer and are retried by later
+triggers, but not without bound: a full mailbox can stay full while writers
+are queued on the target, and a buffer carrying a queued-flush deferral would
+keep the shard's at-cap flag raised. The retry stops once the buffer has
+waited the flush deferral cap (`IngestConfig::flush_deferral_cap_ns`, the
+bound that makes a shard refuse writes, 3559.8 s at the defaults), counted
+from the earlier of its first failed hand-back and its queued-flush deferral;
+the next flush then writes the rows in place. A drain does not wait for that
+bound: `flush_all` yields between its passes so a full target can take the
+rows, a `FlushNow` drain then makes one last pass over the buffers still
+holding such rows, and a teardown reaches the same point on its bypass passes;
+there a hand-back that fails again writes the rows in place. So no drain
+answers with these rows still buffered. Rows a retired-index hand-back could
+not deliver are never written in place outside a teardown, since there they
+would sit where readers do not scan.
+
+**Residual: mismatched rows written in place.** Rows routed by one
+generation are written into an hour another generation owns in exactly these
+cases: a teardown bypass pass whose hand-back cannot deliver (a larger set
+already drained, a condemned log or span target, a dead metrics shard, or a
+full mailbox); a `FlushNow` drain's last pass whose hand-back fails again; and
+a buffer whose retries reached the deferral cap, which with a configuration
+whose cap is zero is its second attempt. A teardown that cannot trust the
+tenant's view also writes in place unchecked, as the scan-set amendment
+describes, so it can write such rows without detecting the mismatch; that is
+counted only on `stale_provisioning_flushes`. Objects are immutable, so an hour
+written this way stays pushdown-eligible with a series at two shard indices for
+good, and a distributed aggregate over it can differ from the single-node
+answer. The trace is a WARN line naming the tenant, shard, hour and target
+count, and the in-process counter `generation_mismatch_written_in_place` on
+each pipeline's snapshot, one per buffer written in place while a mismatch was
+detected. Rows written in place by a binary without this fix stay split the
+same way, and a rolling deploy keeps producing them until the last process
+running such a binary exits.
+
+**Observability.** `rerouted_flushes` keeps counting every hand-back, once
+per flush attempt that delivered rows to at least one target, so a buffer
+whose hand-back delivered part of its rows and is retried for the rest counts
+once per attempt. Each pipeline's snapshot adds
+`rerouted_flushes_generation_mismatch`, the part handed back for this reason,
+and `generation_mismatch_written_in_place`. These are in-process snapshot
+fields: `ravel-server` exports `ravel_ingest_rerouted_flushes_total` by signal
+only, with no reason label, and renders neither new field. Exporting them is a
+change to that crate.
 
 **Tests.** `crates/ravel-ingest/tests/scan_set_handback.rs` runs on the
 metrics, log and span routers: a generation-0 buffer on index 1 deferred to
@@ -880,7 +929,18 @@ metrics, log and span routers: a generation-0 buffer on index 1 deferred to
 hour, is handed back once under the generation-mismatch reason, lands at the
 index the 3-shard generation routes each key to, and the scan rule finds every
 row once; the same buffer opening one hour after the activation writes in
-place. `generation::tests` pins the verdicts: the overlap hours, the owned
-hour for a 4-shard and a 3-shard flush, 4 to 3 to 4 where equal counts write
-in place, a 3 to 4 increase handing back up, and the rule that only a
-strictly smaller set is awaited.
+place. On a 3 to 4 increase the same buffer is handed up to the 4-shard set
+and lands at the 4-shard indices. A strict waiter on a mismatched buffer is
+answered the retryable `Abandoned`, never `Ok`. With the 4-shard set held
+inside its teardown flush by a held data PUT, a 3-shard buffer handing rows up
+to it during shutdown loses none: the send fails as closed and the source's
+teardown writes the rows in place, counted once. A teardown whose target set
+is already drained writes in place with a WARN and counts once. The
+shard-actor unit tests hold a full target mailbox: the rows come back with
+their charge, a later trigger with room hands them over, a buffer kept from a
+full mailbox is written in place once the deferral cap is reached and not
+before, and a `FlushNow` drain answers with nothing buffered.
+`generation::tests` pins the verdicts: the overlap hours, the owned hour for
+a 4-shard and a 3-shard flush, 4 to 3 to 4 where equal counts write in place,
+a 3 to 4 increase handing back up, the owner being the generation active at
+the reading, and the rule that only a strictly smaller set is awaited.

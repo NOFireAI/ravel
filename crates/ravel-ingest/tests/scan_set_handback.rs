@@ -13,6 +13,9 @@
 //! indices below `ravel_catalog::scan_count(h)` and decode every object they
 //! name.
 //!
+//! The increase cases start at 3 shards and reshard up to 4, where a late
+//! flush hands its rows up to a larger set (issue #2429).
+//!
 //! Every wait is a cooperative poll plus an injected-clock advance. No
 //! wall-clock sleep, no `tokio::time::timeout`, no `Instant`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -20,7 +23,7 @@
 mod common;
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
@@ -44,6 +47,7 @@ use ravel_segment::{ReaderLimits, SeriesEntryV4};
 use ravel_types::logstream::{AttrValue, log_stream_id};
 use ravel_types::{Signal, TenantId, shard_for, shard_for_log};
 use tokio::task::JoinHandle;
+use tracing_subscriber::layer::SubscriberExt;
 
 const HOUR_NS: i64 = 3_600_000_000_000;
 /// The hour every case starts in, and its first second.
@@ -102,6 +106,7 @@ struct Counters {
     in_flight: u64,
     hand_back_failures: u64,
     unscanned: u64,
+    mismatch_in_place: u64,
 }
 
 /// Reads a router's counters through a shared metrics handle, so a case can
@@ -200,6 +205,7 @@ impl Pipe for IngestRouter {
                     .sum(),
                 hand_back_failures: snap.hand_back_failures,
                 unscanned: snap.teardown_unscanned_writes,
+                mismatch_in_place: snap.generation_mismatch_written_in_place,
             }
         })
     }
@@ -305,6 +311,7 @@ impl Pipe for LogIngestRouter {
                     .sum(),
                 hand_back_failures: snap.hand_back_failures,
                 unscanned: snap.teardown_unscanned_writes,
+                mismatch_in_place: snap.generation_mismatch_written_in_place,
             }
         })
     }
@@ -380,6 +387,7 @@ impl Pipe for SpanIngestRouter {
                     .sum(),
                 hand_back_failures: snap.hand_back_failures,
                 unscanned: snap.teardown_unscanned_writes,
+                mismatch_in_place: snap.generation_mismatch_written_in_place,
             }
         })
     }
@@ -756,7 +764,9 @@ impl<P: Pipe> World<P> {
 /// each actor (`flush_tenant` in shard.rs, log_shard.rs, span_shard.rs). With
 /// the first made unconditional, or the second replaced by
 /// `ScanCheck::InScanSet`, the flush writes under shard 3 in hour
-/// `ACTIVATION_HOUR + S` and nothing is handed back.
+/// `ACTIVATION_HOUR + S` and nothing is handed back. And the reason test in
+/// each metrics registry's `record_rerouted_flush`: counting every hand-back
+/// as a generation mismatch moves `rerouted_generation_mismatch` to 1.
 async fn retired_index_past_the_window_hands_back<P: Pipe>() {
     let world = World::<P>::new().await;
     let keys = rows_on::<P>(&world.deferred, RETIRED_SHARD, 1, 6);
@@ -782,6 +792,11 @@ async fn retired_index_past_the_window_hands_back<P: Pipe>() {
         drive(&world.clock, || world.router.counters().rerouted == 1).await,
         "the flush is handed back, counters {:?}",
         world.router.counters()
+    );
+    assert_eq!(
+        world.router.counters().rerouted_generation_mismatch,
+        0,
+        "a retired-index hand-back is not counted as a generation mismatch"
     );
     let store = world.store.as_ref();
     world.router.flush().await;
@@ -1488,9 +1503,247 @@ async fn a_hand_back_to_a_draining_set_is_never_lost<P: Pipe>() {
     );
     assert_eq!(c.unscanned, 0);
     assert_eq!(
+        c.mismatch_in_place, 1,
+        "the source's teardown counts its in-place write"
+    );
+    assert_eq!(
         rows_at::<P>(store, &deferred, SOURCE_SHARD, pin_hour).await,
         expected(&keys),
         "the source's teardown wrote the rows in place"
+    );
+}
+
+/// Issue #2429 on an increase, 3 shards to 4: a buffer routed by generation 0
+/// on the 3-shard set is deferred until its flush would pin an hour the
+/// 4-shard generation owns alone. Its rows are handed up to the 4-shard set,
+/// a send that may not wait and here finds room, each lands at generation
+/// 1's index for its key, and the scan rule finds every row exactly once.
+///
+/// Guard: the `Ok(Some(owner)) if owner != count` hand-back arm of
+/// `GenerationSwitch::scan_check` (generation.rs). With it disabled the flush
+/// writes in place under `COVERED_SHARD` in `pin_hour`.
+async fn an_increase_hands_a_late_buffer_up_to_the_owner<P: Pipe>() {
+    let world = World::<P>::with_config(up_config()).await;
+    let keys: Vec<usize> = (0..10_000)
+        .filter(|&i| {
+            P::shard_of(&world.deferred, i, UP_FROM) == COVERED_SHARD
+                && P::shard_of(&world.deferred, i, UP_TO) != COVERED_SHARD
+        })
+        .skip(1)
+        .take(6)
+        .collect();
+    assert_eq!(keys.len(), 6);
+    let mut by_target: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+    for &i in &keys {
+        by_target
+            .entry(P::shard_of(&world.deferred, i, UP_TO))
+            .or_default()
+            .push(i);
+    }
+    world.defer(COVERED_SHARD, &keys).await;
+    world.reshard_to(UP_TO).await;
+
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    let generations = persisted_generations(world.store.as_ref(), &world.deferred, P::SIGNAL).await;
+    assert_eq!(
+        stable_generation_for_hour(&generations, pin_hour, DEFAULT_SCAN_SLACK_HOURS),
+        Some(1),
+        "the 4-shard generation owns the pinned hour alone"
+    );
+    let targets: Vec<u32> = std::iter::once(COVERED_SHARD)
+        .chain(by_target.keys().copied())
+        .collect();
+    wait_for_commit(&world, &targets, pin_hour).await;
+    world.router.flush().await;
+
+    let store = world.store.as_ref();
+    assert_eq!(
+        rows_at::<P>(store, &world.deferred, COVERED_SHARD, pin_hour).await,
+        Vec::<i64>::new(),
+        "nothing routed by the 3-shard generation is written under shard {COVERED_SHARD} \
+         in hour {pin_hour}; counters {:?}",
+        world.router.counters()
+    );
+    let counters = world.router.counters();
+    assert_eq!(counters.rerouted, 1, "the flush is handed up once");
+    assert_eq!(counters.rerouted_generation_mismatch, 1);
+    assert_eq!(counters.mismatch_in_place, 0);
+    for (&target, target_keys) in &by_target {
+        assert_eq!(
+            rows_at::<P>(store, &world.deferred, target, pin_hour).await,
+            expected(target_keys),
+            "the rows the 4-shard generation routes to shard {target} land there"
+        );
+    }
+    assert_eq!(
+        scanned_rows::<P>(store, &world.deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "the scan rule finds every row exactly once"
+    );
+}
+
+/// A strict waiter whose buffer is handed back for a generation mismatch is
+/// answered with the retryable outcome-unknown `Abandoned` carrying the
+/// mismatch message, never an `Ok`, and its row is still written once.
+///
+/// Guard: the `Ok(Some(owner)) if owner != count` hand-back arm of
+/// `GenerationSwitch::scan_check`. With it disabled the flush writes in place
+/// and acknowledges the waiter `Ok`.
+async fn strict_waiter_on_a_mismatched_buffer_is_abandoned<P: Pipe>() {
+    let world = World::<P>::new().await;
+    let keys = covered_rows::<P>(&world.deferred, 1);
+    let handle = world
+        .router
+        .send_row(&world.deferred, keys[0], WriteMode::Strict);
+    assert!(
+        settle(|| world.router.counters().buffered == 1).await,
+        "the strict row is buffered on the 4-shard set before the reshard"
+    );
+    world.reshard_down().await;
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    assert!(
+        drive(&world.clock, || handle.is_finished()).await,
+        "the strict write is answered"
+    );
+    let answer = handle.await.expect("strict write task");
+    assert!(
+        answer.contains("Abandoned") && answer.contains("another generation owns"),
+        "the waiter gets the outcome-unknown Abandoned for a mismatch, got {answer}"
+    );
+    let counters = world.router.counters();
+    assert_eq!(counters.rerouted, 1);
+    assert_eq!(counters.rerouted_generation_mismatch, 1);
+    world.router.flush().await;
+    assert_eq!(
+        scanned_rows::<P>(world.store.as_ref(), &world.deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "the abandoned waiter's row is written once"
+    );
+}
+
+/// Collects the message of every WARN event on this thread.
+#[derive(Clone, Default)]
+struct WarnCapture {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        self.messages.lock().expect("lock").push(visitor.0);
+    }
+}
+
+#[derive(Default)]
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+impl WarnCapture {
+    fn count(&self, needle: &str) -> usize {
+        self.messages
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count()
+    }
+}
+
+/// A teardown whose generation-mismatch hand-back finds its target set
+/// already drained writes the rows in place, where readers find them, logs a
+/// WARN and counts the write once on the in-place counter, not on the
+/// unscanned one.
+///
+/// Guard: the `!enforced || self.mismatch_in_place` in-place branch of each
+/// actor's hand-back arm in `flush_tenant`. Without it the teardown takes the
+/// unscanned-write branch: no WARN, the in-place counter reads 0 and the
+/// unscanned counter 1.
+async fn a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone<P: Pipe>() {
+    let capture = WarnCapture::default();
+    let _default =
+        tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+    // Not `drain_only_config`: its day-long age clocks spend the whole
+    // read-side slack, so its deferral cap is 0 and the bounded retry, not
+    // the teardown, would write the rows in place.
+    let world = World::<P>::with_config(up_config()).await;
+    let keys: Vec<usize> = (0..10_000)
+        .filter(|&i| {
+            P::shard_of(&world.deferred, i, UP_FROM) == SOURCE_SHARD
+                && P::shard_of(&world.deferred, i, UP_TO) != SOURCE_SHARD
+        })
+        .take(3)
+        .collect();
+    for &i in &keys {
+        let write = world
+            .router
+            .send_row(&world.deferred, i, WriteMode::Buffered);
+        assert_eq!(write.await.expect("write task"), "ok");
+    }
+    world.reshard_to(UP_TO).await;
+    // One clock move: the late buffer's age trigger fires once, finds its
+    // view past the trust horizon and stays closed. Its first hand-back is
+    // tried by the teardown, after the 4-shard set has closed.
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    assert!(
+        settle(|| world.router.counters().stale == 1).await,
+        "the late flush stays closed on an untrusted view"
+    );
+    // A write after the activation builds the 4-shard set, which shutdown
+    // drains, and closes, before the 3-shard set.
+    let other = world.router.send_row(&world.parked, 0, WriteMode::Buffered);
+    assert_eq!(other.await.expect("write task"), "ok");
+
+    let World {
+        router,
+        store,
+        deferred,
+        ..
+    } = world;
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let counters = router.counter_source();
+    router.shutdown().await;
+
+    let c = counters();
+    assert_eq!(
+        c.mismatch_in_place, 1,
+        "one buffer written in place, counters {c:?}"
+    );
+    assert_eq!(c.unscanned, 0);
+    assert_eq!(c.rerouted, 0);
+    assert_eq!(
+        capture.count("writing a flush in place in an ingest hour another shard generation owns"),
+        1,
+        "the in-place write is logged once, {:?}",
+        capture.messages.lock().expect("lock")
+    );
+    let store = store.as_ref();
+    assert_eq!(
+        rows_at::<P>(store, &deferred, SOURCE_SHARD, pin_hour).await,
+        expected(&keys),
+        "written in place under the source index"
+    );
+    assert_eq!(
+        scanned_rows::<P>(store, &deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "the scan rule finds every row exactly once"
     );
 }
 
@@ -1518,6 +1771,9 @@ scan_set_cases!(
     metrics_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     metrics_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
     metrics_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
+    metrics_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
+    metrics_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
+    metrics_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
 );
 
 scan_set_cases!(
@@ -1533,6 +1789,9 @@ scan_set_cases!(
     logs_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     logs_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
     logs_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
+    logs_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
+    logs_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
+    logs_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
 );
 
 scan_set_cases!(
@@ -1548,4 +1807,7 @@ scan_set_cases!(
     spans_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     spans_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
     spans_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
+    spans_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
+    spans_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
+    spans_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
 );

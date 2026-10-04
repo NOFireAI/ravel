@@ -549,26 +549,43 @@ onward routes with the new count. Guarantees:
   routing trusts it; outside the scan set it hands the rows to the tenant's
   current generation, and on a view it cannot trust it does not open the
   flush and keeps the rows. A strict write still waiting on handed-back rows
-  is answered `Abandoned` (503, outcome unknown): the rows are written by
-  another shard. A target shard that is dead, or whose mailbox closes before
-  the rows arrive, leaves them with the shard that held them, which retries.
+  is answered `Abandoned` (503, outcome unknown) before the rows are sent:
+  they are written by a target shard or, if none can take them, by the shard
+  that held them. A target shard that is dead, whose mailbox closes before the
+  rows arrive, or, on a hand-back to a larger shard set that may not wait,
+  whose mailbox is full, leaves them with the shard that held them, which
+  retries. A hand-back a target accepted is always written: a shard closes its
+  mailbox before its shutdown flush and writes every hand-back still queued.
   Nor does a late flush write under an hour its routing generation does not
   own (ADR-1642 generation-mismatch amendment): when one generation owns the pinned hour alone and routes
   at another shard count, the rows are handed to that generation's shards the
   same way, so every row of an hour the query planner treats as one
   generation's sits at that generation's index. Inside the activation
   overlap no generation owns the hour and the flush writes in place.
-  Two exceptions remain:
+  Three exceptions remain:
   - A shutdown or channel-close drain that still cannot confirm the view after
     re-reading the provisioning record, or cannot reach a live shard of the
     current generation, writes the rows in place rather than drop them. When
     the target was not live the rows are known to be outside the scan set:
     stored but returned by no query, logged at ERROR with the tenant, shard
     and hour, and counted on `ravel_ingest_teardown_unscanned_writes_total`.
-    A teardown write of rows handed back for an hour another generation owns
-    stays inside the scan set, so readers find them, but a distributed
-    pushdown over that hour can split their series across two slices; it is
-    logged at WARN.
+  - Rows handed back for an hour another generation owns are written in place
+    when the hand-back cannot deliver them in these cases: on a teardown
+    drain's bypass passes (a larger shard set already drained, a condemned
+    log or span target, a dead metrics shard, or a full mailbox); on the last
+    pass of an explicit drain (`flush_all`); and once a buffer's retries have
+    waited the flush deferral cap, counted from its first failed hand-back or
+    its queued-flush deferral, whichever is earlier. A teardown that cannot
+    confirm the view, the first exception, can also write such rows without
+    detecting the mismatch. Readers find these rows, since they are inside the
+    scan set, but objects are immutable, so the hour stays pushdown-eligible
+    with a series at two shard indices for good, and a distributed aggregate
+    over that hour can differ from the single-node answer. The trace is a
+    WARN line with the tenant, shard, hour and target count, and the
+    in-process snapshot counter `generation_mismatch_written_in_place`, not
+    yet exported on `/metrics`. Rows a binary without this rule wrote in place
+    stay split the same way, and a rolling deploy keeps writing them until the
+    last process running such a binary exits.
   - A writer or reshard-append clock skewed beyond the tolerated clock skew
     (one hour) can make the view's scan set wider than the true one.
 - Commit tokens are unaffected: a token minted under any generation resolves

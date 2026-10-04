@@ -183,6 +183,8 @@ pub struct SpanIngestMetrics {
     hand_back_failures: AtomicU64,
     /// The counterpart of `IngestMetrics::teardown_unscanned_writes`.
     teardown_unscanned_writes: AtomicU64,
+    /// The counterpart of `IngestMetrics::generation_mismatch_written_in_place`.
+    generation_mismatch_written_in_place: AtomicU64,
     /// Per-shard count of flushes whose flush task has been spawned but has
     /// not yet acked its waiters (ADR-0067 decisions 1-2, the span-pipeline
     /// counterpart of [`crate::IngestMetrics`]'s own gauge), counted from the
@@ -285,12 +287,15 @@ pub struct SpanIngestMetricsSnapshot {
     /// [`HandBackReason::GenerationMismatch`].
     pub rerouted_flushes_generation_mismatch: u64,
     /// Hand-back episodes that left rows in the source buffer because a
-    /// target shard was not live. Exported as
-    /// `ravel_ingest_hand_back_failures_total`.
+    /// target shard was not live or its mailbox was closed or full. Exported
+    /// as `ravel_ingest_hand_back_failures_total`.
     pub hand_back_failures: u64,
     /// Teardown flushes written in place outside the scan set. Exported as
     /// `ravel_ingest_teardown_unscanned_writes_total`.
     pub teardown_unscanned_writes: u64,
+    /// Buffers written in place into an hour another generation owns, after
+    /// a generation-mismatch hand-back could not deliver. Not exported.
+    pub generation_mismatch_written_in_place: u64,
     /// Sum across shards of [`SpanIngestMetrics::in_flight_flushes_by_shard`]
     /// at snapshot time. The per-shard breakdown does not fit this struct's
     /// flat Copy shape; call `in_flight_flushes_by_shard` directly for that.
@@ -622,6 +627,12 @@ impl SpanIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One buffer written in place into an hour another generation owns.
+    pub(crate) fn record_generation_mismatch_written_in_place(&self) {
+        self.generation_mismatch_written_in_place
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn snapshot(&self) -> SpanIngestMetricsSnapshot {
         let skew = self.shard_skew_by_shard();
         SpanIngestMetricsSnapshot {
@@ -657,6 +668,9 @@ impl SpanIngestMetrics {
                 .load(Ordering::Relaxed),
             hand_back_failures: self.hand_back_failures.load(Ordering::Relaxed),
             teardown_unscanned_writes: self.teardown_unscanned_writes.load(Ordering::Relaxed),
+            generation_mismatch_written_in_place: self
+                .generation_mismatch_written_in_place
+                .load(Ordering::Relaxed),
             in_flight_flushes_total: self
                 .in_flight_flushes_by_shard()
                 .into_iter()

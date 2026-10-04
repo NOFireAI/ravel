@@ -516,9 +516,11 @@ impl SpanIngestRouter {
     /// tasks end on their own after the drain; the `done` acknowledgement fires
     /// after the flush, so durability holds without joining them. Sets drain
     /// largest first, each finished before the next is signalled, so spans a
-    /// retiring set hands back land in a set still running; the sets are
-    /// listed again after each one, since a hand-back can construct the
-    /// current generation's set during the drain.
+    /// retiring set hands back to a smaller set land in a set still running;
+    /// a hand-back to a larger set is either written by it or refused by its
+    /// closed mailbox, as [`crate::IngestRouter::shutdown`] sets out. The
+    /// sets are listed again after each one, since a hand-back can construct
+    /// the current generation's set during the drain.
     pub async fn shutdown(self) {
         let mut drained = Vec::new();
         while let Some((count, set)) = self.switch.largest_undrained_set(&drained) {
