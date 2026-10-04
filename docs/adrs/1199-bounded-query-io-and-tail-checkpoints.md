@@ -111,9 +111,10 @@ They are not otherwise interchangeable, and the difference matters for what
 decision 1 records. The bounded path issues its per-shard LISTs concurrently
 under the resolve-wide semaphore (`catalog.rs:1917-1921`); the prefix path
 drains them sequentially so the runtime request cap is checked page by page
-(`catalog.rs:2379-2382`). Equal request counts, different latency, and
-different serial depth: on the bounded path the serial LIST depth is the
-maximum page count over shards, while on the prefix path it is their sum. A
+(`catalog.rs:2379-2382`; retired, see the concurrent prefix listing amendment
+below). Equal request counts, different latency, and different serial depth:
+on the bounded path the serial LIST depth is the maximum page count over
+shards, while on the prefix path it is their sum. A
 `list_page_depth` figure that does not say which path produced it is not
 comparable across queries. The remaining difference is an early break once a
 key's hour passes the window end (`catalog.rs:2050-2051`), which never triggers
@@ -613,3 +614,25 @@ settled, and the follow-up epic starts at decomposition rather than at design.
 This ADR makes no claim about scan-bound queries. Ravel's published cold
 ClickBench gap is byte-bound in the scan phase, where resolve costs two GETs.
 Nothing here moves it.
+
+## Amendment (2026-10-04): the concurrent prefix listing amendment (ADR-2509, issue #2538)
+
+<!-- amendment-applies: sections="The measured cost" pointer="concurrent prefix listing amendment" -->
+<!-- amendment-supersedes: phrase="drains them sequentially" pointer="concurrent prefix listing amendment" -->
+
+"The measured cost" contrasts the two traversals by saying the prefix path
+lists its shards one after another, so its serial LIST depth is the sum of
+the shards' page counts. ADR-2509 decision 1 retires that. The prefix path now
+lists up to `resolve_get_concurrency` shards at once, as the bounded path
+does, and every page reserves a slot in the resolve-wide request cap before it
+is issued, so the cap stays exact: a window over it is refused on every run,
+though which shard reaches the cap can vary.
+
+- The request counts in this ADR's tables are unchanged. Concurrency changes
+  when pages are issued, not how many.
+- The prefix path's serial LIST depth is now the maximum of the shards' page
+  counts whenever every shard holds a task slot and a request permit at once,
+  as on the bounded path. It never exceeds the sum.
+- `list_page_depth` (`crates/ravel-query/src/io_shape.rs`) reports the total
+  LIST count as an upper bound on serial depth, so it stays a valid upper bound
+  on either path.

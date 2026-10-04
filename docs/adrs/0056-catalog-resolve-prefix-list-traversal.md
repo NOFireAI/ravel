@@ -176,6 +176,8 @@ letting the now-cheap wide windows run:
 - The prefix path carries a **runtime LIST cap**: it counts the pages it
   drains and aborts with `CatalogError::WindowTooWide { estimate: <pages
   issued>, limit }` if the count would exceed `max_catalog_list_requests`.
+  (Shards now list concurrently and each page reserves its slot first; see
+  the reserved-cap amendment below for what the error reports.)
   This preserves that hard bound -- now enforced exactly, at runtime, on the
   one path whose cost is not knowable before listing -- and refuses only a
   scan whose *actual data volume* (not its window width) is unsustainable.
@@ -302,3 +304,38 @@ performance problem for a correctness one and is explicitly not done.
   stays on the per-bucket path for warm windows and only reaches the prefix
   path for windows wide enough that reading the whole subtree is the cheaper
   option anyway.
+
+## Amendment (2026-10-04): the reserved-cap amendment, shards list concurrently (ADR-2509, issue #2538)
+
+<!-- amendment-applies: sections="The request ceiling (INTERACTION 1)" pointer="reserved-cap amendment" -->
+
+ADR-2509 decision 1 changes how the prefix path enforces the runtime LIST cap
+in "The request ceiling (INTERACTION 1)". The path no longer drains its shards
+one after another. Up to `resolve_get_concurrency` shards list at once, and
+pages within a shard stay sequential because each continuation token comes
+from the previous page.
+
+- **The cap is reserved, not checked.** Before issuing a page, a shard's task
+  takes a slot from one resolve-wide counter with an atomic `fetch_update`
+  that refuses when the count is already at `max_catalog_list_requests`. A
+  slot is never returned, so the count bounds LISTs issued, not LISTs that
+  succeeded.
+- A refused reservation aborts the resolve with `CatalogError::WindowTooWide`,
+  and the shards still in flight are cancelled.
+- **The bound stays exact.** One resolve's prefix scan issues at most
+  `max_catalog_list_requests` LISTs, and a window whose total page count
+  exceeds the cap is refused on every run.
+- **What the error reports.** A reservation is refused only when every slot is
+  taken, so the error carries `estimate = max_catalog_list_requests + 1` and
+  `limit = max_catalog_list_requests` on every run, the same values the
+  sequential check produced. The bullet's `<pages issued>` now reads as the
+  pages reserved plus the refused one: when the refusal aborts the resolve,
+  pages that reserved a slot but were still waiting for a request permit are
+  never issued.
+- **What can vary between runs** is which shard's reservation is refused, and
+  how many of the reserved pages were issued before the abort.
+- The shard results are merged in shard order before they are partitioned, so
+  the resolved key set and its order are unchanged. The envelope argument
+  above counts total pages, which concurrency does not change.
+
+Pinned by `crates/ravel-catalog/tests/resolve_prefix_concurrency.rs`.

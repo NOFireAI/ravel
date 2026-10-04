@@ -1296,9 +1296,14 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      window spans.
    - **Prefix scan** (wide windows, at or above
      `prefix_list_crossover_requests` suffix buckets, default 720): the
-     per-shard LISTs drain sequentially under a page-by-page request cap
-     (`max_catalog_list_requests`), so a pathologically wide window is refused
-     deterministically rather than fanning out unboundedly. Cost
+     per-shard LISTs run concurrently, up to `resolve_get_concurrency` shards
+     at once, and pages within a shard stay sequential. Every page first
+     reserves a slot in one resolve-wide request cap
+     (`max_catalog_list_requests`), so the bound stays exact under
+     concurrency and a window whose pages exceed the cap is refused with
+     `WindowTooWide` on every run (ADR-2509). Which shard reaches the cap, and
+     how many reserved LISTs were issued before the refusal, can vary between
+     runs. Shard results are merged in shard order before step 2. Cost
      `O(objects above the watermark / page_size)`.
    Both traversals produce the identical key set and partition it identically
    (step 2 onward).
@@ -1510,7 +1515,8 @@ how narrow `range.end_ns` is. Both traversals cost one bounded LIST per shard
 for the hours above the watermark (`O(objects above the watermark /
 page_size)`), so a wide-but-sparse window no longer pays one LIST per empty
 hour; resolve switches to the prefix scan for wide windows only for its
-sequential page-by-page request cap (ADR-0056).
+resolve-wide request cap, in which every page reserves a slot before it is
+issued (ADR-0056, ADR-2509).
 
 `Catalog::estimated_catalog_requests` still reports the per-bucket worst case
 `shard_count * hour_buckets + SNAPSHOT_WINDOW_REQUESTS_UPPER_BOUND`
@@ -1524,10 +1530,12 @@ windows. Instead:
   `CatalogConfig::max_catalog_list_requests` (default 100,000) is routed to
   the prefix scan rather than refused, because neither bounded path amplifies
   one-object-worth-of-data into thousands of empty LISTs.
-- The prefix scan carries a runtime LIST cap at the same ceiling: it aborts
-  with `WindowTooWide` before issuing a page that would take it over, so a
-  single resolve's scan never issues more than `max_catalog_list_requests`
-  catalog LISTs. The ADR-0064 pending-erasure LIST is one further LIST
+- The prefix scan carries a runtime LIST cap at the same ceiling: every page
+  reserves a slot with an atomic update that refuses at the ceiling, and a
+  refused reservation aborts the resolve with `WindowTooWide` (`estimate` is
+  the ceiling plus one, `limit` the ceiling) and cancels the shards still in
+  flight. The shards list concurrently, but a single resolve's scan never
+  issues more than `max_catalog_list_requests` catalog LISTs. The ADR-0064 pending-erasure LIST is one further LIST
   outside that cap: it starts alongside the scan and is issued once even
   when the scan is refused, so a resolve issues at most
   `max_catalog_list_requests + 1` LISTs in total. Only a scan whose *actual
@@ -1547,7 +1555,10 @@ full listing on any index failure; min-token resolution and snapshot
 pinning are unchanged:
 
 1. Attempt snapshot read: GET HEAD (cached with a short TTL, default 30 s,
-   config `head_cache_ttl`). Decode, validate signal/shard_count against
+   config `head_cache_ttl`). A HEAD GET that returns NotFound is cached for
+   the same TTL, so a tenant that has never folded lists without a HEAD GET
+   until the entry expires; any other GET failure is not cached. The fold
+   reads HEAD from the store and never consults this cache. Decode, validate signal/shard_count against
    the catalog's own config (a shard_count mismatch is a loud error:
    ADR-0010 §9 makes changing it forbidden) and validate tenant_hash
    against the requesting tenant (per ADR-0050 §2, a hard
@@ -1754,8 +1765,8 @@ The two shard-scan LIST paths (`Catalog::list_window_bounded`, via
 `AccountedOp::List` per page instead of going through `guarded_list_all`.
 Both need `list_after`'s start-after marker to skip a shard's
 below-watermark history server-side, which `guarded_list_all`'s plain `list`
-does not take, and the prefix scan additionally checks its runtime LIST
-ceiling before each page rather than draining unconditionally. Each still
+does not take, and the prefix scan additionally reserves a slot in its
+runtime LIST ceiling before each page rather than draining unconditionally. Each still
 acquires the same request-semaphore permit per page and applies the same
 ADR-0050 section 2 tenant-prefix assertion, so the bound and the request
 count are what `guarded_list_all` would produce; only the code path differs.
@@ -1775,7 +1786,9 @@ together). `PartCache` and `PostingsCache` are bounded by their entry count
 alone and evict by insertion order. `HeadCache` additionally carries a
 process-wide capacity bound (`head_cache_capacity`, default 10,000 (tenant,
 signal) entries, FIFO eviction), closing the one cache of the five that previously had a TTL but
-no bound on the number of tenants it could grow to hold.
+no bound on the number of tenants it could grow to hold. An entry recording a
+missing HEAD counts against the same bound, but when the cache is full a new
+one is not cached rather than evicting a present HEAD.
 
 ## Compaction protocol (ADR-0018)
 
