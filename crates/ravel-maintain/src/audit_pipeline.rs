@@ -522,6 +522,7 @@ mod tests {
     use super::*;
 
     use std::future::Future;
+    use std::pin::Pin;
     use std::task::Poll;
     use std::time::Duration;
 
@@ -597,6 +598,138 @@ mod tests {
             audit_mode: AuditMode::Required,
             channel_capacity: 1024,
         }
+    }
+
+    type PendingSubmit<'a> = Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+
+    /// Enqueue every event before the flush loop next runs: each `submit` is
+    /// polled once, which sends it into the channel and leaves it awaiting its
+    /// batch. The loop only runs when this task yields, so the first event it
+    /// receives finds the rest already queued and is never idle.
+    async fn enqueue(pipeline: &AuditPipeline, events: Vec<AuditEvent>) -> Vec<PendingSubmit<'_>> {
+        let mut submissions: Vec<PendingSubmit<'_>> = events
+            .into_iter()
+            .map(|event| Box::pin(pipeline.submit(event)) as PendingSubmit<'_>)
+            .collect();
+        for submission in &mut submissions {
+            let first = std::future::poll_fn(|cx| Poll::Ready(submission.as_mut().poll(cx))).await;
+            assert!(
+                first.is_pending(),
+                "a queued submit stays pending until its batch flushes"
+            );
+        }
+        submissions
+    }
+
+    async fn await_all(submissions: Vec<PendingSubmit<'_>>) -> Vec<Result<()>> {
+        let mut results = Vec::with_capacity(submissions.len());
+        for submission in submissions {
+            results.push(submission.await);
+        }
+        results
+    }
+
+    /// Submit `events` as one queue the loop finds all at once, and return
+    /// each submitter's result in submission order.
+    async fn submit_queued(pipeline: &AuditPipeline, events: Vec<AuditEvent>) -> Vec<Result<()>> {
+        let submissions = enqueue(pipeline, events).await;
+        await_all(submissions).await
+    }
+
+    /// A backend that counts every `put` and makes each one take `put_latency`
+    /// of tokio time before reaching the wrapped store, standing in for a fast
+    /// store under a paused clock.
+    struct TimedPutStore<S> {
+        inner: S,
+        put_latency: Duration,
+        puts: AtomicU64,
+    }
+
+    impl<S> TimedPutStore<S> {
+        fn new(inner: S, put_latency: Duration) -> Self {
+            TimedPutStore {
+                inner,
+                put_latency,
+                puts: AtomicU64::new(0),
+            }
+        }
+
+        fn puts(&self) -> u64 {
+            self.puts.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for TimedPutStore<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> std::result::Result<PutOutcome, StoreError> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            if !self.put_latency.is_zero() {
+                tokio::time::sleep(self.put_latency).await;
+            }
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> std::result::Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> std::result::Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> std::result::Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> std::result::Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> std::result::Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// PUT pairs the window-only loop (no idle trigger) writes for events
+    /// arriving at `arrivals`, offsets from a common start. A window opens
+    /// when the loop takes its first event, at that event's arrival or at the
+    /// end of the flush it arrived during, takes every event arriving before
+    /// `open + max_age`, then flushes for `flush`. An event arriving at the
+    /// instant its window closes misses that window.
+    fn window_only_pairs(arrivals: &[Duration], max_age: Duration, flush: Duration) -> usize {
+        let mut pairs = 0;
+        let mut loop_free_at = Duration::ZERO;
+        let mut next = 0;
+        while next < arrivals.len() {
+            let open = arrivals[next].max(loop_free_at);
+            let close = open + max_age;
+            while next < arrivals.len() && arrivals[next] < close {
+                next += 1;
+            }
+            pairs += 1;
+            loop_free_at = close + flush;
+        }
+        pairs
     }
 
     /// A backend whose first `put` matching `key_contains` applies a
@@ -688,26 +821,27 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pipeline_flushes_on_reaching_max_batch_before_max_age() {
         let store = Arc::new(MemoryStore::new());
         let tenant = TenantHash([1u8; 16]);
         // max_batch=3, a very long max_age: only reaching the count can flush.
         let config = pipeline_config(3, Duration::from_secs(3600));
-        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
+        let pipeline = AuditPipeline::spawn(store.clone(), config);
 
-        // Submit exactly max_batch events concurrently; the batch fills and
-        // flushes, so all three submits return without the timer elapsing.
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 1_000 + i, 7)).await
-            }));
+        // Exactly max_batch events, all queued before the loop takes the
+        // first, so none is idle: the batch fills and flushes without the
+        // timer elapsing.
+        let start = Instant::now();
+        let events = (0..3).map(|i| test_event(tenant, 1_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
+            result.expect("submit ok");
         }
-        for handle in handles {
-            handle.await.expect("submit task").expect("submit ok");
-        }
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the full batch flushed on its count, not on the max_age deadline"
+        );
 
         assert_eq!(
             data_object_count(store.as_ref(), &tenant).await,
@@ -722,25 +856,267 @@ mod tests {
         pipeline.shutdown().await.expect("shutdown");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn pipeline_flushes_on_max_age_with_a_partial_batch() {
         let store = Arc::new(MemoryStore::new());
         let tenant = TenantHash([2u8; 16]);
-        // Large max_batch, short max_age: one event must flush on the timer
-        // without waiting for more events.
-        let config = pipeline_config(1000, Duration::from_millis(20));
-        let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
+        // Large max_batch, short max_age: a non-idle event must flush on the
+        // timer without waiting for more events.
+        let max_age = Duration::from_millis(20);
+        let config = pipeline_config(1000, max_age);
+        let pipeline = AuditPipeline::spawn(store.clone(), config);
 
+        // The first event finds the pipeline idle and flushes at once; the
+        // second arrives within max_age of it, so it opens a window and
+        // flushes alone when that window's deadline passes.
         pipeline
             .submit(test_event(tenant, 5_000, 7))
             .await
+            .expect("the idle event flushes");
+        let start = Instant::now();
+        pipeline
+            .submit(test_event(tenant, 5_001, 7))
+            .await
             .expect("submit flushes on max_age");
+        assert_eq!(
+            start.elapsed(),
+            max_age,
+            "the lone non-idle event waited exactly max_age"
+        );
 
         assert_eq!(
             commit_record_count(store.as_ref(), &tenant).await,
-            1,
-            "the lone event flushed on the age deadline"
+            2,
+            "the idle event's batch and the lone event that flushed on the age deadline"
         );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// ADR-2509 decision 2: an event that arrives to an idle pipeline is
+    /// written at once, not after a `max_age` window nothing else will join.
+    #[tokio::test(start_paused = true)]
+    async fn idle_event_flushes_without_waiting_max_age() {
+        let store = Arc::new(TimedPutStore::new(MemoryStore::new(), Duration::ZERO));
+        let tenant = TenantHash([46u8; 16]);
+        let pipeline = AuditPipeline::spawn(
+            store.clone(),
+            pipeline_config(1000, Duration::from_secs(10)),
+        );
+
+        let start = Instant::now();
+        pipeline
+            .submit(test_event(tenant, 26_000, 7))
+            .await
+            .expect("the idle event is durable");
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the idle event was durable without time advancing toward the max_age deadline"
+        );
+
+        assert_eq!(store.puts(), 2, "one data PUT and one commit PUT");
+        assert_eq!(data_object_count(&store.inner, &tenant).await, 1);
+        assert_eq!(commit_record_count(&store.inner, &tenant).await, 1);
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// The idle trigger's third condition: steady traffic faster than
+    /// `max_age` on a fast store finds the queue empty and no flush in flight
+    /// every time, and without the condition would write one PUT pair per
+    /// event. With it, the pair count is the window-only loop's on the same
+    /// schedule plus at most the first event's.
+    #[tokio::test(start_paused = true)]
+    async fn steady_traffic_faster_than_max_age_batches_as_before() {
+        let max_age = Duration::from_millis(25);
+        let put_latency = Duration::from_millis(1);
+        let arrivals: Vec<Duration> = (0..400).map(|k| Duration::from_millis(5 * k)).collect();
+        let window_only = window_only_pairs(&arrivals, max_age, put_latency * 2);
+        assert_eq!(
+            window_only, 73,
+            "the window-only loop batches this schedule into about 5.5 events per pair"
+        );
+
+        let store = Arc::new(TimedPutStore::new(MemoryStore::new(), put_latency));
+        let tenant = TenantHash([47u8; 16]);
+        let pipeline = Arc::new(AuditPipeline::spawn(
+            store.clone(),
+            pipeline_config(1000, max_age),
+        ));
+
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for (k, offset) in arrivals.iter().enumerate() {
+            let pipeline = pipeline.clone();
+            let at = start + *offset;
+            handles.push(tokio::spawn(async move {
+                sleep_until(at).await;
+                // An event due at the instant a window closes arrives just
+                // after the loop closes it, as `window_only_pairs` assumes.
+                tokio::task::yield_now().await;
+                pipeline.submit(test_event(tenant, k as i64, 7)).await
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("submit task").expect("submit ok");
+        }
+
+        let pairs = commit_record_count(&store.inner, &tenant).await;
+        assert_eq!(data_object_count(&store.inner, &tenant).await, pairs);
+        assert_eq!(
+            store.puts(),
+            2 * pairs as u64,
+            "every pair's two PUTs went through the timed store"
+        );
+        assert!(
+            (window_only..=window_only + 1).contains(&pairs),
+            "steady traffic must batch as the window-only loop does ({window_only} pairs, \
+             plus at most 1), got {pairs} pairs for {} events",
+            arrivals.len()
+        );
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// An event within `max_age` of the previous one is not idle even when
+    /// nothing is queued and no flush is in flight: it waits for its window.
+    #[tokio::test(start_paused = true)]
+    async fn idle_trigger_needs_a_quiet_max_age() {
+        let store = Arc::new(MemoryStore::new());
+        let tenant = TenantHash([48u8; 16]);
+        let max_age = Duration::from_millis(25);
+        let pipeline = AuditPipeline::spawn(store.clone(), pipeline_config(1000, max_age));
+
+        pipeline
+            .submit(test_event(tenant, 27_000, 7))
+            .await
+            .expect("earlier traffic");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let first_at = Instant::now();
+        pipeline
+            .submit(test_event(tenant, 27_001, 7))
+            .await
+            .expect("first event after the gap");
+        assert_eq!(
+            first_at.elapsed(),
+            Duration::ZERO,
+            "the first event after a gap longer than max_age flushes at once"
+        );
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let second_at = Instant::now();
+        pipeline
+            .submit(test_event(tenant, 27_002, 7))
+            .await
+            .expect("second event");
+        assert_eq!(
+            second_at.elapsed(),
+            max_age,
+            "an event 10 ms after the previous one is not idle and waits its max_age window"
+        );
+
+        assert_eq!(commit_record_count(store.as_ref(), &tenant).await, 3);
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// Events queued behind an in-flight flush are not idle, and `max_batch`
+    /// still splits them.
+    #[tokio::test(start_paused = true)]
+    async fn max_batch_still_bounds_a_window() {
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+        let tenant = TenantHash([49u8; 16]);
+        let max_batch = 3;
+        let queued_events: usize = 7;
+        let pipeline = Arc::new(AuditPipeline::spawn(
+            store.clone(),
+            pipeline_config(max_batch, Duration::from_secs(3600)),
+        ));
+
+        // The first event is idle and flushes alone; holding its data PUT
+        // keeps that flush in flight while the rest queue behind it.
+        let first = tokio::spawn({
+            let pipeline = pipeline.clone();
+            async move { pipeline.submit(test_event(tenant, 28_000, 7)).await }
+        });
+        gate.wait_until_held(1).await;
+        let events = (1..=queued_events)
+            .map(|i| test_event(tenant, 28_000 + i as i64, 7))
+            .collect();
+        let queued = enqueue(&pipeline, events).await;
+        let held = gate.held();
+        assert_eq!(held.len(), 1, "exactly the first flush's data PUT is held");
+        assert!(gate.release(held[0]));
+
+        first.await.expect("submit task").expect("first event ok");
+        for result in await_all(queued).await {
+            result.expect("queued event ok");
+        }
+
+        let batches = 1 + queued_events.div_ceil(max_batch);
+        assert_eq!(commit_record_count(store.as_ref(), &tenant).await, batches);
+        assert_eq!(data_object_count(store.as_ref(), &tenant).await, batches);
+        pipeline.shutdown().await.expect("shutdown");
+    }
+
+    /// `required` mode: a batch whose PUT fails fails every submitter in it,
+    /// and the batches before and after it are unaffected.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_put_fails_every_submitter_in_its_batch_and_no_other() {
+        // The second data PUT is the queued batch's; the first is the idle
+        // event's, held so the others queue behind it.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Put,
+                ScriptedFault::Permanent("fault: access denied".into()),
+            )
+            .with_key_contains("/l0/")
+            .with_occurrence(Occurrence::Nth(2)),
+        );
+        let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let gate = store.hold(Op::Put, Some("/l0/".to_string()), Occurrence::Nth(1));
+        let tenant = TenantHash([50u8; 16]);
+        let pipeline = Arc::new(AuditPipeline::spawn(
+            store.clone(),
+            pipeline_config(3, Duration::from_secs(3600)),
+        ));
+
+        let first = tokio::spawn({
+            let pipeline = pipeline.clone();
+            async move { pipeline.submit(test_event(tenant, 29_000, 7)).await }
+        });
+        gate.wait_until_held(1).await;
+        // Five queued events at max_batch 3: a failing batch of three, then a
+        // batch of two.
+        let events = (1..=5).map(|i| test_event(tenant, 29_000 + i, 7)).collect();
+        let queued = enqueue(&pipeline, events).await;
+        let held = gate.held();
+        assert_eq!(held.len(), 1);
+        assert!(gate.release(held[0]));
+
+        first
+            .await
+            .expect("submit task")
+            .expect("the batch before the failure is durable");
+        let results = await_all(queued).await;
+        for result in &results[..3] {
+            assert!(
+                matches!(result, Err(MaintainError::AuditFlush(_))),
+                "every submitter in the failed batch fails closed, got {result:?}"
+            );
+        }
+        for result in &results[3..] {
+            assert!(
+                result.is_ok(),
+                "the batch after the failure is durable, got {result:?}"
+            );
+        }
+
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::Permanent),
+            1,
+            "the injected PUT failure fired once, on the failed batch only"
+        );
+        assert_eq!(commit_record_count(store.as_ref(), &tenant).await, 2);
         pipeline.shutdown().await.expect("shutdown");
     }
 
