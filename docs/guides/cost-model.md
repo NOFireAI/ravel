@@ -251,10 +251,12 @@ to it. Three cases matter:
   is read ranged rather than whole, is the larger of that threshold and five
   request costs: 31,500,000 bytes. So a one-column statement over 35 MB objects
   reads only its column ranges, and the blocks of every object of 31,500,000
-  bytes or less are still read in one whole-object GET. Above the 524,288-byte
-  routing threshold a statement on the planned route (any statement the
-  whole-segment fast path refuses) may probe an object's tail and directories
-  before that read, which a saturated rate never did.
+  bytes or less are still read in one whole-object GET, with no tail probe on
+  the whole-segment fast path and on the planned route (any statement the
+  whole-segment fast path refuses) alike. Above the break-even a statement on
+  the planned route probes an object's tail and directories first, and a wide
+  projection then reads the object whole anyway, because that route does not
+  weigh the projected fraction.
 - A profile with free bytes and no timings saturates the rate: every object is
   read whole, with no tail probe and no ranged read. The routing threshold
   saturates with it, which overrides `--logs-block-range-threshold`, and when

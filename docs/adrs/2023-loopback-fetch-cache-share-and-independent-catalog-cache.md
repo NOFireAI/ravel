@@ -221,11 +221,14 @@ size; ADR-2414 puts the L0 objects of that layout at about 3 MB, and its
 11.24 GB corpus would have to sit in fewer than 357 objects for their average
 to reach the break-even. So on the reference profile those objects' blocks
 are still read in one whole-object GET on the whole-segment fast path and on
-the planned route alike. One request-count change is not covered by that
-measurement: the routing threshold is back at its 512 KiB default, so a
-statement on the planned route (any statement the whole-segment fast path
-refuses) may probe an object above 512 KiB for its footer and directories
-before that whole-object read, where the saturated threshold read the object
-whole with no probe. Whether that moves decision 4's concurrent throughput is
-unmeasured.
+the planned route alike. On the planned route (any statement the
+whole-segment fast path refuses) an object at or below the break-even is read
+whole with no tail probe, as decision 4 measured: the plan phase reads it in
+one covering GET and hands those bytes to the scan, although the routing
+threshold is back at its 512 KiB default. Above the break-even a statement on
+the planned route probes the object's tail and directories, and a wide
+projection then reads the object whole anyway, because the planned route does
+not weigh the projected fraction. That probe is a request the saturated
+threshold never issued; whether it moves decision 4's concurrent throughput on
+a corpus with objects that large is unmeasured.
 

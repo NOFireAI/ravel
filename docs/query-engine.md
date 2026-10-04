@@ -661,9 +661,14 @@ A predicate the skip index cannot decide (a `has_word`/text arm, which bloom
 prunes only at decode; an `attrs['k']='v'` POSTINGS equality; a stream filter)
 still reads the whole object in the plan phase and is counted in the
 `plan_full_reads` metric, so a report can see which statements still pay it. A
-segment at or below the block-range threshold counts there too: the fetch reads
-such an object whole in one GET regardless, so planning it from the skip index
-would cost a second read rather than save one.
+segment at or below the larger of the block-range threshold and the projection
+break-even (set under `cost-based` only, below) counts there too: the fetch
+reads such an object whole in one GET regardless, so planning it from the skip
+index would cost a second read rather than save one
+(`the_planned_route_reads_an_object_under_the_break_even_whole`). Above the
+break-even the planned route probes before the scan's coverage crossover
+decides, and it does not weigh the projected fraction, so a wide statement
+there pays the probe and then reads the object whole.
 
 That plan-phase whole-object read is now carried forward into
 the scan (`ravel_query::CarriedWholeObject`) instead of being thrown away,
