@@ -22,9 +22,11 @@
 //!    nondeterministic scalars ([`crate::session::EXCLUDED_SCALARS`]) and the
 //!    excluded window functions ([`crate::session::EXCLUDED_WINDOWS`], ADR-0097
 //!    decisions 4 and 6), every write/DDL statement (the read-only
-//!    single-statement gate, [`crate::validate`]), and a query spanning both
+//!    single-statement gate, [`crate::validate`]), a query spanning both
 //!    signal tables ([`crate::error::SqlError::CrossSignalQuery`], ADR-0033
-//!    decision C).
+//!    decision C), and the `POSITION(x IN y)` and `SUBSTRING(x FROM y FOR z)`
+//!    special forms, which no registered expression planner handles
+//!    ([`crate::error::SqlError::Plan`], issue #2476).
 //! 3. [`Classification::Unclassified`]: implemented but untested, or
 //!    claimed-supported but actually wrong. This module declares no construct
 //!    into this state; it is the state a construct *falls into* when its
@@ -215,6 +217,12 @@ const E_CROSS_SIGNAL: &str = "SqlError::CrossSignalQuery";
 /// a registry gate; it fails closed inside DataFusion's sliding-window planner,
 /// so the conformance suite verifies it by executing the query.
 const E_SLIDING_AVG: &str = "SqlError::Execution";
+/// The typed error special-form syntax surfaces when no registered expression
+/// planner handles it (issue #2476): DataFusion's SQL-to-plan step refuses it,
+/// mapped to [`crate::error::SqlError::Plan`]. Like [`E_SLIDING_AVG`], it is not
+/// refused by [`crate::validate`], so the conformance suite verifies it by
+/// executing the query.
+const E_NO_EXPR_PLANNER: &str = "SqlError::Plan";
 
 /// One admitted upstream scalar *family* (ADR-0097 decision 8), attested by a
 /// single representative row rather than one row per member. The family row is
@@ -585,6 +593,34 @@ pub fn registry() -> Vec<Construct> {
         example: "SELECT count(*) FROM logs WHERE body LIKE '%record 1%'".to_string(),
         classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
         rationale: "substring pattern match via the Ravel like UDF",
+    });
+
+    // Special-form string syntax with no registered expression planner (issue
+    // #2476). DataFusion plans these only through `UnicodeFunctionPlanner`,
+    // which `crate::session::build_session` does not register, so they are
+    // refused while planning. The function-call forms reach the admitted
+    // scalars instead. sqlparser reads an unquoted `substr(...)` or
+    // `substring(...)` call into the same refused node as the `FROM ... FOR`
+    // form, so only the double-quoted name is a working call.
+    // tests/expr_planner_surface.rs pins both refusals and both call forms.
+    out.push(Construct {
+        category: Category::Clause,
+        name: "POSITION(x IN y)".to_string(),
+        example: "SELECT POSITION('a' IN 'ab')".to_string(),
+        classification: Classification::IntentionallyRejected {
+            typed_error: E_NO_EXPR_PLANNER,
+        },
+        rationale: "no registered expression planner; call strpos(y, x) instead",
+    });
+    out.push(Construct {
+        category: Category::Clause,
+        name: "SUBSTRING(x FROM y FOR z)".to_string(),
+        example: "SELECT SUBSTRING('abc' FROM 1 FOR 2)".to_string(),
+        classification: Classification::IntentionallyRejected {
+            typed_error: E_NO_EXPR_PLANNER,
+        },
+        rationale: "no registered expression planner; call \"substr\"(x, y, z), name \
+                    double-quoted, instead",
     });
 
     // --- Scalar functions (ADR-0097 decisions 4, 8) ----------------------
