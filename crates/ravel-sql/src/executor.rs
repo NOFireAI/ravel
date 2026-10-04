@@ -6507,6 +6507,43 @@ mod tests {
         )
     }
 
+    /// `SqlStats::scan_timing` carries the logs scan's two prefetch-pool
+    /// counters, summed over partitions beside `reopens`, under the metric
+    /// names the scan publishes. Fails against a fold that leaves either
+    /// field out (it reads 0).
+    #[test]
+    fn scan_timing_sums_the_prefetch_pool_counters() {
+        use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricBuilder};
+
+        let set = ExecutionPlanMetricsSet::new();
+        MetricBuilder::new(&set)
+            .counter("prefetch_memory_reopens", 0)
+            .add(1);
+        MetricBuilder::new(&set)
+            .counter("prefetch_memory_reopens", 1)
+            .add(1);
+        MetricBuilder::new(&set)
+            .counter("prefetch_revocations", 0)
+            .add(3);
+        MetricBuilder::new(&set).counter("reopens", 1).add(1);
+        let mut timing = ScanTiming::default();
+        accumulate_scan_timing(&set.clone_inner(), &mut timing);
+        assert_eq!(
+            (
+                timing.reopens,
+                timing.prefetch_memory_reopens,
+                timing.prefetch_revocations
+            ),
+            (1, 2, 3)
+        );
+        let rendered = format!("{timing:?}");
+        assert!(
+            rendered.contains("prefetch_memory_reopens: 2"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("prefetch_revocations: 3"), "{rendered}");
+    }
+
     /// A logs statement's dependency depth reads the bound `plan_segment`
     /// routes on, `plan_whole_object_bound`: a 1,000,000 byte object above the
     /// 524,288 byte routing threshold and under the 31,500,000 byte
