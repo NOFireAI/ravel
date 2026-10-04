@@ -981,6 +981,13 @@ jobs:
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Names the cargo profile this job builds on. An entry is never
+          # rewritten under a key that already exists, so when the job moved
+          # to the `ci` profile the old entry, which holds the default
+          # profile's target subtree, kept being restored and the job built
+          # its dependencies cold on every run (issue #2519). Change this
+          # with the profile.
+          key: ci-profile
       - name: SQL endpoint tests
         run: cargo nextest run --locked --cargo-profile ci -p ravel-server --features sql
       - name: Differential correctness gate
@@ -1041,6 +1048,8 @@ jobs:
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Names the cargo profile, as in `sql` above.
+          key: ci-profile
       - name: Flight SQL tests
         # The `ci` profile, as in `check-shard` (issue #2519): it is dev without
         # debug info. On the default profile this lane wrote about 76 GiB and
@@ -1125,7 +1134,8 @@ jobs:
           # The automatic key names the job, not the matrix entry, so without
           # this every leg would restore whichever leg saved first and build
           # the rest of its own dependencies cold.
-          key: ${{ matrix.lane }}
+          # The suffix names the cargo profile, as in `sql` above.
+          key: ${{ matrix.lane }}-ci-profile
           # Restore everywhere, save only on main: a cache written on a PR ref
           # is readable only by that same pull request's later runs, one on a
           # queue ref by nothing at all, and both die with the ref while
@@ -1342,6 +1352,8 @@ jobs:
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Names the cargo profile, as in `sql` above.
+          key: ci-profile
       - name: Clippy ravel-server --features otap
         run: cargo clippy --locked --profile ci -p ravel-server --features otap --all-targets -- -D warnings
         # `--lib`, not the whole test set: `tests/cli_reference.rs` asserts
