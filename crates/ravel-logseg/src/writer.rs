@@ -112,6 +112,9 @@ pub struct RlogWriter {
     sort_descriptor: Option<SortDescriptor>,
     clustering_generation: u64,
     bloom_scope: BloomScope,
+    /// Set by [`RlogWriter::with_unchecked_stream_attrs`].
+    #[cfg(feature = "test-support")]
+    unchecked_stream_attrs: bool,
 }
 
 /// Which string columns BLOOM covers (ADR-2135 decision 5). A column outside
@@ -218,7 +221,31 @@ impl RlogWriter {
             sort_descriptor: None,
             clustering_generation: 0,
             bloom_scope: BloomScope::All,
+            #[cfg(feature = "test-support")]
+            unchecked_stream_attrs: false,
         }
+    }
+
+    /// Test-only: makes [`RlogWriter::finish`] and
+    /// [`RlogWriter::finish_compacted`] write a `stream_attrs` blob the reader
+    /// cannot decode instead of refusing it, so a test can put such a blob in
+    /// storage and exercise the reader's refusal. A blob that does not decode
+    /// contributes no stream-level columns. Exists only with the
+    /// `test-support` feature, which no production path may enable.
+    #[cfg(feature = "test-support")]
+    pub fn with_unchecked_stream_attrs(mut self) -> Self {
+        self.unchecked_stream_attrs = true;
+        self
+    }
+
+    /// The resource and scope pairs of one STREAM_DIR blob. A blob the reader
+    /// cannot decode is refused, so the writer never stores one.
+    fn stream_pairs(&self, blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+        #[cfg(feature = "test-support")]
+        if self.unchecked_stream_attrs {
+            return Ok(stream_attr_pairs(blob).unwrap_or_default());
+        }
+        stream_attr_pairs(blob)
     }
 
     /// Orders the object's records by `descriptor` and records it in the
@@ -487,7 +514,7 @@ impl RlogWriter {
         // `stream_attrs` can fail on a corrupt blob; that is propagated rather
         // than silently under-indexing.
         for blob in streams.values() {
-            for (k, v) in stream_attr_pairs(blob)? {
+            for (k, v) in self.stream_pairs(blob)? {
                 let (ty, _) = resolve_value(&v);
                 if stream_level_column_eligible(k.as_str(), ty, &indexed_names) {
                     distinct.insert((k, ty.to_u8()));
@@ -576,7 +603,7 @@ impl RlogWriter {
         if !tracked_names.is_empty() {
             for (id, blob) in &streams {
                 let seed =
-                    StreamSeed::build(stream_attr_pairs(blob)?, &tracked_slot, stamp_index.slots());
+                    StreamSeed::build(self.stream_pairs(blob)?, &tracked_slot, stamp_index.slots());
                 stream_seeds.insert(*id, seed);
             }
         }
@@ -1057,7 +1084,7 @@ impl RlogWriter {
             }
         }
         for blob in streams.values() {
-            for (k, v) in stream_attr_pairs(blob)? {
+            for (k, v) in self.stream_pairs(blob)? {
                 let (ty, _) = resolve_value(&v);
                 if stream_level_column_eligible(k.as_str(), ty, &indexed_names) {
                     distinct.insert((k, ty.to_u8()));
@@ -1117,7 +1144,7 @@ impl RlogWriter {
         if !tracked_names.is_empty() {
             for (id, blob) in &streams {
                 let seed =
-                    StreamSeed::build(stream_attr_pairs(blob)?, &tracked_slot, stamp_index.slots());
+                    StreamSeed::build(self.stream_pairs(blob)?, &tracked_slot, stamp_index.slots());
                 stream_seeds.insert(*id, seed);
             }
         }

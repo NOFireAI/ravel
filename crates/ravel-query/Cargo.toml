@@ -118,6 +118,10 @@ ravel-cache = { workspace = true }
 # produce write_v4 L1 parts. ravel-maintain does not depend on ravel-query,
 # so this is acyclic.
 ravel-maintain = { path = "../ravel-maintain", version = "0.21.0" }
+# Already a normal dependency; the dev edge only adds `test-support`, so
+# tests/log_series.rs can store a `stream_attrs` blob the reader refuses
+# (`RlogWriter::with_unchecked_stream_attrs`, issue #2548).
+ravel-logseg = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 # The ADR-0046 disk cache tier (crates/ravel-query/src/cache_correctness.rs)
 # needs a real on-disk directory to construct a `ravel_cache::DiskCache`; the

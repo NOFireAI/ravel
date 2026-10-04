@@ -163,7 +163,32 @@ fn small_blocks() -> RlogConfig {
 }
 
 async fn write_object(store: &MemoryStore, key: &str, records: &[LogRecord]) -> SegmentRef {
-    let mut w = RlogWriter::new(small_blocks(), identity());
+    write_with(
+        RlogWriter::new(small_blocks(), identity()),
+        store,
+        key,
+        records,
+    )
+    .await
+}
+
+/// Like [`write_object`], but the writer stores a `stream_attrs` blob the
+/// reader cannot decode instead of refusing it.
+async fn write_object_unchecked(
+    store: &MemoryStore,
+    key: &str,
+    records: &[LogRecord],
+) -> SegmentRef {
+    let w = RlogWriter::new(small_blocks(), identity()).with_unchecked_stream_attrs();
+    write_with(w, store, key, records).await
+}
+
+async fn write_with(
+    mut w: RlogWriter,
+    store: &MemoryStore,
+    key: &str,
+    records: &[LogRecord],
+) -> SegmentRef {
     for r in records {
         w.push(r.clone()).expect("push");
     }
@@ -1253,8 +1278,9 @@ async fn log_series_corrupt_stream_attrs_under_erasure_is_a_typed_error() {
     let mem = Arc::new(MemoryStore::new());
     let resource = [("service.name", AttrValue::Str("api".to_string()))];
     let good = resource_record(&resource, 100, "INFO", "ok", &[]);
-    // A non-UTF-8 scope name: the writer's own blob walk skips the scope
-    // strings unchecked and accepts it, `decode_stream_attrs` rejects it.
+    // A non-UTF-8 scope name, which `decode_stream_attrs` rejects. The writer
+    // refuses such a blob, so this object bypasses that check on purpose to
+    // put one in storage and exercise the reader.
     let mut corrupt = resource_record(&resource, 200, "INFO", "ok", &[]);
     let at = corrupt
         .stream_attrs
@@ -1263,7 +1289,7 @@ async fn log_series_corrupt_stream_attrs_under_erasure_is_a_typed_error() {
         .expect("scope name in blob");
     corrupt.stream_attrs[at] = 0xFF;
     let ref_a = write_object(&mem, "logs/good.rlog", &[good]).await;
-    let ref_b = write_object(&mem, "logs/corrupt.rlog", &[corrupt]).await;
+    let ref_b = write_object_unchecked(&mem, "logs/corrupt.rlog", &[corrupt]).await;
     let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
     let refs = [ref_a, ref_b];
 
