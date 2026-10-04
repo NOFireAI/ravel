@@ -153,8 +153,9 @@ sequenceDiagram
   itself does not vary, because a window whose total page count exceeds the
   cap is refused on every run. (The `estimate` does not vary: see the
   WindowTooWide estimate correction below.)
-- The shard results are merged in shard order before step 2 partitions them,
-  so the resolved key set and its total order are unchanged.
+- The shard results are merged in shard order (see the merge order correction
+  below) before step 2 partitions them, so the resolved key set and its total
+  order are unchanged.
   `docs/catalog-and-mvcc.md`'s "Both traversals produce the identical key set"
   still holds. ADR-0056 itself makes the narrower claim that the prefix path
   lists a superset and the resolved snapshots converge. Concurrency changes
@@ -286,6 +287,9 @@ The implementing tasks' acceptance stamps are measured the same way as Stage 0:
 | PUT pairs for events submitted while one flush is held | one batch per `max_batch` or `max_age` | unchanged | any change |
 | q1 hot, RustFS entry, end to end | 0.44 s (upstream) | 0.12-0.25 s (from the model) | above 0.30 s |
 
+The steady-traffic row's "about 77" is 73 by the batching model, so its miss
+band is above 74: see the steady-traffic and reachability correction below.
+
 **How the end-to-end bands are derived.**
 - Real S3: the band is the measured components with the listing overlapped
   to about one round and the 25 ms and one 18 ms GET removed. The 19 ms not
@@ -406,7 +410,8 @@ does not move it. See "Deferred" below.
       traffic on a fast store gives one PUT pair per event);
     - a loop that still waits `max_age` for an idle event.
   - A reachability test drives the SQL HTTP handler end to end and asserts
-    the request counts.
+    the request counts. (That test is ticket #2540's: see the steady-traffic
+    and reachability correction below.)
 
 ## Correction (2026-10-04): the WindowTooWide estimate does not vary
 
@@ -434,3 +439,54 @@ implementation does not behave that way.
 - ADR-0056's reserved-cap amendment already states the estimate this way. The
   ADR index row for this decision in `docs/adrs/README.md` is corrected in
   place.
+
+## Correction (2026-10-04): the steady-traffic count and the reachability test
+
+<!-- amendment-applies: sections="What this moves, pre-registered" pointer="steady-traffic and reachability correction" -->
+<!-- amendment-applies: sections="Consequences" pointer="steady-traffic and reachability correction" -->
+
+Two statements above are wrong.
+
+- **The steady-traffic PUT-pair count is 73, not about 77.** The row in "What
+  this moves, pre-registered" puts today's loop at about 77 pairs for one
+  event every 5 ms for 2 s with a store PUT of about 1 ms. Today's loop opens
+  a `max_age` window (25 ms) at an event and then spends one PUT pair on the
+  flush, so on that schedule its windows alternate between 5 and 6 events,
+  one pair each, over a 55 ms period:
+  - 36 periods take 1980 ms and cover 396 of the 400 events in 72 pairs;
+  - the last 4 events make one more pair, for 73.
+
+  The expected-after figure is today's count plus at most one, so the row
+  counts as a miss above 74 pairs. The row's other columns and the reasoning
+  behind them stand.
+- **The reachability test is not part of the branch that implements
+  decisions 1 and 3.** "Consequences" lists a test that drives the SQL HTTP
+  handler end to end and asserts the request counts. That test is ticket
+  #2540, in the epic's second wave. Issue #2538's branch pins the listing and
+  the HEAD cache at the catalog level, in
+  `crates/ravel-catalog/tests/resolve_prefix_concurrency.rs` and
+  `crates/ravel-catalog/tests/snapshot_resolve.rs`.
+
+## Correction (2026-10-04): shard results are merged in completion order
+
+<!-- amendment-applies: sections="1. The prefix traversal lists shards concurrently under a reserved cap" pointer="merge order correction" -->
+<!-- amendment-supersedes: phrase="merged in shard order" pointer="merge order correction" -->
+
+Decision 1 says the shard results are merged in shard order before step 2
+partitions them, and gives that as the reason the resolved key set and its
+order are unchanged. The implementation merges each shard's groups in the
+order the shards complete, which varies between runs. The conclusion holds
+for other reasons:
+
+- `list_shard_by_prefix` groups every key under the `(shard, hour)` parsed
+  from the key itself, so no bucket holds keys from two shards, and a bucket's
+  keys stay in its shard's page order whatever order the shards finish in.
+- Resolve sorts the segments it returns by their own record fields
+  (`segment_sort_key`: created time, writer epoch and sequence, shard, writer
+  id, then the L1 tiebreaks), never by the order they were listed or merged.
+
+`prefix_listing_key_set_matches_sequential` in
+`crates/ravel-catalog/tests/resolve_prefix_concurrency.rs` holds shard 0's
+pages until every other shard has drained, asserts that it did, and checks the
+resolved snapshot against the bounded path's. ADR-0056's reserved-cap
+amendment and `docs/catalog-and-mvcc.md` are corrected in place.
