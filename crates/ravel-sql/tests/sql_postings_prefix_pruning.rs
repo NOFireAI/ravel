@@ -14,7 +14,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod util;
+use crate::util;
 
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use ravel_sql::SqlOutcome;

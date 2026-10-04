@@ -37,7 +37,7 @@ use uuid::Uuid;
 
 use futures::StreamExt;
 
-mod util;
+use crate::util;
 use util::CountingStore;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);

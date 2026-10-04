@@ -20,11 +20,6 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-// The Flight SQL reachability test drives the shared in-process harness, which
-// only links under the `flight-sql` feature.
-#[cfg(feature = "flight-sql")]
-mod util;
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;

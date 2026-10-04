@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+# Test targets are declared explicitly below; see the `[[test]]` section.
+autotests = false
 
 [lints]
 workspace = true
@@ -272,6 +274,75 @@ tempfile = { workspace = true }
 # made of. The major ravel-parquet already links for DataFusion 54, so it adds
 # no lockfile entry.
 parquet = { version = "58", default-features = false, features = ["arrow"] }
+
+# Integration tests link into as few binaries as correctness allows (issue
+# #2523): tests/it.rs compiles most files under tests/ as modules of one
+# binary. The targets below keep their own binary, each for a stated reason.
+[[test]]
+name = "it"
+path = "tests/it.rs"
+
+# Run by name with `--test` from CI, docs and their own module docs.
+[[test]]
+name = "conformance"
+path = "tests/conformance.rs"
+
+[[test]]
+name = "differential"
+path = "tests/differential.rs"
+
+# Each installs a `#[global_allocator]`, and a binary can have one.
+# group_by_reservation_lag is also run by name.
+[[test]]
+name = "group_by_reservation_lag"
+path = "tests/group_by_reservation_lag.rs"
+
+[[test]]
+name = "dedup_finalize_allocation"
+path = "tests/dedup_finalize_allocation.rs"
+
+[[test]]
+name = "dedup_finalize_allocation_many_series_one_segment"
+path = "tests/dedup_finalize_allocation_many_series_one_segment.rs"
+
+[[test]]
+name = "dedup_finalize_allocation_single_series"
+path = "tests/dedup_finalize_allocation_single_series.rs"
+
+[[test]]
+name = "logs_scan_allocations"
+path = "tests/logs_scan_allocations.rs"
+
+[[test]]
+name = "scan_batch_allocations"
+path = "tests/scan_batch_allocations.rs"
+
+# Exact deltas on process-wide monotonic tallies, which tests in another file
+# of the same process could move.
+[[test]]
+name = "declared_stat_carrier_conflicts"
+path = "tests/declared_stat_carrier_conflicts.rs"
+
+[[test]]
+name = "declared_stat_cstat_drops"
+path = "tests/declared_stat_cstat_drops.rs"
+
+# Assert captured `tracing` output. `tracing` caches a callsite's interest
+# process-wide, so another file's test reaching the same callsite with no
+# subscriber can suppress the line asserted on.
+[[test]]
+name = "declared_stat_conflict_log"
+path = "tests/declared_stat_conflict_log.rs"
+
+[[test]]
+name = "flight_span"
+path = "tests/flight_span.rs"
+
+# Its opt-in stress test replaces the process-wide panic hook, which would
+# swallow the panic output of every other test running in the process.
+[[test]]
+name = "group_by_string_keys"
+path = "tests/group_by_string_keys.rs"
 
 [[bench]]
 name = "samples_scan"

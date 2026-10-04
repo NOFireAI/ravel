@@ -75,7 +75,7 @@
 #![cfg(feature = "flight-sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::too_many_arguments)]
 
-mod util;
+use crate::util;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};

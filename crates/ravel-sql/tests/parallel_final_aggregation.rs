@@ -30,7 +30,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod util;
+use crate::util;
 
 use datafusion::physical_plan::displayable;
 use ravel_object_store::ObjectStoreBackend;
