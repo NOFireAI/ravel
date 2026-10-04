@@ -4,6 +4,9 @@
 //! content-addressed part keys and converges at the record's
 //! `CreateIfAbsent`.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
+
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::Signal;
 
@@ -16,7 +19,7 @@ use crate::error::{MaintainError, Result};
 use crate::publish::{PublishOutcome, conserve_exact};
 use crate::read;
 use crate::read::list_bucket_with_ledger;
-use crate::rewrite::FencedRewrite;
+use crate::rewrite::{FencedRewrite, UnwritableInputs};
 use crate::rlog::RlogCodec;
 use crate::rspan_codec::SpanCodec;
 
@@ -42,6 +45,9 @@ pub enum CompactionOutcome {
     /// erased records through query-time dedup).
     RewritePresent,
     /// Fewer than `min_compaction_inputs` L0 records; not worth compacting.
+    /// Also returned when compaction skips an input as unrewritable
+    /// ([`CompactionInputSkipReason`]) and fewer than the minimum remain;
+    /// `count` is then the number of writable inputs left, 0 when none is.
     BelowMinInputs { count: usize },
     /// Built and published (or converged / abandoned): `parts` parts written,
     /// `publish` records how the record PUT resolved.
@@ -49,6 +55,108 @@ pub enum CompactionOutcome {
         parts: usize,
         publish: PublishOutcome,
     },
+}
+
+/// Why compaction left one input object of a bucket out of its merge (issue
+/// #2554): the `reason` label of `ravel_maintain_compaction_inputs_skipped_total`.
+///
+/// A skipped input is left in storage as it is. The published compaction
+/// record does not name it, so the catalog keeps serving it as an L0 object and
+/// no sweep deletes it as superseded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionInputSkipReason {
+    /// The input carries a `stream_attrs` blob the RLOG writer refuses, because
+    /// the reader's decoder cannot decode it (issue #2548). Such an object was
+    /// written before the writer validated its blobs.
+    UnwritableStreamAttrs,
+}
+
+impl CompactionInputSkipReason {
+    pub const ALL: [CompactionInputSkipReason; 1] =
+        [CompactionInputSkipReason::UnwritableStreamAttrs];
+
+    /// The `reason` label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            CompactionInputSkipReason::UnwritableStreamAttrs => "unwritable_stream_attrs",
+        }
+    }
+}
+
+/// The signals whose compaction can skip an input: the two that compact
+/// through RLOG (logs, and the query-audit shard of audit). `/metrics`
+/// renders the skip counter for these signals only, so a codec that starts
+/// overriding `SegmentCodec::unwritable_input` must add its signal here.
+pub const COMPACTION_INPUT_SKIP_SIGNALS: [Signal; 2] = [Signal::Logs, Signal::Audit];
+
+/// The input objects this process has skipped, and the counts behind
+/// [`compaction_inputs_skipped_total`]. Process-wide, so the next compaction of
+/// the same bucket leaves a remembered object out without reading it again.
+#[derive(Default)]
+struct SkippedInputs {
+    keys: HashSet<String>,
+    counts: HashMap<(Signal, CompactionInputSkipReason), u64>,
+}
+
+static SKIPPED_INPUTS: LazyLock<Mutex<SkippedInputs>> =
+    LazyLock::new(|| Mutex::new(SkippedInputs::default()));
+
+fn skipped_inputs() -> MutexGuard<'static, SkippedInputs> {
+    SKIPPED_INPUTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Input objects of `signal` this process's compactions have skipped for
+/// `reason` since it started, each object counted once.
+pub fn compaction_inputs_skipped_total(signal: Signal, reason: CompactionInputSkipReason) -> u64 {
+    skipped_inputs()
+        .counts
+        .get(&(signal, reason))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// `inputs` less every object this process already skipped, in order.
+fn drop_skipped_inputs(
+    inputs: Vec<crate::read::InputRecord>,
+) -> Result<Vec<crate::read::InputRecord>> {
+    let mut kept = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let key = ravel_commit::keys::reconstruct_data_key(&input.record)?;
+        if !skipped_inputs().keys.contains(&key) {
+            kept.push(input);
+        }
+    }
+    Ok(kept)
+}
+
+/// Record that compaction of `bucket` skipped the input object `key` for
+/// `reason`, `error` being the decoder's refusal. The first time per object per
+/// process it counts the skip and warns with the key and the error.
+pub(crate) fn note_skipped_input(
+    bucket: &Bucket,
+    key: &str,
+    reason: CompactionInputSkipReason,
+    error: &str,
+) {
+    {
+        let mut skipped = skipped_inputs();
+        if !skipped.keys.insert(key.to_string()) {
+            return;
+        }
+        *skipped.counts.entry((bucket.signal, reason)).or_insert(0) += 1;
+    }
+    tracing::warn!(
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        object_key = key,
+        reason = reason.name(),
+        error,
+        "compaction skipped an input object it cannot rewrite; the object stays in place \
+         and no compaction record names it (issue #2554)"
+    );
 }
 
 /// What a coordinated compaction run did (ADR-1029 decisions 3 and 5).
@@ -245,6 +353,21 @@ async fn compact_bucket_scoped(
     )
     .await?;
 
+    // An object an earlier run of this process skipped is left out before the
+    // claim and before its catalog is read again, and the minimum is applied
+    // to what remains.
+    let loaded = inputs.len();
+    let inputs = drop_skipped_inputs(inputs)?;
+    if inputs.len() != loaded && (inputs.is_empty() || inputs.len() < config.min_compaction_inputs)
+    {
+        return Ok((
+            ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs {
+                count: inputs.len(),
+            }),
+            None,
+        ));
+    }
+
     // Cancellation checkpoint 1 (ADR-1029 decision 3), which is also where the
     // claim is acquired. A participating run claims every bucket whatever its
     // size, because the claim fences this publish against an erasure rewrite of
@@ -400,6 +523,11 @@ fn listing_gate(listing: &BucketListing) -> Option<CompactionOutcome> {
 /// gate the new listing fails (an erasure rewrite record that landed meanwhile
 /// is [`CompactionOutcome::RewritePresent`]), or an abandoned publish when it
 /// fails none.
+///
+/// An input the codec cannot rewrite is left out of the merge and of the
+/// record ([`UnwritableInputs::Skip`]); when fewer than `min_compaction_inputs`
+/// inputs are left the bucket reports [`CompactionOutcome::BelowMinInputs`]
+/// with the count left.
 async fn run_pipeline<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -418,6 +546,7 @@ async fn run_pipeline<C: SegmentCodec>(
         conserve_exact(),
         start_ns,
         Some(planned),
+        UnwritableInputs::Skip,
     )
     .await?;
 
@@ -426,6 +555,9 @@ async fn run_pipeline<C: SegmentCodec>(
             parts: outcome.parts,
             publish: outcome.publish,
         },
+        FencedRewrite::TooFewWritableInputs { remaining } => {
+            CompactionOutcome::BelowMinInputs { count: remaining }
+        }
         FencedRewrite::RecordSetChanged(now) => {
             listing_gate(&now).unwrap_or(CompactionOutcome::Compacted {
                 parts: 0,
@@ -1135,5 +1267,62 @@ mod tests {
             2 * N,
             start.elapsed()
         );
+    }
+
+    /// A `tracing` writer into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Noting one skipped object twice counts it once and warns once: the
+    /// second note finds the key already remembered and returns before the
+    /// counter and the warning. With that guard gone (the early `return` on
+    /// `skipped.keys.insert` in `note_skipped_input`), the counter moves by 2
+    /// and two warnings are written.
+    #[test]
+    fn noting_one_skipped_object_twice_counts_and_warns_once() {
+        let log = Captured::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let logs = Bucket::new(tenant_hash(), Signal::Logs, SHARD, HOUR);
+        let key = format!("noting-twice-{}", Uuid::new_v4());
+        let reason = CompactionInputSkipReason::UnwritableStreamAttrs;
+        let before = compaction_inputs_skipped_total(Signal::Logs, reason);
+
+        tracing::subscriber::with_default(subscriber, || {
+            note_skipped_input(&logs, &key, reason, "first refusal");
+            note_skipped_input(&logs, &key, reason, "second refusal");
+        });
+
+        assert_eq!(
+            compaction_inputs_skipped_total(Signal::Logs, reason) - before,
+            1,
+            "the object counts once"
+        );
+        let bytes = log.0.lock().expect("log buffer lock").clone();
+        let warnings: Vec<String> = String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| l.contains("compaction skipped an input object") && l.contains(&key))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(warnings[0].contains("first refusal"), "{}", warnings[0]);
     }
 }

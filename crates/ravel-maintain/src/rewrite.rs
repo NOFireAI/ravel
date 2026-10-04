@@ -163,6 +163,11 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         FencedRewrite::RecordSetChanged(_) => Err(MaintainError::Invariant(
             "a rewrite given no planned listing reported a changed record set".to_string(),
         )),
+        // Unreachable by construction: this run fails on an unrewritable input
+        // rather than skipping it, so it cannot run out of inputs.
+        FencedRewrite::TooFewWritableInputs { .. } => Err(MaintainError::Invariant(
+            "a rewrite that skips no input reported no writable inputs".to_string(),
+        )),
     });
     // The frame that OPENED the scope emits the run's report, exactly once
     // (ADR-0996 task 996-8): a directly-driven rewrite reports here; a rewrite
@@ -252,6 +257,7 @@ async fn load_then_rewrite<C: SegmentCodec>(
         conservation,
         start_ns,
         planned,
+        UnwritableInputs::Fail,
     )
     .await
 }
@@ -265,6 +271,28 @@ pub(crate) enum FencedRewrite {
     /// planned from, so the run published nothing (ADR-1029, the 2026-10-03
     /// amendment). Carries the new listing, so the caller can report why.
     RecordSetChanged(BucketListing),
+    /// The run skipped at least one input the codec cannot rewrite
+    /// ([`UnwritableInputs::Skip`]) and fewer than `min_compaction_inputs`
+    /// writable inputs remain, `remaining` of them, so it built and published
+    /// nothing.
+    TooFewWritableInputs { remaining: usize },
+}
+
+/// What a run does with an input its codec's writer would refuse
+/// ([`SegmentCodec::unwritable_input`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnwritableInputs {
+    /// Leave it out of the merge, the input set hash and the record, counted
+    /// and warned once per object per process
+    /// ([`crate::compact::note_skipped_input`]). Compaction does this (issue
+    /// #2554): the object stays in storage and the catalog keeps serving it as
+    /// an L0 object, so no record is lost. When a skip leaves fewer than
+    /// `min_compaction_inputs` inputs the run publishes nothing
+    /// ([`FencedRewrite::TooFewWritableInputs`]).
+    Skip,
+    /// Merge it, so the writer's refusal fails the run. Format migration does
+    /// this: it promises to rewrite the whole live L0 set.
+    Fail,
 }
 
 /// Whether two listings of one bucket name the same record set: the same L0
@@ -331,6 +359,9 @@ pub(crate) async fn relist_changed(
 /// `planned` is the bucket listing the caller planned from. When it is given,
 /// the run re-lists the bucket after its last claim checkpoint and publishes
 /// nothing if the record set changed ([`relist_changed`]).
+///
+/// `unwritable` says whether an input the codec cannot rewrite is skipped or
+/// fails the run ([`UnwritableInputs`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
@@ -341,6 +372,7 @@ pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
     conservation: impl ConservationPredicate,
     start_ns: i64,
     planned: Option<&BucketListing>,
+    unwritable: UnwritableInputs,
 ) -> Result<FencedRewrite> {
     // A cancellation checkpoint anywhere below unwinds to here as the typed
     // `ClaimLost` signal (ADR-1029 decision 3): the run stops and publishes
@@ -358,6 +390,7 @@ pub(crate) async fn rewrite_and_publish_loaded<C: SegmentCodec>(
         conservation,
         start_ns,
         planned,
+        unwritable,
     )
     .await
     {
@@ -390,6 +423,7 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     conservation: impl ConservationPredicate,
     start_ns: i64,
     planned: Option<&BucketListing>,
+    unwritable: UnwritableInputs,
 ) -> Result<FencedRewrite> {
     // A new run's accounting starts from zero: a tracker left installed in a
     // long-lived config would otherwise carry the previous bucket's peaks
@@ -399,7 +433,8 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
         t.reset_for_run();
     }
     C::validate_rewrite_inputs(&inputs)?;
-    let hash = input_set_hash(&inputs);
+    let mut inputs = inputs;
+    let mut hash = input_set_hash(&inputs);
 
     // Cancellation checkpoint 2 (ADR-1029 decision 3): the input set is
     // listed, read and hashed, and nothing has been fetched per input yet. The
@@ -422,10 +457,23 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     for input in &inputs {
         pending.push(C::load_input_catalog(store, config, input));
     }
-    let catalogs: Vec<C::Catalog> = stream_iter(pending)
+    let mut catalogs: Vec<C::Catalog> = stream_iter(pending)
         .buffered(config.input_read_concurrency.max(1))
         .try_collect()
         .await?;
+
+    if unwritable == UnwritableInputs::Skip {
+        let loaded = inputs.len();
+        (inputs, catalogs) = skip_unwritable_inputs::<C>(bucket, inputs, catalogs)?;
+        if inputs.len() != loaded {
+            if inputs.is_empty() || inputs.len() < config.min_compaction_inputs {
+                return Ok(FencedRewrite::TooFewWritableInputs {
+                    remaining: inputs.len(),
+                });
+            }
+            hash = input_set_hash(&inputs);
+        }
+    }
 
     let parts = C::build_parts(store, config, bucket, &inputs, catalogs, &hash).await?;
 
@@ -488,6 +536,36 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
         parts: parts.len(),
         publish,
     }))
+}
+
+/// Split off every input whose catalog the codec's writer would refuse
+/// ([`SegmentCodec::unwritable_input`]), recording each as skipped, and return
+/// the rest with their catalogs, still aligned and in canonical order.
+fn skip_unwritable_inputs<C: SegmentCodec>(
+    bucket: &Bucket,
+    inputs: Vec<crate::read::InputRecord>,
+    catalogs: Vec<C::Catalog>,
+) -> Result<(Vec<crate::read::InputRecord>, Vec<C::Catalog>)> {
+    if inputs.len() != catalogs.len() {
+        return Err(MaintainError::Invariant(
+            "inputs and catalogs length mismatch".to_string(),
+        ));
+    }
+    let mut kept_inputs = Vec::with_capacity(inputs.len());
+    let mut kept_catalogs = Vec::with_capacity(catalogs.len());
+    for (input, catalog) in inputs.into_iter().zip(catalogs) {
+        match C::unwritable_input(&catalog) {
+            Some((reason, error)) => {
+                let key = keys::reconstruct_data_key(&input.record)?;
+                crate::compact::note_skipped_input(bucket, &key, reason, &error);
+            }
+            None => {
+                kept_inputs.push(input);
+                kept_catalogs.push(catalog);
+            }
+        }
+    }
+    Ok((kept_inputs, kept_catalogs))
 }
 
 /// The result of a [`migrate_bucket_format`] call. Every variant except
@@ -696,6 +774,12 @@ async fn migrate_bucket_format_scoped(
         // fails, an erasure rewrite record above all.
         FencedRewrite::RecordSetChanged(now) => {
             migrate_listing_gate(&now).unwrap_or(MigrateOutcome::RecordSetChanged)
+        }
+        // A migration skips no input (`UnwritableInputs::Fail`).
+        FencedRewrite::TooFewWritableInputs { .. } => {
+            return Err(MaintainError::Invariant(
+                "a migration that skips no input reported no writable inputs".to_string(),
+            ));
         }
     })
 }
@@ -1037,6 +1121,9 @@ async fn reencode_compaction_parts_scoped(
         Some(FencedRewrite::RecordSetChanged(now)) => {
             Ok(reencode_listing_gate(&now).unwrap_or(ReencodeOutcome::RecordSetChanged))
         }
+        Some(FencedRewrite::TooFewWritableInputs { .. }) => Err(MaintainError::Invariant(
+            "a re-encode, which skips no input, reported no writable inputs".to_string(),
+        )),
         None => Err(MaintainError::Invariant(
             "a re-encode lost its claim but its guard names no checkpoint".to_string(),
         )),

@@ -2625,14 +2625,12 @@ async fn gather_l0_inputs(
 /// whose key it does not return is not, whatever bucket either sits in.
 ///
 /// It is deliberately keyed on the record's own input list rather than on the
-/// bucket the record lives in. The two coincide today only because a
-/// compaction or rewrite refuses an unsealed bucket and a sealed bucket's L0
-/// set is frozen, so a record over that bucket necessarily covers all of it.
-/// Any caller that needs "is this L0 record superseded" must ask this
-/// question, not the bucket-membership question, or it inherits that seal
-/// invariant as a silent premise: a partial-coverage record (one naming some
-/// but not all of its bucket's L0 set) makes the two answers differ, and the
-/// bucket-membership answer is the wrong one.
+/// bucket the record lives in. A compaction record can name only part of its
+/// sealed bucket's L0 set: compaction leaves out an input it cannot rewrite
+/// ([`crate::compact::CompactionInputSkipReason`]), and that object stays live
+/// as L0. Any caller that needs "is this L0 record superseded" must ask this
+/// question, not the bucket-membership question, so that an object the record
+/// does not name is never treated as superseded.
 ///
 /// Shared by rule 2's own [`gather_l0_inputs`] and by the migrate floor-raise
 /// re-audit ([`crate::migrate::count_below_target`]), so the
