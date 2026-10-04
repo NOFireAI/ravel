@@ -438,6 +438,11 @@ pub struct ScanTiming {
     /// `attrs_raw` fallback reopens and their open stall.
     pub reopen_elapsed_ns: u64,
     pub reopens: u64,
+    /// Fast-path opens the fetch memory budget refused and the scan retried
+    /// once, and the unconsumed prefetches those refusals dropped (ADR-2414
+    /// decision A2), all partitions.
+    pub prefetch_memory_reopens: u64,
+    pub prefetch_revocations: u64,
     /// Synchronous decode plus Arrow build inside `poll_next`.
     pub decode_build_elapsed_ns: u64,
     pub decode_build_elapsed_max_ns: u64,
@@ -496,6 +501,8 @@ fn accumulate_scan_timing(metrics: &MetricsSet, timing: &mut ScanTiming) {
         timing.segments_opened += sum("segments_opened");
         timing.reopen_elapsed_ns += sum("reopen_elapsed");
         timing.reopens += sum("reopens");
+        timing.prefetch_memory_reopens += sum("prefetch_memory_reopens");
+        timing.prefetch_revocations += sum("prefetch_revocations");
         timing.decode_build_elapsed_ns += sum("decode_build_elapsed");
         timing.emit_elapsed_ns += sum("emit_elapsed");
         timing.plan_init_elapsed_ns += sum("plan_init_elapsed");
