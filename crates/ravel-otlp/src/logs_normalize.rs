@@ -28,12 +28,18 @@
 //! bound is what makes the no-overflow guarantee hold on its own terms; it
 //! does not depend on prost's decode-time recursion limit (an upstream
 //! default this crate neither sets nor controls) still being in force.
+//!
+//! Attribute values that convert are then held to the stricter storage rule,
+//! [`ravel_logseg::attr_value_fits_depth`]: a resource, scope or record
+//! attribute nested past what the log segment format holds is rejected here
+//! with [`LogRejection::AttributeTooDeeplyNested`], so it never reaches a
+//! flush that would refuse it.
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-use ravel_logseg::stream_attrs_bytes;
+use ravel_logseg::{MAX_ATTR_DEPTH, attr_value_fits_depth, stream_attrs_bytes};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
 use crate::logs_limits::{LogIngestLimits, LogRejection};
@@ -705,6 +711,9 @@ fn convert_attr(
         });
     }
     let value = convert_value(&kv.key, kv.value.as_ref(), 1)?;
+    if !attr_value_fits_depth(&value) {
+        return Err(too_deeply_nested(&kv.key));
+    }
     let len = attr_value_len(&value);
     if len > limits.max_attribute_value_len {
         return Err(LogRejection::AttributeValueTooLong {
@@ -730,7 +739,33 @@ fn convert_attr(
 /// through. This mirrors ravel-promql's parser complexity guard (#529), which
 /// likewise refuses to depend on an upstream library surviving unbounded
 /// recursion.
+///
+/// This is the converter's own stack guard, and it is the only depth bound a
+/// structured body meets. The storage rule an attribute must also satisfy is
+/// stricter and lives in ravel-logseg ([`ravel_logseg::attr_value_fits_depth`],
+/// reported here as [`MAX_STORED_ATTRIBUTE_LEVELS`]).
 pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 100;
+
+/// The deepest nesting an attribute value may reach and still be stored, the
+/// `max` that [`LogRejection::AttributeTooDeeplyNested`] reports. It counts
+/// levels below the attribute itself: an array adds one level for its
+/// elements, a kvlist one for its entries and one more for their values. So
+/// 15 kvlists or 31 arrays nested around a scalar fit, and one more does not.
+/// Derived from [`ravel_logseg::MAX_ATTR_DEPTH`], whose accounting
+/// [`ravel_logseg::attr_value_fits_depth`] states, so it cannot drift from
+/// the rule admission enforces.
+pub const MAX_STORED_ATTRIBUTE_LEVELS: usize = MAX_ATTR_DEPTH as usize - 1;
+
+/// The rejection for an attribute nested past the storage rule. The converter's
+/// own guard reports the same limit: a value nested past
+/// [`MAX_ATTRIBUTE_NESTING_DEPTH`] is past [`MAX_STORED_ATTRIBUTE_LEVELS`] too,
+/// and the storage limit is the one a client can act on.
+fn too_deeply_nested(key: &str) -> LogRejection {
+    LogRejection::AttributeTooDeeplyNested {
+        key: key.to_string(),
+        max: MAX_STORED_ATTRIBUTE_LEVELS,
+    }
+}
 
 /// Map one OTLP `AnyValue` to the canonical [`AttrValue`]. Lists and maps
 /// recurse through the same mapping. `key` is carried only for the rejection
@@ -745,17 +780,15 @@ pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 100;
 /// one more per enclosing array or kvlist). Exceeding
 /// [`MAX_ATTRIBUTE_NESTING_DEPTH`] rejects the value rather than recursing
 /// further, so a malformed or hostile payload cannot drive this recursion
-/// past a bounded depth.
+/// past a bounded depth. A value that converts may still be past the storage
+/// rule; [`convert_attr`] checks that.
 fn convert_value(
     key: &str,
     value: Option<&AnyValue>,
     depth: usize,
 ) -> Result<AttrValue, LogRejection> {
     if depth > MAX_ATTRIBUTE_NESTING_DEPTH {
-        return Err(LogRejection::AttributeTooDeeplyNested {
-            key: key.to_string(),
-            max: MAX_ATTRIBUTE_NESTING_DEPTH,
-        });
+        return Err(too_deeply_nested(key));
     }
     match value.and_then(|v| v.value.as_ref()) {
         None => Err(LogRejection::MissingAttributeValue {
@@ -1637,14 +1670,64 @@ mod tests {
         }
     }
 
+    /// Wrap `leaf` in `layers` nested single-entry `KvlistValue`s, each entry
+    /// keyed `m`.
+    fn nested_kvlist(layers: usize, leaf: AnyValueVariant) -> AnyValue {
+        let mut value = any(leaf);
+        for _ in 0..layers {
+            value = any(AnyValueVariant::KvlistValue(KeyValueList {
+                values: vec![attr_kv("m", value)],
+            }));
+        }
+        value
+    }
+
+    /// The deepest array nest the storage rule admits around a scalar: an
+    /// array adds one level, so `MAX_STORED_ATTRIBUTE_LEVELS` of them fit.
+    const FITTING_ARRAYS: usize = MAX_STORED_ATTRIBUTE_LEVELS;
+    /// The deepest kvlist nest the storage rule admits around a scalar: a
+    /// kvlist adds two levels.
+    const FITTING_KVLISTS: usize = MAX_STORED_ATTRIBUTE_LEVELS / 2;
+
+    #[test]
+    fn storage_limits_in_nesting_terms() {
+        assert_eq!(MAX_STORED_ATTRIBUTE_LEVELS, 31);
+        assert_eq!(FITTING_ARRAYS, 31);
+        assert_eq!(FITTING_KVLISTS, 15);
+    }
+
     #[test]
     fn attribute_nested_exactly_at_the_depth_limit_converts() {
-        // MAX - 1 array layers put the I64 leaf at nesting level
-        // MAX_ATTRIBUTE_NESTING_DEPTH: the deepest level that still converts.
-        let deep = nested_array(
-            MAX_ATTRIBUTE_NESTING_DEPTH - 1,
-            AnyValueVariant::IntValue(7),
-        );
+        // FITTING_KVLISTS kvlist layers around a scalar: the deepest kvlist
+        // nest the segment format holds.
+        let kvlists = nested_kvlist(FITTING_KVLISTS, AnyValueVariant::IntValue(7));
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv("maps", kvlists)],
+                    1,
+                )],
+            )],
+        )]));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        let mut cur = &out.records[0].attrs[0].1;
+        for _ in 0..FITTING_KVLISTS {
+            match cur {
+                AttrValue::Map(entries) => {
+                    assert_eq!(entries.len(), 1);
+                    cur = &entries[0].1;
+                }
+                other => panic!("expected Map layer, got {other:?}"),
+            }
+        }
+        assert_eq!(cur, &AttrValue::I64(7));
+
+        // FITTING_ARRAYS array layers: the deepest array nest it holds.
+        let deep = nested_array(FITTING_ARRAYS, AnyValueVariant::IntValue(7));
         let out = normalize(request(vec![resource_logs(
             vec![],
             vec![scope_logs(
@@ -1661,9 +1744,9 @@ mod tests {
         assert_eq!(out.records.len(), 1);
         let (key, value) = &out.records[0].attrs[0];
         assert_eq!(key, "deep");
-        // MAX - 1 single-element List layers around the I64(7) leaf.
+        // FITTING_ARRAYS single-element List layers around the I64(7) leaf.
         let mut cur = value;
-        for _ in 0..(MAX_ATTRIBUTE_NESTING_DEPTH - 1) {
+        for _ in 0..FITTING_ARRAYS {
             match cur {
                 AttrValue::List(items) => {
                     assert_eq!(items.len(), 1);
@@ -1677,37 +1760,135 @@ mod tests {
 
     #[test]
     fn attribute_nested_one_past_the_limit_is_rejected_with_typed_error() {
-        // MAX array layers put the leaf at level MAX + 1, one past the limit.
-        // The over-nested attribute is dropped and reported; the record and
-        // its sibling attribute survive (per-record partial-failure contract).
-        let deep = nested_array(MAX_ATTRIBUTE_NESTING_DEPTH, AnyValueVariant::IntValue(7));
-        let out = normalize(request(vec![resource_logs(
-            vec![],
-            vec![scope_logs(
-                "lib",
-                "1",
-                vec![record(
-                    Some(any(AnyValueVariant::StringValue("body".into()))),
-                    vec![attr_kv("deep", deep), string_kv("ok", "1")],
-                    1,
+        // One kvlist or one array layer past the deepest nest the segment
+        // format holds. The over-nested attribute is dropped and reported; the
+        // record and its sibling attribute survive (per-record
+        // partial-failure contract).
+        for deep in [
+            nested_kvlist(FITTING_KVLISTS + 1, AnyValueVariant::IntValue(7)),
+            nested_array(FITTING_ARRAYS + 1, AnyValueVariant::IntValue(7)),
+        ] {
+            let out = normalize(request(vec![resource_logs(
+                vec![],
+                vec![scope_logs(
+                    "lib",
+                    "1",
+                    vec![record(
+                        Some(any(AnyValueVariant::StringValue("body".into()))),
+                        vec![attr_kv("deep", deep), string_kv("ok", "1")],
+                        1,
+                    )],
                 )],
-            )],
+            )]));
+            assert_eq!(out.records.len(), 1);
+            assert_eq!(
+                out.records[0].attrs,
+                vec![("ok".to_string(), AttrValue::Str("1".into()))]
+            );
+            assert_eq!(
+                out.rejected,
+                vec![LogRejection::AttributeTooDeeplyNested {
+                    key: "deep".to_string(),
+                    max: MAX_STORED_ATTRIBUTE_LEVELS,
+                }]
+            );
+            assert_eq!(
+                out.rejected[0].to_string(),
+                "attribute deep nests more than 31 levels deep (an array adds one level, a kvlist two)"
+            );
+        }
+    }
+
+    /// A resource attribute one level past the storage rule rejects every
+    /// record under that resource, since dropping it would change stream
+    /// identity; one at the limit is admitted and its `stream_attrs` blob
+    /// decodes under the segment format's own decoder.
+    #[test]
+    fn resource_attribute_past_the_storage_rule_rejects_its_group() {
+        let records = || {
+            vec![
+                record(
+                    Some(any(AnyValueVariant::StringValue("a".into()))),
+                    vec![],
+                    1,
+                ),
+                record(
+                    Some(any(AnyValueVariant::StringValue("b".into()))),
+                    vec![],
+                    2,
+                ),
+            ]
+        };
+        let at = nested_kvlist(FITTING_KVLISTS, AnyValueVariant::IntValue(7));
+        let out = normalize(request(vec![resource_logs(
+            vec![attr_kv("deep", at)],
+            vec![scope_logs("lib", "1", records())],
         )]));
-        assert_eq!(out.records.len(), 1);
-        assert_eq!(
-            out.records[0].attrs,
-            vec![("ok".to_string(), AttrValue::Str("1".into()))]
-        );
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records.len(), 2);
+        let decoded = ravel_logseg::record::decode_stream_attrs(&out.records[0].stream_attrs)
+            .expect("an admitted resource attribute decodes");
+        assert_eq!(decoded.resource.len(), 1);
+
+        let past = nested_kvlist(FITTING_KVLISTS + 1, AnyValueVariant::IntValue(7));
+        let out = normalize(request(vec![resource_logs(
+            vec![attr_kv("deep", past)],
+            vec![scope_logs("lib", "1", records())],
+        )]));
+        assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
-            vec![LogRejection::AttributeTooDeeplyNested {
-                key: "deep".to_string(),
-                max: MAX_ATTRIBUTE_NESTING_DEPTH,
+            vec![LogRejection::Grouped {
+                reason: Box::new(LogRejection::AttributeTooDeeplyNested {
+                    key: "deep".to_string(),
+                    max: MAX_STORED_ATTRIBUTE_LEVELS,
+                }),
+                count: 2,
             }]
         );
+        assert_eq!(out.rejected[0].rejected_count(), 2);
+    }
+
+    /// A scope attribute one array level past the storage rule rejects every
+    /// record under that scope and leaves a sibling scope admitted.
+    #[test]
+    fn scope_attribute_past_the_storage_rule_rejects_its_group() {
+        let mut bad = scope_logs(
+            "bad",
+            "1",
+            vec![record(
+                Some(any(AnyValueVariant::StringValue("a".into()))),
+                vec![],
+                1,
+            )],
+        );
+        if let Some(scope) = bad.scope.as_mut() {
+            scope.attributes = vec![attr_kv(
+                "deep",
+                nested_array(FITTING_ARRAYS + 1, AnyValueVariant::IntValue(7)),
+            )];
+        }
+        let good = scope_logs(
+            "good",
+            "1",
+            vec![record(
+                Some(any(AnyValueVariant::StringValue("b".into()))),
+                vec![],
+                2,
+            )],
+        );
+        let out = normalize(request(vec![resource_logs(vec![], vec![bad, good])]));
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].body, "b");
         assert_eq!(
-            out.rejected[0].to_string(),
-            "attribute deep nests more than 100 levels deep"
+            out.rejected,
+            vec![LogRejection::Grouped {
+                reason: Box::new(LogRejection::AttributeTooDeeplyNested {
+                    key: "deep".to_string(),
+                    max: MAX_STORED_ATTRIBUTE_LEVELS,
+                }),
+                count: 1,
+            }]
         );
     }
 
@@ -1718,7 +1899,7 @@ mod tests {
     /// whole record and never a sibling.
     #[test]
     fn over_nested_attribute_rejection_does_not_spread_to_a_sibling_record() {
-        let deep = nested_array(MAX_ATTRIBUTE_NESTING_DEPTH, AnyValueVariant::IntValue(7));
+        let deep = nested_array(FITTING_ARRAYS + 1, AnyValueVariant::IntValue(7));
         let bad = record(
             Some(any(AnyValueVariant::StringValue("a".into()))),
             vec![attr_kv("deep", deep)],
@@ -1745,7 +1926,7 @@ mod tests {
             out.rejected,
             vec![LogRejection::AttributeTooDeeplyNested {
                 key: "deep".to_string(),
-                max: MAX_ATTRIBUTE_NESTING_DEPTH,
+                max: MAX_STORED_ATTRIBUTE_LEVELS,
             }]
         );
         // The over-nested attribute dropped, but its record was stored, so it
@@ -1917,39 +2098,45 @@ mod tests {
 
     #[test]
     fn attribute_too_deeply_nested_inside_a_kvlist_reports_the_enclosing_attribute_key() {
-        // The depth guard reaches its rejection through the `depth > MAX`
-        // check at the top of convert_value, a different route than the
-        // Missing/Unsupported arms below it, so it needs its own coverage
-        // of the same key-identity claim.
-        let deep = nested_array(MAX_ATTRIBUTE_NESTING_DEPTH, AnyValueVariant::IntValue(7));
-        let out = normalize(request(vec![resource_logs(
-            vec![],
-            vec![scope_logs(
-                "lib",
-                "1",
-                vec![record(
-                    Some(any(AnyValueVariant::StringValue("body".into()))),
-                    vec![attr_kv(
-                        "outer",
-                        any(AnyValueVariant::KvlistValue(KeyValueList {
-                            values: vec![KeyValue {
-                                key: "inner".to_string(),
-                                value: Some(deep),
-                                ..Default::default()
-                            }],
-                        })),
+        // Two routes reach this rejection, each different from the
+        // Missing/Unsupported arms, so each needs its own coverage of the same
+        // key-identity claim: the storage rule checked after conversion (the
+        // outer kvlist's two levels plus FITTING_ARRAYS - 1 arrays is one past
+        // the limit), and the converter's own `depth > MAX` stack guard at the
+        // top of convert_value.
+        for deep in [
+            nested_array(FITTING_ARRAYS - 1, AnyValueVariant::IntValue(7)),
+            nested_array(MAX_ATTRIBUTE_NESTING_DEPTH, AnyValueVariant::IntValue(7)),
+        ] {
+            let out = normalize(request(vec![resource_logs(
+                vec![],
+                vec![scope_logs(
+                    "lib",
+                    "1",
+                    vec![record(
+                        Some(any(AnyValueVariant::StringValue("body".into()))),
+                        vec![attr_kv(
+                            "outer",
+                            any(AnyValueVariant::KvlistValue(KeyValueList {
+                                values: vec![KeyValue {
+                                    key: "inner".to_string(),
+                                    value: Some(deep),
+                                    ..Default::default()
+                                }],
+                            })),
+                        )],
+                        1,
                     )],
-                    1,
                 )],
-            )],
-        )]));
-        assert_eq!(
-            out.rejected,
-            vec![LogRejection::AttributeTooDeeplyNested {
-                key: "outer".to_string(),
-                max: MAX_ATTRIBUTE_NESTING_DEPTH,
-            }]
-        );
+            )]));
+            assert_eq!(
+                out.rejected,
+                vec![LogRejection::AttributeTooDeeplyNested {
+                    key: "outer".to_string(),
+                    max: MAX_STORED_ATTRIBUTE_LEVELS,
+                }]
+            );
+        }
     }
 
     #[test]

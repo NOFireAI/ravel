@@ -26,7 +26,8 @@ use crate::page_dir::{PageDir, PageLoc};
 use crate::postings::{POSTINGS_VERSION_V1, PostingsSection, term_key};
 use crate::record::{
     COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT, COL_SPAN_ID,
-    COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate, resolve_value,
+    COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, MAX_ATTR_DEPTH,
+    Predicate, resolve_value,
 };
 use crate::rlog_bloom::RlogBloomSection;
 use crate::rlog_codec::decode_dict_page;
@@ -2046,9 +2047,6 @@ pub fn phrase_match(value: &[u8], word: &str) -> bool {
     toks.windows(query.len()).any(|w| w == query.as_slice())
 }
 
-/// Decodes canonical attribute bytes (the write-side [`canonical_attr_bytes`])
-/// back into attributes. Used for `attrs_raw` overflow. Depth-bounded against
-/// hostile nesting.
 /// The resource and scope attribute `(name, value)` pairs a STREAM_DIR blob
 /// carries, in blob order (the resource set first, then the scope set). The
 /// blob layout is `canonical_attr_bytes(resource) || len+scope_name ||
@@ -2083,7 +2081,15 @@ pub fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSeg
     Ok(pairs)
 }
 
-fn decode_canonical_attrs(bytes: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+/// Decodes canonical attribute bytes (the write-side [`canonical_attr_bytes`])
+/// back into attributes. Used for `attrs_raw` overflow. Nesting is bounded by
+/// [`crate::record::MAX_ATTR_DEPTH`] with the accounting
+/// [`crate::record::attr_value_fits_depth`] states, the same rule the
+/// `stream_attrs` decoder enforces: a set is refused exactly when one of its
+/// values does not satisfy that predicate.
+pub(crate) fn decode_canonical_attrs(
+    bytes: &[u8],
+) -> Result<Vec<(String, AttrValue)>, LogSegError> {
     let mut pos = 0usize;
     let out = decode_attr_set(bytes, &mut pos, 0)?;
     if pos != bytes.len() {
@@ -2092,7 +2098,25 @@ fn decode_canonical_attrs(bytes: &[u8]) -> Result<Vec<(String, AttrValue)>, LogS
     Ok(out)
 }
 
-const MAX_ATTR_DEPTH: u32 = 32;
+/// The error the `attrs_raw` decoder returns for nesting past
+/// [`MAX_ATTR_DEPTH`], which the writer also returns when it refuses an
+/// overflow value that would decode to it.
+pub(crate) fn attrs_raw_too_deep() -> LogSegError {
+    LogSegError::Corrupted("attrs_raw too deep".into())
+}
+
+/// Refuses, with the `attrs_raw` decoder's own error, overflow attributes that
+/// the decoder would refuse for their nesting.
+pub(crate) fn check_attrs_raw_depth(attrs: &[(String, AttrValue)]) -> Result<(), LogSegError> {
+    if attrs
+        .iter()
+        .all(|(_, v)| crate::record::attr_value_fits_depth(v))
+    {
+        Ok(())
+    } else {
+        Err(attrs_raw_too_deep())
+    }
+}
 
 fn decode_attr_set(
     bytes: &[u8],
@@ -2100,7 +2124,7 @@ fn decode_attr_set(
     depth: u32,
 ) -> Result<Vec<(String, AttrValue)>, LogSegError> {
     if depth > MAX_ATTR_DEPTH {
-        return Err(LogSegError::Corrupted("attrs_raw too deep".into()));
+        return Err(attrs_raw_too_deep());
     }
     use crate::varint::get_uvarint;
     let count = get_uvarint(bytes, pos)?;
@@ -2121,7 +2145,7 @@ fn decode_attr_set(
             .map_err(|_| LogSegError::Corrupted("attr key not utf-8".into()))?
             .to_string();
         *pos = kend;
-        let value = decode_attr_value(bytes, pos, depth)?;
+        let value = decode_attr_value(bytes, pos, depth + 1)?;
         out.push((key, value));
     }
     Ok(out)
@@ -2129,6 +2153,9 @@ fn decode_attr_set(
 
 fn decode_attr_value(bytes: &[u8], pos: &mut usize, depth: u32) -> Result<AttrValue, LogSegError> {
     use crate::varint::{get_uvarint, zigzag_decode};
+    if depth > MAX_ATTR_DEPTH {
+        return Err(attrs_raw_too_deep());
+    }
     let tag = *bytes
         .get(*pos)
         .ok_or_else(|| LogSegError::Corrupted("attr tag truncated".into()))?;
