@@ -7996,7 +7996,11 @@ mod tests {
         // ADR-0873 decision 2 to split the declared-statistics drop tally
         // across its four carriers; `gate`, `site` and `worker` are the
         // nineteenth to twenty-first, added by ADR-1702 decision 11 for the
-        // CPU gate and tokio runtime families.
+        // CPU gate and tokio runtime families. The list is the variants every
+        // build has: the `sql`-only `DdlKind`, `DdlOutcome` and `DdlPhase`
+        // (issue #2374, which add the `phase` key and reuse `kind` and
+        // `outcome`) and the `flight-sql`-only `SliceRejectReason` are not in
+        // it.
         let one_of_each = [
             Label::TenantHash(TenantHashLabel::Other),
             Label::Signal(Signal::Metrics),
@@ -8139,7 +8143,8 @@ mod tests {
         assert_eq!(
             one_of_each.len(),
             29,
-            "exactly 29 label variants in a default build (flight-sql adds SliceRejectReason), 21 distinct keys"
+            "exactly 29 label variants every build has, 21 distinct keys (sql adds DdlKind, \
+             DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
