@@ -638,9 +638,12 @@ pub struct Cli {
     )]
     pub audit_text: AuditTextArg,
 
-    /// Audit group-commit batch size (ADR-0062 decision 2b): the pipeline
-    /// flushes one RLOG object plus one commit record after this many
-    /// submitted events, or after `--audit-max-age`, whichever comes first.
+    /// Audit group-commit batch size (ADR-0062 decision 2b): a batch is
+    /// written as one RLOG object plus one commit record per tenant once it
+    /// holds this many events, or after `--audit-max-age`, whichever comes
+    /// first. An event that finds the pipeline idle is written at once,
+    /// without batching (ADR-0062 idle-flush amendment; see
+    /// `--audit-max-age`).
     /// Unset uses the pipeline's own default
     /// (`ravel_maintain::config::DEFAULT_AUDIT_MAX_BATCH`).
     #[arg(
@@ -650,10 +653,14 @@ pub struct Cli {
     )]
     pub audit_max_batch: Option<usize>,
 
-    /// Audit group-commit batch age ceiling (ADR-0062 decision 2b): the
-    /// pipeline flushes a non-empty batch after this long even if
-    /// `--audit-max-batch` has not been reached. Unset uses the pipeline's
-    /// own default (`ravel_maintain::config::DEFAULT_AUDIT_MAX_AGE`, 25 ms).
+    /// Audit group-commit batch age ceiling (ADR-0062 decision 2b): a batch
+    /// is written after this long even if `--audit-max-batch` has not been
+    /// reached. An event that finds the pipeline idle is written at once
+    /// instead of waiting: idle means nothing else is queued, the event was
+    /// not submitted while a write was in flight, and the pipeline picked up
+    /// its previous event at least this long earlier (ADR-0062 idle-flush
+    /// amendment). Unset uses the pipeline's own default
+    /// (`ravel_maintain::config::DEFAULT_AUDIT_MAX_AGE`, 25 ms).
     #[arg(
         long = "audit-max-age",
         value_name = "DURATION",
