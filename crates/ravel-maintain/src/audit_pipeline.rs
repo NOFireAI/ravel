@@ -348,8 +348,8 @@ impl QueryAuditSink for AuditPipeline {
 /// while a flush was in flight, and the loop received the previous event at
 /// least `max_age` earlier. The last condition keeps steady traffic batching:
 /// idle flushes are at least `max_age` apart, so each adds at most one PUT
-/// pair over the window-only loop, and traffic faster than `max_age` never
-/// takes this path.
+/// pair over the window-only loop, and traffic faster than `max_age` takes
+/// this path only for its first event.
 async fn run_flush_loop(
     mut rx: mpsc::Receiver<Submission>,
     store: Arc<dyn ObjectStoreBackend>,

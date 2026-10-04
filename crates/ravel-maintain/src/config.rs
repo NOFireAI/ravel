@@ -1230,7 +1230,8 @@ pub const DEFAULT_INTERIOR_REVERIFY_NS: i64 = 6 * NS_PER_HOUR;
 pub const DEFAULT_AUDIT_MAX_BATCH: usize = 256;
 /// Default `max_age` for the group-commit audit pipeline (ADR-0062 §2b): a
 /// batch is flushed once this long has elapsed since its first buffered event,
-/// even below `max_batch`.
+/// even below `max_batch`. An event that finds the pipeline idle does not wait
+/// it (see [`AuditPipelineConfig::max_age`]).
 pub const DEFAULT_AUDIT_MAX_AGE: Duration = Duration::from_millis(25);
 /// Default submission-channel capacity for the audit pipeline: the number of
 /// in-flight submissions the bounded `mpsc` from submitters to the flush task
@@ -1256,7 +1257,8 @@ pub enum AuditMode {
 
 /// Configuration for the group-commit [`crate::audit_pipeline::AuditPipeline`]
 /// (ADR-0062 §2b). A batch flushes on whichever of `max_batch` or `max_age`
-/// comes first; `audit_mode` picks the flush-failure posture.
+/// comes first, except that an event finding the pipeline idle flushes at once;
+/// `audit_mode` picks the flush-failure posture.
 #[derive(Debug, Clone)]
 pub struct AuditPipelineConfig {
     /// Flush once the current batch reaches this many buffered records, before
@@ -1265,6 +1267,11 @@ pub struct AuditPipelineConfig {
     /// Flush once this long has elapsed since the current batch's first
     /// buffered event, before `max_batch` is reached. Default
     /// [`DEFAULT_AUDIT_MAX_AGE`] (25 ms).
+    ///
+    /// An event flushes at once, without opening a window, when the pipeline
+    /// is idle: nothing else is queued, it was not submitted while a flush was
+    /// in flight, and the previous event arrived at least `max_age` earlier.
+    /// The first event is idle. Traffic faster than `max_age` keeps batching.
     pub max_age: Duration,
     /// The [`ravel_types::Signal::Audit`] shard every batch is written to.
     /// Default [`crate::query_audit::QUERY_AUDIT_SHARD`].
