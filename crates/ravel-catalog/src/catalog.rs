@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use parking_lot::Mutex;
 #[cfg(test)]
 use prost::Message;
@@ -3531,15 +3531,26 @@ impl Catalog {
     /// the scan method (ADR-0056 INTERACTION 2): a key in any in-range bucket,
     /// however far below the window end, is still grouped and resolved.
     ///
-    /// A running LIST count is capped at
-    /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests)
-    /// and aborts with [`CatalogError::WindowTooWide`] before issuing a page
-    /// that would exceed it. This is the request bound, enforced at
-    /// runtime on the one path whose cost is not knowable before listing: a
-    /// wide-but-sparse window is served, and only a scan whose actual object
-    /// volume is unsustainable is refused.
+    /// The shards drain concurrently, up to
+    /// [`CatalogConfig::resolve_get_concurrency`](crate::CatalogConfig::resolve_get_concurrency)
+    /// at a time (the bound [`Catalog::list_window_bounded`] uses); pages
+    /// within one shard stay sequential, since each page's continuation comes
+    /// from the previous one. Before issuing a page, a shard reserves a slot
+    /// from one counter shared by every shard, capped at
+    /// [`CatalogConfig::max_catalog_list_requests`](crate::CatalogConfig::max_catalog_list_requests).
+    /// A refused reservation aborts the whole scan with
+    /// [`CatalogError::WindowTooWide`] and drops the other shards' in-flight
+    /// pages; a reserved slot is never returned. The bound stays exact: no
+    /// scan issues more than the cap, and a scan whose total page count
+    /// exceeds it is refused on every run. Which shard is refused, and how
+    /// many reserved pages were actually issued before the abort, can vary
+    /// between runs. This is the request bound, enforced at runtime on the
+    /// one path whose cost is not knowable before listing: a wide-but-sparse
+    /// window is served, and only a scan whose actual object volume is
+    /// unsustainable is refused. The per-shard groups are merged in shard
+    /// order, so the grouped key set is what a shard-by-shard drain produces.
     ///
-    /// That page-by-page ceiling, and the `list_after` start marker, are why
+    /// That page-by-page reservation, and the `list_after` start marker, are why
     /// this path records its own `AccountedOp::List` per page instead of
     /// calling [`Catalog::guarded_list_all`], which takes no start marker and
     /// drains unconditionally. Both share the page loop itself
@@ -3560,18 +3571,11 @@ impl Catalog {
     ) -> Result<HashMap<String, SegmentRef>, CatalogError> {
         // One recursive LIST per shard, grouping keys by (shard, hour), each
         // shard's scan bounded below the watermark by a `list_after` start
-        // marker (below) so it does not page through the shard's whole history
-        // before reaching the listing suffix. The LISTs drain sequentially so
-        // the runtime request cap is checked deterministically page by page;
-        // the expensive per-bucket record GETs are what run concurrently below,
-        // mirroring the per-bucket loop's concurrency model.
-        let mut grouped: HashMap<(u32, u32), Vec<ObjectMeta>> = HashMap::new();
-        // Shared rather than a plain local because the fetch hook's future
-        // cannot borrow from the hook itself (see `drain_pages`), and the
-        // counter spans every shard's drain. An atomic, not a Cell, so the
-        // resolve future this sits inside stays `Send`.
-        let lists_issued = AtomicU64::new(0);
-        let cap = self.config.max_catalog_list_requests;
+        // marker so it does not page through the shard's whole history before
+        // reaching the listing suffix. The shards drain concurrently; every
+        // page first reserves a slot from `lists_reserved`, so the runtime
+        // request cap is never overshot however the shards interleave.
+        let lists_reserved = AtomicU64::new(0);
         let tenant_prefix = format!("t/{}/", tenant.to_hex());
         // Shard bound is the union scan set over every hour in the listing
         // suffix (ADR-0052 section 4), not the static
@@ -3592,68 +3596,38 @@ impl Catalog {
             window_end_hour,
             crate::provisioning::DEFAULT_SCAN_SLACK_HOURS,
         );
-        for shard in 0..scan_shards {
-            let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
-            // Skip the shard's below-watermark history server-side: the
-            // shard-hour prefix for `listing_start_hour` sorts before every
-            // key at or above it, so `list_after` resumes strictly past it.
-            let start_after =
-                keys::commit_shard_hour_prefix(tenant, signal, shard, listing_start_hour)?;
-            let prefix_ref = prefix.as_str();
-            drain_pages(
-                prefix_ref,
-                Some(&start_after),
-                MAX_LIST_PAGES,
-                |start_after: Option<String>, page_token| {
-                    let lists_issued = &lists_issued;
-                    async move {
-                        // Refuse before issuing a page that would exceed the
-                        // ceiling, so at most `cap` LISTs are ever issued (the
-                        // request bound).
-                        let issued = lists_issued.load(Ordering::Relaxed);
-                        if issued >= cap {
-                            return Err(CatalogError::WindowTooWide {
-                                estimate: issued.saturating_add(1),
-                                limit: cap,
-                            });
-                        }
-                        let _permits = self.acquire_request_permits(prefix_ref).await?;
-                        let page = self
-                            .store
-                            .list_after(prefix_ref, start_after.as_deref(), page_token)
-                            .await;
-                        accounting.record_s3_request(AccountedOp::List);
-                        lists_issued.fetch_add(1, Ordering::Relaxed);
-                        Ok(page?)
-                    }
-                },
-                |meta: ObjectMeta| {
-                    // ADR-0050 §2 isolation assertion, identical to
-                    // `guarded_list_all`: every returned key is under this
-                    // tenant's prefix or the scan hard-fails.
-                    if !meta.key.starts_with(&tenant_prefix) {
-                        self.record_isolation_breach();
-                        return Err(CatalogError::FieldMismatch {
-                            key: prefix.clone(),
-                            field: "list_prefix",
-                            expected: tenant_prefix.clone(),
-                            actual: meta.key,
-                        });
-                    }
-                    let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
-                        BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
-                        BucketEntry::CompactionRecord(k) => (k.shard, k.ingest_hour_bucket),
-                        BucketEntry::RewriteRecord(k) => (k.shard, k.ingest_hour_bucket),
-                        BucketEntry::Tombstone(k) => (k.shard, k.ingest_hour_bucket),
-                    };
-                    if bhour < listing_start_hour || bhour > window_end_hour {
-                        return Ok(DrainStep::Continue);
-                    }
-                    grouped.entry((bshard, bhour)).or_default().push(meta);
-                    Ok(DrainStep::Continue)
-                },
-            )
+        // `buffer_unordered` so a refusal or error from any shard ends the
+        // scan at once (dropping the others' in-flight pages) instead of
+        // waiting behind an earlier shard; the shard index restores order.
+        let mut shard_groups: Vec<(u32, ShardBuckets)> = stream::iter(0..scan_shards)
+            .map(|shard| {
+                let lists_reserved = &lists_reserved;
+                let tenant_prefix = tenant_prefix.as_str();
+                async move {
+                    let buckets = self
+                        .list_shard_by_prefix(
+                            tenant,
+                            signal,
+                            shard,
+                            listing_start_hour,
+                            window_end_hour,
+                            tenant_prefix,
+                            lists_reserved,
+                            accounting,
+                        )
+                        .await?;
+                    Ok::<_, CatalogError>((shard, buckets))
+                }
+            })
+            .buffer_unordered(self.config.resolve_get_concurrency)
+            .try_collect()
             .await?;
+        shard_groups.sort_unstable_by_key(|(shard, _)| *shard);
+        let mut grouped: ShardBuckets = HashMap::new();
+        for (_, buckets) in shard_groups {
+            for (coord, objs) in buckets {
+                grouped.entry(coord).or_default().extend(objs);
+            }
         }
 
         // Resolve each surviving bucket through the shared per-bucket path,
@@ -3677,6 +3651,87 @@ impl Catalog {
             }
         }
         Ok(out)
+    }
+
+    /// One shard's drain for [`Catalog::list_window_by_prefix`]: its pages in
+    /// order, each reserving a slot from `lists_reserved` before it is issued,
+    /// grouped by `(shard, hour)` with only the hours in
+    /// `[listing_start_hour, window_end_hour]` kept.
+    #[allow(clippy::too_many_arguments)]
+    async fn list_shard_by_prefix(
+        &self,
+        tenant: &TenantHash,
+        signal: Signal,
+        shard: u32,
+        listing_start_hour: u32,
+        window_end_hour: u32,
+        tenant_prefix: &str,
+        lists_reserved: &AtomicU64,
+        accounting: &QueryAccounting,
+    ) -> Result<ShardBuckets, CatalogError> {
+        let cap = self.config.max_catalog_list_requests;
+        let prefix = keys::commit_shard_prefix(tenant, signal, shard)?;
+        // Skip the shard's below-watermark history server-side: the
+        // shard-hour prefix for `listing_start_hour` sorts before every key at
+        // or above it, so `list_after` resumes strictly past it.
+        let start_after =
+            keys::commit_shard_hour_prefix(tenant, signal, shard, listing_start_hour)?;
+        let prefix_ref = prefix.as_str();
+        let mut grouped: ShardBuckets = HashMap::new();
+        drain_pages(
+            prefix_ref,
+            Some(&start_after),
+            MAX_LIST_PAGES,
+            |start_after: Option<String>, page_token| async move {
+                // Reserve before issuing: the increment and the cap check are
+                // one atomic step, so concurrent shards can never both take the
+                // last slot (the request bound).
+                if let Err(reserved) =
+                    lists_reserved.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                        if n < cap { Some(n + 1) } else { None }
+                    })
+                {
+                    return Err(CatalogError::WindowTooWide {
+                        estimate: reserved.saturating_add(1),
+                        limit: cap,
+                    });
+                }
+                let _permits = self.acquire_request_permits(prefix_ref).await?;
+                let page = self
+                    .store
+                    .list_after(prefix_ref, start_after.as_deref(), page_token)
+                    .await;
+                accounting.record_s3_request(AccountedOp::List);
+                Ok(page?)
+            },
+            |meta: ObjectMeta| {
+                // ADR-0050 §2 isolation assertion, identical to
+                // `guarded_list_all`: every returned key is under this
+                // tenant's prefix or the scan hard-fails.
+                if !meta.key.starts_with(tenant_prefix) {
+                    self.record_isolation_breach();
+                    return Err(CatalogError::FieldMismatch {
+                        key: prefix.clone(),
+                        field: "list_prefix",
+                        expected: tenant_prefix.to_string(),
+                        actual: meta.key,
+                    });
+                }
+                let (bshard, bhour) = match keys::partition_bucket_entry(&meta.key)? {
+                    BucketEntry::CommitRecord(k) => (k.shard, k.ingest_hour_bucket),
+                    BucketEntry::CompactionRecord(k) => (k.shard, k.ingest_hour_bucket),
+                    BucketEntry::RewriteRecord(k) => (k.shard, k.ingest_hour_bucket),
+                    BucketEntry::Tombstone(k) => (k.shard, k.ingest_hour_bucket),
+                };
+                if bhour < listing_start_hour || bhour > window_end_hour {
+                    return Ok(DrainStep::Continue);
+                }
+                grouped.entry((bshard, bhour)).or_default().push(meta);
+                Ok(DrainStep::Continue)
+            },
+        )
+        .await?;
+        Ok(grouped)
     }
 
     /// Concurrently load and cache every commit record in `keys` under the
