@@ -199,6 +199,9 @@ struct Routed {
     object_sizes: Vec<u64>,
     /// The `EngineConfig` the server's own resolution produced for this argv.
     engine: ravel_query::EngineConfig,
+    /// The startup stamp `ravel_server::start` emits for this argv, built from
+    /// the same budgets as [`Self::engine`].
+    stamp: ravel_server::config::LogsFetchStamp,
 }
 
 /// Publish the fixture, resolve `argv` the way `ravel_server::start` does, and
@@ -228,6 +231,7 @@ async fn run(argv: &[&str]) -> Routed {
     let engine = budgets
         .apply_to_engine(ravel_query::EngineConfig::default())
         .expect("engine config resolves");
+    let stamp = budgets.logs_fetch_stamp();
 
     let catalog = build_catalog(
         Arc::clone(&store),
@@ -305,6 +309,7 @@ async fn run(argv: &[&str]) -> Routed {
         timestamps,
         object_sizes,
         engine,
+        stamp,
     }
 }
 
@@ -426,9 +431,18 @@ async fn fetch_policy_selects_the_logs_read_shape_end_to_end() {
 /// derivation (ADR-0996 decision 2). At the ADR-0904 default value that is the
 /// ranged route this fixture's objects take today.
 ///
+/// The same holds with the flag at the reference profile's own time-term
+/// rate, 6,300,000 bytes, under the default `cost-based` policy (issue #2555):
+/// no break-even is derived, the startup stamp names the 524,288-byte routing
+/// threshold, and the fixture's objects, all under 18,900,000 bytes, open
+/// ranged.
+///
 /// Prove-the-test: pass the resolution `Some(...unwrap_or(default))` as its
 /// explicit input, erasing the unset case, and the unset run below routes
-/// ranged `(2, 0)` instead of the expected whole-object `(0, 2)`.
+/// ranged `(2, 0)` instead of the expected whole-object `(0, 2)`; derive the
+/// three-request-cost break-even from the explicit flag too and the
+/// 1,887,437 run routes `(0, 2)`, and with that assertion set aside the
+/// 6,300,000 run reads `Some(18900000)` where `None` is expected.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_explicit_request_cost_flag_keeps_its_deployment_on_the_ranged_route() {
     let explicit = run(&[
@@ -459,5 +473,47 @@ async fn an_explicit_request_cost_flag_keeps_its_deployment_on_the_ranged_route(
     assert_eq!(
         (derived.ranged_opens, derived.whole_object_opens),
         (0, SEGMENTS as u64)
+    );
+    assert_eq!(
+        derived.stamp.break_even_in_force(),
+        (18_900_000, "profile"),
+        "the derived rate's break-even is three request costs of the time term"
+    );
+
+    // The flag at the reference profile's own time-term rate still keeps the
+    // routing threshold as the break-even: the three-request-cost break-even
+    // pairs only with a rate the profile produced. Every fixture object sits
+    // under 18,900,000 bytes, so a break-even derived from the flag would read
+    // them whole.
+    let at_time_term = run(&[
+        BASE_ARGV.as_slice(),
+        &["--logs-request-cost-bytes", "6300000"],
+    ]
+    .concat())
+    .await;
+    assert_eq!(at_time_term.engine.logs_request_cost_bytes, 6_300_000);
+    assert_eq!(
+        at_time_term.engine.logs_projection_break_even_bytes, None,
+        "an explicit rate derives no break-even"
+    );
+    assert_eq!(at_time_term.stamp.rate_term, "flag");
+    assert_eq!(at_time_term.stamp.projection_break_even_bytes, None);
+    assert_eq!(
+        at_time_term.stamp.break_even_in_force(),
+        (524_288, "routing-threshold"),
+        "the startup line prints the routing threshold as the break-even in force"
+    );
+    assert!(
+        at_time_term
+            .object_sizes
+            .iter()
+            .all(|&size| size < 18_900_000),
+        "fixture objects must sit under three request costs: {:?}",
+        at_time_term.object_sizes
+    );
+    assert_eq!(
+        (at_time_term.ranged_opens, at_time_term.whole_object_opens),
+        (SEGMENTS as u64, 0),
+        "an object under 18,900,000 bytes still opens ranged under the explicit flag"
     );
 }
