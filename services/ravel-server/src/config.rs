@@ -1969,7 +1969,8 @@ pub struct Cli {
     /// to a store read, never a query error. SQL spill is the exception:
     /// unless `--sql-spill off` or `RAVEL_SQL_SPILL_DIR` is set, startup
     /// creates `<cache-dir>/sql-spill` and refuses to start if it cannot, and
-    /// spill is off when half the volume's free bytes is below 1 GiB (see
+    /// spill is off when half of the volume's free bytes, after the read
+    /// cache's disk-tier bound is subtracted, is below 1 GiB (see
     /// `--sql-spill`).
     ///
     /// Encryption posture (ADR-0046 decision 7): bytes this process writes to
