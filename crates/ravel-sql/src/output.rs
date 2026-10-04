@@ -316,10 +316,8 @@ fn cell_to_json(column: &str, array: &ArrayRef, row: usize) -> Result<Json, SqlE
         }
         DataType::Interval(IntervalUnit::DayTime) => {
             let value = downcast::<IntervalDayTimeArray>(array, "Interval(DayTime)")?.value(row);
-            let nanoseconds = i64::from(value.milliseconds)
-                .checked_mul(1_000_000)
-                .ok_or_else(|| unencodable(column, array, INTERVAL_OVERFLOW))?;
-            interval_json(0, value.days, nanoseconds)
+            // An i32 count of milliseconds times 10^6 always fits an i64.
+            interval_json(0, value.days, i64::from(value.milliseconds) * 1_000_000)
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
             let value =
@@ -387,7 +385,6 @@ const DURATION_NANOS_OVERFLOW: &str = "the value has no i64 count of nanoseconds
 const NOT_A_TIME_OF_DAY: &str =
     "a JSON time must be at least 0 and less than one day since midnight";
 const NOT_A_DATE: &str = "a JSON date must be a whole day from 0000-01-01 to 9999-12-31";
-const INTERVAL_OVERFLOW: &str = "an interval component has no i64 count of nanoseconds";
 
 /// The error for a cell of `column` that `array`'s JSON form cannot hold. It
 /// names the column, the type and a fixed reason, never the value.

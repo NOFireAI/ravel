@@ -155,9 +155,9 @@ string: `NaN`, `+Inf`, and `-Inf`. Other column types are encoded as follows:
 
 A column whose type or value has no JSON encoding (a type with no rule above,
 a timestamp or duration past the i64 nanosecond range, a time that is
-negative or a whole day or more, a date outside years 0000 to 9999, a
-`Date64` that is not a whole day, or an interval component past the i64
-nanosecond range) fails the query with 422 `execution`. The message names
+negative or a whole day or more, a date outside years 0000 to 9999, or a
+`Date64` that is not a whole day) fails the query with 422 `execution`. The
+message names
 the column and its Arrow type and gives the reason, never the value:
 `column "<name>" of type <type> cannot be encoded as JSON: <reason>; request
 the Arrow IPC format to read it exactly`. A type with no rule is also logged
