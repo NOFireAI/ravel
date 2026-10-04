@@ -4122,6 +4122,8 @@ mod tests {
             "the warm catalog serves the resolve of later statements: {warm_g:?}"
         );
         for i in 2..STATEMENTS {
+            // Real monotonic clock: holds only while the warm statements finish
+            // within `head_cache_ttl` (30 s) of the first's cached l/HEAD NotFound.
             assert_eq!(
                 warm_g[i], warm_g[1],
                 "warm per-statement GETs plateau once the catalog is warm: {warm_g:?}"
@@ -4505,6 +4507,8 @@ mod tests {
 
         // Warm run: served from cache, and the never-folded tenant's NotFound
         // l/HEAD stays cached too (ADR-2509 decision 3), so no store GET.
+        // Real monotonic clock: these two hold only while the warm run starts
+        // within `head_cache_ttl` (30 s) of the cold run's HEAD read.
         assert_eq!(
             acc[1].object_store_get_requests, 0,
             "warm run's store GETs fall from 3 to 0 (all cache-served)"
@@ -6208,7 +6212,8 @@ mod tests {
             .expect("per_run_accounting is a JSON array");
         assert_eq!(per_run.len(), 2, "per_run_accounting has one entry per run");
         assert_eq!(per_run[0]["object_store_get_requests"], 3);
-        // The warm run's l/HEAD NotFound is cached (ADR-2509 decision 3).
+        // The warm run's l/HEAD NotFound is cached (ADR-2509 decision 3), on the
+        // real monotonic clock, so only within `head_cache_ttl` (30 s) of the cold run.
         assert_eq!(per_run[1]["object_store_get_requests"], 0);
     }
 
