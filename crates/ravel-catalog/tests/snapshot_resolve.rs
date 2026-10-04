@@ -1105,3 +1105,141 @@ async fn missing_head_is_cached_for_ttl_on_resolve_only() {
         "the HEAD published inside the TTL is read and its parts served"
     );
 }
+
+/// Captures the message of every WARN event on this thread.
+#[derive(Clone, Default)]
+struct WarnCapture {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+impl WarnCapture {
+    /// A fresh capture installed as this thread's default subscriber. A
+    /// process-global default goes in first, once: with only thread-local
+    /// subscribers, tracing rebuilds callsite interest from whichever of them
+    /// are alive at that instant, so a sibling test's subscriber coming and
+    /// going can leave a WARN callsite disabled for this thread.
+    fn install() -> (Self, tracing::subscriber::DefaultGuard) {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+        let capture = Self::default();
+        let subscriber = {
+            use tracing_subscriber::layer::SubscriberExt;
+            tracing_subscriber::registry().with(capture.clone())
+        };
+        let guard = tracing::subscriber::set_default(subscriber);
+        (capture, guard)
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.messages
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message.contains(needle))
+            .count()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        let mut visitor = MessageVisitor::default();
+        event.record(&mut visitor);
+        self.messages.lock().unwrap().push(visitor.0);
+    }
+}
+
+#[derive(Default)]
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+/// Resolves the same window three times with the monotonic clock frozen at 0
+/// over an unfolded segment whose Metrics HEAD key holds `head_bytes`, and
+/// returns how many times the HEAD was read and how many WARNs contained
+/// `warning`.
+async fn resolve_thrice_over_head(head_bytes: Vec<u8>, warning: &str) -> (usize, usize) {
+    let inner = Arc::new(MemoryStore::new());
+    let hour = 14_000u32;
+    let now_ns = now_at_seal(hour);
+    publish_segment(
+        inner.as_ref(),
+        0,
+        Uuid::new_v4(),
+        1,
+        hour,
+        now_ns - NS_PER_HOUR,
+    )
+    .await;
+    let head = head_key(&tenant(), Signal::Metrics);
+    inner
+        .put(&head, Bytes::from(head_bytes), PutOptions::default())
+        .await
+        .expect("put HEAD");
+    let (counting, log) = CountingStore::new(inner);
+    let clock = Arc::new(TestMonoClock::default());
+    let catalog = Catalog::new(counting, config(1))
+        .expect("catalog")
+        .with_monotonic_clock(clock);
+
+    let (capture, _guard) = WarnCapture::install();
+    for _ in 0..3 {
+        assert_eq!(resolved_segments(&catalog, hour, now_ns).await, 1);
+    }
+    (log.get_count_for(&head), capture.count(warning))
+}
+
+/// "Only a NotFound is cached": a HEAD that fails to decode is not cached as
+/// an absence, so every resolve inside the TTL GETs it again and warns again.
+#[tokio::test]
+async fn undecodable_head_is_not_cached_and_warns_on_every_resolve() {
+    let (head_gets, warnings) =
+        resolve_thrice_over_head(b"not a head".to_vec(), "HEAD failed to decode").await;
+    assert_eq!(head_gets, 3, "each resolve GETs the undecodable HEAD");
+    assert_eq!(warnings, 3, "each resolve warns");
+}
+
+/// "Only a NotFound is cached": a HEAD whose signal does not match is not
+/// cached as an absence, so every resolve inside the TTL GETs it again and
+/// warns again.
+#[tokio::test]
+async fn signal_mismatched_head_is_not_cached_and_warns_on_every_resolve() {
+    let logs_head = ravel_proto::catalog::v1::SnapshotHead {
+        format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+        tenant_hash: tenant().0.to_vec(),
+        signal: ravel_proto::commit::v1::Signal::Logs as u32,
+        shard_count: 1,
+        watermark_hour: 10,
+        parts: vec![ravel_proto::catalog::v1::SnapshotPartRef {
+            key: "unused-part-key".to_string(),
+            blake3: vec![0u8; 32],
+            size: 1,
+            entry_count: 0,
+            watermark_hour: 10,
+            min_hour: 0,
+            column_stats: None,
+        }],
+        folder_id: Uuid::new_v4().into_bytes().to_vec(),
+        created_unix_ns: 0,
+        postings: None,
+        shard_generation_count: 1,
+    };
+    let bytes = ravel_catalog::encode_head(&logs_head).expect("encode a Logs HEAD");
+    let (head_gets, warnings) = resolve_thrice_over_head(bytes, "HEAD signal mismatch").await;
+    assert_eq!(head_gets, 3, "each resolve GETs the mismatched HEAD");
+    assert_eq!(warnings, 3, "each resolve warns");
+}
