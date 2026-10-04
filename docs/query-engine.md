@@ -422,15 +422,19 @@ saving, not the request-cost-derived 8.9 MiB.
 
 Under `cost-based`, and only there, a finite rate derived from the store cost
 profile (not one an explicit `--logs-request-cost-bytes` set) also resolves a
-projection break-even (ADR-2414 decision A3): the larger of the routing threshold and
-`WHOLE_OBJECT_REQUEST_MULTIPLE` request costs, carried as
+projection break-even (ADR-2414 decision A3, as its three-request-cost amendment
+sets it): the larger of the routing threshold and three request costs
+(`COST_BASED_RANGED_REQUESTS - 1`; a ranged read of a narrow projection was
+measured at about four GETs per object, and it pays when the bytes it skips
+exceed the cost of the three requests it adds over one whole-object GET),
+carried as
 `EngineConfig::logs_projection_break_even_bytes` and handed to the fetcher with
 `LogSegmentFetcher::with_projection_break_even_bytes`. When it is set,
 `ranged_projection_pays` weighs the saving against it and the ranged fetch's
 size crossover reads it too, so an object the route sent ranged is not read
 whole one layer down and an object at or below the break-even is read whole on
 either entry. The reference profile's rate is its time term, 6,300,000 bytes,
-so the break-even is 31,500,000 bytes: a one-column statement over 35 MB
+so the break-even is 18,900,000 bytes: a one-column statement over 35 MB
 objects reads ranged, a 3 MB object reads whole whatever its projection. The
 other policies resolve no break-even and keep the routing threshold as it.
 
