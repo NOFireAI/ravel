@@ -141,7 +141,17 @@ string: `NaN`, `+Inf`, and `-Inf`. Other column types are encoded as follows:
 - `Date32` and `Date64` are `YYYY-MM-DD` strings;
 - every decimal width (`Decimal32`, `Decimal64`, `Decimal128`, `Decimal256`)
   is a string holding its exact decimal text;
-- binary columns are lowercase hex strings.
+- binary columns are lowercase hex strings;
+- an `Interval` of any unit is an object with all three integer fields
+  `months`, `days` and `nanoseconds`, each 0 where the unit has no such
+  component (a day-time interval's milliseconds become nanoseconds). The
+  three stay apart because none converts exactly into another (a month has
+  no fixed number of days), and an ISO 8601 duration cannot carry a negative
+  component beside a positive one;
+- every list layout (`List`, `LargeList`, `FixedSizeList`, `ListView`,
+  `LargeListView`) is a JSON array whose elements follow these same rules;
+- a `Dictionary` with any integer key type (`Int8` to `Int64`, `UInt8` to
+  `UInt64`) is encoded as the value its key addresses.
 
 A column whose type or value has no JSON encoding (a type with no rule above,
 a timestamp or duration past the i64 nanosecond range, a time that is

@@ -498,17 +498,22 @@ async fn clickbench_q19_plans_and_groups_by_extracted_minute() {
 }
 
 /// Two rows of one column per Arrow type the JSON encoder had no arm for
-/// before issues #2390 and #2496, written to Parquet with the Arrow schema
-/// embedded so the reader restores each type. The reader hands both `Binary`
-/// and `LargeBinary` back as `BinaryView`, so one binary column covers both.
+/// before issues #2390, #2496 and #2512, written to Parquet with the Arrow
+/// schema embedded so the reader restores each type. The reader hands both
+/// `Binary` and `LargeBinary` back as `BinaryView`, so one binary column
+/// covers both. The #2512 columns are null in the second row.
 fn typed_bytes() -> Bytes {
     use datafusion::arrow::array::{
         BinaryArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array,
-        Decimal256Array, DurationMillisecondArray, Float16Array, Int8Array, Int16Array,
+        Decimal256Array, DictionaryArray, DurationMillisecondArray, FixedSizeListArray,
+        Float16Array, Int8Array, Int16Array, IntervalDayTimeArray, LargeListArray,
         Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
         TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray, UInt16Array,
     };
-    use datafusion::arrow::datatypes::{ArrowPrimitiveType, Float16Type, TimeUnit, i256};
+    use datafusion::arrow::datatypes::{
+        ArrowPrimitiveType, Float16Type, Int32Type, IntervalDayTime, IntervalUnit, TimeUnit,
+        UInt16Type, i256,
+    };
     type F16 = <Float16Type as ArrowPrimitiveType>::Native;
 
     let beyond_i128 = i256::from_i128(i128::MAX)
@@ -543,7 +548,24 @@ fn typed_bytes() -> Bytes {
         Field::new("dec32", DataType::Decimal32(9, 2), false),
         Field::new("dec64", DataType::Decimal64(18, 3), false),
         Field::new("dur", DataType::Duration(TimeUnit::Millisecond), false),
+        Field::new("iv", DataType::Interval(IntervalUnit::DayTime), true),
+        Field::new(
+            "ll",
+            DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int32, true))),
+            true,
+        ),
+        Field::new(
+            "fsl",
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int32, true)), 2),
+            true,
+        ),
+        Field::new(
+            "dict",
+            DataType::Dictionary(Box::new(DataType::UInt16), Box::new(DataType::Utf8)),
+            true,
+        ),
     ]));
+    let dict: DictionaryArray<UInt16Type> = vec![Some("minus"), None].into_iter().collect();
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
         vec![
@@ -588,6 +610,18 @@ fn typed_bytes() -> Bytes {
                     .expect("decimal"),
             ),
             Arc::new(DurationMillisecondArray::from(vec![-1, 1_500])),
+            Arc::new(IntervalDayTimeArray::from(vec![
+                Some(IntervalDayTime::new(-2, -1_500)),
+                None,
+            ])),
+            Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(-1), None]), None],
+            )),
+            Arc::new(FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                vec![Some(vec![Some(-1), Some(2)]), None],
+                2,
+            )),
+            Arc::new(dict),
         ],
     )
     .expect("batch");
@@ -598,9 +632,10 @@ fn typed_bytes() -> Bytes {
     Bytes::from(out)
 }
 
-/// Issues #2390 and #2496: a Parquet table's Int8, Int16, UInt16, Date32,
-/// Date64, second/millisecond/microsecond timestamp, Decimal128, binary,
-/// Decimal256, Float16, time-of-day, Decimal32, Decimal64 and duration
+/// Issues #2390, #2496 and #2512: a Parquet table's Int8, Int16, UInt16,
+/// Date32, Date64, second/millisecond/microsecond timestamp, Decimal128,
+/// binary, Decimal256, Float16, time-of-day, Decimal32, Decimal64, duration,
+/// day-time interval, large list, fixed-size list and UInt16-keyed dictionary
 /// columns encode through the JSON output path the SQL endpoint serves,
 /// instead of failing with "no JSON encoding for arrow type".
 #[tokio::test]
@@ -651,6 +686,10 @@ async fn parquet_column_types_encode_as_json() {
         ("dec32", "Decimal32(9, 2)"),
         ("dec64", "Decimal64(18, 3)"),
         ("dur", "Duration(ms)"),
+        ("iv", "Interval(DayTime)"),
+        ("ll", "LargeList(Int32)"),
+        ("fsl", "FixedSizeList(2 x Int32)"),
+        ("dict", "Dictionary(UInt16, Utf8)"),
     ];
     assert_eq!(
         types,
@@ -683,7 +722,11 @@ async fn parquet_column_types_encode_as_json() {
                 1,
                 "-0.05",
                 "-0.001",
-                -1_000_000
+                -1_000_000,
+                { "months": 0, "days": -2, "nanoseconds": -1_500_000_000_i64 },
+                [-1, null],
+                [-1, 2],
+                "minus"
             ],
             [
                 8,
@@ -704,7 +747,11 @@ async fn parquet_column_types_encode_as_json() {
                 86_399_999_999_999_i64,
                 "9999999.99",
                 "999999999999999.999",
-                1_500_000_000
+                1_500_000_000,
+                null,
+                null,
+                null,
+                null
             ]
         ])
     );
