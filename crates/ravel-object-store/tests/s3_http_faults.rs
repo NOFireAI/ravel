@@ -3360,6 +3360,108 @@ async fn scheduled_large_put_with_integrity_takes_one_permit() {
     );
 }
 
+/// A whole-object read above the request body bound, through a scheduled class
+/// handle, keeps exactly as many requests in flight as the permits it holds
+/// (issue #2493): one when the class has capacity 1, two when the background
+/// class has two. The read is one truncated unranged GET and then five ranged
+/// ones. The endpoint holds every GET until one more than the permits are in
+/// flight, or one second passes, as the put test above does: a read within its
+/// permits never reaches that target, so every request it sends together is in
+/// flight at once; a read that over-issues reaches it and shows the extra
+/// request in the peak.
+#[tokio::test]
+async fn scheduled_large_get_keeps_requests_within_its_permits() {
+    // (scheduler sizing, use the background handle, permits the read can hold)
+    for (config, background, permits) in [
+        (SchedulerConfig::new(1, 1, 1), false, 1),
+        (SchedulerConfig::new(8, 2, 1), true, 2),
+    ] {
+        let fake = FakeS3::start().await;
+        let http = small_chunk_http();
+        let bound = http.max_request_body_bytes();
+        let object = patterned(5 * bound + 123);
+        fake.seed("scheduled/large-read", &object);
+        fake.hold(&[Op::Get], permits + 1, Duration::from_secs(1));
+        let classed = ClassedStore::scheduled(Arc::new(fake.store_with_http(http)), config);
+        let handle = if background {
+            classed.background()
+        } else {
+            classed.foreground()
+        };
+
+        let outcome = handle
+            .get("scheduled/large-read", GetRange::Full)
+            .await
+            .expect("a scheduled whole-object read must succeed");
+
+        assert_eq!(
+            &outcome.data[..],
+            &object[..],
+            "the read must return the object's exact bytes"
+        );
+        assert_eq!(
+            fake.count(Op::Get),
+            6,
+            "the read must have been split into one unranged and five ranged requests"
+        );
+        let peak = fake.peak_in_flight();
+        assert_eq!(
+            peak, permits,
+            "{peak} requests were in flight at once for a read holding {permits} permit(s) \
+             ({config:?}, background: {background})"
+        );
+    }
+}
+
+/// A read whose size is known to be one request takes one permit: a
+/// whole-object read that fits in one response, and a caller-supplied range or
+/// suffix of any size, which is never split. In a class of three permits the
+/// endpoint holds every GET until three are in flight together. Three such
+/// reads issued at once each take one permit, so all three overlap there; a
+/// read taking a second permit would leave the third waiting, and three would
+/// never be in flight together.
+#[tokio::test]
+async fn scheduled_small_and_ranged_gets_take_one_permit() {
+    const PERMITS: usize = 3;
+    let fake = FakeS3::start().await;
+    let http = small_chunk_http();
+    let bound = http.max_request_body_bytes() as u64;
+    fake.seed("scheduled/small", b"one response carries this object");
+    fake.seed(
+        "scheduled/large",
+        &patterned(usize::try_from(5 * bound).expect("a 5 MiB size fits a usize")),
+    );
+    fake.hold(&[Op::Get], PERMITS, Duration::from_secs(5));
+    let classed = ClassedStore::scheduled(
+        Arc::new(fake.store_with_http(http)),
+        SchedulerConfig::new(PERMITS, PERMITS, 1),
+    );
+    let handle = classed.foreground();
+
+    let (small, ranged, suffix) = tokio::join!(
+        handle.get("scheduled/small", GetRange::Full),
+        handle.get("scheduled/large", GetRange::Range(0, 3 * bound)),
+        handle.get("scheduled/large", GetRange::Suffix(2 * bound)),
+    );
+    small.expect("a small whole-object read must succeed");
+    assert_eq!(
+        ranged.expect("a ranged read must succeed").data.len() as u64,
+        3 * bound
+    );
+    assert_eq!(
+        suffix.expect("a suffix read must succeed").data.len() as u64,
+        2 * bound
+    );
+
+    assert_eq!(fake.count(Op::Get), PERMITS, "one request per read");
+    let peak = fake.peak_in_flight();
+    assert_eq!(
+        peak, PERMITS,
+        "at most {peak} of {PERMITS} reads were ever in flight together, so a read held \
+         permits its single request does not use"
+    );
+}
+
 /// `SlowDown` inside a 200 response body is S3's documented behavior for
 /// `CompleteMultipartUpload`, and it is a protocol signal rather than a
 /// success: the client must retry it, and the upload must complete correctly
