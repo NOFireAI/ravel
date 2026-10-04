@@ -110,7 +110,7 @@ fn kind_admits_scheme(kind: &ExternalKind, scheme: &str) -> bool {
 /// external store is reached through `open_external` rather than constructed
 /// here, so the same path runs in tests over in-memory stores.
 pub async fn add_grant(
-    ravel_store: &dyn ObjectStoreBackend,
+    ravel_store: &Arc<dyn ObjectStoreBackend>,
     tenant: &TenantHash,
     profile: &ExternalProfile,
     url: &str,
@@ -170,11 +170,11 @@ pub async fn add_grant(
                 profile.name
             )
         })?;
-    probe_not_ravel_bucket(ravel_store, external.as_ref())
+    probe_not_ravel_bucket(ravel_store.as_ref(), ravel_store, external.as_ref())
         .await
         .with_context(|| format!("the bucket behind {url:?} did not qualify as external"))?;
 
-    let grant = grants::add(ravel_store, tenant, &profile.name, url, created_by, clock).await?;
+    let grant = grants::add(ravel_store.as_ref(), tenant, &profile.name, url, created_by, clock).await?;
     Ok(grant)
 }
 
@@ -223,7 +223,7 @@ pub async fn add(
     let profile = find_profile(&profiles, profile_name)?;
     let hash = TenantId::new(tenant).hash();
     let grant = add_grant(
-        store.as_ref(),
+        &store,
         &hash,
         profile,
         location,
@@ -280,6 +280,7 @@ fn require_profiles_path(path: Option<&Path>) -> anyhow::Result<&Path> {
 mod tests {
     use bytes::Bytes;
     use ravel_object_store::external::{GcsProfileCredentials, S3ProfileCredentials};
+    use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
         Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
@@ -313,6 +314,11 @@ mod tests {
                 credentials: GcsProfileCredentials::ApplicationDefault,
             },
         }
+    }
+
+    /// Ravel's own bucket, as the shared handle [`add_grant`] takes.
+    fn ravel_bucket() -> Arc<dyn ObjectStoreBackend> {
+        Arc::new(MemoryStore::new())
     }
 
     /// An external bucket holding one object under `data/`.
@@ -490,7 +496,7 @@ mod tests {
     /// prefix returns nothing.
     #[tokio::test]
     async fn a_grant_of_one_object_finds_it_through_an_object_store_listing() {
-        let ravel = MemoryStore::new();
+        let ravel = ravel_bucket();
         let external: Arc<dyn ObjectStoreBackend> =
             Arc::new(ListsUnderSlash(external_bucket().await));
         let listed = external
@@ -519,7 +525,7 @@ mod tests {
     #[tokio::test]
     async fn a_prefix_grant_lists_through_an_object_store_listing() {
         for url in ["s3://customer/data/", "s3://customer/data"] {
-            let ravel = MemoryStore::new();
+            let ravel = ravel_bucket();
             let external: Arc<dyn ObjectStoreBackend> =
                 Arc::new(ListsUnderSlash(external_bucket().await));
             let grant = add_grant(
@@ -542,7 +548,7 @@ mod tests {
     /// the grant it wrote is the one `ls` reads back.
     #[tokio::test]
     async fn add_qualifies_the_store_and_writes_the_grant() {
-        let ravel = MemoryStore::new();
+        let ravel = ravel_bucket();
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
         let profile = s3_profile("prod");
         let grant = add_grant(
@@ -576,7 +582,7 @@ mod tests {
     /// `sys/pq-probe/`.
     #[tokio::test]
     async fn add_leaves_no_probe_object_in_ravels_bucket() {
-        let ravel = MemoryStore::new();
+        let ravel = ravel_bucket();
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
         add_grant(
             &ravel,
@@ -595,12 +601,66 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
     }
 
+    /// A grant cancelled while the bucket probe's identity read is in flight,
+    /// as an interrupted `ravel parquet grant` is, still leaves no probe
+    /// object in Ravel's bucket: the probe's drop guard deletes it.
+    #[tokio::test]
+    async fn a_grant_cancelled_mid_probe_leaves_no_probe_object() {
+        let ravel = ravel_bucket();
+        let external = Arc::new(FaultStore::new(external_bucket().await, FaultPlan::empty()));
+        let gate = external.hold(Op::Get, Some("sys/pq-probe/".to_string()), Occurrence::Always);
+        let open = opener(external.clone());
+        let tenant = TenantId::new("acme").hash();
+        let profile = s3_profile("prod");
+
+        let mut grant = Box::pin(add_grant(
+            &ravel,
+            &tenant,
+            &profile,
+            "s3://customer/data/",
+            "ravel-cli",
+            &AtNs(NOW),
+            &open,
+        ));
+        tokio::select! {
+            outcome = &mut grant => panic!("a held identity read cannot complete: {outcome:?}"),
+            () = gate.wait_until_held(1) => {}
+        }
+        let held = gate.held_details();
+        assert_eq!(held.len(), 1, "{held:?}");
+        let (_, held_op, held_key) = &held[0];
+        assert_eq!(*held_op, Op::Get);
+        let during = ravel_object_store::list_all(&ravel, "sys/pq-probe/")
+            .await
+            .expect("list");
+        assert_eq!(
+            during.iter().map(|m| m.key.clone()).collect::<Vec<_>>(),
+            vec![held_key.clone()],
+            "the probe object is in Ravel's bucket while its identity read is held"
+        );
+
+        drop(grant);
+        let mut left = during;
+        for _ in 0..100 {
+            if left.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            left = ravel_object_store::list_all(&ravel, "sys/pq-probe/")
+                .await
+                .expect("list");
+        }
+        assert!(left.is_empty(), "a cancelled grant left {left:?}");
+        let grants = grants::list(&ravel, &tenant).await.expect("list grants");
+        assert!(grants.is_empty(), "{grants:?}");
+    }
+
     /// Distinguishing test for the precondition probe: an external store that
     /// serves a read carrying an ETag it never issued is refused, and nothing
     /// is written to the grants record.
     #[tokio::test]
     async fn add_refuses_a_store_that_ignores_if_match() {
-        let ravel = MemoryStore::new();
+        let ravel = ravel_bucket();
         let external: Arc<dyn ObjectStoreBackend> =
             Arc::new(IgnoresIfMatch(external_bucket().await));
         let err = add_grant(
@@ -629,7 +689,7 @@ mod tests {
     /// Ravel just wrote and the grant is refused.
     #[tokio::test]
     async fn add_refuses_ravels_own_bucket_under_another_handle() {
-        let ravel = Arc::new(MemoryStore::new());
+        let ravel = ravel_bucket();
         ravel
             .put(
                 "data/part-0.parquet",
@@ -639,7 +699,7 @@ mod tests {
             .await
             .expect("put");
         let err = add_grant(
-            ravel.as_ref(),
+            &ravel,
             &TenantId::new("acme").hash(),
             &s3_profile("prod"),
             "s3://customer/data/",
@@ -663,7 +723,7 @@ mod tests {
     /// S3 profile is refused before any store is opened.
     #[tokio::test]
     async fn add_refuses_a_scheme_the_profile_kind_does_not_address() {
-        let ravel = MemoryStore::new();
+        let ravel = ravel_bucket();
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
         let err = add_grant(
             &ravel,
@@ -691,7 +751,7 @@ mod tests {
     /// about the scheme being unusable.
     #[tokio::test]
     async fn a_gs_location_under_a_gcs_profile_is_granted() {
-        let ravel = MemoryStore::new();
+        let ravel = ravel_bucket();
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
         let grant = add_grant(
             &ravel,
@@ -711,7 +771,7 @@ mod tests {
     /// that is why: there is nothing to run the precondition probe on.
     #[tokio::test]
     async fn add_refuses_a_prefix_that_holds_no_object() {
-        let ravel = MemoryStore::new();
+        let ravel = ravel_bucket();
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
         let err = add_grant(
             &ravel,
@@ -777,7 +837,7 @@ mod tests {
         }
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(store);
         let err = add_grant(
-            &MemoryStore::new(),
+            &ravel_bucket(),
             &TenantId::new("acme").hash(),
             &s3_profile("prod"),
             "s3://customer/data",
@@ -798,7 +858,7 @@ mod tests {
         assert!(!text.contains("holds no object"), "{text}");
 
         let err = add_grant(
-            &MemoryStore::new(),
+            &ravel_bucket(),
             &TenantId::new("acme").hash(),
             &s3_profile("prod"),
             "s3://customer/elsewhere/",
@@ -829,7 +889,7 @@ mod tests {
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(store);
         for url in ["s3://customer/data", "s3://customer/data/"] {
             let err = add_grant(
-                &MemoryStore::new(),
+                &ravel_bucket(),
                 &TenantId::new("acme").hash(),
                 &s3_profile("prod"),
                 url,
@@ -869,7 +929,7 @@ mod tests {
             .expect("put");
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_store);
         for url in ["s3://customer/data", "s3://customer/data/t1/"] {
-            let ravel = MemoryStore::new();
+            let ravel = ravel_bucket();
             let tenant = TenantId::new("acme").hash();
             let grant = add_grant(
                 &ravel,
@@ -896,7 +956,7 @@ mod tests {
             .expect("put marker");
         let markers_only: Arc<dyn ObjectStoreBackend> = Arc::new(markers_only);
         let err = add_grant(
-            &MemoryStore::new(),
+            &ravel_bucket(),
             &TenantId::new("acme").hash(),
             &s3_profile("prod"),
             "s3://customer/empty/",
@@ -942,7 +1002,7 @@ mod tests {
     /// `remove` takes the grant back out, and `ls` then reports none.
     #[tokio::test]
     async fn remove_takes_the_grant_back_out() {
-        let ravel = MemoryStore::new();
+        let ravel = ravel_bucket();
         let external: Arc<dyn ObjectStoreBackend> = Arc::new(external_bucket().await);
         let tenant = TenantId::new("acme").hash();
         add_grant(

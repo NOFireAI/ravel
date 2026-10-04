@@ -50,7 +50,6 @@
 //! from a best-effort background task, through the unwrapped Ravel store, so
 //! that delete is not in the statement's reported cost.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use ravel_object_store::external::probe::{
