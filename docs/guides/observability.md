@@ -2040,13 +2040,12 @@ comparison is
 `ravel_cache_resident_bytes / on(mode, cache) group_left ravel_cache_max_bytes`,
 per `cache` and per `tier`: once a disk tier exists the residency series carry
 a `tier` label and the ceiling does not, so a plain division matches nothing.
-For `cache="fetch"` the ceiling is one capacity shared across
-tiers. For `cache="catalog"`, RAM and disk each get their OWN ceiling at the
-same configured byte figure (`build_catalog` in `services/ravel-server/src/
-query.rs` passes the same `CacheLimits` to both the RAM cache and
-`with_disk_byte_cache`), so a tiered catalog cache can hold up to 2x the
-configured bytes in total, and the held-vs-budgeted ratio for the catalog
-cache must be read per tier, not summed across tiers.
+Both caches bound each tier to the configured byte figure independently: the
+fetch cache's RAM and disk tiers are built from the same `--cache-max-bytes`
+limits (`build_cache` in `services/ravel-server`), and the catalog cache's from
+the same catalog limits (`build_catalog`, same crate). A tiered cache of either
+kind can therefore hold up to twice its configured bytes in total, and its
+held-vs-budgeted ratio is read per tier, not summed across tiers.
 
 ### Admission (`ravel_admission_*`, `ravel_ingest_wire_bytes_total`)
 
