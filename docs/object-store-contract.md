@@ -1844,9 +1844,10 @@ than on the request path:
   rule the operator sets on that prefix in the bucket itself. Each leaked
   object is 32 bytes.
 
-Nothing in a shipping binary constructs an `ExternalStore` or calls either
-probe yet. The callers are the Parquet reader and the grant and
-`CREATE EXTERNAL TABLE` paths of ADR-2040, which have not landed.
+Both probes have two callers, the ADR-2040 paths that admit a location:
+`ravel-cli tenant parquet-grant add` and `CREATE EXTERNAL TABLE`. Each opens
+its `ExternalStore` with `ExternalStore::open`, as the Parquet reader does
+for the stores it reads tables' files through.
 
 ## Rules for callers
 
