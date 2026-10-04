@@ -59,6 +59,7 @@ mod config;
 pub mod conformance;
 mod cost;
 mod ddl;
+mod ddl_cost;
 mod declared;
 mod dedup;
 #[cfg(feature = "flight-sql")]
@@ -126,6 +127,9 @@ pub use config::{
     SpillConfigError, SqlConfig, compensated_group_values_ceiling,
 };
 pub use ddl::{DEFAULT_MIN_GRACE_MS, DdlErrorClass, DdlExecuteError, DdlOutcome};
+pub use ddl_cost::{
+    DDL_COST_BYTES, DDL_PHASE_COUNT, DdlCost, DdlExecution, DdlPhase, DdlPhaseCost,
+};
 pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
 #[cfg(feature = "flight-sql")]
 pub use distributed::{

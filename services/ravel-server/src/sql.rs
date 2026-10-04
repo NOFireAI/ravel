@@ -382,6 +382,7 @@ async fn run_ddl(
             executor
                 .execute_ddl(tenant_hash, &sql, &tenant_str, deadline)
                 .await
+                .result
                 .map_err(|err| ServiceError::from_ddl(err, tenant_hash))
         }
         .await;

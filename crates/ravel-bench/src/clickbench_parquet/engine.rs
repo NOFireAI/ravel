@@ -235,6 +235,7 @@ mod in_process {
                 .executor
                 .execute_ddl(self.tenant, sql, CREATED_BY, Duration::from_secs(30))
                 .await
+                .result
                 .map_err(|e| EngineError::Ddl(e.to_string()))?;
             Ok(ddl_receipt(&outcome))
         }
