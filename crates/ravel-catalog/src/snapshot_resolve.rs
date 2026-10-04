@@ -26,6 +26,7 @@ use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
+use crate::cache::CachedHead;
 use crate::catalog::Catalog;
 use crate::charged::{Charged, ChargedPart, ChargedPostings};
 use crate::declared_stats::{self, DeclaredColumnStats};
@@ -587,7 +588,11 @@ impl Catalog {
 
     /// Read HEAD, through the TTL cache unless `bypass_cache`. Any failure
     /// short of a `shard_count` or `tenant_hash` mismatch is logged and
-    /// folded into `None` (fall back to listing). A `shard_count` mismatch
+    /// folded into `None` (fall back to listing). A `NotFound` on a cached
+    /// read is itself cached for `head_cache_ttl` (see
+    /// [`crate::cache::HeadCache::insert_absent`]), so a tenant with no HEAD
+    /// yet costs one HEAD GET per TTL rather than one per resolve; any other
+    /// failure is not cached and the next resolve GETs again. A `shard_count` mismatch
     /// is a loud error, but under
     /// ADR-0052 section 5 "mismatch" no longer means "not equal to this
     /// process's static `shard_count`": the head's `shard_count` is the
@@ -626,14 +631,31 @@ impl Catalog {
                 accounting,
             )
         {
-            // A cached head was validated when first admitted; the caller keeps
-            // its own generation view (`None`).
-            return Ok(Some((cached, None)));
+            return Ok(match cached {
+                // A cached head was validated when first admitted; the caller
+                // keeps its own generation view (`None`).
+                CachedHead::Present(head) => Some((head, None)),
+                // A tenant that has not folded yet: list, as the GET would
+                // have, without re-issuing it within the TTL.
+                CachedHead::Absent => None,
+            });
         }
 
         let got = match self.guarded_get(head_key, GetRange::Full, accounting).await {
             Ok(got) => got,
-            Err(StoreError::NotFound) => return Ok(None),
+            Err(StoreError::NotFound) => {
+                // Only a definite NotFound is cached, and never from the
+                // bypass re-read, which exists to see the store as it is now.
+                if !bypass_cache {
+                    self.head_cache().insert_absent(
+                        *tenant,
+                        signal,
+                        stamp_mono_ns,
+                        self.config().head_cache_capacity,
+                    );
+                }
+                return Ok(None);
+            }
             Err(err) => {
                 tracing::warn!(error = %err, key = %head_key, "HEAD GET failed, falling back to listing");
                 return Ok(None);

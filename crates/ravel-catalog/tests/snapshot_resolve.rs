@@ -993,3 +993,115 @@ async fn head_cache_stamp_is_taken_before_the_head_get() {
         "refused one nanosecond past the TTL counted from before the GET"
     );
 }
+
+async fn resolved_segments(catalog: &Catalog, hour: u32, now_ns: i64) -> usize {
+    catalog
+        .resolve(
+            &tenant(),
+            Signal::Metrics,
+            full_window_range(hour, now_ns),
+            &[],
+            now_ns,
+        )
+        .await
+        .expect("resolve")
+        .segments
+        .len()
+}
+
+/// A query resolve that finds no HEAD caches the `NotFound` for
+/// `head_cache_ttl` on the monotonic clock, stamped before the GET; a
+/// timeout is not cached; the fold's own HEAD read is not served from that
+/// absence; and a HEAD published inside the TTL is read once it expires.
+#[tokio::test]
+async fn missing_head_is_cached_for_ttl_on_resolve_only() {
+    let inner = Arc::new(MemoryStore::new());
+    let hour = 13_000u32;
+    let now_ns = now_at_seal(hour);
+    publish_segment(
+        inner.as_ref(),
+        0,
+        Uuid::new_v4(),
+        1,
+        hour,
+        now_ns - NS_PER_HOUR,
+    )
+    .await;
+    let head = head_key(&tenant(), Signal::Metrics);
+    let plan = FaultPlan::empty().with_sequence(
+        Sequence::new(Op::Get)
+            .with_key_contains(head.clone())
+            .then_fault(ScriptedFault::Timeout)
+            .then_passthrough(),
+    );
+    let fault = Arc::new(FaultStore::new(inner, plan));
+    let (counting, log) = CountingStore::new(fault.clone());
+    let clock = Arc::new(TestMonoClock::default());
+    let catalog = Catalog::new(counting, config(1))
+        .expect("catalog")
+        .with_monotonic_clock(clock.clone());
+
+    clock.set(0);
+    assert_eq!(resolved_segments(&catalog, hour, now_ns).await, 1);
+    assert_eq!(log.get_count_for(&head), 1, "the first resolve GETs HEAD");
+    assert_eq!(fault.fault_count(Op::Get, FaultKind::Timeout), 1);
+
+    assert_eq!(resolved_segments(&catalog, hour, now_ns).await, 1);
+    assert_eq!(
+        log.get_count_for(&head),
+        2,
+        "a timed-out HEAD GET is not cached; this GET returns NotFound"
+    );
+
+    clock.set(TTL_NS / 2);
+    assert_eq!(resolved_segments(&catalog, hour, now_ns).await, 1);
+    assert_eq!(
+        log.get_count_for(&head),
+        2,
+        "the NotFound is served from cache inside the TTL"
+    );
+
+    let report = catalog
+        .fold(
+            &tenant(),
+            Signal::Metrics,
+            Uuid::new_v4(),
+            now_ns,
+            &[],
+            None,
+        )
+        .await
+        .expect("fold publishes HEAD inside the TTL");
+    assert_eq!(report.watermark_hour, Some(hour));
+    assert_eq!(
+        log.get_count_for(&head),
+        3,
+        "the fold GETs HEAD although the resolve cached its absence"
+    );
+    let snap_gets = log.get_count_for("/snap/");
+
+    clock.set(TTL_NS);
+    assert_eq!(resolved_segments(&catalog, hour, now_ns).await, 1);
+    assert_eq!(
+        log.get_count_for(&head),
+        3,
+        "the absence, stamped before the GET at 0, is served at exactly the TTL"
+    );
+    assert_eq!(
+        log.get_count_for("/snap/"),
+        snap_gets,
+        "inside the TTL the resolve lists rather than reading the new HEAD's parts"
+    );
+
+    clock.set(TTL_NS + 1);
+    assert_eq!(resolved_segments(&catalog, hour, now_ns).await, 1);
+    assert_eq!(
+        log.get_count_for(&head),
+        4,
+        "past the TTL the resolve GETs HEAD again"
+    );
+    assert!(
+        log.get_count_for("/snap/") > snap_gets,
+        "the HEAD published inside the TTL is read and its parts served"
+    );
+}

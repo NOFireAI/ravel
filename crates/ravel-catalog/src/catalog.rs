@@ -5262,6 +5262,16 @@ mod tests {
         }
     }
 
+    /// A monotonic clock stopped at zero, so no HEAD cache entry expires
+    /// between two resolves of one test.
+    struct FrozenMono;
+
+    impl ravel_cpu_gate::MonotonicClock for FrozenMono {
+        fn now_nanos(&self) -> u64 {
+            0
+        }
+    }
+
     /// Build, PUT the data object, and publish a fully self-consistent
     /// commit record for one segment under [`Signal::Metrics`]. Each call uses
     /// a fresh writer id. [`publish_segment_for`] is the same for any signal.
@@ -5775,7 +5785,8 @@ mod tests {
                 ..config(1)
             },
         )
-        .expect("catalog");
+        .expect("catalog")
+        .with_monotonic_clock(Arc::new(FrozenMono));
 
         let base_hour = 500_000u32;
         let record_count = 5u32;
@@ -5821,13 +5832,12 @@ mod tests {
             0,
             "a cold resolve fetches every record it touches, so none is served from cache"
         );
-        // Two records fetched cold plus the one non-record GET a resolve makes
-        // regardless, which is what fixes the constant the full-window
-        // assertion below subtracts.
+        // Two records fetched cold plus the HEAD GET, whose NotFound the
+        // full-window resolve below is then served from the HEAD cache.
         assert_eq!(
             warm_acc.snapshot().s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
             3,
-            "a cold resolve over two records issues two record GETs plus one fixed GET"
+            "a cold resolve over two records issues two record GETs plus the HEAD GET"
         );
 
         // Full window: the two warmed records are served from cache, the other
@@ -5862,9 +5872,9 @@ mod tests {
         // commit-record assertion above would not notice.
         assert_eq!(
             full_snap.s3_requests[ravel_types::accounting::AccountedOp::Get.index()],
-            4,
-            "the three unwarmed records are fetched, plus the same one fixed GET the cold \
-             resolve above showed, and the two counted serves fetch nothing"
+            3,
+            "the three unwarmed records are fetched, HEAD's cached absence costs no GET, \
+             and the two counted serves fetch nothing"
         );
     }
 
@@ -6735,17 +6745,20 @@ mod tests {
             acc.snapshot().s3_requests(AccountedOp::Get)
         }
 
-        let off_catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
+        let off_catalog = Catalog::new(store.clone(), config(1))
+            .expect("catalog")
+            .with_monotonic_clock(Arc::new(FrozenMono));
         let off = measured_gets(&off_catalog, range, now).await;
 
         let on_catalog = Catalog::new(store.clone(), config(1))
             .expect("catalog")
+            .with_monotonic_clock(Arc::new(FrozenMono))
             .with_provisioning_enforcement();
         let on = measured_gets(&on_catalog, range, now).await;
 
         assert_eq!(
-            off, 1,
-            "warm resolve GET count with enforcement off: only the uncached HEAD read"
+            off, 0,
+            "warm resolve GET count with enforcement off: none, HEAD's absence is cached"
         );
         assert_eq!(
             on,
