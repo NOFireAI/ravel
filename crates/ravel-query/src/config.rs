@@ -701,8 +701,8 @@ pub struct EngineConfig {
     /// [`Self::store_get_concurrency`] to read the resolved value.
     pub store_get_concurrency: Option<usize>,
     /// Explicit override for DataFusion `target_partitions`
-    /// (ADR-1195's `--sql-partition-count`); wired into
-    /// `crates/ravel-sql/src/session.rs` by a follow-up task. `None` falls
+    /// (ADR-1195's `--sql-partition-count`); `ravel-sql`'s `session_config`
+    /// sets `target_partitions` from the resolved value. `None` falls
     /// back to [`Self::fetch_concurrency`]: use
     /// [`Self::sql_partition_count`] to read the resolved value.
     pub sql_partition_count: Option<usize>,
