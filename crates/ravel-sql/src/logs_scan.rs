@@ -3800,6 +3800,16 @@ impl PrefetchPool {
             slot.handed_back.clear();
         }
     }
+
+    /// Gives `partition`'s slot back when its stream is dropped, so a later
+    /// `execute` of the same plan instance (a parent that runs its input
+    /// once per iteration) claims it again. Two live streams on one slot
+    /// stay refused by [`Self::register`].
+    fn unregister(&self, partition: usize) {
+        if let Some(flag) = self.registered.get(partition) {
+            flag.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Which open [`LogScanStream::on_open_refused`] retries.
@@ -4046,8 +4056,10 @@ struct LogScanStream {
     /// segments may be open at once, counting the one being opened or drained.
     /// While that segment is a ranged open, [`Self::top_up_prefetch`] issues the
     /// next owned segments' ranged opens up to this bound, and they are consumed
-    /// in owned order, so rows, per-segment counters and per-query accounting
-    /// are those of the sequential walk. A prefetched open holds the fetched
+    /// in owned order, so rows and per-segment counters are those of the
+    /// sequential walk, and so is per-query accounting unless a refused open
+    /// drops prefetches, whose requests and bytes are then counted on top. A
+    /// prefetched open holds the fetched
     /// column-chunk bytes of its segment, reserved against the fetcher's memory
     /// budget like any open's, so the bytes this partition holds for opened
     /// segments are bounded by this share times one segment's projected bytes,
@@ -4602,6 +4614,7 @@ impl Stream for LogScanStream {
 impl Drop for LogScanStream {
     fn drop(&mut self) {
         self.prefetch_pool.clear(self.partition);
+        self.prefetch_pool.unregister(self.partition);
     }
 }
 
@@ -4824,7 +4837,8 @@ impl LogScanStream {
                     }
                 }
                 // The current open is polled before the opens behind it are
-                // topped up, so its reservations go first; the top-up then
+                // topped up, so its first reservation goes first (its later
+                // ones can still follow a prefetch's); the top-up then
                 // runs whether it resolved or is still in flight, which keeps
                 // the next segments' round trips overlapping this one's.
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {

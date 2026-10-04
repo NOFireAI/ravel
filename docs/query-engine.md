@@ -447,8 +447,9 @@ its bytes over its throughput: a ranged open is a probe, a directory read and
 its column ranges in sequence. So while the segment a partition is opening or
 draining was opened ranged, the partition issues the ranged opens of its next
 owned segments ahead of their turn (ADR-2414 decision A2), each time after the
-current open has been polled, so the current open reserves its bytes first and
-the next segments' round trips still overlap it, up to
+current open has been polled, so the current open makes its first reservation
+first (a ranged open reserves in stages, and its later stages can still follow
+a prefetch's) and the next segments' round trips still overlap it, up to
 
 ```text
 share = max(2, store_get_concurrency / sql_partition_count)

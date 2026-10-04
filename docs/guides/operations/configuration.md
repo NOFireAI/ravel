@@ -1190,8 +1190,8 @@ anyway. The startup line reports the break-even in force as
 other policies and when `--logs-request-cost-bytes` is set, which keep the
 routing threshold as the break-even, it reports that threshold with
 `break_even_source="routing-threshold"`: 524,288 bytes by default, but under
-`request-minimal`, and under a `cost-based` resolution whose profile records
-neither prices nor timings, the threshold is saturated and the line prints
+`request-minimal`, and under a `cost-based` resolution whose profile prices
+bytes at zero and records no timings, the threshold is saturated and the line prints
 18446744073709551615. The
 coalescing gap, the largest hole between two wanted ranges that one request
 reads through, stays one request cost (at least 64 KiB) under every policy, so
