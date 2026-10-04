@@ -364,7 +364,10 @@ mod tests {
             // An extra path segment between the table's `v/` and a second
             // `v/`, which the Query grant's `*` binds. The slot the parser
             // reads is everything between the first `v/` and `.pqm`.
-            ("q/v/00000000000000000001", "version is not 20 decimal digits"),
+            (
+                "q/v/00000000000000000001",
+                "version is not 20 decimal digits",
+            ),
         ] {
             let key = format!("t/{th}/pq/t/hits/v/{slot}.pqm");
             assert_eq!(

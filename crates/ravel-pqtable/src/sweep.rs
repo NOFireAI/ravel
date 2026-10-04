@@ -478,8 +478,7 @@ mod tests {
         let store = MemoryStore::with_page_size(2);
         store.set_clock_ms(0);
         for v in [1, 2] {
-            let bytes =
-                encode_manifest(&TENANT, &live_manifest("hits", v, &[1])).expect("encode");
+            let bytes = encode_manifest(&TENANT, &live_manifest("hits", v, &[1])).expect("encode");
             store
                 .put(
                     &manifest_key(&TENANT, "hits", v).expect("key"),

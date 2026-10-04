@@ -1329,6 +1329,8 @@ neither deletes it nor deletes the versions beneath it because of it. The
 first listing in each process that finds one logs a `warn` line naming the
 tenant hash, the table, the highest such key's version characters and the
 repair command, and `parquet ls` prints a line for each table that has one.
+A process tracks at most 4096 such tables; past that, only one in every 1024
+listings of a further table logs the line.
 
 The bound removes the automatic wedge from versions above 2^32 and from keys
 that name no version. A forged version at or below the bound still blocks DDL

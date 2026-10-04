@@ -1113,12 +1113,14 @@ whose only versions are above the bound is no table. Each listing that finds
 a version above the bound or a key that names no version is counted per
 table (`resolve::above_bound_resolves`), and the first one in a process is
 logged at `warn` as a `resolve::AboveBoundVersions`, which names the tenant
-hash, the table, how many keys, the highest key's 20 version characters
-(escaped, since whoever put the key chose them), the bound and the repair
-command. The count is kept for at most `resolve::ABOVE_BOUND_TABLES_MAX`
-(4096) tables per process; past that a new table is warned about on every
-listing and not counted, so the map cannot grow with the number of tables
-someone forges keys under. A Flight ticket pin above the bound is refused as
+hash, the table, how many keys, the highest key's version characters (the
+text between `v/` and `.pqm`, escaped, since whoever put the key chose
+them), the bound and the repair command. The count is kept for at most
+`resolve::ABOVE_BOUND_TABLES_MAX` (4096) tables per process; past that a
+listing of a new table is not counted per table, so the map cannot grow with
+the number of tables someone forges keys under, and is warned about on one in
+every `resolve::ABOVE_BOUND_WARN_EVERY` (1024) such listings, so the log
+cannot grow with them either. A Flight ticket pin above the bound is refused as
 `PinnedManifestGone` before any read. `ravel-cli parquet ls` prints each
 table's newest version at or below the bound, with `--table` every version
 at or below it, reads neither kind of skipped key, and says when either

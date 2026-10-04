@@ -40,8 +40,8 @@ pub struct AboveBoundVersions {
     pub tenant_hash: String,
     pub table: String,
     pub count: usize,
-    /// The 20 version characters of the highest such key in key order, as
-    /// the key spells them. Chosen by whoever put the key, so print it
+    /// The version characters (the text between `v/` and `.pqm`) of the
+    /// highest such key in key order, as the key spells them. Chosen by whoever put the key, so print it
     /// escaped.
     pub highest: String,
     pub bound: u64,
@@ -95,7 +95,7 @@ fn record_in(
     }
     let nth = *overflow;
     *overflow = overflow.saturating_add(1);
-    nth % warn_every == 0
+    nth.is_multiple_of(warn_every)
 }
 
 /// Count and, the first time, log one listing of `table` that found
@@ -291,10 +291,10 @@ async fn list_grouped(
 }
 
 /// Every version number of `table`, ascending, from a paginated LIST of its
-/// `v/` prefix, including any above [`MAX_MANIFEST_VERSION`]. A key whose 20
-/// characters name no version is skipped and counted
-/// ([`above_bound_resolves`]); any other key that is not a version of this
-/// table is [`ResolveError::ForeignKey`].
+/// `v/` prefix, including any above [`MAX_MANIFEST_VERSION`]. A `.pqm` key
+/// whose slot names no version ([`ListedManifestKey::InvalidVersion`]) is
+/// skipped and counted ([`above_bound_resolves`]); any other key that is not a
+/// version of this table is [`ResolveError::ForeignKey`].
 pub async fn versions(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,

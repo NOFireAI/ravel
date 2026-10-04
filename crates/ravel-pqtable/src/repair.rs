@@ -2,7 +2,8 @@
 //!
 //! No writer creates a version above [`MAX_MANIFEST_VERSION`] or a `.pqm` key
 //! whose slot names no version, so one was put by something else: the
-//! Query credential's create-only grant admits any 20-character version.
+//! Query credential's create-only grant admits any 20-character version, and
+//! its table wildcard also admits an extra path segment under a table's `v/`.
 //! Readers and the sweep already skip both ([`crate::resolve::newest`],
 //! [`crate::sweep::plan`]); [`list`] flags them and [`delete_flagged`]
 //! deletes exactly those.
