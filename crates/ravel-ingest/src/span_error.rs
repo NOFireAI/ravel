@@ -35,6 +35,12 @@ pub enum SpanWriteError {
     /// or a strict waiter on a buffer whose deferral reached the flush
     /// deferral cap): a later flush writes those spans, so a retry stores
     /// them twice.
+    ///
+    /// Also the gateway's answer to a keyed write whose idempotency marker
+    /// lookup failed with a store error (issue #2462). No flush ran: the
+    /// write was refused before its own data was written, so a retry is safe.
+    /// The message is the gateway's fixed client-facing text; the store error
+    /// and the marker key go to the gateway's server-side log.
     #[error("flush abandoned: {0}")]
     Abandoned(String),
     /// Building the RSPAN object failed (a deterministic input problem);
