@@ -292,9 +292,15 @@ echo "==> scripts/guards/check-test-suites-run.sh"
 echo "==> ingest-memory flag-doc overclaim guard (issue #1297)"
 check_ingest_memory_flag_docs "${config_rs}"
 
-# Match CI's `check` job: it runs `cargo nextest run --workspace
-# --cargo-profile ci`. Use nextest when it is installed so a local run
-# warms the same `ci`-profile artifacts CI reuses; fall back to `cargo
+# The same tests as CI's `check` job, on the `ci` profile. CI runs them on
+# `ci-opt`, which is `ci` with third-party dependencies at opt-level 2
+# (ADR-0053, "check on ci-opt" amendment): CI restores a dependency cache
+# and pays for that optimisation once, a local or fleet run builds cold and
+# would pay it every time. So this run and CI's do not share artifacts, and
+# a test whose result depends on how dependencies are compiled can pass
+# here and fail there. To reproduce such a failure, run
+# `cargo nextest run --locked --workspace --cargo-profile ci-opt`.
+# Use nextest when it is installed; fall back to `cargo
 # test` (which every dev machine has) otherwise. nextest cannot run
 # doctests, so those always go through `cargo test --doc`, pinned to the
 # `ci` profile for consistency. `command -v` in an `if` condition does not

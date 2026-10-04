@@ -105,7 +105,8 @@ green run pays no extra serialization on its critical path. `check` and
   satisfy branch protection. Mappings are conservative; when in doubt a
   lane runs.
 - Unify `check` on the `ci` profile: nextest already uses it; doctests
-  move to `--profile ci`, collapsing one full compile configuration.
+  move to `--profile ci`, collapsing one full compile configuration. The
+  profile is now `ci-opt`; see the check on ci-opt amendment below.
 - `docker-build` stops cloning full history to decide "no"; it consumes a
   `changes` output.
 - `free-disk-space` (0.5-4m per job) remains only where a lane actually
@@ -148,7 +149,8 @@ script pair is deleted.
   cache is attached" test is the template).
 - gates.sh: use nextest with the `ci` profile where nextest is installed,
   matching CI's configuration so local and CI runs exercise the same
-  artifacts.
+  artifacts. That match no longer holds; see the check on ci-opt amendment
+  below.
 
 ## Rejected alternatives
 
@@ -362,3 +364,56 @@ count comes down.
 The build is now 60 to 70 percent of each leg, so a fifth leg would buy
 almost nothing. The next lever is the build itself (issue #2523), not
 more legs.
+
+## Amendment: check on ci-opt
+
+<!-- amendment-applies: sections="D4. Run less, share more|D7. Delivery process determinism (skills and scripts, not ci.yml)" pointer="check on ci-opt amendment" -->
+
+Dated 2026-10-04. Tracked in issue #2524 under epic #2526.
+
+D4 unified `check` on the `ci` profile, and D7 had `gates.sh` use the same
+profile so that a local run and CI exercise the same artifacts. `check` now
+runs on `ci-opt`: the `ci` profile with third-party dependencies at
+`opt-level = 2`. `gates.sh` and the fleet executors stay on `ci`. D4's
+point, one compile configuration inside the job, still holds, since the
+tests and the doctests both use `ci-opt`. D7's match between local and CI
+artifacts does not.
+
+### Why
+
+The test phase of `check` is CPU-bound, and the CPU goes to dependencies
+built unoptimised: 41 tests over 10 seconds each used 1,236 of 2,374
+CPU-seconds, in zstd, arrow and datafusion. With dependencies optimised,
+the 2,404 tests of one shard took 329 CPU-seconds where they had taken
+618, 46.9 percent less. Workspace crates stay unoptimised, with debug
+assertions and overflow checks on, so they compile as fast as before.
+
+### Why not everywhere
+
+Optimising dependencies is paid when they are built. CI restores a
+dependency cache and pays once per cache key. A local gate or a fleet
+executor builds cold and would pay on every run: the cold build of a
+`check` leg went from about 7 minutes to between 22 and 28. So the profile
+is used where a cache absorbs the cost and nowhere else.
+
+### What is given up
+
+A local `ci` run and CI's `ci-opt` run compile dependencies differently,
+so a test whose result depends on that can pass locally and fail the
+required check. This is not hypothetical: the first run on `ci-opt` failed
+`ravel-sql`'s differential gate, because a sum over NaNs returned a
+different NaN from the reference (issue #2558, ADR-0022's NaN propagation
+amendment). That test had only ever run unoptimised, and it fails on the
+release profile too, which is the reason to want the required check closer
+to how the binaries are built, not further from it.
+
+To reproduce a failure that appears only in CI:
+`cargo nextest run --locked --workspace --cargo-profile ci-opt`.
+
+### Cost
+
+Until the first `main` run saves the new cache entry, every run builds
+dependencies cold; the leg timeout is 45 minutes for that case. The cache
+key names the profile, so that entry is written; a profile change that
+kept the old key would restore the old subtree on every run and never
+save the new one.
