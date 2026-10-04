@@ -226,9 +226,7 @@ impl PinnedParquetReader {
             let (fetched, refused) = self.fetch_once(key, phase, range.start, range.end).await;
             let followed_a_refusal = matches!(
                 fetched,
-                Err(SingleFlightError::Upstream(
-                    CacheFetchError::BudgetRefused
-                ))
+                Err(SingleFlightError::Upstream(CacheFetchError::BudgetRefused))
             ) && refused
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
