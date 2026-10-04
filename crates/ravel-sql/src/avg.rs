@@ -57,7 +57,7 @@
 use std::sync::Arc;
 
 use datafusion::arrow::array::{
-    Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array,
+    Array, ArrayRef, BooleanArray, Decimal128Array, Decimal128Builder, Float64Array, Int64Array,
 };
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::{DataType, Field, FieldRef};
@@ -800,20 +800,57 @@ impl GroupsAccumulator for ExactIntegerAvgGroupsAccumulator {
     fn state(&mut self, emit_to: EmitTo) -> DFResult<Vec<ArrayRef>> {
         let sums = emit_to.take_needed(&mut self.sums);
         let counts = emit_to.take_needed(&mut self.counts);
-        let mut sum_values: Vec<Option<i128>> = Vec::with_capacity(sums.len());
+        // Built straight into exact-capacity arrays: staging the sums as a
+        // `Vec<Option<i128>>` costs 32 bytes per group on top of the two
+        // `Vec`s being drained, and that staging is memory the pool's
+        // reservation never sees (it only counts `size()`).
+        let mut sum_builder = Decimal128Builder::with_capacity(sums.len());
         for (sum, count) in sums.iter().zip(counts.iter()) {
             if *count > 0 {
-                sum_values.push(Some(checked_decimal128_value(*sum)?));
+                sum_builder.append_value(checked_decimal128_value(*sum)?);
             } else {
-                sum_values.push(None);
+                sum_builder.append_null();
             }
         }
-        let sum_array: Decimal128Array = sum_values
-            .into_iter()
-            .collect::<Decimal128Array>()
-            .with_precision_and_scale(38, 0)?;
-        let count_array: Int64Array = counts.into_iter().map(Some).collect();
+        drop(sums);
+        let sum_array = sum_builder.finish().with_precision_and_scale(38, 0)?;
+        let count_array = Int64Array::from_iter_values(counts);
         Ok(vec![Arc::new(sum_array), Arc::new(count_array)])
+    }
+
+    /// One state row per input row, so a partial aggregation that finds its
+    /// groups nearly all distinct can pass rows through instead of holding a
+    /// group table (`skip_partial_aggregation`, #680). Exact `i128` addition
+    /// is associative, so merging per-row states in the final stage gives the
+    /// same bits as folding the rows into a partial group first. A row the
+    /// filter drops, or whose value is NULL, becomes the state of a group that
+    /// saw no row: a NULL sum and a zero count, which `merge_batch` skips.
+    fn convert_to_state(
+        &self,
+        values: &[ArrayRef],
+        opt_filter: Option<&BooleanArray>,
+    ) -> DFResult<Vec<ArrayRef>> {
+        let ints = as_int64(&values[0])?;
+        let mut sum_builder = Decimal128Builder::with_capacity(ints.len());
+        let mut counts = Vec::with_capacity(ints.len());
+        for row in 0..ints.len() {
+            if row_is_filtered(opt_filter, row) || ints.is_null(row) {
+                sum_builder.append_null();
+                counts.push(0i64);
+            } else {
+                sum_builder.append_value(i128::from(ints.value(row)));
+                counts.push(1i64);
+            }
+        }
+        let sum_array = sum_builder.finish().with_precision_and_scale(38, 0)?;
+        Ok(vec![
+            Arc::new(sum_array),
+            Arc::new(Int64Array::from(counts)),
+        ])
+    }
+
+    fn supports_convert_to_state(&self) -> bool {
+        true
     }
 
     fn size(&self) -> usize {
@@ -1101,6 +1138,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `convert_to_state` (the skip-partial-aggregation path) followed by
+    /// `merge_batch` must give the same per-group bits as `update_batch` over
+    /// the same rows, including NULL values and filtered rows, which is what
+    /// lets a partial aggregation pass rows through without changing a result.
+    #[test]
+    fn exact_integer_convert_to_state_merges_to_the_update_batch_result() {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![
+            Some(10i64),
+            None,
+            Some(-7),
+            Some(i64::MAX),
+            Some(i64::MIN),
+            Some(5),
+            Some(9),
+            Some(1),
+        ]));
+        let group_indices = vec![0usize, 0, 1, 2, 2, 3, 3, 4];
+        let filter = BooleanArray::from(vec![true, true, true, true, true, false, true, true]);
+
+        let mut reference = ExactIntegerAvgGroupsAccumulator::new();
+        reference
+            .update_batch(&[Arc::clone(&values)], &group_indices, Some(&filter), 6)
+            .expect("update_batch must not fail");
+
+        let state = ExactIntegerAvgGroupsAccumulator::new()
+            .convert_to_state(&[values], Some(&filter))
+            .expect("convert_to_state must not fail");
+        assert_eq!(state.len(), 2, "state is a sum column and a count column");
+        assert_eq!(
+            state[0].len(),
+            8,
+            "one state row per input row, filtered or not"
+        );
+        let mut merged = ExactIntegerAvgGroupsAccumulator::new();
+        merged
+            .merge_batch(&state, &group_indices, None, 6)
+            .expect("merge_batch must not fail");
+
+        assert_eq!(
+            grouped_integer_bits(&mut reference),
+            grouped_integer_bits(&mut merged),
+            "per-row states merged in the final stage must equal the direct fold"
+        );
+        assert!(ExactIntegerAvgGroupsAccumulator::new().supports_convert_to_state());
     }
 
     /// `EmitTo::First` must drain exactly the first `n` groups and leave the
