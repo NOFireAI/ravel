@@ -2202,7 +2202,9 @@ fn render_ingest_shard_family(out: &mut String, mode: Mode, pipelines: &[IngestP
 
 /// Keyed log and span writes refused because an idempotency marker lookup
 /// probe failed with a store error (issue #2462), read from the process-global
-/// counters in [`crate::logs_ingest`]. Rendered only for the logs and spans
+/// counters in [`crate::logs_ingest`], and the marker probe GETs those lookups
+/// issued, read from [`ravel_ingest::idempotency_probe_gets`]. Rendered only
+/// for the logs and spans
 /// pipelines this process runs: metrics take no idempotency key, so that
 /// sample is structurally absent, not zero.
 fn render_idempotency_lookup_family(
@@ -2222,15 +2224,30 @@ fn render_idempotency_lookup_family(
     write_header(
         out,
         NAME,
-        "Keyed log and span writes refused with a retryable 503 / UNAVAILABLE because their idempotency marker lookup failed, by signal: a GET of a marker key failed with a store error other than not-found, or the lookup was still running at the request's ack deadline. Each refusal also logs a WARN line naming the key and the store error, or the deadline.",
+        "Keyed log and span writes refused with a retryable 503 / UNAVAILABLE because their idempotency marker lookup failed, by signal: a GET of a marker key failed with a store error other than not-found, or the lookup was still running at half of the request's ack deadline, the share it may use. Each refusal also logs a WARN line naming the key and the store error, or the deadline.",
         "counter",
     );
-    for signal in signals {
+    for &signal in &signals {
         write_sample(
             out,
             NAME,
             &[Label::Mode(mode), Label::Signal(signal)],
             crate::logs_ingest::idempotency_lookup_failures(signal),
+        );
+    }
+    const PROBES: &str = "ravel_ingest_idempotency_probe_gets_total";
+    write_header(
+        out,
+        PROBES,
+        "Idempotency marker probe GETs issued by keyed log and span writes' marker lookups, by signal, hits and misses alike: a lookup that hits near the current hour costs 3, one that misses costs one per hour of the dedup window plus 2.",
+        "counter",
+    );
+    for &signal in &signals {
+        write_sample(
+            out,
+            PROBES,
+            &[Label::Mode(mode), Label::Signal(signal)],
+            ravel_ingest::idempotency_probe_gets(signal),
         );
     }
 }
@@ -8960,13 +8977,13 @@ mod tests {
         );
     }
 
-    /// The idempotency lookup-failure counter renders one sample per marker
-    /// signal the process ingests, and none for metrics, which takes no key.
-    /// Values are process-global, so this pins the shape, not the count; the
-    /// logs and traces ingest tests pin the count.
+    /// The idempotency lookup-failure and probe-GET counters each render one
+    /// sample per marker signal the process ingests, and none for metrics,
+    /// which takes no key. Values are process-global, so this pins the shape,
+    /// not the count; the logs and traces ingest tests pin the failure count
+    /// and `ravel-ingest`'s idempotency tests pin the probe count.
     #[test]
     fn idempotency_lookup_failures_render_for_logs_and_spans_only() {
-        const NAME: &str = "ravel_ingest_idempotency_lookup_failures_total";
         let ingest = vec![
             IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot::default()),
             IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
@@ -8975,11 +8992,22 @@ mod tests {
         let mut body = String::new();
         render_idempotency_lookup_family(&mut body, Mode::Gateway, &ingest);
 
-        assert_eq!(body.matches(&format!("# TYPE {NAME} counter")).count(), 1);
-        for signal in ["logs", "spans"] {
-            let sample = format!("{NAME}{{mode=\"gateway\",signal=\"{signal}\"}} ");
-            assert_eq!(body.matches(&sample).count(), 1, "{signal}:\n{body}");
+        for name in [
+            "ravel_ingest_idempotency_lookup_failures_total",
+            "ravel_ingest_idempotency_probe_gets_total",
+        ] {
+            assert_eq!(body.matches(&format!("# TYPE {name} counter")).count(), 1);
+            for signal in ["logs", "spans"] {
+                let sample = format!("{name}{{mode=\"gateway\",signal=\"{signal}\"}} ");
+                assert_eq!(body.matches(&sample).count(), 1, "{signal}:\n{body}");
+            }
         }
+        assert!(
+            body.contains(
+                "# HELP ravel_ingest_idempotency_probe_gets_total Idempotency marker probe GETs"
+            ),
+            "{body}"
+        );
         assert!(!body.contains("signal=\"metrics\""), "{body}");
 
         let mut metrics_only = String::new();
