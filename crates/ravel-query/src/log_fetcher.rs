@@ -1372,6 +1372,19 @@ impl LogSegmentFetcher {
         saved > self.block_range.effective_projection_break_even() as f64
     }
 
+    /// The object size at or below which [`plan_segment`](Self::plan_segment)
+    /// reads the object whole, with no probe, and carries it to the scan: the
+    /// larger of the routing threshold and the ranged fetch's own size
+    /// crossover (the projection break-even under cost-based, ADR-2414
+    /// decision A3). At or below the crossover the scan's ranged fetch reads
+    /// the object whole anyway, so a plan-phase probe there would read it a
+    /// second time under another cache key. Off cost-based
+    /// [`Self::with_block_range_threshold`] pins both to the same value.
+    fn plan_whole_object_bound(&self) -> u64 {
+        self.block_range_threshold
+            .max(self.block_range.effective_projection_break_even())
+    }
+
     /// Per-object relevance from the catalog summary alone, with no object
     /// read: true iff the segment's event-ts span (`SegmentRef`'s
     /// `min_event_ts_ns..=max_event_ts_ns`, the same bounds the footer carries)
@@ -1887,13 +1900,14 @@ impl LogSegmentFetcher {
             // trusting blindly): the slow path's `ts_range_relevant` would return
             // `None` for a genuinely empty segment, and the fast path should agree
             // rather than returning `Some((0, ..))` for an input that should never
-            // reach a segment at all. `object_size > block_range_threshold` keeps
-            // the fast path strictly to the band where it actually saves a GET: at
-            // or below the threshold `tenant_bytes` already takes a single
+            // reach a segment at all. `object_size > plan_whole_object_bound()`
+            // keeps the fast path strictly to the band where it actually saves a
+            // GET: at or below that bound `tenant_bytes` already takes a single
             // whole-object read (`fetch_footer` has no matching whole-object
-            // crossover of its own, so below the threshold it would read the same
+            // crossover of its own, so below the bound it would read the same
             // object twice under two different cache keys instead of once).
-            if seg_ref.object_size > self.block_range_threshold
+            let whole_object_bound = self.plan_whole_object_bound();
+            if seg_ref.object_size > whole_object_bound
                 && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
                 && query.is_block_predicate_free()
                 && query.ts_min_ns <= seg_ref.min_event_ts_ns
@@ -1923,8 +1937,9 @@ impl LogSegmentFetcher {
             // The relevance check is the one the fallback's `tenant_bytes` runs: it
             // is what turns an out-of-window segment into the `None` the caller
             // drops, and unlike the fast path's containment test this branch's
-            // guard does not imply it.
-            if seg_ref.object_size > self.block_range_threshold
+            // guard does not imply it. The size guard is the fast path's, for
+            // the same reason.
+            if seg_ref.object_size > whole_object_bound
                 && seg_ref.min_event_ts_ns <= seg_ref.max_event_ts_ns
                 && Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
                 && Self::plan_skip_decidable(query)
@@ -2002,7 +2017,8 @@ impl LogSegmentFetcher {
 
             // Fallback: a predicate the skip index cannot decide (a `has_word`/text
             // content arm with only a per-block bloom, an attribute-equality POSTINGS
-            // prune, a stream filter), or a below-threshold object. Read as before --
+            // prune, a stream filter), or an object at or below
+            // `plan_whole_object_bound`. Read as before --
             // the survivor count then needs the reader's full prune over the fetched
             // buffer -- and hand no footer forward. This whole-object plan read is the
             // amplification #761 could not remove for these shapes; the caller counts
