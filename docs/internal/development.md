@@ -75,9 +75,14 @@ jobs then do not each recompile the overlapping crates from scratch.
 - The jobs that reclaim runner disk before compiling share one composite
   action, `.github/actions/free-disk-space`, instead of copying the same
   shell block. A lane that pulls no container image passes
-  `background: "true"`: the SDK directories are deleted in a detached
-  process, the image prune is skipped, and the job does not wait. Those
-  lanes end with a `df -h /` step that records their peak disk usage.
+  `background: "true"`: the same deletes run in a detached process and the
+  job does not wait. A lane that does pull an image must keep the default,
+  because the image prune would run beside the pull.
+- Those lanes also run `.github/actions/disk-usage` twice: `phase: start`
+  before the cleanup, which prints free space and samples it every 15
+  seconds, and `phase: report` as the last step, which prints the lowest
+  sample and fails the job under a 3 GiB floor. The cache save that runs
+  after a job's last step is outside the measurement.
 
 You do not need sccache or nextest on your machine. `cargo check` and the gate
 list above are enough for the local loop.

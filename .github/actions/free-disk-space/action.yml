@@ -5,11 +5,11 @@ description: >-
 inputs:
   background:
     description: >-
-      When "true", delete the SDK directories in a detached process and
-      return at once, so the job does not wait for space it only needs at
-      link time. The image prune is skipped in this mode: a prune running
-      beside a later pull can delete the image the job just fetched, so a
-      job that needs the image space reclaimed keeps the default.
+      When "true", run the same deletes in a detached process and return at
+      once, so the job does not wait for space it only needs at link time.
+      Never set it on a job that pulls or runs a container image: the image
+      prune would then run beside the pull and can delete the image the job
+      just fetched.
     required: false
     default: "false"
 runs:
@@ -20,19 +20,20 @@ runs:
       env:
         FREE_DISK_BACKGROUND: ${{ inputs.background }}
       run: |
-        remove_sdks() {
+        reclaim() {
           sudo rm -rf /usr/share/dotnet || true
           sudo rm -rf /opt/ghc || true
           sudo rm -rf "${ANDROID_HOME:-/usr/local/lib/android}" || true
           sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          docker image prune -af || true
         }
         if [ "$FREE_DISK_BACKGROUND" = "true" ]; then
           # Output goes to a file, not the step's pipe, so the step ends when
-          # this shell does and not when the deletes do.
-          ( remove_sdks ) > "${RUNNER_TEMP}/free-disk-space.log" 2>&1 &
-          disown
-          echo "removing preinstalled SDKs in the background"
+          # this shell does and not when the deletes do. The disk-usage
+          # action's report phase prints the file.
+          log="${RUNNER_TEMP:?RUNNER_TEMP is not set}/free-disk-space.log"
+          ( reclaim ) > "$log" 2>&1 &
+          echo "reclaiming disk in the background; output in $log"
         else
-          remove_sdks
-          docker image prune -af || true
+          reclaim
         fi

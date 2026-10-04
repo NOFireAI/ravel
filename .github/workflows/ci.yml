@@ -825,8 +825,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      # Background form (issue #2517): this lane pulls no container image, and
-      # the space is first needed at link time, minutes after this step.
+      # Sampled from here to the report step at the end of the job, so the
+      # question of whether this lane needs the cleanup at all (ADR-0053 D4)
+      # has a number: free space before the cleanup, and the lowest it fell.
+      # Background cleanup (issue #2517): this lane pulls no container image,
+      # and the space is first needed at link time, minutes after this step.
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
       - uses: ./.github/actions/free-disk-space
         with:
           background: "true"
@@ -854,11 +860,11 @@ jobs:
       # unchanged and only debug info is dropped.
       - name: Doctests
         run: cargo test --locked --doc --profile ci --workspace
-      # Peak usage per lane, so dropping the cleanup step outright can rest on
-      # a number (issue #2517).
-      - name: Disk usage at the end of the job
+      - name: Report the lowest free space the job reached
         if: always()
-        run: df -h /
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
 
   # The SQL surface. Two things the `check` job cannot
   # cover:
@@ -890,6 +896,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
       - uses: ./.github/actions/free-disk-space
         with:
           background: "true"
@@ -915,9 +924,11 @@ jobs:
           # float edge-case and multi-segment-overlap space than a local run.
           PROPTEST_CASES: 512
         run: cargo nextest run --locked -p ravel-sql --test differential
-      - name: Disk usage at the end of the job
+      - name: Report the lowest free space the job reached
         if: always()
-        run: df -h /
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
 
   # The Flight SQL surface. Until this job existed, every test
   # behind ravel-server's `flight-sql` feature was compiled and discarded: the
@@ -945,6 +956,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
       - uses: ./.github/actions/free-disk-space
         with:
           background: "true"
@@ -964,9 +978,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Flight SQL tests
         run: cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql
-      - name: Disk usage at the end of the job
+      - name: Report the lowest free space the job reached
         if: always()
-        run: df -h /
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
 
   # Never-compiled ravel-bench feature combinations (ADR-0053 D6). Six cargo
   # features are off by default and no other job builds them, so a break in
@@ -1030,6 +1046,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
       - uses: ./.github/actions/free-disk-space
         with:
           background: "true"
@@ -1099,9 +1118,11 @@ jobs:
         # unrelated to the seam.
       - name: Test ravel-logseg + ravel-ingest --features stage-timing
         run: cargo test --locked -p ravel-logseg -p ravel-ingest --features stage-timing
-      - name: Disk usage at the end of the job
+      - name: Report the lowest free space the job reached
         if: always()
-        run: df -h /
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
 
   # The `ravel-server --features otap` lane (issue #1590), split out of
   # `features` above so no single job carries every feature lane. This links
@@ -1155,6 +1176,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
       - uses: ./.github/actions/free-disk-space
         with:
           background: "true"
@@ -1178,9 +1202,11 @@ jobs:
         # tree. `--all-targets` on the clippy step above still compiles it.
       - name: Test ravel-server --features otap
         run: cargo test --locked -p ravel-server --features otap --lib
-      - name: Disk usage at the end of the job
+      - name: Report the lowest free space the job reached
         if: always()
-        run: df -h /
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
 
   # The whole workspace with every feature of every member on at once (issue
   # #1925). Each lane above builds one feature set; none builds their union, so
@@ -1218,7 +1244,12 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
       - uses: ./.github/actions/free-disk-space
+        with:
+          background: "true"
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -1231,6 +1262,11 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy --workspace --all-features
         run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Report the lowest free space the job reached
+        if: always()
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
 
   # Supply-chain gate. deny.toml encodes an advisory,
   # license, ban, and source policy that `make audit` runs locally but no
@@ -2156,6 +2192,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - uses: ./.github/actions/disk-usage
+        with:
+          phase: start
       - uses: ./.github/actions/free-disk-space
         with:
           background: "true"
@@ -2193,9 +2232,11 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: lcov.info
           fail_ci_if_error: false
-      - name: Disk usage at the end of the job
+      - name: Report the lowest free space the job reached
         if: always()
-        run: df -h /
+        uses: ./.github/actions/disk-usage
+        with:
+          phase: report
 
   # Container-first quickstart verification (ADR-0081 decisions 5, 6, 7). Builds
   # the pull request's OWN ravel-server (the shipping `--features

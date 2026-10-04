@@ -1,0 +1,67 @@
+name: Disk usage
+description: >-
+  Measure how close a job comes to filling the runner's root volume. The
+  start phase prints free space and samples it every 15 seconds for the rest
+  of the job; the report phase prints the lowest sample and fails the job
+  when it is under the floor. The cache save that runs after a job's last
+  step is outside the measurement.
+inputs:
+  phase:
+    description: >-
+      "start", as the first step after checkout and before any cleanup, or
+      "report", as the last step with `if: always()`.
+    required: true
+  min-free-gb:
+    description: >-
+      Report phase only. The job fails when the lowest sample is below this
+      many GiB, so a lane drifting toward a full disk goes red with a number
+      before it goes red with a linker error.
+    required: false
+    default: "3"
+runs:
+  using: composite
+  steps:
+    - name: Disk usage
+      shell: bash
+      env:
+        DISK_USAGE_PHASE: ${{ inputs.phase }}
+        DISK_USAGE_MIN_FREE_GB: ${{ inputs.min-free-gb }}
+      run: |
+        samples="${RUNNER_TEMP:?RUNNER_TEMP is not set}/disk-free-kb.log"
+        case "$DISK_USAGE_PHASE" in
+          start)
+            df -h /
+            (
+              while :; do
+                df --output=avail -k / | awk 'NR == 2 { print $1 }' >> "$samples"
+                sleep 15
+              done
+            ) > /dev/null 2>&1 &
+            ;;
+          report)
+            df -h /
+            cleanup_log="${RUNNER_TEMP}/free-disk-space.log"
+            if [ -s "$cleanup_log" ]; then
+              echo "background cleanup output:"
+              cat "$cleanup_log"
+            fi
+            if [ ! -s "$samples" ]; then
+              echo "::error::no free-space samples were recorded; the start phase did not run"
+              exit 1
+            fi
+            count=$(wc -l < "$samples")
+            first_kb=$(awk 'NR == 1 { print $1 }' "$samples")
+            min_kb=$(awk 'NR == 1 || $1 < m { m = $1 } END { print m }' "$samples")
+            floor_kb=$((DISK_USAGE_MIN_FREE_GB * 1024 * 1024))
+            echo "free space before cleanup: $((first_kb / 1024)) MiB"
+            echo "lowest free space: $((min_kb / 1024)) MiB over ${count} samples"
+            if [ "$min_kb" -lt "$floor_kb" ]; then
+              echo "::error::free space fell to $((min_kb / 1024)) MiB, under the ${DISK_USAGE_MIN_FREE_GB} GiB floor"
+              exit 1
+            fi
+            ;;
+          *)
+            echo "::error::unknown disk-usage phase '$DISK_USAGE_PHASE'"
+            exit 1
+            ;;
+        esac
