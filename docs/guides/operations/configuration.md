@@ -812,17 +812,19 @@ Unlike the read cache, the spill directory is checked at startup: with
 cannot create `<cache-dir>/sql-spill`, measure its free space, or take its own
 directory's lock. `--sql-spill off` starts without touching it.
 
-An `ORDER BY` placed directly over an aggregation with no float `GROUP BY`
-column (or over the select list directly above it) gets the aggregation's
-`GROUP BY` columns appended as trailing tiebreak terms, ascending with nulls
-last, whatever the spill setting and whichever aggregates it computes. The
-order is then total, so a qualifying statement returns the same rows in the
-same order with spill forced, with spill off, and in memory. A `GROUP BY`
-column the select list renames is matched under its new name, one it leaves
-out is carried to the sort and dropped again, and an alias that only shares a
-`GROUP BY` column's name is not taken for it. An `ORDER BY` over a float
-`GROUP BY` column, over grouping sets, over a `HAVING` filter, or over a
-nested subquery is left as written, and the query does not spill.
+An `ORDER BY` placed directly over an aggregation built only from `COUNT`,
+`SUM` and `AVG`, with no float `GROUP BY` column (or over the select list
+directly above it), gets the aggregation's `GROUP BY` columns appended as
+trailing tiebreak terms, ascending with nulls last, whatever the spill
+setting and whatever the types of the aggregated columns. The order is then
+total, so a qualifying statement returns the same rows in the same order
+with spill forced, with spill off, and in memory. A `GROUP BY` column the
+select list renames is matched under its new name, one it leaves out is
+carried to the sort and dropped again, and an alias that only shares a
+`GROUP BY` column's name is not taken for it. An `ORDER BY` over any other
+aggregate (such as `MAX` or `MIN`), over a float `GROUP BY` column, over
+grouping sets, over a `HAVING` filter, or over a nested subquery is left as
+written, and the query does not spill.
 
 ## Retention and garbage-collection configuration
 

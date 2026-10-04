@@ -613,8 +613,8 @@ posture.
 
 **Requirement 4: a `Sort` over a spill-exact aggregate is eligible.** Before
 planning, `rewrite_sort_group_key_tie_order` appends to every `Sort` whose
-input is an `Aggregate` with no float group-by key, or a `Projection`
-directly over one, the
+input is an `Aggregate` with no float group-by key and only `count`, `sum`
+or `avg` aggregate functions, or a `Projection` directly over one, the
 aggregate's group-by expressions that are not already sort terms, in group
 order, ascending with nulls last, as trailing sort terms; `fetch` is
 unchanged. Group keys are unique per aggregate output row, so the sort key
@@ -628,14 +628,17 @@ removed again by a projection back to the statement's schema.
 
 The rewrite is applied to the plan a statement executes whenever that plan
 has a `Sort` of this shape, whatever the spill setting (on, off, or
-disabled by `--sql-spill off`) and whatever the aggregate computes: the
-gate reads only the `Sort`'s input shape and the group keys' types, not
-spill eligibility, because that plan has not been through the analyzer
-whose type coercion eligibility depends on (an `avg` over an `Int32`
-column is exact only once its argument is coerced to `Int64`). The order
-is therefore total and the same in every configuration, including for a
-statement whose aggregates make it ineligible. For a statement that does
-not spill, the cost
+disabled by `--sql-spill off`): the gate reads only the `Sort`'s input
+shape, the group keys' types and the aggregate function names, never
+argument types or spill eligibility, because that plan has not been
+through the analyzer whose type coercion eligibility depends on (an `avg`
+over an `Int32` column is exact only once its argument is coerced to
+`Int64`). The order is therefore total and the same in every
+configuration, including for a `sum` or `avg` over floats, which never
+spills. A `Sort` over any other aggregate function is left as written: it
+can never be eligible, and a trailing term would keep a `max` or `min`
+top-k from the bounded aggregate of issue #1402, whose gate requires a
+single sort term. For a statement that does not spill, the cost
 is comparing the extra terms on rows whose earlier terms tie, plus carrying
 a projected-through key column to the sort.
 The spill decision is taken on the separately planned classification plan;

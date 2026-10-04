@@ -1403,8 +1403,9 @@ async fn an_order_by_alias_named_like_a_group_key_gives_the_same_top_ten_spilled
 /// Issue #2416: `avg` over an `Int32` column is spill-exact only once the
 /// analyzer has coerced its argument to `Int64`, so the plan `ctx.sql`
 /// returns, before analysis, is not spill-eligible even apart from its sort
-/// order. The executed plan's tiebreak rewrite is gated on the `Sort`'s shape
-/// and group key types alone, so it still makes the order total, the
+/// order. The executed plan's tiebreak rewrite is gated on the `Sort`'s shape,
+/// group key types and aggregate function names, never argument types, so it
+/// still makes the order total, the
 /// executed-plan re-check passes, and the statement spills with the same top
 /// ten as in memory and with spill off.
 ///
