@@ -65,7 +65,7 @@ Named non-goals (unchanged gaps, referenced not re-litigated): the ADR-0046 loca
 
 Failure semantics: if the flush fails, every query in the batch fails (HTTP 503 / Flight `Unavailable`), `audit_mode=required` being the default. During an S3 outage queries fail closed instead of running unaudited — the precise inversion of the lossiness gap. `audit_mode=best-effort` remains available as an explicit, documented opt-out (dev, single-tenant labs); choosing it is visible configuration, per "approximation is opt-in and visible."
 
-Cost and latency: the response tail gains up to `max_age` plus one dual-PUT round trip (S3 PUT p50 ~10-30 ms). PUT count drops from 2/query to 2/flush — at 100 queries/s and 25 ms batching, from 200 PUTs/s to <=80/s worst case and far fewer under load, directly shrinking the keyspace growth rate before retention even runs.
+Cost and latency: the response tail gains up to `max_age` plus one dual-PUT round trip (S3 PUT p50 ~10-30 ms). PUT count drops from 2/query to 2/flush — at 100 queries/s and 25 ms batching, from 200 PUTs/s to <=80/s worst case (at most 160 PUTs/s under the idle-flush amendment below) and far fewer under load, directly shrinking the keyspace growth rate before retention even runs.
 
 **2c. Bounded keyspace: maintain the query-audit shard.** `Signal::Audit` shard `QUERY_AUDIT_SHARD=1` joins the maintained set as a fourth maintenance target with its own policy knob: RLOG compaction (existing machinery, new signal/shard parameter) and a dedicated `audit_retention` window (default 90 d, configurable; deployments with regulatory retention set it to their obligation). Sweep remains horizon-gated and passes through `LegalHoldCheck`, so a placed legal hold protects audit evidence exactly as it protects data. Legal-hold shard 0 stays excluded from maintenance (its growth is per operator action, not per query) and stays deny-delete forever.
 
@@ -215,3 +215,66 @@ max_age` + one dual-PUT RTT bound assumes a healthy store, and against a
 degraded one the worst case is `AUDIT_WRITE_BUDGET` (30 seconds) for each
 tenant group written ahead of and including the query's own,
 not the unbounded retry ladder the bullet's original wording implied.
+
+## Amendment (2026-10-04): an event that finds the pipeline idle flushes at once
+
+<!-- amendment-applies: sections="2. Audit: one evidential pipeline for every query surface" pointer="idle-flush amendment" -->
+
+This is the idle-flush amendment that ADR-2509 decision 2 calls for. Section
+2b flushes a batch on `max_batch` records or `max_age`, so a query that
+arrives alone waits the whole `max_age` (25 ms by default) for a batch that
+nothing else will join. Sequential traffic always arrives alone: the next
+statement is submitted only after the previous response. ADR-2509 measured
+that wait as part of the per-statement floor.
+
+**The idle trigger.** The flush loop (`run_flush_loop`) now flushes an event
+at once, without opening a `max_age` window, when all three of these hold
+for it:
+
+- nothing else is queued behind it;
+- it was not submitted while a flush was in flight. Every flush is awaited
+  inline on the loop, so the loop records the instant its last flush ended,
+  and each submission carries the instant it was enqueued; a submission
+  enqueued before that end arrived during the flush;
+- the loop received its previous event at least `max_age` earlier.
+
+The first event the pipeline ever receives qualifies. Every other event
+opens or joins a window that flushes at `max_batch` or `max_age`, whichever
+comes first, exactly as section 2b describes, including events submitted
+during a flush and events within `max_age` of the one before.
+
+**Cost, set against section 2b's PUT-spend rationale.** Section 2b batches
+to cut PUTs from two per query to two per flush, and the rejected
+synchronous per-query dual-PUT survives only as the `max_batch=1`
+configuration, one PUT pair per event. Without the third condition, steady
+traffic on a fast store would find the queue empty and no flush in flight at
+almost every event, and degenerate to that outcome. With it:
+
+- idle flushes are at least `max_age` apart, and each adds at most one PUT
+  pair over the window-only loop on the same arrival schedule, because the
+  triggering event flushes alone instead of sharing a window with the events
+  behind it;
+- so the pair count is at most twice the window-only loop's on any arrival
+  schedule, and at most one extra pair per `max_age` of wall time;
+- traffic arriving more often than once per `max_age` never takes the idle
+  path after its first event, and batches as before.
+
+Section 2b's worst case at 100 queries/s and 25 ms batching therefore rises
+from at most 80 PUTs/s to at most 160 PUTs/s, still below the 200 PUTs/s of
+one pair per query. That is a bound, not the expected rate: 100 queries/s
+arriving evenly, every 10 ms, never takes the idle path after its first
+event and stays at the window-only loop's rate.
+
+**The durability contract is unchanged.** An idle event is written by the
+same flush path as a batch: one data object, then its commit record, in the
+`audit_write.rs` durability order. Its submitter still awaits that flush
+before the response is released. A failed flush still fails the submitter
+closed in `required` mode and releases it in `best-effort` mode, with the
+PUT retry ladder of the 2026-09-27 amendment in front of that rule.
+
+**The numbers from ADR-2509.** On S3, the query-audit write was about 123 ms
+of the per-statement floor: the 25 ms `max_age` wait, then the data object
+and its commit record at about 49 ms each. For sequential traffic this
+amendment removes the 25 ms wait. The two PUTs of about 49 ms each remain,
+and they are the largest part of the floor on a folded tenant; ADR-2509
+defers them.

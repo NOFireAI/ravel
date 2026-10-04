@@ -34,7 +34,10 @@ cannot be made durable, so a query never outlives its own trail.
 deployment that would rather serve unaudited than fail closed.
 `--audit-max-batch` and `--audit-max-age` bound how many records the pipeline
 groups into one write and how long a record waits before that group is forced
-out; unset, both take the pipeline's own defaults. Installed only in the
+out; unset, both take the pipeline's own defaults. A record that finds the
+pipeline idle (nothing else queued, no write in progress, and no record in the
+last `--audit-max-age`) is written at once instead of waiting, so sequential
+queries do not pay the batching wait. Installed only in the
 query-serving modes (`all` and `query`); `maintain` and `gateway` serve no
 query surface and install no pipeline.
 
