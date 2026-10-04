@@ -2509,17 +2509,18 @@ impl SqlExecutor {
                 self.fetcher.whole_object_threshold(),
                 self.fetcher.get_limiter_permits() as u64,
             ),
-            // `block_range_threshold` is the knob `plan_segment` itself
-            // routes on (`log_fetcher.rs:1368,1398`): at or below it there is
-            // no probe at all and the read is one whole-object GET, above it
-            // a footer probe precedes a dependent read, so it is the correct
-            // input to `depth_for_object`. `effective_whole_object_threshold`
-            // is a different, larger-by-default knob governing a later,
-            // pre-probe crossover inside `BlockRangeFetcher`
-            // (`log_fetcher.rs:4481`) and would be the wrong choice here;
-            // alerts and audit read through this same `log_fetcher`.
+            // `plan_whole_object_bound` is the bound `plan_segment`'s guard
+            // routes on: the larger of the routing threshold and the
+            // projection break-even, so at or below it the read is one
+            // whole-object GET with no probe, and above it a footer probe
+            // precedes a dependent read. The routing threshold alone would
+            // report a probe chain for an object under the break-even that
+            // the plan reads whole. Above the bound the scan's fast path may
+            // still read whole when `ranged_projection_pays` declines, so the
+            // depth stays an upper bound there. Alerts and audit read
+            // through this same `log_fetcher`.
             TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => (
-                self.log_fetcher.block_range_threshold(),
+                self.log_fetcher.plan_whole_object_bound(),
                 self.log_fetcher.get_limiter_permits() as u64,
             ),
             // `SpanSegmentFetcher` has no block-range/whole-object split: it
@@ -5505,6 +5506,57 @@ mod tests {
             SqlConfig::default(),
             1 << 30,
         )
+    }
+
+    /// A logs statement's dependency depth reads the bound `plan_segment`
+    /// routes on, `plan_whole_object_bound`: a 1,000,000 byte object above the
+    /// 524,288 byte routing threshold and under the 31,500,000 byte
+    /// projection break-even is read whole with no probe, depth 1. Fails
+    /// against feeding `block_range_threshold()`, which reports the probe
+    /// chain's depth 4.
+    #[test]
+    fn sql_io_shape_reports_whole_object_depth_under_the_break_even() {
+        use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef};
+        use ravel_object_store::memory::MemoryStore;
+
+        let store = Arc::new(MemoryStore::new());
+        let catalog = Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("cat"));
+        let log_fetcher = LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(524_288)
+            .with_projection_break_even_bytes(Some(31_500_000));
+        assert_eq!(log_fetcher.plan_whole_object_bound(), 31_500_000);
+        let exec = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            log_fetcher,
+            SpanSegmentFetcher::new(store),
+            SqlConfig::default(),
+            1 << 30,
+        );
+        let snapshot = Snapshot {
+            segments: vec![SegmentRef {
+                data_object_key: "t/obj.rlog".to_string(),
+                object_size: 1_000_000,
+                min_event_ts_ns: 0,
+                max_event_ts_ns: 1,
+                ingest_hour_bucket: 0,
+                sample_count: 1,
+                series_count: 0,
+                shard: 0,
+                content_hash: [0u8; 32],
+                writer_id: Uuid::from_u128(1),
+                writer_epoch: 1,
+                writer_seq: 1,
+                created_unix_ns: 0,
+                level: SegmentLevel::L0,
+                segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+                declared_column_stats: Default::default(),
+            }],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let shape = exec.sql_io_shape(TargetSignal::Logs, &snapshot, &PhaseAccounting::new(), 0);
+        assert_eq!(shape.dependency_depth, 1);
     }
 
     /// ADR-0069 decision 2: a tenant idle past the TTL has its
