@@ -562,8 +562,11 @@ source wins:
    `RAVEL_SQL_SPILL_MAX_BYTES` when it is set alone, and otherwise
    `derive_spill_max_bytes`: half the free bytes measured once at startup on
    the volume backing `<cache-dir>/sql-spill`, capped at four times
-   `memory_budget_bytes`, floored at 1 GiB. With the host's memory unknown
-   the budget is unbounded and only the half-of-free and floor clauses
+   `memory_budget_bytes`, and raised to 1 GiB when that cap is below it.
+   When half the free bytes is itself below 1 GiB, spill is disabled
+   instead, so a derived ceiling is never below 1 GiB and never more than
+   half the free bytes. With the host's memory unknown the budget is
+   unbounded and only the half-of-free clause and the 1 GiB threshold
    apply.
 4. Otherwise spill is disabled.
 
@@ -580,7 +583,9 @@ process that runs the maintenance loop (`maintain` mode). No second
 identity is minted for spill.
 Startup logs the outcome as two `performance default resolved` lines,
 `sql_spill_dir` and `sql_spill_max_bytes`, each with a `source` of `env`,
-`cache-dir`, `env-override`, `derived`, `flag-off` or `unset`.
+`cache-dir`, `env-override`, `derived`, `flag-off`, `unset` or, for the
+disabled case of item 3, `cache-dir-insufficient-space` on both lines
+together with a WARN line.
 
 **Requirement 2: the ceiling is one process-wide bound.** The resolved
 ceiling (`SpillConfig::max_bytes`, derived or configured) bounds the scratch

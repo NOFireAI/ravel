@@ -1280,8 +1280,10 @@ pub struct Cli {
     /// `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` pair; else, with
     /// `--cache-dir` set, `<cache-dir>/sql-spill/<instance-id>` under a ceiling
     /// of half the volume's free bytes at startup, capped at four times the
-    /// memory budget and floored at 1 GiB (`RAVEL_SQL_SPILL_MAX_BYTES` alone
-    /// replaces that ceiling); else no spill. The ceiling bounds all of the
+    /// memory budget and raised to 1 GiB when that cap is lower, with spill
+    /// off when half the free bytes is below 1 GiB
+    /// (`RAVEL_SQL_SPILL_MAX_BYTES` alone replaces that ceiling); else no
+    /// spill. The ceiling bounds all of the
     /// process's queries together. `off` disables spill whatever the
     /// environment or `--cache-dir` says. The startup log's
     /// `sql_spill_dir` and `sql_spill_max_bytes` lines report the outcome.
@@ -1955,9 +1957,11 @@ pub struct Cli {
     /// share (there is no separate disk-tier capacity flag). The
     /// directory is created lazily on first admission and is never
     /// required to exist; a missing, full, or corrupt cache directory degrades
-    /// to a store read, never a query error. SQL spill is the exception: when
-    /// it resolves under this directory (see `--sql-spill`), startup creates
-    /// `<cache-dir>/sql-spill` and refuses to start if it cannot.
+    /// to a store read, never a query error. SQL spill is the exception:
+    /// unless `--sql-spill off` or `RAVEL_SQL_SPILL_DIR` is set, startup
+    /// creates `<cache-dir>/sql-spill` and refuses to start if it cannot, and
+    /// spill is off when half the volume's free bytes is below 1 GiB (see
+    /// `--sql-spill`).
     ///
     /// Encryption posture (ADR-0046 decision 7): bytes this process writes to
     /// this directory are NOT encrypted by the SSE-KMS object-storage path.

@@ -172,18 +172,24 @@ pub const DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 /// [`DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE`] times the memory budget, and
 /// floored at [`DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES`]. Half, not all, of free
 /// space so spill leaves room for whatever else shares the volume (another
-/// process, the OS itself). Below 2 GiB free the floor wins instead, and at
-/// 1 GiB free or less the ceiling is everything that is free or more. The
-/// memory-budget cap keeps the derived ceiling from outgrowing what the
-/// process's spilling queries could plausibly need; the floor keeps a
-/// nearly-full volume from deriving a
-/// ceiling so small every spill attempt immediately exhausts its budget.
-pub fn derive_spill_max_bytes(free_bytes: u64, memory_budget_bytes: u64) -> u64 {
+/// process, the OS itself). The memory-budget cap keeps the derived ceiling
+/// from outgrowing what the process's spilling queries could plausibly need.
+///
+/// `None`, spill off, when half the free space is below the floor: a ceiling
+/// the volume cannot hold would let a spilling query write until the volume is
+/// full. The floor therefore only ever raises a memory-budget cap below it,
+/// never half of free space.
+pub fn derive_spill_max_bytes(free_bytes: u64, memory_budget_bytes: u64) -> Option<u64> {
     let half_free = free_bytes / 2;
+    if half_free < DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES {
+        return None;
+    }
     let memory_cap = memory_budget_bytes.saturating_mul(DERIVED_SPILL_MAX_BYTES_MEMORY_MULTIPLE);
-    half_free
-        .min(memory_cap)
-        .max(DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES)
+    Some(
+        half_free
+            .min(memory_cap)
+            .max(DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES),
+    )
 }
 
 /// The inputs a `--cache-dir`-configured deployment resolves a
@@ -272,7 +278,8 @@ impl SpillConfig {
     ///    ceiling is `env_quota` when it alone is set (the env quota overrides
     ///    the derived ceiling under a `--cache-dir` deployment), else
     ///    [`derive_spill_max_bytes`] of `cache_dir`'s free bytes and memory
-    ///    budget.
+    ///    budget. When that derivation finds too little free space it is
+    ///    `Ok(None)`: spill off.
     /// 3. Neither 1 nor 2: `Ok(None)`, the no-spill default.
     ///
     /// `env_dir` set with `env_quota` unset is always
@@ -302,7 +309,11 @@ impl SpillConfig {
         let Some(cache_dir) = cache_dir else {
             return Ok(None);
         };
-        let max_bytes = derive_spill_max_bytes(cache_dir.free_bytes, cache_dir.memory_budget_bytes);
+        let Some(max_bytes) =
+            derive_spill_max_bytes(cache_dir.free_bytes, cache_dir.memory_budget_bytes)
+        else {
+            return Ok(None);
+        };
         Ok(Some(SpillConfig {
             dir: cache_spill_dir(cache_dir.cache_dir, cache_dir.instance_id),
             max_bytes,
@@ -709,7 +720,7 @@ mod tests {
             Some(cache_dir_spill(free_bytes, memory_budget_bytes)),
         )
         .expect("a cache-dir-only resolution never errors")
-        .expect("a configured cache-dir always enables spill");
+        .expect("10 GiB free enables cache-dir spill");
         assert_eq!(
             resolved.dir,
             PathBuf::from("/var/cache/ravel/sql-spill/inst-1")
@@ -717,15 +728,41 @@ mod tests {
         assert_eq!(resolved.max_bytes, 4 * 1024 * 1024 * 1024);
     }
 
-    /// The derived ceiling floors at 1 GiB even on a nearly-full volume. A
-    /// wrong implementation with no floor would derive a ceiling so small
-    /// (or zero) that every spill attempt immediately exhausts its budget.
+    /// The 1 GiB floor raises a memory-budget cap below it, and only when half
+    /// the free space can hold it: at exactly 2 GiB free (half = 1 GiB) under
+    /// a 1 KiB budget the ceiling is 1 GiB, one byte pair less free and spill
+    /// is off, and at 800 MiB and at 0 free spill is off.
+    ///
+    /// Prove-the-test: the floor applied last, after the clamp
+    /// (`half_free.min(memory_cap).max(FLOOR)` with no early return), returns
+    /// 1 GiB below 2 GiB free and the `2 GiB - 2` row reads
+    /// `Some(1073741824)`; the floor applied before the clamp
+    /// (`half_free.max(FLOOR).min(memory_cap)`, no early return) returns the
+    /// 4 KiB cap and the 2 GiB row reads `Some(4096)`.
     #[test]
-    fn resolve_cache_dir_ceiling_floors_at_one_gib() {
-        let resolved = SpillConfig::resolve(None, None, Some(cache_dir_spill(1024, 1024)))
-            .expect("a cache-dir-only resolution never errors")
-            .expect("a configured cache-dir always enables spill");
-        assert_eq!(resolved.max_bytes, DERIVED_SPILL_MAX_BYTES_FLOOR_BYTES);
+    fn derive_resolves_off_when_half_the_free_space_is_below_the_floor() {
+        const MIB: u64 = 1024 * 1024;
+        const GIB: u64 = 1024 * MIB;
+        for (free_bytes, expected) in [
+            (2 * GIB, Some(GIB)),
+            (2 * GIB - 2, None),
+            (800 * MIB, None),
+            (0, None),
+        ] {
+            assert_eq!(
+                derive_spill_max_bytes(free_bytes, 1024),
+                expected,
+                "free_bytes={free_bytes}"
+            );
+            let resolved =
+                SpillConfig::resolve(None, None, Some(cache_dir_spill(free_bytes, 1024)))
+                    .expect("a cache-dir-only resolution never errors");
+            assert_eq!(
+                resolved.map(|config| config.max_bytes),
+                expected,
+                "resolve, free_bytes={free_bytes}"
+            );
+        }
     }
 
     /// `RAVEL_SQL_SPILL_MAX_BYTES` alone, with no directory, overrides the
@@ -742,7 +779,7 @@ mod tests {
             Some(cache_dir_spill(1_000_000_000_000, 1024 * 1024 * 1024)),
         )
         .expect("a dir-less env quota under cache-dir never errors")
-        .expect("a configured cache-dir always enables spill");
+        .expect("an env quota under cache-dir enables spill");
         assert_eq!(
             resolved.dir,
             PathBuf::from("/var/cache/ravel/sql-spill/inst-1")

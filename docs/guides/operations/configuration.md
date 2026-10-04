@@ -703,10 +703,14 @@ an error naming the missing variable.
 
 The derived ceiling is half the free bytes on the volume backing
 `<cache-dir>/sql-spill`, measured once at startup, capped at four times the
-process memory budget (`memory_budget_bytes` in the startup log), and never
-below 1 GiB. On a volume with 200 GiB free and the 30,064,771,072-byte budget
-of a 30 GiB host, that is 107,374,182,400 bytes: half the free space, below
-the 120,259,084,288-byte cap.
+process memory budget (`memory_budget_bytes` in the startup log), and raised
+to 1 GiB when that cap is below 1 GiB. When half the free bytes is below
+1 GiB, spill is off instead: both startup lines read `value=none
+source=cache-dir-insufficient-space` and a WARN line says why. A derived
+ceiling is therefore never below 1 GiB and never more than half the free
+bytes. On a volume with 200 GiB free and the 30,064,771,072-byte budget of a
+30 GiB host, that is 107,374,182,400 bytes: half the free space, below the
+120,259,084,288-byte cap.
 
 The ceiling is one budget for the whole process. A qualifying query reserves
 its own spill limit out of it before it starts: the ceiling, or whatever is
@@ -724,8 +728,8 @@ same `setting=... value=... source=...` layout as `sql_max_query_bytes`:
 
 | `setting` | `value` | `source` |
 |---|---|---|
-| `sql_spill_dir` | the spill directory, or `none` | `env`, `cache-dir`, `flag-off` or `unset` |
-| `sql_spill_max_bytes` | the process spill ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `flag-off` or `unset` |
+| `sql_spill_dir` | the spill directory, or `none` | `env`, `cache-dir`, `cache-dir-insufficient-space`, `flag-off` or `unset` |
+| `sql_spill_max_bytes` | the process spill ceiling in bytes, or `none` | `env`, `env-override` (the variable alone over a `--cache-dir` root), `derived`, `cache-dir-insufficient-space`, `flag-off` or `unset` |
 
 Under `--cache-dir` the layout is:
 
