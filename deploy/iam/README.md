@@ -441,7 +441,7 @@ and #2350:
 | The alert evaluator: `acquire_lease` writes `t/<tenant_hash>/a/alert-lease` (`CreateIfAbsent`, or a GET then `CasVersion`), `read_alert_state_memo` reads and `write_alert_state_memo` overwrites `t/<tenant_hash>/a/state/latest`, and each transition is published as an L0 data object and a commit record (`CreateIfAbsent`) | `query`, `all` | `s3:GetObject`, `s3:PutObject` | `QueryRead` `t/*/a/alert-lease` and `t/*/a/state/latest`; `QueryWrite` `t/*/a/alert-lease`, `t/*/a/state/latest`, `t/*/a/l0/*` and `t/*/a/c/*` |
 | Alert retention: `alert_keep_set` reads `t/<tenant_hash>/a/state/latest`, and `alert_keyspace_is_empty` lists `t/<tenant_hash>/a/` and `quarantine/t/<tenant_hash>/a/` | `maintain` | `s3:GetObject`, `s3:ListBucket` | `MaintainRead` `t/*/a/state/latest`; `MaintainList` `s3:prefix` `t/*/a/` and `quarantine/t/*/a/` |
 | `ravel-cli tenant parquet-grant add` and `remove` write `t/<tenant_hash>/pq/grants` through `replace_whole` (`crates/ravel-pqtable/src/grants.rs`: a GET, then a PUT with `CreateIfAbsent` or `CasVersion`) | Admin | `s3:PutObject` | `AdminWrite` `t/*/pq/grants` (the read is `AdminRead` `t/*`) |
-| `parquet-grant add` qualifies the target bucket with `probe_not_ravel_bucket` (`crates/ravel-object-store/src/external/probe.rs`), which PUTs `sys/pq-probe/<32 hex chars>` and DELETEs it before returning | Admin | `s3:PutObject`, `s3:DeleteObject` | `AdminWrite` and `AdminProbeDelete` `sys/pq-probe/*` |
+| `parquet-grant add` qualifies the target bucket with `probe_not_ravel_bucket` (`crates/ravel-object-store/src/external/probe.rs`), which PUTs `sys/pq-probe/<32 hex chars>` and DELETEs it before returning, including when the PUT is reported failed; a failed inline DELETE is retried by a background DELETE, which does not run if the process exits first | Admin | `s3:PutObject`, `s3:DeleteObject` | `AdminWrite` and `AdminProbeDelete` `sys/pq-probe/*` |
 | The Parquet table provider (`crates/ravel-sql/src/parquet.rs`, built from `services/ravel-server/src/query.rs`) resolves a table through `crates/ravel-pqtable/src/resolve.rs`: `newest` (through `versions`) lists `t/<tenant_hash>/pq/t/<table>/v/`, `read_version` GETs the manifest, and `grants::list` GETs `t/<tenant_hash>/pq/grants` | `query`, `all` | `s3:ListBucket`, `s3:GetObject` | `QueryList` `s3:prefix` `t/*/pq/t/*`; `QueryRead` `t/*/pq/t/*` and `t/*/pq/grants` |
 | HTTP Parquet DDL: `POST /api/v1/sql` runs `CREATE [OR REPLACE] EXTERNAL TABLE` and `DROP TABLE` through `execute_ddl` (`crates/ravel-sql/src/ddl.rs`). `resolve::newest` lists `t/<tenant_hash>/pq/t/<table>/v/` and GETs the newest manifest; `CREATE` also GETs `t/<tenant_hash>/pq/grants` and runs `probe_not_ravel_bucket`, which PUTs `sys/pq-probe/<random>` (`Overwrite`) and DELETEs it; `writer::apply` (`crates/ravel-pqtable/src/writer.rs`) PUTs `t/<tenant_hash>/pq/t/<table>/v/<version>.pqm` with `CreateIfAbsent`, its only put, for both `CREATE` and `DROP` | `query`, `all` | `s3:ListBucket`, `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` | `QueryManifestCreate` `t/????????????????????????????????/pq/t/*/v/????????????????????.pqm`, conditioned on `StringEquals` `s3:if-none-match` `*`; `QueryWrite` and `QueryProbeDelete` `sys/pq-probe/*`; the list and reads are the Parquet table provider's row above |
 | `ravel-cli parquet sweep` (`crates/ravel-pqtable/src/sweep.rs`): `plan` lists `t/<tenant_hash>/pq/t/`, the CLI wrapper reads `sys/gc` for the deployment's grace floor, and `execute` deletes each superseded manifest | Maintain credential | `s3:ListBucket`, `s3:GetObject`, `s3:DeleteObject` | `MaintainList` `s3:prefix` `t/*/pq/t/*`; `MaintainDelete` `t/*/pq/t/*`; `sys/gc` is already in `MaintainRead` |
@@ -669,11 +669,13 @@ against the Ravel bucket (ADR-0055, HTTP DDL amendment):
 - `QueryWrite` gains `sys/pq-probe/*`, and `QueryProbeDelete` grants
   `s3:DeleteObject` on `sys/pq-probe/*` only: before every `CREATE`,
   `probe_not_ravel_bucket` PUTs `sys/pq-probe/<random>` (`Overwrite`) and
-  DELETEs it on every path it returns through; a cancelled probe's drop guard
-  issues the same DELETE from a background task, under the same grant.
-  Nothing in Ravel reaps that prefix, so a lifecycle rule on `sys/pq-probe/`
-  bounds what a probe leaves behind when that background delete fails or never
-  runs.
+  DELETEs it inline before it returns, including when the PUT is reported
+  failed. A probe dropped mid-flight (the statement deadline), or one whose
+  inline DELETE failed, has its drop guard issue the same DELETE from a
+  background task, under the same grant. Nothing in Ravel reaps that prefix,
+  so a lifecycle rule on `sys/pq-probe/` bounds what a probe leaves behind
+  when that background delete fails, when the process exits or is killed
+  before it runs, or when the guard fires with no tokio runtime.
 
 The manifest listing, manifest reads and grants-record read were already in
 `QueryList` and `QueryRead`. The `LOCATION` listing, HEAD and footer reads and

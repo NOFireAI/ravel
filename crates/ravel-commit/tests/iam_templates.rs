@@ -5154,9 +5154,11 @@ fn is_parquet_subkey(key: &str, sub: &str) -> bool {
 /// `CreateIfAbsent` when the record is absent and `CasVersion` when it exists.
 /// Before the write, `add` qualifies the target bucket with
 /// `probe_not_ravel_bucket` (`crates/ravel-object-store/src/external/probe.rs`),
-/// which PUTs `sys/pq-probe/<random>` to the Ravel bucket and DELETEs it on every
-/// path it returns through. Nothing deletes the grants record: a deleted record
-/// reads as a tenant with no grants.
+/// which PUTs `sys/pq-probe/<random>` to the Ravel bucket and DELETEs it before
+/// it returns, including when the PUT is reported failed. A probe dropped
+/// mid-flight, or one whose inline DELETE failed, leaves the DELETE to a
+/// best-effort background task, which can fail or never run. Nothing deletes
+/// the grants record: a deleted record reads as a tenant with no grants.
 #[test]
 fn admin_template_covers_every_parquet_grant_call() {
     let grants = parquet_grants_key();
@@ -5297,8 +5299,10 @@ fn query_template_covers_every_parquet_table_read() {
 ///   `writer::apply`'s own-write check GETs a manifest it put.
 /// - `grants::list` GETs `t/<hash>/pq/grants` (`CREATE` only).
 /// - `probe_not_ravel_bucket` PUTs `sys/pq-probe/<32 hex>` with
-///   `PutMode::Overwrite` and DELETEs it on every path it returns through
-///   (`CREATE` only).
+///   `PutMode::Overwrite` and DELETEs it before it returns, including when the
+///   PUT is reported failed; a probe dropped by the statement deadline, or one
+///   whose inline DELETE failed, leaves the DELETE to a best-effort background
+///   task (`CREATE` only).
 /// - `writer::apply` PUTs `t/<hash>/pq/t/<table>/v/<version:020>.pqm` with
 ///   `PutMode::CreateIfAbsent`, its only put (`crates/ravel-pqtable/src/writer.rs`).
 ///   A `DROP` writes a dropped manifest version through the same put and
