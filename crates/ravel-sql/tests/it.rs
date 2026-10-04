@@ -144,3 +144,47 @@ mod statement_complexity;
 mod stddev_var_family_rejected;
 #[path = "validate_grouped_minmax_and_stddev.rs"]
 mod validate_grouped_minmax_and_stddev;
+
+/// With `autotests = false`, a file added under `tests/` is compiled by
+/// nothing until it is declared, and a test that is never compiled never
+/// fails. Every `.rs` file beside this one must be exactly one of: a module
+/// above, or a `[[test]]` target in Cargo.toml.
+#[test]
+#[allow(clippy::expect_used)]
+fn every_test_file_is_a_member_or_a_declared_target() {
+    let crate_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let tests_dir = crate_dir.join("tests");
+    let root = std::fs::read_to_string(tests_dir.join("it.rs")).expect("read tests/it.rs");
+    let manifest = std::fs::read_to_string(crate_dir.join("Cargo.toml")).expect("read Cargo.toml");
+
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&tests_dir).expect("list tests/") {
+        let path = entry.expect("read a tests/ entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+            let name = path.file_name().expect("a file name").to_string_lossy();
+            files.push(name.into_owned());
+        }
+    }
+    // A scan that finds almost nothing would pass every file it did not see.
+    assert!(
+        files.len() >= 70,
+        "found only {} test files under tests/; the scan itself is broken",
+        files.len()
+    );
+
+    let mut problems = Vec::new();
+    for file in files.iter().filter(|file| file.as_str() != "it.rs") {
+        let member = root.contains(&format!("#[path = \"{file}\"]"));
+        let target = manifest.contains(&format!("path = \"tests/{file}\""));
+        match (member, target) {
+            (true, false) | (false, true) => {}
+            (false, false) => problems.push(format!(
+                "{file}: neither a module of tests/it.rs nor a [[test]] target, so it never runs"
+            )),
+            (true, true) => problems.push(format!(
+                "{file}: both a module of tests/it.rs and a [[test]] target, so it runs twice"
+            )),
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
