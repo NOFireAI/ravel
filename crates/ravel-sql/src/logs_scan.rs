@@ -1307,8 +1307,9 @@ struct BlockMetrics {
     /// than counting survivors from the skip index (#761). Two causes: a
     /// predicate the skip index cannot decide (a `has_word`/text content arm,
     /// which only bloom prunes and only at decode; an attribute-equality
-    /// POSTINGS prune; a stream filter), or an object at or below the
-    /// block-range threshold, which the fetch reads whole in one GET regardless.
+    /// POSTINGS prune; a stream filter), or an object at or below the larger
+    /// of the block-range threshold and the projection break-even, which the
+    /// fetch reads whole in one GET regardless.
     /// Published once by partition 0, so a report can tell a fully-skip-planned
     /// query from one still paying the plan-phase read.
     plan_full_reads: Count,
