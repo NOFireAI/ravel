@@ -231,7 +231,7 @@ pub enum LogsFetchPolicyArg {
     /// of its price term and its time term. At the reference (intra-region)
     /// profile the rate is the time term, 6.3 MB per request, so a narrow
     /// projection reads an object ranged when the bytes it skips exceed the
-    /// projection break-even (five request costs, 31.5 MB), and an object at
+    /// projection break-even (three request costs, 18.9 MB), and an object at
     /// or below the break-even reads whole; at egress prices it resolves to a
     /// small byte cost.
     #[default]
@@ -1380,7 +1380,7 @@ pub struct Cli {
     /// reference intra-region profile is the time term, 6.3 MB per request:
     /// a narrow projection reads an object ranged when the bytes it skips
     /// exceed the projection break-even (the larger of the routing threshold
-    /// and five request costs, 31.5 MB by default), and an object at or below
+    /// and three request costs, 18.9 MB by default), and an object at or below
     /// the break-even reads whole;
     /// `latency-first` (issue #1196) resolves
     /// the byte quantities exactly as `byte-minimal` does. Read at startup
@@ -1429,7 +1429,7 @@ pub struct Cli {
     /// term and the time term (latency times throughput: 6.3 MB on the
     /// reference profile), so a narrow projection reads an object ranged when
     /// the bytes it skips exceed the projection break-even (the larger of the
-    /// routing threshold and five request costs), and an object at or below
+    /// routing threshold and three request costs), and an object at or below
     /// the break-even reads whole;
     /// no price ever reaches the fetch layer (ADR-0904's layering, preserved).
     /// A file that is unreadable, is not valid TOML, carries an unknown key,
@@ -9943,7 +9943,7 @@ mod tests {
             EngineConfig {
                 logs_request_cost_bytes: 6_300_000,
                 logs_block_range_threshold: 524_288,
-                logs_projection_break_even_bytes: Some(31_500_000),
+                logs_projection_break_even_bytes: Some(18_900_000),
                 fetch_concurrency: REFERENCE_FETCH_CONCURRENCY,
                 max_segments: DERIVED_MAX_SEGMENTS,
                 // ADR-1195: `apply_to_engine` always sets the three unbundled
@@ -11742,7 +11742,7 @@ mod tests {
         let engine = engine_from(&cli);
         assert_eq!(engine.logs_request_cost_bytes, 6_300_000);
         assert_eq!(engine.logs_block_range_threshold, 524_288);
-        assert_eq!(engine.logs_projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(engine.logs_projection_break_even_bytes, Some(18_900_000));
         assert_eq!(
             engine.logs_fetch_policy,
             ravel_query::LogsFetchPolicy::CostBased,
@@ -11984,9 +11984,9 @@ mod tests {
     ///
     /// Prove-the-test: drop `logs_projection_break_even_bytes` from
     /// `apply_to_engine` (leaving `..base`'s `None`) and the engine assertion
-    /// reads `None` against `Some(31500000)`; drop the cost-based-only
+    /// reads `None` against `Some(18900000)`; drop the cost-based-only
     /// condition from `resolve_logs_fetch` and the byte-minimal stamp reads
-    /// `Some(9437185)` against `None`; print `unwrap_or(0)` again and the
+    /// `Some(5662311)` against `None`; print `unwrap_or(0)` again and the
     /// byte-minimal line reads 0 against 524288.
     #[test]
     fn the_default_stamp_carries_the_time_term_and_the_break_even() {
@@ -12008,18 +12008,18 @@ mod tests {
         assert_eq!(stamp.rate_term, "time");
         assert_eq!(stamp.request_cost_bytes, 6_300_000);
         assert_eq!(stamp.block_range_threshold, 524_288);
-        assert_eq!(stamp.projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(stamp.projection_break_even_bytes, Some(18_900_000));
         assert_eq!(stamp.overridden_block_range_threshold, None);
         assert_eq!(stamp.saturated_profile, None);
         assert_eq!(
             engine_from(&cli).logs_projection_break_even_bytes,
-            Some(31_500_000),
+            Some(18_900_000),
             "the break-even reaches the engine config the fetcher is built from"
         );
-        assert_eq!(stamp.break_even_in_force(), (31_500_000, "profile"));
+        assert_eq!(stamp.break_even_in_force(), (18_900_000, "profile"));
         let line = emitted(&stamp);
         assert!(
-            line.contains(" projection_break_even_bytes=31500000 break_even_source=\"profile\""),
+            line.contains(" projection_break_even_bytes=18900000 break_even_source=\"profile\""),
             "{line}"
         );
 

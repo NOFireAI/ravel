@@ -3278,7 +3278,7 @@ mod tests {
                 settings.logs_request_cost_bytes,
                 settings.logs_projection_break_even_bytes,
             ),
-            (524_288, 6_300_000, Some(31_500_000)),
+            (524_288, 6_300_000, Some(18_900_000)),
             "cost-based at the reference profile takes the time term (ADR-2414 decision A3)"
         );
     }
@@ -3295,7 +3295,7 @@ mod tests {
 
     /// A loaded-tenant run at the default policy against the reference profile
     /// hands the fetcher the routing a stock server has: the time term's
-    /// request cost, the 512 KiB routing threshold and the 31,500,000-byte
+    /// request cost, the 512 KiB routing threshold and the 18,900,000-byte
     /// projection break-even (ADR-2414 decision A3). Byte-minimal hands it the
     /// compiled-in rate and no break-even. The lane resolves through the same
     /// call the server makes, so a lane that kept its own routing would read
@@ -3308,7 +3308,7 @@ mod tests {
         let settings = tenant_settings_for(&cfg, 1);
         assert_eq!(settings.logs_block_range_threshold, 524_288);
         assert_eq!(settings.logs_request_cost_bytes, 6_300_000);
-        assert_eq!(settings.logs_projection_break_even_bytes, Some(31_500_000));
+        assert_eq!(settings.logs_projection_break_even_bytes, Some(18_900_000));
 
         cfg.logs_fetch_policy = LogsFetchPolicy::ByteMinimal;
         let settings = tenant_settings_for(&cfg, 1);
@@ -5936,7 +5936,7 @@ mod tests {
             false,
             None,
             // Byte-minimal routing: the default policy reads this 2 MiB object
-            // whole (it is under the 31,500,000-byte projection break-even),
+            // whole (it is under the 18,900,000-byte projection break-even),
             // and this test is about the ranged path.
             byte_minimal_settings(),
             false,

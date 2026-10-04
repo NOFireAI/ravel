@@ -1005,8 +1005,8 @@ async fn a_saturated_cost_based_resolution_routes_whole_object() {
     );
     let timed = fetcher_from(&cost_based_at_reference(), Arc::new(MemoryStore::new()));
     assert!(
-        object_size <= 31_500_000 && !timed.ranged_projection_pays(object_size, 0.1),
-        "at the reference profile an object under the 31,500,000-byte break-even \
+        object_size <= 18_900_000 && !timed.ranged_projection_pays(object_size, 0.1),
+        "at the reference profile an object under the 18,900,000-byte break-even \
          routes whole too"
     );
 
@@ -1054,7 +1054,7 @@ async fn a_saturated_cost_based_resolution_routes_whole_object() {
 /// timings (ADR-2414 decision A3), so its arm runs on the reference prices
 /// without the timings. At the reference profile itself the rate is the
 /// finite time term and the routing threshold stays at 512 KiB, but the
-/// object sits under the 31,500,000-byte projection break-even, so the plan
+/// object sits under the 18,900,000-byte projection break-even, so the plan
 /// phase still issues no probe and reads it in one GET: the scan would read
 /// it whole at that break-even, and a probe first would read it twice.
 #[tokio::test]
@@ -1181,8 +1181,8 @@ async fn the_planned_route_reads_an_object_under_the_break_even_whole() {
     let size = bytes.len() as u64;
     let reference = cost_based_at_reference();
     assert_eq!(reference.block_range_threshold, 524_288);
-    assert_eq!(reference.projection_break_even_bytes, Some(31_500_000));
-    assert!(size > 524_288 && size <= 31_500_000);
+    assert_eq!(reference.projection_break_even_bytes, Some(18_900_000));
+    assert!(size > 524_288 && size <= 18_900_000);
 
     let fast = LogQuery::new(i64::MIN, i64::MAX);
     let skip = coded_query(0, 1_000);

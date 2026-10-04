@@ -28,15 +28,16 @@ pub(crate) mod test_tracing;
 
 pub use config::{
     ALERT_DELIVERY_SLACK, BUDGETED_REQUESTS_PER_UNSEALED_FLUSH, ByteLimit,
-    DEFAULT_BUDGET_REFERENCE_SHARDS, DEFAULT_DEADLINE, DEFAULT_FETCH_CONCURRENCY,
-    DEFAULT_LOG_MAX_FETCH_RUN_BYTES, DEFAULT_MAX_SAMPLES, DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES,
-    EngineConfig, EngineConfigError, FOLD_STALL_ALERT_FOR, LATENCY_FIRST_MEASURED_CONCURRENCY,
-    LogsFetchPolicy, MAX_REQUESTS_PER_UNSEALED_FLUSH, REFERENCE_CLOCK_SKEW_ALLOWANCE,
-    REFERENCE_FOLD_INTERVAL, REFERENCE_FOLD_SAFETY_MARGIN, REFERENCE_HEAD_CACHE_TTL,
-    REFERENCE_MAX_FLUSH_LIFETIME, REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH,
-    RateTerm, RequestBudgetParts, RequestLimit, ResolvedLogsFetch, SealMargin, covered_span,
-    derive_max_s3_requests, derive_max_s3_requests_for, fold_lag_tail_threshold, healthy_tail_max,
-    request_budget_parts, resolve_logs_fetch,
+    COST_BASED_RANGED_REQUESTS, DEFAULT_BUDGET_REFERENCE_SHARDS, DEFAULT_DEADLINE,
+    DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_MAX_FETCH_RUN_BYTES, DEFAULT_MAX_SAMPLES,
+    DEFAULT_MAX_SEGMENTS, DEFAULT_MAX_SERIES, EngineConfig, EngineConfigError,
+    FOLD_STALL_ALERT_FOR, LATENCY_FIRST_MEASURED_CONCURRENCY, LogsFetchPolicy,
+    MAX_REQUESTS_PER_UNSEALED_FLUSH, REFERENCE_CLOCK_SKEW_ALLOWANCE, REFERENCE_FOLD_INTERVAL,
+    REFERENCE_FOLD_SAFETY_MARGIN, REFERENCE_HEAD_CACHE_TTL, REFERENCE_MAX_FLUSH_LIFETIME,
+    REQUEST_BUDGET_FIXED_OVERHEAD, REQUESTS_PER_UNSEALED_FLUSH, RateTerm, RequestBudgetParts,
+    RequestLimit, ResolvedLogsFetch, SealMargin, covered_span, derive_max_s3_requests,
+    derive_max_s3_requests_for, fold_lag_tail_threshold, healthy_tail_max, request_budget_parts,
+    resolve_logs_fetch,
 };
 pub use dedup_order::{DedupKey, serves_over};
 pub use engine::{
