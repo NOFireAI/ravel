@@ -175,9 +175,9 @@ representations. OTLP ingest is untouched: it arrives row-shaped over the
 wire, so converting it to columnar per request would add a pivot rather
 than remove one.
 
-Since ADR-2467 the shard buffer rule here stands and the scope does not: a
-row-major buffer is pivoted to columnar inside the writer at flush; see the
-ADR-2467 amendment below.
+ADR-2467 proposed pivoting a row-major buffer to columnar inside the writer
+at flush, and then parked it, so this decision stands as written; see the
+ADR-2467 amendment and the amendment of 2026-10-05 below.
 
 That refusal is an API-level guard, not a behavior change on any live path.
 The loader builds its own `LogIngestRouter` in its own process
@@ -245,9 +245,10 @@ Decoded equality is a fallback only if a specific chunking input turns out
 not to be reproducible column-wise, and that would be recorded here as an
 amendment with the reason.
 
-Since ADR-2467 the row builder is a reference behind a cargo feature and
-row-shaped input is encoded by the columnar builder; see the ADR-2467
-amendment below.
+ADR-2467 proposed encoding row-shaped input through the columnar builder,
+with the row builder kept as a reference, and then parked it, so this
+decision stands as written; see the ADR-2467 amendment and the amendment of
+2026-10-05 below.
 
 ### 8. The target is under 10 minutes, and here is the arithmetic
 
@@ -428,5 +429,22 @@ test in `services/ravel-cli` needs no code change, and what it anchors
 narrows: both of its arms now encode through the columnar builder, so it
 compares the loader's batch builder with the record-based fold, two batch
 builders, and no longer two object builders.
+
+## Amendment (2026-10-05): ADR-2467's routing is parked; decisions 5 and 7 stand as written
+
+<!-- amendment-applies: sections="5. A tenant's shard buffer is columnar or row-major, never both|7. Byte-identical output is the acceptance anchor, at two levels" pointer="amendment of 2026-10-05" -->
+
+The amendment above described a change that has not been made. ADR-2467
+parked its routing decision after a measurement on records with many distinct
+attribute names: the record-to-batch conversion it would have used holds
+memory in proportion to records times distinct names, 668 MB against the row
+builder's 58 MB at 20,000 records and 1,000 names.
+
+So decision 5 stands in full: the columnar path is bulk-load only, and OTLP
+ingest is row-shaped from the wire to the row builder. Decision 7 stands in
+full: the row builder and the columnar builder are both production paths,
+and both differential tests compare them as they always have. The row
+builder is not behind a cargo feature. ADR-2467 records what would have to
+be true before the routing is proposed again.
 
 Refs: #586, #519, #541, #560, #570, #584, #585, #660

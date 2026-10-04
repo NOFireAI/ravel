@@ -1,6 +1,7 @@
 # ADR-2467: row-shaped log input is encoded by the columnar builder
 
-Status: Accepted (2026-10-04). Issue #2467.
+Status: Accepted (2026-10-04); decisions 1 to 4 parked by the amendment of
+2026-10-05. Issue #2467.
 No persistent format changes. Every RLOG object stays byte-identical; this
 decision changes which in-memory path builds it.
 Amends ADR-0109 decisions 5 and 7: the columnar path is no longer bulk-load
@@ -123,6 +124,9 @@ either corpus; both columnar arms fed the records to `from_records`
 directly. Decision 2's effect has not been measured at all.
 
 ## Decision
+
+Decisions 1 to 4 are parked and decisions 5 and 6 are restated for both
+builders: see the amendment of 2026-10-05 below.
 
 1. **A row-mode `RlogWriter` encodes through the columnar builder.** At
    `finish`, a writer that received records by `push` folds them into one
@@ -248,6 +252,9 @@ flowchart TD
 
 ## Consequences
 
+The consequences that follow from routing do not apply while decision 1 is
+parked: see the amendment of 2026-10-05 below.
+
 - On the measured corpus, the columnar builder fed the records directly
   peaks 25% to 31% under the row builder. The routed path also holds the
   writer's doubled record vector, so its estimated peak is 23% to 25% under,
@@ -276,3 +283,76 @@ flowchart TD
   to the columnar builder that alters object bytes still fails the
   byte-identity tests, as today.
 - Encoded objects do not change.
+
+## Amendment (2026-10-05): routing is parked; decisions 5 and 6 apply to both builders
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="amendment of 2026-10-05" -->
+
+Decision 1 routes row-shaped input through `ColumnarLogBatch::from_records`.
+A review of the implementation (issue #2564) found, and a measurement
+confirmed (issue #2585, result branch
+`task/21fbfbf8-2e38-4444-be3f-649278687b63/result`, file
+`stage2-sparse-input.md`), that `from_records` allocates a full-length vector
+for every distinct attribute name and type across the records, before the
+dynamic-column budget is applied. Its memory therefore grows with records
+times distinct keys. The row builder's grows with the attributes present.
+
+Records of 10 attributes each, drawn from K distinct keys; heap at its global
+maximum, input included; object bytes identical between the arms:
+
+| Shape | Row builder | Columnar route | Ratio |
+|---|---|---|---|
+| 20,000 rows, K = 100 | 52.2 MB | 91.9 MB | 1.76 |
+| 20,000 rows, K = 1,000 | 57.6 MB | 668.1 MB | 11.6 |
+| 20,000 rows, K = 10,000 | 56.2 MB | not run | |
+| 200,000 rows, K = 1,000 | 486.1 MB | not run | |
+
+The dense allocation measured 643.5 MB at K = 1,000 against 640.0 MB for
+rows times keys times the 32 bytes of one slot. The two largest columnar runs
+were not made: each was expected to need about 6.4 GB, and the measurement's
+own rule required twice that in available memory, which a 16 GB host did not
+have. Every shape this ADR measured before accepting decision 1, including
+the width gate of decision 4, had every attribute present on every record,
+so none of them exercised this. Ingest's default limits cap a record at 128
+attributes; the review found no cap on the distinct names across a flush or a
+compaction part.
+
+The same review found that `VarBytes`, which the columnar batch stores body
+and severity text in, keeps `u32` offsets, while the compaction part memory
+target is derived up to 8 GiB. Whether one writer can in practice be handed
+more than 4 GiB of text was not established.
+
+What changes:
+
+- **Decisions 1 to 4 are parked.** Row-shaped input keeps encoding through
+  the row builder, which stays a production path with no cargo feature in
+  front of it. ADR-0109 decisions 5 and 7 stand as ADR-0109 wrote them, and
+  ADR-0109 carries an amendment saying so. The width gate's result stands as
+  a measurement; it gates nothing while decision 1 is parked.
+- **What would reopen decision 1.** A fold whose memory is proportional to
+  the attributes present (the batch `from_records` returns is already of that
+  shape; only the intermediate is dense), a resolution of the `VarBytes`
+  offset width, and a third gate beside the narrow and wide ones: the sparse
+  shapes in the table above, with the columnar route's peak no higher than
+  the row builder's. That is a new decision and needs its own ADR or a
+  further amendment here. The implementation branch of #2564 is kept as
+  reference for it.
+- **Decision 5 applies to both builders.** Each builder encodes the stream
+  directory through an encode-side entry point over borrowed entries, into a
+  buffer sized for its content.
+- **Decision 6 applies to both builders, and names the row builder's
+  largest item.** In the row builder the stream seeds are last read while
+  rows are resolved, and the resolved rows are last read in the block loop;
+  after it only their count is used. Each is dropped after that last read,
+  the rows with their count kept, before the trailing sections are
+  assembled. In both builders the skip index, the
+  page and field directories and the bloom entries are dropped after their
+  last read. The profile in "Stage 0: the true peak" puts the row builder's
+  peak at 20,000 streams in section assembly, with the resolved rows still
+  alive, so this is where that shape's saving is. How much it saves is not
+  measured; the task that implements it pre-registers a figure and measures
+  it with the same profiler.
+- **Consequences that no longer hold:** the estimated 23% to 25% lower peak,
+  the lower encode time on wide records, one production builder instead of
+  two, and `ColumnarLogBatch::validate` running on every row-shaped encode.
+  Encoded objects still do not change.
