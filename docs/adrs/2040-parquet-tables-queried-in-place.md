@@ -382,7 +382,7 @@ query fails with a typed `LocationNotGranted` error. The grant the
 manifest recorded is kept for audit and plays no part in this check. The
 grants record is cached per tenant for at most 60 seconds (read on every
 query instead, per the grants and DDL cost amendment below), so a revoked
-grant stops admitting reads within 60 seconds.
+grant stops admitting reads on the next query.
 
 A file changed or deleted under a table fails the
 query with `FileChanged` or `FileMissing`, as the pinning amendment below

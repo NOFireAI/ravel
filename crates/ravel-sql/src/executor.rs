@@ -216,9 +216,9 @@ pub enum ParquetPlan {
     /// Resolved by this request's own resolve; `None` when the statement
     /// names no live Parquet table.
     Resolved(Option<ParquetResolution>),
-    /// The manifest versions a Flight ticket pinned: the plan reads exactly
-    /// these objects, never a newer version, and checks the tenant's grants as
-    /// they are now. Empty when the statement named no Parquet table.
+    /// The manifest versions a Flight ticket pinned, redeemed as the `flight`
+    /// module doc, "The two-RPC problem, and the pin", states. Empty when the
+    /// statement named no Parquet table.
     Pinned(Vec<ParquetPin>),
 }
 
@@ -2560,12 +2560,11 @@ impl SqlExecutor {
     /// manifest versions (ADR-2040 D1, D3).
     ///
     /// The statement gets the same table-function and URL-table refusal
-    /// [`Self::resolve_parquet_target`] gives it. Then each pin is read by its
-    /// version, a GET with no LIST, and every file is checked against the
-    /// grants that exist now, so a grant removed since `GetFlightInfo` fails
-    /// here with [`ParquetQueryError::LocationNotGranted`]. No pins is `None`:
-    /// the statement named no live Parquet table when it was planned, and no
-    /// newest manifest stands in for one.
+    /// [`Self::resolve_parquet_target`] gives it. Then
+    /// [`parquet::resolve_pinned_tables`] redeems the pins, as the `flight`
+    /// module doc, "The two-RPC problem, and the pin", states. No pins is
+    /// `None`: the statement named no live Parquet table when it was planned,
+    /// and no newest manifest stands in for one.
     ///
     /// Every read here is charged to the Resolve phase.
     async fn resolve_pinned_parquet(

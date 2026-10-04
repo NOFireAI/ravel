@@ -9,8 +9,9 @@
 //! tenant's `ravel-pq://<tenant_hash>/` URL (crate::session).
 //!
 //! A Flight SQL ticket pins each table's manifest version instead
-//! ([`ParquetPin`]): `DoGet` reads those manifest objects by version
-//! ([`resolve_pinned_tables`]) and still checks the grants as they are then.
+//! ([`ParquetPin`]), and `DoGet` redeems the pins through
+//! [`resolve_pinned_tables`]. The `flight` module doc, "The two-RPC problem,
+//! and the pin", states how.
 //!
 //! What a server wires in is [`ParquetSources`]: Ravel's store, the external
 //! stores its credential profiles reach ([`ExternalStores`]), and the read
@@ -33,7 +34,7 @@ use datafusion::error::DataFusionError;
 use ravel_object_store::external::{ExternalKind, ExternalProfile, ExternalStore, ProfileError};
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
-    PageToken, PutOptions, PutOutcome, StoreError,
+    PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
 };
 use ravel_parquet::{
     MetadataCache, ParquetReadError, ParquetTableError, ParquetTableProvider, ReadLimits,
@@ -374,6 +375,13 @@ impl ExternalStores for ProfileStores {
 /// [`ExternalStores`] from a fixed map of profile name to store, the store
 /// serving every bucket of its profile. The seam an embedder or a test uses to
 /// read Parquet files from stores it built itself.
+///
+/// [`ExternalStores::store`] ignores its `bucket` argument here: the profile
+/// name alone picks the store. It performs no Ravel-bucket refusal either; a
+/// store in the map that is Ravel's own is handed out like any other. Only
+/// [`ProfileStores`], built with [`ProfileStores::refusing`], refuses one
+/// here; a `CREATE` over such a store is still refused later, by the DDL
+/// path's own not-Ravel's-bucket probe.
 #[derive(Default)]
 pub struct ExternalStoreMap {
     stores: HashMap<String, Arc<dyn ObjectStoreBackend>>,
@@ -494,8 +502,8 @@ pub struct ParquetResolution {
 
 impl ParquetResolution {
     /// The table name and manifest version of each resolved table: what a
-    /// Flight ticket pins so that `DoGet` reads these manifest objects and no
-    /// newer ones.
+    /// Flight ticket pins. The `flight` module doc, "The two-RPC problem, and
+    /// the pin", states how `DoGet` redeems them.
     pub fn pins(&self) -> Vec<ParquetPin> {
         self.manifests
             .iter()
@@ -996,7 +1004,8 @@ pub(crate) fn read_error(err: &DataFusionError) -> Option<ParquetReadError> {
 }
 
 /// Ravel's own store as the Parquet resolve reads it: every LIST, GET and HEAD
-/// is charged to the resolve phase's accounting. It never writes.
+/// is charged to the resolve phase's accounting, a pinned or pin-reporting
+/// read as a GET and `pin_of` as a HEAD. It never writes.
 struct ResolveStore {
     inner: Arc<dyn ObjectStoreBackend>,
     accounting: QueryAccounting,
@@ -1030,6 +1039,32 @@ impl ObjectStoreBackend for ResolveStore {
         Ok(outcome)
     }
 
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        self.accounting.record_s3_request(AccountedOp::Get);
+        let read = self.inner.get_pinned(key, range, pin).await?;
+        self.accounting
+            .add_s3_bytes(AccountedOp::Get, read.outcome.data.len() as u64);
+        Ok(read)
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        self.accounting.record_s3_request(AccountedOp::Get);
+        let read = self.inner.get_with_pin(key, range).await?;
+        self.accounting
+            .add_s3_bytes(AccountedOp::Get, read.outcome.data.len() as u64);
+        Ok(read)
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        self.accounting.record_s3_request(AccountedOp::Head);
+        self.inner.pin_of(key).await
+    }
+
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
         self.accounting.record_s3_request(AccountedOp::Head);
         self.inner.head(key).await
@@ -1038,6 +1073,16 @@ impl ObjectStoreBackend for ResolveStore {
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
         self.accounting.record_s3_request(AccountedOp::List);
         self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.accounting.record_s3_request(AccountedOp::List);
+        self.inner.list_after(prefix, start_after, page).await
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
@@ -1051,6 +1096,10 @@ impl ObjectStoreBackend for ResolveStore {
 
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities()
+    }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
     }
 }
 
@@ -1158,6 +1207,38 @@ mod tests {
             got.err()
         );
         assert_eq!(ravel.metrics().snapshot().op(StoreOp::Get).calls, 1);
+    }
+
+    /// A pinned read through `ResolveStore` reaches the inner store, which
+    /// serves it, rather than the trait default, which refuses every pinned
+    /// read as unsupported; it is charged to the resolve accounting as a GET.
+    #[tokio::test]
+    async fn a_pinned_read_through_the_resolve_store_reaches_the_inner_store() {
+        use ravel_object_store::memory::MemoryStore;
+
+        let inner = Arc::new(MemoryStore::new());
+        inner
+            .put("m", Bytes::from_static(b"manifest"), PutOptions::default())
+            .await
+            .expect("put");
+        let accounting = QueryAccounting::new();
+        let store = ResolveStore {
+            inner: inner.clone(),
+            accounting: accounting.clone(),
+        };
+
+        let (_, pin) = store.pin_of("m").await.expect("pin_of");
+        let read = store
+            .get_pinned("m", GetRange::Full, &pin)
+            .await
+            .expect("a pinned read the inner store serves");
+        assert_eq!(read.outcome.data, Bytes::from_static(b"manifest"));
+        assert_eq!(read.pin, pin);
+
+        let snapshot = accounting.snapshot();
+        assert_eq!(snapshot.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(snapshot.s3_requests(AccountedOp::Head), 1);
+        assert_eq!(snapshot.total_s3_bytes(), 8);
     }
 
     /// `ProfileStores` opens one store per (profile, bucket), the first time
