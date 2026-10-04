@@ -287,7 +287,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -1103,6 +1103,11 @@ pub struct LogsScanExec {
     /// poll and reused by the rest (ADR-0102). `None` entries are ts-irrelevant
     /// segments that issue no GET.
     counts: Arc<OnceCell<Arc<PlanCounts>>>,
+    /// The statement's prefetch pool (ADR-2414 decision A2): every
+    /// partition's issued, unconsumed fast-path opens, one slot per
+    /// partition, so a partition whose current open the fetch memory budget
+    /// refuses can drop all of them, not only its own.
+    prefetch_pool: Arc<PrefetchPool>,
     /// Inclusive ts bounds for the fetch's [`LogQuery`].
     ts_min: i64,
     ts_max: i64,
@@ -1337,11 +1342,17 @@ struct BlockMetrics {
     /// from [`Self::open_elapsed`] so a fallback's second open is visible.
     reopen_elapsed: Time,
     reopens: Count,
-    /// Ranged fast-path opens the fetch memory budget refused while this
-    /// partition's pipeline held other opens, each reopened sequentially at
-    /// its segment's turn with the pipeline turned off (ADR-2414 decision A2).
-    /// At most one per partition: after it the partition walks sequentially.
+    /// Current fast-path opens (a first open, a consumed prefetch, or the
+    /// `attrs_raw` reopen) the fetch memory budget refused and this partition
+    /// retried once, after dropping every unconsumed prefetch of the statement
+    /// and turning its pipeline off (ADR-2414 decision A2,
+    /// [`LogScanStream::on_open_refused`]).
     prefetch_memory_reopens: Count,
+    /// Unconsumed prefetches, of any partition of the statement, that this
+    /// partition's refused opens dropped ([`PrefetchPool::revoke_all`]). Each
+    /// dropped prefetch's segment went back to its owner's work and was
+    /// opened again at its turn.
+    prefetch_revocations: Count,
     /// Wall time in the synchronous decode and Arrow build sites inside
     /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
     /// columnar path, `next_block` on the row path. Nothing nested is timed
@@ -1380,6 +1391,8 @@ impl BlockMetrics {
             reopens: MetricBuilder::new(metrics).counter("reopens", partition),
             prefetch_memory_reopens: MetricBuilder::new(metrics)
                 .counter("prefetch_memory_reopens", partition),
+            prefetch_revocations: MetricBuilder::new(metrics)
+                .counter("prefetch_revocations", partition),
             decode_build_elapsed: MetricBuilder::new(metrics)
                 .subset_time("decode_build_elapsed", partition),
             emit_elapsed: MetricBuilder::new(metrics).subset_time("emit_elapsed", partition),
@@ -1785,6 +1798,7 @@ impl LogsScanExec {
             segments: Arc::new(segments.to_vec()),
             target_partitions: declared_partitions,
             counts: Arc::new(OnceCell::new()),
+            prefetch_pool: Arc::new(PrefetchPool::new(declared_partitions)),
             ts_min,
             ts_max,
             content,
@@ -2553,8 +2567,8 @@ impl ExecutionPlan for LogsScanExec {
     /// added to the struct later without a matching line here is a compile
     /// error, not a silently-dropped one (the exact bug class the
     /// `segment_timing` fix on this file addressed for [`Self::reproject`]).
-    /// `counts` and `metrics` are shared with `self` via `Arc`/`Arc<Mutex<_>>`
-    /// clone rather than rebuilt, matching upstream's own `with_fetch` on leaf
+    /// `counts`, `prefetch_pool` and `metrics` are shared with `self` via
+    /// `Arc`/`Arc<Mutex<_>>` clone rather than rebuilt, matching upstream's own `with_fetch` on leaf
     /// nodes like `StreamingTableExec`: the optimizer replaces `self` with the
     /// returned plan in the tree, so `self` is dropped and never executed, and
     /// nothing is ever double-counted or double-planned.
@@ -2565,6 +2579,7 @@ impl ExecutionPlan for LogsScanExec {
             segments: Arc::clone(&self.segments),
             target_partitions: self.target_partitions,
             counts: Arc::clone(&self.counts),
+            prefetch_pool: Arc::clone(&self.prefetch_pool),
             ts_min: self.ts_min,
             ts_max: self.ts_max,
             content: Arc::clone(&self.content),
@@ -2714,6 +2729,7 @@ impl ExecutionPlan for LogsScanExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
+        self.prefetch_pool.register(partition)?;
         let mut query =
             LogQuery::new(self.ts_min, self.ts_max).with_erasure((*self.erasure).clone());
         for c in self.content.iter() {
@@ -2805,9 +2821,9 @@ impl ExecutionPlan for LogsScanExec {
             stripe_blocks: self.stripe_blocks,
             fast_whole_segment,
             prefetch_share,
-            prefetched: VecDeque::new(),
+            prefetch_pool: Arc::clone(&self.prefetch_pool),
             current_by_chunk: false,
-            current_prefetched: false,
+            retrying: false,
             segments: Arc::clone(&self.segments),
             work,
             reservation,
@@ -3650,16 +3666,19 @@ fn is_fetch_memory_refusal(e: &DataFusionError) -> bool {
     )
 }
 
-/// A ranged fast-path open issued ahead of this partition's turn to drain
-/// its segment (ADR-2414 decision A2). It is the same [`open_segment_fast`]
-/// future the sequential open would build, polled from
+/// A ranged fast-path open issued ahead of its partition's turn to drain
+/// its segment (ADR-2414 decision A2), held in that partition's
+/// [`PrefetchSlot`]. It is the same [`open_segment_fast`] future the
+/// sequential open would build, polled from
 /// [`LogScanStream::drive_prefetches`] until it resolves; the resolved open
 /// is kept, error included, until the segment's turn comes, so an error is
 /// reported for the segment that produced it and only once the segments
-/// before it have been emitted.
+/// before it have been emitted. Its fetch reservations are owned by the
+/// future or by the bytes it resolved to, so dropping it, from whichever
+/// partition's task, releases them at once.
 struct Prefetch {
-    /// The owned work item the open was issued for, kept whole so a memory
-    /// refusal can hand it back to the sequential walk.
+    /// The owned work item the open was issued for, kept whole so a
+    /// revocation can hand it back to its owner's work.
     owned: OwnedSeg,
     /// When the open was issued: the start of this segment's `open_elapsed`.
     issued: Instant,
@@ -3672,6 +3691,124 @@ enum PrefetchOpen {
         opened: Box<DFResult<Option<LogSegmentScan>>>,
         at: Instant,
     },
+}
+
+/// One partition's share of a [`PrefetchPool`].
+#[derive(Default)]
+struct PrefetchSlot {
+    /// The issued opens of the owner's segments after its current one, in
+    /// owned order.
+    prefetched: VecDeque<Prefetch>,
+    /// Segments whose prefetch a revocation dropped, in owned order, for the
+    /// owner to move back to the front of its work.
+    handed_back: VecDeque<OwnedSeg>,
+}
+
+/// One statement's prefetched fast-path opens, a slot per partition
+/// (ADR-2414 decision A2). The fetch memory budget is process-wide, so a
+/// partition whose current open is refused may be refused for bytes another
+/// partition's prefetches hold; [`Self::revoke_all`] lets it drop them all
+/// synchronously, without waiting for any other stream to be polled.
+///
+/// A slot's lock is never held across an await, and no code path holds two
+/// slot locks at once.
+struct PrefetchPool {
+    /// Set by the first revocation: no partition of the statement issues
+    /// another prefetch.
+    off: AtomicBool,
+    slots: Vec<std::sync::Mutex<PrefetchSlot>>,
+    /// Whether each partition's stream has been built, so a second `execute`
+    /// of one partition cannot share a slot with the first.
+    registered: Vec<AtomicBool>,
+}
+
+impl PrefetchPool {
+    fn new(partitions: usize) -> Self {
+        PrefetchPool {
+            off: AtomicBool::new(false),
+            slots: (0..partitions)
+                .map(|_| std::sync::Mutex::new(PrefetchSlot::default()))
+                .collect(),
+            registered: (0..partitions).map(|_| AtomicBool::new(false)).collect(),
+        }
+    }
+
+    fn is_off(&self) -> bool {
+        self.off.load(Ordering::SeqCst)
+    }
+
+    /// Claims `partition`'s slot for the stream `execute` is building.
+    fn register(&self, partition: usize) -> DFResult<()> {
+        let flag = self.registered.get(partition).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "logs scan partition {partition} has no prefetch slot"
+            ))
+        })?;
+        if flag.swap(true, Ordering::SeqCst) {
+            return Err(DataFusionError::Internal(format!(
+                "logs scan partition {partition} executed twice"
+            )));
+        }
+        Ok(())
+    }
+
+    fn slot(&self, partition: usize) -> DFResult<std::sync::MutexGuard<'_, PrefetchSlot>> {
+        self.slots
+            .get(partition)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "logs scan partition {partition} has no prefetch slot"
+                ))
+            })?
+            .lock()
+            .map_err(|_| {
+                DataFusionError::Internal(format!(
+                    "logs scan partition {partition}'s prefetch slot lock is poisoned"
+                ))
+            })
+    }
+
+    /// Turns the statement's pipeline off, then drops every unconsumed
+    /// prefetch of every partition, one slot at a time in index order:
+    /// each is popped from the back and its segment pushed on the front of
+    /// that slot's `handed_back`, so owned order is kept. Dropping a
+    /// prefetch releases its fetch reservations before this returns.
+    /// Returns how many were dropped.
+    fn revoke_all(&self) -> DFResult<usize> {
+        self.off.store(true, Ordering::SeqCst);
+        let mut dropped = 0;
+        for partition in 0..self.slots.len() {
+            let mut slot = self.slot(partition)?;
+            while let Some(Prefetch { owned, open, .. }) = slot.prefetched.pop_back() {
+                drop(open);
+                slot.handed_back.push_front(owned);
+                dropped += 1;
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// Drops everything `partition`'s slot holds. Used on the stream's way
+    /// out, so it clears a poisoned slot too rather than leaving its
+    /// prefetches' bytes reserved.
+    fn clear(&self, partition: usize) {
+        if let Some(slot) = self.slots.get(partition) {
+            let mut slot = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.prefetched.clear();
+            slot.handed_back.clear();
+        }
+    }
+}
+
+/// Which open [`LogScanStream::on_open_refused`] retries.
+enum Reopen {
+    /// The segment's fast-path open, on the route its first open took.
+    Fast,
+    /// The `attrs_raw` row-path reopen, skipping the `skip` blocks of this
+    /// partition's list already emitted.
+    Rows { skip: usize },
 }
 
 /// Consecutive `attrs_raw`-overflow fallbacks (see
@@ -3913,25 +4050,27 @@ struct LogScanStream {
     /// are those of the sequential walk. A prefetched open holds the fetched
     /// column-chunk bytes of its segment, reserved against the fetcher's memory
     /// budget like any open's, so the bytes this partition holds for opened
-    /// segments are bounded by this share times one segment's projected bytes.
+    /// segments are bounded by this share times one segment's projected bytes,
+    /// and a statement's by its partition count times that.
     ///
     /// `1`, no prefetch, everywhere else: on the striped route, and under a
     /// pushed `fetch`, which may stop the partition before segments it would
     /// have prefetched. A whole-object fast-path open is never prefetched and
     /// stops the pipeline at its turn, because an in-flight whole-object open
     /// holds a full object per slot; the `attrs_raw` fallback reopen also stays
-    /// sequential, with the prefetches behind it left in flight.
+    /// sequential, with the prefetches behind it left in flight unless the
+    /// budget refuses it ([`Self::on_open_refused`]).
     prefetch_share: usize,
-    /// The issued opens of the owned segments after the current one, in owned
-    /// order. Empty unless [`Self::prefetch_share`] exceeds 1.
-    prefetched: VecDeque<Prefetch>,
+    /// The statement's prefetch pool, shared with the exec and every other
+    /// partition's stream. This partition's issued opens of the owned
+    /// segments after the current one live in its slot, [`Self::partition`].
+    prefetch_pool: Arc<PrefetchPool>,
     /// Whether the current fast-path segment was opened ranged, the
     /// precondition for prefetching behind it.
     current_by_chunk: bool,
-    /// Whether the current segment's open was issued ahead of its turn, so a
-    /// memory refusal of it is one the sequential walk might not have met
-    /// ([`Self::reopen_after_memory_refusal`]).
-    current_prefetched: bool,
+    /// Whether the open in flight is [`Self::on_open_refused`]'s one retry of
+    /// a refused open. Cleared when an open resolves and at the next segment.
+    retrying: bool,
     /// Every segment in the snapshot, snapshot order, shared with the exec. The
     /// owned-work computation indexes this by segment position.
     segments: Arc<Vec<SegmentRef>>,
@@ -4079,16 +4218,18 @@ impl LogScanStream {
     }
 
     /// Issue the ranged opens of this partition's next owned segments, in
-    /// owned order, until [`Self::prefetch_share`] opens are held counting the
-    /// current one (ADR-2414 decision A2). Only behind a ranged current
-    /// segment, and only while the next owned segment is itself a ranged
-    /// open: the first whole-object segment stays in `work` and opens
-    /// sequentially at its turn.
-    fn top_up_prefetch(&mut self, cx: &mut Context<'_>) {
-        if !self.current_by_chunk {
-            return;
+    /// owned order, into its slot of the statement's [`PrefetchPool`], until
+    /// [`Self::prefetch_share`] opens are held counting the current one
+    /// (ADR-2414 decision A2). Only behind a ranged current segment, only
+    /// while the next owned segment is itself a ranged open (the first
+    /// whole-object segment stays in `work` and opens sequentially at its
+    /// turn), and never once a revocation has turned the statement's
+    /// pipeline off.
+    fn top_up_prefetch(&mut self, cx: &mut Context<'_>) -> DFResult<()> {
+        if !self.current_by_chunk || self.prefetch_pool.is_off() {
+            return Ok(());
         }
-        while self.prefetched.len() + 1 < self.prefetch_share {
+        loop {
             let ranged = self
                 .work
                 .front()
@@ -4096,79 +4237,166 @@ impl LogScanStream {
             if !ranged {
                 break;
             }
-            let Some(next) = self.work.pop_front() else {
-                break;
+            let ordinal = {
+                let mut slot = self.prefetch_pool.slot(self.partition)?;
+                // Re-read under the lock: a revoker sets `off` before it
+                // drains this slot, so nothing pushed here outlives a drain.
+                if self.prefetch_pool.is_off() || slot.prefetched.len() + 1 >= self.prefetch_share {
+                    break;
+                }
+                let Some(next) = self.work.pop_front() else {
+                    break;
+                };
+                let ordinal = next.ordinal;
+                let open = open_segment_fast(Arc::clone(&self.ctx), next.seg.clone(), true);
+                slot.prefetched.push_back(Prefetch {
+                    owned: next,
+                    issued: Instant::now(),
+                    open: PrefetchOpen::InFlight(open),
+                });
+                ordinal
             };
-            self.mark_segment_at(next.ordinal, "seg_open_start_offset");
-            let open = open_segment_fast(Arc::clone(&self.ctx), next.seg.clone(), true);
-            self.prefetched.push_back(Prefetch {
-                owned: next,
-                issued: Instant::now(),
-                open: PrefetchOpen::InFlight(open),
-            });
+            self.mark_segment_at(ordinal, "seg_open_start_offset");
         }
-        self.drive_prefetches(cx);
+        self.drive_prefetches(cx)
     }
 
-    /// Poll every in-flight prefetched open once, keeping each result until
-    /// its segment's turn. A pending open has registered `cx`'s waker, so the
-    /// stream is polled again when it can make progress.
-    fn drive_prefetches(&mut self, cx: &mut Context<'_>) {
+    /// Poll every in-flight prefetched open in this partition's slot once,
+    /// keeping each result until its segment's turn. A pending open has
+    /// registered `cx`'s waker, so the stream is polled again when it can
+    /// make progress.
+    fn drive_prefetches(&mut self, cx: &mut Context<'_>) -> DFResult<()> {
         let mut ready = Vec::new();
-        for prefetch in self.prefetched.iter_mut() {
-            if let PrefetchOpen::InFlight(fut) = &mut prefetch.open
-                && let Poll::Ready(opened) = fut.as_mut().poll(cx)
-            {
-                prefetch.open = PrefetchOpen::Ready {
-                    opened: Box::new(opened),
-                    at: Instant::now(),
-                };
-                ready.push(prefetch.owned.ordinal);
+        {
+            let mut slot = self.prefetch_pool.slot(self.partition)?;
+            for prefetch in slot.prefetched.iter_mut() {
+                if let PrefetchOpen::InFlight(fut) = &mut prefetch.open
+                    && let Poll::Ready(opened) = fut.as_mut().poll(cx)
+                {
+                    prefetch.open = PrefetchOpen::Ready {
+                        opened: Box::new(opened),
+                        at: Instant::now(),
+                    };
+                    ready.push(prefetch.owned.ordinal);
+                }
             }
         }
         for ordinal in ready {
             self.mark_segment_at(ordinal, "seg_open_ready_offset");
         }
+        Ok(())
     }
 
-    /// Handles the current segment's failed open on the ranged fast path. A
-    /// fetch memory refusal of an open the pipeline issued ahead of its turn,
-    /// or of the current open while the pipeline holds opens behind it, is
-    /// one the sequential walk might not have met: the partition turns its
-    /// pipeline off, releases the opens it holds behind the current segment
-    /// (their segments go back to the front of `work`, in owned order, and
-    /// open sequentially at their turns), and reopens the current segment the
-    /// way the sequential walk does. Returns the error untouched when it is
-    /// any other error, or when the pipeline is already off, so a refusal of
-    /// that sequential reopen fails the query.
-    fn reopen_after_memory_refusal(&mut self, e: DataFusionError) -> Result<(), DataFusionError> {
-        let pipelined = self.current_prefetched || !self.prefetched.is_empty();
-        if !(self.fast_whole_segment
-            && self.current_by_chunk
-            && self.prefetch_share > 1
-            && pipelined
-            && is_fetch_memory_refusal(&e))
-        {
+    /// Moves the segments a revocation handed back to this partition to the
+    /// front of its work, in owned order.
+    fn reclaim_handed_back(&mut self) -> DFResult<()> {
+        let mut slot = self.prefetch_pool.slot(self.partition)?;
+        while let Some(owned) = slot.handed_back.pop_back() {
+            self.work.push_front(owned);
+        }
+        Ok(())
+    }
+
+    /// The next owned segment's prefetched open, if its turn has come with
+    /// one in this partition's slot. Segments a revocation handed back are
+    /// moved to the front of `work` first, under the same lock, so none is
+    /// skipped by a revocation landing between the two reads.
+    fn take_next_prefetch(&mut self) -> DFResult<Option<Prefetch>> {
+        let mut slot = self.prefetch_pool.slot(self.partition)?;
+        if slot.handed_back.is_empty() {
+            return Ok(slot.prefetched.pop_front());
+        }
+        while let Some(owned) = slot.handed_back.pop_back() {
+            self.work.push_front(owned);
+        }
+        Ok(None)
+    }
+
+    /// Handles a refused current open on the whole-segment fast path: a first
+    /// open, a consumed prefetch ([`Reopen::Fast`]), or the `attrs_raw`
+    /// row-path reopen ([`Reopen::Rows`]).
+    ///
+    /// The fetch memory budget is process-wide, so the bytes that refused
+    /// the open may be held by prefetches of any partition of the statement.
+    /// On a fetch memory refusal this turns the statement's pipeline off,
+    /// drops every unconsumed prefetch of every partition
+    /// ([`PrefetchPool::revoke_all`]; each segment goes back to the front of
+    /// its owner's work, in owned order), moves this partition's own handed
+    /// back segments into its work, and retries the refused open once, at
+    /// once, on the same route and, for the row-path reopen, with the same
+    /// `skip`. It waits for no other stream: the bytes are released by the
+    /// drop itself. Any other error, any error off the fast path, and a
+    /// refusal of the retry itself are returned untouched.
+    ///
+    /// The property this gives: within one statement a current open is
+    /// reported refused only if the budget refused it twice, the second
+    /// time after every unconsumed prefetch of every partition of the
+    /// statement had been dropped and the statement's pipeline turned off.
+    /// Between the drain and the retry a sibling's current open may reserve
+    /// first; the retry then meets one open per partition, which is the
+    /// sequential walk's own peak. Across statements the budget stays
+    /// fail-fast: another statement's prefetches can hold the bytes, and
+    /// that refusal is typed and reported like any contended reservation.
+    fn on_open_refused(&mut self, e: DataFusionError, reopen: Reopen) -> DFResult<()> {
+        if !(self.fast_whole_segment && is_fetch_memory_refusal(&e)) || self.retrying {
             return Err(e);
         }
         let Some(seg) = self.current_seg.clone() else {
             return Err(e);
         };
-        self.prefetch_share = 1;
-        while let Some(prefetch) = self.prefetched.pop_back() {
-            self.work.push_front(prefetch.owned);
-        }
-        self.current_prefetched = false;
+        let dropped = self.prefetch_pool.revoke_all()?;
+        self.reclaim_handed_back()?;
+        self.retrying = true;
+        self.blocks.prefetch_revocations.add(dropped);
         self.blocks.prefetch_memory_reopens.add(1);
         tracing::debug!(
             partition = self.partition,
             segment = self.current_seg_ordinal,
+            dropped,
             error = %e,
-            "ranged prefetch refused by the fetch memory budget; reopening sequentially"
+            "open refused by the fetch memory budget; dropped the statement's \
+             prefetches and retrying once"
         );
-        self.open_started.get_or_insert_with(Instant::now);
-        self.state = LogScanState::Opening(open_segment_fast(Arc::clone(&self.ctx), seg, true));
+        self.state = match reopen {
+            Reopen::Fast => {
+                self.open_started.get_or_insert_with(Instant::now);
+                LogScanState::Opening(open_segment_fast(
+                    Arc::clone(&self.ctx),
+                    seg,
+                    self.current_by_chunk,
+                ))
+            }
+            Reopen::Rows { skip } => {
+                self.open_started = Some(Instant::now());
+                LogScanState::ReopenRows {
+                    fut: self.row_reopen(seg),
+                    skip,
+                }
+            }
+        };
         Ok(())
+    }
+
+    /// The `attrs_raw` fallback's row-path reopen of `seg`, the current
+    /// segment: the same routing decision its first open took (#862) on the
+    /// fast path, and on the striped route the same block-index list, survivor
+    /// list, footer and directories, with the carried whole object `take()`n,
+    /// so it is consumed at most once by construction.
+    fn row_reopen(&mut self, seg: SegmentRef) -> OpenFuture {
+        if self.fast_whole_segment {
+            let by_chunk = self.ctx.open_by_column_chunk(&seg);
+            open_segment_fast(Arc::clone(&self.ctx), seg, by_chunk)
+        } else {
+            open_segment_subset(
+                Arc::clone(&self.ctx),
+                seg,
+                self.current_indices.clone(),
+                self.current_survivors.clone(),
+                self.current_footer.clone(),
+                self.current_whole_object.take(),
+                self.current_dirs.as_ref().map(|c| Arc::clone(&c.dirs)),
+            )
+        }
     }
 
     /// The surviving-block index of the block just decoded, or `None` when
@@ -4322,7 +4550,7 @@ impl LogScanStream {
         self.state = LogScanState::Done;
         self.current_dirs = None;
         self.work.clear();
-        self.prefetched.clear();
+        self.prefetch_pool.clear(self.partition);
         self.release_block();
         self.reservation.shrink(std::mem::take(&mut self.emitted));
         Poll::Ready(Some(Err(e)))
@@ -4366,10 +4594,25 @@ impl Stream for LogScanStream {
     }
 }
 
+/// The prefetch pool belongs to the exec and outlives this stream, so a
+/// stream dropped mid-statement (a cancelled query, a satisfied limit above
+/// it) drops its own slot's prefetches here, releasing their fetch
+/// reservations with it rather than when the plan is dropped.
+impl Drop for LogScanStream {
+    fn drop(&mut self) {
+        self.prefetch_pool.clear(self.partition);
+    }
+}
+
 impl LogScanStream {
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<DFResult<RecordBatch>>> {
         let this = self;
-        this.drive_prefetches(cx);
+        if let Err(e) = this
+            .reclaim_handed_back()
+            .and_then(|()| this.drive_prefetches(cx))
+        {
+            return this.fail(e);
+        }
         loop {
             // Anything buffered from the current block goes out first.
             if this.has_pending() {
@@ -4438,143 +4681,153 @@ impl LogScanStream {
                     // remains), and never a truncation of what is already
                     // buffered (`has_pending` above always runs first).
                     this.work.clear();
-                    this.prefetched.clear();
+                    this.prefetch_pool.clear(this.partition);
                     this.state = LogScanState::Done;
                 }
-                // The next owned segment's open was issued ahead of its turn
-                // (ADR-2414 decision A2). Everything the sequential walk
-                // records for a fast-path segment is recorded here, at its
-                // turn and in owned order; every prefetch is a ranged open.
-                LogScanState::NextSegment if !this.prefetched.is_empty() => {
-                    let Some(Prefetch {
+                LogScanState::NextSegment => {
+                    let prefetch = match this.take_next_prefetch() {
+                        Ok(prefetch) => prefetch,
+                        Err(e) => return this.fail(e),
+                    };
+                    // The next owned segment's open was issued ahead of its
+                    // turn (ADR-2414 decision A2). Everything the sequential
+                    // walk records for a fast-path segment is recorded here,
+                    // at its turn and in owned order; every prefetch is a
+                    // ranged open.
+                    if let Some(Prefetch {
                         owned: OwnedSeg { seg, ordinal, .. },
                         issued,
                         open,
-                    }) = this.prefetched.pop_front()
-                    else {
-                        continue;
-                    };
-                    this.current_seg = Some(seg);
-                    this.current_seg_ordinal = ordinal;
-                    this.current_indices = Vec::new();
-                    this.current_survivors = None;
-                    this.current_footer = None;
-                    this.current_dirs = None;
-                    this.current_whole_object = None;
-                    this.current_by_chunk = true;
-                    this.current_prefetched = true;
-                    this.block_cursor = 0;
-                    this.consecutive_fallbacks = 0;
-                    this.blocks.segments_opened.add(1);
-                    this.blocks.record_fast_path_route(true);
-                    this.ctx.record_open_shape(true);
-                    this.ctx.record_data_object_touched();
-                    match open {
-                        PrefetchOpen::InFlight(fut) => {
-                            this.open_started = Some(issued);
-                            this.state = LogScanState::Opening(fut);
-                        }
-                        PrefetchOpen::Ready { opened, at } => {
-                            this.open_started = None;
-                            this.blocks
-                                .open_elapsed
-                                .add_duration(at.saturating_duration_since(issued));
-                            match *opened {
-                                Ok(Some(scan)) => {
-                                    this.state = if this.columnar_eligible {
-                                        LogScanState::Columnar(Box::new(scan))
-                                    } else {
-                                        LogScanState::Rows(Box::new(scan))
-                                    };
-                                }
-                                Ok(None) => this.finish_segment(),
-                                Err(e) => {
-                                    if let Err(e) = this.reopen_after_memory_refusal(e) {
-                                        return this.fail(e);
+                    }) = prefetch
+                    {
+                        this.current_seg = Some(seg);
+                        this.current_seg_ordinal = ordinal;
+                        this.current_indices = Vec::new();
+                        this.current_survivors = None;
+                        this.current_footer = None;
+                        this.current_dirs = None;
+                        this.current_whole_object = None;
+                        this.current_by_chunk = true;
+                        this.retrying = false;
+                        this.block_cursor = 0;
+                        this.consecutive_fallbacks = 0;
+                        this.blocks.segments_opened.add(1);
+                        this.blocks.record_fast_path_route(true);
+                        this.ctx.record_open_shape(true);
+                        this.ctx.record_data_object_touched();
+                        match open {
+                            PrefetchOpen::InFlight(fut) => {
+                                this.open_started = Some(issued);
+                                this.state = LogScanState::Opening(fut);
+                            }
+                            PrefetchOpen::Ready { opened, at } => {
+                                this.open_started = None;
+                                this.blocks
+                                    .open_elapsed
+                                    .add_duration(at.saturating_duration_since(issued));
+                                match *opened {
+                                    Ok(Some(scan)) => {
+                                        this.state = if this.columnar_eligible {
+                                            LogScanState::Columnar(Box::new(scan))
+                                        } else {
+                                            LogScanState::Rows(Box::new(scan))
+                                        };
+                                    }
+                                    Ok(None) => this.finish_segment(),
+                                    Err(e) => {
+                                        if let Err(e) = this.on_open_refused(e, Reopen::Fast) {
+                                            return this.fail(e);
+                                        }
                                     }
                                 }
                             }
                         }
+                        if let Err(e) = this.top_up_prefetch(cx) {
+                            return this.fail(e);
+                        }
+                        continue;
                     }
-                    this.top_up_prefetch(cx);
+                    match this.work.pop_front() {
+                        Some(OwnedSeg {
+                            seg,
+                            ordinal,
+                            indices,
+                            survivors,
+                            footer,
+                            whole_object,
+                            dirs,
+                        }) => {
+                            this.current_seg = Some(seg.clone());
+                            this.current_seg_ordinal = ordinal;
+                            this.current_indices = indices.clone();
+                            this.current_survivors = survivors.clone();
+                            this.current_footer = footer.clone();
+                            let open_dirs = dirs.as_ref().map(|c| Arc::clone(&c.dirs));
+                            this.current_dirs = dirs;
+                            // Moved, not cloned: this stream consumes the carried
+                            // whole object exactly once, by whichever open below
+                            // `take()`s it first. A later `ReopenRows` reopen
+                            // must see `None` and pay for its own fetch (real GET
+                            // or read-cache hit), or `tenant_bytes_with_footer`
+                            // charges `add_bytes_reused` twice for one buffer
+                            // (issue #835 follow-up).
+                            this.current_whole_object = whole_object;
+                            this.retrying = false;
+                            this.block_cursor = 0;
+                            this.consecutive_fallbacks = 0;
+                            this.blocks.segments_opened.add(1);
+                            this.open_started = Some(Instant::now());
+                            this.mark_segment("seg_open_start_offset");
+                            // Whole-segment fast path reads the object in one GET
+                            // (#693 part 3), or by column chunk when the projection
+                            // is narrow enough to pay for the extra round trips
+                            // (#862); the striped path opens only this partition's
+                            // subset, reusing the plan footer if any.
+                            this.state = if this.fast_whole_segment {
+                                let by_chunk = this.ctx.open_by_column_chunk(&seg);
+                                this.current_by_chunk = by_chunk;
+                                this.blocks.record_fast_path_route(by_chunk);
+                                this.ctx.record_open_shape(by_chunk);
+                                // The fast path's owning-partition recorder for
+                                // ADR-0996 decision 3; see
+                                // `PartitionCtx::record_data_object_touched` for why
+                                // this site is once per segment per query and why
+                                // the planned route's recorder cannot also fire.
+                                this.ctx.record_data_object_touched();
+                                LogScanState::Opening(open_segment_fast(
+                                    Arc::clone(&this.ctx),
+                                    seg,
+                                    by_chunk,
+                                ))
+                            } else {
+                                // `take()`, not the moved-in value directly: this
+                                // IS the one consumption of the carried whole
+                                // object (see the comment above where it moved
+                                // into `current_whole_object`). Taking it here
+                                // leaves `None` behind for any later reopen.
+                                let whole_object = this.current_whole_object.take();
+                                LogScanState::Opening(open_segment_subset(
+                                    Arc::clone(&this.ctx),
+                                    seg,
+                                    indices,
+                                    survivors,
+                                    footer,
+                                    whole_object,
+                                    open_dirs,
+                                ))
+                            };
+                            if let Err(e) = this.top_up_prefetch(cx) {
+                                return this.fail(e);
+                            }
+                        }
+                        None => {
+                            this.state = LogScanState::Done;
+                        }
+                    }
                 }
-                LogScanState::NextSegment => match this.work.pop_front() {
-                    Some(OwnedSeg {
-                        seg,
-                        ordinal,
-                        indices,
-                        survivors,
-                        footer,
-                        whole_object,
-                        dirs,
-                    }) => {
-                        this.current_seg = Some(seg.clone());
-                        this.current_seg_ordinal = ordinal;
-                        this.current_indices = indices.clone();
-                        this.current_survivors = survivors.clone();
-                        this.current_footer = footer.clone();
-                        let open_dirs = dirs.as_ref().map(|c| Arc::clone(&c.dirs));
-                        this.current_dirs = dirs;
-                        // Moved, not cloned: this stream consumes the carried
-                        // whole object exactly once, by whichever open below
-                        // `take()`s it first. A later `ReopenRows` reopen
-                        // must see `None` and pay for its own fetch (real GET
-                        // or read-cache hit), or `tenant_bytes_with_footer`
-                        // charges `add_bytes_reused` twice for one buffer
-                        // (issue #835 follow-up).
-                        this.current_whole_object = whole_object;
-                        this.current_prefetched = false;
-                        this.block_cursor = 0;
-                        this.consecutive_fallbacks = 0;
-                        this.blocks.segments_opened.add(1);
-                        this.open_started = Some(Instant::now());
-                        this.mark_segment("seg_open_start_offset");
-                        // Whole-segment fast path reads the object in one GET
-                        // (#693 part 3), or by column chunk when the projection
-                        // is narrow enough to pay for the extra round trips
-                        // (#862); the striped path opens only this partition's
-                        // subset, reusing the plan footer if any.
-                        this.state = if this.fast_whole_segment {
-                            let by_chunk = this.ctx.open_by_column_chunk(&seg);
-                            this.current_by_chunk = by_chunk;
-                            this.blocks.record_fast_path_route(by_chunk);
-                            this.ctx.record_open_shape(by_chunk);
-                            // The fast path's owning-partition recorder for
-                            // ADR-0996 decision 3; see
-                            // `PartitionCtx::record_data_object_touched` for why
-                            // this site is once per segment per query and why
-                            // the planned route's recorder cannot also fire.
-                            this.ctx.record_data_object_touched();
-                            LogScanState::Opening(open_segment_fast(
-                                Arc::clone(&this.ctx),
-                                seg,
-                                by_chunk,
-                            ))
-                        } else {
-                            // `take()`, not the moved-in value directly: this
-                            // IS the one consumption of the carried whole
-                            // object (see the comment above where it moved
-                            // into `current_whole_object`). Taking it here
-                            // leaves `None` behind for any later reopen.
-                            let whole_object = this.current_whole_object.take();
-                            LogScanState::Opening(open_segment_subset(
-                                Arc::clone(&this.ctx),
-                                seg,
-                                indices,
-                                survivors,
-                                footer,
-                                whole_object,
-                                open_dirs,
-                            ))
-                        };
-                        this.top_up_prefetch(cx);
-                    }
-                    None => {
-                        this.state = LogScanState::Done;
-                    }
-                },
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
+                        this.retrying = false;
                         if let Some(started) = this.open_started.take() {
                             this.blocks.open_elapsed.add_elapsed(started);
                         }
@@ -4591,10 +4844,11 @@ impl LogScanStream {
                         if let Some(started) = this.open_started.take() {
                             this.blocks.open_elapsed.add_elapsed(started);
                         }
+                        this.retrying = false;
                         this.finish_segment();
                     }
                     Poll::Ready(Err(e)) => {
-                        if let Err(e) = this.reopen_after_memory_refusal(e) {
+                        if let Err(e) = this.on_open_refused(e, Reopen::Fast) {
                             return this.fail(e);
                         }
                     }
@@ -4605,6 +4859,7 @@ impl LogScanStream {
                 },
                 LogScanState::ReopenRows { fut, skip } => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
+                        this.retrying = false;
                         if let Some(started) = this.open_started.take() {
                             this.blocks.reopen_elapsed.add_elapsed(started);
                         }
@@ -4617,8 +4872,16 @@ impl LogScanStream {
                     // Cannot happen for a segment already opened once this scan;
                     // treat a vanished segment as end-of-segment rather than
                     // panicking.
-                    Poll::Ready(Ok(None)) => this.finish_segment(),
-                    Poll::Ready(Err(e)) => return this.fail(e),
+                    Poll::Ready(Ok(None)) => {
+                        this.retrying = false;
+                        this.finish_segment();
+                    }
+                    Poll::Ready(Err(e)) => {
+                        let skip = *skip;
+                        if let Err(e) = this.on_open_refused(e, Reopen::Rows { skip }) {
+                            return this.fail(e);
+                        }
+                    }
                     Poll::Pending => return Poll::Pending,
                 },
                 LogScanState::Columnar(scan) => {
@@ -4759,27 +5022,7 @@ impl LogScanStream {
                             // re-counted: the route metric and the accounting
                             // handle's opens-by-shape counters both tally
                             // segments, not opens.
-                            let fut = if this.fast_whole_segment {
-                                let by_chunk = this.ctx.open_by_column_chunk(&seg);
-                                open_segment_fast(Arc::clone(&this.ctx), seg, by_chunk)
-                            } else {
-                                // `take()`, not `clone()`: the first open
-                                // already took the carried whole object (if
-                                // any), so this is always `None` here. `take`
-                                // rather than reading the field directly keeps
-                                // that single-consumption invariant true by
-                                // construction instead of by this call site
-                                // happening to run after the first one.
-                                open_segment_subset(
-                                    Arc::clone(&this.ctx),
-                                    seg,
-                                    this.current_indices.clone(),
-                                    this.current_survivors.clone(),
-                                    this.current_footer.clone(),
-                                    this.current_whole_object.take(),
-                                    this.current_dirs.as_ref().map(|c| Arc::clone(&c.dirs)),
-                                )
-                            };
+                            let fut = this.row_reopen(seg);
                             this.blocks.reopens.add(1);
                             this.consecutive_fallbacks += 1;
                             this.open_started = Some(Instant::now());
