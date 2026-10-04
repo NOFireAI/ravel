@@ -779,11 +779,11 @@ impl SqlExecutor {
                 let costed_ravel_store: Arc<dyn ObjectStoreBackend> =
                     Arc::new(recorder.probe_store(ravel_store));
                 probe_not_ravel_bucket(&costed_ravel_store, ravel_store, &probe_external)
-                .await
-                .map_err(|source| DdlExecuteError::RavelBucketProbe {
-                    location: location.clone(),
-                    source,
-                })?;
+                    .await
+                    .map_err(|source| DdlExecuteError::RavelBucketProbe {
+                        location: location.clone(),
+                        source,
+                    })?;
 
                 let grant_url = grant.url();
                 let granted_location = GrantedLocation { grant, key };

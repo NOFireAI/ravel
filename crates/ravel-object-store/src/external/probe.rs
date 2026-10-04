@@ -669,7 +669,7 @@ mod tests {
         let candidate = Arc::clone(&ravel);
         let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
 
-        let err = probe_not_ravel_bucket(&handle, &handle,candidate.as_ref())
+        let err = probe_not_ravel_bucket(&handle, &handle, candidate.as_ref())
             .await
             .expect_err("Ravel's own bucket must be detected");
         assert!(
@@ -688,7 +688,7 @@ mod tests {
         let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = MemoryStore::new();
 
-        probe_not_ravel_bucket(&handle, &handle,&candidate)
+        probe_not_ravel_bucket(&handle, &handle, &candidate)
             .await
             .expect("a different bucket must pass");
         assert!(
@@ -967,10 +967,8 @@ mod tests {
         let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
         let candidate = MemoryStore::new();
 
-        let err = futures::executor::block_on(probe_not_ravel_bucket(
-            &handle, &handle, &candidate,
-        ))
-        .expect_err("a put reported as failed fails the probe");
+        let err = futures::executor::block_on(probe_not_ravel_bucket(&handle, &handle, &candidate))
+            .expect_err("a put reported as failed fails the probe");
         let key = match err {
             RavelBucketProbeFailure::ProbeWriteFailed { key, .. } => key,
             other => panic!("expected ProbeWriteFailed, got {other:?}"),
@@ -1003,8 +1001,7 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build a current-thread runtime");
-        let verdict =
-            runtime.block_on(probe_not_ravel_bucket(&ravel_handle, &cleanup, &candidate));
+        let verdict = runtime.block_on(probe_not_ravel_bucket(&ravel_handle, &cleanup, &candidate));
         drop(runtime);
 
         let key = match verdict {
@@ -1133,7 +1130,7 @@ mod tests {
         let candidate = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
         let gate = candidate.hold(Op::Get, Some(PROBE_PREFIX.to_string()), Occurrence::Always);
 
-        let mut probe = Box::pin(probe_not_ravel_bucket(&handle, &handle,&candidate));
+        let mut probe = Box::pin(probe_not_ravel_bucket(&handle, &handle, &candidate));
         tokio::select! {
             verdict = &mut probe => panic!("a held identity read cannot complete: {verdict:?}"),
             () = gate.wait_until_held(1) => {}
@@ -1219,11 +1216,7 @@ mod tests {
         let cleanup: Arc<dyn ObjectStoreBackend> = memory.clone();
         let candidate = MemoryStore::new();
 
-        let mut probe = Box::pin(probe_not_ravel_bucket(
-            &ravel_handle,
-            &cleanup,
-            &candidate,
-        ));
+        let mut probe = Box::pin(probe_not_ravel_bucket(&ravel_handle, &cleanup, &candidate));
         tokio::select! {
             verdict = &mut probe => panic!("a hanging put cannot complete: {verdict:?}"),
             () = ravel.landed_notify.notified() => {}
@@ -1252,7 +1245,7 @@ mod tests {
         ));
         let handle: Arc<dyn ObjectStoreBackend> = ravel.clone();
 
-        probe_not_ravel_bucket(&handle, &handle,&MemoryStore::new())
+        probe_not_ravel_bucket(&handle, &handle, &MemoryStore::new())
             .await
             .expect("a failed inline delete does not change the verdict");
         assert_eq!(ravel.fault_count(Op::Delete, FaultKind::Transient), 1);
