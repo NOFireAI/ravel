@@ -256,14 +256,18 @@ almost every event, and degenerate to that outcome. With it:
   behind it;
 - so the pair count is at most twice the window-only loop's on any arrival
   schedule, and at most one extra pair per `max_age` of wall time;
-- traffic arriving more often than once per `max_age` never takes the idle
-  path after its first event, and batches as before.
+- traffic that the loop receives more often than once per `max_age` does not
+  take the idle path after its first event, and batches as before. The
+  condition is measured where the loop receives an event, so a loop wake
+  delayed by `max_age` or more can make the next event idle. The bound above
+  already counts that case.
 
 Section 2b's worst case at 100 queries/s and 25 ms batching therefore rises
 from at most 80 PUTs/s to at most 160 PUTs/s, still below the 200 PUTs/s of
 one pair per query. That is a bound, not the expected rate: 100 queries/s
-arriving evenly, every 10 ms, never takes the idle path after its first
-event and stays at the window-only loop's rate.
+arriving evenly, every 10 ms, and received without a `max_age` stall, does
+not take the idle path after its first event and stays at the window-only
+loop's rate.
 
 **The durability contract is unchanged.** An idle event is written by the
 same flush path as a batch: one data object, then its commit record, in the
