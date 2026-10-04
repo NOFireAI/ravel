@@ -944,6 +944,39 @@ mod tests {
         );
     }
 
+    /// The shape of `ravel-cli`: the probe runs under `block_on`, its error
+    /// propagates out of `main`, and the runtime is dropped with no yield in
+    /// between, which cancels any task the probe spawned before it is polled.
+    /// A current-thread runtime makes that deterministic: nothing runs a
+    /// spawned task except a yield of this thread. So the object is gone only
+    /// if the probe deleted it before returning.
+    #[test]
+    fn a_put_reported_failed_leaves_no_object_when_the_runtime_drops_on_return() {
+        let memory = Arc::new(MemoryStore::new());
+        let ravel = FaultStore::new(Arc::clone(&memory), put_lands_then_reports_failure());
+        let cleanup: Arc<dyn ObjectStoreBackend> = memory.clone();
+        let candidate = MemoryStore::new();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build a current-thread runtime");
+        let verdict = runtime.block_on(probe_not_ravel_bucket(&ravel, &cleanup, &candidate));
+        drop(runtime);
+
+        let key = match verdict {
+            Err(RavelBucketProbeFailure::ProbeWriteFailed { key, .. }) => key,
+            other => panic!("expected ProbeWriteFailed, got {other:?}"),
+        };
+        assert_eq!(ravel.fault_count(Op::Put, FaultKind::DuplicateDelivery), 1);
+        assert!(
+            matches!(
+                futures::executor::block_on(memory.head(&key)),
+                Err(StoreError::NotFound)
+            ),
+            "the probe object {key} outlived the runtime"
+        );
+    }
+
     /// On a clean return the probe deletes its object once, inline, and the
     /// guard spawns nothing: no second delete, and no other object under the
     /// prefix is touched.
