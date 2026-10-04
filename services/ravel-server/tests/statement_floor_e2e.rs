@@ -1,7 +1,8 @@
 //! Reachability proof for ADR-2509's per-statement floor mechanisms (issue
 //! #2540): a real [`ravel_server::start`] server answers `POST /api/v1/sql`
 //! over an unfolded logs tenant, and the requests the statement issues show
-//! that each mechanism runs on the shipping path, not only at the crate level.
+//! that each mechanism's effect reaches the shipping path, not only the crate
+//! level.
 //!
 //! - The prefix listing drains its shards concurrently (decision 1).
 //! - A missing catalog HEAD is cached across statements (decision 3).
@@ -49,9 +50,9 @@ const OBJECTS_PER_SHARD: u32 = 2;
 const RECORDS_PER_OBJECT: usize = 3;
 const TOTAL_RECORDS: i64 = (SHARDS * OBJECTS_PER_SHARD) as i64 * RECORDS_PER_OBJECT as i64;
 /// The statement window `[0 s, WINDOW_END_HOUR h]`. At [`SHARDS`] shards the
-/// per-bucket estimate is at least `4 * 201 = 804` suffix buckets, above the
-/// default `prefix_list_crossover_requests` (720), so the resolve takes the
-/// prefix path with no crossover override.
+/// resolve estimates at least `4 * 201 = 804` suffix buckets, at or above the
+/// default `prefix_list_crossover_requests` (720), so it takes the prefix path
+/// with no crossover override.
 const WINDOW_END_HOUR: i64 = 200;
 const SQL: &str = "SELECT COUNT(*) FROM logs";
 
@@ -59,8 +60,8 @@ fn tenant_hash() -> TenantHash {
     TenantId::new(TENANT).hash()
 }
 
-/// The whole-shard commit prefix the prefix path lists. The per-bucket path
-/// lists `(shard, hour)` prefixes below it instead, never this one.
+/// The whole-shard commit prefix both listing paths LIST, starting at the
+/// listing's first hour.
 fn shard_prefix(shard: u32) -> String {
     keys::commit_shard_prefix(&tenant_hash(), Signal::Logs, shard).expect("shard prefix")
 }
@@ -453,6 +454,10 @@ async fn wait_for_list_count(log: &RequestLog, n: usize, why: &str) {
 /// Decision 1: the prefix traversal lists the shards concurrently. Shard 0's
 /// commit LIST is held, and shards 1 to 3 are still listed while it is held. A
 /// sequential shard loop never issues them, and the wait fails.
+///
+/// The bounded (non-prefix) traversal issues the same LIST per shard, also
+/// concurrently, so the request log cannot tell the two apart. The window
+/// size ([`WINDOW_END_HOUR`]) is what selects the prefix path here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_prefix_listing_runs_shards_concurrently_through_http() {
     let fx = start_fixture(Default::default()).await;
@@ -482,14 +487,12 @@ async fn sql_prefix_listing_runs_shards_concurrently_through_http() {
     let (status, value) = statement.await.expect("statement task");
     assert_counts_every_record(status, &value);
 
-    // The prefix path ran: exactly one LIST per shard, each of the whole-shard
-    // prefix. The per-bucket path would list `(shard, hour)` prefixes instead.
     let mut listed = fx.log.logs_commit_lists();
     listed.sort();
     let whole_shards: Vec<String> = (0..SHARDS).map(shard_prefix).collect();
     assert_eq!(
         listed, whole_shards,
-        "the resolve must take the prefix path: one whole-shard LIST per shard"
+        "the resolve must issue exactly one whole-shard LIST per shard"
     );
     drop(fx.running);
 }
