@@ -332,7 +332,12 @@ async fn a_min_flush_bytes_at_target_bytes_refuses_startup() {
             .expect("a min_flush_bytes at target_bytes must refuse startup");
         assert_cadence_error(
             &err,
-            |e| matches!(e, FlushCadenceError::MinFlushBytesNotBelowTargetBytes { .. }),
+            |e| {
+                matches!(
+                    e,
+                    FlushCadenceError::MinFlushBytesNotBelowTargetBytes { .. }
+                )
+            },
             "MinFlushBytesNotBelowTargetBytes",
             &["--min-flush-bytes", "target_bytes"],
         );

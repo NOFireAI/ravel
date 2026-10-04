@@ -137,17 +137,19 @@ async fn start_server_configured(
         max_inflight_flushes: 1,
         max_queued_flushes: 8,
         adaptive_flush_delay: false,
-        // Every write here is buffered-mode and `min_flush_bytes` is never
-        // reached, so no buffer gets the fast clock and only the idle delay
-        // can fire an automatic flush: long enough that none does during a
-        // test, so the shutdown drain is the only thing that can flush the
-        // buffered record. 3599s rather than 3600s: an hour of trigger delay
-        // plus the hour of flush lifetime leaves no flush deferral cap, which
-        // `start` refuses. The fast delay stays at the 2s default, since a
-        // fast delay whose strict visibility budget reaches 3s is refused too.
+        // Every write here is one buffered-mode record, far below
+        // `min_flush_bytes`, so no buffer gets the fast clock and only the
+        // idle delay can fire an automatic flush: long enough that none does
+        // during a test, so the shutdown drain is the only thing that can
+        // flush the buffered record. 3599s rather than 3600s: an hour of
+        // trigger delay plus the hour of flush lifetime leaves no flush
+        // deferral cap, which `start` refuses. The fast delay and
+        // `min_flush_bytes` stay at their defaults, since `start` also
+        // refuses a fast delay whose strict visibility budget reaches 3s and
+        // a `min_flush_bytes` at or above `target_bytes`.
         max_flush_delay: Duration::from_secs(2),
         max_flush_delay_idle: Duration::from_secs(3599),
-        min_flush_bytes: 1024 * 1024 * 1024,
+        min_flush_bytes: 256 * 1024,
         idle_flush_byte_floor: 0,
         mode,
         listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
