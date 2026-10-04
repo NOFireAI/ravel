@@ -67,8 +67,10 @@ Clause / operator	LIKE	SELECT count(*) FROM logs WHERE body LIKE '%record 1%'
 Clause / operator	LIMIT	SELECT ts, value FROM samples ORDER BY series_id, ts LIMIT 1
 Clause / operator	OFFSET	SELECT value FROM samples ORDER BY value OFFSET 1
 Clause / operator	ORDER BY	SELECT ts, value FROM samples ORDER BY ts
+Clause / operator	POSITION(x IN y)	SELECT POSITION('a' IN 'ab')
 Clause / operator	Projection	SELECT ts, value FROM samples ORDER BY series_id, ts
 Clause / operator	REGEXP_REPLACE backreference	SELECT regexp_replace('ab', '(a)(b)', '\2\1') FROM samples LIMIT 1
+Clause / operator	SUBSTRING(x FROM y FOR z)	SELECT SUBSTRING('abc' FROM 1 FOR 2)
 Clause / operator	count(DISTINCT)	SELECT count(DISTINCT series_id) FROM samples
 Clause / operator	date_part(minute)	SELECT date_part('minute', ts) FROM samples
 Clause / operator	declared i64 typed aggregate	SELECT sum(dur) FROM logs

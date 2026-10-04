@@ -30,6 +30,8 @@ mod ceiling_breach;
 mod deadline;
 #[path = "erasure_dedup_positions.rs"]
 mod erasure_dedup_positions;
+#[path = "expr_planner_surface.rs"]
+mod expr_planner_surface;
 #[path = "extract_field.rs"]
 mod extract_field;
 #[path = "flight.rs"]

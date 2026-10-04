@@ -757,8 +757,9 @@ pub fn build_session(
     // planner under the facade's `datetime_expressions` feature, which this
     // crate leaves off. The planner builds its `date_part` call from the UDF
     // value, not by name, so the scalar allowlist below does not gate this
-    // path: re-read the planner on every DataFusion upgrade, since a new
-    // rewrite target in it would not fail closed.
+    // path. The planner set is pinned by
+    // `registered_expr_planners_are_pinned_for_every_table`, and what each
+    // planner admits, syntax by syntax, by `tests/expr_planner_surface.rs`.
     ctx.register_expr_planner(Arc::new(DatetimeFunctionPlanner))?;
 
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration
@@ -1533,6 +1534,86 @@ mod tests {
             metrics_scalars.contains_key("label_match"),
             "a metrics session must keep label_match after the scalar gate"
         );
+    }
+
+    /// The expression planners every session carries, in registration order
+    /// (issue #2476). A planner builds its rewrite target from the function
+    /// value, not by name, so the scalar allowlist above never sees what it
+    /// rewrites to: this pin is the drift guard for that path. A planner
+    /// appearing, disappearing, or moving fails here; what each one admits is
+    /// pinned per syntax by `tests/expr_planner_surface.rs`.
+    ///
+    /// Each name is the planner's `Debug` output cut at the first character
+    /// that cannot be part of a Rust identifier. Every planner below derives
+    /// `Debug` on a fieldless struct, which prints exactly the type name; the
+    /// cut keeps the name stable if an upstream planner later gains a field.
+    /// `std::any::type_name` is not usable here, since the session hands back
+    /// `Arc<dyn ExprPlanner>` and the concrete type is erased.
+    #[test]
+    fn registered_expr_planners_are_pinned_for_every_table() {
+        const EXPECTED: [&str; 6] = [
+            // From `with_default_features()`. Struct literal `STRUCT(1, 2)` /
+            // `STRUCT(1 AS a)` to `struct`/`named_struct`, dictionary literal
+            // `{'a': 1}` to `named_struct`, `OVERLAY(x PLACING y FROM n)` to
+            // `overlay`, and struct field access `s.a` to `get_field`. All four
+            // targets are in ADMITTED_SCALARS.
+            "CoreFunctionPlanner",
+            // From `with_default_features()`. Normalizes the arguments of an
+            // aggregate call such as `count()` / `count(*)`; it plans no new
+            // syntax and targets whichever admitted aggregate was named.
+            "AggregateFunctionPlanner",
+            // From `with_default_features()`. The same normalization for a
+            // function used with `OVER`, such as `count(*) OVER ()`.
+            "WindowFunctionPlanner",
+            // `build_session`: `map_col['key']` subscript to `get_field`.
+            "MapFieldAccessPlanner",
+            // `build_session`: `trace_id = '<32-hex>'` / `<>` to a native
+            // `FixedSizeBinary(16)` literal comparison; no function call.
+            "TraceIdHexLiteralPlanner",
+            // `build_session`: `EXTRACT(field FROM expr)` to `date_part`.
+            "DatetimeFunctionPlanner",
+        ];
+
+        fn planner_name(
+            planner: &Arc<dyn datafusion::logical_expr::planner::ExprPlanner>,
+        ) -> String {
+            format!("{planner:?}")
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect()
+        }
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        for (label, table) in [
+            ("metrics", metrics_table(&store)),
+            ("logs", logs_table(&store)),
+            ("spans", spans_table(&store)),
+            ("alerts", alerts_table(&store)),
+            ("audit", audit_table(&store)),
+            ("parquet", parquet_table(ravel_types::TenantHash([0u8; 16]))),
+        ] {
+            let ctx = build_session(
+                &SqlConfig::default(),
+                test_pool(),
+                table,
+                false,
+                SpillDecision::Disabled,
+            )
+            .expect("session builds");
+            let registered: Vec<String> = ctx
+                .state()
+                .expr_planners()
+                .iter()
+                .map(planner_name)
+                .collect();
+            assert_eq!(
+                registered, EXPECTED,
+                "{label}: the registered expression planners changed. Each planner \
+                 widens the SQL surface by syntax the scalar allowlist cannot see; \
+                 re-read what the new or removed planner admits before updating \
+                 this list"
+            );
+        }
     }
 
     /// ADR-2040 D6: a Parquet session evaluates filters in the reader and

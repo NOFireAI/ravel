@@ -36,7 +36,7 @@ use ravel_sql::conformance::{
     Category, Classification, Construct, Verdict, Verified, registry, render_document,
     render_example_manifest, score,
 };
-use ravel_sql::{QueryOutput, SqlError, ValidationError, validate_query};
+use ravel_sql::{ErrorClass, QueryOutput, SqlError, ValidationError, validate_query};
 use ravel_types::{Signal, TenantId, logstream};
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 use uuid::Uuid;
@@ -503,6 +503,24 @@ async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
                     },
                     Ok(_) => Verdict::Broken {
                         observed: "moving-frame avg was accepted".to_string(),
+                    },
+                }
+            } else if typed_error == "SqlError::Plan" {
+                // Special-form syntax no registered expression planner handles
+                // (issue #2476) passes the gate and is refused while planning.
+                match fixture
+                    .executor
+                    .execute(tenant.hash(), &request(&construct.example))
+                    .await
+                {
+                    Err(e @ SqlError::Plan(_)) if e.class() == ErrorClass::Unsupported => {
+                        Verdict::Confirmed
+                    }
+                    Err(e) => Verdict::Broken {
+                        observed: format!("wrong error ({:?}): {e}", e.class()),
+                    },
+                    Ok(_) => Verdict::Broken {
+                        observed: "special-form syntax was accepted".to_string(),
                     },
                 }
             } else {
