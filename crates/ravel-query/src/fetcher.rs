@@ -2399,6 +2399,7 @@ impl SegmentFetcher {
         let mut stats = FetchStats::default();
         let mut scratch = Vec::new();
         let mut out = Vec::with_capacity(scalar.len());
+        let mut cursor = RunPlanCursor::new(planned);
         for entry in scalar {
             match &seg_ref.level {
                 SegmentLevel::L0 => {
@@ -2419,7 +2420,7 @@ impl SegmentFetcher {
                         // targets (see `phase_timers::RUN_PLAN_LOOKUP_NS`'s
                         // doc comment).
                         let lookup_start = Instant::now();
-                        let found = find_run_plan(planned, &entry.entry.series_id, run_index);
+                        let found = cursor.next(&entry.entry.series_id, run_index);
                         phase_timers::RUN_PLAN_LOOKUP_NS.fetch_add(
                             lookup_start.elapsed().as_nanos() as u64,
                             Ordering::Relaxed,
@@ -2479,7 +2480,7 @@ impl SegmentFetcher {
                     // under the same total order as the pre-compaction L0s.
                     for (run_index, run) in entry.runs.iter().enumerate() {
                         let lookup_start = Instant::now();
-                        let found = find_run_plan(planned, &entry.entry.series_id, run_index);
+                        let found = cursor.next(&entry.entry.series_id, run_index);
                         phase_timers::RUN_PLAN_LOOKUP_NS.fetch_add(
                             lookup_start.elapsed().as_nanos() as u64,
                             Ordering::Relaxed,
@@ -2630,6 +2631,7 @@ impl SegmentFetcher {
         // cross-thread reason as the scalar path (ADR-0044 decision 5).
         let mut span_decompressed: u64 = 0;
         let mut out = Vec::with_capacity(histogram.len());
+        let mut cursor = RunPlanCursor::new(planned);
         for entry in histogram {
             match &seg_ref.level {
                 SegmentLevel::L0 => {
@@ -2639,7 +2641,7 @@ impl SegmentFetcher {
                     let mut values = Vec::new();
                     for (run_index, run) in entry.runs.iter().enumerate() {
                         let lookup_start = Instant::now();
-                        let found = find_run_plan(planned, &entry.entry.series_id, run_index);
+                        let found = cursor.next(&entry.entry.series_id, run_index);
                         phase_timers::RUN_PLAN_LOOKUP_NS.fetch_add(
                             lookup_start.elapsed().as_nanos() as u64,
                             Ordering::Relaxed,
@@ -2690,7 +2692,7 @@ impl SegmentFetcher {
                     // the same total order as the pre-compaction L0s.
                     for (run_index, run) in entry.runs.iter().enumerate() {
                         let lookup_start = Instant::now();
-                        let found = find_run_plan(planned, &entry.entry.series_id, run_index);
+                        let found = cursor.next(&entry.entry.series_id, run_index);
                         phase_timers::RUN_PLAN_LOOKUP_NS.fetch_add(
                             lookup_start.elapsed().as_nanos() as u64,
                             Ordering::Relaxed,
@@ -3304,15 +3306,31 @@ fn verify_l1_identity(
     Ok(())
 }
 
-/// Looks up the planned byte ranges for one run of one series.
-fn find_run_plan<'a>(
+/// Sequential cursor over a `planned` slice, valid because `plan_ranges_v4`
+/// builds it in exactly the series/run-run order the decode loops consume.
+struct RunPlanCursor<'a> {
     planned: &'a [ravel_segment::PlannedRunRange],
-    series_id: &SeriesId,
-    run_index: usize,
-) -> Option<&'a ravel_segment::PlannedRunRange> {
-    planned
-        .iter()
-        .find(|p| &p.series_id == series_id && p.run_index == run_index)
+    pos: usize,
+}
+
+impl<'a> RunPlanCursor<'a> {
+    fn new(planned: &'a [ravel_segment::PlannedRunRange]) -> Self {
+        Self { planned, pos: 0 }
+    }
+
+    fn next(
+        &mut self,
+        series_id: &SeriesId,
+        run_index: usize,
+    ) -> Option<&'a ravel_segment::PlannedRunRange> {
+        let candidate = self.planned.get(self.pos)?;
+        if &candidate.series_id == series_id && candidate.run_index == run_index {
+            self.pos += 1;
+            Some(candidate)
+        } else {
+            None
+        }
+    }
 }
 
 fn expected_identity(tenant_hash: TenantHash, seg_ref: &SegmentRef) -> ExpectedIdentity {
