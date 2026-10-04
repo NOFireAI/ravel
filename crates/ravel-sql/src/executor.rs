@@ -2094,16 +2094,19 @@ impl SqlExecutor {
         )
         .map_err(plan_error)?;
         // ADR-0954 (issue #2416): the tiebreak rewrite applied to `analyzed`
-        // above, now applied to the plan this session executes, and applied
-        // whatever the spill decision. A Sort over a spill-exact aggregate
-        // therefore has the same total order with spill on, off or disabled,
-        // so the statement returns the same rows in every configuration.
+        // above, now applied to the plan this session executes, whatever the
+        // spill decision. Gated on the Sort's shape and group key types
+        // alone, not on spill eligibility: this plan has not been through the
+        // analyzer, whose type coercion the eligibility predicate depends on,
+        // so a statement whose executed plan the re-check below finds
+        // eligible also gets its total order here. The statement therefore
+        // returns the same rows with spill on, off or disabled.
         let mut plan = ctx
             .sql(sql)
             .await
             .map_err(plan_error)?
             .into_unoptimized_plan();
-        if plan_is_spill_eligible_ignoring_sort_order(&plan) {
+        if plan_has_tie_order_edit(&plan) {
             plan = tie_ordered_or_unchanged(plan);
         }
         #[cfg(test)]
@@ -4334,6 +4337,43 @@ fn tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
     })
 }
 
+/// [`tie_order_edit`] for a `Sort` whose aggregate's GROUP BY keys are all
+/// non-float ([`group_keys_are_non_float`]), else `None`. A float key is left
+/// alone for the reason it disqualifies spill: nothing proves which `-0.0` or
+/// NaN bit pattern represents its group, so ordering on it proves nothing.
+fn total_tie_order_edit(sort: &Sort) -> Option<TieOrderEdit> {
+    let aggregate = match sort.input.as_ref() {
+        LogicalPlan::Aggregate(aggregate) => aggregate,
+        LogicalPlan::Projection(projection) => match projection.input.as_ref() {
+            LogicalPlan::Aggregate(aggregate) => aggregate,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if !group_keys_are_non_float(aggregate) {
+        return None;
+    }
+    tie_order_edit(sort)
+}
+
+/// Whether `plan` has a `Sort` [`rewrite_sort_group_key_tie_order`] edits:
+/// one over an `Aggregate` (or a `Projection` directly over one) whose GROUP
+/// BY keys are all non-float and not yet all sort terms. Shape and key types
+/// only; what the aggregate computes does not matter, so a statement gets the
+/// same total order whether or not its plan is spill-eligible.
+fn plan_has_tie_order_edit(plan: &LogicalPlan) -> bool {
+    plan.exists(|node| {
+        Ok(matches!(
+            node,
+            LogicalPlan::Sort(sort) if matches!(
+                total_tie_order_edit(sort),
+                Some(TieOrderEdit::Extend(_) | TieOrderEdit::ProjectThrough { .. })
+            )
+        ))
+    })
+    .unwrap_or(false)
+}
+
 /// Apply `edit` to `sort`, leaving `fetch` unchanged.
 fn apply_tie_order_edit(
     sort: Sort,
@@ -4371,10 +4411,11 @@ fn apply_tie_order_edit(
 }
 
 /// Rewrites every `Sort` whose input is an `Aggregate` (or a `Projection`
-/// directly over one) so its key is total over that aggregate's GROUP BY keys
-/// ([`tie_order_edit`]): each key without a sort term is appended, in group
-/// order, ascending with nulls last, and `fetch` is unchanged. A `Sort` no
-/// edit applies to is returned unchanged. Does not reach into subquery plans.
+/// directly over one) with no float GROUP BY key so its key is total over
+/// that aggregate's GROUP BY keys ([`total_tie_order_edit`]): each key without
+/// a sort term is appended, in group order, ascending with nulls last, and
+/// `fetch` is unchanged. A `Sort` no edit applies to is returned unchanged.
+/// Does not reach into subquery plans.
 ///
 /// Errors only when a rebuilt `Projection` does not validate (a user column
 /// already named like a [`TIEBREAK_COLUMN_PREFIX`] column). Every caller then
@@ -4384,7 +4425,7 @@ fn apply_tie_order_edit(
 fn rewrite_sort_group_key_tie_order(plan: LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
     Ok(plan
         .transform_down(|node| match node {
-            LogicalPlan::Sort(sort) => match tie_order_edit(&sort) {
+            LogicalPlan::Sort(sort) => match total_tie_order_edit(&sort) {
                 Some(edit) => apply_tie_order_edit(sort, edit),
                 None => Ok(Transformed::no(LogicalPlan::Sort(sort))),
             },
@@ -4419,18 +4460,21 @@ fn tie_ordered_or_unchanged(plan: LogicalPlan) -> LogicalPlan {
 /// spilled group state picks a merge-order-stable representative bit pattern.
 fn aggregate_node_is_spill_exact(aggregate: &Aggregate) -> bool {
     let schema = aggregate.input.schema().as_ref();
-    for key in &aggregate.group_expr {
-        match key.get_type(schema) {
-            Ok(ty) if crate::minmax::is_float(&ty) => return false,
-            Ok(_) => {}
-            // Fail closed: a key whose type will not resolve is not admitted.
-            Err(_) => return false,
-        }
-    }
+    group_keys_are_non_float(aggregate)
+        && aggregate
+            .aggr_expr
+            .iter()
+            .all(|expr| aggregate_expr_is_spill_exact(expr, schema))
+}
+
+/// Whether every GROUP BY key of `aggregate` resolves to a type that is not a
+/// float. Fail closed: a key whose type will not resolve does not count.
+fn group_keys_are_non_float(aggregate: &Aggregate) -> bool {
+    let schema = aggregate.input.schema().as_ref();
     aggregate
-        .aggr_expr
+        .group_expr
         .iter()
-        .all(|expr| aggregate_expr_is_spill_exact(expr, schema))
+        .all(|key| matches!(key.get_type(schema), Ok(ty) if !crate::minmax::is_float(&ty)))
 }
 
 /// Whether one aggregate expression keeps its exact answer when the spill path
@@ -6213,9 +6257,13 @@ mod tests {
         assert!(rewrite_sort_group_key_tie_order(plan).is_err());
     }
 
-    /// A float GROUP BY key stays spill-ineligible under an `ORDER BY`: the
-    /// rewrite is not even attempted (the plan is ineligible whatever its sort
-    /// order), and running it anyway does not make the plan eligible.
+    /// A float GROUP BY key stays spill-ineligible under an `ORDER BY`, and
+    /// the rewrite leaves its `Sort` as written: ordering on a float group key
+    /// proves no total order, so the executed-plan gate does not fire and the
+    /// rewrite itself appends nothing.
+    ///
+    /// Prove-the-test: drop the `group_keys_are_non_float` check from
+    /// `total_tie_order_edit` and the gate reads true.
     #[tokio::test]
     async fn a_float_group_key_under_order_by_stays_ineligible() {
         let plan = eviction_test_executor()
@@ -6228,12 +6276,44 @@ mod tests {
             .await
             .expect("the statement plans");
         assert!(!plan_is_spill_eligible_ignoring_sort_order(&plan));
+        assert!(!plan_has_tie_order_edit(&plan));
+        let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
+        assert_eq!(sort_terms(&rewritten), vec![term(None, "c", false)]);
+        assert!(!plan_is_spill_eligible(&rewritten));
+    }
+
+    /// The executed-plan gate reads the `Sort`'s shape and group key types,
+    /// not what the aggregate computes: a `min` over a string group key is
+    /// not spill-exact, yet its `Sort` gets the group keys as tiebreaks, so
+    /// its top ten does not depend on how the aggregate's groups arrived. A
+    /// `Sort` that already orders by every group key has nothing to edit.
+    ///
+    /// Prove-the-test: return `plan_is_spill_eligible_ignoring_sort_order` from
+    /// `plan_has_tie_order_edit` and the `min` row reads false; drop the
+    /// `Extend`/`ProjectThrough` filter (accept any `Some`) and the
+    /// already-total row reads true.
+    #[tokio::test]
+    async fn the_tie_order_gate_reads_shape_not_aggregate_exactness() {
+        let plan =
+            q33_plan("SELECT a, b, min(x) AS m FROM q33 GROUP BY a, b ORDER BY m DESC LIMIT 10")
+                .await;
+        assert!(!plan_is_spill_eligible_ignoring_sort_order(&plan));
+        assert!(plan_has_tie_order_edit(&plan));
         let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite applies");
         assert_eq!(
             sort_terms(&rewritten),
-            vec![term(None, "c", false), term(Some("samples"), "value", true)]
+            vec![
+                term(None, "m", false),
+                term(Some("q33"), "a", true),
+                term(Some("q33"), "b", true),
+            ]
         );
-        assert!(!plan_is_spill_eligible(&rewritten));
+
+        let already_total = q33_plan(
+            "SELECT a, b, count(*) AS c FROM q33 GROUP BY a, b ORDER BY c DESC, a, b LIMIT 10",
+        )
+        .await;
+        assert!(!plan_has_tie_order_edit(&already_total));
     }
 
     /// Strips every `Sort` back to its first term: the shape a classification
