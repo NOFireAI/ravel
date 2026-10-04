@@ -581,29 +581,69 @@ this can still carry one, and compaction cannot write its records
 into an L1 segment. Compaction leaves that object out of the merge and merges
 the rest of the bucket. The compaction record does not name the skipped object,
 so no sweep deletes it as superseded, and the catalog keeps serving it as an
-L0 object, readable exactly as before: every merged-view read of it still
-fails.
+L0 object.
+
+Queries still read the object. A query that has to decode its stream
+attributes fails with a typed error rather than returning its records: a SQL
+query that projects `attrs` or a declared attribute column, a metric query
+over logs that decodes the object's stream labels, and a logs query while an
+erasure request is pending for the tenant's logs. These failures do not depend
+on compaction: they are the same whether or not compaction has skipped the
+object.
 
 What an operator sees:
 
 - `ravel_maintain_compaction_inputs_skipped_total{signal="logs",reason="unwritable_stream_attrs"}`
   (or `signal="audit"` for the query-audit shard) moves by one per skipped
-  object. Each object counts once per process; another process, or this one
-  after a restart, that reads the same object counts it again.
+  object. The counter is per process and resets to 0 on restart. Each object
+  counts once per process, and only when compaction reads it: once the rest of
+  its bucket is compacted no later evaluation reads the object, so after a
+  restart the counter stays at 0 while the object remains. Alert on an
+  increase, not on a level.
 - One `WARN` line per object per process, `compaction skipped an input object
   it cannot rewrite`, carrying `object_key` (the object's storage key),
   `reason` and `error` (the decoder's refusal), with the bucket's signal,
-  shard and hour.
-- The bucket compacts as usual. When every input of the bucket is such an
-  object, nothing is published and the bucket reports below-minimum, and the
-  process that skipped them does not read them again.
+  shard and hour. The warning line is the durable trace of a skip; the counter
+  is not.
+- The rest of the bucket compacts as usual when at least
+  `min_compaction_inputs` (default 2) healthy inputs remain. When fewer remain,
+  including when every input is such an object, nothing is published and the
+  bucket reports below-minimum. `ravel_maintain_l0_records_pending` then counts
+  the healthy inputs that remain and not the skipped objects, so a bucket whose
+  inputs are all skipped adds 0 to it. The process that skipped the object does
+  not read it again; a bucket left this way has no compaction record, so each
+  new process, and this one after a restart, reads the object once, counts it
+  and warns.
+- The evaluation that reads and skips the object takes and completes the
+  bucket's claim, as any compaction does. A later evaluation, in the same
+  process, of a bucket left below the minimum by its skipped objects returns
+  before the claim and takes none.
+- A bucket whose listing holds fewer than `min_compaction_inputs` L0 records
+  is never read by compaction, so an object of this kind alone in such a bucket
+  is not counted or warned. It is counted in
+  `ravel_maintain_l0_records_pending` like any other L0 record.
 
-The object is not deleted and not rewritten by any maintenance path. The
-remedy is to delete that object, or rewrite it, by hand. Until then, an
-erasure request whose window covers it stays pending, because the erasure
-rewrite of a compacted bucket rewrites only the compaction record's outputs,
-and `ravel-cli maintain migrate`, which skips no input, still fails on a bucket
-it rewrites while that bucket has no compaction record and holds the object. A
+No maintenance path rewrites the object. Retention expiry deletes it with the
+rest of its bucket. There is no supported manual procedure to remove or repair
+it yet: a data object's key is derived from its content, so it cannot be
+rewritten in place, and deleting only the data object leaves its commit record
+pointing at an object that no longer exists. Leaving it until retention removes
+it changes nothing for reads, since the failures above do not depend on
+compaction. The exception is erasure:
+
+- In a bucket with a compaction record, the erasure rewrite rewrites only the
+  record's outputs and never reaches the skipped object, so an erasure request
+  whose window covers the object stays pending.
+- In a bucket with no compaction record (every input skipped, or too few left
+  to meet the minimum), the erasure rewrite of that bucket reads every L0
+  object in it and fails when it writes the skipped object's records into its
+  output, the same refusal compaction avoids, on every tick. The failure is
+  logged for that bucket and the pass goes on to the next one, but no erasure
+  request for that tenant and signal is marked complete on a tick where any
+  bucket failed, so the request stays pending.
+
+`ravel-cli maintain migrate`, which skips no input, still fails on a bucket it
+rewrites while that bucket has no compaction record and holds the object. A
 `compact-bucket` or `compact-tenant` run skips the object the same
 way and logs the same warning, but it is a separate process with no `/metrics`
 endpoint, so it moves no server counter.

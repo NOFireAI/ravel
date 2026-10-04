@@ -3977,9 +3977,9 @@ fn render_maintain_safety_family(
         "Input objects compaction left out of its merge instead of failing on them, by signal \
          and reason, each object counted once per process since process start (issue #2554). \
          reason=\"unwritable_stream_attrs\": a log object carrying a stream_attrs blob the RLOG \
-         writer refuses. The rest of the bucket is merged; the skipped object stays in storage, \
-         is not named by the compaction record, and still fails merged-view reads. A warn log \
-         line names its key; the remedy is to delete or rewrite that object by hand.",
+         writer refuses. The rest of the bucket is merged when at least min_compaction_inputs \
+         inputs remain; the skipped object stays in storage and is not named by any compaction \
+         record. A warn log line names its key. Resets on restart: alert on an increase.",
         "counter",
     );
     for &(signal, reason, value) in &snapshot.compaction_inputs_skipped {

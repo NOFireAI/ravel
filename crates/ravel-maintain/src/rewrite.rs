@@ -165,7 +165,7 @@ pub async fn rewrite_and_publish<C: SegmentCodec>(
         )),
         // Unreachable by construction: this run fails on an unrewritable input
         // rather than skipping it, so it cannot run out of inputs.
-        FencedRewrite::NoWritableInputs => Err(MaintainError::Invariant(
+        FencedRewrite::TooFewWritableInputs { .. } => Err(MaintainError::Invariant(
             "a rewrite that skips no input reported no writable inputs".to_string(),
         )),
     });
@@ -271,9 +271,11 @@ pub(crate) enum FencedRewrite {
     /// planned from, so the run published nothing (ADR-1029, the 2026-10-03
     /// amendment). Carries the new listing, so the caller can report why.
     RecordSetChanged(BucketListing),
-    /// Every input was one the codec cannot rewrite and the run skips
-    /// ([`UnwritableInputs::Skip`]), so it built and published nothing.
-    NoWritableInputs,
+    /// The run skipped at least one input the codec cannot rewrite
+    /// ([`UnwritableInputs::Skip`]) and fewer than `min_compaction_inputs`
+    /// writable inputs remain, `remaining` of them, so it built and published
+    /// nothing.
+    TooFewWritableInputs { remaining: usize },
 }
 
 /// What a run does with an input its codec's writer would refuse
@@ -284,7 +286,9 @@ pub(crate) enum UnwritableInputs {
     /// and warned once per object per process
     /// ([`crate::compact::note_skipped_input`]). Compaction does this (issue
     /// #2554): the object stays in storage and the catalog keeps serving it as
-    /// an L0 object, so no record is lost.
+    /// an L0 object, so no record is lost. When a skip leaves fewer than
+    /// `min_compaction_inputs` inputs the run publishes nothing
+    /// ([`FencedRewrite::TooFewWritableInputs`]).
     Skip,
     /// Merge it, so the writer's refusal fails the run. Format migration does
     /// this: it promises to rewrite the whole live L0 set.
@@ -430,20 +434,6 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     }
     C::validate_rewrite_inputs(&inputs)?;
     let mut inputs = inputs;
-    if unwritable == UnwritableInputs::Skip {
-        // An object an earlier run of this process skipped is left out before
-        // its catalog is read again.
-        let mut kept = Vec::with_capacity(inputs.len());
-        for input in inputs {
-            if !crate::compact::is_skipped_input(&keys::reconstruct_data_key(&input.record)?) {
-                kept.push(input);
-            }
-        }
-        inputs = kept;
-        if inputs.is_empty() {
-            return Ok(FencedRewrite::NoWritableInputs);
-        }
-    }
     let mut hash = input_set_hash(&inputs);
 
     // Cancellation checkpoint 2 (ADR-1029 decision 3): the input set is
@@ -475,10 +465,12 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
     if unwritable == UnwritableInputs::Skip {
         let loaded = inputs.len();
         (inputs, catalogs) = skip_unwritable_inputs::<C>(bucket, inputs, catalogs)?;
-        if inputs.is_empty() {
-            return Ok(FencedRewrite::NoWritableInputs);
-        }
         if inputs.len() != loaded {
+            if inputs.is_empty() || inputs.len() < config.min_compaction_inputs {
+                return Ok(FencedRewrite::TooFewWritableInputs {
+                    remaining: inputs.len(),
+                });
+            }
             hash = input_set_hash(&inputs);
         }
     }
@@ -784,7 +776,7 @@ async fn migrate_bucket_format_scoped(
             migrate_listing_gate(&now).unwrap_or(MigrateOutcome::RecordSetChanged)
         }
         // A migration skips no input (`UnwritableInputs::Fail`).
-        FencedRewrite::NoWritableInputs => {
+        FencedRewrite::TooFewWritableInputs { .. } => {
             return Err(MaintainError::Invariant(
                 "a migration that skips no input reported no writable inputs".to_string(),
             ));
@@ -1129,7 +1121,7 @@ async fn reencode_compaction_parts_scoped(
         Some(FencedRewrite::RecordSetChanged(now)) => {
             Ok(reencode_listing_gate(&now).unwrap_or(ReencodeOutcome::RecordSetChanged))
         }
-        Some(FencedRewrite::NoWritableInputs) => Err(MaintainError::Invariant(
+        Some(FencedRewrite::TooFewWritableInputs { .. }) => Err(MaintainError::Invariant(
             "a re-encode, which skips no input, reported no writable inputs".to_string(),
         )),
         None => Err(MaintainError::Invariant(

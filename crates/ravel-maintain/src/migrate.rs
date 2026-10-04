@@ -662,16 +662,14 @@ async fn list_shard_hours(
 /// The exclusion is keyed on the superseding record's explicit `inputs` list
 /// (via [`crate::sweep::superseded_input_commit_keys`], the same predicate
 /// sweep rule 2 deletes by), not on membership of the record's ingest-hour
-/// bucket. Bucket membership gives the same answer today, since
-/// compaction and rewrite refuse an unsealed bucket and a sealed bucket's L0
-/// set is frozen, so any record over a bucket covers that bucket's whole L0
-/// set. But this re-audit exists to verify the walk independently, and keying
-/// it on membership would make it inherit that seal invariant as a premise
-/// instead of confirming coverage. If a partial-coverage record ever exists
-/// (naming some but not all of its bucket's L0 set), membership would exclude
-/// the still-live, un-migrated remainder and raise the floor over data below
-/// the target, a false claim about durable state; the input-set predicate
-/// excludes exactly the records that were actually superseded.
+/// bucket. A compaction record can name only part of its bucket's L0 set:
+/// compaction leaves out an input it cannot rewrite
+/// ([`crate::compact::CompactionInputSkipReason`]), and that object stays live
+/// as L0. Membership would exclude such a still-live, un-migrated object and
+/// raise the floor over data below the target, a false claim about durable
+/// state; the input-set predicate excludes exactly the records that were
+/// actually superseded, so an object the record does not name is never treated
+/// as superseded.
 ///
 /// Only an AUTHORITATIVE compaction record's inputs are excluded. Compaction
 /// records whose input sets overlap resolve to one winner per overlap

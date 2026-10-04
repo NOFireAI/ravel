@@ -20,12 +20,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use common::*;
+use ravel_commit::erasure::compute_compaction_input_set_hash;
 use ravel_commit::{keys, record};
+use ravel_fleet::claim::COMPACTION_CLAIMS_PREFIX;
+use ravel_logseg::LogSegError;
 use ravel_maintain::claim_guard::ClaimSleeper;
 use ravel_maintain::{
     ClaimParticipant, Clock, CompactionInputSkipReason, CompactionOutcome, CompactorConfig,
-    Coordination, FixedClock, MaintainMemo, MaintainReport, PublishOutcome, compact_bucket,
-    compaction_inputs_skipped_total,
+    Coordination, FixedClock, MaintainError, MaintainMemo, MaintainReport, PublishOutcome,
+    compact_bucket, compaction_inputs_skipped_total, migrate_bucket_format,
 };
 use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence, SequenceStep};
 use ravel_object_store::memory::MemoryStore;
@@ -152,7 +155,8 @@ async fn seed_refused(store: &dyn ObjectStoreBackend, base: u128, n: u64) -> (St
 
 /// `mem` behind a [`FaultStore`] with one sequence per key in `keys`, in
 /// order, each passing every GET of its key through and counting it:
-/// `sequence_progress(i)` is the number of reads of `keys[i]`.
+/// `sequence_progress(i)` is the number of reads of `keys[i]`. One more
+/// sequence, at index `keys.len()`, counts the compaction claim PUTs.
 fn counting_reads_of(mem: &Arc<MemoryStore>, keys: &[&str]) -> FaultStore<Arc<MemoryStore>> {
     let mut plan = FaultPlan::empty();
     for key in keys {
@@ -162,6 +166,11 @@ fn counting_reads_of(mem: &Arc<MemoryStore>, keys: &[&str]) -> FaultStore<Arc<Me
                 .with_steps(vec![SequenceStep::Passthrough; 1024]),
         );
     }
+    plan = plan.with_sequence(
+        Sequence::new(Op::Put)
+            .with_key_contains(COMPACTION_CLAIMS_PREFIX)
+            .with_steps(vec![SequenceStep::Passthrough; 1024]),
+    );
     FaultStore::new(Arc::clone(mem), plan)
 }
 
@@ -249,7 +258,10 @@ fn writer(base: u128, n: u64) -> String {
 ///
 /// Against the pre-change code the first tick fails with the writer's
 /// `Corrupted` refusal (`expect("the tick succeeds")`); without the record's
-/// input list being cut down, the published record names the refused writer.
+/// input list being cut down, the published record names the refused writer;
+/// without the hash recomputed after the skip (`hash = input_set_hash(&inputs)`
+/// in the rewrite primitive), the record's hash covers three inputs while it
+/// names two.
 #[tokio::test]
 async fn a_refused_object_is_skipped_and_the_rest_of_its_bucket_merged() {
     capture();
@@ -287,6 +299,11 @@ async fn a_refused_object_is_skipped_and_the_rest_of_its_bucket_merged() {
         input_writers(&record),
         BTreeSet::from([writer(BASE, 1), writer(BASE, 2)]),
         "the record names the healthy inputs and not the skipped one"
+    );
+    assert_eq!(
+        record.input_set_hash,
+        compute_compaction_input_set_hash(&record.inputs).to_vec(),
+        "the input set hash covers exactly the inputs the record names"
     );
     assert_eq!(
         record.parts.iter().map(|p| p.sample_count).sum::<u64>(),
@@ -337,12 +354,14 @@ async fn a_refused_object_is_skipped_and_the_rest_of_its_bucket_merged() {
 
 /// A bucket holding only refused objects has nothing left to merge: the first
 /// tick reads both objects, counts and warns each once, publishes nothing and
-/// reports the bucket below the input threshold. The second tick reads neither
-/// object, because this process remembers both, and counts nothing more.
+/// reports the bucket below the input threshold with no pending L0 record. The
+/// second tick reads neither object, because this process remembers both,
+/// counts nothing more, and puts no claim.
 ///
 /// Against the pre-change code the first tick fails with the writer's
-/// refusal; with the remembered set unconsulted (`is_skipped_input` in the
-/// rewrite primitive), the second tick reads both catalogs again.
+/// refusal; with the remembered set unconsulted (`drop_skipped_inputs` in
+/// `compact_bucket_scoped`), the second tick reads both catalogs again; with
+/// that filter after the claim acquisition, the second tick puts a claim.
 #[tokio::test]
 async fn a_skipped_object_is_not_read_again_by_the_same_process() {
     capture();
@@ -363,21 +382,136 @@ async fn a_skipped_object_is_not_read_again_by_the_same_process() {
     let first = tick(&mut memo, &store, &clock, &config).await;
     assert_eq!(first.compacted, 0);
     assert_eq!(first.already_done, 1, "reported below the input threshold");
+    assert_eq!(first.l0_records_pending, 0, "no writable input is pending");
     let reads = (store.sequence_progress(0), store.sequence_progress(1));
     assert!(reads.0 > 0 && reads.1 > 0, "both catalogs read: {reads:?}");
+    let claim_puts = store.sequence_progress(2);
+    assert!(claim_puts > 0, "the first tick claims the bucket");
     assert_eq!(skipped_total() - before, 2);
     assert_eq!(compaction_record_count(&*mem).await, 0, "nothing published");
 
     let second = tick(&mut memo, &store, &clock, &config).await;
     assert_eq!(second.already_done, 1);
+    assert_eq!(second.l0_records_pending, 0);
     assert_eq!(
         (store.sequence_progress(0), store.sequence_progress(1)),
         reads,
         "the second tick reads neither refused object"
     );
+    assert_eq!(
+        store.sequence_progress(2),
+        claim_puts,
+        "the second tick puts no claim"
+    );
     assert_eq!(skipped_total() - before, 2, "and counts nothing more");
     assert_eq!(skip_warnings_naming(&first_data).len(), 1);
     assert_eq!(skip_warnings_naming(&second_data).len(), 1);
+}
+
+/// A bucket of one healthy and one refused input passes the listing's input
+/// count, but only one writable input remains once the refused one is dropped,
+/// below the default minimum of 2. The first tick reads the refused object,
+/// counts and warns it once, publishes no record and reports the bucket below
+/// the minimum with the one healthy record pending. The second tick reads
+/// neither the refused object nor publishes, and puts no claim.
+///
+/// With the minimum not re-checked after the skip (the
+/// `inputs.len() < config.min_compaction_inputs` test after
+/// `skip_unwritable_inputs` in the rewrite primitive), the first tick publishes
+/// a record over the one healthy input.
+#[tokio::test]
+async fn a_skip_that_leaves_the_bucket_below_the_minimum_publishes_nothing() {
+    capture();
+    let _serial = SERIAL.lock().await;
+    const BASE: u128 = 0x400;
+
+    let mem = Arc::new(MemoryStore::new());
+    let now_ns = sealed_now_ns();
+    mem.set_clock_ms((now_ns / 1_000_000) as u64);
+    seed_healthy(&*mem, BASE, 1).await;
+    let (_, refused_data) = seed_refused(&*mem, BASE, 2).await;
+    let store = counting_reads_of(&mem, &[&refused_data]);
+    let clock = FixedClock::new(now_ns);
+    let config = claiming_config(&clock);
+    assert_eq!(config.min_compaction_inputs, 2);
+    let mut memo = MaintainMemo::with_default_interval();
+    let before = skipped_total();
+
+    let first = tick(&mut memo, &store, &clock, &config).await;
+    assert_eq!(first.compacted, 0, "nothing compacts");
+    assert_eq!(first.already_done, 1, "reported below the input threshold");
+    assert_eq!(
+        first.l0_records_pending, 1,
+        "the healthy input is the one record left pending"
+    );
+    let reads = store.sequence_progress(0);
+    assert!(
+        reads > 0,
+        "the first tick reads the refused object's catalog"
+    );
+    let claim_puts = store.sequence_progress(1);
+    assert_eq!(compaction_record_count(&*mem).await, 0, "nothing published");
+    assert_eq!(skipped_total() - before, 1, "the skip counts once");
+    assert_eq!(skip_warnings_naming(&refused_data).len(), 1);
+
+    let second = tick(&mut memo, &store, &clock, &config).await;
+    assert_eq!(second.compacted, 0);
+    assert_eq!(second.already_done, 1);
+    assert_eq!(second.l0_records_pending, 1);
+    assert_eq!(
+        store.sequence_progress(0),
+        reads,
+        "the second tick does not read the refused object"
+    );
+    assert_eq!(
+        store.sequence_progress(1),
+        claim_puts,
+        "the second tick puts no claim"
+    );
+    assert_eq!(compaction_record_count(&*mem).await, 0, "nor publishes");
+    assert_eq!(skipped_total() - before, 1, "the counter stays at 1");
+    assert_eq!(skip_warnings_naming(&refused_data).len(), 1);
+}
+
+/// Format migration skips no input: over a bucket holding a refused object it
+/// fails with the writer's typed `Corrupted` refusal, publishes nothing, and
+/// moves no skip counter.
+///
+/// With the migration passing `UnwritableInputs::Skip` (in `load_then_rewrite`)
+/// it skips the refused object, counts it, and publishes a record over the two
+/// healthy inputs.
+#[tokio::test]
+async fn format_migration_still_fails_on_a_refused_object() {
+    capture();
+    let _serial = SERIAL.lock().await;
+    const BASE: u128 = 0x500;
+
+    let store = MemoryStore::new();
+    seed_healthy(&store, BASE, 1).await;
+    seed_healthy(&store, BASE, 2).await;
+    let (_, refused_data) = seed_refused(&store, BASE, 3).await;
+    let before = skipped_total();
+
+    let err = migrate_bucket_format(
+        &store,
+        &FixedClock::new(sealed_now_ns()),
+        &CompactorConfig::default(),
+        &logs_bucket(),
+        u32::MAX,
+    )
+    .await
+    .expect_err("the migration fails on the refused object");
+    assert!(
+        matches!(err, MaintainError::LogSeg(LogSegError::Corrupted(_))),
+        "{err:?}"
+    );
+    assert_eq!(
+        compaction_record_count(&store).await,
+        0,
+        "nothing published"
+    );
+    assert_eq!(skipped_total(), before, "the skip counter does not move");
+    assert!(skip_warnings_naming(&refused_data).is_empty());
 }
 
 /// A bucket with no refused object compacts every input exactly as before:
