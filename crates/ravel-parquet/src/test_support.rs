@@ -149,8 +149,9 @@ pub(crate) fn arrow_schema_panicking(original: &[u8]) -> Vec<u8> {
 /// `at` changed from `from_value` to `to_value` (a one-byte field header,
 /// `0x15`, followed by the field's value as a one-byte zigzag varint; every
 /// `Encoding` ordinal this crate's tests flip fits one byte as
-/// `ordinal * 2`). Used to retype a nested `DataPageHeader`'s `encoding`
-/// field, `at` found relative to a chunk's `data_page_offset`.
+/// `ordinal * 2`). Used to retype a `PageHeader`'s `type` field or a nested
+/// `DataPageHeader`'s `encoding` field, `at` found relative to a chunk's
+/// `data_page_offset`.
 pub(crate) fn retype_page_header(
     original: &[u8],
     at: usize,
