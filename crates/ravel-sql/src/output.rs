@@ -350,10 +350,7 @@ fn cell_to_json(column: &str, array: &ArrayRef, row: usize) -> Result<Json, SqlE
         // encoded by the same rules as a top-level cell, so a nested Utf8 or
         // Map reads exactly as it would in a column of its own. Every list
         // layout encodes the same way.
-        DataType::List(_) => list_json(
-            column,
-            &downcast::<ListArray>(array, "List")?.value(row),
-        )?,
+        DataType::List(_) => list_json(column, &downcast::<ListArray>(array, "List")?.value(row))?,
         DataType::LargeList(_) => list_json(
             column,
             &downcast::<LargeListArray>(array, "LargeList")?.value(row),
@@ -1010,12 +1007,7 @@ mod tests {
     #[test]
     fn date64_that_is_not_a_date_is_a_typed_error() {
         use datafusion::arrow::array::Date64Array;
-        for millis in [
-            123_456_789,
-            -123_456_789,
-            2_932_897 * 86_400_000,
-            i64::MIN,
-        ] {
+        for millis in [123_456_789, -123_456_789, 2_932_897 * 86_400_000, i64::MIN] {
             assert_unencodable(
                 Arc::new(Date64Array::from(vec![millis])) as ArrayRef,
                 &digits(millis),
