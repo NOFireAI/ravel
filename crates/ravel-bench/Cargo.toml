@@ -77,6 +77,12 @@ thiserror = { workspace = true }
 # gate. No new external crate enters the workspace.
 tonic = { workspace = true }
 stats_alloc = "0.1.10"
+# Stage 0e (issue #2480, epic #2467): heap profiler that attributes LIVE
+# bytes to allocation call stacks at a process-exit snapshot, used by
+# `logseg_live_by_site` to resolve the stage 0d block-stage memory
+# contradiction. Not in the workspace `[workspace.dependencies]`; new
+# external crate, bench-only, single measurement use.
+dhat = "0.3.3"
 # Gated behind `parquet-baseline` (off by default). arrow reuses the
 # workspace pin (identical to ravel-otap's); parquet is pinned lockstep to
 # the same major and is a new external dependency.
@@ -307,6 +313,11 @@ bench = false
 [[bin]]
 name = "segment_alloc_profile"
 path = "src/bin/segment_alloc_profile.rs"
+bench = false
+
+[[bin]]
+name = "logseg_peak_by_site"
+path = "src/bin/logseg_peak_by_site.rs"
 bench = false
 
 [[bin]]
