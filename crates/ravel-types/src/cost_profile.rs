@@ -360,7 +360,10 @@ pub enum CostProfileError {
     /// The profile sets a request timing to zero. A zero timing makes the
     /// time term's request cost zero, which on a profile with free bytes the
     /// cost-based rate floors to one byte: ranged reads nearly everywhere,
-    /// from a figure nobody measured.
+    /// from a figure nobody measured. Only an exact zero is refused: positive
+    /// timings whose product is under one byte per request (microseconds
+    /// times bytes per second below 1,000,000) truncate to the same zero and
+    /// floor the same way.
     #[error("store cost profile sets {field} to 0; a measured request timing is positive")]
     ZeroTiming {
         /// The timing field set to zero.

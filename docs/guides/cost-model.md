@@ -252,8 +252,9 @@ to it. Three cases matter:
   request costs: 31,500,000 bytes. So a one-column statement over 35 MB objects
   reads only its column ranges, and the blocks of every object of 31,500,000
   bytes or less are still read in one whole-object GET, with no tail probe on
-  the whole-segment fast path and on the planned route (any statement the
-  whole-segment fast path refuses) alike. Above the break-even a statement on
+  the whole-segment fast path, on the planned route (any statement the
+  whole-segment fast path refuses) and on the log-series route's
+  stream-directory read alike. Above the break-even a statement on
   the planned route probes an object's tail and directories first, and a wide
   projection whose surviving ranges cover at least 75% of the object then
   reads it whole anyway, because that route does not weigh the projected

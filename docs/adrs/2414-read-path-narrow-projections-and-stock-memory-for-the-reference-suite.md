@@ -92,6 +92,12 @@ time is its bytes over its share of throughput, not its round trips times
 the latency. Pinned by a `FaultStore::hold` test: with a partition owning
 three segments and the first segment's range GET held, the second segment's
 range GETs are issued before the hold releases; today they are not.
+Within one statement a current open is reported refused by the fetch memory
+budget only if the budget refused it twice, the second time after every
+unconsumed prefetch of every partition of the statement had been dropped and
+the statement's pipeline turned off. Across statements the budget stays
+fail-fast: another statement's prefetches can hold the bytes, and that
+refusal is typed and reported like any contended reservation.
 
 A3. **The cost-based policy carries a time term, so a narrow projection on
 S3 reads ranged.** A request's cost in bytes is the bytes one connection
