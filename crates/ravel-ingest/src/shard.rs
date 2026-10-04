@@ -56,7 +56,8 @@ use crate::config::{
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
 use crate::generation::{
-    FlushScope, HandBackArrival, SCAN_SET_HANDBACK_ABANDONED, ScanCheck, reread_and_check,
+    FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck, mismatch_retry_spent,
+    reread_and_check, send_hand_back,
 };
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -223,9 +224,35 @@ struct TenantBuf {
     /// Set once a hand-back from this buffer found a target shard not live, so
     /// the episode counts and logs once however many triggers retry it.
     hand_back_blocked: bool,
+    /// When a generation-mismatch hand-back from this buffer first left rows
+    /// undelivered, so later triggers retry it only until the deferral cap
+    /// ([`mismatch_retry_spent`]).
+    mismatch_held_since_ns: Option<i64>,
 }
 
 impl TenantBuf {
+    /// Merges rows that are already admitted and charged: rows handed back
+    /// to this shard, or rows a failed hand-back send returned. Their arrival
+    /// bookkeeping travels with them. Leaves the buffer untouched on a
+    /// collision, as [`TenantBuf::merge`] does.
+    fn absorb(
+        &mut self,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
+    ) -> Result<(), WriteError> {
+        self.merge_unstamped(points)?;
+        self.absorb_exemplars(exemplars);
+        self.charges.extend(charges);
+        arrival.fold_into(
+            &mut self.oldest_arrival_ns,
+            &mut self.min_ingest_ts_ns,
+            &mut self.max_ingest_ts_ns,
+        );
+        Ok(())
+    }
+
     fn note_arrival(&mut self, arrival_ns: i64) {
         if let Some(last) = self.last_arrival_ns {
             let gap = arrival_ns.saturating_sub(last).max(0);
@@ -1023,6 +1050,10 @@ pub(crate) struct ShardActor {
     /// Set by a hand-back and cleared by the next flush that opens in place,
     /// so a run of hand-backs on this shard logs one WARN.
     handing_back: bool,
+    /// Set for a drain's last pass over buffers a generation-mismatch
+    /// hand-back left undelivered: a hand-back that fails again there writes
+    /// the rows in place, so the drain does not answer with them buffered.
+    mismatch_in_place: bool,
     /// Inside a drain, the tenants whose provisioning record this drain has
     /// already re-read after the scan-set check found no trusted view, so each
     /// is re-read once per drain rather than once per pass. `None` outside a
@@ -1088,6 +1119,7 @@ impl ShardActor {
             cap_flag,
             scope,
             handing_back: false,
+            mismatch_in_place: false,
             drain_rereads: None,
         }
     }
@@ -1144,8 +1176,10 @@ impl ShardActor {
                             let _ = done.send(());
                         }
                         Some(ShardMsg::Shutdown { done }) => {
+                            let unprocessed = self.close_mailbox().await;
                             self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
                                 .await;
+                            drop(unprocessed);
                             let _ = done.send(());
                             break;
                         }
@@ -1187,6 +1221,35 @@ impl ShardActor {
                 }
             }
         }
+    }
+
+    /// Closes this actor's mailbox before its teardown flush, so every later
+    /// send fails as closed and its sender keeps the message, and absorbs every
+    /// hand-back already queued: a hand-back this mailbox accepted is written
+    /// by this drain, unless its rows collide with a series id already
+    /// buffered under another label set, which drops them with an ERROR
+    /// (`absorb_rows`). Any other message still queued is returned for the
+    /// caller to drop after the drain, which is when the receiver dropped it
+    /// before this existed. A `Write` cannot be queued here through the
+    /// router, whose `shutdown` consumes it.
+    async fn close_mailbox(&mut self) -> Vec<ShardMsg> {
+        self.rx.close();
+        let mut unprocessed = Vec::new();
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                ShardMsg::HandBack {
+                    tenant,
+                    points,
+                    exemplars,
+                    charges,
+                    arrival,
+                } => {
+                    self.absorb_rows(&tenant, points, exemplars, charges, arrival);
+                }
+                other => unprocessed.push(other),
+            }
+        }
+        unprocessed
     }
 
     /// Merges one write into its tenant buffer and opens a size-triggered flush
@@ -1316,7 +1379,7 @@ impl ShardActor {
         arrival: HandBackArrival,
     ) -> bool {
         let buf = self.tenants.entry(tenant.clone()).or_default();
-        if let Err(err) = buf.merge_unstamped(points) {
+        if let Err(err) = buf.absorb(points, exemplars, charges, arrival) {
             // A series id claiming a second label set is the ADR-0005 collision
             // a fresh write would have been refused for; there is no caller
             // left to answer, so the rows are dropped loudly.
@@ -1328,43 +1391,40 @@ impl ShardActor {
             );
             return false;
         }
-        buf.absorb_exemplars(exemplars);
-        buf.charges.extend(charges);
-        arrival.fold_into(
-            &mut buf.oldest_arrival_ns,
-            &mut buf.min_ingest_ts_ns,
-            &mut buf.max_ingest_ts_ns,
-        );
         true
     }
 
     /// Hands `buf`'s rows to the shards of the `count`-shard set that
     /// `shard_for` routes them to, instead of writing them under this shard's
-    /// index outside the scan set of the hour it would pin (ADR-1642 scan-set
+    /// index outside the scan set of the hour it would pin, or into an hour
+    /// another generation owns, as `reason` says (ADR-1642 scan-set
     /// amendment). Every target's liveness is checked before anything is taken
-    /// apart, so a dead or closed target returns the buffer untouched for the
-    /// caller to keep. Past that point strict waiters are answered `Abandoned`
-    /// (outcome unknown: the rows are written, by another shard), and each
-    /// target gets a clone of every charge, so each is refunded once, by the
-    /// last of those flushes, and never charged twice.
+    /// apart, so a dead or closed target returns the buffer untouched, waiters
+    /// included, for the caller to keep or write. Past that point strict
+    /// waiters are answered `Abandoned` (outcome unknown: the rows are
+    /// written, by a target shard or, if none can take them, by this one),
+    /// and each target gets a clone of every charge, so each is refunded
+    /// once, by the last of those flushes, and never charged twice.
     ///
-    /// A target that dies after the liveness check fails its send, which
-    /// returns the message: its rows go back into this shard's buffer for the
-    /// tenant with the charges, once however many sends failed, so the next
-    /// flush attempt retries the hand-back. Their waiters were already
-    /// answered, so nothing is acknowledged twice. Returns whether any target
-    /// took rows.
+    /// A target that closed after the liveness check fails its send, which
+    /// returns the message: its rows are gathered into the returned
+    /// [`HandedBack::kept`] buffer with the charges, once however many sends
+    /// failed, for the caller to keep or write. Their waiters were already
+    /// answered, so nothing is acknowledged twice.
     ///
-    /// The send awaits the target's mailbox on this actor. A hand-back always
-    /// goes to a strictly smaller set than this one (the target count is at
-    /// most `scan_count`, which this index is not below), so a chain of such
-    /// waits ends and cannot cycle.
+    /// The send awaits the target's mailbox on this actor only when the target
+    /// set is strictly smaller than this one ([`FlushScope::may_wait_on`]), so
+    /// a chain of such waits ends and cannot cycle. A retired-index hand-back
+    /// always qualifies (the target count is at most `scan_count`, which this
+    /// index is not below); a generation-mismatch hand-back to a larger set
+    /// sends only into a mailbox with room, and a full one fails the send.
     async fn hand_back(
         &mut self,
         tenant: &TenantId,
         mut buf: TenantBuf,
         count: u32,
-    ) -> Result<bool, TenantBuf> {
+        reason: HandBackReason,
+    ) -> HandedBack<TenantBuf> {
         let mut targets: Vec<u32> = buf
             .series
             .keys()
@@ -1377,14 +1437,20 @@ impl ShardActor {
         for &target in &targets {
             match self.scope.live_sender(count, target) {
                 Some(tx) => senders.push(tx),
-                None => return Err(buf),
+                None => {
+                    return HandedBack {
+                        delivered: false,
+                        kept: Some(buf),
+                        target_dead: true,
+                    };
+                }
             }
         }
 
         let waiters = std::mem::take(&mut buf.waiters);
         self.ctx.ack_waiters(
             waiters,
-            Err(WriteError::Abandoned(SCAN_SET_HANDBACK_ABANDONED.into())),
+            Err(WriteError::Abandoned(reason.abandoned_message().into())),
         );
         let TenantBuf {
             series,
@@ -1395,6 +1461,7 @@ impl ShardActor {
             charges,
             deferred_since_ns,
             hand_back_blocked,
+            mismatch_held_since_ns,
             ..
         } = buf;
         let arrival = HandBackArrival {
@@ -1430,8 +1497,10 @@ impl ShardActor {
                 .or_default()
                 .push(exemplar);
         }
+        let wait = self.scope.may_wait_on(count);
         let mut delivered = false;
-        let mut kept = false;
+        let mut kept: Option<TenantBuf> = None;
+        let mut target_dead = false;
         for (target, tx) in targets.into_iter().zip(senders) {
             let msg = ShardMsg::HandBack {
                 tenant: tenant.clone(),
@@ -1440,40 +1509,42 @@ impl ShardActor {
                 charges: charges.clone(),
                 arrival,
             };
-            let Err(mpsc::error::SendError(msg)) = tx.send(msg).await else {
+            let Err(refused) = send_hand_back(&tx, msg, wait).await else {
                 delivered = true;
                 continue;
             };
+            target_dead |= refused.closed;
             let ShardMsg::HandBack {
                 points,
                 exemplars,
                 charges: returned,
                 ..
-            } = msg
+            } = refused.msg
             else {
                 continue;
             };
-            let charges = if kept { Vec::new() } else { returned };
-            if self.absorb_rows(tenant, points, exemplars, charges, arrival)
-                && let Some(buf) = self.tenants.get_mut(tenant)
-            {
-                buf.deferred_since_ns = buf.deferred_since_ns.or(deferred_since_ns);
-                buf.hand_back_blocked = true;
-            }
-            if !kept && !hand_back_blocked {
-                self.metrics.record_hand_back_failure();
-                tracing::warn!(
-                    signal = ?self.ctx.signal,
+            let charges = if kept.is_some() { Vec::new() } else { returned };
+            let rest = kept.get_or_insert_with(|| TenantBuf {
+                deferred_since_ns,
+                hand_back_blocked,
+                mismatch_held_since_ns,
+                ..TenantBuf::default()
+            });
+            // Rows of one buffer cannot claim two label sets for one id.
+            if let Err(err) = rest.absorb(points, exemplars, charges, arrival) {
+                self.metrics.record_series_id_collision();
+                tracing::error!(
                     shard = self.shard,
-                    target,
-                    tenant_hash = %tenant.hash().to_hex(),
-                    "ravel-ingest: hand-back target shard closed before its rows arrived; \
-                     keeping them in this shard's buffer for the next flush to retry"
+                    error = %err,
+                    "ravel-ingest: returned hand-back rows could not merge; dropping them"
                 );
             }
-            kept = true;
         }
-        Ok(delivered)
+        HandedBack {
+            delivered,
+            kept,
+            target_dead,
+        }
     }
 
     /// A buffer with a strict-mode waiter, or one whose flush would write at
@@ -1636,12 +1707,47 @@ impl ShardActor {
     /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
     /// the residue is still in the tenant map with its arrival bookkeeping and
     /// the actor is still running to flush it.
+    ///
+    /// Rows a generation-mismatch hand-back returned from a full mailbox get
+    /// more chances; a target that is not live has its rows written in place
+    /// by the flush that found it. Between passes the actor yields, so the
+    /// target can take them on the next pass. A [`DrainIntent::Retryable`]
+    /// drain then makes one last pass, with the lag check still enforced,
+    /// over the buffers still holding such rows, writing them in place if the
+    /// hand-back fails again; a [`DrainIntent::Teardown`] reaches the same
+    /// write on its bypass passes. So at most [`MAX_FLUSH_ALL_PASSES`]
+    /// enforced passes, then one last pass or that many bypass passes. The
+    /// drain can still answer with such rows buffered: on that last pass a
+    /// lag or regression refusal, a view still `Unknown` after the drain's
+    /// re-read, or a verdict that flipped to a retired index whose hand-back
+    /// fails keeps them for a later trigger, and on a teardown rows a
+    /// regression refusal keeps through every bypass pass are residue like
+    /// any other.
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
         self.drain_rereads = Some(HashSet::new());
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
             self.flush_all_pass(trigger, LagCheck::Enforced).await;
             passes += 1;
+            if self.holds_mismatch_rows() {
+                tokio::task::yield_now().await;
+            }
+        }
+        if matches!(intent, DrainIntent::Retryable) && self.holds_mismatch_rows() {
+            self.mismatch_in_place = true;
+            let held: Vec<TenantId> = self
+                .tenants
+                .iter()
+                .filter(|(_, buf)| buf.mismatch_held_since_ns.is_some())
+                .map(|(tenant, _)| tenant.clone())
+                .collect();
+            for tenant in held {
+                if let Some(buf) = self.tenants.remove(&tenant) {
+                    self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
+                        .await;
+                }
+            }
+            self.mismatch_in_place = false;
         }
         let mut bypass_passes = 0;
         if matches!(intent, DrainIntent::Teardown) {
@@ -1684,6 +1790,14 @@ impl ShardActor {
         self.drain_rereads = None;
         self.join_all_flushes().await;
         self.refresh_oldest_deferral();
+    }
+
+    /// Whether a buffer still holds rows a generation-mismatch hand-back left
+    /// undelivered.
+    fn holds_mismatch_rows(&self) -> bool {
+        self.tenants
+            .values()
+            .any(|buf| buf.mismatch_held_since_ns.is_some())
     }
 
     /// One drain pass: a fresh snapshot of the buffered tenant keys, each
@@ -2091,7 +2205,8 @@ impl ShardActor {
             }
         };
         // ADR-1642 scan-set amendment: write under this shard index only if
-        // the read side scans it for the hour this flush is about to pin.
+        // the read side scans it for the hour this flush is about to pin, and
+        // no other generation owns that hour alone (issue #2429).
         let buf = match self
             .scan_check(tenant_hash, ingest_hour_bucket, raw_ns)
             .await
@@ -2101,46 +2216,106 @@ impl ShardActor {
                 buf
             }
             ScanCheck::HandBack {
+                target_count,
+                reason: HandBackReason::GenerationMismatch,
+                ..
+            } if mismatch_retry_spent(
+                buf.mismatch_held_since_ns,
+                buf.deferred_since_ns,
+                raw_ns,
+                self.deferral_cap_ns,
+            ) =>
+            {
+                // This flush opens at or past the cap, so, as on the deferral
+                // path, no strict waiter is acknowledged from it.
+                let waiters = std::mem::take(&mut buf.waiters);
+                self.ctx.ack_waiters(
+                    waiters,
+                    Err(WriteError::Abandoned(DEFERRAL_CAP_ABANDONED.into())),
+                );
+                self.metrics.record_generation_mismatch_written_in_place();
+                tracing::warn!(
+                    signal = ?self.ctx.signal,
+                    shard = self.shard,
+                    tenant_hash = %tenant_hash.to_hex(),
+                    ingest_hour_bucket,
+                    target_count,
+                    "ravel-ingest: a generation-mismatch hand-back kept failing for the flush \
+                     deferral cap; writing the flush in place in an ingest hour another shard \
+                     generation owns; readers find the rows, but a pushdown split over this \
+                     hour may see their series at two shard indices"
+                );
+                buf
+            }
+            ScanCheck::HandBack {
                 scan_count,
-                active_count,
-            } => match self.hand_back(&tenant, buf, active_count).await {
-                Ok(delivered) => {
-                    if delivered {
-                        self.metrics.record_rerouted_flush();
-                        if !std::mem::replace(&mut self.handing_back, true) {
-                            tracing::warn!(
-                                signal = ?self.ctx.signal,
-                                shard = self.shard,
-                                ingest_hour_bucket,
-                                scan_count,
-                                active_count,
-                                "ravel-ingest: flush would write outside the read-side scan set \
-                                 of its ingest hour; handing its rows to the current shard generation"
-                            );
-                        }
+                target_count,
+                reason,
+            } => {
+                let handed = self.hand_back(&tenant, buf, target_count, reason).await;
+                if handed.delivered {
+                    self.metrics.record_rerouted_flush(reason);
+                    if !std::mem::replace(&mut self.handing_back, true) {
+                        tracing::warn!(
+                            signal = ?self.ctx.signal,
+                            shard = self.shard,
+                            ingest_hour_bucket,
+                            scan_count,
+                            target_count,
+                            reason = reason.label(),
+                            "ravel-ingest: flush would write outside the read-side scan set \
+                             of its ingest hour, or into an hour another shard generation \
+                             owns; handing its rows to that hour's shard generation"
+                        );
                     }
-                    return;
                 }
-                Err(mut buf) => {
-                    buf.stale_view_counted = false;
-                    if matches!(lag_check, LagCheck::Enforced) {
-                        if !std::mem::replace(&mut buf.hand_back_blocked, true) {
-                            self.metrics.record_hand_back_failure();
-                            tracing::warn!(
-                                signal = ?self.ctx.signal,
-                                shard = self.shard,
-                                tenant_hash = %tenant_hash.to_hex(),
-                                ingest_hour_bucket,
-                                active_count,
-                                "ravel-ingest: a hand-back target shard of the tenant's current \
-                                 generation is dead or closed; keeping the rows in this shard's \
-                                 buffer until it is live again (the next write routed to a dead \
-                                 metrics shard respawns it)"
-                            );
-                        }
-                        self.tenants.insert(tenant, buf);
-                        return;
+                let target_dead = handed.target_dead;
+                let Some(mut buf) = handed.kept else {
+                    return;
+                };
+                buf.stale_view_counted = false;
+                let enforced = matches!(lag_check, LagCheck::Enforced);
+                // A target that is not live cannot take the rows on a later
+                // flush, so only a full mailbox is retried.
+                if reason == HandBackReason::GenerationMismatch
+                    && (target_dead || !enforced || self.mismatch_in_place)
+                {
+                    self.metrics.record_generation_mismatch_written_in_place();
+                    tracing::warn!(
+                        signal = ?self.ctx.signal,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        target_count,
+                        target_dead,
+                        "ravel-ingest: writing a flush in place in an ingest hour another \
+                         shard generation owns, because a hand-back target shard is dead, \
+                         condemned or closed, or a drain found its mailbox still full; \
+                         readers find the rows, but a pushdown split over this hour may see \
+                         their series at two shard indices"
+                    );
+                    buf
+                } else if enforced {
+                    if reason == HandBackReason::GenerationMismatch {
+                        buf.mismatch_held_since_ns.get_or_insert(raw_ns);
                     }
+                    if !std::mem::replace(&mut buf.hand_back_blocked, true) {
+                        self.metrics.record_hand_back_failure();
+                        tracing::warn!(
+                            signal = ?self.ctx.signal,
+                            shard = self.shard,
+                            tenant_hash = %tenant_hash.to_hex(),
+                            ingest_hour_bucket,
+                            target_count,
+                            "ravel-ingest: a hand-back target shard is dead, closed, or its \
+                             mailbox full on a send that may not wait; keeping the rows in \
+                             this shard's buffer for a later flush to retry (the next write \
+                             routed to a dead metrics shard respawns it)"
+                        );
+                    }
+                    self.tenants.insert(tenant, buf);
+                    return;
+                } else {
                     self.metrics.record_teardown_unscanned_write();
                     tracing::error!(
                         signal = ?self.ctx.signal,
@@ -2148,7 +2323,7 @@ impl ShardActor {
                         tenant_hash = %tenant_hash.to_hex(),
                         ingest_hour_bucket,
                         scan_count,
-                        active_count,
+                        target_count,
                         "ravel-ingest: teardown bypass pass: writing a flush in place under a \
                          shard index readers do not scan for its ingest hour, because a \
                          hand-back target shard is dead or closed; the rows are stored but no \
@@ -2156,7 +2331,7 @@ impl ShardActor {
                     );
                     buf
                 }
-            },
+            }
             ScanCheck::Unknown => {
                 let mut buf = buf;
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
@@ -3640,24 +3815,98 @@ mod tests {
         metrics: Arc<IngestMetrics>,
         store: Arc<dyn ObjectStoreBackend>,
         budget: Arc<IngestByteBudget>,
+        clock: Arc<TestClock>,
         task: tokio::task::JoinHandle<()>,
     }
 
     /// Handing back to a two-shard set, which these rows split across.
     const HAND_BACK: ScanCheck = ScanCheck::HandBack {
         scan_count: 3,
-        active_count: 2,
+        target_count: 2,
+        reason: HandBackReason::RetiredIndex,
     };
+
+    /// The same two-shard target, for an hour another generation owns.
+    const MISMATCH: ScanCheck = ScanCheck::HandBack {
+        scan_count: 4,
+        target_count: 2,
+        reason: HandBackReason::GenerationMismatch,
+    };
+
+    /// Age clocks at 50 ms on a 10 ms tick, so a buffer is due on the tick
+    /// after its write once the clock moves.
+    fn ticking_config() -> IngestConfig {
+        IngestConfig {
+            shard_count: 4,
+            max_flush_delay: Duration::from_millis(50),
+            max_flush_delay_idle: Duration::from_millis(50),
+            flush_tick: Duration::from_millis(10),
+            ..IngestConfig::default()
+        }
+    }
+
+    /// A hand-back target whose two-slot mailbox is already full.
+    fn full_target() -> (mpsc::Sender<ShardMsg>, mpsc::Receiver<ShardMsg>) {
+        let (tx, rx) = mpsc::channel(2);
+        fill(&tx);
+        (tx, rx)
+    }
+
+    fn fill(tx: &mpsc::Sender<ShardMsg>) {
+        while tx
+            .try_send(ShardMsg::FlushNow {
+                done: oneshot::channel().0,
+            })
+            .is_ok()
+        {}
+    }
+
+    /// Advances the clock one 10 ms tick at a time, yielding after each,
+    /// until `probe` holds or 400 ticks pass.
+    async fn tick_until(clock: &TestClock, mut probe: impl FnMut() -> bool) -> bool {
+        for _ in 0..400 {
+            if probe() {
+                return true;
+            }
+            clock.advance_ns(10_000_000);
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        probe()
+    }
 
     impl HandBackRig {
         fn new(target: Option<mpsc::Sender<ShardMsg>>) -> Self {
-            let scope = crate::generation::ScriptedScope::new(HAND_BACK, target);
-            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-            let metrics = Arc::new(IngestMetrics::new(4));
             let config = IngestConfig {
                 shard_count: 4,
                 ..IngestConfig::default()
             };
+            Self::with(HAND_BACK, target, config)
+        }
+
+        fn with(
+            verdict: ScanCheck,
+            target: Option<mpsc::Sender<ShardMsg>>,
+            config: IngestConfig,
+        ) -> Self {
+            let (rig, start) = Self::parked(verdict, target, config);
+            start.send(()).expect("actor task waits for its start");
+            rig
+        }
+
+        /// [`Self::with`], with the actor not running until the returned
+        /// sender fires, so a test can queue messages in the order the actor
+        /// is to find them.
+        fn parked(
+            verdict: ScanCheck,
+            target: Option<mpsc::Sender<ShardMsg>>,
+            config: IngestConfig,
+        ) -> (Self, oneshot::Sender<()>) {
+            let scope = crate::generation::ScriptedScope::new(verdict, target);
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let metrics = Arc::new(IngestMetrics::new(4));
+            let clock = TestClock::new(BASE_NS);
             let (tx, rx) = mpsc::channel(64);
             let actor = ShardActor::new(
                 3,
@@ -3665,7 +3914,7 @@ mod tests {
                 Uuid::new_v4(),
                 1,
                 Arc::clone(&store),
-                TestClock::new(BASE_NS),
+                clock.clone(),
                 Arc::new(ravel_commit::rng::SystemRng),
                 config,
                 Arc::clone(&metrics),
@@ -3677,18 +3926,52 @@ mod tests {
                 #[cfg(feature = "stage-timing")]
                 Arc::new(MetricStageTimings::new()),
             );
-            HandBackRig {
+            let (start, started) = oneshot::channel::<()>();
+            let rig = HandBackRig {
                 tx,
                 scope,
                 metrics,
                 store,
                 budget: IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1 << 30)),
-                task: tokio::spawn(actor.run()),
-            }
+                clock,
+                task: tokio::spawn(async move {
+                    if started.await.is_ok() {
+                        actor.run().await;
+                    }
+                }),
+            };
+            (rig, start)
         }
 
-        /// Buffers six points of tenant `acme`, under one charge of `bytes`.
-        async fn write(&self, bytes: u64) -> Arc<IngestByteCharge> {
+        /// Commit records written under this rig's shard index, 3.
+        async fn own_commits(&self) -> usize {
+            list_all(self.store.as_ref(), "t/")
+                .await
+                .expect("list")
+                .into_iter()
+                .filter(|o| o.key.contains("/c/0003/"))
+                .count()
+        }
+
+        /// Samples across the commit records written under shard index 3.
+        async fn own_samples(&self) -> u64 {
+            let mut samples = 0;
+            for object in list_all(self.store.as_ref(), "t/").await.expect("list") {
+                if object.key.contains("/c/0003/") {
+                    let bytes = self
+                        .store
+                        .get(&object.key, GetRange::Full)
+                        .await
+                        .expect("get commit record")
+                        .data;
+                    samples += record::decode(&bytes).expect("decode").sample_count;
+                }
+            }
+            samples
+        }
+
+        /// Six points of tenant `acme`, which split across a two-shard set.
+        fn six_points() -> Vec<IngestPoint> {
             let tenant = TenantId::new("acme");
             let points: Vec<IngestPoint> = (0..6)
                 .map(|i| {
@@ -3702,13 +3985,35 @@ mod tests {
                 .collect();
             let targets: HashSet<u32> = points.iter().map(|p| shard_for(&p.series_id, 2)).collect();
             assert_eq!(targets.len(), 2, "the rows split across both targets");
+            points
+        }
+
+        /// Buffers six points of tenant `acme`, under one charge of `bytes`.
+        async fn write(&self, bytes: u64) -> Arc<IngestByteCharge> {
+            self.write_acked(bytes, None).await
+        }
+
+        /// [`Self::write`] with a strict waiter, answered on the returned
+        /// receiver.
+        async fn write_strict(
+            &self,
+            bytes: u64,
+        ) -> (
+            Arc<IngestByteCharge>,
+            oneshot::Receiver<Result<CommitToken, WriteError>>,
+        ) {
+            let (ack, answer) = oneshot::channel();
+            (self.write_acked(bytes, Some(ack)).await, answer)
+        }
+
+        async fn write_acked(&self, bytes: u64, ack: Option<Ack>) -> Arc<IngestByteCharge> {
             let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
             self.tx
                 .send(ShardMsg::Write {
-                    tenant,
-                    points,
+                    tenant: TenantId::new("acme"),
+                    points: Self::six_points(),
                     exemplars: Vec::new(),
-                    ack: None,
+                    ack,
                     charge: Some(Arc::clone(&charge)),
                 })
                 .await
@@ -3752,9 +4057,9 @@ mod tests {
     /// source buffer and its charge is held exactly once, so the next hand-back
     /// delivers all six rows with the one charge per target message.
     ///
-    /// Guard: the `self.absorb_rows(..)` call in `hand_back`'s failed-send
-    /// branch. Without it the returned message is dropped, the charge refunds
-    /// at once, and the held-bytes assertion reads 0.
+    /// Guard: the `rest.absorb(..)` call in `hand_back`'s failed-send branch.
+    /// Without it the returned message is dropped, the charge refunds at
+    /// once, and the held-bytes assertion reads 0.
     #[tokio::test]
     async fn a_target_closed_after_the_liveness_check_returns_the_rows() {
         let (closed, inbox) = mpsc::channel(16);
@@ -3803,9 +4108,9 @@ mod tests {
     /// A target that is not live at the check keeps the whole buffer, counted
     /// once however many drain passes retry it.
     ///
-    /// Guard: `self.tenants.insert(tenant, buf)` in `flush_tenant`'s
-    /// `Err(mut buf)` arm. Without it the buffer is dropped and the live
-    /// target later receives no rows.
+    /// Guard: `self.tenants.insert(tenant, buf)` in the `else if enforced`
+    /// branch of `flush_tenant`'s hand-back arm. Without it the buffer is
+    /// dropped and the live target later receives no rows.
     #[tokio::test]
     async fn a_dead_target_keeps_the_whole_source_buffer() {
         let rig = HandBackRig::new(None);
@@ -3833,10 +4138,11 @@ mod tests {
     /// A teardown whose hand-back target is not live writes the rows in place,
     /// where readers do not scan them, and counts the write.
     ///
-    /// Guard: `self.metrics.record_teardown_unscanned_write()` in
-    /// `flush_tenant`'s `Err(mut buf)` arm, and the `buf` it falls through
-    /// with. Without the first the counter reads 0; with the arm keeping the
-    /// buffer instead, nothing is written and the residue counter moves.
+    /// Guard: `self.metrics.record_teardown_unscanned_write()` in the last
+    /// branch of `flush_tenant`'s hand-back arm, and the `buf` it falls
+    /// through with. Without the first the counter reads 0; with the arm
+    /// keeping the buffer instead, nothing is written and the residue counter
+    /// moves.
     #[tokio::test]
     async fn a_teardown_with_a_dead_target_writes_in_place_and_counts_it() {
         let rig = HandBackRig::new(None);
@@ -3861,5 +4167,281 @@ mod tests {
             .collect();
         assert_eq!(commits.len(), 1, "one commit under shard 3, {commits:?}");
         rig.task.await.expect("actor ends");
+    }
+
+    /// A generation-mismatch hand-back to a set it may not wait on finds the
+    /// target mailbox full: the rows go back to this shard's buffer with their
+    /// charge, and a later trigger with room hands them over. With the mailbox
+    /// kept full, a buffer is retried until the flush deferral cap and then
+    /// written in place, counted once, and a strict waiter still attached at
+    /// the cap is answered the deferral-cap `Abandoned`, not `Ok`.
+    ///
+    /// Guards: the `mismatch_retry_spent(..)` arm of `flush_tenant`: without
+    /// it the rows stay buffered past the cap and the in-place counter reads
+    /// 0. The waiter strip in that arm: without it the waiter reads `Ok`. And
+    /// the `rest.absorb(..)` call in `hand_back`: without it the rows of a
+    /// failed send are dropped and the held-bytes assertion reads 0.
+    #[tokio::test]
+    async fn a_full_upward_mailbox_is_retried_until_the_deferral_cap() {
+        let config = ticking_config();
+        let (target, mut inbox) = full_target();
+        let rig = HandBackRig::with(MISMATCH, Some(target.clone()), config);
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+
+        assert!(
+            tick_until(&rig.clock, || rig.metrics.snapshot().hand_back_failures
+                == 1)
+            .await,
+            "the age trigger tries the hand-back"
+        );
+        let snap = rig.metrics.snapshot();
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            4_096,
+            "the rows and their charge are back in the source buffer"
+        );
+        assert_eq!(snap.rerouted_flushes, 0);
+        assert_eq!(snap.generation_mismatch_written_in_place, 0);
+
+        while inbox.try_recv().is_ok() {}
+        assert!(
+            tick_until(&rig.clock, || rig.metrics.snapshot().rerouted_flushes == 1).await,
+            "a later trigger with room hands the rows over"
+        );
+        let (mut points, mut charges) = (0, Vec::new());
+        while let Ok(msg) = inbox.try_recv() {
+            if let ShardMsg::HandBack {
+                points: p,
+                charges: c,
+                ..
+            } = msg
+            {
+                points += p.len();
+                charges.extend(c);
+            }
+        }
+        assert_eq!(points, 6, "every row is handed over");
+        assert_eq!(
+            rig.metrics.snapshot().rerouted_flushes_generation_mismatch,
+            1
+        );
+        drop(charges);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+
+        fill(&target);
+        drop(rig.write(4_096).await);
+        assert!(
+            tick_until(&rig.clock, || rig.metrics.snapshot().hand_back_failures
+                == 2)
+            .await,
+            "the second buffer's hand-back fails on the full mailbox"
+        );
+        let cap_ns = config.flush_deferral_cap_ns();
+        rig.clock.advance_ns(cap_ns - 1);
+        assert!(!settles(|| rig.budget.in_flight_bytes() == 0).await);
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            0,
+            "retried, not written, short of the cap"
+        );
+        // A strict write joining after that retry is still attached when the
+        // cap is reached.
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        // Before the clock moves, or the tick can win the actor's select and
+        // write the buffer before the strict write joins it.
+        assert!(
+            settles(|| rig.tx.capacity() == rig.tx.max_capacity()).await,
+            "the actor takes the strict write"
+        );
+        assert!(
+            tick_until(&rig.clock, || rig.budget.in_flight_bytes() == 0).await,
+            "written once the deferral reaches the cap"
+        );
+        ticks(&rig.clock, 5).await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(snap.rerouted_flushes, 1);
+        assert_eq!(rig.own_commits().await, 1, "written under shard 3");
+        match answer.await.expect("waiter answered") {
+            Err(WriteError::Abandoned(msg)) => assert_eq!(
+                msg, DEFERRAL_CAP_ABANDONED,
+                "not acknowledged from a flush at the cap"
+            ),
+            other => panic!("expected the deferral-cap Abandoned, got {other:?}"),
+        }
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A drain whose generation-mismatch hand-back finds the target mailbox
+    /// full does not answer with the rows still buffered: its last pass
+    /// writes them in place, counted once.
+    ///
+    /// Guard: the `DrainIntent::Retryable` last pass in `flush_all`. Without
+    /// it `FlushNow` is answered with the rows still buffered and charged, and
+    /// nothing is written.
+    #[tokio::test]
+    async fn a_drain_with_a_full_upward_target_answers_with_nothing_buffered() {
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let (target, _inbox) = full_target();
+        let rig = HandBackRig::with(MISMATCH, Some(target), config);
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            0,
+            "nothing is left buffered when the drain answers"
+        );
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(snap.rerouted_flushes, 0);
+        assert_eq!(rig.own_commits().await, 1, "written under shard 3");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// Ticks until the first age-triggered flush of a generation-mismatch
+    /// buffer has either written it in place or kept it for a retry, then a
+    /// few more, and returns the rig's snapshot.
+    async fn first_mismatch_flush(rig: &HandBackRig) -> crate::metrics::IngestMetricsSnapshot {
+        assert!(
+            tick_until(&rig.clock, || {
+                let snap = rig.metrics.snapshot();
+                snap.generation_mismatch_written_in_place + snap.hand_back_failures > 0
+            })
+            .await,
+            "the age trigger opens the flush"
+        );
+        ticks(&rig.clock, 5).await;
+        rig.metrics.snapshot()
+    }
+
+    /// A generation-mismatch hand-back whose target is not live at the check
+    /// (a dead or condemned shard, or a closed mailbox) writes the rows in
+    /// place on the first flush that sees it, with no retry: one flush, the
+    /// in-place counter at exactly 1, every row durable, nothing left
+    /// buffered. The strict waiter is still on the buffer and is answered
+    /// `Ok` from that write.
+    ///
+    /// Guard: `target_dead` in the condition of the in-place branch of
+    /// `flush_tenant`'s hand-back arm. Without it the buffer takes the retry
+    /// branch: `hand_back_failures` reads 1, nothing is written, and the
+    /// charge stays held.
+    #[tokio::test]
+    async fn a_mismatch_to_a_target_not_live_at_the_check_is_written_in_place_at_once() {
+        let rig = HandBackRig::with(MISMATCH, None, ticking_config());
+        rig.scope.set_wait(false);
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+
+        let snap = first_mismatch_flush(&rig).await;
+        assert_eq!(snap.hand_back_failures, 0, "not kept for a retry");
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(snap.flushes_by_age, 1, "exactly one flush");
+        assert_eq!(snap.rerouted_flushes, 0);
+        answer
+            .await
+            .expect("waiter answered")
+            .expect("the in-place write acknowledges the strict waiter");
+        assert!(settles(|| rig.budget.in_flight_bytes() == 0).await);
+        assert_eq!(rig.own_commits().await, 1, "written under shard 3");
+        assert_eq!(rig.own_samples().await, 6, "every row, once");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The same for a target whose mailbox closes between the liveness check
+    /// and the send: written in place at once. The strict waiter was answered
+    /// `Abandoned` before the send, as on every hand-back past the check.
+    ///
+    /// Guard: `target_dead |= refused.closed` in `hand_back`. Without it a
+    /// closed mailbox reads as a full one and the buffer is kept for a retry.
+    #[tokio::test]
+    async fn a_mismatch_to_a_target_closed_at_the_send_is_written_in_place_at_once() {
+        let (closed, inbox) = mpsc::channel(16);
+        drop(inbox);
+        let rig = HandBackRig::with(MISMATCH, Some(closed), ticking_config());
+        rig.scope.set_wait(false);
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+
+        let snap = first_mismatch_flush(&rig).await;
+        assert_eq!(snap.hand_back_failures, 0, "not kept for a retry");
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(snap.flushes_by_age, 1, "exactly one flush");
+        assert!(matches!(
+            answer.await.expect("waiter answered"),
+            Err(WriteError::Abandoned(_))
+        ));
+        assert!(settles(|| rig.budget.in_flight_bytes() == 0).await);
+        assert_eq!(rig.own_commits().await, 1, "written under shard 3");
+        assert_eq!(rig.own_samples().await, 6, "every row, once");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A hand-back already queued when the actor takes `Shutdown` is absorbed
+    /// as the actor closes its mailbox and written by the teardown flush: its
+    /// rows are durable exactly once, their charge is released, and no
+    /// tenant is left unflushed.
+    ///
+    /// Guard: the `self.absorb_rows(..)` call in `close_mailbox`. Pushing the
+    /// queued `HandBack` to `unprocessed` instead drops it after the drain:
+    /// nothing is written and the commit count reads 0.
+    #[tokio::test]
+    async fn a_hand_back_queued_behind_shutdown_is_written_exactly_once() {
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let (rig, start) = HandBackRig::parked(ScanCheck::InScanSet, None, config);
+        let charge = Arc::new(rig.budget.try_charge(4_096).expect("charge"));
+        let (done, answered) = oneshot::channel();
+        rig.tx
+            .send(ShardMsg::Shutdown { done })
+            .await
+            .expect("send Shutdown");
+        rig.tx
+            .send(ShardMsg::HandBack {
+                tenant: TenantId::new("acme"),
+                points: HandBackRig::six_points(),
+                exemplars: Vec::new(),
+                charges: vec![Arc::clone(&charge)],
+                arrival: HandBackArrival {
+                    oldest_arrival_ns: Some(BASE_NS),
+                    min_ingest_ts_ns: Some(BASE_NS),
+                    max_ingest_ts_ns: Some(BASE_NS),
+                },
+            })
+            .await
+            .expect("send HandBack behind Shutdown");
+        drop(charge);
+        start.send(()).expect("actor task waits for its start");
+
+        answered.await.expect("Shutdown answered");
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.flush_all_residue_tenants, 0);
+        assert_eq!(snap.series_id_collisions, 0);
+        assert_eq!(rig.budget.in_flight_bytes(), 0, "the charge is released");
+        assert_eq!(rig.own_commits().await, 1, "one teardown write");
+        assert_eq!(rig.own_samples().await, 6, "every handed-back row, once");
+        rig.task.await.expect("actor ends");
+    }
+
+    /// Advances the clock `n` 10 ms ticks, yielding after each.
+    async fn ticks(clock: &TestClock, n: usize) {
+        for _ in 0..n {
+            clock.advance_ns(10_000_000);
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
     }
 }
