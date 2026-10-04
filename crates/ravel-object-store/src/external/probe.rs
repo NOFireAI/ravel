@@ -1006,11 +1006,7 @@ mod tests {
         let candidate = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
         let gate = candidate.hold(Op::Get, Some(PROBE_PREFIX.to_string()), Occurrence::Always);
 
-        let mut probe = Box::pin(probe_not_ravel_bucket(
-            ravel.as_ref(),
-            &cleanup,
-            &candidate,
-        ));
+        let mut probe = Box::pin(probe_not_ravel_bucket(ravel.as_ref(), &cleanup, &candidate));
         tokio::select! {
             verdict = &mut probe => panic!("a held identity read cannot complete: {verdict:?}"),
             () = gate.wait_until_held(1) => {}

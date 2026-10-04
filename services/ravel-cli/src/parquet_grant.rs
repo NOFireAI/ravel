@@ -174,7 +174,15 @@ pub async fn add_grant(
         .await
         .with_context(|| format!("the bucket behind {url:?} did not qualify as external"))?;
 
-    let grant = grants::add(ravel_store.as_ref(), tenant, &profile.name, url, created_by, clock).await?;
+    let grant = grants::add(
+        ravel_store.as_ref(),
+        tenant,
+        &profile.name,
+        url,
+        created_by,
+        clock,
+    )
+    .await?;
     Ok(grant)
 }
 
@@ -608,7 +616,11 @@ mod tests {
     async fn a_grant_cancelled_mid_probe_leaves_no_probe_object() {
         let ravel = ravel_bucket();
         let external = Arc::new(FaultStore::new(external_bucket().await, FaultPlan::empty()));
-        let gate = external.hold(Op::Get, Some("sys/pq-probe/".to_string()), Occurrence::Always);
+        let gate = external.hold(
+            Op::Get,
+            Some("sys/pq-probe/".to_string()),
+            Occurrence::Always,
+        );
         let open = opener(external.clone());
         let tenant = TenantId::new("acme").hash();
         let profile = s3_profile("prod");
