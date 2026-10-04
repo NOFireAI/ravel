@@ -146,6 +146,7 @@ impl DdlCost {
 ///
 /// [`SqlExecutor::execute_ddl`]: crate::SqlExecutor::execute_ddl
 #[derive(Debug)]
+#[must_use]
 pub struct DdlExecution {
     pub result: Result<DdlOutcome, DdlExecuteError>,
     pub cost: DdlCost,

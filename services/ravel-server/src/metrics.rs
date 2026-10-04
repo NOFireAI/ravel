@@ -11,10 +11,11 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly twenty-one label keys: `tenant_hash`, `signal`, `mode`,
-//! `op`, `error_kind`, `workload_class`, `level`, `reason`, `shard`, `cache`,
-//! `tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`,
-//! `carrier`, `gate`, `site`, and `worker` (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
+//! renders exactly twenty-one label keys, twenty-two in a `sql` build:
+//! `tenant_hash`, `signal`, `mode`, `op`, `error_kind`, `workload_class`,
+//! `level`, `reason`, `shard`, `cache`, `tier`, `kind`, `outcome`,
+//! `allocator`, `stat`, `component`, `class`, `carrier`, `gate`, `site`, and
+//! `worker`, plus `phase` in a `sql` build (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
 //! seal-divergence family, `shard` added by ADR-1692 decision 2 as the ninth
 //! key for the per-shard ingest-skew family, `cache` to split the read-cache
@@ -31,9 +32,11 @@
 //! into their `Pinned` and `Resolve` classes, `carrier` added by
 //! ADR-0873 decision 2 to split the declared-statistics drop tally across
 //! its four carriers, and `gate`, `site` and `worker` added by ADR-1702
-//! decision 11 for the CPU gate and tokio runtime families). The twenty-one
-//! keys come from twenty-nine `Label` variants (thirty in a `flight-sql`
-//! build), because some variants share a
+//! decision 11 for the CPU gate and tokio runtime families, and `phase` added
+//! by issue #2374 for the SQL DDL store-cost families). The keys come from
+//! twenty-nine `Label` variants, thirty-two in a `sql` build (`DdlKind`,
+//! `DdlOutcome` and `DdlPhase`) and thirty-three in a `flight-sql` build,
+//! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
 //! `CapabilityRejectReason` and, in a `flight-sql` build,
@@ -41,7 +44,9 @@
 //! `Level` (log/tracing
 //! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
-//! `MergeMemoryKind` and `DeletedObjectKind` both render `kind`, and `ReadGateSite` and `WriteGateSite` both render
+//! `MergeMemoryKind`, `DeletedObjectKind` and, in a `sql` build, `DdlKind`
+//! render `kind`, `AlertOutcome` and, in a `sql` build, `DdlOutcome` render
+//! `outcome`, and `ReadGateSite` and `WriteGateSite` both render
 //! `site`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
 //! only constructor.
 //! Every variant's payload is a closed enum
