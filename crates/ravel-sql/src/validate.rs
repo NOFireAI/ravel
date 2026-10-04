@@ -2315,4 +2315,40 @@ mod tests {
             DdlValidationError::DropUnsupported { clause: "CASCADE" }
         ));
     }
+
+    #[test]
+    fn drop_table_restrict_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE orders RESTRICT"),
+            DdlValidationError::DropUnsupported { clause: "RESTRICT" }
+        ));
+    }
+
+    #[test]
+    fn drop_table_purge_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE orders PURGE"),
+            DdlValidationError::DropUnsupported { clause: "PURGE" }
+        ));
+    }
+
+    #[test]
+    fn drop_temporary_table_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TEMPORARY TABLE orders"),
+            DdlValidationError::DropUnsupported {
+                clause: "TEMPORARY"
+            }
+        ));
+    }
+
+    #[test]
+    fn drop_table_on_table_is_rejected() {
+        assert!(matches!(
+            reject_ddl("DROP TABLE orders ON other"),
+            DdlValidationError::DropUnsupported {
+                clause: "the MySQL DROP INDEX ON <table> form"
+            }
+        ));
+    }
 }

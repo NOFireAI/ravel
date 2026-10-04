@@ -263,8 +263,8 @@
 //! resolved. A Parquet table has no segment set, so before this version `DoGet`
 //! resolved each table's newest manifest again, and a table replaced between
 //! the two RPCs streamed a schema other than the one `FlightInfo` advertised.
-//! `DoGet` now reads exactly the pinned manifest objects and checks the tenant's
-//! grants as they are at redemption. It also carries the request's lowered
+//! The `flight` module doc, "The two-RPC problem, and the pin", states how
+//! `DoGet` redeems these pins. Version 8 also carries the request's lowered
 //! budgets ([`FlightTicket::budgets`]), which `GetFlightInfo` applied while
 //! resolving and planning and which bind `DoGet`'s scans the same way. A v7 (or
 //! earlier) ticket is rejected with [`FlightTicketError::UnsupportedVersion`],
@@ -681,10 +681,8 @@ pub struct FlightTicket {
     /// tenant with no declared columns.
     pub declared_columns: Vec<DeclaredColumn>,
     /// The Parquet tables the statement reads, each at the manifest version
-    /// `GetFlightInfo` resolved (ADR-2040 D1, D3). `DoGet` reads exactly these
-    /// manifest objects and never the table's newest, so the schema it streams
-    /// is the one the `FlightInfo` advertised; it checks the tenant's grants
-    /// as they are at redemption. At most [`MAX_STATEMENT_TABLE_NAMES`]; empty
+    /// `GetFlightInfo` resolved (ADR-2040 D1, D3), redeemed as the `flight`
+    /// module doc states. At most [`MAX_STATEMENT_TABLE_NAMES`]; empty
     /// for a statement over a signal table. A slice ticket carries none.
     pub parquet_tables: Vec<ParquetPin>,
     /// The request's lowered budgets (ADR-1374 decision 3), which can only
@@ -755,6 +753,9 @@ impl FlightTicket {
         for pin in &self.parquet_tables {
             if validate_table(&pin.table).is_err() {
                 return Err(FlightTicketError::InvalidParquetTable);
+            }
+            if pin.version == 0 {
+                return Err(FlightTicketError::InvalidParquetVersion);
             }
             write_len_prefixed(&mut buf, pin.table.as_bytes())?;
             buf.extend_from_slice(&pin.version.to_le_bytes());
@@ -862,6 +863,9 @@ impl FlightTicket {
                 return Err(FlightTicketError::InvalidParquetTable);
             }
             let version = u64::from_le_bytes(cur.read_array::<8>()?);
+            if version == 0 {
+                return Err(FlightTicketError::InvalidParquetVersion);
+            }
             parquet_tables.push(ParquetPin {
                 table: table.to_owned(),
                 version,
@@ -1006,6 +1010,10 @@ pub enum FlightTicketError {
     /// A pinned Parquet table's name is not a valid table name.
     #[error("ticket contains an invalid Parquet table name")]
     InvalidParquetTable,
+    /// A pinned Parquet table's manifest version is 0; manifest versions
+    /// start at 1.
+    #[error("ticket pins Parquet manifest version 0; versions start at 1")]
+    InvalidParquetVersion,
     /// A budget limit's tag byte, or the budgets flag, was not one the layout
     /// defines.
     #[error("ticket contains an invalid budget tag {0}")]
@@ -1930,7 +1938,7 @@ mod tests {
             (0..count)
                 .map(|i| ParquetPin {
                     table: format!("t{i}"),
-                    version: i,
+                    version: i + 1,
                 })
                 .collect()
         };
@@ -2036,6 +2044,38 @@ mod tests {
                 version: 9,
             }]
         );
+    }
+
+    /// A pin of manifest version 0 is a typed error at decode and at encode:
+    /// manifest versions start at 1, so no resolve can have produced it.
+    #[test]
+    fn a_pin_of_manifest_version_zero_is_refused() {
+        let key = test_key();
+        assert_eq!(
+            FlightTicket::decode(
+                &spliced(&pin_section(&[(b"hits".as_slice(), 0)]), &[0]),
+                &key
+            ),
+            Err(FlightTicketError::InvalidParquetVersion)
+        );
+        let bad = FlightTicket {
+            parquet_tables: vec![ParquetPin {
+                table: "hits".to_owned(),
+                version: 0,
+            }],
+            ..sample_ticket()
+        };
+        assert_eq!(
+            bad.encode(&key),
+            Err(FlightTicketError::InvalidParquetVersion)
+        );
+        // Non-vacuity: version 1 in the same splice decodes.
+        let ok = FlightTicket::decode(
+            &spliced(&pin_section(&[(b"hits".as_slice(), 1)]), &[0]),
+            &key,
+        )
+        .expect("a valid pin");
+        assert_eq!(ok.parquet_tables[0].version, 1);
     }
 
     /// Budgets round-trip in every shape, and a flag or limit tag the layout
@@ -2207,7 +2247,7 @@ mod tests {
             parquet_tables: (0..MAX_STATEMENT_TABLE_NAMES as u64)
                 .map(|i| ParquetPin {
                     table: format!("table_{i}"),
-                    version: i,
+                    version: i + 1,
                 })
                 .collect(),
             budgets: None,
@@ -2507,7 +2547,7 @@ mod tests {
     }
 
     fn parquet_pin_strategy() -> impl Strategy<Value = ParquetPin> {
-        ("[a-z_][a-z0-9_]{0,62}", any::<u64>())
+        ("[a-z_][a-z0-9_]{0,62}", 1..=u64::MAX)
             .prop_filter("a reserved name is no table name", |(table, _)| {
                 validate_table(table).is_ok()
             })

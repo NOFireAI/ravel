@@ -32,13 +32,14 @@
 //! table replaced between the RPCs streams the schema and rows `FlightInfo`
 //! advertised. A table dropped between the RPCs is read the same way: the drop
 //! is a newer manifest version, so `DoGet` streams the pinned rows, as a
-//! segment pin streams segments a later deletion removed. The tenant's grants are the one thing not pinned: `DoGet` reads
-//! them again, and a grant removed since `GetFlightInfo` fails it with
-//! `LocationNotGranted` (ADR-2040 D3). A pinned manifest that has been swept
-//! fails `DoGet` with `SnapshotInvalidated`. The ticket also pins the request's
-//! lowered budgets, so `DoGet` scans under the limits `GetFlightInfo` applied.
-//! A Parquet statement is never distributed, and a slice ticket that names a
-//! Parquet table is refused.
+//! segment pin streams segments a later deletion removed. The tenant's grants
+//! are the one thing not pinned: `DoGet` reads them again, and a grant removed
+//! since `GetFlightInfo` fails it with `LocationNotGranted` (ADR-2040 D3). A
+//! pinned manifest that has been swept fails `DoGet` with
+//! `SnapshotInvalidated`. The ticket also pins the request's lowered budgets,
+//! so `DoGet` scans under the limits `GetFlightInfo` applied. A Parquet
+//! statement is never distributed, and a slice ticket that names a Parquet
+//! table is refused.
 //!
 //! # A client ticket's tenant is never trusted
 //!
@@ -61,8 +62,7 @@
 //! anything. There is exactly one logical table (`samples`) per tenant and the
 //! metadata answers are therefore identical for every tenant, but "the answer
 //! happens to be constant" is not a reason to answer an unauthenticated
-//! caller: default-deny is the invariant, not a consequence of the data
-//!.
+//! caller: default-deny is the invariant, not a consequence of the data.
 //!
 //! # Deadline and the GC protection horizon
 //!
