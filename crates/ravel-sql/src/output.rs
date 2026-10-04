@@ -30,9 +30,10 @@
 //! a negative value, or one of a whole day or more, is an error. `Date32`
 //! and `Date64` are `YYYY-MM-DD` strings, and a value with no such form (a
 //! year outside 0000 to 9999, or a `Date64` that is not a whole day) is an
-//! error. `Decimal128` and `Decimal256` are strings of their exact decimal
-//! text. Binary types are lowercase hex strings. A type with no arm is an
-//! error naming the type. These are all `SqlError::Internal`: `/api/v1/sql`
+//! error. Every decimal width (`Decimal32` to `Decimal256`) is a string of
+//! its exact decimal text. Binary types are lowercase hex strings. A type
+//! with no arm is an error naming the type. These are all
+//! `SqlError::Internal`: `/api/v1/sql`
 //! answers with only the fixed internal message and logs the detail, while
 //! the `/mcp` tool output carries the error's full text.
 
@@ -40,14 +41,15 @@ use std::fmt::Write as _;
 
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
-    Decimal128Array, Decimal256Array, DictionaryArray, FixedSizeBinaryArray, Float16Array,
-    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
-    LargeStringArray, ListArray, MapArray, StringArray, StringViewArray, StructArray,
-    Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
+    FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringArray,
+    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
-use datafusion::arrow::datatypes::{DataType, Int32Type, SchemaRef, TimeUnit};
+use datafusion::arrow::datatypes::{DataType, Int32Type, SchemaRef, TimeUnit, i256};
 use datafusion::arrow::ipc::writer::StreamWriter;
 use datafusion::arrow::record_batch::RecordBatch;
 use serde_json::{Map as JsonMap, Value as Json, json};
@@ -220,6 +222,14 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
                 .ok_or_else(|| not_a_date("Date64", millis))?;
             json!(text)
         }
+        DataType::Decimal32(_, scale) => json!(decimal_text(
+            downcast::<Decimal32Array>(array, "Decimal32")?.value(row),
+            *scale
+        )),
+        DataType::Decimal64(_, scale) => json!(decimal_text(
+            downcast::<Decimal64Array>(array, "Decimal64")?.value(row),
+            *scale
+        )),
         DataType::Decimal128(_, scale) => json!(decimal_text(
             downcast::<Decimal128Array>(array, "Decimal128")?.value(row),
             *scale
@@ -396,10 +406,18 @@ fn date_text(days: i64) -> Option<String> {
         .then(|| format!("{year:04}-{month:02}-{day:02}"))
 }
 
+/// An unscaled decimal value whose `Display` is its exact base-10 text: the
+/// integer types the Arrow decimal arrays store. Kept private and implemented
+/// only for those, so a float or a string cannot reach [`decimal_text`].
+trait ExactDecimalDigits: std::fmt::Display {}
+impl ExactDecimalDigits for i32 {}
+impl ExactDecimalDigits for i64 {}
+impl ExactDecimalDigits for i128 {}
+impl ExactDecimalDigits for i256 {}
+
 /// The exact decimal text of an unscaled `value` at `scale`: `12345` at
-/// scale 2 is `123.45`, `12` at scale -2 is `1200`. Generic over the integer's
-/// own exact base-10 `Display`, which covers both `i128` and arrow's `i256`.
-fn decimal_text(value: impl std::fmt::Display, scale: i8) -> String {
+/// scale 2 is `123.45`, `12` at scale -2 is `1200`.
+fn decimal_text(value: impl ExactDecimalDigits, scale: i8) -> String {
     let text = value.to_string();
     let (sign, digits) = match text.strip_prefix('-') {
         Some(magnitude) => ("-", magnitude),
@@ -913,6 +931,25 @@ mod tests {
         assert_eq!(
             column_json(Arc::new(negative_scale) as ArrayRef).expect("json"),
             vec![json!("1200"), json!("0")]
+        );
+    }
+
+    #[test]
+    fn decimal32_and_decimal64_are_their_exact_decimal_text() {
+        use datafusion::arrow::array::{Decimal32Array, Decimal64Array};
+        let narrow = Decimal32Array::from(vec![12_345, -5, i32::MAX])
+            .with_precision_and_scale(9, 2)
+            .expect("decimal32");
+        assert_eq!(
+            column_json(Arc::new(narrow) as ArrayRef).expect("json"),
+            vec![json!("123.45"), json!("-0.05"), json!("21474836.47")]
+        );
+        let wide = Decimal64Array::from(vec![i64::MIN, 12])
+            .with_precision_and_scale(18, -3)
+            .expect("decimal64");
+        assert_eq!(
+            column_json(Arc::new(wide) as ArrayRef).expect("json"),
+            vec![json!("-9223372036854775808000"), json!("12000")]
         );
     }
 
