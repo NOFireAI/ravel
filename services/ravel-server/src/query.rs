@@ -874,11 +874,14 @@ pub const SPILL_ROOT_LEFT_SWEPT_ASIDE: &str = "a sweep moved it aside for remova
 /// Whenever `--cache-dir` is set, `--sql-spill` is not off, and
 /// `<cache-dir>/sql-spill` already exists, roots there whose owner is gone are
 /// swept first, before the free space is measured and whatever spill then
-/// resolves to, so the measurement sees the bytes the sweep reclaimed.
+/// resolves to, so the measurement sees the bytes the sweep reclaimed. Only a
+/// process that serves SQL calls this, so a `maintain` or `gateway` process,
+/// or a build without the `sql` feature, sweeps nothing.
 ///
-/// Fails, refusing startup, on a spill configuration error, when the free
-/// space under `--cache-dir` cannot be measured, or when this process cannot
-/// take its own root's lock; every message names the path involved.
+/// Fails, refusing startup, on a spill configuration error, when
+/// `<cache-dir>/sql-spill` cannot be created or its free space cannot be
+/// measured, or when this process cannot take its own root's lock; every
+/// message names the path involved.
 #[cfg(feature = "sql")]
 pub fn prepare_sql_spill(
     cache_dir: Option<&std::path::Path>,
@@ -3657,6 +3660,16 @@ mod tests {
             }
         );
         assert!(startup.owner.is_none());
+        let mut left: Vec<_> = std::fs::read_dir(cache.path().join("sql-spill"))
+            .expect("list the spill parent")
+            .map(|entry| entry.expect("spill parent entry").file_name())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from("inst-held")],
+            "no root of this process's own is created"
+        );
         assert_eq!(seen, vec![false]);
     }
 
@@ -3688,6 +3701,10 @@ mod tests {
             !orphan.exists(),
             "the cache dir's orphan root must be swept"
         );
+        assert!(
+            cache.path().join("sql-spill").is_dir(),
+            "the sweep removes roots, not the directory that holds them"
+        );
         assert_eq!(
             (
                 startup.resolved.dir_source,
@@ -3717,9 +3734,9 @@ mod tests {
     /// and on a cache dir without `sql-spill` creates none.
     ///
     /// Prove-the-test: drop the `!settings.off` guard on the sweep in
-    /// `prepare_sql_spill_with` and the orphan is gone; create
-    /// `<cache-dir>/sql-spill` before the sweep's existence check and the
-    /// empty cache dir gains it.
+    /// `prepare_sql_spill_with` and the orphan is gone; drop the same guard on
+    /// the creation of `<cache-dir>/sql-spill` and the empty cache dir gains
+    /// it.
     #[test]
     fn sql_spill_off_touches_nothing() {
         let cache = tempfile::tempdir().expect("cache dir");
