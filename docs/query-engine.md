@@ -112,9 +112,13 @@ cached bytes of a since-erased subject unreachable: a cache hit is filtered
 exactly like a fresh GET. A series matching a windowless predicate is
 dropped whole, including from `/labels`, `/label/{name}/values`, and
 `/series`; a windowed predicate drops only that series' in-window samples
-and leaves it enumerable. The equivalent hop for the SQL logs, spans, and
-metrics surfaces in `ravel-sql` is not wired yet: those scans build their
-own queries and do not read `Snapshot::pending_erasure`.
+and leaves it enumerable. The SQL surfaces in `ravel-sql` take the same hop:
+each table provider derives the pending predicates from the pinned snapshot
+when it is built, and its scan applies the exclusion after decode and after
+any cache tier: the logs, alerts and audit scans through the authoritative
+merged resource, scope and record view (`retain_unerased_log_records`), the
+spans scan per decoded span (`is_erased_span`), and the metrics `samples`
+scan over the decoded series it fetched (`retain_series_soa`).
 
 ## Logs `COUNT(*)` from catalog row counts
 
