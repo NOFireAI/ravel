@@ -889,7 +889,7 @@ mod tests {
         let cleanup: Arc<dyn ObjectStoreBackend> = counted_cleanup.clone();
         let candidate = MemoryStore::new();
 
-        let err = probe_not_ravel_bucket(&handle, &handle, &candidate)
+        let err = probe_not_ravel_bucket(&ravel, &cleanup, &candidate)
             .await
             .expect_err("a probe that was never written answers nothing");
         assert!(
