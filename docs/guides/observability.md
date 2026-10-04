@@ -2035,13 +2035,16 @@ sample `tier="disk"`. With no disk tier, a family renders one sample with no
 | `ravel_cache_disk_entries_expired_max_age_total` | Disk-tier entries dropped for aging past the per-entry max-age, across the hit check, the startup scan, and the periodic background sweep. An age-based expiry, separate from the capacity-driven eviction counter above. |
 | `ravel_cache_resident_entries` | Gauge. Entries currently held in this cache tier, live rather than cumulative. Rendered for both `cache="fetch"` and `cache="catalog"`. |
 | `ravel_cache_resident_bytes` | Gauge. Payload bytes currently held in this cache tier, live rather than cumulative. Rendered for both `cache="fetch"` and `cache="catalog"`. |
-| `ravel_cache_max_bytes` | Gauge. The resolved startup byte ceiling for this cache, for comparing held-vs-budgeted. Rendered for both `cache="fetch"` and `cache="catalog"`. |
+| `ravel_cache_max_bytes` | Gauge. The resolved startup byte ceiling for this cache, for comparing held-vs-budgeted. Rendered for both `cache="fetch"` and `cache="catalog"`, with no `tier` label even when a disk tier exists. |
 
 The request hit rate is `hits / (hits + misses)`. The byte hit rate is
 `bytes_served / (bytes_served + bytes_admitted)`. The renderer leaves both
 ratios for PromQL to compute, per `cache` and per `tier`. The held-vs-budgeted
-comparison is `ravel_cache_resident_bytes / ravel_cache_max_bytes`, per `cache`
-and per `tier`. For `cache="fetch"` the ceiling is one capacity shared across
+comparison is
+`ravel_cache_resident_bytes / on(mode, cache) group_left ravel_cache_max_bytes`,
+per `cache` and per `tier`: once a disk tier exists the residency series carry
+a `tier` label and the ceiling does not, so a plain division matches nothing.
+For `cache="fetch"` the ceiling is one capacity shared across
 tiers. For `cache="catalog"`, RAM and disk each get their OWN ceiling at the
 same configured byte figure (`build_catalog` in `services/ravel-server/src/
 query.rs` passes the same `CacheLimits` to both the RAM cache and
