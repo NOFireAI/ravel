@@ -21,8 +21,12 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_memory::MemoryBudget;
-use ravel_object_store::external::probe::{PreconditionProbeFailure, RavelBucketProbeFailure};
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::external::probe::{
+    PROBE_PREFIX, PreconditionProbeFailure, RavelBucketProbeFailure,
+};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::instrument::{InstrumentedStore, STORE_OP_COUNT, StoreOp};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -1539,6 +1543,82 @@ async fn whole_statement_deadline_expires_during_the_grants_read_and_writes_no_m
     assert!(
         tables.is_empty(),
         "no manifest may be written when the grants read never completed"
+    );
+}
+
+/// The probe objects under [`PROBE_PREFIX`] in Ravel's own store.
+async fn probe_objects(ravel: &InstrumentedStore<MemoryStore>) -> Vec<String> {
+    ravel
+        .inner()
+        .list(PROBE_PREFIX, None)
+        .await
+        .expect("list probe prefix")
+        .objects
+        .into_iter()
+        .map(|meta| meta.key)
+        .collect()
+}
+
+/// A statement whose deadline expires inside `probe_not_ravel_bucket`, after
+/// the probe object was written to Ravel's bucket and before the probe's own
+/// delete, still deletes that object. The lake store holds the identity read
+/// of the probe key open forever, so the statement can only end through its
+/// deadline, which drops the probe mid-flight.
+#[tokio::test(start_paused = true)]
+async fn deadline_inside_the_ravel_bucket_probe_deletes_the_probe_object() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let gate = fault_store.hold(Op::Get, Some(PROBE_PREFIX.to_string()), Occurrence::Always);
+    let lake = Arc::clone(&fault_store) as Arc<dyn ObjectStoreBackend>;
+    let fixture = Lake::unlimited(lake);
+    fixture
+        .put_file("t/hits/0.parquet", parquet_bytes(&[1], &["a"], &[0.5]))
+        .await;
+    let t = tenant("acme");
+    fixture.grant(&t).await;
+
+    let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
+    let executor = Arc::clone(&fixture.executor);
+    let statement = tokio::spawn(async move {
+        executor
+            .execute_ddl(t, &sql, CREATED_BY, deadline())
+            .await
+            .result
+    });
+
+    gate.wait_until_held(1).await;
+    let held = gate.held_details();
+    assert_eq!(held.len(), 1, "{held:?}");
+    let (_, held_op, held_key) = &held[0];
+    assert_eq!(*held_op, Op::Get);
+    assert_eq!(
+        probe_objects(&fixture.ravel).await,
+        vec![held_key.clone()],
+        "the probe object must be in Ravel's bucket while its identity read is held"
+    );
+
+    let err = statement
+        .await
+        .expect("join")
+        .expect_err("a held identity read must end the statement at its deadline");
+    assert!(
+        matches!(err, DdlExecuteError::Deadline { deadline: d } if d == deadline()),
+        "{err:?}"
+    );
+    // The held read was never released: the probe was dropped while parked
+    // on it, not completed past it.
+    assert_eq!(gate.held_count(), 1);
+
+    let mut leaked = probe_objects(&fixture.ravel).await;
+    for _ in 0..100 {
+        if leaked.is_empty() {
+            break;
+        }
+        tokio::task::yield_now().await;
+        leaked = probe_objects(&fixture.ravel).await;
+    }
+    assert!(
+        leaked.is_empty(),
+        "a statement cancelled inside the probe must delete its probe object: {leaked:?}"
     );
 }
 
