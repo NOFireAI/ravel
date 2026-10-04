@@ -635,9 +635,12 @@ than passing for "no pull request open".
   CI's doc-scripts job; cases in `scripts/guards/check-promql-unreachable.test.sh`.
 - `scripts/guards/check-release-profile.sh`: exits non-zero when the published
   binaries would not be built optimised. `[profile.release]` must set `lto` to
-  `"thin"` or `"fat"` and `codegen-units = 1`, with no `opt-level` other than 3
-  there or in a `[profile.release.package.*]` table; every `cargo build` in the
-  root `Dockerfile` must carry `--release` and no `--profile`; neither that
+  `"thin"`, `"fat"` or `true`, `codegen-units = 1`, and keep debug info on
+  (the published debug-symbols image is split out of these binaries), with no
+  `opt-level` other than 3 there or in a per-package release override, in
+  either the `[profile.release.package.NAME]` or the inline-table spelling;
+  every `cargo build` in the root `Dockerfile` must carry `--release` and no
+  `--profile`, checked per build after joining continuation lines; neither that
   file nor `publish-images.yml` may set a `CARGO_PROFILE_RELEASE_*` variable;
   and `publish-images.yml` must build the root `Dockerfile`. Test lanes are
   free to tune `profile.ci`; this is the profile that must not follow them.

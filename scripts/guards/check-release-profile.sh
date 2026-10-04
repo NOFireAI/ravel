@@ -9,11 +9,15 @@
 #
 # Checks, all text scans, no build:
 #   1. `[profile.release]` in the workspace Cargo.toml sets `lto` to "thin",
-#      "fat" or true, sets `codegen-units = 1`, and sets no `opt-level` other
-#      than 3. The same `opt-level` rule holds for every
-#      `[profile.release.package.*]` table.
+#      "fat" or true, sets `codegen-units = 1`, keeps debug info on (the
+#      published debug-symbols image is split out of these binaries), and sets
+#      no `opt-level` other than 3. The same `opt-level` rule holds for every
+#      per-package release override, in either spelling: a
+#      `[profile.release.package.NAME]` table or an inline table under
+#      `[profile.release.package]`.
 #   2. Every `cargo build` in the root Dockerfile carries `--release` and no
-#      `--profile`.
+#      `--profile`. Backslash continuations are joined first, and a line that
+#      chains several builds is checked per build.
 #   3. Neither the Dockerfile nor publish-images.yml sets a
 #      `CARGO_PROFILE_RELEASE_*` variable, which overrides the manifest.
 #   4. publish-images.yml builds from the root Dockerfile: it names no other
@@ -105,10 +109,45 @@ while IFS= read -r header; do
   check_opt_level "${table%]}"
 done < <(grep -E '^\[profile\.release\.package\..*\]$' "${manifest}" || true)
 
+# The same override spelled as an inline table: `name = { opt-level = 1 }`
+# under a bare [profile.release.package].
+while IFS= read -r entry; do
+  [[ -n "${entry}" ]] || continue
+  finding "${manifest}: [profile.release.package] lowers opt-level: ${entry}"
+done < <(table_body profile.release.package \
+  | grep -E 'opt-level[[:space:]]*=' \
+  | grep -vE 'opt-level[[:space:]]*=[[:space:]]*3([^0-9]|$)' || true)
+
+# The debug-symbols image is split out of these binaries, so a release profile
+# without debug info publishes an empty symbol set.
+debug="$(printf '%s\n' "${release_body}" | key_value debug)"
+case "${debug}" in
+  "" | 0 | false | none)
+    finding "${manifest}: [profile.release] debug = ${debug:-<unset>}; the published debug-symbols image needs debug info" ;;
+esac
+
 # --- 2. the Dockerfile builds on that profile --------------------------------
 
-build_lines="$(grep -nE 'cargo[[:space:]]+build' "${dockerfile}" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+# Logical lines: a backslash continuation is joined to the line that starts
+# it, and the number reported is that first line's. Comment lines are dropped
+# before joining so a commented-out continuation cannot swallow a real line.
+logical_lines() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    {
+      if (start == 0) start = NR
+      line = $0
+      if (sub(/\\[[:space:]]*$/, "", line)) { buf = buf line " "; next }
+      print start ":" buf line
+      buf = ""; start = 0
+    }
+    END { if (start != 0) print start ":" buf }
+  ' "${dockerfile}"
+}
+
+build_lines="$(logical_lines | grep -E 'cargo[[:space:]]+build' || true)"
 [[ -n "${build_lines}" ]] || missing "${dockerfile} has no cargo build line"
+builds=0
 
 while IFS= read -r line; do
   number="${line%%:*}"
@@ -116,6 +155,7 @@ while IFS= read -r line; do
   # One line can chain several builds; test each `cargo build ...` segment.
   while IFS= read -r segment; do
     [[ -n "${segment}" ]] || continue
+    builds=$((builds + 1))
     if [[ "${segment}" != *"--release"* ]]; then
       finding "${dockerfile}:${number}: cargo build without --release: ${segment}"
     fi
@@ -152,5 +192,5 @@ if [[ "${findings}" -gt 0 ]]; then
   printf '%s finding(s): published binaries would not be built on the optimised release profile\n' "${findings}"
   exit 1
 fi
-printf 'release profile guard: clean (lto=%s, codegen-units=%s, %s cargo build line(s) in %s)\n' \
-  "${lto}" "${units}" "$(printf '%s\n' "${build_lines}" | wc -l | tr -d ' ')" "${dockerfile}"
+printf 'release profile guard: clean (lto=%s, codegen-units=%s, debug=%s, %s cargo build(s) in %s)\n' \
+  "${lto}" "${units}" "${debug}" "${builds}" "${dockerfile}"
