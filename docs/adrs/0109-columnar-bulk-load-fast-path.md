@@ -241,6 +241,9 @@ Decoded equality is a fallback only if a specific chunking input turns out
 not to be reproducible column-wise, and that would be recorded here as an
 amendment with the reason.
 
+Since ADR-2467 the row builder is a test-only reference and row-shaped input
+is encoded by the columnar builder; see the ADR-2467 amendment below.
+
 ### 8. The target is under 10 minutes, and here is the arithmetic
 
 Addressable CPU, from the table above: `build_record` 3.5, `resolve_row`
@@ -390,5 +393,21 @@ operator-facing precision for no measurable saving.
   untouched, so no format version bump is required.
 - The reported number is a measured before-and-after on the reference box.
   No load-time win is claimed from the arithmetic in decision 8.
+
+## Amendment (2026-10-04): the row builder is the test-only reference (ADR-2467)
+
+<!-- amendment-applies: sections="7. Byte-identical output is the acceptance anchor, at two levels" pointer="ADR-2467 amendment" -->
+
+ADR-2467 routes row-shaped input through the columnar builder: a writer that
+received records by `push` folds them into one batch at `finish`. The row
+builder stops being a production path and stays in the crate as a test-only
+reference.
+
+Decision 7's requirement is unchanged: the two builders produce byte-identical
+objects for the same records, and the two differential tests stay. What
+changes is how the writer-level test reaches the row builder. It used to push
+records through `RlogWriter::push`; that entry point now leads to the columnar
+builder, so the test's row arm calls the reference builder directly. The
+end-to-end test in `services/ravel-cli` is unaffected.
 
 Refs: #586, #519, #541, #560, #570, #584, #585, #660
