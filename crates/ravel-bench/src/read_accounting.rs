@@ -202,8 +202,10 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
 
     /// Counted via [`Counters::record_pinned_get`]: a pinned read is still
     /// one GET on the wire, so it also bumps the plain GET totals. Counted
-    /// whatever the outcome, as `head` is: a read refused with
-    /// `PreconditionFailed` is still a paid request, and adds 0 bytes.
+    /// for any returned outcome: a read refused with `PreconditionFailed` is
+    /// still a paid request, and adds 0 bytes. Unlike `head`, the count is
+    /// taken after the call returns (it needs the byte count), so a future
+    /// dropped mid-flight is not counted.
     async fn get_pinned(
         &self,
         key: &str,
@@ -216,9 +218,9 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
         read
     }
 
-    /// Counted via [`Counters::record_pinned_get`] whatever the outcome, for
-    /// the same reasons as [`Self::get_pinned`]: a read of a missing key is
-    /// still a paid request, and adds 0 bytes.
+    /// Counted via [`Counters::record_pinned_get`] for any returned outcome,
+    /// as [`Self::get_pinned`] is and with the same cancellation gap: a read
+    /// of a missing key is still a paid request, and adds 0 bytes.
     async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
         let read = self.inner.get_with_pin(key, range).await;
         let bytes = read.as_ref().map_or(0, |r| r.outcome.data.len() as u64);
