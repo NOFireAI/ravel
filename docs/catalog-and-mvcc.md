@@ -1791,7 +1791,9 @@ process-wide capacity bound (`head_cache_capacity`, default 10,000 (tenant,
 signal) entries, FIFO eviction), closing the one cache of the five that previously had a TTL but
 no bound on the number of tenants it could grow to hold. An entry recording a
 missing HEAD counts against the same bound, but when the cache is full a new
-one is not cached rather than evicting a present HEAD.
+one is not cached rather than evicting a present HEAD. A present insert at
+capacity evicts the oldest missing-HEAD entry first, and falls back to the
+oldest entry only when none is held.
 
 ## Compaction protocol (ADR-0018)
 
