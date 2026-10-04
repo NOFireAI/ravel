@@ -27,7 +27,9 @@
 //! with no i64 nanosecond count is an error. Such a count is usually past
 //! 2^53, so a client must parse JSON integers exactly to keep it. A `Time32`
 //! or `Time64` of any unit is an integer count of nanoseconds since midnight;
-//! a negative value, or one of a whole day or more, is an error. `Date32`
+//! a negative value, or one of a whole day or more, is an error. A
+//! `Duration` of any unit is a signed integer count of nanoseconds; one with
+//! no i64 nanosecond count is an error. `Date32`
 //! and `Date64` are `YYYY-MM-DD` strings, and a value with no such form (a
 //! year outside 0000 to 9999, or a `Date64` that is not a whole day) is an
 //! error. Every decimal width (`Decimal32` to `Decimal256`) is a string of
@@ -42,9 +44,10 @@ use std::fmt::Write as _;
 use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
-    FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringArray,
-    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+    DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+    DurationSecondArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray,
+    StringArray, StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
@@ -210,6 +213,24 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
             downcast::<Time64NanosecondArray>(array, "Time64(ns)")?.value(row),
             1,
         )?),
+        DataType::Duration(TimeUnit::Second) => json!(duration_nanos(
+            array,
+            downcast::<DurationSecondArray>(array, "Duration(s)")?.value(row),
+            1_000_000_000,
+        )?),
+        DataType::Duration(TimeUnit::Millisecond) => json!(duration_nanos(
+            array,
+            downcast::<DurationMillisecondArray>(array, "Duration(ms)")?.value(row),
+            1_000_000,
+        )?),
+        DataType::Duration(TimeUnit::Microsecond) => json!(duration_nanos(
+            array,
+            downcast::<DurationMicrosecondArray>(array, "Duration(us)")?.value(row),
+            1_000,
+        )?),
+        DataType::Duration(TimeUnit::Nanosecond) => {
+            json!(downcast::<DurationNanosecondArray>(array, "Duration(ns)")?.value(row))
+        }
         DataType::Date32 => {
             let days = downcast::<Date32Array>(array, "Date32")?.value(row);
             json!(date_text(i64::from(days)).ok_or_else(|| not_a_date("Date32", days.into()))?)
@@ -349,6 +370,17 @@ fn scale_to_nanos(array: &ArrayRef, value: i64, nanos_per_unit: i64) -> Result<i
     value.checked_mul(nanos_per_unit).ok_or_else(|| {
         SqlError::Internal(format!(
             "{} value {value} overflows an i64 count of nanoseconds since the epoch",
+            array.data_type()
+        ))
+    })
+}
+
+/// A duration of a coarser unit as a signed count of nanoseconds. A value
+/// with no i64 nanosecond count is an error rather than a wrapped number.
+fn duration_nanos(array: &ArrayRef, value: i64, nanos_per_unit: i64) -> Result<i64, SqlError> {
+    value.checked_mul(nanos_per_unit).ok_or_else(|| {
+        SqlError::Internal(format!(
+            "{} value {value} overflows an i64 count of nanoseconds",
             array.data_type()
         ))
     })
@@ -1163,12 +1195,99 @@ mod tests {
         }
     }
 
+    #[test]
+    fn duration_seconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationSecondArray;
+        let array = Arc::new(DurationSecondArray::from(vec![90, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(90_000_000_000_i64), json!(-1_000_000_000)]
+        );
+    }
+
+    #[test]
+    fn duration_milliseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationMillisecondArray;
+        let array = Arc::new(DurationMillisecondArray::from(vec![1_500, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_500_000_000), json!(-1_000_000)]
+        );
+    }
+
+    #[test]
+    fn duration_microseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationMicrosecondArray;
+        let array = Arc::new(DurationMicrosecondArray::from(vec![1_500, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_500_000), json!(-1_000)]
+        );
+    }
+
+    #[test]
+    fn duration_nanoseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationNanosecondArray;
+        let array =
+            Arc::new(DurationNanosecondArray::from(vec![i64::MAX, -1, i64::MIN])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(i64::MAX), json!(-1), json!(i64::MIN)]
+        );
+    }
+
+    /// One unit past the i64 nanosecond range on either side has no JSON
+    /// nanosecond count.
+    #[test]
+    fn duration_overflowing_i64_nanoseconds_is_a_typed_error() {
+        use datafusion::arrow::array::{
+            DurationMicrosecondArray, DurationMillisecondArray, DurationSecondArray,
+        };
+        let cases: Vec<(ArrayRef, i64)> = vec![
+            (
+                Arc::new(DurationSecondArray::from(vec![9_223_372_037])),
+                9_223_372_037,
+            ),
+            (
+                Arc::new(DurationSecondArray::from(vec![-9_223_372_037])),
+                -9_223_372_037,
+            ),
+            (
+                Arc::new(DurationMillisecondArray::from(vec![9_223_372_036_855])),
+                9_223_372_036_855,
+            ),
+            (
+                Arc::new(DurationMicrosecondArray::from(vec![-9_223_372_036_854_776])),
+                -9_223_372_036_854_776,
+            ),
+        ];
+        for (array, value) in cases {
+            let data_type = array.data_type().to_string();
+            let message = column_error(array);
+            assert_eq!(
+                message,
+                format!("{data_type} value {value} overflows an i64 count of nanoseconds")
+            );
+        }
+    }
+
     /// No display-formatter fallback: a type with no arm still fails, naming
-    /// the type.
+    /// the type. `RunEndEncoded` is the example because parquet's Arrow
+    /// reader never returns it for a column: it derives each column type from
+    /// the physical and logical type, keeps an embedded schema hint only for a
+    /// fixed set of primitive, list, struct, map and dictionary types, and its
+    /// writer refuses a run-end encoded column outright.
     #[test]
     fn a_type_with_no_arm_is_a_typed_error_naming_it() {
-        use datafusion::arrow::array::DurationSecondArray;
-        let message = column_error(Arc::new(DurationSecondArray::from(vec![1])) as ArrayRef);
-        assert_eq!(message, "no JSON encoding for arrow type Duration(s)");
+        use datafusion::arrow::array::RunArray;
+        use datafusion::arrow::datatypes::Int32Type;
+        let array: RunArray<Int32Type> = vec!["a", "a", "b"].into_iter().collect();
+        let array = Arc::new(array) as ArrayRef;
+        let expected = format!("no JSON encoding for arrow type {}", array.data_type());
+        assert!(
+            expected.starts_with("no JSON encoding for arrow type RunEndEncoded"),
+            "{expected}"
+        );
+        assert_eq!(column_error(array), expected);
     }
 }
