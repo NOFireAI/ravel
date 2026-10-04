@@ -186,7 +186,7 @@ time is reported under `coverage`, not here.
 | `invalid_argument` | An argument is well-formed but not acceptable as given: two mutually exclusive fields set together, a value out of range, an empty `filter` string, a label list bounded by neither a selector nor a label name. |
 | `missing_argument` | A required argument, most often a time input, was not sent. |
 | `validation` | The query engine rejected the statement itself. The message is the engine's own text, safe to show. |
-| `unsupported` | The request names a construct or an operation the tool does not implement. |
+| `unsupported` | The request names a construct or an operation the tool does not implement. For `ravel_query_sql` this also covers a result column the JSON encoding cannot hold: the message is `column "<name>" of type <arrow type> cannot be encoded as JSON: <reason>; cast the column in the query to a type JSON can hold, or read it over /api/v1/sql with the Arrow IPC format`, and never carries the value. |
 | `budget_estimate_exceeds_ceiling` | `ravel_explain_query` found the statement's estimated cost above the effective budget. The failure names the factor to narrow by. |
 | `budget_exceeded` | A running call passed one of its budgets. The failure names the counter that tripped. |
 | `deadline` | The call passed its effective deadline. |
