@@ -3031,9 +3031,24 @@ mod tick_tests {
         metrics: Arc<AlertMetrics>,
         rules: Vec<Rule>,
     ) -> AlertEvaluator {
-        let catalog =
-            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
-        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
+        let catalog = Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog");
+        evaluator_over_catalog(store, catalog, clock, sinks, metrics, rules)
+    }
+
+    /// [`evaluator_for_rules`] over a caller-built catalog.
+    fn evaluator_over_catalog(
+        store: Arc<dyn ObjectStoreBackend>,
+        catalog: Catalog,
+        clock: Arc<TestClock>,
+        sinks: Vec<AlertSink>,
+        metrics: Arc<AlertMetrics>,
+        rules: Vec<Rule>,
+    ) -> AlertEvaluator {
+        let engine = QueryEngine::new(
+            Arc::new(catalog),
+            Arc::clone(&store),
+            EngineConfig::default(),
+        );
         let config = AlertEvalConfig {
             enabled: true,
             sinks: Arc::new(sinks),
@@ -5520,6 +5535,15 @@ mod tick_tests {
         }
     }
 
+    /// A catalog monotonic clock that never advances.
+    struct FrozenMonoClock;
+
+    impl ravel_cpu_gate::MonotonicClock for FrozenMonoClock {
+        fn now_nanos(&self) -> u64 {
+            0
+        }
+    }
+
     /// The whole cost of one steady-state `run_tick`, bracketed end to end
     /// (issue #1294, review finding 2). The fold tests above pin the fold's own
     /// reads; nothing pinned the lease and memo calls a tick makes around them,
@@ -5574,7 +5598,19 @@ mod tick_tests {
         .await;
 
         let clock = TestClock::at(NOW_NS);
-        let mut ev = evaluator(Arc::clone(&store), Arc::clone(&clock));
+        // The catalog's monotonic clock is frozen, so tick 1's cached HEAD
+        // NotFound cannot outlive `head_cache_ttl` on a slow runner.
+        let catalog = Catalog::new(Arc::clone(&store), CatalogConfig::default())
+            .expect("catalog")
+            .with_monotonic_clock(Arc::new(FrozenMonoClock));
+        let mut ev = evaluator_over_catalog(
+            Arc::clone(&store),
+            catalog,
+            Arc::clone(&clock),
+            Vec::new(),
+            Arc::new(AlertMetrics::default()),
+            vec![threshold_rule()],
+        );
 
         // Tick 1 is the cold path: no memo, a full fold, and the Firing onset.
         assert_eq!(ev.run_tick().await.records_written, 1, "onset fires");
