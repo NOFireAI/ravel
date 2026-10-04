@@ -138,7 +138,8 @@ string: `NaN`, `+Inf`, and `-Inf`. Other column types are encoded as follows:
 - a `Time32` or `Time64` of any unit is an integer count of nanoseconds
   since midnight;
 - `Date32` and `Date64` are `YYYY-MM-DD` strings;
-- `Decimal128` and `Decimal256` are strings holding their exact decimal text;
+- every decimal width (`Decimal32`, `Decimal64`, `Decimal128`, `Decimal256`)
+  is a string holding its exact decimal text;
 - binary columns are lowercase hex strings.
 
 A column whose type or value has no JSON encoding (a type with no rule above,
