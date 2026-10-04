@@ -259,7 +259,7 @@ tenant's cached generation history. That view is trusted for `h` only before
   once until the last of those flushes ends. A strict waiter on the buffer is
   answered with the outcome-unknown `Abandoned` (503). The current generation
   is in the scan set of every hour its shards pin, so rows are handed back
-  again only if another decrease activates first.
+  again only if another reshard activates first.
 - With no view, or one past its horizon, the flush does not open and the
   buffer stays as it was. The episode counts once per buffer on
   `ravel_ingest_stale_provisioning_flushes_total`, however many triggers
@@ -271,10 +271,34 @@ tenant's cached generation history. That view is trusted for `h` only before
   drain flushes every buffer the re-read confirms. Only a re-read that fails
   keeps the buffer.
 
+A late flush also never writes under an hour its routing generation does not
+own (ADR-1642 generation-mismatch amendment). Inside the scan set, the same check asks
+`ravel_catalog::stable_generation_for_hour` whether one generation owns `h`
+alone, the rule the distributed query planner's pushdown gate uses. When it
+does and that generation routes at a shard count other than the count of the
+set holding the buffer, the flush writes nothing under its own index and hands
+the rows to the owner's set, by the same mechanism and with the same charges,
+waiter answer and fail-closed view as above, so every row of an owned hour
+sits at the index the owner routes it to. Without that, a series could sit at
+two indices in an hour the planner splits by shard index, and slice workers
+would each count part of it. Generations that share a count route every row
+alike, so the comparison is by count. Inside the activation overlap, the `S`
+hours after an activation, no generation owns the hour and the flush writes in
+place as the scan set allows. A hand-back to a larger set (after a reshard to
+more shards) does not wait for room in a target's mailbox, so waits between
+sets form no cycle: a full mailbox returns the rows to the source buffer, as a
+closed one does, and the next trigger retries. A teardown drain that cannot
+reach a live target for such a hand-back writes the rows in place with a WARN:
+readers find them, since they are inside the scan set, but a distributed
+pushdown over that hour can split their series across two slices.
+
 Each pipeline counts hand-backs as `rerouted_flushes`, exported as
-`ravel_ingest_rerouted_flushes_total` by signal, and the first hand-back of an
-episode on a shard logs once at WARN. A hand-back that finds a target not
-live, or whose send fails, counts once per buffer on
+`ravel_ingest_rerouted_flushes_total` by signal, and the part handed back for
+an hour another generation owns as `rerouted_flushes_generation_mismatch`
+(reason `generation_mismatch`; the rest are `retired_index`). The first
+hand-back of an episode on a shard logs once at WARN with its reason. A
+hand-back that finds a target not live, or whose send fails, counts once per
+buffer on
 `ravel_ingest_hand_back_failures_total` and logs once (WARN for metrics, whose
 dead shard the next write respawns; ERROR for logs and spans, whose dead shard
 is condemned and whose rows then wait for the teardown drain). `flush_all`

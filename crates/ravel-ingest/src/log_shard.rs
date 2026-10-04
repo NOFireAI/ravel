@@ -2221,7 +2221,8 @@ impl LogShardActor {
                         target_count,
                         "ravel-ingest: teardown bypass pass: writing a flush in place in an \
                          ingest hour another shard generation owns, because a hand-back target \
-                         shard is dead or condemned; every query finds the records"
+                         shard is dead or condemned; readers find the records, but a pushdown \
+                         split over this hour may see their streams at two shard indices"
                     );
                     buf
                 }

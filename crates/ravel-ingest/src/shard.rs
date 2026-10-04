@@ -2142,7 +2142,8 @@ impl ShardActor {
                         target_count,
                         "ravel-ingest: teardown bypass pass: writing a flush in place in an \
                          ingest hour another shard generation owns, because a hand-back target \
-                         shard is dead or closed; every query finds the rows"
+                         shard is dead or closed; readers find the rows, but a pushdown split \
+                         over this hour may see their series at two shard indices"
                     );
                     buf
                 }

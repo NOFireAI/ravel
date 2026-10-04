@@ -1563,7 +1563,8 @@ impl SpanShardActor {
                         target_count,
                         "ravel-ingest: teardown bypass pass: writing a flush in place in an \
                          ingest hour another shard generation owns, because a hand-back target \
-                         shard is dead or condemned; every query finds the spans"
+                         shard is dead or condemned; readers find the spans, but a pushdown \
+                         split over this hour may see their traces at two shard indices"
                     );
                     buf
                 }
