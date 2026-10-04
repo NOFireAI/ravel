@@ -6,8 +6,8 @@
 
 use proptest::prelude::*;
 use ravel_logseg::{
-    AttrValue, LogRecord, LogSegError, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter,
-    stream_attrs_bytes,
+    AttrValue, ColumnarLogBatch, LogRecord, LogSegError, LogStreamId, ObjectIdentity, RlogConfig,
+    RlogWriter, stream_attrs_bytes,
 };
 
 const STREAMS: u8 = 4;
@@ -171,5 +171,49 @@ fn routed_path_refuses_two_blobs_for_one_stream_id() {
             "expected InconsistentStreamAttrs, got {:?}",
             other.map(|o| o.len())
         ),
+    }
+}
+
+/// A writer is row-major or columnar for its whole lifetime (ADR-0109
+/// decision 5), never both: a `push` after a `push_columnar`, or a
+/// `push_columnar` after a `push`, is refused with a typed `LimitExceeded`
+/// rather than silently mixing the two buffers. Neither refusal had a test
+/// before this one (found while building the ADR-2467 error-parity table for
+/// issue #2564): both are reachable from the row-builder entry point
+/// (`push`) and so are in scope for this routing change even though the
+/// check itself is unchanged by it.
+#[test]
+fn cross_mode_push_is_refused() {
+    let rec = LogRecord {
+        stream_id: sid(0),
+        stream_attrs: stream_blob(0),
+        ts_ns: 1,
+        observed_ts_ns: 1,
+        severity_num: 9,
+        severity_text: "INFO".to_string(),
+        body: "a".to_string(),
+        trace_id: None,
+        span_id: None,
+        flags: 0,
+        attrs: Vec::new(),
+    };
+    let batch = ColumnarLogBatch::from_records(std::slice::from_ref(&rec));
+
+    let mut row_first = RlogWriter::new(RlogConfig::default(), identity());
+    row_first.push(rec.clone()).expect("push");
+    match row_first.push_columnar(batch.clone()) {
+        Err(LogSegError::LimitExceeded(m)) => {
+            assert!(m.contains("columnar push into a row-major writer"), "{m}");
+        }
+        other => panic!("expected LimitExceeded, got {other:?}"),
+    }
+
+    let mut columnar_first = RlogWriter::new(RlogConfig::default(), identity());
+    columnar_first.push_columnar(batch).expect("push_columnar");
+    match columnar_first.push(rec) {
+        Err(LogSegError::LimitExceeded(m)) => {
+            assert!(m.contains("row-major push into a columnar writer"), "{m}");
+        }
+        other => panic!("expected LimitExceeded, got {other:?}"),
     }
 }
