@@ -280,6 +280,13 @@ pub struct SqlSpillSettings {
     /// [`ResolvedPerformanceDefaults::memory_budget_bytes`], the input that
     /// caps a `--cache-dir`-derived spill ceiling at four times its value.
     pub memory_budget_bytes: u64,
+    /// The most the read cache's disk tier under `--cache-dir` may hold:
+    /// [`ResolvedPerformanceDefaults::cache_max_bytes`] plus
+    /// [`ResolvedPerformanceDefaults::catalog_cache_max_bytes`], each of which
+    /// bounds one cache's disk tier, or `0` under `--disable-cache`. A
+    /// `--cache-dir`-derived spill ceiling is taken from the volume's free
+    /// bytes less this.
+    pub read_cache_bytes: u64,
 }
 
 impl Default for SqlSpillSettings {
@@ -287,6 +294,7 @@ impl Default for SqlSpillSettings {
         SqlSpillSettings {
             off: false,
             memory_budget_bytes: u64::MAX,
+            read_cache_bytes: 0,
         }
     }
 }
@@ -1279,9 +1287,10 @@ pub struct Cli {
     /// pool to the first configured source: the
     /// `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` pair; else, with
     /// `--cache-dir` set, `<cache-dir>/sql-spill/<instance-id>` under a ceiling
-    /// of half the volume's free bytes at startup, capped at four times the
-    /// memory budget and raised to 1 GiB when that cap is lower, with spill
-    /// off when half the free bytes is below 1 GiB
+    /// of half the volume's free bytes at startup after the read cache's
+    /// disk-tier bound is subtracted, capped at four times the memory budget
+    /// and raised to 1 GiB when that cap is lower, with spill off when that
+    /// half is below 1 GiB
     /// (`RAVEL_SQL_SPILL_MAX_BYTES` alone replaces that ceiling); else no
     /// spill. The ceiling bounds all of the
     /// process's queries together. `off` disables spill whatever the
@@ -5733,6 +5742,13 @@ impl Cli {
             sql_spill: SqlSpillSettings {
                 off: self.sql_spill == SqlSpillArg::Off,
                 memory_budget_bytes: resolved.memory_budget_bytes,
+                read_cache_bytes: if resolved.cache_disabled {
+                    0
+                } else {
+                    resolved
+                        .cache_max_bytes
+                        .saturating_add(resolved.catalog_cache_max_bytes)
+                },
             },
         })
     }
@@ -12966,12 +12982,18 @@ mod tests {
     /// `--sql-spill` parses `auto` (the default) and `off`, refuses every
     /// other word, and reaches [`QueryBudgets::sql_spill`] beside the
     /// resolved memory budget the `--cache-dir` ceiling is capped against
-    /// (ADR-0954, amended by issue #2416).
+    /// and the read cache's disk-tier bound subtracted from the free bytes it
+    /// is derived from (ADR-0954, amended by issue #2416): the fetcher and
+    /// catalog cache ceilings summed (7,516,192,768 + 1,503,238,553 on the
+    /// reference host), and `0` under `--disable-cache`.
     ///
     /// Prove-the-test: write `off: false` in `Cli::query_budgets` and the `off`
     /// row reads `false`; pass `resolved.memory_remainder_bytes` instead of
     /// `memory_budget_bytes` and the budget reads 21,045,339,751 against
-    /// 30,064,771,072.
+    /// 30,064,771,072; pass `resolved.cache_max_bytes` alone as
+    /// `read_cache_bytes` and the default row reads 7,516,192,768 against
+    /// 9,019,431,321; drop the `cache_disabled` branch and the
+    /// `--disable-cache` row reads 9,019,431,321 against 0.
     #[test]
     fn sql_spill_flag_parses_auto_and_off_and_reaches_query_budgets() {
         assert_eq!(cli(&[]).sql_spill, SqlSpillArg::Auto);
@@ -12984,10 +13006,21 @@ mod tests {
             );
         }
 
-        for (args, off) in [
-            (&[][..], false),
-            (&["--sql-spill", "auto"][..], false),
-            (&["--sql-spill", "off"][..], true),
+        for (args, off, read_cache_bytes) in [
+            (&[][..], false, 9_019_431_321),
+            (&["--sql-spill", "auto"][..], false, 9_019_431_321),
+            (&["--sql-spill", "off"][..], true, 9_019_431_321),
+            (
+                &[
+                    "--cache-max-bytes",
+                    "4096",
+                    "--catalog-cache-max-bytes",
+                    "8192",
+                ][..],
+                false,
+                12_288,
+            ),
+            (&["--disable-cache"][..], false, 0),
         ] {
             let parsed = cli(args);
             let resolved = resolved_from(&parsed);
@@ -12997,6 +13030,7 @@ mod tests {
                 SqlSpillSettings {
                     off,
                     memory_budget_bytes: 30_064_771_072,
+                    read_cache_bytes,
                 },
                 "{args:?}"
             );
