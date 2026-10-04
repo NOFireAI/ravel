@@ -837,6 +837,7 @@ mod tests {
         for result in submit_queued(&pipeline, events).await {
             result.expect("submit ok");
         }
+        // hygiene-allow: wall-clock -- start_paused: elapsed() reads tokio's injected clock
         assert_eq!(
             start.elapsed(),
             Duration::ZERO,
@@ -878,6 +879,7 @@ mod tests {
             .submit(test_event(tenant, 5_001, 7))
             .await
             .expect("submit flushes on max_age");
+        // hygiene-allow: wall-clock -- start_paused: elapsed() reads tokio's injected clock
         assert_eq!(
             start.elapsed(),
             max_age,
@@ -908,6 +910,7 @@ mod tests {
             .submit(test_event(tenant, 26_000, 7))
             .await
             .expect("the idle event is durable");
+        // hygiene-allow: wall-clock -- start_paused: elapsed() reads tokio's injected clock
         assert_eq!(
             start.elapsed(),
             Duration::ZERO,
@@ -996,6 +999,7 @@ mod tests {
             .submit(test_event(tenant, 27_001, 7))
             .await
             .expect("first event after the gap");
+        // hygiene-allow: wall-clock -- start_paused: elapsed() reads tokio's injected clock
         assert_eq!(
             first_at.elapsed(),
             Duration::ZERO,
@@ -1008,6 +1012,7 @@ mod tests {
             .submit(test_event(tenant, 27_002, 7))
             .await
             .expect("second event");
+        // hygiene-allow: wall-clock -- start_paused: elapsed() reads tokio's injected clock
         assert_eq!(
             second_at.elapsed(),
             max_age,
@@ -1089,6 +1094,7 @@ mod tests {
         for result in await_all(queued).await {
             result.expect("queued event ok");
         }
+        // hygiene-allow: wall-clock -- start_paused: elapsed() reads tokio's injected clock
         assert_eq!(
             released_at.elapsed(),
             max_age,
