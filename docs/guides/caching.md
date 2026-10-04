@@ -41,8 +41,8 @@ The cache stores byte ranges read from two kinds of objects:
   cost profile (intra-region, where transferred bytes are free and the bill
   is requests) a request costs 6,300,000 bytes and the break-even is five of
   them, 31,500,000 bytes. The blocks of an object of that size or less are
-  read in one whole-object GET (a statement on the planned route may still
-  probe its tail first); a larger one takes the block-range shape above when the bytes its
+  read in one whole-object GET with no tail probe, on the whole-segment fast
+  path and on the planned route alike; a larger one takes the block-range shape above when the bytes its
   projection skips exceed the break-even, and is read whole otherwise. Set
   `--logs-fetch-policy byte-minimal` explicitly to get the block-range shape
   above every object the threshold routes there. See the flag table below.
