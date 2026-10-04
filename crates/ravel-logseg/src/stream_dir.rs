@@ -6,12 +6,10 @@
 //! is a binary search. Decode treats every field as untrusted: a non-ascending
 //! sequence, an entry count over the cap, or any truncation is `Corrupted`.
 //!
-//! [`StreamDir::encode`] and [`StreamDir::encode_borrowed`] write the same
-//! bytes for the same entries; both go through the private `entry_len` /
-//! `write_entry` pair below so the layout exists in one place. The borrowed
-//! form exists so a writer holding its blobs elsewhere (never owning a
-//! `StreamEntry` per stream) can still size its output buffer exactly before
-//! writing it.
+//! [`StreamDir::encode_borrowed`] is the one encoder: the writer calls it with
+//! blobs it already holds, so no blob is copied into a `StreamEntry` per
+//! stream. [`StreamDir::encode`] delegates to it and has no caller on the
+//! write path; it serves tests and callers that already own a `StreamDir`.
 
 use ravel_types::logstream::LogStreamId;
 
@@ -50,17 +48,17 @@ fn uvarint_len(mut value: u64) -> usize {
     }
 }
 
-/// Bytes one entry occupies once encoded: 16-byte id, the blob's
+/// Bytes one entry occupies once encoded: the id, the blob's
 /// length-prefixed form, then the two block-range varints.
 fn entry_len(blob_len: usize, first_blk: u32, last_blk: u32) -> usize {
-    16 + uvarint_len(blob_len as u64)
+    size_of::<LogStreamId>()
+        + uvarint_len(blob_len as u64)
         + blob_len
         + uvarint_len(u64::from(first_blk))
         + uvarint_len(u64::from(last_blk))
 }
 
-/// Writes one entry's bytes, the layout both `encode` and `encode_borrowed`
-/// share.
+/// Writes one entry's bytes.
 fn write_entry(
     out: &mut Vec<u8>,
     stream_id: &LogStreamId,
@@ -114,17 +112,17 @@ impl StreamDir {
 
     /// Serializes the section in its uncompressed form.
     pub fn encode(&self) -> Vec<u8> {
-        let size = 4 + self
+        let borrowed: Vec<BorrowedStreamEntry<'_>> = self
             .entries
             .iter()
-            .map(|e| entry_len(e.blob.len(), e.first_blk, e.last_blk))
-            .sum::<usize>();
-        let mut out = Vec::with_capacity(size);
-        out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
-        for e in &self.entries {
-            write_entry(&mut out, &e.stream_id, &e.blob, e.first_blk, e.last_blk);
-        }
-        out
+            .map(|e| BorrowedStreamEntry {
+                stream_id: e.stream_id,
+                blob: &e.blob,
+                first_blk: e.first_blk,
+                last_blk: e.last_blk,
+            })
+            .collect();
+        Self::encode_borrowed(&borrowed)
     }
 
     /// Serializes borrowed entries into exactly the bytes [`StreamDir::encode`]
@@ -323,17 +321,22 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_encoder_matches_owned_encode_for_empty_and_single_entry() {
+    fn borrowed_encoder_writes_the_documented_layout() {
         let empty: Vec<(u32, Vec<u8>, u32, u32)> = Vec::new();
         assert_eq!(
             StreamDir::encode_borrowed(&to_borrowed_entries(&empty)),
-            StreamDir::new(to_owned_entries(&empty)).encode(),
+            0u32.to_le_bytes().to_vec(),
         );
 
         let one = vec![(7u32, b"resource-blob".to_vec(), 2u32, 9u32)];
-        let owned_bytes = StreamDir::new(to_owned_entries(&one)).encode();
         let borrowed_bytes = StreamDir::encode_borrowed(&to_borrowed_entries(&one));
-        assert_eq!(borrowed_bytes, owned_bytes);
+        let mut expected = 1u32.to_le_bytes().to_vec();
+        expected.extend_from_slice(&id32(7).0);
+        expected.push(13);
+        expected.extend_from_slice(b"resource-blob");
+        expected.extend_from_slice(&[2, 9]);
+        assert_eq!(borrowed_bytes, expected);
+        assert_eq!(StreamDir::new(to_owned_entries(&one)).encode(), expected);
         let got = StreamDir::decode(&borrowed_bytes, 1000).expect("decode");
         assert_eq!(got, StreamDir::new(to_owned_entries(&one)));
     }
@@ -415,11 +418,9 @@ mod tests {
             #![proptest_config(ProptestConfig::with_cases(256))]
 
             #[test]
-            fn borrowed_encoder_matches_owned_encode_byte_for_byte(raw in arb_entries()) {
+            fn borrowed_encoder_round_trips_through_decode_at_exact_size(raw in arb_entries()) {
                 let owned = StreamDir::new(to_owned_entries(&raw));
-                let owned_bytes = owned.encode();
                 let borrowed_bytes = StreamDir::encode_borrowed(&to_borrowed_entries(&raw));
-                prop_assert_eq!(&borrowed_bytes, &owned_bytes);
                 prop_assert_eq!(borrowed_bytes.capacity(), borrowed_bytes.len());
 
                 let decoded = StreamDir::decode(&borrowed_bytes, raw.len() as u64 + 1).expect("decode");

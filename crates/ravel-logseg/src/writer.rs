@@ -1761,10 +1761,24 @@ impl RlogWriter {
             blocks.push(out);
         }
 
-        // Per-block scratch is read for the last time in the loop above
-        // (stream_seeds via the per-row stamp finish, the flat stat and
-        // indexed-term arrays via the drains and the postings pass, the
-        // stamp scratch via `stamp.begin`/`stamp.finish`).
+        // Everything per row is read for the last time in or before the loop
+        // above: the gathered row arrays, the permutation, the dictionaries
+        // and their per-row ids, and the per-batch column metadata.
+        drop(perm);
+        drop(g_ts);
+        drop(g_obs);
+        drop(g_stream_ref);
+        drop(g_body);
+        drop(g_sevtext);
+        drop(g_attrs_raw);
+        drop(g_est_dyn);
+        drop(col_dict_ids);
+        drop(global_dict);
+        drop(col_meta);
+        drop(col_rank);
+        // So is the per-block scratch (stream_seeds via the per-row stamp
+        // finish, the flat stat and indexed-term arrays via the drains and
+        // the postings pass, the stamp scratch via `stamp.begin`/`stamp.finish`).
         drop(stream_seeds);
         drop(stamp);
         drop(blk_indexed);
