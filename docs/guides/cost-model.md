@@ -255,8 +255,9 @@ to it. Three cases matter:
   the whole-segment fast path and on the planned route (any statement the
   whole-segment fast path refuses) alike. Above the break-even a statement on
   the planned route probes an object's tail and directories first, and a wide
-  projection then reads the object whole anyway, because that route does not
-  weigh the projected fraction.
+  projection whose surviving ranges cover at least 75% of the object then
+  reads it whole anyway, because that route does not weigh the projected
+  fraction.
 - A profile with free bytes and no timings saturates the rate: every object is
   read whole, with no tail probe and no ranged read. The routing threshold
   saturates with it, which overrides `--logs-block-range-threshold`, and when

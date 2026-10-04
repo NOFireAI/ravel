@@ -682,7 +682,8 @@ index would cost a second read rather than save one
 (`the_planned_route_reads_an_object_under_the_break_even_whole`). Above the
 break-even the planned route probes before the scan's coverage crossover
 decides, and it does not weigh the projected fraction, so a wide statement
-there pays the probe and then reads the object whole.
+whose surviving ranges cover at least 75% of the object pays the probe and
+then reads it whole.
 
 That plan-phase whole-object read is now carried forward into
 the scan (`ravel_query::CarriedWholeObject`) instead of being thrown away,
