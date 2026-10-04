@@ -69,6 +69,25 @@ pub fn stream_attrs_bytes(
     out
 }
 
+/// [`stream_attrs_bytes`] with the scope name and version taken as raw bytes,
+/// so a test can build the non-UTF-8 blob a malformed producer could hand the
+/// writer.
+#[cfg(test)]
+pub(crate) fn stream_attrs_bytes_raw_scope(
+    resource_attrs: &[(String, AttrValue)],
+    scope_name: &[u8],
+    scope_version: &[u8],
+    scope_attrs: &[(String, AttrValue)],
+) -> Vec<u8> {
+    let mut out = canonical_attr_bytes(resource_attrs);
+    put_uvarint(&mut out, scope_name.len() as u64);
+    out.extend_from_slice(scope_name);
+    put_uvarint(&mut out, scope_version.len() as u64);
+    out.extend_from_slice(scope_version);
+    out.extend_from_slice(&canonical_attr_bytes(scope_attrs));
+    out
+}
+
 /// Depth cap when decoding a stream_attrs blob, so hostile nesting cannot
 /// exhaust the stack.
 const MAX_ATTR_DEPTH: u32 = 32;
@@ -93,7 +112,13 @@ pub struct StreamAttrs {
 /// exactly, including a nested `List`/`Map` and an `F64`'s exact bit pattern (a
 /// NaN payload or -0.0 survives, since the encoding stores `to_bits` verbatim).
 /// Corrupt input (a truncated blob, an over-long length prefix, an unknown
-/// value tag) is a typed [`LogSegError::Corrupted`], never a panic.
+/// value tag, a key, string value, scope name or scope version that is not
+/// UTF-8) is a typed [`LogSegError::Corrupted`], never a panic.
+///
+/// This is the one definition of a valid blob:
+/// [`crate::reader::stream_attr_pairs`] is implemented on it and refuses
+/// exactly what it refuses, with the same error, and the writer validates every
+/// STREAM_DIR blob through that function.
 pub fn decode_stream_attrs(blob: &[u8]) -> Result<StreamAttrs, LogSegError> {
     let mut pos = 0usize;
     let resource = decode_attr_set(blob, &mut pos, 0)?;
@@ -574,6 +599,36 @@ mod tests {
         let blob = vec![1u8, 0x80, 0x80, 0x80, 0x80, 0x01];
         let err = decode_stream_attrs(&blob).unwrap_err();
         assert!(matches!(err, LogSegError::Corrupted(_)), "got {err:?}");
+    }
+
+    fn corrupted_message(err: LogSegError) -> String {
+        match err {
+            LogSegError::Corrupted(msg) => msg,
+            other => panic!("expected Corrupted, got {other:?}"),
+        }
+    }
+
+    /// `stream_attr_pairs` refuses `blob` with exactly the error
+    /// `decode_stream_attrs` returns for it.
+    fn assert_both_refuse(blob: &[u8]) {
+        let want = corrupted_message(decode_stream_attrs(blob).expect_err("decode_stream_attrs"));
+        let got = corrupted_message(
+            crate::reader::stream_attr_pairs(blob)
+                .expect_err("stream_attr_pairs must refuse what decode_stream_attrs refuses"),
+        );
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn stream_attr_pairs_refuses_a_non_utf8_scope_name() {
+        let blob = stream_attrs_bytes_raw_scope(&resource(), b"sc\xff", b"1", &scope_attrs());
+        assert_both_refuse(&blob);
+    }
+
+    #[test]
+    fn stream_attr_pairs_refuses_a_non_utf8_scope_version() {
+        let blob = stream_attrs_bytes_raw_scope(&resource(), b"sc", b"1\xc3", &scope_attrs());
+        assert_both_refuse(&blob);
     }
 
     fn arb_value() -> impl Strategy<Value = AttrValue> {
