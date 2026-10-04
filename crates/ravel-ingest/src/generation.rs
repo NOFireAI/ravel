@@ -47,6 +47,11 @@
 //! open and the switch starts one background re-read of the record. A drain
 //! waits for that re-read instead ([`reread_and_check`]), so one drain flushes
 //! every buffer whose view the re-read confirms.
+//!
+//! The same check hands rows back when the hour is owned by a generation that
+//! routes at another count (issue #2429): a flush writes only in hours its
+//! routing generation can own, so every hour a pushdown split treats as one
+//! generation's holds each key at that generation's index.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -58,7 +63,7 @@ use std::time::Duration;
 use prost::Message;
 use ravel_catalog::{
     DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, active_shard_count, provisioning_key,
-    read_generations_checked, scan_count,
+    read_generations_checked, scan_count, stable_generation_for_hour,
 };
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_proto::sys::v1 as sysproto;
@@ -145,12 +150,53 @@ pub struct GenerationLoadError;
 pub(crate) enum ScanCheck {
     /// The shard index is inside the scan set of the hour: write in place.
     InScanSet,
-    /// The shard index is outside it. Write nothing under it and hand the rows
-    /// back to the `active_count`-shard set, the tenant's current generation.
-    HandBack { scan_count: u32, active_count: u32 },
+    /// Write nothing under this shard index and hand the rows back to the
+    /// `target_count`-shard set, for `reason`.
+    HandBack {
+        scan_count: u32,
+        target_count: u32,
+        reason: HandBackReason,
+    },
     /// No view this router can trust for the hour: do not open the flush.
     Unknown,
 }
+
+/// Why a flush hands its rows back instead of writing them (ADR-1642 scan-set
+/// amendment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandBackReason {
+    /// The shard index is outside the scan set of the hour, after a decrease.
+    /// The rows go to the count active at the flush-open reading.
+    RetiredIndex,
+    /// The index is inside the scan set, but the hour is owned alone by a
+    /// generation that routes at another count (issue #2429). The rows go to
+    /// the owner's count, so each lands at the index the owner routes it to.
+    GenerationMismatch,
+}
+
+impl HandBackReason {
+    /// The value of the `reason` label this hand-back is counted under.
+    pub fn label(self) -> &'static str {
+        match self {
+            HandBackReason::RetiredIndex => "retired_index",
+            HandBackReason::GenerationMismatch => "generation_mismatch",
+        }
+    }
+
+    /// The `Abandoned` message a strict waiter on the handed-back buffer gets.
+    pub(crate) fn abandoned_message(self) -> &'static str {
+        match self {
+            HandBackReason::RetiredIndex => SCAN_SET_HANDBACK_ABANDONED,
+            HandBackReason::GenerationMismatch => GENERATION_HANDBACK_ABANDONED,
+        }
+    }
+}
+
+/// The `Abandoned` message for a [`HandBackReason::GenerationMismatch`]
+/// hand-back, the counterpart of [`SCAN_SET_HANDBACK_ABANDONED`].
+pub(crate) const GENERATION_HANDBACK_ABANDONED: &str = "strict ack withheld: the flush \
+     would have written rows routed under one shard generation into an ingest hour another \
+     generation owns; its rows were handed to that generation's shards and are written there";
 
 /// The `Abandoned` message a strict waiter gets when its buffer is handed back
 /// at flush open. Its rows are written, by a shard of the current generation,
@@ -205,9 +251,25 @@ pub(crate) trait FlushScope<M>: Send + Sync {
     fn check(&self, tenant: TenantHash, shard: u32, hour: u32, now_ns: i64) -> ScanCheck;
     /// The live mailbox of shard `shard` in the `count`-shard set.
     fn live_sender(&self, count: u32, shard: u32) -> Option<mpsc::Sender<M>>;
+    /// Whether a hand-back to the `count`-shard set may wait for room in the
+    /// target's mailbox. Only a strictly smaller set than this actor's may be
+    /// awaited, so the waits between sets form no cycle; a hand-back to any
+    /// other set sends only if the mailbox has room now.
+    fn may_wait_on(&self, count: u32) -> bool;
     /// Re-read the tenant's provisioning record, joining a read already in
     /// flight. Resolves `true` once a read succeeded and its view is installed.
     fn reread(&self, tenant: TenantHash) -> Reread;
+}
+
+/// Sends one hand-back message, awaiting room in the target's mailbox only
+/// when `wait` is set ([`FlushScope::may_wait_on`]). A closed or, without
+/// `wait`, full mailbox returns the message.
+pub(crate) async fn send_hand_back<M>(tx: &mpsc::Sender<M>, msg: M, wait: bool) -> Result<(), M> {
+    if wait {
+        tx.send(msg).await.map_err(|err| err.0)
+    } else {
+        tx.try_send(msg).map_err(|err| err.into_inner())
+    }
 }
 
 /// A pending [`FlushScope::reread`].
@@ -250,16 +312,19 @@ pub(crate) async fn reread_and_check<M>(
     verdict
 }
 
-/// The production [`FlushScope`]: a weak reference to the router's switch, so
-/// an actor never keeps its router's shard sets (and with them every actor's
-/// mailbox) alive after the router is dropped.
+/// The production [`FlushScope`] of one shard-actor set: a weak reference to
+/// the router's switch, so an actor never keeps its router's shard sets (and
+/// with them every actor's mailbox) alive after the router is dropped, and the
+/// shard count of the set, which is what identifies the generation that routed
+/// its rows.
 pub(crate) struct SwitchScope<H> {
     switch: Weak<GenerationSwitch<H>>,
+    count: u32,
 }
 
 impl<H> SwitchScope<H> {
-    pub(crate) fn new(switch: Weak<GenerationSwitch<H>>) -> Self {
-        SwitchScope { switch }
+    pub(crate) fn new(switch: Weak<GenerationSwitch<H>>, count: u32) -> Self {
+        SwitchScope { switch, count }
     }
 }
 
@@ -270,7 +335,7 @@ where
 {
     fn check(&self, tenant: TenantHash, shard: u32, hour: u32, now_ns: i64) -> ScanCheck {
         match self.switch.upgrade() {
-            Some(switch) => switch.scan_check(tenant, shard, hour, now_ns),
+            Some(switch) => switch.scan_check(tenant, self.count, shard, hour, now_ns),
             None => ScanCheck::Unknown,
         }
     }
@@ -279,6 +344,10 @@ where
         let switch = self.switch.upgrade()?;
         let set = switch.set_for_count(count);
         set.get(shard as usize)?.live_sender()
+    }
+
+    fn may_wait_on(&self, count: u32) -> bool {
+        count < self.count
     }
 
     fn reread(&self, tenant: TenantHash) -> Reread {
@@ -302,6 +371,10 @@ impl<M> FlushScope<M> for AlwaysInScope {
 
     fn live_sender(&self, _count: u32, _shard: u32) -> Option<mpsc::Sender<M>> {
         None
+    }
+
+    fn may_wait_on(&self, _count: u32) -> bool {
+        true
     }
 
     fn reread(&self, _tenant: TenantHash) -> Reread {
@@ -345,6 +418,10 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    fn may_wait_on(&self, _count: u32) -> bool {
+        true
     }
 
     fn reread(&self, _tenant: TenantHash) -> Reread {
@@ -656,8 +733,9 @@ impl<H> GenerationSwitch<H> {
 
 impl<H: Send + Sync + 'static> GenerationSwitch<H> {
     /// The scan-set check at flush open (ADR-1642 scan-set amendment): whether
-    /// shard `shard` may write a flush of `tenant` that is about to pin ingest
-    /// hour `hour`, by the read side's own rule, `ravel_catalog::scan_count`
+    /// shard `shard` of the `count`-shard set may write a flush of `tenant`
+    /// that is about to pin ingest hour `hour`, by the read side's own rules,
+    /// `ravel_catalog::scan_count` and `ravel_catalog::stable_generation_for_hour`
     /// with [`DEFAULT_SCAN_SLACK_HOURS`].
     ///
     /// The cached view is trusted for `hour` only before [`trust_horizon`], the
@@ -670,9 +748,21 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
     /// generation activated by `now_ns` stays in the scan set of every later
     /// hour until `S` hours past its successor; a view that claimed otherwise
     /// is treated as untrusted rather than handed a loop.
+    ///
+    /// An index inside the scan set is still handed back, with
+    /// [`HandBackReason::GenerationMismatch`], when one generation owns `hour`
+    /// alone and routes at a count other than `count` (issue #2429): written
+    /// in place, its rows would sit at indices the owner does not route them
+    /// to, in an hour a pushdown split treats as the owner's. The rows go to
+    /// the owner's set, whose own check passes them. The generation that
+    /// routed the rows is identified by `count`, since the sets are keyed by
+    /// count and two generations with one count route every row alike. An
+    /// hour no single generation owns, the overlap after an activation, writes
+    /// in place as the scan set allows.
     pub(crate) fn scan_check(
         self: &Arc<Self>,
         tenant: TenantHash,
+        count: u32,
         shard: u32,
         hour: u32,
         now_ns: i64,
@@ -685,12 +775,26 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
                 {
                     let scan = scan_count(&view.generations, hour, DEFAULT_SCAN_SLACK_HOURS);
                     let active = active_shard_count(&view.generations, hour_of(now_ns));
+                    let owner =
+                        stable_generation_for_hour(&view.generations, hour, DEFAULT_SCAN_SLACK_HOURS)
+                            .and_then(|owner| {
+                                view.generations.iter().find(|g| g.generation == owner)
+                            })
+                            .map(|owner| owner.shard_count);
                     if shard < scan {
-                        ScanCheck::InScanSet
+                        match owner {
+                            Some(owner) if owner != count => ScanCheck::HandBack {
+                                scan_count: scan,
+                                target_count: owner,
+                                reason: HandBackReason::GenerationMismatch,
+                            },
+                            _ => ScanCheck::InScanSet,
+                        }
                     } else if active <= shard {
                         ScanCheck::HandBack {
                             scan_count: scan,
-                            active_count: active,
+                            target_count: active,
+                            reason: HandBackReason::RetiredIndex,
                         }
                     } else {
                         ScanCheck::Unknown
@@ -1121,37 +1225,128 @@ mod tests {
     /// The flush-open check against a 4 to 3 decrease activating at hour 100,
     /// on a view refreshed at hour 102 (trusted before hour 104): the retired
     /// index 3 is in the scan set through hour 102 (`S` = 3), handed back to
-    /// the 3-shard set from hour 103, an index the successor covers is never
-    /// handed back, and an hour past the trust horizon or a tenant with no
-    /// view is unknown.
+    /// the 3-shard set from hour 103, and an hour past the trust horizon or a
+    /// tenant with no view is unknown. An index the successor covers writes in
+    /// place through the overlap, hours 100 to 102, and from hour 103, which
+    /// the 3-shard generation owns alone, a 4-shard flush on it is handed back
+    /// to the owner while a 3-shard flush on it writes in place.
     #[test]
     fn scan_check_follows_the_read_side_rule_inside_the_trust_horizon() {
         let sw = Arc::new(index_switch(4, DEFAULT_REFRESH_INTERVAL_NS));
         let t = tenant(9);
         sw.refresh(t, vec![gen0(4), gen1(3, 100)], 102 * NS_PER_HOUR);
         assert_eq!(
-            sw.scan_check(t, 3, 102, 102 * NS_PER_HOUR),
+            sw.scan_check(t, 4, 3, 102, 102 * NS_PER_HOUR),
             ScanCheck::InScanSet
         );
         assert_eq!(
-            sw.scan_check(t, 3, 103, 103 * NS_PER_HOUR),
+            sw.scan_check(t, 4, 3, 103, 103 * NS_PER_HOUR),
             ScanCheck::HandBack {
                 scan_count: 3,
-                active_count: 3
+                target_count: 3,
+                reason: HandBackReason::RetiredIndex,
+            }
+        );
+        for hour in 100..=102 {
+            assert_eq!(
+                sw.scan_check(t, 4, 2, hour, 102 * NS_PER_HOUR),
+                ScanCheck::InScanSet,
+                "hour {hour} is inside the activation overlap"
+            );
+        }
+        assert_eq!(
+            sw.scan_check(t, 4, 2, 103, 103 * NS_PER_HOUR),
+            ScanCheck::HandBack {
+                scan_count: 3,
+                target_count: 3,
+                reason: HandBackReason::GenerationMismatch,
             }
         );
         assert_eq!(
-            sw.scan_check(t, 2, 103, 103 * NS_PER_HOUR),
+            sw.scan_check(t, 3, 2, 103, 103 * NS_PER_HOUR),
             ScanCheck::InScanSet
         );
         assert_eq!(
-            sw.scan_check(t, 3, 104, 104 * NS_PER_HOUR),
+            sw.scan_check(t, 4, 3, 104, 104 * NS_PER_HOUR),
             ScanCheck::Unknown
         );
         assert_eq!(
-            sw.scan_check(tenant(10), 0, 102, 102 * NS_PER_HOUR),
+            sw.scan_check(tenant(10), 4, 0, 102, 102 * NS_PER_HOUR),
             ScanCheck::Unknown
         );
+    }
+
+    /// The generation-mismatch hand-back compares shard counts: after 4 to 3
+    /// to 4, an hour the second 4-shard generation owns alone takes a flush of
+    /// the first generation's 4-shard set in place, since both route every row
+    /// alike. On an increase, 3 to 4, a 3-shard flush into an hour the 4-shard
+    /// generation owns is handed back up to the 4-shard set, and before the
+    /// increase an hour generation 0 owns takes it in place.
+    #[test]
+    fn generation_mismatch_compares_the_routing_count() {
+        let sw = Arc::new(index_switch(4, DEFAULT_REFRESH_INTERVAL_NS));
+        let t = tenant(11);
+        let history = vec![
+            gen0(4),
+            gen1(3, 100),
+            ShardGeneration {
+                generation: 2,
+                shard_count: 4,
+                activation_hour: 110,
+                appended_unix_ns: 0,
+            },
+        ];
+        sw.refresh(t, history, 114 * NS_PER_HOUR);
+        assert_eq!(
+            sw.scan_check(t, 4, 1, 114, 114 * NS_PER_HOUR),
+            ScanCheck::InScanSet
+        );
+        assert_eq!(
+            sw.scan_check(t, 3, 1, 114, 114 * NS_PER_HOUR),
+            ScanCheck::HandBack {
+                scan_count: 4,
+                target_count: 4,
+                reason: HandBackReason::GenerationMismatch,
+            }
+        );
+
+        let up = tenant(12);
+        sw.refresh(up, vec![gen0(3), gen1(4, 100)], 103 * NS_PER_HOUR);
+        assert_eq!(
+            sw.scan_check(up, 3, 2, 103, 103 * NS_PER_HOUR),
+            ScanCheck::HandBack {
+                scan_count: 4,
+                target_count: 4,
+                reason: HandBackReason::GenerationMismatch,
+            }
+        );
+        assert_eq!(
+            sw.scan_check(up, 3, 2, 99, 103 * NS_PER_HOUR),
+            ScanCheck::InScanSet
+        );
+    }
+
+    /// Only a strictly smaller set is awaited by a hand-back, and a send that
+    /// may not wait returns the message when the mailbox is full.
+    #[tokio::test]
+    async fn a_hand_back_waits_only_on_a_smaller_set() {
+        struct NoSender;
+        impl LiveSender<()> for NoSender {
+            fn live_sender(&self) -> Option<mpsc::Sender<()>> {
+                None
+            }
+        }
+        let scope = SwitchScope::<NoSender>::new(Weak::new(), 4);
+        assert!(FlushScope::<()>::may_wait_on(&scope, 3));
+        assert!(!FlushScope::<()>::may_wait_on(&scope, 4));
+        assert!(!FlushScope::<()>::may_wait_on(&scope, 5));
+
+        let (tx, mut rx) = mpsc::channel::<u32>(1);
+        assert_eq!(send_hand_back(&tx, 1, false).await, Ok(()));
+        assert_eq!(send_hand_back(&tx, 2, false).await, Err(2));
+        assert_eq!(rx.recv().await, Some(1));
+        drop(rx);
+        assert_eq!(send_hand_back(&tx, 3, true).await, Err(3));
     }
 
     /// Handed-back rows widen the receiving buffer's arrival bookkeeping in

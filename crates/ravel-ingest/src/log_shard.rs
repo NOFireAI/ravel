@@ -69,7 +69,7 @@ use crate::config::{
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::generation::{
-    FlushScope, HandBackArrival, SCAN_SET_HANDBACK_ABANDONED, ScanCheck, reread_and_check,
+    FlushScope, HandBackArrival, HandBackReason, ScanCheck, reread_and_check, send_hand_back,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -1437,12 +1437,14 @@ impl LogShardActor {
     /// `Abandoned` and a clone of every charge to each target. Columnar batches
     /// are re-partitioned by the same rule the router's columnar path uses. A
     /// failed send returns its records and charges to this shard's buffer, as
-    /// in the metrics actor. Returns whether any target took records.
+    /// in the metrics actor, and so does a full mailbox on a send that may
+    /// not wait. Returns whether any target took records.
     async fn hand_back(
         &mut self,
         tenant: &TenantId,
         mut buf: LogTenantBuf,
         count: u32,
+        reason: HandBackReason,
     ) -> Result<bool, LogTenantBuf> {
         let mut targets: Vec<u32> = match &buf.content {
             BufContent::Empty => Vec::new(),
@@ -1472,7 +1474,7 @@ impl LogShardActor {
         let waiters = std::mem::take(&mut buf.waiters);
         self.ctx.ack_waiters(
             waiters,
-            Err(LogWriteError::Abandoned(SCAN_SET_HANDBACK_ABANDONED.into())),
+            Err(LogWriteError::Abandoned(reason.abandoned_message().into())),
         );
         let LogTenantBuf {
             content,
@@ -1516,6 +1518,7 @@ impl LogShardActor {
                 }
             }
         }
+        let wait = self.scope.may_wait_on(count);
         let mut delivered = false;
         let mut kept = false;
         for (target, tx) in targets.into_iter().zip(senders) {
@@ -1528,7 +1531,7 @@ impl LogShardActor {
                 charges: charges.clone(),
                 arrival,
             };
-            let Err(mpsc::error::SendError(msg)) = tx.send(msg).await else {
+            let Err(msg) = send_hand_back(&tx, msg, wait).await else {
                 delivered = true;
                 continue;
             };
@@ -1555,7 +1558,8 @@ impl LogShardActor {
                     target,
                     tenant_hash = %tenant.hash().to_hex(),
                     "ravel-ingest: hand-back target log shard closed before its records \
-                     arrived; keeping them in this shard's buffer for the next flush to retry"
+                     arrived, or its mailbox was full on a send that may not wait; keeping \
+                     them in this shard's buffer for the next flush to retry"
                 );
             }
             kept = true;
@@ -2172,7 +2176,8 @@ impl LogShardActor {
             }
         };
         // ADR-1642 scan-set amendment: write under this shard index only if
-        // the read side scans it for the hour this flush is about to pin.
+        // the read side scans it for the hour this flush is about to pin, and
+        // no other generation owns that hour alone (issue #2429).
         let buf = match self
             .scan_check(tenant_hash, ingest_hour_bucket, raw_ns)
             .await
@@ -2183,24 +2188,42 @@ impl LogShardActor {
             }
             ScanCheck::HandBack {
                 scan_count,
-                active_count,
-            } => match self.hand_back(&tenant, buf, active_count).await {
+                target_count,
+                reason,
+            } => match self.hand_back(&tenant, buf, target_count, reason).await {
                 Ok(delivered) => {
                     if delivered {
-                        self.metrics.record_rerouted_flush();
+                        self.metrics.record_rerouted_flush(reason);
                         if !std::mem::replace(&mut self.handing_back, true) {
                             tracing::warn!(
                                 signal = ?Signal::Logs,
                                 shard = self.shard,
                                 ingest_hour_bucket,
                                 scan_count,
-                                active_count,
+                                target_count,
+                                reason = reason.label(),
                                 "ravel-ingest: flush would write outside the read-side scan set \
-                                 of its ingest hour; handing its rows to the current shard generation"
+                                 of its ingest hour, or into an hour another shard generation \
+                                 owns; handing its rows to that hour's shard generation"
                             );
                         }
                     }
                     return;
+                }
+                Err(buf) if reason == HandBackReason::GenerationMismatch
+                    && !matches!(lag_check, LagCheck::Enforced) =>
+                {
+                    tracing::warn!(
+                        signal = ?Signal::Logs,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        target_count,
+                        "ravel-ingest: teardown bypass pass: writing a flush in place in an \
+                         ingest hour another shard generation owns, because a hand-back target \
+                         shard is dead or condemned; every query finds the records"
+                    );
+                    buf
                 }
                 Err(mut buf) => {
                     buf.stale_view_counted = false;
@@ -2212,7 +2235,7 @@ impl LogShardActor {
                                 shard = self.shard,
                                 tenant_hash = %tenant_hash.to_hex(),
                                 ingest_hour_bucket,
-                                active_count,
+                                target_count,
                                 "ravel-ingest: a hand-back target log shard of the tenant's \
                                  current generation is dead or condemned; keeping the records in \
                                  this shard's buffer, where they stay until a target is live or \
@@ -2229,7 +2252,7 @@ impl LogShardActor {
                         tenant_hash = %tenant_hash.to_hex(),
                         ingest_hour_bucket,
                         scan_count,
-                        active_count,
+                        target_count,
                         "ravel-ingest: teardown bypass pass: writing a flush in place under a \
                          shard index readers do not scan for its ingest hour, because a \
                          hand-back target shard is dead or condemned; the records are stored \
@@ -4043,7 +4066,8 @@ mod tests {
 
     const HAND_BACK: ScanCheck = ScanCheck::HandBack {
         scan_count: 3,
-        active_count: 2,
+        target_count: 2,
+        reason: HandBackReason::RetiredIndex,
     };
 
     impl HandBackRig {

@@ -177,7 +177,7 @@ impl Pipe for IngestRouter {
         Counters {
             buffered: snap.buffered_points_total,
             rerouted: snap.rerouted_flushes,
-            rerouted_generation_mismatch: 0,
+            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
             stale: snap.stale_provisioning_flushes,
             deferred: self
                 .metrics()
@@ -284,7 +284,7 @@ impl Pipe for LogIngestRouter {
         Counters {
             buffered: snap.buffered_records_total,
             rerouted: snap.rerouted_flushes,
-            rerouted_generation_mismatch: 0,
+            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
             stale: snap.stale_provisioning_flushes,
             deferred: self
                 .metrics()
@@ -361,7 +361,7 @@ impl Pipe for SpanIngestRouter {
         Counters {
             buffered: snap.buffered_spans_total,
             rerouted: snap.rerouted_flushes,
-            rerouted_generation_mismatch: 0,
+            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
             stale: snap.stale_provisioning_flushes,
             deferred: self
                 .metrics()

@@ -50,7 +50,7 @@ pub use config::{
     buffer_memory_backstop_bytes, plausible_ingest_clock,
 };
 pub use error::WriteError;
-pub use generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, Routed};
+pub use generation::{DEFAULT_REFRESH_INTERVAL_NS, GenerationSwitch, HandBackReason, Routed};
 pub use idempotency::{
     IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS, IdempotencyReceipt, LookupOutcome, MARKER_SUFFIX,
     MarkerError, MarkerLookupError, MarkerWriteError, WriteOutcome, decode_marker,
