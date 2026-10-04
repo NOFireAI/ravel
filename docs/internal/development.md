@@ -72,9 +72,12 @@ jobs then do not each recompile the overlapping crates from scratch.
 - Tests run under `cargo nextest run` (installed via
   `taiki-e/install-action@nextest`) instead of `cargo test`, for faster
   parallel execution and clearer output.
-- The four jobs that reclaim runner disk before compiling share one
-  composite action, `.github/actions/free-disk-space`, instead of copying
-  the same shell block.
+- The jobs that reclaim runner disk before compiling share one composite
+  action, `.github/actions/free-disk-space`, instead of copying the same
+  shell block. A lane that pulls no container image passes
+  `background: "true"`: the SDK directories are deleted in a detached
+  process, the image prune is skipped, and the job does not wait. Those
+  lanes end with a `df -h /` step that records their peak disk usage.
 
 You do not need sccache or nextest on your machine. `cargo check` and the gate
 list above are enough for the local loop.
