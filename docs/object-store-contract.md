@@ -158,7 +158,7 @@ Cost of the split, in requests and wire bytes as transferred, excluding
 | Object size | Requests | Wire bytes |
 |---|---|---|
 | 0 .. bound | 1, unranged | the object |
-| above the bound | `ceil(size / bound)`: the unranged first, cut at the bound, then ranged ones up to 4 in flight | the object, plus one response header set per additional request, plus whatever the endpoint had already sent of the abandoned first body when its connection was dropped |
+| above the bound | `ceil(size / bound)`: the unranged first, cut at the bound, then ranged ones up to 4 in flight (no more than the read's permits under a scheduled handle, below) | the object, plus one response header set per additional request, plus whatever the endpoint had already sent of the abandoned first body when its connection was dropped |
 
 The ranges start where the cut first body stopped and partition the rest of the
 object, so no byte is read twice. Dropping the unread remainder of the first
@@ -169,6 +169,24 @@ request after the first carries the first's ETag as an `If-Match`, so an object
 overwritten mid-read fails the read (retryable) rather than splicing two
 versions together; data objects are immutable, and the mutable pointer keys are
 all far below the bound, so this is a guard rather than a live path.
+
+Through a scheduled `ClassedStore` handle (`--store-scheduling`), where one
+permit stands for one request in flight, the handle's `get`, `get_pinned` and
+`get_with_pin` take one permit. The size, and so the fan-out, is unknown until
+the first response arrives, and most whole-object reads are that one request,
+so no extra permit is taken up front. Once the first response shows ranged
+requests remain, the read takes free permits of its class that admission
+grants right now, without waiting and never ahead of a waiting foreground
+acquire, until it holds one per remaining range or 4, whichever is fewer. It
+keeps those permits until it returns and no more ranged requests in flight
+than it holds
+(`s3_http_faults::scheduled_large_get_keeps_requests_within_its_permits`). A
+class with no spare permit fetches the ranges one at a time. A read that fits
+in one response, and a caller-supplied range or suffix of any size, holds one
+permit (`s3_http_faults::scheduled_small_and_ranged_gets_take_one_permit`).
+The cost is that a split read's extra permits are only those free at that
+moment: a read whose class has no free permit when its first response arrives
+fetches every range one at a time, even if permits free up during it.
 
 **Worst-case wall time for one logical operation.** A request timeout is a
 retryable error, and `object_store` runs its own internal retry loop

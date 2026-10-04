@@ -231,7 +231,8 @@ pub(crate) fn put_fan_out(len: usize, mode: &PutMode) -> usize {
 /// same value as [`MULTIPART_UPLOAD_CONCURRENCY`] on the write side: enough
 /// parallel connections that splitting a large read does not serialise its
 /// round trips, few enough that a query fetching many objects at once does not
-/// multiply its connection count by the chunk count of each.
+/// multiply its connection count by the chunk count of each. Under a scheduled
+/// handle the read keeps no more in flight than the permits it holds.
 const WHOLE_OBJECT_GET_CONCURRENCY: usize = 4;
 
 /// Transfer rate the per-request body bound is sized against: 5 Mbps
@@ -2374,7 +2375,10 @@ impl S3Store {
     /// **Cost.** An object at or below the chunk size is exactly one request,
     /// with no HEAD before it; above it, `ceil(size / chunk)` requests, the
     /// first being the truncated unranged one and the rest ranged, up to
-    /// [`WHOLE_OBJECT_GET_CONCURRENCY`] of them in flight. Wire bytes are the
+    /// [`WHOLE_OBJECT_GET_CONCURRENCY`] of them in flight, and no more than the
+    /// permits a scheduled handle's read holds once it has widened its budget
+    /// with the free ones ([`crate::scheduling`], "Ops that fan out"); the
+    /// truncated first request is always alone. Wire bytes are the
     /// object's size apart from one extra set of response headers per
     /// additional request and whatever the endpoint had already sent of the
     /// abandoned first body before the connection was dropped; neither figure
@@ -2444,6 +2448,13 @@ impl S3Store {
             // read of the old version instead of the failure documented above.
             None => Pin::etag(first.etag.clone()),
         };
+        // A scheduled handle admitted this read with one permit; the fan-out is
+        // known only now, so this is where it can take more.
+        let fan_out = ranges.len().min(WHOLE_OBJECT_GET_CONCURRENCY);
+        let concurrency = crate::scheduling::widen_request_budget(fan_out)
+            .map_or(WHOLE_OBJECT_GET_CONCURRENCY, |budget| {
+                budget.clamp(1, WHOLE_OBJECT_GET_CONCURRENCY)
+            });
         {
             let mut inflight = futures::stream::iter(ranges.into_iter().map(|range| {
                 self.get_one(
@@ -2453,7 +2464,7 @@ impl S3Store {
                     None,
                 )
             }))
-            .buffered(WHOLE_OBJECT_GET_CONCURRENCY);
+            .buffered(concurrency);
             while let Some(piece) = inflight.next().await {
                 let piece = piece.map_err(|e| match e {
                     // The `If-Match` failed: the object was overwritten between
