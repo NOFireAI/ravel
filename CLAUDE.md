@@ -84,17 +84,19 @@ cargo test -p <your-crate>        # plus --workspace when your change is cross-c
 ```
 
 Those do not cover `ravel-server`'s SQL and Flight SQL surfaces: both sit
-behind cargo features that are off by default. A crate-scoped run
-(`-p ravel-server`) compiles neither. A `--workspace` run that builds test
+behind cargo features that are off by default. `cargo test -p ravel-server`
+compiles neither. A `--workspace` run that builds test
 targets (`cargo clippy --workspace --all-targets`, `cargo test --workspace`,
 `cargo nextest run --workspace`) does compile the SQL surface, because
 `ravel-cli` has a dev-dependency on `ravel-server` with the `sql` feature and
 cargo unifies features across what it builds. A workspace run that builds no
 test targets does not: `cargo check --workspace` and `cargo build --workspace`
-leave dev-dependencies out, so they check `ravel-server` without `sql`. No
-workspace run compiles Flight SQL, and none builds `ravel-server` with `sql`
-selected on its own, without the dependency features the rest of the
-workspace adds. When your change touches
+leave dev-dependencies out, so they check `ravel-server` without `sql`. None
+of the three commands above compiles Flight SQL or the ravel-bench features,
+and none builds `ravel-server` with `sql` selected on its own, without the
+dependency features the rest of the workspace adds. (CI's `all-features` job
+type-checks every feature at once with clippy; it runs no tests and is not
+one of the local gates.) When your change touches
 `ravel-server`, `ravel-sql`, or `ravel-query`, add:
 
 ```sh
@@ -116,7 +118,8 @@ builds them as dependencies and cargo never compiles a dependency's
 `#[cfg(test)]` module, so their own gated tests run in neither. Do
 not skip them: a workspace gate can print "All gates passed" on a tree where
 a feature lane fails. For `flight-sql` and the ravel-bench features that is
-because no workspace run compiles them at all. For `sql` it is because the
+because the default workspace gate never compiles them. For `sql` it is
+because the
 workspace run builds `ravel-server` with the dependency features the rest of
 the workspace adds, so a break that only appears with `sql` selected on its
 own passes there.
