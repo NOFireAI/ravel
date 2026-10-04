@@ -6,65 +6,57 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.97.1-orange.svg)](rust-toolchain.toml)
 
-**The write is acknowledged when S3 has it. Not before.**
+**Ravel acknowledges a write when S3 has it.**
 
-Ravel is a database for OpenTelemetry metrics, logs, and traces where object
-storage is the only durable component. No write-ahead log. No replicated ingest
-quorum. No StatefulSet. Kill any Ravel process at any instant, and every
-strictly acknowledged write is still there.
+Ravel is a database for OpenTelemetry metrics, logs, and traces. Object
+storage is its only durable component: Ravel has no write-ahead log, no
+replicated ingest quorum, and no StatefulSet. You can kill any Ravel process
+at any instant, and every strictly acknowledged write is still there.
 
 ![Ingesting one sample under strict acknowledgement, SIGKILLing the ravel-server container, replacing it with a fresh one, and reading the pre-kill sample back by its commit token.](docs/demo.gif)
 
-Strict acknowledgement is the default. A request is acknowledged only after
+Strict acknowledgement is the default. Ravel acknowledges a request only after
 every batch its points contributed to has its data object durably stored and
-its commit record created, and the response carries one commit token per shard
-those points flushed through. After a strict acknowledgement, no crash of any
-Ravel process loses that data.
+its commit record created. The response carries one commit token per shard
+those points flushed through.
 
 Buffered acknowledgement is opt-in per request. It
 acknowledges after admission and enqueue to a shard actor, and it returns no
-commit token: it trades the guarantee above for write latency. A crash between
-that acknowledgement and the flush loses the buffered window. A flush whose own
-store calls exceed the flush lifetime budget is abandoned instead, dropping
-already-acknowledged rows with no crash at all.
+commit token. It gives up the crash guarantee of strict acknowledgement for
+lower write latency. A crash between that acknowledgement and the flush loses
+the buffered window. A flush whose store calls exceed the flush lifetime
+budget is abandoned, and it drops rows that are already acknowledged, with no
+crash.
+
 The [consistency model](docs/consistency-model.md) is normative for both
-modes.
+acknowledgement modes. [How Ravel is verified](#how-ravel-is-verified) lists
+the checks behind the durability guarantee.
 
-The durability protocols above are modeled in TLA+. TLC checked five finite
-models of the commit, catalog, lifecycle, resharding, and maintenance
-protocols, over one shared object-store model, under stated bounds and
-assumptions. Negative controls show that each invariant can fail. Every checked
-property traces to a Rust symbol and, for all but five recorded rows, a named
-test. The
-[formal verification guide](docs/guides/formal-verification.md) has the
-bounds, the assumptions, and the results.
+## The design trade
 
-## Why it is built this way
+Ravel writes to the object store first. An ingest shard builds an immutable
+columnar segment in memory, PUTs it, PUTs a commit record, and then answers
+the exporter. Pass the commit token from the response back to a query, and
+you read your own write with no listing race.
 
-Every self-hosted observability stack ends up storing data on object storage.
-Almost none of them start there. The common design buffers writes in a
-replicated ingest layer with local disks, then ships to object storage later.
-That is why running one means running a write-ahead log,
-PersistentVolumeClaims, replication factors, and rollout ordering.
-
-Ravel makes the object store the first stop. An ingest shard builds an immutable
-columnar segment in memory, PUTs it, PUTs a commit record, and only then answers
-the exporter. The response carries a commit token. Pass that token back to a
-query and you read your own write, with no listing race.
-
-The trade is explicit. You pay object-store latency on the write path, and you
-delete the entire replicated stateful layer. Ravel's job is to make that a good
-trade.
+The common design buffers writes in a replicated ingest layer with local
+disks and ships them to object storage later. To run that design, you run a
+write-ahead log, PersistentVolumeClaims, replication factors, and rollout
+ordering. With Ravel you operate none of that layer, and you pay object-store
+latency on the write path.
 
 ## Is Ravel a fit
 
-**What it is for.** Metrics, logs, and traces on any S3-compatible object store,
-with no stateful ingest layer to operate and no local disk in the durability
-path. A Prometheus-compatible query API, so existing Grafana dashboards work
-against it. Read-your-write on an object store: a strict acknowledgement hands
-back a commit token, and a query that carries the token back reads exactly that
-write. Multi-tenancy with per-tenant server-side encryption using a key
-management service (SSE-KMS), legal hold, and admission limits.
+**What it is for.**
+
+- Metrics, logs, and traces on any S3-compatible object store, with no
+  stateful ingest layer to operate and no local disk in the durability path.
+- A Prometheus-compatible query API, so existing Grafana dashboards work
+  against it.
+- Read-your-write on an object store. A strict acknowledgement returns a
+  commit token, and a query that carries the token reads that write.
+- Multi-tenancy with per-tenant server-side encryption using a key management
+  service (SSE-KMS), legal hold, and admission limits.
 
 **What it does not do.**
 
@@ -75,52 +67,60 @@ management service (SSE-KMS), legal hold, and admission limits.
   `ravel_log_lines` and `ravel_log_bytes` metric names (see
   [PromQL over logs](docs/guides/query.md#promql-over-logs)). Neither surface
   gets you LogQL, TraceQL, a trace-by-ID endpoint, or a Jaeger or Tempo API.
-- Profiles are a reserved object-key prefix only. No ingest, no query.
+- Profiles have a reserved object-key prefix only. No path ingests or queries
+  them.
 - Exemplars are stored from the OpenTelemetry Protocol (OTLP) only. Remote Write
   and OTAP decode exemplars and then discard them.
 - Distributed read fan-out is off unless `--distributed-query` and
   `--fragment-key-file` are both given. The PromQL lane and the SQL lane (on
   the Flight SQL service) are both in the published image.
 
-**Who should wait.** If your dashboards range over months of high-cardinality
-metrics, the missing downsampled storage will cost you on every panel. If your
-logs workflow depends on LogQL's line-pipeline browsing style, or your traces
-workflow depends on TraceQL or the Jaeger UI, there is nothing here to point
-them at; a Grafana Prometheus datasource can already chart log volume and
-error rate against Ravel through PromQL, and filter the lines it counts by
-body text, but it cannot browse the lines themselves. Reading log lines is
-SQL's job. If you need write acknowledgement in single-digit milliseconds, strict
-mode pays an object-store round trip and buffered mode gives up the crash guarantee
-above. Ravel is pre-1.0, and until v1.0 ships it may break backward
-compatibility: the persistent formats are versioned contracts, but a version
-change before v1.0 retires the old one rather than keeping it readable, and the
-surfaces around them still move. A bulk data-object format bump (RSEG, RLOG,
-RSPAN) is therefore a non-rollbackable, forward-only data-migration event: the
-reader admits one on-object version at a time, so once data is written at a new
-version, a build that predates the bump cannot read it, and objects left at the
-retired version are wiped or re-ingested. The other persistent
-formats do not work this way: rebuildable fold outputs and the additive,
-field-number-frozen records evolve without a one-way step. The two-version
-reader window that makes an upgrade reversible across one version boundary
-opens at v1.0, so treat a format upgrade as one-way until then. See the
-segment, log, and span format specs for the exact posture.
+**Who should wait.** Wait if one of these describes you:
+
+- Your dashboards range over months of high-cardinality metrics. The missing
+  downsampled storage costs you on every panel.
+- Your logs workflow depends on the line-pipeline browsing style of LogQL, or
+  your traces workflow depends on TraceQL or the Jaeger UI. Ravel has nothing
+  to point them at. A Grafana Prometheus datasource can chart log volume and
+  error rate against Ravel through PromQL, and it can filter the lines it
+  counts by body text. It cannot browse the lines. To read log lines, use SQL.
+- You need write acknowledgement in single-digit milliseconds. Strict
+  acknowledgement pays an object-store round trip, and buffered
+  acknowledgement gives up the crash guarantee.
+
+**Before v1.0.** Ravel is pre-1.0, and until v1.0 ships it can break backward
+compatibility. The persistent formats are versioned contracts. Before v1.0, a
+version change retires the old version and does not keep it readable, and the
+surfaces around the formats still move.
+
+A version change of a bulk data-object format (RSEG, RLOG, RSPAN) is a
+forward-only data migration that you cannot roll back:
+
+- The reader admits one on-object version at a time.
+- After data is written at a new version, a build that predates the change
+  cannot read it.
+- Objects left at the retired version are wiped or re-ingested.
+
+The other persistent formats evolve without a one-way step. They are the
+rebuildable fold outputs and the additive records with frozen field numbers.
+The two-version reader window, which makes an upgrade reversible across one
+version boundary, opens at v1.0. Until then, treat a format upgrade as
+one-way. The [RSEG](docs/segment-format.md), [RLOG](docs/log-segment-format.md),
+and [RSPAN](docs/span-segment-format.md) specs state the posture of each
+format.
 
 ## What works
 
-Ravel ingests OTLP natively and answers PromQL and SQL. Everything below is
-either in the published container image or behind a named cargo feature, and the
+Ravel ingests OTLP natively and answers PromQL and SQL. Each surface below is
+in the published container image or behind a named cargo feature, and the
 matrix says which.
 
-The matrix describes `main`, not a release. Its "In published image" column
-means the surface is compiled into the image built from `main`, so a surface
-that lands after the tag the quickstart pins is not yet in the image you get by
-following the quickstart. Every entry below is in the pinned `0.22.0` image;
-`git log v0.22.0..main` is what tells you whether that is still true after the
-next feature lands, and `CHANGELOG.md` records which release each surface first
-shipped in. Two entries missed the previous pinned tag this way: the `alerts`
-and `audit` SQL tables were registered, and PromQL over logs was answered, only
-after `0.13.0` was cut, so a reader following the README against that image got
-a missing table and an empty vector.
+The matrix describes `main`. Its "In published image" column means that the
+image built from `main` compiles the surface in. A surface that lands after
+the tag that the quickstart pins is not yet in the quickstart image. Every
+entry below is in the pinned `0.22.0` image. After the next feature lands,
+`git log v0.22.0..main` tells you whether that is still true. `CHANGELOG.md`
+records the release that each surface first shipped in.
 
 <!-- BEGIN SUPPORT MATRIX -->
 
@@ -136,28 +136,25 @@ a missing table and an empty vector.
 
 <!-- END SUPPORT MATRIX -->
 
-No crate in the workspace declares a default feature set, so `sql`,
-`flight-sql`, and `otap` are off in any build that does not ask for them. The
-published `ravel-server` image is built with `--features sql,flight-sql,otap`,
-so all three are compiled in. `POST /api/v1/sql` and Flight SQL answer as soon
-as the server is up; Flight SQL is a gRPC service on the gRPC listener, runs
-ad-hoc statements, and returns `unimplemented` for prepared statements. OTAP
-ingest is registered only when the process is started with `--otap`
-([docs/otap-ingest.md](docs/otap-ingest.md)). A source build gets the same
-surfaces by passing the same `--features` list to cargo.
+The published `ravel-server` image is built with
+`--features sql,flight-sql,otap`. No crate in the workspace declares a default
+feature set, so a source build gets the same surfaces only when you pass the
+same `--features` list to cargo.
 
-Exactly five SQL tables are registered: `samples`, `logs`, `spans`, `alerts`,
-and `audit`. SQL is the only way to query traces, alerts, and audit records.
-Logs are also queryable over PromQL, as `ravel_log_lines` and
-`ravel_log_bytes`.
+- `POST /api/v1/sql` and Flight SQL answer as soon as the server is up.
+- Flight SQL is a gRPC service on the gRPC listener. It runs ad-hoc statements
+  and returns `unimplemented` for prepared statements.
+- OTAP ingest is registered only when the process starts with `--otap`
+  ([docs/otap-ingest.md](docs/otap-ingest.md)).
+- SQL is the only way to query traces, alerts, and audit records.
 
-A tenant can also query Parquet tables: Parquet files read in place, in an S3,
-GCS or Azure location an operator granted the tenant with
-`ravel-cli tenant parquet-grant add`, through a credential profile from the
-file `ravel-server --parquet-profiles` names. A statement reads only Parquet
-tables or one of the five tables above, never both, and a table reads exactly
-the file versions it was defined over. A caller with the `ddl` capability,
-which is absent by default, creates a table with
+A tenant can also query Parquet tables. These are Parquet files read in place,
+in an S3, GCS or Azure location that an operator granted the tenant with
+`ravel-cli tenant parquet-grant add`. The read goes through a credential
+profile from the file that `ravel-server --parquet-profiles` names. A
+statement reads only Parquet tables or one of the five tables above, never
+both. A table reads only the file versions it was defined over. A caller with
+the `ddl` capability, which is absent by default, creates a table with
 `CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION '...'` and removes it
 with `DROP TABLE` (see the [query guide](docs/guides/query.md)). Such a table
 is queried by name:
@@ -166,66 +163,49 @@ is queried by name:
 SELECT URL, count(*) AS c FROM hits WHERE CounterID = 62 GROUP BY URL ORDER BY c DESC LIMIT 10
 ```
 
-The `samples` table has a `Float64` `value` column and nothing that can hold a
-native histogram, so a histogram sample is not a row there and `SELECT count(*)
-FROM samples` counts scalar samples only. A JSON response whose query met
-excluded histogram data carries a top-level `warnings` array saying so; query
+The `samples` table has no column that can hold a native histogram. Query
 native histograms over PromQL. See the
 [query guide](docs/guides/query.md#sql-over-samples-logs-and-spans).
 
 Also live:
 
-- A Prometheus-compatible HTTP API, so existing Grafana dashboards work.
-  `/api/v1/metadata` returns real per-metric type, help, and unit for metrics
-  whose ingest carried that metadata, and OTLP metric names get the standard
-  Prometheus-style unit and `_total` suffixes at ingest (a monotonic `foo` with
-  `unit: "By"` lands as `foo_bytes_total`), so the same metric matches whether
-  it arrives over OTLP or through a collector's Prometheus exporter.
-- Exemplars that link a metric sample to its trace.
+- `/api/v1/metadata` returns per-metric type, help, and unit for metrics whose
+  ingest carried that metadata. OTLP metric names get the standard
+  Prometheus-style unit and `_total` suffixes at ingest. See
+  [metric metadata](docs/guides/ingest.md#metric-metadata-and-otlp-name-suffixing).
+- Exemplars that link a metric sample to its trace
+  ([correlation guide](docs/guides/correlation.md)).
 - Alert rules whose every transition is written to object storage as immutable
-  data, and readable back through the `alerts` SQL table.
+  data, and readable back through the `alerts` SQL table
+  ([alerting guide](docs/guides/alerting.md)).
 - An analytics endpoint for change point detection and summary statistics.
 - Compaction, age-based retention, and garbage collection for metrics, logs,
   and spans, with audit compacted and retained on its own separate schedule.
   Alert transitions have no maintenance path yet.
-- A Kubernetes operator with a `RavelCluster` custom resource.
+- A Kubernetes operator with a `RavelCluster` custom resource. The
+  [Kubernetes guide](docs/guides/kubernetes.md) runs the ingest and query
+  round trip on a local `kind` cluster.
 - Per-tenant typed attribute columns on the `logs` SQL table, so typed
-  comparisons and aggregates need no `CAST` over the stringified `attrs` map.
-  See the [query guide](docs/guides/query.md). A tenant's config record can
-  also carry a clustering key and a bloom scope, which
-  `ravel-cli clustering-key set`/`clear` and `ravel-cli bloom-scope set`
-  write and the matching `show` commands print. The RLOG objects a tenant's
-  log flushes write after a set carry the key and the scope, except for up to
-  a server's 60 s tenant config staleness horizon, a layout the flush cannot
-  resolve (written unkeyed and counted on
-  `ingest_clustering_key_unresolved_total`), and a failed config read (the
-  last layout read, or the default, is served); compaction carries them
-  through a rewrite (see the
-  [ingest guide](docs/guides/ingest.md#setting-a-tenants-clustering-key-and-bloom-scope)).
+  comparisons and aggregates need no `CAST` over the stringified `attrs` map
+  ([query guide](docs/guides/query.md#declaring-typed-attribute-columns)).
+- A clustering key and a bloom scope in a tenant's config record, which the
+  tenant's RLOG objects carry
+  ([ingest guide](docs/guides/ingest.md#setting-a-tenants-clustering-key-and-bloom-scope)).
 
-The PromQL conformance table in the
-[query engine spec](docs/query-engine.md) classifies every construct as
-supported, intentionally rejected, an accepted divergence, or unclassified; the
-[SQL conformance table](docs/sql-conformance.md) uses three states, without the
-accepted-divergence one. Both are generated, not written: the PromQL table from
-a Ravel-only run that measures which constructs Ravel reaches and answers, and
-the SQL table from the conformance suite's recorded verdict for each construct.
-Agreement with Prometheus is a separate row of the PromQL table. That row reads
-`not measured in this run` in the committed table: the gated differential lane
-runs against a pinned Prometheus binary and publishes its counts into the
-`promql-difftest` job log, and nothing writes them back into the table. The gaps
-are measured rather than claimed.
+The [query engine spec](docs/query-engine.md) holds the PromQL conformance
+table, and the [SQL conformance table](docs/sql-conformance.md) covers SQL.
+Both tables are generated. Agreement with Prometheus is a separate row of the
+PromQL table, and that row reads `not measured in this run` in the committed
+table.
 
-Two ingest limits are worth knowing before you point a sender at Ravel:
+Two ingest limits apply before you point a sender at Ravel:
 
-- Metrics must be cumulative. A delta-temporality `Sum` or `Histogram` is
-  rejected, and the OTLP response says so. Converting delta to cumulative
-  needs per-series state held between requests, and Ravel's compute processes
-  hold no durable local state, so the conversion belongs in the collector: the
-  `deltatocumulative` processor does it, and the
+- Metrics must be cumulative. Ravel rejects a delta-temporality `Sum` or
+  `Histogram`, and the OTLP response says so. Convert in the collector with
+  the `deltatocumulative` processor. The
   [ingest guide](docs/guides/ingest.md#delta-temporality-metrics) has the
-  configuration. Senders you control can usually be set to export cumulative
-  directly instead.
+  configuration. A sender that you control can usually export cumulative
+  directly.
 - A structured log body (an array or a map) is stored as canonical JSON text,
   not as a nested value. It reads back as a JSON string, so a query that wants
   a field inside it parses that string.
@@ -234,8 +214,8 @@ Two ingest limits are worth knowing before you point a sender at Ravel:
 
 One command starts the whole stack from published images: RustFS for object
 storage, `ravel-server`, an OpenTelemetry Collector that feeds it your host's own
-metrics, and Grafana with a provisioned Ravel datasource. No Rust toolchain, no
-compile.
+metrics, and Grafana with a provisioned Ravel datasource. You need no Rust
+toolchain and no compile step.
 
 ```sh
 docker compose -f deploy/docker-compose/ravel.yml up -d
@@ -246,7 +226,7 @@ is already wired up. The first dashboard shows your machine's metrics after a fe
 scrape intervals.
 
 Query the data back over the Prometheus-compatible API. Every query needs the
-demo bearer token, exactly as a real deployment needs a real one:
+demo bearer token, as a real deployment needs a real one:
 
 <!-- ravel:run status=200; json:.status=success -->
 ```sh
@@ -255,7 +235,7 @@ curl -s -H "Authorization: Bearer demo-token" \
 ```
 
 Logs answer the same PromQL API, through the reserved `ravel_log_lines` and
-`ravel_log_bytes` metric names ([details](docs/guides/query.md#promql-over-logs)):
+`ravel_log_bytes` metric names:
 
 <!-- ravel:run status=200; json:.data.resultType=vector; nonempty:.data.result -->
 ```sh
@@ -265,8 +245,7 @@ curl -s -H "Authorization: Bearer demo-token" \
 ```
 
 The published image carries the `sql` feature, so `POST /api/v1/sql` answers
-by default. The registered tables are `samples`, `logs`, `spans`, `alerts`, and
-`audit`:
+by default:
 
 <!-- ravel:run status=200; nonempty:.data.rows -->
 ```sh
@@ -276,9 +255,9 @@ curl -s -X POST http://127.0.0.1:4318/api/v1/sql \
   -d '{"query":"SELECT * FROM samples LIMIT 5"}'
 ```
 
-To watch the read-your-write path directly, run
+To watch the read-your-write path, run
 [demo/walkthrough.sh](demo/walkthrough.sh) while the stack is up. It ingests one
-export, captures its commit token, and reads that exact write back.
+export, captures its commit token, and reads that write back.
 
 Stop the stack:
 
@@ -299,45 +278,30 @@ which demonstrates the durability claim against the running stack:
 demo/kill-and-recover.sh
 ```
 
-It ingests one export under strict acknowledgement and captures the
-`x-ravel-commit-token` from the response. It then `SIGKILL`s the `ravel-server`
-container, so the process cannot flush anything on its way out. It deletes that
-container, starts a fresh one with an empty filesystem, and reads the pre-kill
-sample back with `min_commit_token`. Nothing crosses the kill except what is in
-RustFS.
+1. It ingests one export under strict acknowledgement and captures the
+   `x-ravel-commit-token` from the response.
+2. It `SIGKILL`s the `ravel-server` container, so the process cannot flush
+   anything on its way out.
+3. It deletes that container and starts a fresh one with an empty filesystem.
+4. It reads the pre-kill sample back with `min_commit_token`.
 
-The script asserts every step and exits non-zero if the sample is absent or the
-token comes back unsatisfiable. A passing run is evidence, not a demonstration
-you have to watch closely. CI runs it against a live stack on every change to the
+Nothing crosses the kill except what is in RustFS. The script asserts every
+step and exits non-zero if the sample is absent or the token comes back
+unsatisfiable. CI runs it against a live stack on every change to the
 quickstart.
-
-### Security of the demo stack
-
-Every credential in [deploy/docker-compose/ravel.yml](deploy/docker-compose/ravel.yml)
-is a fixed development value: the `demo-token` bearer token and the RustFS
-`ravel` / `ravel-dev-secret` pair. Every published host port binds loopback
-(`127.0.0.1`) only, so the checked-in token never fronts an ingest endpoint on
-your network. None of these values are for a deployment that a network can reach.
 
 ### Beyond the demo stack
 
-A real deployment points `--store s3` at any S3-compatible store, exactly as the
-quickstart points it at RustFS, and on EC2 it can drop static keys entirely with
-`--s3-auth instance-role`. The [operations guide](docs/guides/operations.md)
-documents every storage flag, including temporary session tokens and a rotating
-credentials file.
+Every credential in [deploy/docker-compose/ravel.yml](deploy/docker-compose/ravel.yml)
+is a fixed development value, and every published host port binds loopback
+(`127.0.0.1`) only. None of these values are for a deployment that a network
+can reach.
 
-Every query byte comes from object storage, so a read cache sits in front of it.
-The RAM tier is on by default, bounded by `--cache-max-bytes` (the catalog's
-own byte cache by `--catalog-cache-max-bytes`) and switched off with
-`--disable-cache`; `--cache-dir <path>` adds a second, disposable disk
-tier. Neither tier holds durable state. See the
-[caching guide](docs/guides/caching.md).
-
-Changing Ravel's code? `make demo` builds from source and runs the same round
-trip. It does not build the `sql` feature, so `POST /api/v1/sql` is unavailable
-on that path while PromQL and ingest behave the same. The
-[development guide](docs/internal/development.md) covers the source workflow.
+| To do this | Read |
+|---|---|
+| Point `--store s3` at any S3-compatible store, or use `--s3-auth instance-role` on EC2 in place of static keys | [Choosing a credential source](docs/guides/operations/configuration.md#choosing-a-credential-source) |
+| Size or switch off the read cache that sits in front of object storage | [Caching guide](docs/guides/caching.md) |
+| Run your own build with `make demo`, which does not build the `sql` feature | [Development guide](docs/internal/development.md) |
 
 ## How it fits together
 
@@ -351,17 +315,9 @@ it once the catalog resolves that commit into a snapshot. The
 
 All query endpoints live under `/api/v1` on the HTTP listener, which binds
 `127.0.0.1:4318` by default. They need `Authorization: Bearer <token>`, the same
-as ingest.
-
-One maintenance route sits alongside them: `POST /api/v1/admin/fold` triggers a
-catalog fold for the authenticated tenant and one named signal, instead of
-waiting for the background fold's next tick. It takes the same bearer token the
-query routes take, and its response says which of four things happened: a
-snapshot was `published`, `nothing_eligible` was found to fold, a concurrent fold
-won the `HEAD` compare-and-swap (`lost_cas`), or the call was `throttled`. Right
-after a load the honest answer is `nothing_eligible`: an ingest hour is not
-foldable until the sealing window behind it has elapsed. See
-[architecture](docs/architecture.md#on-demand-catalog-fold).
+as ingest. The [HTTP API reference](docs/reference/http-api.md) lists every
+route. One of them, `POST /api/v1/admin/fold`, triggers a
+[catalog fold on demand](docs/architecture.md#on-demand-catalog-fold).
 
 ## Agents (MCP)
 
@@ -373,19 +329,6 @@ runtime `--mcp` flag, both off by default: build with the feature, then pass
 reachable from outside localhost) to mount `POST /mcp` on the query router.
 One tool is served today, `ravel_capabilities`; the other eight are
 catalogued and refuse calls until their bodies land.
-
-## Kubernetes
-
-The operator runs the same ingest and query round trip on a real cluster. This
-needs `docker`, `kind`, and `kubectl`:
-
-```sh
-scripts/kind-up.sh     # cluster, images, fake S3, operator, RavelCluster
-scripts/kind-demo.sh   # ingest through gateway mode, query through query mode
-scripts/kind-down.sh
-```
-
-See the [Kubernetes guide](docs/guides/kubernetes.md).
 
 ## Container images
 
@@ -402,10 +345,10 @@ docker pull ghcr.io/nofireai/ravel-operator:latest
 docker pull ghcr.io/nofireai/ravel-ingest-router:latest
 ```
 
-`X.Y.Z` is write-once. A bad release is superseded by a new patch release, never
-by re-pushing the tag. `latest`, `X`, and `X.Y` move with the newest matching
-release. Pin by digest (`ghcr.io/nofireai/ravel-server@sha256:...`) when you need
-an immutable reference.
+`X.Y.Z` is write-once. A new patch release supersedes a bad release, and the
+tag is never re-pushed. `latest`, `X`, and `X.Y` move with the newest matching
+release. When you need an immutable reference, pin by digest
+(`ghcr.io/nofireai/ravel-server@sha256:...`).
 
 ### Verifying signatures
 
@@ -427,41 +370,33 @@ Replace `v0.22.0` and `0.22.0` with the release you are verifying. The tag ref i
 
 ## How Ravel is verified
 
-Durability claims are cheap to write and hard to keep. These are the checks that
-hold Ravel to them:
-
-- TLA+ models check the commit, catalog, lifecycle, resharding, and
-  maintenance protocols over one shared object-store model, and every checked
-  property observes the store itself rather than the model's own bookkeeping.
-  Each area carries negative controls that show its invariants can fail, and
-  reachability obligations that show a guarded state is still reached.
-  `scripts/check-tla.sh` runs the smoke, negative, and traceability lanes on
-  every pull request that touches formal/ or the paths it models. The
-  exhaustive lane runs nightly. See the
-  [formal verification guide](docs/guides/formal-verification.md) for the
-  results.
+- TLC checked five finite TLA+ models of the commit, catalog, lifecycle,
+  resharding, and maintenance protocols, over one shared object-store model,
+  under stated bounds and assumptions. Negative controls show that each
+  invariant can fail. Every checked property traces to a Rust symbol and, for
+  all but five recorded rows, a named test. The
+  [formal verification guide](docs/guides/formal-verification.md) has the
+  bounds, the assumptions, the lanes, and the results.
 - A deterministic simulation harness drives the full ingest, fold, compact,
   sweep, and query cycle under injected faults. It checks read-your-write,
   strict-ack durability, compaction equivalence, record-count conservation, and
   orphan-free sweeps every cycle. Any violation prints its master seed and a
   one-command replay. A nightly job sweeps 200 seeds.
 - The PromQL evaluator is differentially tested against a pinned real Prometheus
-  binary. The per-construct conformance table publishes what Ravel reaches, and
-  agreement with that binary as its own row.
-- `unsafe` is forbidden workspace-wide, at the compiler rather than by review.
+  binary.
+- The compiler forbids `unsafe` across the workspace.
 - Property tests cover every codec and parser. Fuzz targets run on the segment
   and span formats.
 - A fault-injection store fails operations by kind, key, and occurrence, and the
   failure-path tests assert its counters.
-- The [consistency model](docs/consistency-model.md) is normative, and its crash
-  matrix is test-asserted.
+- Tests assert the crash matrix of the
+  [consistency model](docs/consistency-model.md).
 
 ## Repository layout
 
-- `crates/` holds the types, the object store, the segment formats (RSEG for
-  metrics, RLOG for logs, RSPAN for spans), the commit protocol, the catalog, the
-  decoders, the ingest actors, PromQL, the query engine, and DataFusion-backed
-  SQL.
+- `crates/` holds the library crates, from the segment formats (RSEG for
+  metrics, RLOG for logs, RSPAN for spans) to the query engine and SQL. See
+  the [crate map](docs/architecture.md#crate-map).
 - `services/` holds `ravel-server` (the `all`, `gateway`, `query`, and
   `maintain` modes in one binary), `ravel-cli` (a segment, commit, and catalog
   inspector, and the Parquet bulk loader), `ravel-ingest-router` (the optional
@@ -476,12 +411,7 @@ hold Ravel to them:
   nothing to a first query.
 - The [documentation index](docs/README.md) lists every guide, spec, and decision
   record.
-- [Architecture](docs/architecture.md) is the mental model, and the
-  [consistency model](docs/consistency-model.md) is normative for
-  acknowledgement, visibility, and crash behavior.
-- Formats: [RSEG](docs/segment-format.md) for metrics,
-  [RLOG](docs/log-segment-format.md) for logs, and
-  [RSPAN](docs/span-segment-format.md) for spans.
+- [Architecture](docs/architecture.md) is the mental model.
 - [Contributing](CONTRIBUTING.md), the [changelog](CHANGELOG.md), and the
   [AI policy](AI_POLICY.md).
 
