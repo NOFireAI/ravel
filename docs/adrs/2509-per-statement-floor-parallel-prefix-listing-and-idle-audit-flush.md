@@ -151,7 +151,8 @@ sequenceDiagram
 - **Determinism loses one property.** Which shard reaches the cap first, and
   the `estimate` value in the error, can vary between runs. The refusal
   itself does not vary, because a window whose total page count exceeds the
-  cap is refused on every run.
+  cap is refused on every run. (The `estimate` does not vary: see the
+  WindowTooWide estimate correction below.)
 - The shard results are merged in shard order before step 2 partitions them,
   so the resolved key set and its total order are unchanged.
   `docs/catalog-and-mvcc.md`'s "Both traversals produce the identical key set"
@@ -183,8 +184,9 @@ sequenceDiagram
   - ADR-0056, section "The request ceiling (INTERACTION 1)". Its runtime-cap
     bullet, `WindowTooWide { estimate: <pages issued> }`, now reports the
     pages reserved when the cap was reached, and that number is no longer
-    stable between runs. ADR-0056 gets an amendment naming that section, with
-    an inline pointer in the bullet.
+    stable between runs. (It is stable, the cap plus one on every run: see
+    the WindowTooWide estimate correction below.) ADR-0056 gets an amendment
+    naming that section, with an inline pointer in the bullet.
   - Both ADR amendments use the `sections=`/`pointer=` marker syntax that
     `scripts/guards/check-amendment-integrity.sh` checks.
 
@@ -381,7 +383,8 @@ does not move it. See "Deferred" below.
   within the bound `list_window_bounded` already uses.
 - **The `WindowTooWide` error.** It names the pages reserved when the cap was
   hit, which can differ between runs of the same over-wide query. Tests
-  assert the refusal and the bound, not the exact count.
+  assert the refusal and the bound, not the exact count. (Both sentences are
+  wrong: see the WindowTooWide estimate correction below.)
 - **The audit pipeline.**
   - Sequential traffic no longer waits `max_age`.
   - Traffic arriving more often than once per `max_age` batches exactly as
@@ -404,3 +407,30 @@ does not move it. See "Deferred" below.
     - a loop that still waits `max_age` for an idle event.
   - A reachability test drives the SQL HTTP handler end to end and asserts
     the request counts.
+
+## Correction (2026-10-04): the WindowTooWide estimate does not vary
+
+<!-- amendment-applies: sections="1. The prefix traversal lists shards concurrently under a reserved cap" pointer="WindowTooWide estimate correction" -->
+<!-- amendment-applies: sections="Consequences" pointer="WindowTooWide estimate correction" -->
+
+Three passages above say the `CatalogError::WindowTooWide` error reports a
+number that can change between runs: decision 1's determinism bullet, its
+"Docs this changes" bullet for ADR-0056, and the `WindowTooWide` bullet in
+"Consequences", which adds that tests do not assert the exact count. The
+implementation does not behave that way.
+
+- A page's reservation is refused only when the shared counter already reads
+  `max_catalog_list_requests`, and the error reports that reading plus one.
+  Every refusal therefore carries `estimate = max_catalog_list_requests + 1`
+  and `limit = max_catalog_list_requests`, the same values the sequential
+  check produced before this decision.
+- What can vary between runs is which shard's reservation is refused, and how
+  many of the reserved pages were issued before the abort. The refusal and the
+  request bound do not vary.
+- Tests assert the exact value: `prefix_listing_cap_is_exact_under_concurrency`
+  in `crates/ravel-catalog/tests/resolve_prefix_concurrency.rs` pins
+  `estimate == max_catalog_list_requests + 1` with all four shards' first
+  pages held at once.
+- ADR-0056's reserved-cap amendment already states the estimate this way. The
+  ADR index row for this decision in `docs/adrs/README.md` is corrected in
+  place.
