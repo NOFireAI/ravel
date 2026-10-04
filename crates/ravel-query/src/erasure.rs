@@ -342,7 +342,7 @@ pub fn retain_series_entries(entries: &mut Vec<SeriesEntry>, predicates: &[Erasu
     });
 }
 
-/// Removes erased log rows in place (ADR-0064 decision 1): a row is dropped if
+/// Removes erased log rows in place (ADR-0064 decision 2): a row is dropped if
 /// any predicate's conjunction matches its per-record attributes and, when the
 /// predicate is windowed, its `ts_ns` falls in the window. A no-op when
 /// `predicates` is empty.

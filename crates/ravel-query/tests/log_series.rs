@@ -1053,6 +1053,239 @@ async fn log_series_erasure_excludes_matching_records_and_their_bytes() {
     );
 }
 
+/// Bodies of the five records each [`host_pair_fixture`] stream carries, at ts
+/// 100..=104 in order: lengths 1..=5, so one stream's byte total is 15.
+const HOST_PAIR_BODIES: [&str; 5] = ["a", "bb", "ccc", "dddd", "eeeee"];
+
+/// Two streams whose records are identical except for the `host.name`
+/// resource attribute (`h1` versus `h2`): `service.name=api` on both, five
+/// INFO records each at ts 100..=104 with [`HOST_PAIR_BODIES`], and no
+/// per-record attributes, so a predicate on `host.name` is visible only
+/// through the merged resource + scope + record view (ADR-0064 decision 2).
+/// `host.name` surfaces as the `host_name` label, so each stream is its own
+/// series.
+async fn host_pair_fixture(store: &MemoryStore) -> SegmentRef {
+    let mut records = Vec::new();
+    for host in ["h1", "h2"] {
+        let resource = [
+            ("service.name", AttrValue::Str("api".to_string())),
+            ("host.name", AttrValue::Str(host.to_string())),
+        ];
+        for (ts, body) in (100..).zip(HOST_PAIR_BODIES) {
+            records.push(resource_record(&resource, ts, "INFO", body, &[]));
+        }
+    }
+    write_object(store, "logs/host-pair.rlog", &records).await
+}
+
+/// `(host_name, sample ts list, value sum)` per series, sorted by host.
+async fn host_series(
+    fetcher: &LogSegmentFetcher,
+    seg_ref: &SegmentRef,
+    metric: LogMetric,
+    erasure: &[ErasurePredicate],
+) -> Vec<(String, Vec<i64>, f64)> {
+    let name = match metric {
+        LogMetric::Lines => LOG_LINES_METRIC,
+        LogMetric::Bytes => LOG_BYTES_METRIC,
+    };
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, name),
+        LabelMatcher::equal("job", "api"),
+    ];
+    let req = LogSeriesRequest {
+        metric,
+        erasure,
+        ..lines_request(&matchers, full_window())
+    };
+    let accounting = PhaseAccounting::new();
+    let out = fetch_log_series(
+        fetcher,
+        TENANT,
+        std::slice::from_ref(seg_ref),
+        &req,
+        &accounting,
+    )
+    .await
+    .expect("fetch_log_series");
+    let mut series: Vec<(String, Vec<i64>, f64)> = out
+        .series
+        .iter()
+        .map(|s| {
+            (
+                s.labels
+                    .get("host_name")
+                    .expect("host_name label")
+                    .to_string(),
+                s.samples.iter().map(|x| x.ts_ns).collect(),
+                s.samples.iter().map(|x| x.value).sum(),
+            )
+        })
+        .collect();
+    series.sort_by(|a, b| a.0.cmp(&b.0));
+    series
+}
+
+fn host_predicate(host: &str) -> ErasurePredicate {
+    ErasurePredicate::windowless(vec![("host.name".to_string(), host.to_string())])
+}
+
+/// Issue #2541: an erasure predicate naming only a resource attribute
+/// (`host.name=h2`) erases that stream's records from `ravel_log_lines` and
+/// `ravel_log_bytes`. The line count drops by exactly the erased stream's 5
+/// records and its byte sum by exactly its 15 bytes, and the `host_name="h2"`
+/// series is absent rather than present with no samples. The records carry no
+/// per-record attributes, so the fetcher's `with_erasure` pre-filter cannot
+/// see the subject; remove the `retain_unerased_log_records` call in
+/// `fetch_log_series` and both erased assertions fail with h2 still present.
+#[tokio::test]
+async fn log_series_resource_only_erasure_drops_the_erased_stream() {
+    let mem = Arc::new(MemoryStore::new());
+    let seg_ref = host_pair_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let all_ts = vec![100, 101, 102, 103, 104];
+
+    assert_eq!(
+        host_series(&fetcher, &seg_ref, LogMetric::Lines, &[]).await,
+        vec![
+            ("h1".to_string(), all_ts.clone(), 5.0),
+            ("h2".to_string(), all_ts.clone(), 5.0),
+        ],
+        "both streams counted before erasure"
+    );
+    assert_eq!(
+        host_series(
+            &fetcher,
+            &seg_ref,
+            LogMetric::Lines,
+            &[host_predicate("h2")]
+        )
+        .await,
+        vec![("h1".to_string(), all_ts.clone(), 5.0)],
+        "10 lines minus the erased stream's 5; the h2 series is absent"
+    );
+
+    assert_eq!(
+        host_series(&fetcher, &seg_ref, LogMetric::Bytes, &[]).await,
+        vec![
+            ("h1".to_string(), all_ts.clone(), 15.0),
+            ("h2".to_string(), all_ts.clone(), 15.0),
+        ],
+        "both streams' bytes before erasure"
+    );
+    assert_eq!(
+        host_series(
+            &fetcher,
+            &seg_ref,
+            LogMetric::Bytes,
+            &[host_predicate("h2")]
+        )
+        .await,
+        vec![("h1".to_string(), all_ts, 15.0)],
+        "30 bytes minus the erased stream's 15; the h2 series is absent"
+    );
+}
+
+/// Issue #2541: a resource-only predicate windowed to `[101, 103)` erases only
+/// the h2 records at ts 101 and 102 (bodies "bb" and "ccc"), leaving h2's
+/// series with ts 100, 103 and 104 and h1 untouched. Fails with the
+/// `retain_unerased_log_records` call in `fetch_log_series` removed (h2 keeps
+/// all five samples).
+#[tokio::test]
+async fn log_series_windowed_resource_only_erasure_drops_only_its_window() {
+    let mem = Arc::new(MemoryStore::new());
+    let seg_ref = host_pair_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let windowed = [ErasurePredicate::new(
+        vec![("host.name".to_string(), "h2".to_string())],
+        101,
+        103,
+    )];
+
+    assert_eq!(
+        host_series(&fetcher, &seg_ref, LogMetric::Lines, &windowed).await,
+        vec![
+            ("h1".to_string(), vec![100, 101, 102, 103, 104], 5.0),
+            ("h2".to_string(), vec![100, 103, 104], 3.0),
+        ],
+    );
+    assert_eq!(
+        host_series(&fetcher, &seg_ref, LogMetric::Bytes, &windowed).await,
+        vec![
+            ("h1".to_string(), vec![100, 101, 102, 103, 104], 15.0),
+            ("h2".to_string(), vec![100, 103, 104], 10.0),
+        ],
+        "h2's 15 bytes minus \"bb\" (2) and \"ccc\" (3)"
+    );
+}
+
+/// Issue #2541: predicates that match neither stream through the merged view
+/// (a resource value no stream has, and a key no record or stream carries)
+/// change nothing.
+#[tokio::test]
+async fn log_series_unrelated_resource_erasure_changes_nothing() {
+    let mem = Arc::new(MemoryStore::new());
+    let seg_ref = host_pair_fixture(&mem).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let unrelated = [
+        host_predicate("h3"),
+        ErasurePredicate::windowless(vec![("user.id".to_string(), "u1".to_string())]),
+    ];
+
+    for metric in [LogMetric::Lines, LogMetric::Bytes] {
+        assert_eq!(
+            host_series(&fetcher, &seg_ref, metric, &unrelated).await,
+            host_series(&fetcher, &seg_ref, metric, &[]).await,
+        );
+    }
+}
+
+/// Issue #2541: a record whose `stream_attrs` blob does not decode, on a query
+/// whose predicate needs the merged view to decide it, fails the query with
+/// `LogSeriesError::Decode` rather than returning a count. The corrupt record
+/// shares its stream id with a well-formed stream in an earlier segment, so
+/// the Plan phase serves its labels from the per-query cache and never decodes
+/// the corrupt blob; only the merged-view match does. Remove the
+/// `retain_unerased_log_records` call in `fetch_log_series` and the query
+/// succeeds with a count.
+#[tokio::test]
+async fn log_series_corrupt_stream_attrs_under_erasure_is_a_typed_error() {
+    let mem = Arc::new(MemoryStore::new());
+    let resource = [("service.name", AttrValue::Str("api".to_string()))];
+    let good = resource_record(&resource, 100, "INFO", "ok", &[]);
+    // A non-UTF-8 scope name: the writer's own blob walk skips the scope
+    // strings unchecked and accepts it, `decode_stream_attrs` rejects it.
+    let mut corrupt = resource_record(&resource, 200, "INFO", "ok", &[]);
+    let at = corrupt
+        .stream_attrs
+        .windows(5)
+        .position(|w| w == b"scope")
+        .expect("scope name in blob");
+    corrupt.stream_attrs[at] = 0xFF;
+    let ref_a = write_object(&mem, "logs/good.rlog", &[good]).await;
+    let ref_b = write_object(&mem, "logs/corrupt.rlog", &[corrupt]).await;
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>);
+    let refs = [ref_a, ref_b];
+
+    let matchers = [
+        LabelMatcher::equal(METRIC_NAME_LABEL, LOG_LINES_METRIC),
+        LabelMatcher::equal("job", "api"),
+    ];
+    let erasure = [host_predicate("h2")];
+    let req = LogSeriesRequest {
+        erasure: &erasure,
+        ..lines_request(&matchers, full_window())
+    };
+    let accounting = PhaseAccounting::new();
+    let err = fetch_log_series(&fetcher, TENANT, &refs, &req, &accounting)
+        .await
+        .expect_err("a corrupt stream_attrs blob under erasure fails the query");
+    assert!(
+        matches!(err, LogSeriesError::Decode(_)),
+        "expected LogSeriesError::Decode, got {err:?}"
+    );
+}
+
 /// Finding 3: `job=~"api|worker"` selects `s1`+`s4` (merged, `job="api"`)
 /// and `s2` (`job="worker"`) -- 2 series. `s3` (`job="pay/api"`) does not
 /// match `"api|worker"` and is excluded. With `max_series: 1` the second
