@@ -101,9 +101,10 @@
 //! bit for bit. NaN and infinity in ungrouped
 //! `sum` are covered by golden cases that assert the properties that *are*
 //! well defined (a NaN result is NaN; an infinite result has the right sign)
-//! rather than a payload the lane order chooses. This applies property
-//! assertions to the one operator where exact-bit comparison is not portably
-//! possible.
+//! rather than a payload the lane order chooses. Property assertions are
+//! used only where exact-bit comparison is not portably possible: ungrouped
+//! `sum` over values that are not exactly representable, and the bits of a
+//! NaN result of `avg` and of grouped `sum`.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -165,7 +166,10 @@ async fn assert_all(fixture: &Fixture, tenant: &TenantId, queries: &[Query]) {
 /// and hardware-chosen), and every other cell -- including finite values,
 /// signed infinities, and signed zeros -- must be bit-identical. This is
 /// strictly stronger than a tolerance: the only bits it forgives are a NaN's
-/// sign and payload, which the ADR itself declares not portable (decision 6b).
+/// sign and payload. ADR-0022 decision 6b asked for engine-versus-reference
+/// bit equality of NaN results on the same host; issue #2558 showed that does
+/// not hold even on one host, and the ADR's NaN propagation amendment records
+/// what the gate asserts instead.
 /// [`nan_carve_out_forgives_only_the_bits_of_a_nan`] pins both halves.
 fn cells_match_up_to_nan_bits(got: &Cell, want: &Cell) -> bool {
     match (got, want) {
@@ -226,7 +230,7 @@ fn nan_carve_out_forgives_only_the_bits_of_a_nan() {
 /// which forgives only a NaN's sign and payload. Used by the `avg` shapes and
 /// by grouped `sum` over the full value pool, whose results are bit-identical
 /// to the reference except for the hardware- and compiler-chosen NaN (module
-/// header, ADR-0022 decision 6b).
+/// header, ADR-0022 NaN propagation amendment).
 async fn assert_matches_up_to_nan_bits(fixture: &Fixture, tenant: &TenantId, query: &Query) {
     let snapshot = fixture.snapshot(tenant).await;
     let reference = util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot).await;
