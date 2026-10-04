@@ -38,6 +38,8 @@ proptest = { workspace = true }
 # can store a `stream_attrs` blob the writer refuses
 # (`RlogWriter::with_unchecked_stream_attrs`, issue #2554).
 ravel-logseg = { workspace = true, features = ["test-support"] }
+# Captures the warn line compaction emits for a skipped input.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

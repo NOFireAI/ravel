@@ -78,7 +78,8 @@ pub use claim_guard::{Acquire, Checkpoint, ClaimGuard, ClaimSkip, ClaimSkipReaso
 pub use clock::{Clock, FixedClock};
 pub use codec::{RsegCodec, SegmentCodec};
 pub use compact::{
-    ClaimAcquisition, ClaimedCompaction, CompactionOutcome, compact_bucket, compact_bucket_claimed,
+    COMPACTION_INPUT_SKIP_SIGNALS, ClaimAcquisition, ClaimedCompaction, CompactionInputSkipReason,
+    CompactionOutcome, compact_bucket, compact_bucket_claimed, compaction_inputs_skipped_total,
 };
 pub use config::{
     AdmissionMode, AuditMode, AuditPipelineConfig, ClaimParticipant, CompactorConfig, Coordination,

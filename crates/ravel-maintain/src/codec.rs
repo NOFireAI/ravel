@@ -60,6 +60,7 @@ use ravel_object_store::ObjectStoreBackend;
 
 use crate::bucket::Bucket;
 use crate::build::BuiltPart;
+use crate::compact::CompactionInputSkipReason;
 use crate::config::CompactorConfig;
 use crate::error::Result;
 use crate::read::InputRecord;
@@ -116,6 +117,14 @@ pub trait SegmentCodec {
     /// refusal, never a silent downgrade), which [`RsegCodec`] does.
     fn validate_rewrite_inputs(_inputs: &[InputRecord]) -> Result<()> {
         Ok(())
+    }
+
+    /// Why this codec's writer would refuse to rewrite the input `catalog`
+    /// describes, with the decoder's error, or `None` when it can rewrite it.
+    /// Compaction leaves such an input out of its merge instead of failing on
+    /// it (issue #2554). The default rewrites everything.
+    fn unwritable_input(_catalog: &Self::Catalog) -> Option<(CompactionInputSkipReason, String)> {
+        None
     }
 }
 
