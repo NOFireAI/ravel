@@ -3547,8 +3547,12 @@ impl Catalog {
     /// between runs. This is the request bound, enforced at runtime on the
     /// one path whose cost is not knowable before listing: a wide-but-sparse
     /// window is served, and only a scan whose actual object volume is
-    /// unsustainable is refused. The per-shard groups are merged in shard
-    /// order, so the grouped key set is what a shard-by-shard drain produces.
+    /// unsustainable is refused. The shards' groups are merged in whatever
+    /// order the shards complete. That order is unobservable: a key is grouped
+    /// under its own `(shard, hour)`, so no bucket takes keys from two shards
+    /// and each bucket keeps its shard's page order, and `resolve_impl` sorts
+    /// the resolved segments by [`segment_sort_key`]. The resolved key set
+    /// and its order are therefore those of a shard-by-shard drain.
     ///
     /// That page-by-page reservation, and the `list_after` start marker, are why
     /// this path records its own `AccountedOp::List` per page instead of
@@ -3598,8 +3602,10 @@ impl Catalog {
         );
         // `buffer_unordered` so a refusal or error from any shard ends the
         // scan at once (dropping the others' in-flight pages) instead of
-        // waiting behind an earlier shard; the shard index restores order.
-        let mut shard_groups: Vec<(u32, ShardBuckets)> = stream::iter(0..scan_shards)
+        // waiting behind an earlier shard. Completion order is not kept: each
+        // bucket holds one shard's keys only, and resolve_impl sorts the
+        // segments it resolves.
+        let shard_groups: Vec<ShardBuckets> = stream::iter(0..scan_shards)
             .map(|shard| {
                 let lists_reserved = &lists_reserved;
                 let tenant_prefix = tenant_prefix.as_str();
@@ -3616,15 +3622,14 @@ impl Catalog {
                             accounting,
                         )
                         .await?;
-                    Ok::<_, CatalogError>((shard, buckets))
+                    Ok::<_, CatalogError>(buckets)
                 }
             })
             .buffer_unordered(self.config.resolve_get_concurrency)
             .try_collect()
             .await?;
-        shard_groups.sort_unstable_by_key(|(shard, _)| *shard);
         let mut grouped: ShardBuckets = HashMap::new();
-        for (_, buckets) in shard_groups {
+        for buckets in shard_groups {
             for (coord, objs) in buckets {
                 grouped.entry(coord).or_default().extend(objs);
             }
