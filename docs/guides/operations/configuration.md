@@ -1202,7 +1202,7 @@ deployment against a loopback `--s3-endpoint`.
 |---|---|---|
 | `request-minimal` | Fewest object-store requests. An object at or under the fetch bound is read whole in one covering request with no footer probe; a larger object is read as covering sub-range requests. | The backend bills requests and not transfer, so a saved request is a saved dollar and the bytes it costs are free. |
 | `byte-minimal` | Fewest transferred bytes. Ranged reads wherever they save more bytes than a request is worth. | The backend bills egress, or the network is the constraint, so moved bytes are the cost that matters. |
-| `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved at startup from the profile's prices and its measured request timings. | You want the shape the deployment's own prices and timings imply. At the reference intra-region profile, on every store including a loopback one, a request costs 6,300,000 bytes (its time term), so a projection that skips more than 31,500,000 bytes of an object reads ranged and every object of 31,500,000 bytes or less reads whole. |
+| `cost-based` | Whichever of the two is cheaper under the active store cost profile, resolved at startup from the profile's prices and its measured request timings. | You want the shape the deployment's own prices and timings imply. At the reference intra-region profile, on every store including a loopback one, a request costs 6,300,000 bytes (its time term), so a projection that skips more than 18,900,000 bytes of an object reads ranged and every object of 18,900,000 bytes or less reads whole. |
 | `latency-first` | Fewest transferred bytes, exactly like `byte-minimal`. An intent, not a tuning constant: it says spend requests to save wall time, and leaves how up to the concurrency you configure. | Cold wall-clock matters more than the request bill, and you are willing to raise the object-store GET concurrency and the SQL scan width explicitly to cash in the trade: measured over 3 reps on a 42-statement reference corpus, true cold in the warm-up-empty state, at GET concurrency 256: 5.30x the GET requests (570,752 against 107,781) for 52% less cold time, with a per-rep range of 50.3% to 54.2%. That ratio is a measurement of two code paths at one point in the project's history, not a property of the policy, and it has already moved once as the cost-based side changed; the decision record for the fetch objective names the exact build it was taken on. Re-measure against the build you run rather than treating it as a constant. |
 
 For any policy value a query returns exactly the same rows. Only request counts
@@ -1320,9 +1320,9 @@ timings it resolves to 4,294 bytes, which the floors then clamp.
 Under `cost-based`, and only there, a finite rate derived from the profile also
 sets the projection break-even: the bytes a narrow projection must save before it is read ranged
 instead of whole, the larger of the routing threshold
-(`--logs-block-range-threshold`, 524,288 bytes by default) and five request
-costs. At the reference profile that is 31,500,000 bytes, so a one-column read
-of a 35 MB object reads its column ranges while every object of 31,500,000
+(`--logs-block-range-threshold`, 524,288 bytes by default) and three request
+costs. At the reference profile that is 18,900,000 bytes, so a one-column read
+of a 35 MB object reads its column ranges while every object of 18,900,000
 bytes or less, such as a 3 MB flush object, still reads whole. The same figure
 is the object size at or below which the ranged fetch reads the whole object
 anyway. The startup line reports the break-even in force as

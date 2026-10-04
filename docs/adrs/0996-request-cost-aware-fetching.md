@@ -800,9 +800,26 @@ threshold keeps its configured value, and an explicit
 `--logs-block-range-threshold` is no longer overridden there. When
 `cost-based` derives a finite rate the projection break-even becomes the larger
 of the routing threshold and five request costs (31,500,000 bytes at the
-reference profile), so narrow projections of large objects read ranged while
+reference profile; three request costs, 18,900,000 bytes, since the
+three-request-cost break-even amendment below), so narrow projections of large objects read ranged while
 objects at or below the break-even read whole. `request-minimal`,
 `byte-minimal` and `latency-first` resolve as before, and so does an explicit
 `--logs-request-cost-bytes`, whose deployment keeps the routing threshold as
 its break-even. The startup stamp names the term
 (`rate_term`) and the break-even (`projection_break_even_bytes`).
+
+## Amendment (2026-10-04, ADR-2414, issue #2555): the three-request-cost break-even amendment
+
+<!-- amendment-applies: sections="Amendment (2026-10-03, ADR-2414): the time-term amendment to the cost-based rate" pointer="three-request-cost break-even amendment" -->
+
+This is the three-request-cost break-even amendment. ADR-2414's amendment
+for issue #2555 lowers the projection break-even a cost-based derivation
+resolves from five request costs to three: the larger of the routing
+threshold and 3 * request cost, 18,900,000 bytes at the reference profile.
+Decision 2 is otherwise as the time-term amendment above leaves it: the rate
+derivation, the routing threshold, `request-minimal`, `byte-minimal`,
+`latency-first`, and an explicit `--logs-request-cost-bytes`, which still
+derives no break-even, are unchanged. A 3 MB L0 object, under one request
+cost of 6,300,000 bytes, still reads whole. The startup stamp prints
+`projection_break_even_bytes=18900000 break_even_source="profile"` at default
+flags.

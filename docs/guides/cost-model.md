@@ -248,9 +248,12 @@ to it. Three cases matter:
   request. The routing threshold keeps its configured value, 524,288 bytes by
   default, and an explicit `--logs-block-range-threshold` is not overridden.
   The projection break-even, the bytes a projection must skip before an object
-  is read ranged rather than whole, is the larger of that threshold and five
-  request costs: 31,500,000 bytes. So a one-column statement over 35 MB objects
-  reads only its column ranges, and the blocks of every object of 31,500,000
+  is read ranged rather than whole, is the larger of that threshold and three
+  request costs: 18,900,000 bytes. Three, because a ranged read of a narrow
+  projection issues about four GETs per object against one for a whole read,
+  so it pays only when the bytes it skips exceed the cost of the three extra
+  requests. So a one-column statement over 35 MB objects
+  reads only its column ranges, and the blocks of every object of 18,900,000
   bytes or less are still read in one whole-object GET, with no tail probe on
   the whole-segment fast path, on the planned route (any statement the
   whole-segment fast path refuses) and on the log-series route's
@@ -281,7 +284,7 @@ a transfer-free deployment under `cost-based` it replaces the time term's
 6,300,000 bytes and drops the projection break-even that comes with a derived
 rate, so the routing threshold is the break-even again, exactly as before
 there was a time term: a narrow projection that skips more than 524,288 bytes
-reads ranged, including objects up to 31,500,000 bytes the time term reads
+reads ranged, including objects up to 18,900,000 bytes the time term reads
 whole. Leave the flag unset unless a measurement on your own deployment says
 the derived value is wrong for it.
 
@@ -333,8 +336,8 @@ verbatim as the pre-probe crossover instead of deriving five request costs from
 this value, except where the resolution also hands it a projection break-even.
 It does so when `cost-based` derives a finite rate from the profile, the
 shipped flag set: the break-even is the larger of the routing threshold and
-five request costs, and it replaces the threshold in the second and third
-decisions, so there they follow the derived rate (31,500,000 bytes at the
+three request costs, and it replaces the threshold in the second and third
+decisions, so there they follow the derived rate (18,900,000 bytes at the
 reference profile). Under `byte-minimal` and `latency-first`, and wherever this
 flag is set explicitly, the two decisions follow the routing threshold, and
 raising this value without also raising `--logs-block-range-threshold` moves
@@ -398,7 +401,7 @@ deployment's billing shape, which is why this is a flag and not a constant.
 
 1. **Leave it unset.** Costs nothing, and at the shipped reference profile it
    is what lets the fetch-policy resolver take the time term, 6,300,000 bytes,
-   with its 31,500,000-byte projection break-even: narrow projections of
+   with its 18,900,000-byte projection break-even: narrow projections of
    objects large enough to skip more than that read ranged, and everything
    else reads whole. Setting the flag at all replaces that rate, and the
    break-even with it. An operator who wants ranged reads wherever they save
@@ -419,7 +422,7 @@ deployment's billing shape, which is why this is a flag and not a constant.
 3. **Raise it on a request-billed, transfer-free backend** (same-region S3)
    when you want every object read whole. On the shipped `cost-based` policy at
    the reference profile, option 1 already reads whole every object the
-   31,500,000-byte break-even covers; setting the flag replaces the derived
+   18,900,000-byte break-even covers; setting the flag replaces the derived
    rate and drops that break-even, so the routing threshold decides again.
    Set it at or above the largest segment object *any* tenant this
    process serves writes. The flag is process-wide, so a single tenant's largest

@@ -120,7 +120,8 @@ compare the saved bytes against 512 KiB and read a 3 MB L0 object ranged,
 the shape ADR-2023 measured as a threefold concurrent throughput loss. So
 under `cost-based`, and only there, `ranged_projection_pays` takes the
 larger of the configured routing threshold and five request costs as its
-break-even: a 35 MB object at a 3% projection saves 34 MB against a 31 MB
+break-even (three request costs, 18,900,000 bytes, since the three-request-cost amendment below):
+a 35 MB object at a 3% projection saves 34 MB against a 31 MB
 break-even and reads ranged; a 3 MB L0 object saves under 3 MB and reads
 whole; an explicit `--logs-block-range-threshold` still bounds the
 block-range routing it was written for. The break-even applies only when
@@ -148,7 +149,9 @@ force. The partition count is unchanged (derived from cores); with A2 that
 is enough.
 
 Expected on the reference box after A1 to A3 (pre-registered on #1248
-before A3's run): the one-column statement under 2 s cold at 32 partitions,
+before A3's run): the one-column statement under 2 s cold at 32 partitions
+(see the three-request-cost amendment below for the read shape the five-request-cost
+break-even gave that statement; it records no wall time),
 the stock cold suite under 200 s over the same 42 statements the 241.4 s
 baseline covers, with q33 reported beside it under its own band (B3), and
 the tuned arm re-registered for 35 MB objects with partitions at most the
@@ -229,7 +232,9 @@ while q33 is reported as a 43rd row.
 ## Consequences
 
 - Narrow projections on S3 move their columns' bytes and finish in the time
-  those bytes take. On the whole-segment fast path wide statements are
+  those bytes take, on objects where the bytes they skip exceed the
+  break-even (three request costs since the three-request-cost amendment below).
+  On the whole-segment fast path wide statements are
   unchanged (they fail the break-even and read whole, as today). On the
   planned route an object at or below the break-even is read whole with no
   probe, but an object above it pays the tail probe and directory reads
@@ -255,7 +260,7 @@ flowchart LR
     Q[statement, projection f] --> P{partitions vs segments}
     P -->|partitions <= segments| F[whole-segment fast path]
     P -->|partitions > segments| S[striped path]
-    F --> R{ranged_projection_pays?<br/>saved bytes > max(routing threshold, 5 x request cost)}
+    F --> R{ranged_projection_pays?<br/>saved bytes > max(routing threshold, 5 x request cost)<br/>3 x request cost since the three-request-cost amendment}
     R -->|yes, A3 time term| RG[ranged column reads<br/>A2: pipelined per partition]
     R -->|no| W[whole-object GET]
     S --> D[A1: directories decoded once per segment<br/>row groups dealt whole]
@@ -286,3 +291,70 @@ hold; both now carry a pointer here, and the rest of this ADR stands.
   shape returns the same top ten with spill forced and with spill off.
 
 Decision B2 itself stands as a record of what this ADR did not change.
+
+## Amendment (2026-10-04): the cost-based projection break-even is three request costs (issue #2555)
+
+<!-- amendment-applies: sections="Track A: narrow projections|Consequences" pointer="three-request-cost amendment" -->
+<!-- amendment-supersedes: phrase="five request costs" pointer="three-request-cost amendment" -->
+
+This is the three-request-cost amendment. Decision A3 set the cost-based
+projection break-even at five request costs; it is now three. A3, the first
+Consequences bullet and the diagram carry a pointer here, and the rest of
+this ADR stands.
+
+**Why three.** A whole read costs one request and S bytes; a ranged read
+costs k requests and b bytes. At a rate of r bytes per request the ranged
+read pays when (k - 1) * r + b < S, that is when the bytes it skips, S - b,
+exceed (k - 1) * r. Five request costs is that inequality with k = 6, taken
+from the 5.46 GETs per object measured on q20 on an older layout, the figure
+`WHOLE_OBJECT_REQUEST_MULTIPLE` records. On the reference tenant a
+one-column projection measured 4.19 GETs per object under `latency-first`
+(918 over 219 objects) and 4.40 under `cost-based` for the 107 objects that
+read ranged, moving 0.89 to 0.95 MB per object. So k = 4
+(`COST_BASED_RANGED_REQUESTS`), and the break-even is three request costs.
+
+**What five request costs produced.** At 31,500,000 bytes on the reference
+profile, the 112 of those 219 objects at or below about 32.4 MB (the size at
+which a 3-of-114 projection skips 31,500,000 bytes) read whole: 583 GETs and
+2,919,327,365 wire bytes, 37.7 percent of the 7,741,962,796-byte corpus,
+where the ranged read of all 219 objects moves 194,213,453.
+
+**The new break-even.** When `cost-based` takes its rate from the profile
+(its price term or its time term), the break-even is
+max(routing threshold, 3 * request cost): 18,900,000 bytes on the reference
+profile, whose request cost is the time term's 6,300,000. The whole-segment
+fast path compares it with the bytes it expects to skip, the object size less
+its count-ratio estimate of the projected bytes (`ranged_projection_pays`).
+The plan phase (`plan_whole_object_bound`) and the ranged fetch's size
+crossover know no projection and compare it with the object size, so an
+object of 18,900,000 bytes or less reads whole on both, and the planned route
+probes an object above it before the coverage crossover decides.
+
+**Not changed.** An explicit `--logs-request-cost-bytes` still derives no
+break-even and keeps the routing threshold in its place, whatever its value.
+`request-minimal`, `byte-minimal` and `latency-first` resolve as before. The
+0.75 coverage crossover, the coalescing gap (one request cost, at least
+64 KiB), and ADR-0904's derived crossover (`WHOLE_OBJECT_REQUEST_MULTIPLE`
+request costs, still 5) are unchanged. A 3 MB L0 object still reads whole:
+one request cost, 6,300,000 bytes, already exceeds it, so no projection of it
+skips three.
+
+**Known limit.** The fast path's projected fraction is a ratio of column
+counts, not of bytes. A statement narrow by count and wide by bytes (a few
+columns holding most of an object's bytes) is estimated to skip more than it
+does and is routed ranged; if its pages then cover 75% of the object the
+coverage crossover reads it whole after the probe and directory reads, and
+below that it pays the ranged requests for a smaller saving than estimated.
+Lowering the break-even from five request costs to three widens the band of
+object sizes where that misroute can happen. This amendment records no wall
+time for the one-column statement A3 expected under 2 s.
+
+Pinned by `the_cost_based_break_even_is_three_request_costs` (ravel-query
+config), `a_3mb_l0_object_reads_whole_on_the_reference_profile`,
+`a_30mb_object_reads_ranged_narrow_and_whole_wide` and
+`the_planned_route_reads_an_object_under_the_break_even_whole` (ravel-query
+`log_fetch_bound`), the fetch half of
+`a_30mb_object_reads_ranged_narrow_and_whole_wide` (ravel-sql
+`logs_fast_path_projection_routing`), and
+`an_explicit_request_cost_flag_keeps_its_deployment_on_the_ranged_route`
+(ravel-server `logs_fetch_policy_e2e`).

@@ -458,7 +458,7 @@ cargo run -p ravel-bench --features sql-latency --bin sql_latency_bench -- \
   intra-region profile no longer resolves to request-minimal behaviour: the
   rate is the profile's time term, 6,300,000 bytes per request, and a narrow
   projection reads an object ranged only where it skips more than the
-  31,500,000-byte projection break-even, so objects of that size or less are
+  18,900,000-byte projection break-even, so objects of that size or less are
   still read whole; `latency-first`
   resolves the byte-minimizing quantities as an intent rather than from prices,
   and pays off only at the concurrency its trade was measured at, which a pass

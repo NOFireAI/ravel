@@ -212,11 +212,13 @@ and `request_latency * per_connection_throughput`, and on the intra-region
 profile, whose prices are zero, the rate is therefore finite instead of
 `u64::MAX`. The routing threshold keeps its configured value, and the
 projection break-even (`ranged_projection_pays`) takes the larger of that
-threshold and five request costs, so a 3 MB L0 object still reads whole and
+threshold and five request costs (three since the issue #2555 amendment
+below), so a 3 MB L0 object still reads whole and
 a 35 MB compacted object at a narrow projection reads ranged. The loopback
 measurement in decision 4 was reasoned about, not re-run, and the result is
 this. Unless `--store-cost-profile` names another profile, a loopback
-deployment resolves the reference profile and its 31,500,000-byte break-even. Decision 4 states no object
+deployment resolves the reference profile and its 31,500,000-byte break-even
+(18,900,000 bytes since the issue #2555 amendment below). Decision 4 states no object
 size; ADR-2414 puts the L0 objects of that layout at about 3 MB each, so on
 that figure each object decision 4 measured sits under the break-even on its
 own (whether an object reads whole depends on its own size, not on the
@@ -233,4 +235,23 @@ it whole anyway (the coverage crossover), because the planned route does not
 weigh the projected fraction. That probe is a request the saturated
 threshold never issued; whether it moves decision 4's concurrent throughput on
 a corpus with objects that large is unmeasured.
+
+## Amendment (2026-10-04, Refs: #2555): the projection break-even is three request costs
+
+<!-- amendment-applies: sections="Amendment (2026-10-03, Refs: #2414): a time term in the cost-based rate and a projection break-even above the routing threshold" pointer="issue #2555 amendment" -->
+
+This is the issue #2555 amendment. ADR-2414's three-request-cost amendment
+lowers the cost-based projection break-even from five request costs to
+three, the larger of the routing threshold and 3 * request cost: 18,900,000
+bytes on the reference profile instead of 31,500,000. The ADR-2414
+amendment above now carries a pointer here at both figures.
+
+Its conclusion for decision 4 holds. A 3 MB L0 object is under one request
+cost, 6,300,000 bytes, so it is under the break-even at either figure, and on
+the reference profile its blocks are still read in one whole-object GET on
+the whole-segment fast path and on the planned route, with no tail probe on
+the planned route. What moves is the band between 18,900,000 and 31,500,000
+bytes: an object there that a narrow projection skips more than 18,900,000
+bytes of reads ranged on the fast path, and the planned route probes every
+object there before the coverage crossover decides.
 
