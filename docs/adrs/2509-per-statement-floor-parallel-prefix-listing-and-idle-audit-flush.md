@@ -37,7 +37,7 @@ measured over 30 hot q1 statements with the background fold disabled:
 | query-audit write | about 123 ms | about 30% | The pipeline waits its `max_age` (25 ms) for a batch that sequential traffic never fills, then writes the data object and its commit record, about 49 ms each, in that order. |
 | GET | about 35 ms | about 8% | One is the catalog HEAD read. It returns NotFound and is never cached, so every statement repeats it. |
 | CPU | 31 ms | about 7% | planning, the declared-stats decode, LIST XML parsing |
-| total wall time | 413 ms | | The four parts account for about 394 ms. Of the remaining 19 ms, 3 ms is the client and about 16 ms is unattributed (HTTP and JSON handling, scheduling). The parts are additive because each step waits on the previous one. |
+| total wall time | 413 ms | | The four parts account for about 394 ms. Of the remaining 19 ms, 3 ms is the client and about 16 ms is unattributed (HTTP and JSON handling, scheduling). Whether the LIST timer includes response parsing is not established; if it does, the LIST and CPU rows overlap by that parse time, and the unattributed share is larger. The parts are additive because each step waits on the previous one. |
 
 - The client contributes about 3 ms.
 - The `stats.phases` request counts agree: 5 LIST and 2 GET, all in
@@ -159,15 +159,21 @@ sequenceDiagram
   lists a superset and the resolved snapshots converge. Concurrency changes
   neither.
 - **Docs this changes.** The retired rationale, that the prefix path's LISTs
-  drain one after another so the cap is checked page by page, appears in five
+  drain one after another so the cap is checked page by page, appears in seven
   places. Each is changed as follows:
   - `docs/catalog-and-mvcc.md`, the "Prefix scan" bullet in the resolve
     steps. This is a normative doc, so it is edited in place to state this
     rule.
+  - `docs/catalog-and-mvcc.md`, the crossover paragraph saying resolve
+    switches to the prefix scan for wide windows "only for its sequential
+    page-by-page request cap". Edited in place: the prefix path is now chosen
+    for a reserved cap, not a sequential one.
   - The doc comment on `list_window_by_prefix`
     (`crates/ravel-catalog/src/catalog.rs`). Edited in place.
   - The doc comment on `DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS`
     (`crates/ravel-catalog/src/config.rs`). Edited in place.
+  - The doc on the `CatalogConfig::prefix_list_crossover_requests` field, in
+    the same file. Edited in place.
   - ADR-1199, section "The measured cost". Its paragraph contrasting the two
     traversals says the prefix path's serial LIST depth is the sum of the
     shards' page counts; under this decision it becomes the maximum, as on the
@@ -188,7 +194,10 @@ sequenceDiagram
   pipeline is idle flushes at once instead of opening a `max_age` window.
   Idle means all three of:
   - nothing else is queued;
-  - no flush is in flight;
+  - no flush is in flight. Today's loop awaits each flush inline, so this
+    always holds when it receives an event. It is stated so the rule stays
+    correct if the flush ever moves off the loop. This decision does not
+    move it;
   - the loop received its previous event at least `max_age` earlier.
 - **Every other event batches exactly as today.** It opens or joins a
   window that flushes at `max_batch` or `max_age`, whichever comes first.
