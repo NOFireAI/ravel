@@ -446,7 +446,9 @@ partition's ranged reads cost its round trips times the request latency, not
 its bytes over its throughput: a ranged open is a probe, a directory read and
 its column ranges in sequence. So while the segment a partition is opening or
 draining was opened ranged, the partition issues the ranged opens of its next
-owned segments ahead of their turn (ADR-2414 decision A2), up to
+owned segments ahead of their turn (ADR-2414 decision A2), each time after the
+current open has been polled, so the current open reserves its bytes first and
+the next segments' round trips still overlap it, up to
 
 ```text
 share = max(2, store_get_concurrency / sql_partition_count)
@@ -469,24 +471,40 @@ it have been emitted.
 Each prefetched open holds the fetched column-chunk bytes of its segment,
 reserved against the fetcher's memory budget like any open's, so a partition
 holds at most `share` times one segment's projected bytes for opened
-segments. That budget is shared across queries, so it can refuse an open the
-sequential walk would not have held at the same time. When it refuses an open
-issued ahead of its turn, or the current open while opens are held behind it,
-the partition does not fail the query: it turns its pipeline off, releases the
-opens it holds behind the current segment (their segments open again at their
-turns), and reopens the refused segment sequentially at its turn. Only a
-refusal of that sequential reopen fails the query, with the typed fetch memory
-error. The scan counts each such fallback in `prefetch_memory_reopens`, at most
-one per partition, and the rows, `segments_opened`, the route split and the
+segments, and a statement at most its partition count times that. The budget
+is one process-wide budget shared by every partition of every statement, so it
+can refuse an open the sequential walk would not have held at the same time.
+A statement keeps every partition's unconsumed prefetches in one pool, a slot
+per partition. When the budget refuses a partition's current open (a first
+open, a consumed prefetch, or the `attrs_raw` reopen), the partition turns the
+statement's pipeline off, drops every partition's unconsumed prefetches, whose
+segments return to the front of their owners' work in owned order and open
+again at their turns, and retries the refused open once, at once. It waits for
+no other partition to be polled: dropping a prefetch releases its bytes. A
+refused retry fails the query with the typed fetch memory error. So within one
+statement a current open is reported refused only if the budget refused it
+twice, the second time after every unconsumed prefetch of every partition of
+the statement had been dropped and the statement's pipeline turned off.
+Between the drain and the retry a sibling's current open may reserve first;
+the retry then meets one open per partition, which is the sequential walk's
+own peak. Across statements the budget stays fail-fast: another statement's
+prefetches can hold the bytes, and that refusal is typed and reported like any
+contended reservation
+(`another_statements_prefetches_fail_an_open_fast_and_typed`). The scan counts
+each retry in `prefetch_memory_reopens` and each dropped prefetch in
+`prefetch_revocations`. The rows, `segments_opened`, the route split and the
 data objects touched are those of the sequential walk
-(`a_prefetch_refused_by_the_memory_budget_reopens_sequentially`); the request,
-byte and decode figures also carry whatever the refused and released opens had
-already read, and a released segment's open start is marked twice on the
-timeline. Three opens stay sequential: a whole-object fast-path open, which is
-never prefetched and stops the pipeline at its turn because an in-flight
-whole-object open holds a full object per slot; every open on the striped
-route; and the `attrs_raw` fallback reopen, which leaves the prefetches
-behind it in flight and consumes them after the reopened scan ends.
+(`a_refused_open_drops_every_partitions_prefetches_and_retries_once`,
+`released_prefetches_go_back_to_work_in_owned_order`); the request, byte and
+decode figures also carry whatever the dropped opens had already read, and a
+dropped segment's open start is marked twice on the timeline. Three opens are
+never prefetched: a whole-object fast-path open, which stops the pipeline at
+its turn because an in-flight whole-object open holds a full object per slot;
+every open on the striped route; and the `attrs_raw` fallback reopen, which
+leaves the prefetches behind it in flight and consumes them after the reopened
+scan ends. A refused `attrs_raw` reopen drops the prefetches behind it like any
+refused open and retries on the row path with the same skip
+(`a_refused_attrs_raw_reopen_drops_the_prefetches_behind_it`).
 
 ## The striped route: directories once per segment, row groups whole
 

@@ -4328,8 +4328,9 @@ impl LogScanStream {
     /// drop itself. Any other error, any error off the fast path, and a
     /// refusal of the retry itself are returned untouched.
     ///
-    /// The property this gives: within one statement a current open is
-    /// reported refused only if the budget refused it twice, the second
+    /// The property this gives: within one statement a current open (a first
+    /// open, a consumed prefetch, or the `attrs_raw` reopen) is reported
+    /// refused only if the budget refused it twice, the second
     /// time after every unconsumed prefetch of every partition of the
     /// statement had been dropped and the statement's pipeline turned off.
     /// Between the drain and the retry a sibling's current open may reserve

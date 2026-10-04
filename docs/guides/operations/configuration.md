@@ -1129,10 +1129,11 @@ same run under a different profile reprices to different numbers.
 
 The two timings are measured constants, not prices: the latency of one request
 from the deployment's hosts and the bytes one connection transfers per second,
-with `timings_measured` naming when and where they were measured. The reference
-values were measured on the reference box of the reference suite,
-intra-region against the object store. They are optional, and set together
-or not at all.
+with `timings_measured` a free-text note of their provenance that nothing
+derives a figure from. The reference values were measured on the reference box
+of the reference suite, intra-region against the object store, and the
+reference profile's note says so and records no date. They are optional, and
+set together or not at all.
 
 Every field except `delete_class_nanodollars` and the three timing fields is
 required. Loading is fail-closed: an unreadable file, invalid TOML, an unknown
@@ -1187,8 +1188,11 @@ is the object size at or below which the ranged fetch reads the whole object
 anyway. The startup line reports the break-even in force as
 `projection_break_even_bytes` with `break_even_source="profile"`; under the
 other policies and when `--logs-request-cost-bytes` is set, which keep the
-routing threshold as the break-even, it reports that threshold (524,288 bytes
-by default) with `break_even_source="routing-threshold"`. The
+routing threshold as the break-even, it reports that threshold with
+`break_even_source="routing-threshold"`: 524,288 bytes by default, but under
+`request-minimal`, and under a `cost-based` resolution whose profile records
+neither prices nor timings, the threshold is saturated and the line prints
+18446744073709551615. The
 coalescing gap, the largest hole between two wanted ranges that one request
 reads through, stays one request cost (at least 64 KiB) under every policy, so
 at the reference profile it is 6,300,000 bytes.
