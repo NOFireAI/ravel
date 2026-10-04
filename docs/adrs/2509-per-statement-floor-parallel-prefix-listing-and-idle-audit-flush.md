@@ -37,7 +37,7 @@ measured over 30 hot q1 statements with the background fold disabled:
 | query-audit write | about 123 ms | about 30% | The pipeline waits its `max_age` (25 ms) for a batch that sequential traffic never fills, then writes the data object and its commit record, about 49 ms each, in that order. |
 | GET | about 35 ms | about 8% | One is the catalog HEAD read. It returns NotFound and is never cached, so every statement repeats it. |
 | CPU | 31 ms | about 7% | planning, the declared-stats decode, LIST XML parsing |
-| total wall time | 413 ms | | The parts sum to it: each step waits on the previous one. |
+| total wall time | 413 ms | | The four parts account for about 394 ms. Of the remaining 19 ms, 3 ms is the client and about 16 ms is unattributed (HTTP and JSON handling, scheduling). The parts are additive because each step waits on the previous one. |
 
 - The client contributes about 3 ms.
 - The `stats.phases` request counts agree: 5 LIST and 2 GET, all in
@@ -158,16 +158,28 @@ sequenceDiagram
   still holds. ADR-0056 itself makes the narrower claim that the prefix path
   lists a superset and the resolved snapshots converge. Concurrency changes
   neither.
-- **Docs this changes.**
-  - The retired wording, "drain sequentially ... refused deterministically",
-    lives only in `docs/catalog-and-mvcc.md` (the prefix-scan bullet under
-    the resolve steps). That is a normative doc, not an ADR, so it is edited
-    in place to state this rule.
-  - What changes in ADR-0056 is its runtime-cap bullet:
-    `WindowTooWide { estimate: <pages issued> }` now reports the pages
-    reserved when the cap was reached, and that number is no longer stable
-    between runs. ADR-0056 gets an amendment naming that bullet, with an
-    inline pointer from the bullet, in the marker syntax
+- **Docs this changes.** The retired rationale, that the prefix path's LISTs
+  drain one after another so the cap is checked page by page, appears in five
+  places. Each is changed as follows:
+  - `docs/catalog-and-mvcc.md`, the "Prefix scan" bullet in the resolve
+    steps. This is a normative doc, so it is edited in place to state this
+    rule.
+  - The doc comment on `list_window_by_prefix`
+    (`crates/ravel-catalog/src/catalog.rs`). Edited in place.
+  - The doc comment on `DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS`
+    (`crates/ravel-catalog/src/config.rs`). Edited in place.
+  - ADR-1199, section "The measured cost". Its paragraph contrasting the two
+    traversals says the prefix path's serial LIST depth is the sum of the
+    shards' page counts; under this decision it becomes the maximum, as on the
+    bounded path. ADR-1199 gets an amendment naming that section, with an
+    inline pointer in the paragraph. The `list_page_depth` figure it governs
+    stays a valid upper bound (`crates/ravel-query/src/io_shape.rs`).
+  - ADR-0056, section "The request ceiling (INTERACTION 1)". Its runtime-cap
+    bullet, `WindowTooWide { estimate: <pages issued> }`, now reports the
+    pages reserved when the cap was reached, and that number is no longer
+    stable between runs. ADR-0056 gets an amendment naming that section, with
+    an inline pointer in the bullet.
+  - Both ADR amendments use the `sections=`/`pointer=` marker syntax that
     `scripts/guards/check-amendment-integrity.sh` checks.
 
 ### 2. The audit pipeline flushes when it is idle
@@ -204,9 +216,16 @@ sequenceDiagram
   each submission finds the pipeline idle.
 - ADR-0062's contract is untouched: every submitter still awaits its batch's
   durable flush before its response is released, in `required` and
-  `best-effort` alike. ADR-0062 gets an amendment, marker `none` with a
-  reason, recording the idle trigger, the cost bound and these numbers,
-  against ADR-0062's PUT-spend rationale.
+  `best-effort` alike.
+- **The ADR-0062 amendment.** ADR-0062 section 2b's worst-case PUT rate
+  ("from 200 PUTs/s to <=80/s" at 100 queries/s and 25 ms batching) doubles
+  under this bound, to at most 160 PUTs/s. So ADR-0062 gets an amendment
+  marked `amendment-applies: sections="2. Audit: one evidential pipeline for
+  every query surface"` with a pointer to the amendment heading, and section 2
+  carries the inline pointer next to that figure. The amendment records:
+  - the idle trigger and its three conditions;
+  - the cost bound, set against ADR-0062's PUT-spend rationale;
+  - the numbers from this decision.
 
 ### 3. A missing catalog HEAD is cached on the resolve path
 
@@ -224,8 +243,12 @@ sequenceDiagram
     cache. A fold that saw a cached absence would rebuild from nothing and
     lose its HEAD CAS.
   - ADR-1133's delete gate does not consult it either.
-- A GET that fails for any reason other than NotFound is not cached. It still
-  falls back to listing, as today.
+- **What writes an absence.** Only a `StoreError::NotFound` from a read that
+  does not bypass the cache. `read_head` also returns no HEAD for any other
+  GET error, a HEAD that fails to decode, and a HEAD whose signal does not
+  match. None of those is cached: each still falls back to listing and logs
+  its warning on every statement, as today. The `bypass_cache: true` re-read
+  on the NotFound-race path neither reads nor writes an absence.
 - **Capacity.** An absence counts as one entry against
   `head_cache_capacity`, like a present HEAD. It is never inserted if
   inserting it would evict a present HEAD: when the cache is full, the
@@ -254,7 +277,8 @@ The implementing tasks' acceptance stamps are measured the same way as Stage 0:
 
 **How the end-to-end bands are derived.**
 - Real S3: the band is the measured components with the listing overlapped
-  to about one round and the 25 ms and one 18 ms GET removed.
+  to about one round and the 25 ms and one 18 ms GET removed. The 19 ms not
+  attributed to any component is carried into the band unchanged.
 - RustFS: the band comes from a model that undershoots by about 70 ms, so
   its upper edge carries that error.
 
