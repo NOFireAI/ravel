@@ -8,8 +8,10 @@
 //! being wrong is either reading bytes from a file that has since been replaced
 //! or exposing Ravel's own objects through an external table.
 //!
-//! Nothing in a shipping binary calls either yet; the grant CLI (#2051) and
-//! `CREATE EXTERNAL TABLE` (#2054) are the callers.
+//! Two shipping callers run both: `ravel-cli tenant parquet-grant add`
+//! (`services/ravel-cli/src/parquet_grant.rs`), and `CREATE EXTERNAL TABLE`
+//! over `POST /api/v1/sql` (`crates/ravel-sql/src/ddl.rs`), which ravel-server
+//! serves when built with its `sql` feature.
 
 use bytes::Bytes;
 use rand::RngExt;

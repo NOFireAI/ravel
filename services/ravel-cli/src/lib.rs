@@ -26,6 +26,9 @@ pub mod rlog_footprint;
 pub mod storage_layout;
 pub mod store;
 pub mod tenancy;
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tenant_kms_routing_tests;
 pub mod tenant_token;
 pub mod typed_attr_column;
 

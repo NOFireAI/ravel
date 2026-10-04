@@ -143,6 +143,7 @@ One-shot catalog fold for one (tenant, signal)
 | `--shards` |  | `4` |  |
 | `--signal` |  | `metrics` | Which signal's snapshot to fold. Defaults to metrics, so an existing invocation keeps its meaning |
 | `--tenant` |  |  |  |
+| `--tenant-kms-config` | `RAVEL_TENANT_KMS_CONFIG` |  | Path to the per-tenant SSE-KMS file ravel-server reads from its own `--tenant-kms-config` (ADR-0062 decision 1): a TOML `[tenants]` table mapping tenant name to KMS key ARN. When the file names the command's `--tenant`, every data object this command writes under that tenant's `t/<tenant_hash>/` prefix is encrypted under that key. The tenant's key-epoch record `t/<tenant_hash>/enc` is a control record that only ravel-server's startup records a key in: when it is absent, or records a different current key, the command refuses before any write; start ravel-server with the file first. A tenant the file does not name is written under the bucket's default encryption, as ravel-server writes it. Requires `--store s3`. A dry run validates the file, reads the key-epoch record and refuses as the real run would, and writes nothing. Absent (the default): every write uses the bucket's default encryption |
 
 ### catalog inspect
 
@@ -198,6 +199,7 @@ Run one compaction pass over a single sealed bucket. A bucket with at least 64 M
 | `--shard` |  |  |  |
 | `--signal` |  |  |  |
 | `--tenant` |  |  |  |
+| `--tenant-kms-config` | `RAVEL_TENANT_KMS_CONFIG` |  | Path to the per-tenant SSE-KMS file ravel-server reads from its own `--tenant-kms-config` (ADR-0062 decision 1): a TOML `[tenants]` table mapping tenant name to KMS key ARN. When the file names the command's `--tenant`, every data object this command writes under that tenant's `t/<tenant_hash>/` prefix is encrypted under that key. The tenant's key-epoch record `t/<tenant_hash>/enc` is a control record that only ravel-server's startup records a key in: when it is absent, or records a different current key, the command refuses before any write; start ravel-server with the file first. A tenant the file does not name is written under the bucket's default encryption, as ravel-server writes it. Requires `--store s3`. A dry run validates the file, reads the key-epoch record and refuses as the real run would, and writes nothing. Absent (the default): every write uses the bucket's default encryption |
 
 ### maintain compact-tenant
 
@@ -217,6 +219,7 @@ Compact every sealed bucket of a whole tenant signal: walk each shard's ingest h
 | `--shards` |  |  | Shard count to walk (shards `0..N`). Omit to resolve it from the tenant's durable shard-count provisioning record; given together with a record, the two must agree. With neither flag nor record the command errors, naming the tenant |
 | `--signal` |  |  |  |
 | `--tenant` |  |  |  |
+| `--tenant-kms-config` | `RAVEL_TENANT_KMS_CONFIG` |  | Path to the per-tenant SSE-KMS file ravel-server reads from its own `--tenant-kms-config` (ADR-0062 decision 1): a TOML `[tenants]` table mapping tenant name to KMS key ARN. When the file names the command's `--tenant`, every data object this command writes under that tenant's `t/<tenant_hash>/` prefix is encrypted under that key. The tenant's key-epoch record `t/<tenant_hash>/enc` is a control record that only ravel-server's startup records a key in: when it is absent, or records a different current key, the command refuses before any write; start ravel-server with the file first. A tenant the file does not name is written under the bucket's default encryption, as ravel-server writes it. Requires `--store s3`. A dry run validates the file, reads the key-epoch record and refuses as the real run would, and writes nothing. Absent (the default): every write uses the bucket's default encryption |
 | `--to-hour` |  |  | Last ingest-hour bucket to consider, inclusive. Omit to stop at the current hour |
 
 ### maintain sweep
@@ -266,6 +269,7 @@ Migrate a (tenant, signal, format family) up to a target format version, then ra
 | `--signal` |  |  |  |
 | `--target-version` |  |  | Target format version to raise the floor to. Defaults to the signal's current supported on-object version |
 | `--tenant` |  |  |  |
+| `--tenant-kms-config` | `RAVEL_TENANT_KMS_CONFIG` |  | Path to the per-tenant SSE-KMS file ravel-server reads from its own `--tenant-kms-config` (ADR-0062 decision 1): a TOML `[tenants]` table mapping tenant name to KMS key ARN. When the file names the command's `--tenant`, every data object this command writes under that tenant's `t/<tenant_hash>/` prefix is encrypted under that key. The tenant's key-epoch record `t/<tenant_hash>/enc` is a control record that only ravel-server's startup records a key in: when it is absent, or records a different current key, the command refuses before any write; start ravel-server with the file first. A tenant the file does not name is written under the bucket's default encryption, as ravel-server writes it. Requires `--store s3`. A dry run validates the file, reads the key-epoch record and refuses as the real run would, and writes nothing. Absent (the default): every write uses the bucket's default encryption |
 
 ### maintain verify-custody
 

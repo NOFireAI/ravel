@@ -1,4 +1,5 @@
-//! A path-style fake S3 endpoint for the store and qualify tests: object PUT
+//! A path-style fake S3 endpoint for the store, qualify and tenant-KMS tests
+//! (the binary's dispatch tests include this file too): object PUT
 //! (with `If-None-Match: *` and `If-Match` preconditions), GET, HEAD, DELETE
 //! and `ListObjectsV2` over an in-memory map, and the bucket subresource GETs
 //! the bucket-protection control plane sends. It honors enough of the object
@@ -42,6 +43,9 @@ pub(crate) struct SeenPut {
     pub key: String,
     /// Every `x-amz-checksum-*` request header, name and value.
     pub checksum_headers: Vec<(String, String)>,
+    /// The `x-amz-server-side-encryption-aws-kms-key-id` header: the KMS key
+    /// the PUT asked to be encrypted under, `None` for the bucket default.
+    pub sse_kms_key_id: Option<String>,
 }
 
 /// One `ListObjectsV2` request as the endpoint received it.
@@ -289,6 +293,10 @@ fn put_object(state: &FakeS3, key: &str, headers: &HeaderMap, body: Bytes) -> Re
     state.puts.lock().expect("puts lock").push(SeenPut {
         key: key.to_string(),
         checksum_headers,
+        sse_kms_key_id: headers
+            .get("x-amz-server-side-encryption-aws-kms-key-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
     });
     let header_text = |name: header::HeaderName| {
         headers
@@ -347,6 +355,13 @@ fn get_object(state: &FakeS3, key: &str, headers: &HeaderMap) -> Response {
         .and_then(|spec| spec.strip_prefix("bytes=")?.split_once('-'))
         .map(|(start, end)| {
             let len = data.len();
+            // A suffix range, `bytes=-N`: the last N bytes, as a footer-first
+            // segment read asks for.
+            if start.trim().is_empty() {
+                let suffix: usize = end.trim().parse().ok()?;
+                let last = len.checked_sub(1)?;
+                return (suffix > 0).then_some((len.saturating_sub(suffix), last));
+            }
             let start: usize = start.trim().parse().ok()?;
             let end = match end.trim() {
                 "" => len.checked_sub(1)?,
@@ -532,4 +547,185 @@ fn xml_escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Tenant data a test seeds through the plain store before it runs a command
+/// against the endpoint. The library's tests and the binary's dispatch tests
+/// both use it, which is why it sits beside the endpoint they share.
+pub(crate) mod seed {
+    use std::collections::BTreeSet;
+
+    use bytes::Bytes;
+    use ravel_commit::keys;
+    use ravel_commit::publish::{self, RetryPolicy};
+    use ravel_commit::record::{self, NewCommitRecord};
+    use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_types::{Signal, TenantId};
+    use uuid::Uuid;
+
+    pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+    /// The key-epoch record `t/<hash>/enc` as ravel-server's startup leaves it
+    /// for a tenant its `--tenant-kms-config` names: epoch 0 under the
+    /// deployment default, then `key_arn` as the current key. ravel-cli
+    /// writes no epoch, so a routed command needs this in place first.
+    pub(crate) async fn key_epochs(store: &dyn ObjectStoreBackend, tenant: &str, key_arn: &str) {
+        let tenant_hash = TenantId::new(tenant).hash();
+        ravel_catalog::record_key_epoch(store, &tenant_hash, "", 0, 500)
+            .await
+            .expect("epoch 0");
+        ravel_catalog::record_key_epoch(store, &tenant_hash, key_arn, 500, 500)
+            .await
+            .expect("epoch 1");
+    }
+
+    fn logs_record(stream: u8, ts_ns: i64) -> LogRecord {
+        let mut id = [0u8; 16];
+        id[0] = stream;
+        LogRecord {
+            stream_id: LogStreamId(id),
+            stream_attrs: ravel_logseg::stream_attrs_bytes(
+                &[(
+                    "service.name".into(),
+                    AttrValue::Str(format!("svc-{stream}")),
+                )],
+                "scope",
+                "1",
+                &[],
+            ),
+            ts_ns,
+            observed_ts_ns: ts_ns,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "get /api ok".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("code".into(), AttrValue::I64(200))],
+        }
+    }
+
+    /// Two L0 `.rlog` objects and their commit records in one sealed logs
+    /// bucket, enough for a compaction to merge rather than report
+    /// `BelowMinInputs`.
+    pub(crate) async fn two_l0_logs(
+        store: &dyn ObjectStoreBackend,
+        tenant: &str,
+        shard: u32,
+        hour: u32,
+    ) {
+        let tenant_hash = TenantId::new(tenant).hash();
+        let base_ns = i64::from(hour) * NS_PER_HOUR;
+        for seq in 1..=2u64 {
+            let records: Vec<LogRecord> = (0..4)
+                .map(|i| {
+                    logs_record(
+                        u8::try_from(i % 2).expect("fits u8"),
+                        base_ns + i64::from(i) * 1_000_000 + i64::try_from(seq).expect("fits i64"),
+                    )
+                })
+                .collect();
+            let writer_id = Uuid::new_v4();
+            let identity = ObjectIdentity {
+                tenant_hash: tenant_hash.0,
+                shard,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: 1,
+                writer_seq: seq,
+            };
+            let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+            for r in &records {
+                writer.push(r.clone()).expect("push");
+            }
+            let bytes = Bytes::from(writer.finish().expect("finish L0"));
+            let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+            let data_key = keys::data_key(
+                &tenant_hash,
+                Signal::Logs,
+                shard,
+                writer_id,
+                1,
+                seq,
+                &content_hash,
+            )
+            .expect("data key");
+            store
+                .put(&data_key, bytes.clone(), PutOptions::default())
+                .await
+                .expect("put data object");
+
+            let streams: BTreeSet<LogStreamId> = records.iter().map(|r| r.stream_id).collect();
+            let min_ts = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+            let max_ts = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+            let created = base_ns + i64::try_from(seq).expect("fits i64") * 1_000_000;
+            let rec = record::build(NewCommitRecord {
+                tenant_hash,
+                signal: Signal::Logs,
+                shard,
+                writer_id,
+                writer_epoch: 1,
+                writer_seq: seq,
+                object_size: bytes.len() as u64,
+                content_hash,
+                sample_count: records.len() as u64,
+                series_count: streams.len() as u64,
+                min_event_ts_ns: min_ts,
+                max_event_ts_ns: max_ts,
+                min_ingest_ts_ns: created,
+                max_ingest_ts_ns: created,
+                segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+                created_unix_ns: created,
+                ingest_hour_bucket: hour,
+            })
+            .expect("build commit record");
+            let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+            store
+                .put(&commit_key, record::encode(&rec), PutOptions::default())
+                .await
+                .expect("put commit record");
+        }
+    }
+
+    /// Publish one sealed metrics commit record and its placeholder data
+    /// object.
+    pub(crate) async fn metrics_l0(
+        store: &dyn ObjectStoreBackend,
+        tenant: &str,
+        shard: u32,
+        seq: u64,
+        created_unix_ns: i64,
+    ) {
+        let tenant_hash = TenantId::new(tenant).hash();
+        let ingest_hour_bucket = u32::try_from(created_unix_ns / NS_PER_HOUR).expect("fits u32");
+        let payload = format!("seg-{shard}-{seq}").into_bytes();
+        let content_hash = *blake3::hash(&payload).as_bytes();
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard,
+            writer_id: Uuid::new_v4(),
+            writer_epoch: 1,
+            writer_seq: seq,
+            object_size: payload.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created_unix_ns - 1_000,
+            max_event_ts_ns: created_unix_ns,
+            min_ingest_ts_ns: created_unix_ns - 1_000,
+            max_ingest_ts_ns: created_unix_ns,
+            segment_format_version: 1,
+            created_unix_ns,
+            ingest_hour_bucket,
+        })
+        .expect("valid record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        publish::put_data_object(store, &data_key, Bytes::from(payload))
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
 }

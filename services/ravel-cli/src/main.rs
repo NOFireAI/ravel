@@ -1483,6 +1483,8 @@ enum MaintainCommand {
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
+        #[command(flatten)]
+        tenant_kms: store::TenantKmsArgs,
     },
     /// Compact every sealed bucket of a whole tenant signal: walk each shard's
     /// ingest hours and run the same per-bucket compaction `compact-bucket`
@@ -1609,6 +1611,8 @@ enum MaintainCommand {
         /// compactor default).
         #[arg(long, value_name = "LEVEL")]
         compaction_zstd_level: Option<i32>,
+        #[command(flatten)]
+        tenant_kms: store::TenantKmsArgs,
     },
     /// Run one sweep pass (orphan GC, superseded, unreferenced segments) over a shard.
     Sweep {
@@ -1706,6 +1710,8 @@ enum MaintainCommand {
         /// default: such a bucket is then reported as reencode_blocked.
         #[arg(long)]
         reencode_compaction_parts: bool,
+        #[command(flatten)]
+        tenant_kms: store::TenantKmsArgs,
     },
     /// Re-verify the content-addressed chain for a tenant at rest (both
     /// signals): every live data object's content still hashes to the hash16
@@ -1773,6 +1779,8 @@ enum CatalogCommand {
         /// text report. Either form carries every counter on the report.
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        tenant_kms: store::TenantKmsArgs,
     },
     /// Decode and print HEAD and every referenced snapshot part for one
     /// (tenant, signal).
@@ -1798,8 +1806,33 @@ enum CatalogCommand {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    run(Cli::parse()).await
+}
 
+/// Install `scheme` process-wide. A second install of the scheme already in
+/// force (a test driving [`run`] more than once) is accepted; a different one
+/// is refused.
+fn install_tenant_hash_scheme(scheme: ravel_types::TenantHashScheme) -> anyhow::Result<()> {
+    match ravel_types::install_tenant_hash_scheme(scheme) {
+        Ok(()) => Ok(()),
+        Err(rejected) => {
+            let probe = TenantId::new("ravel-cli-scheme-probe");
+            if rejected.hash(&probe) == probe.hash() {
+                Ok(())
+            } else {
+                anyhow::bail!("tenant-hash scheme was already installed")
+            }
+        }
+    }
+}
+
+async fn run(cli: Cli) -> anyhow::Result<()> {
+    run_logged(cli, &mut std::io::stderr()).await
+}
+
+/// [`run`], writing the `--tenant-kms-config` routing line to `log` rather
+/// than stderr.
+async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
     // Before running any subcommand that computes a tenant hash, resolve the
     // bucket's real tenant-hash scheme from `sys/tenancy` and install it
     // process-wide. Without this a hashing command would silently use the
@@ -1818,8 +1851,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             tenancy::resolve_scheme(store.as_ref(), configured).await?
         };
-        ravel_types::install_tenant_hash_scheme(scheme)
-            .map_err(|_| anyhow::anyhow!("tenant-hash scheme was already installed"))?;
+        install_tenant_hash_scheme(scheme)?;
     } else if command_is_write(&cli.command) {
         // A writing command that does not hash a tenant (`gc-config set`:
         // `sys/gc` is a bucket-root object) still writes into the same
@@ -1935,9 +1967,11 @@ async fn main() -> anyhow::Result<()> {
                     signal,
                     max_flush_lifetime,
                     json,
+                    tenant_kms,
                 },
         } => catalog::fold(
-            store::build_store(&cli.store)?,
+            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
+                .await?,
             cli.store.selection(),
             &tenant,
             shards,
@@ -1989,10 +2023,19 @@ async fn main() -> anyhow::Result<()> {
                     l1_part_memory_target_bytes,
                     max_l1_part_bytes,
                     compaction_zstd_level,
+                    tenant_kms,
                 },
         } => {
             maintain::compact_with_part_split_targets(
-                store::build_store(&cli.store)?,
+                store::build_tenant_data_store(
+                    &cli.store,
+                    &tenant_kms,
+                    &tenant,
+                    dry_run,
+                    now_ns()?,
+                    log,
+                )
+                .await?,
                 cli.store.selection(),
                 &tenant,
                 signal,
@@ -2023,9 +2066,18 @@ async fn main() -> anyhow::Result<()> {
                     input_read_concurrency,
                     bucket_concurrency,
                     compaction_zstd_level,
+                    tenant_kms,
                 },
         } => maintain::compact_tenant(
-            store::build_store(&cli.store)?,
+            store::build_tenant_data_store(
+                &cli.store,
+                &tenant_kms,
+                &tenant,
+                dry_run,
+                now_ns()?,
+                log,
+            )
+            .await?,
             cli.store.selection(),
             &tenant,
             signal,
@@ -2124,10 +2176,19 @@ async fn main() -> anyhow::Result<()> {
                     no_claim,
                     dry_run,
                     reencode_compaction_parts,
+                    tenant_kms,
                 },
         } => {
             maintain::migrate(
-                store::build_store(&cli.store)?,
+                store::build_tenant_data_store(
+                    &cli.store,
+                    &tenant_kms,
+                    &tenant,
+                    dry_run,
+                    now_ns()?,
+                    log,
+                )
+                .await?,
                 cli.store.selection(),
                 &tenant,
                 signal,
@@ -3587,6 +3648,57 @@ mod tests {
              allocation: the process is not running under the jemalloc global allocator"
         );
         std::hint::black_box(big);
+    }
+
+    /// Every subcommand path, space-joined, whose own arguments include
+    /// `--tenant-kms-config`.
+    fn paths_taking_tenant_kms_config(
+        command: &clap::Command,
+        prefix: &str,
+        out: &mut Vec<String>,
+    ) {
+        for sub in command.get_subcommands() {
+            let path = if prefix.is_empty() {
+                sub.get_name().to_string()
+            } else {
+                format!("{prefix} {}", sub.get_name())
+            };
+            if sub
+                .get_arguments()
+                .any(|arg| arg.get_long() == Some("tenant-kms-config"))
+            {
+                out.push(path.clone());
+            }
+            paths_taking_tenant_kms_config(sub, &path, out);
+        }
+    }
+
+    /// Issue #2363: `--tenant-kms-config` is taken by exactly the commands
+    /// that write tenant data under the Maintain credential, and by nothing
+    /// else. Every Admin command that writes a control record (`hold set`,
+    /// `erase submit`, `commit reconstruct`, `provision`, `tenant
+    /// parquet-grant`, `typed-attr-column set`, `clustering-key`, `bloom-scope`)
+    /// has no way to receive it, so its writes stay under the bucket's default
+    /// encryption, as ADR-0055's Decrypt-only Admin role requires.
+    ///
+    /// Non-vacuity: drop the `tenant_kms` field from `MaintainCommand::Migrate`
+    /// and the set loses `maintain migrate`; flatten `TenantKmsArgs` into
+    /// `HoldCommand::Set` and it gains `hold set`. Either fails the equality.
+    #[test]
+    fn only_maintain_credential_data_writers_take_tenant_kms_config() {
+        use clap::CommandFactory;
+        let mut got = Vec::new();
+        paths_taking_tenant_kms_config(&Cli::command(), "", &mut got);
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "catalog fold",
+                "maintain compact-bucket",
+                "maintain compact-tenant",
+                "maintain migrate",
+            ]
+        );
     }
 
     /// `load --signal` defaults to logs and accepts all three signal names
@@ -5233,5 +5345,396 @@ mod cli_reference_tests {
             "docs/reference/ravel-cli-flags.md is stale. Regenerate it with:\n  \
              {REGEN}\nMarkers: {BEGIN_MARKER} .. {END_MARKER}"
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, dead_code)]
+#[path = "fake_s3.rs"]
+mod fake_s3;
+
+/// `--tenant-kms-config` driven through [`run`], the function `main` calls,
+/// for each command that takes it, against a key-epoch record ravel-server's
+/// startup already wrote with the file's key: a real run's data writes under
+/// the tenant's prefix carry the tenant key and no key epoch is written, and
+/// a dry run logs the routing line and writes nothing under that prefix.
+/// These pin each call site's `dry_run` argument, which the library tests of
+/// `build_tenant_data_store` cannot see.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tenant_kms_dispatch_tests {
+    use std::io::Write;
+
+    use clap::Parser;
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_types::{Signal, TenantId};
+
+    use super::fake_s3::seed::{self, NS_PER_HOUR};
+    use super::fake_s3::{Echo, FakeS3, SeenPut, spawn};
+    use super::{Cli, run_logged, store};
+
+    const TENANT: &str = "acme";
+    const TENANT_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-key";
+    const HOUR: u32 = 100;
+
+    fn kms_file() -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp file");
+        write!(file, "[tenants]\n{TENANT} = \"{TENANT_KEY}\"\n").expect("write kms file");
+        file
+    }
+
+    fn store_flags(endpoint: &str) -> Vec<String> {
+        [
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+            "--tenant-hash-unkeyed",
+        ]
+        .map(str::to_string)
+        .to_vec()
+    }
+
+    fn plain_store(endpoint: &str) -> std::sync::Arc<dyn ObjectStoreBackend> {
+        let flags = store_flags(endpoint);
+        let without_tenancy = &flags[..flags.len() - 1];
+        let args = store::StoreArgs::try_parse_from(without_tenancy).expect("store flags parse");
+        store::build_store(&args).expect("plain store")
+    }
+
+    /// Parse `command` after the global store flags, with the KMS file, and
+    /// run it exactly as `main` does, returning what it logged in place of
+    /// stderr.
+    async fn run_command_logged(
+        endpoint: &str,
+        file: &tempfile::NamedTempFile,
+        command: &[&str],
+    ) -> (anyhow::Result<()>, String) {
+        let mut argv = store_flags(endpoint);
+        argv.extend(command.iter().map(|arg| arg.to_string()));
+        argv.push("--tenant-kms-config".to_string());
+        argv.push(file.path().display().to_string());
+        let mut log = Vec::new();
+        let result = run_logged(Cli::try_parse_from(argv).expect("command parses"), &mut log).await;
+        (result, String::from_utf8(log).expect("utf-8 log"))
+    }
+
+    async fn run_command(
+        endpoint: &str,
+        file: &tempfile::NamedTempFile,
+        command: &[&str],
+    ) -> anyhow::Result<()> {
+        run_command_logged(endpoint, file, command).await.0
+    }
+
+    fn routing_line() -> String {
+        format!("tenant-kms: tenant \"{TENANT}\" writes are encrypted under {TENANT_KEY}\n")
+    }
+
+    /// The key-epoch record as ravel-server's startup leaves it for the
+    /// file's key.
+    async fn seed_server_epochs(endpoint: &str) {
+        seed::key_epochs(plain_store(endpoint).as_ref(), TENANT, TENANT_KEY).await;
+    }
+
+    fn tenant_prefix() -> String {
+        format!("t/{}/", TenantId::new(TENANT).hash().to_hex())
+    }
+
+    fn tenant_puts_since(fake: &FakeS3, start: usize) -> Vec<SeenPut> {
+        let prefix = tenant_prefix();
+        fake.puts()
+            .into_iter()
+            .skip(start)
+            .filter(|put| put.key.starts_with(&prefix))
+            .collect()
+    }
+
+    /// The command wrote no key epoch, and every write under the tenant's
+    /// prefix carried the tenant key. Returns those routed keys.
+    fn assert_routed(data: &[SeenPut]) -> Vec<String> {
+        let enc = format!("{}enc", tenant_prefix());
+        assert_eq!(
+            data.iter().filter(|put| put.key == enc).count(),
+            0,
+            "ravel-cli writes no key epoch"
+        );
+        let unrouted: Vec<(&str, Option<&str>)> = data
+            .iter()
+            .filter(|put| put.sse_kms_key_id.as_deref() != Some(TENANT_KEY))
+            .map(|put| (put.key.as_str(), put.sse_kms_key_id.as_deref()))
+            .collect();
+        assert!(
+            unrouted.is_empty(),
+            "every data write must carry {TENANT_KEY}; these did not: {unrouted:?}"
+        );
+        assert!(!data.is_empty(), "the command wrote tenant data");
+        data.iter().map(|put| put.key.clone()).collect()
+    }
+
+    fn assert_nothing_written(fake: &FakeS3, start: usize) {
+        assert_eq!(
+            tenant_puts_since(fake, start),
+            Vec::new(),
+            "nothing is written under the tenant's prefix, not even enc"
+        );
+    }
+
+    async fn seeded_logs(endpoint: &str) {
+        seed_server_epochs(endpoint).await;
+        seed::two_l0_logs(plain_store(endpoint).as_ref(), TENANT, 0, HOUR).await;
+    }
+
+    const COMPACT_BUCKET: [&str; 10] = [
+        "maintain",
+        "compact-bucket",
+        "--tenant",
+        TENANT,
+        "--signal",
+        "logs",
+        "--shard",
+        "0",
+        "--hour",
+        "100",
+    ];
+    const COMPACT_TENANT: [&str; 12] = [
+        "maintain",
+        "compact-tenant",
+        "--tenant",
+        TENANT,
+        "--signal",
+        "logs",
+        "--shards",
+        "1",
+        "--from-hour",
+        "100",
+        "--to-hour",
+        "100",
+    ];
+    const MIGRATE: [&str; 8] = [
+        "maintain", "migrate", "--tenant", TENANT, "--signal", "logs", "--shards", "1",
+    ];
+
+    /// Non-vacuity: pass `true` for `dry_run` at the compact-bucket call site
+    /// in `run_logged` and the routed-write assertion fails: every L1 part
+    /// unrouted.
+    #[tokio::test]
+    async fn compact_bucket_real_run_routes_through_the_tenant_key() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        seeded_logs(&endpoint).await;
+        let start = fake.puts().len();
+        run_command(&endpoint, &kms_file(), &COMPACT_BUCKET)
+            .await
+            .expect("compact-bucket runs");
+        let routed = assert_routed(&tenant_puts_since(&fake, start));
+        assert!(routed.iter().any(|key| key.contains("/l1/")), "{routed:?}");
+    }
+
+    /// Non-vacuity: pass `false` for `dry_run` at the compact-bucket call site
+    /// and the routed store is built, so the compaction writes its L1 parts.
+    #[tokio::test]
+    async fn compact_bucket_dry_run_writes_nothing() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        seeded_logs(&endpoint).await;
+        let start = fake.puts().len();
+        let mut command = COMPACT_BUCKET.to_vec();
+        command.push("--dry-run");
+        let (result, log) = run_command_logged(&endpoint, &kms_file(), &command).await;
+        result.expect("compact-bucket dry run");
+        assert_eq!(
+            log,
+            routing_line(),
+            "a dry run logs the real run's routing line"
+        );
+        assert_nothing_written(&fake, start);
+    }
+
+    /// A dry run refuses a differing recorded key with the real run's message.
+    ///
+    /// Non-vacuity: drop the `check_tenant_kms_records` call from the dry-run
+    /// branch of `build_tenant_data_store` and the dry run succeeds.
+    #[tokio::test]
+    async fn compact_bucket_dry_run_refuses_a_differing_recorded_key() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        let plain = plain_store(&endpoint);
+        seed::key_epochs(plain.as_ref(), TENANT, RECORDED_KEY).await;
+        seed::two_l0_logs(plain.as_ref(), TENANT, 0, HOUR).await;
+        let start = fake.puts().len();
+        let mut command = COMPACT_BUCKET.to_vec();
+        command.push("--dry-run");
+        let err = run_command(&endpoint, &kms_file(), &command)
+            .await
+            .expect_err("a differing recorded key refuses the dry run");
+        assert_eq!(err.to_string(), differing_key_refusal());
+        assert_nothing_written(&fake, start);
+    }
+
+    #[tokio::test]
+    async fn compact_tenant_real_run_routes_through_the_tenant_key() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        seeded_logs(&endpoint).await;
+        let start = fake.puts().len();
+        run_command(&endpoint, &kms_file(), &COMPACT_TENANT)
+            .await
+            .expect("compact-tenant runs");
+        let routed = assert_routed(&tenant_puts_since(&fake, start));
+        assert!(routed.iter().any(|key| key.contains("/l1/")), "{routed:?}");
+    }
+
+    #[tokio::test]
+    async fn compact_tenant_dry_run_writes_nothing() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        seeded_logs(&endpoint).await;
+        let start = fake.puts().len();
+        let mut command = COMPACT_TENANT.to_vec();
+        command.push("--dry-run");
+        let (result, log) = run_command_logged(&endpoint, &kms_file(), &command).await;
+        result.expect("compact-tenant dry run");
+        assert_eq!(log, routing_line());
+        assert_nothing_written(&fake, start);
+    }
+
+    async fn provisioned_logs(endpoint: &str) {
+        let plain = plain_store(endpoint);
+        ravel_catalog::validate_or_adopt(
+            plain.as_ref(),
+            &TenantId::new(TENANT).hash(),
+            Signal::Logs,
+            1,
+            0,
+            ravel_catalog::AbsentPolicy::CreateFromConfig,
+        )
+        .await
+        .expect("provision");
+        seed::key_epochs(plain.as_ref(), TENANT, TENANT_KEY).await;
+        seed::two_l0_logs(plain.as_ref(), TENANT, 0, HOUR).await;
+    }
+
+    /// A walk with nothing below the target still raises the floor, which
+    /// rewrites the provisioning record: a routed data write.
+    #[tokio::test]
+    async fn migrate_real_run_routes_through_the_tenant_key() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        provisioned_logs(&endpoint).await;
+        let start = fake.puts().len();
+        run_command(&endpoint, &kms_file(), &MIGRATE)
+            .await
+            .expect("migrate runs");
+        let routed = assert_routed(&tenant_puts_since(&fake, start));
+        assert!(
+            routed.iter().any(|key| key.ends_with("/prov")),
+            "{routed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn migrate_dry_run_writes_nothing() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        provisioned_logs(&endpoint).await;
+        let start = fake.puts().len();
+        let mut command = MIGRATE.to_vec();
+        command.push("--dry-run");
+        let (result, log) = run_command_logged(&endpoint, &kms_file(), &command).await;
+        result.expect("migrate dry run");
+        assert_eq!(log, routing_line());
+        assert_nothing_written(&fake, start);
+    }
+
+    /// `catalog fold` has no dry run; its call site passes `false`.
+    #[tokio::test]
+    async fn catalog_fold_routes_through_the_tenant_key() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        let now = ravel_cli::now_ns().expect("wall clock");
+        seed::metrics_l0(
+            plain_store(&endpoint).as_ref(),
+            TENANT,
+            0,
+            1,
+            now - 3 * NS_PER_HOUR,
+        )
+        .await;
+        seed_server_epochs(&endpoint).await;
+        let start = fake.puts().len();
+        run_command(
+            &endpoint,
+            &kms_file(),
+            &[
+                "catalog", "fold", "--tenant", TENANT, "--shards", "1", "--signal", "metrics",
+            ],
+        )
+        .await
+        .expect("fold runs");
+        let routed = assert_routed(&tenant_puts_since(&fake, start));
+        let head = format!("{}catalog/m/HEAD", tenant_prefix());
+        assert!(routed.contains(&head), "{routed:?}");
+    }
+
+    const RECORDED_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-old-key";
+
+    fn differing_key_refusal() -> String {
+        format!(
+            "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): tenant \
+             \"{TENANT}\" has key \"{RECORDED_KEY}\" recorded as its current key epoch at \
+             t/{}/enc, but --tenant-kms-config names \"{TENANT_KEY}\": a key change is recorded \
+             by ravel-server at startup, never by this command. Refusing before any write; \
+             start ravel-server with the new key first, or run this command with the file the \
+             servers run with",
+            TenantId::new(TENANT).hash().to_hex()
+        )
+    }
+
+    /// The refusal reaches the operator as the command's error, before the
+    /// command writes anything under the tenant's prefix.
+    #[tokio::test]
+    async fn a_differing_recorded_key_refuses_the_command() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        let plain = plain_store(&endpoint);
+        seed::key_epochs(plain.as_ref(), TENANT, RECORDED_KEY).await;
+        seed::two_l0_logs(plain.as_ref(), TENANT, 0, HOUR).await;
+        let start = fake.puts().len();
+
+        let err = run_command(&endpoint, &kms_file(), &COMPACT_BUCKET)
+            .await
+            .expect_err("a differing recorded key refuses");
+        assert_eq!(err.to_string(), differing_key_refusal());
+        assert_nothing_written(&fake, start);
+    }
+
+    /// A tenant with no key-epoch record refuses the command: ravel-cli
+    /// records no key, so the operator starts ravel-server with the file
+    /// first. Nothing is written under the tenant's prefix, enc included.
+    ///
+    /// Non-vacuity: make `epoch_action` return `Ok(EpochAction::Bootstrap)`
+    /// for an absent record under `KeyChangePolicy::Refuse` and the command
+    /// runs, writing epochs 0 and 1 and its L1 parts.
+    #[tokio::test]
+    async fn an_absent_key_epoch_record_refuses_the_command() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        seed::two_l0_logs(plain_store(&endpoint).as_ref(), TENANT, 0, HOUR).await;
+        let start = fake.puts().len();
+
+        let err = run_command(&endpoint, &kms_file(), &COMPACT_BUCKET)
+            .await
+            .expect_err("an absent record refuses");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): tenant \
+                 \"{TENANT}\" has no key-epoch record at t/{}/enc, but --tenant-kms-config \
+                 names \"{TENANT_KEY}\" for it: a tenant's key epochs are recorded by \
+                 ravel-server at startup, never by this command. Refusing before any write; \
+                 start ravel-server with this --tenant-kms-config file first, then rerun this \
+                 command",
+                TenantId::new(TENANT).hash().to_hex()
+            )
+        );
+        assert_nothing_written(&fake, start);
     }
 }
