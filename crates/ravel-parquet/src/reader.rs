@@ -376,10 +376,14 @@ impl PinnedParquetReader {
             // a refused flight: the attempts are capped, so the last
             // unconsulted refusal is reported the same shape a store error
             // would be, rather than retried again.
-            SingleFlightError::Upstream(CacheFetchError::BudgetRefused { message, .. }) => {
+            SingleFlightError::Upstream(CacheFetchError::BudgetRefused { .. }) => {
                 ParquetReadError::Store {
                     key,
-                    source: Arc::new(StoreError::Transient(message)),
+                    source: Arc::new(StoreError::Transient(
+                        "another query's request or byte budget refused the shared read this \
+                         one joined"
+                            .to_string(),
+                    )),
                 }
             }
             SingleFlightError::Upstream(CacheFetchError::Store(source)) => match *source {
@@ -1901,7 +1905,7 @@ mod tests {
     /// version 2 data page: the header keeps its version 1 fields and has no
     /// version 2 fields.
     fn data_page_retyped_as_v2() -> Vec<u8> {
-        let mut bytes = valid();
+        let bytes = valid();
         let end = bytes.len() - TRAILER_LEN as usize;
         let metadata = ParquetMetaDataReader::decode_metadata(
             &bytes[end - footer_len_of(&bytes) as usize..end],
@@ -1909,11 +1913,9 @@ mod tests {
         .expect("footer");
         let at = metadata.row_group(0).column(1).data_page_offset();
         let at = usize::try_from(at).expect("offset");
-        // Field 1 (`type`, an i32) of the compact-protocol PageHeader:
-        // DATA_PAGE (0) as a zigzag varint becomes DATA_PAGE_V2 (3).
-        assert_eq!(bytes[at..at + 2], [0x15, 0x00], "a data page header");
-        bytes[at + 1] = 0x06;
-        bytes
+        // Field 1 (`type`) of the compact-protocol PageHeader: DATA_PAGE (0)
+        // becomes DATA_PAGE_V2 (3).
+        retype_page_header(&bytes, at, 0, 3)
     }
 
     /// [`valid`] with column `a`'s one data page retyped from `PLAIN` to
@@ -1949,8 +1951,8 @@ mod tests {
     /// (the footer cannot tell whether a chunk's first page is a dictionary
     /// page).
     ///
-    /// Retyping an actual dictionary page's own top-level header (the literal
-    /// shape its name describes) does not reach this panic in parquet-58.4.0:
+    /// Retyping an actual dictionary page's own top-level header as a data
+    /// page does not reach this panic in parquet-58.4.0:
     /// `decode_page` has an explicit typed-error path for a mismatch between
     /// a `PageHeader`'s `type` field and the nested header struct it carries,
     /// which a type that no longer matches its own nested header always is.
@@ -1961,7 +1963,7 @@ mod tests {
     /// the column reader tries to use the decoder slot the claimed encoding
     /// names.
     #[test]
-    fn a_dictionary_page_retyped_as_a_data_page_is_refused_as_corrupt() {
+    fn a_data_page_claiming_dictionary_encoding_is_refused_as_corrupt() {
         let bytes = data_page_retyped_as_dictionary_encoded();
         let got = scan_second_file_where(bytes, Some(page_pruning_filter()));
         assert_decoder_panic(&got.expect_err("the retyped data page must fail the scan"));
@@ -2703,6 +2705,12 @@ mod tests {
         );
         assert!(matches!(b_err, ParquetReadError::Store { .. }), "{b_err:?}");
         assert!(
+            b_err.to_string().contains(
+                "another query's request or byte budget refused the shared read this one joined"
+            ),
+            "the error blames the flight B joined, not B's own budget: {b_err}"
+        );
+        assert!(
             recording.ranges().is_empty(),
             "no flight, nor a fourth attempt under B's own untouched budget, \
              ever issued a GET"
@@ -3237,7 +3245,9 @@ mod tests {
             first.is_pending(),
             "the late caller waits on its gated disk peek"
         );
-        disk_peek.entered().await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), disk_peek.entered())
+            .await
+            .expect("the late caller's disk peek reaches its gate");
         assert_eq!(
             tiered.in_flight_waiters(&key),
             0,
