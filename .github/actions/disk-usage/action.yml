@@ -2,9 +2,10 @@ name: Disk usage
 description: >-
   Measure how close a job comes to filling the runner's root volume. The
   start phase prints free space and samples it every 15 seconds for the rest
-  of the job; the report phase prints the lowest sample and fails the job
-  when it is under the floor. The cache save that runs after a job's last
-  step is outside the measurement.
+  of the job; the report phase prints the lowest sample, a lower bound on what
+  the lowest would have been without the free-disk-space cleanup, and fails
+  the job when the lowest sample is under the floor. The cache save that runs
+  after a job's last step is outside the measurement.
 inputs:
   phase:
     description: >-
@@ -15,7 +16,9 @@ inputs:
     description: >-
       Report phase only. The job fails when the lowest sample is below this
       many GiB, so a lane drifting toward a full disk goes red with a number
-      before it goes red with a linker error.
+      before it goes red with a linker error. Hosted runners start these
+      lanes with about 86 GiB free (88,061 MiB measured on two lanes of run
+      37192526596), so the default is an alarm far from normal operation.
     required: false
     default: "3"
 runs:
@@ -41,12 +44,13 @@ runs:
           report)
             df -h /
             cleanup_log="${RUNNER_TEMP}/free-disk-space.log"
+            cleanup_freed="${RUNNER_TEMP}/free-disk-space-freed-kb"
             if [ -s "$cleanup_log" ]; then
               echo "background cleanup output:"
               cat "$cleanup_log"
             fi
             if [ ! -s "$samples" ]; then
-              echo "::error::no free-space samples were recorded; the start phase did not run"
+              echo "::error::no free-space samples were recorded: the start phase did not run, or the job was cancelled before it"
               exit 1
             fi
             count=$(wc -l < "$samples")
@@ -55,6 +59,16 @@ runs:
             floor_kb=$((DISK_USAGE_MIN_FREE_GB * 1024 * 1024))
             echo "free space before cleanup: $((first_kb / 1024)) MiB"
             echo "lowest free space: $((min_kb / 1024)) MiB over ${count} samples"
+            if [ -s "$cleanup_freed" ]; then
+              freed_kb=$(awk 'NR == 1 { print $1 }' "$cleanup_freed")
+              echo "cleanup freed: $((freed_kb / 1024)) MiB"
+              # A lower bound: it takes the whole of what the cleanup freed off
+              # the lowest sample, including samples taken before the cleanup
+              # had freed it.
+              echo "lowest free space without the cleanup: at least $(((min_kb - freed_kb) / 1024)) MiB"
+            elif [ -e "$cleanup_log" ]; then
+              echo "the background cleanup had not finished; what it freed is unknown for this run"
+            fi
             if [ "$min_kb" -lt "$floor_kb" ]; then
               echo "::error::free space fell to $((min_kb / 1024)) MiB, under the ${DISK_USAGE_MIN_FREE_GB} GiB floor"
               exit 1

@@ -81,8 +81,10 @@ jobs then do not each recompile the overlapping crates from scratch.
 - Those lanes also run `.github/actions/disk-usage` twice: `phase: start`
   before the cleanup, which prints free space and samples it every 15
   seconds, and `phase: report` as the last step, which prints the lowest
-  sample and fails the job under a 3 GiB floor. The cache save that runs
-  after a job's last step is outside the measurement.
+  sample, what the background cleanup freed, a lower bound on the lowest
+  free space without the cleanup, and fails the job when the lowest sample
+  is under a 3 GiB floor. The cache save that runs after a job's last step
+  is outside the measurement.
 
 You do not need sccache or nextest on your machine. `cargo check` and the gate
 list above are enough for the local loop.

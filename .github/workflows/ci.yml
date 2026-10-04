@@ -827,7 +827,9 @@ jobs:
           persist-credentials: false
       # Sampled from here to the report step at the end of the job, so the
       # question of whether this lane needs the cleanup at all (ADR-0053 D4)
-      # has a number: free space before the cleanup, and the lowest it fell.
+      # has numbers: free space before the cleanup, the lowest it fell, what
+      # the cleanup freed, and from those a lower bound on the lowest it would
+      # have fallen without the cleanup.
       # Background cleanup (issue #2517): this lane pulls no container image,
       # and the space is first needed at link time, minutes after this step.
       - uses: ./.github/actions/disk-usage
