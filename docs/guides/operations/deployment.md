@@ -346,7 +346,10 @@ operator credential rather than a service credential:
 - On a deployment that runs `--tenant-kms-config`, pass the same file to the
   four of those that write tenant data: `maintain compact-bucket`,
   `maintain compact-tenant`, `maintain migrate` and `catalog fold`. They route
-  their writes through the tenant's key exactly as the servers do. Without
+  their data writes through the tenant's key exactly as the servers do. They
+  never record a key change: when the tenant's key-epoch record names a
+  different current key than the file, the command refuses before writing
+  anything, so roll a new key out to the servers first. Without
   the flag they write under the bucket's default encryption, and nothing
   fails: only the encryption key of what they wrote differs. The control
   records the Admin credential writes stay under the bucket's default

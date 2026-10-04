@@ -6202,12 +6202,16 @@ fn maintain_template_covers_every_maintain_migrate_call() {
 
 /// Issue #2363: under `--tenant-kms-config`, `ravel-cli maintain
 /// compact-bucket`, `compact-tenant`, `migrate` and `catalog fold` route their
-/// tenant writes through the tenant's KMS key, under the Maintain credential.
-/// Each key class they write is one the real routing predicate routes, one
-/// `maintain.json` grants a PUT of the kind the command sends, and Maintain
-/// holds both `kms:Encrypt` and `kms:GenerateDataKey*`, so a routed write
-/// reaches the key rather than failing closed. The key-epoch record the
-/// command bootstraps first is checked the same way.
+/// tenant data writes through the tenant's KMS key, under the Maintain
+/// credential: L1 parts, compaction records, catalog snapshot parts, `HEAD`
+/// and `idx` objects, and `migrate`'s cursor and `prov` floor raise. Each of
+/// those key classes is one the real routing predicate routes and one
+/// `maintain.json` grants a PUT of the kind the command sends. Maintain holds
+/// both `kms:Encrypt` and `kms:GenerateDataKey*`, granted to the whole role
+/// rather than per key, so a routed write reaches the key rather than failing
+/// closed. The key-epoch record `enc` is never routed: a command creates it,
+/// when it is absent, before the tenant's key is registered, so only its PUT
+/// grant is checked.
 #[test]
 fn maintain_cli_data_writes_are_routed_and_maintain_can_encrypt_them() {
     let maintain = load_policy("maintain");
@@ -6221,10 +6225,16 @@ fn maintain_cli_data_writes_are_routed_and_maintain_can_encrypt_them() {
 
     let tenant = test_tenant();
     let hash = tenant.to_hex();
-    let mut writes = vec![
-        (format!("t/{hash}/enc"), PutCondition::CreateOnly),
-        (format!("t/{hash}/enc"), PutCondition::CasOnly),
-    ];
+    let enc = format!("t/{hash}/enc");
+    for kind in [PutCondition::CreateOnly, PutCondition::CasOnly] {
+        assert!(
+            put_allowed(&enc, kind),
+            "maintain: no PutObject Allow admits a {kind:?} write of {enc:?}, which a \
+             Maintain-credential ravel-cli command issues when the record is absent"
+        );
+    }
+
+    let mut writes = Vec::new();
     for signal in PROVISIONED_SIGNALS {
         let sig = signal.key_prefix();
         writes.push((
@@ -6243,6 +6253,15 @@ fn maintain_cli_data_writes_are_routed_and_maintain_can_encrypt_them() {
             format!("t/{hash}/catalog/{sig}/HEAD"),
             PutCondition::CasOnly,
         ));
+        writes.push((
+            format!("t/{hash}/catalog/{sig}/idx/name-postings"),
+            PutCondition::CreateOnly,
+        ));
+        // migrate_cursor_key in crates/ravel-maintain/src/migrate.rs.
+        let cursor = format!("t/{hash}/{sig}/maint/migrate/rseg/cursor");
+        writes.push((cursor.clone(), PutCondition::CreateOnly));
+        writes.push((cursor, PutCondition::CasOnly));
+        writes.push((format!("t/{hash}/{sig}/prov"), PutCondition::CasOnly));
     }
     for (key, kind) in &writes {
         assert!(

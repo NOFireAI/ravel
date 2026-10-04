@@ -11,14 +11,11 @@ use std::io::Write;
 
 use bytes::Bytes;
 use clap::Parser;
-use ravel_commit::keys;
-use ravel_commit::publish::{self, RetryPolicy};
-use ravel_commit::record::{self, NewCommitRecord};
-use ravel_logseg::{AttrValue, LogRecord, LogStreamId, ObjectIdentity, RlogConfig, RlogWriter};
+use ravel_commit::record;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
 use ravel_types::{Signal, TenantId};
-use uuid::Uuid;
 
+use crate::fake_s3::seed::{self, NS_PER_HOUR};
 use crate::fake_s3::{Echo, FakeS3, SeenPut, spawn};
 use crate::maintain::{self, ClaimOptions, MigrateSwitches, SignalArg};
 use crate::store::{
@@ -30,8 +27,10 @@ const TENANT_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-key";
 const OTHER_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/globex-key";
 const SHARD: u32 = 0;
 const HOUR: u32 = 100;
-const NS_PER_HOUR: i64 = 3_600_000_000_000;
 const S3: StoreSelection = StoreSelection::explicit(StoreKind::S3);
+/// `build_tenant_data_store`'s `dry_run` argument.
+const REAL_RUN: bool = false;
+const DRY_RUN: bool = true;
 
 fn s3_args(endpoint: &str) -> StoreArgs {
     StoreArgs::try_parse_from([
@@ -124,105 +123,8 @@ fn assert_other_tenant_untouched(fake: &FakeS3) {
     );
 }
 
-fn logs_record(stream: u8, ts_ns: i64) -> LogRecord {
-    let mut id = [0u8; 16];
-    id[0] = stream;
-    LogRecord {
-        stream_id: LogStreamId(id),
-        stream_attrs: ravel_logseg::stream_attrs_bytes(
-            &[(
-                "service.name".into(),
-                AttrValue::Str(format!("svc-{stream}")),
-            )],
-            "scope",
-            "1",
-            &[],
-        ),
-        ts_ns,
-        observed_ts_ns: ts_ns,
-        severity_num: 9,
-        severity_text: "INFO".into(),
-        body: "get /api ok".into(),
-        trace_id: None,
-        span_id: None,
-        flags: 0,
-        attrs: vec![("code".into(), AttrValue::I64(200))],
-    }
-}
-
-/// Two L0 `.rlog` objects and their commit records in one sealed logs bucket,
-/// enough for a compaction to merge rather than report `BelowMinInputs`.
 async fn seed_two_l0_logs(store: &dyn ObjectStoreBackend) {
-    let tenant_hash = TenantId::new(TENANT).hash();
-    let base_ns = i64::from(HOUR) * NS_PER_HOUR;
-    for seq in 1..=2u64 {
-        let records: Vec<LogRecord> = (0..4)
-            .map(|i| {
-                logs_record(
-                    u8::try_from(i % 2).expect("fits u8"),
-                    base_ns + i64::from(i) * 1_000_000 + i64::try_from(seq).expect("fits i64"),
-                )
-            })
-            .collect();
-        let writer_id = Uuid::new_v4();
-        let identity = ObjectIdentity {
-            tenant_hash: tenant_hash.0,
-            shard: SHARD,
-            writer_id: writer_id.into_bytes(),
-            writer_epoch: 1,
-            writer_seq: seq,
-        };
-        let mut writer = RlogWriter::new(RlogConfig::default(), identity);
-        for r in &records {
-            writer.push(r.clone()).expect("push");
-        }
-        let bytes = Bytes::from(writer.finish().expect("finish L0"));
-        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
-        let data_key = keys::data_key(
-            &tenant_hash,
-            Signal::Logs,
-            SHARD,
-            writer_id,
-            1,
-            seq,
-            &content_hash,
-        )
-        .expect("data key");
-        store
-            .put(&data_key, bytes.clone(), PutOptions::default())
-            .await
-            .expect("put data object");
-
-        let streams: BTreeSet<LogStreamId> = records.iter().map(|r| r.stream_id).collect();
-        let min_ts = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
-        let max_ts = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
-        let created = base_ns + i64::try_from(seq).expect("fits i64") * 1_000_000;
-        let rec = record::build(NewCommitRecord {
-            tenant_hash,
-            signal: Signal::Logs,
-            shard: SHARD,
-            writer_id,
-            writer_epoch: 1,
-            writer_seq: seq,
-            object_size: bytes.len() as u64,
-            content_hash,
-            sample_count: records.len() as u64,
-            series_count: streams.len() as u64,
-            min_event_ts_ns: min_ts,
-            max_event_ts_ns: max_ts,
-            min_ingest_ts_ns: created,
-            max_ingest_ts_ns: created,
-            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
-            created_unix_ns: created,
-            ingest_hour_bucket: HOUR,
-        })
-        .expect("build commit record");
-        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
-        store
-            .put(&commit_key, record::encode(&rec), PutOptions::default())
-            .await
-            .expect("put commit record");
-    }
+    seed::two_l0_logs(store, TENANT, SHARD, HOUR).await;
 }
 
 /// The bucket's compaction record keys, read back through the plain store.
@@ -266,7 +168,7 @@ async fn compact_bucket_writes_l1_parts_and_its_record_under_the_tenant_key() {
     let start = fake.puts().len();
     let file = kms_file();
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, true, 1_000)
+    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
         .await
         .expect("routed store");
     maintain::compact(
@@ -302,7 +204,7 @@ async fn compact_tenant_writes_l1_parts_and_its_records_under_the_tenant_key() {
     let start = fake.puts().len();
     let file = kms_file();
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, true, 1_000)
+    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
         .await
         .expect("routed store");
     maintain::compact_tenant(
@@ -391,7 +293,7 @@ async fn migrate_reencode_writes_l1_parts_and_its_record_under_the_tenant_key() 
     let start = fake.puts().len();
     let file = kms_file();
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, true, 1_000)
+    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
         .await
         .expect("routed store");
     let mut out = Vec::new();
@@ -435,41 +337,6 @@ async fn migrate_reencode_writes_l1_parts_and_its_record_under_the_tenant_key() 
     assert_other_tenant_untouched(&fake);
 }
 
-/// Publish one sealed metrics commit record and its placeholder data object.
-async fn publish_metrics_l0(store: &dyn ObjectStoreBackend, seq: u64, created_unix_ns: i64) {
-    let tenant_hash = TenantId::new(TENANT).hash();
-    let ingest_hour_bucket = u32::try_from(created_unix_ns / NS_PER_HOUR).expect("fits u32");
-    let payload = format!("seg-{SHARD}-{seq}").into_bytes();
-    let content_hash = *blake3::hash(&payload).as_bytes();
-    let rec = record::build(NewCommitRecord {
-        tenant_hash,
-        signal: Signal::Metrics,
-        shard: SHARD,
-        writer_id: Uuid::new_v4(),
-        writer_epoch: 1,
-        writer_seq: seq,
-        object_size: payload.len() as u64,
-        content_hash,
-        sample_count: 1,
-        series_count: 1,
-        min_event_ts_ns: created_unix_ns - 1_000,
-        max_event_ts_ns: created_unix_ns,
-        min_ingest_ts_ns: created_unix_ns - 1_000,
-        max_ingest_ts_ns: created_unix_ns,
-        segment_format_version: 1,
-        created_unix_ns,
-        ingest_hour_bucket,
-    })
-    .expect("valid record");
-    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
-    publish::put_data_object(store, &data_key, Bytes::from(payload))
-        .await
-        .expect("put data object");
-    publish::publish(store, &rec, &RetryPolicy::default())
-        .await
-        .expect("publish");
-}
-
 /// `catalog fold`: the snapshot part and `HEAD` it publishes go out under the
 /// tenant's key.
 ///
@@ -481,11 +348,11 @@ async fn catalog_fold_writes_its_snapshot_under_the_tenant_key() {
     let args = s3_args(&endpoint);
     let plain = build_store(&args).expect("plain store");
     let now = crate::now_ns().expect("wall clock");
-    publish_metrics_l0(plain.as_ref(), 1, now - 3 * NS_PER_HOUR).await;
+    seed::metrics_l0(plain.as_ref(), TENANT, SHARD, 1, now - 3 * NS_PER_HOUR).await;
     let start = fake.puts().len();
     let file = kms_file();
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, true, 1_000)
+    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
         .await
         .expect("routed store");
     crate::catalog::fold(store, S3, TENANT, 1, SignalArg::Metrics, None, now, false)
@@ -517,7 +384,7 @@ async fn a_tenant_the_file_does_not_name_writes_under_the_bucket_default() {
     let mut file = tempfile::NamedTempFile::new().expect("temp file");
     write!(file, "[tenants]\nglobex = \"{OTHER_KEY}\"\n").expect("write kms file");
 
-    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, true, 1_000)
+    let store = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
         .await
         .expect("routed store");
     let key = format!("{}l/l1/probe", tenant_prefix(TENANT));
@@ -544,14 +411,14 @@ async fn a_dry_run_validates_the_file_and_writes_nothing() {
     let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
     let args = s3_args(&endpoint);
     let file = kms_file();
-    build_tenant_data_store(&args, &kms_args(&file), TENANT, false, 1_000)
+    build_tenant_data_store(&args, &kms_args(&file), TENANT, DRY_RUN, 1_000)
         .await
         .expect("a dry run builds the plain store");
     assert!(fake.puts().is_empty(), "a dry run writes nothing");
 
     let mut bad = tempfile::NamedTempFile::new().expect("temp file");
     write!(bad, "[tenants]\n{TENANT} = \"\"\n").expect("write kms file");
-    let err = build_tenant_data_store(&args, &kms_args(&bad), TENANT, false, 1_000)
+    let err = build_tenant_data_store(&args, &kms_args(&bad), TENANT, DRY_RUN, 1_000)
         .await
         .err()
         .expect("an invalid file fails a dry run too");
@@ -564,13 +431,85 @@ async fn a_dry_run_validates_the_file_and_writes_nothing() {
     );
 }
 
+/// A key-epoch record whose current key is not the file's refuses the
+/// command: only ravel-server's startup records a key change, and the record
+/// is append-only, so the command writes nothing under the tenant's prefix,
+/// neither an epoch nor any compaction output.
+///
+/// Non-vacuity: pass `KeyChangePolicy::RecordRotation` in
+/// `build_tenant_data_store` and the compaction runs, appending an epoch and
+/// writing its L1 parts.
+#[tokio::test]
+async fn a_recorded_key_that_differs_from_the_file_refuses_the_command() {
+    const RECORDED_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-old-key";
+    let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+    let args = s3_args(&endpoint);
+    let plain = build_store(&args).expect("plain store");
+    let tenant_hash = TenantId::new(TENANT).hash();
+    ravel_catalog::record_key_epoch(plain.as_ref(), &tenant_hash, "", 0, 500)
+        .await
+        .expect("epoch 0");
+    ravel_catalog::record_key_epoch(plain.as_ref(), &tenant_hash, RECORDED_KEY, 500, 500)
+        .await
+        .expect("epoch 1 under another key");
+    seed_two_l0_logs(plain.as_ref()).await;
+    let start = fake.puts().len();
+    let enc = format!("{}enc", tenant_prefix(TENANT));
+    let reads_before = fake.gets().iter().filter(|key| **key == enc).count();
+    let file = kms_file();
+
+    let err = async {
+        let store =
+            build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000).await?;
+        maintain::compact(
+            store,
+            S3,
+            TENANT,
+            SignalArg::Logs,
+            SHARD,
+            HOUR,
+            false,
+            None,
+            None,
+            &ClaimOptions::fresh(),
+        )
+        .await
+    }
+    .await
+    .expect_err("a differing recorded key refuses the command");
+
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "failed to configure per-tenant SSE-KMS routing (--tenant-kms-config): tenant \
+             \"{TENANT}\" has key \"{RECORDED_KEY}\" recorded as its current key epoch at \
+             t/{}/enc, but --tenant-kms-config names \"{TENANT_KEY}\": a key change is recorded \
+             by ravel-server at startup, never by this command. Refusing before any write; start \
+             ravel-server with the new key first, or run this command with the file the servers \
+             run with",
+            tenant_hash.to_hex()
+        )
+    );
+    assert!(
+        fake.gets().iter().filter(|key| **key == enc).count() > reads_before,
+        "the bootstrap read the epoch record"
+    );
+    assert_eq!(
+        tenant_puts_since(&fake, start, TENANT),
+        Vec::new(),
+        "nothing is written under the tenant's prefix after the bootstrap read"
+    );
+    assert!(compaction_record_keys(plain.as_ref()).await.is_empty());
+    assert_other_tenant_untouched(&fake);
+}
+
 /// The same refusal ravel-server's `Cli::validate` makes: the routing store
 /// builds a real `S3Store` per tenant, which `--store memory` cannot.
 #[tokio::test]
 async fn the_flag_under_store_memory_is_refused() {
     let args = StoreArgs::try_parse_from(["ravel-cli", "--store", "memory"]).expect("flags parse");
     let file = kms_file();
-    let err = build_tenant_data_store(&args, &kms_args(&file), TENANT, true, 1_000)
+    let err = build_tenant_data_store(&args, &kms_args(&file), TENANT, REAL_RUN, 1_000)
         .await
         .err()
         .expect("memory plus the flag is refused");

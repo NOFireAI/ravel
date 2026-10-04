@@ -532,14 +532,17 @@ pub struct TenantKmsArgs {
     /// Path to the per-tenant SSE-KMS file ravel-server reads from its own
     /// `--tenant-kms-config` (ADR-0062 decision 1): a TOML `[tenants]` table
     /// mapping tenant name to KMS key ARN. When the file names the command's
-    /// `--tenant`, every object this command writes under that tenant's
-    /// `t/<tenant_hash>/` prefix is encrypted under that key, and its key-epoch
-    /// record `t/<tenant_hash>/enc` is created or extended first, exactly as
-    /// ravel-server's startup does. A tenant the file does not name is written
-    /// under the bucket's default encryption, as ravel-server writes it.
-    /// Requires `--store s3`. A dry run reads and validates the file and
-    /// writes nothing. Absent (the default): every write uses the bucket's
-    /// default encryption.
+    /// `--tenant`, every data object this command writes under that tenant's
+    /// `t/<tenant_hash>/` prefix is encrypted under that key. The tenant's
+    /// key-epoch record `t/<tenant_hash>/enc` is a control record written
+    /// under the bucket default: when it is absent the command creates it
+    /// first, as ravel-server's startup does; when it records a different
+    /// current key the command refuses before any write, because only
+    /// ravel-server's startup records a key change. A tenant the file does not
+    /// name is written under the bucket's default encryption, as ravel-server
+    /// writes it. Requires `--store s3`. A dry run reads and validates the
+    /// file and writes nothing. Absent (the default): every write uses the
+    /// bucket's default encryption.
     #[arg(
         long = "tenant-kms-config",
         env = "RAVEL_TENANT_KMS_CONFIG",
@@ -574,17 +577,19 @@ fn load_tenant_kms_config(
 /// Without `--tenant-kms-config` this is [`build_store`], unchanged. With it,
 /// the S3 store is wrapped in a [`KmsRoutingStore`] the way ravel-server's
 /// `build_store` wraps its own, and the file's entry for `tenant` is applied
-/// with [`configure_tenant_kms`](ravel_catalog::tenant_kms::configure_tenant_kms):
-/// the key-epoch record is bootstrapped, then the key registered, so every
-/// later write under `t/<tenant_hash>/` is encrypted under it. Only `tenant`'s
-/// entry is applied: this command writes no other tenant's data, and applying
-/// another entry could append a rotation epoch for a tenant it never touches.
+/// with [`KeyChangePolicy::Refuse`](ravel_catalog::tenant_kms::KeyChangePolicy::Refuse):
+/// an absent key-epoch record is bootstrapped, a record whose current key is
+/// the file's is left alone, and a record whose current key differs refuses
+/// the command before any write, since only ravel-server's startup records a
+/// key change (ADR-0062 decision 1b). The key is then registered, so every
+/// later data write under `t/<tenant_hash>/` is encrypted under it. Only
+/// `tenant`'s entry is applied: this command writes no other tenant's data.
 /// A tenant the file does not name routes nowhere, exactly as in ravel-server:
 /// its writes go to the default store.
 ///
-/// `writes` is false for a dry run: the file is still read and validated, so a
-/// bad one fails before the real run, but nothing is bootstrapped and the
-/// plain store is returned.
+/// For a dry run the file is still read and validated, so a bad one fails
+/// before the real run, but nothing is bootstrapped and the plain store is
+/// returned.
 ///
 /// Must run after the tenant-hash scheme is installed, since it hashes
 /// `tenant`.
@@ -592,7 +597,7 @@ pub async fn build_tenant_data_store(
     args: &StoreArgs,
     kms_args: &TenantKmsArgs,
     tenant: &str,
-    writes: bool,
+    dry_run: bool,
     now_ns: i64,
 ) -> anyhow::Result<Arc<dyn ObjectStoreBackend>> {
     let Some(path) = kms_args.tenant_kms_config.as_deref() else {
@@ -601,7 +606,7 @@ pub async fn build_tenant_data_store(
     let config = load_tenant_kms_config(args, path)?;
     let tenant_id = TenantId::new(tenant);
     let key_arn = config.key_for(&tenant_id).map(str::to_string);
-    if !writes {
+    if dry_run {
         return build_store(args);
     }
 
@@ -620,11 +625,12 @@ pub async fn build_tenant_data_store(
     match key_arn {
         Some(key_arn) => {
             let only_this_tenant = config.restricted_to(&tenant_id);
-            ravel_catalog::tenant_kms::configure_tenant_kms(
+            ravel_catalog::tenant_kms::configure_tenant_kms_with_policy(
                 kms.as_ref(),
                 kms.as_ref(),
                 &only_this_tenant,
                 now_ns,
+                ravel_catalog::tenant_kms::KeyChangePolicy::Refuse,
             )
             .await
             .map_err(|err| {

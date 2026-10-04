@@ -1268,8 +1268,12 @@ them. `ravel-cli` builds no per-tenant KMS routing store, so these writes, like
 every `ravel-cli` write, are encrypted under the bucket default rather than a
 routed tenant's key. (No longer true under `--tenant-kms-config`: see the
 tenant-KMS ravel-cli amendment below.)
-`ravel-cli parquet sweep`, `maintain compact-bucket` and `maintain
-compact-tenant` are the `ravel-cli` commands that take the Maintain credential.
+`ravel-cli parquet sweep`, `maintain compact-bucket`, `maintain
+compact-tenant`, `maintain migrate`, `maintain sweep` and `catalog fold` are
+the six `ravel-cli` commands that take the Maintain credential. (Corrected by
+the tenant-KMS ravel-cli amendment below: this sentence named only the first
+three, though `migrate`, `sweep` and `fold` took the Maintain credential
+too.)
 
 **The gateway reaps dead admission snapshots.** Each ingest process
 overwrites its own snapshot
@@ -1702,10 +1706,18 @@ fold`, take the servers' `--tenant-kms-config` flag and file. The parser and
 the key-epoch bootstrap moved from `ravel-server` into
 `ravel_catalog::tenant_kms`, which both binaries call, and each command wraps
 its S3 store in the same `KmsRoutingStore` the servers build. For the tenant
-it writes, it bootstraps that tenant's `t/<hash>/enc` record first, then
-writes everything else under `t/<hash>/` under the tenant's key. A tenant the
-file does not name is written under the bucket default, as the servers write
-it. Maintain already holds `kms:Encrypt` and `kms:GenerateDataKey*` on the
+it writes, it reads that tenant's `t/<hash>/enc` record first. An absent
+record is created with the tenant's first epochs, as server startup creates
+it; a record whose current key is the file's is left alone; a record whose
+current key differs refuses the whole command before any write. Only server
+startup records a key change (ADR-0062 decision 1b): the record is
+append-only and deny-delete, so an epoch a command recorded from a stale file
+could never be removed. The command then writes its data under `t/<hash>/`
+under the tenant's key; the epoch record itself is a control record under the
+bucket default. A tenant the file does not name is written under the bucket
+default, as the servers write it. Routing is opt-in through the flag: without
+it these commands write under the bucket default as before. Maintain already
+holds `kms:Encrypt` and `kms:GenerateDataKey*` on the
 tenant keys and the `t/*/enc` write, so §1's Maintain row and the templates
 are unchanged.
 
@@ -1715,7 +1727,10 @@ control records under `t/<hash>/` (provisioning records, legal holds,
 reconstructed commit records, erasure requests, the tenant config record and
 the Parquet grants record) are written under the bucket default whatever the
 file says. `maintain sweep` writes only its unnamed-since markers under `t/`
-and takes no flag either.
+and takes no flag either. `load` is not a Maintain-credential command and
+takes no flag: its L0 segments, commit records and provisioning record stay
+under the bucket default.
 
-Recorded as an appended amendment, with an inline pointer added to the
-2026-10-02 amendment.
+Recorded as an appended amendment, with inline pointers added to the
+2026-10-02 amendment, one of which corrects its list of the `ravel-cli`
+commands that take the Maintain credential.

@@ -14,7 +14,7 @@ use ravel_object_store::{KmsRoutingStore, ObjectStoreBackend};
 use ravel_types::{TenantHash, TenantId};
 use serde::Deserialize;
 
-use crate::key_epoch::{KeyEpochError, read_epochs_from_store, record_key_epoch};
+use crate::key_epoch::{KeyEpoch, KeyEpochError, read_epochs_from_store, record_key_epoch};
 
 /// A `--tenant-kms-config` file's parsed, validated content: one KMS key ARN
 /// per named tenant. Order is irrelevant; the map is keyed by [`TenantId`] so
@@ -86,6 +86,32 @@ pub enum TenantKmsError {
          {MAX_EPOCH_CAS_RETRIES} retries"
     )]
     CasRetriesExhausted { tenant: String },
+    #[error(
+        "tenant {tenant:?} has key {recorded_key:?} recorded as its current key epoch at \
+         t/{hash_hex}/enc, but --tenant-kms-config names {configured_key:?}: a key change is \
+         recorded by ravel-server at startup, never by this command. Refusing before any \
+         write; start ravel-server with the new key first, or run this command with the file \
+         the servers run with"
+    )]
+    KeyChangeRefused {
+        tenant: String,
+        hash_hex: String,
+        recorded_key: String,
+        configured_key: String,
+    },
+}
+
+/// What [`configure_tenant_kms_with_policy`] does when a tenant's key-epoch
+/// record already exists and its current key differs from the configured one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyChangePolicy {
+    /// Append a new epoch at `now_ns` (ADR-0062 decision 1b). Server startup
+    /// alone records a key change, so only ravel-server uses this.
+    RecordRotation,
+    /// Refuse with [`TenantKmsError::KeyChangeRefused`] and write nothing.
+    /// The `t/<hash>/enc` record is append-only and deny-delete, so an epoch
+    /// a command records from a stale file could never be removed.
+    Refuse,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -136,18 +162,42 @@ const MAX_EPOCH_CAS_RETRIES: u32 = 5;
 /// moment this key becomes active. A later restart with the same key is a
 /// no-op; a later restart with a *different* key (rotation) appends a new
 /// epoch at `now_ns`.
+///
+/// This is ravel-server's startup path: [`KeyChangePolicy::RecordRotation`].
 pub async fn configure_tenant_kms(
     kms: &KmsRoutingStore,
     store: &dyn ObjectStoreBackend,
     config: &TenantKmsConfig,
     now_ns: i64,
 ) -> Result<(), TenantKmsError> {
+    configure_tenant_kms_with_policy(kms, store, config, now_ns, KeyChangePolicy::RecordRotation)
+        .await
+}
+
+/// [`configure_tenant_kms`] with an explicit [`KeyChangePolicy`] for a record
+/// whose current key differs from the configured one. The absent-record
+/// bootstrap and the same-key no-op are identical under both policies; a
+/// refused tenant's key is never registered.
+pub async fn configure_tenant_kms_with_policy(
+    kms: &KmsRoutingStore,
+    store: &dyn ObjectStoreBackend,
+    config: &TenantKmsConfig,
+    now_ns: i64,
+    policy: KeyChangePolicy,
+) -> Result<(), TenantKmsError> {
     for (tenant, key_arn) in config.iter() {
         let hash = tenant.hash();
-        bootstrap_tenant_epoch(store, tenant, &hash, key_arn, now_ns).await?;
+        bootstrap_tenant_epoch(store, tenant, &hash, key_arn, now_ns, policy).await?;
         kms.set_tenant_key(hash.to_hex(), key_arn.to_string());
     }
     Ok(())
+}
+
+/// A record holding only the epoch-0 deployment-default entry is a first
+/// configuration whose epoch 1 was never written (a lost CAS race or a crash
+/// between the two puts), not a key a server recorded.
+fn is_unfinished_bootstrap(epochs: &[KeyEpoch]) -> bool {
+    matches!(epochs, [only] if only.epoch == 0 && only.key_arn.is_empty() && only.activated_ns == 0)
 }
 
 async fn bootstrap_tenant_epoch(
@@ -156,6 +206,7 @@ async fn bootstrap_tenant_epoch(
     hash: &TenantHash,
     key_arn: &str,
     now_ns: i64,
+    policy: KeyChangePolicy,
 ) -> Result<(), TenantKmsError> {
     for _ in 0..MAX_EPOCH_CAS_RETRIES {
         let existing = read_epochs_from_store(store, hash).await.map_err(|error| {
@@ -181,6 +232,13 @@ async fn bootstrap_tenant_epoch(
                 };
                 if last.key_arn == key_arn {
                     Ok(())
+                } else if policy == KeyChangePolicy::Refuse && !is_unfinished_bootstrap(&epochs) {
+                    return Err(TenantKmsError::KeyChangeRefused {
+                        tenant: tenant.as_str().to_string(),
+                        hash_hex: hash.to_hex(),
+                        recorded_key: last.key_arn.clone(),
+                        configured_key: key_arn.to_string(),
+                    });
                 } else {
                     record_key_epoch(store, hash, key_arn, now_ns, now_ns)
                         .await
@@ -210,6 +268,10 @@ async fn bootstrap_tenant_epoch(
 mod tests {
     use super::*;
     use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{InstrumentedStore, StoreOp};
+
+    const SERVER: KeyChangePolicy = KeyChangePolicy::RecordRotation;
+    const CLI: KeyChangePolicy = KeyChangePolicy::Refuse;
 
     #[test]
     fn empty_file_yields_no_tenants() {
@@ -306,7 +368,7 @@ mod tests {
         let hash = tenant.hash();
         let key_arn = "arn:aws:kms:us-east-1:111122223333:key/acme";
 
-        bootstrap_tenant_epoch(&store, &tenant, &hash, key_arn, 1_000)
+        bootstrap_tenant_epoch(&store, &tenant, &hash, key_arn, 1_000, SERVER)
             .await
             .expect("bootstrap");
 
@@ -330,10 +392,10 @@ mod tests {
         let hash = tenant.hash();
         let key_arn = "arn:aws:kms:us-east-1:111122223333:key/acme";
 
-        bootstrap_tenant_epoch(&store, &tenant, &hash, key_arn, 1_000)
+        bootstrap_tenant_epoch(&store, &tenant, &hash, key_arn, 1_000, SERVER)
             .await
             .expect("first boot");
-        bootstrap_tenant_epoch(&store, &tenant, &hash, key_arn, 2_000)
+        bootstrap_tenant_epoch(&store, &tenant, &hash, key_arn, 2_000, SERVER)
             .await
             .expect("second boot with the same key");
 
@@ -356,10 +418,10 @@ mod tests {
         let first_key = "arn:aws:kms:us-east-1:111122223333:key/acme-v1";
         let second_key = "arn:aws:kms:us-east-1:111122223333:key/acme-v2";
 
-        bootstrap_tenant_epoch(&store, &tenant, &hash, first_key, 1_000)
+        bootstrap_tenant_epoch(&store, &tenant, &hash, first_key, 1_000, SERVER)
             .await
             .expect("first boot");
-        bootstrap_tenant_epoch(&store, &tenant, &hash, second_key, 2_000)
+        bootstrap_tenant_epoch(&store, &tenant, &hash, second_key, 2_000, SERVER)
             .await
             .expect("rotation");
 
@@ -371,5 +433,185 @@ mod tests {
         assert_eq!(epochs[2].epoch, 2);
         assert_eq!(epochs[2].key_arn, second_key);
         assert_eq!(epochs[2].activated_ns, 2_000);
+    }
+
+    const FIRST_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-v1";
+    const SECOND_KEY: &str = "arn:aws:kms:us-east-1:111122223333:key/acme-v2";
+
+    /// A routing store whose per-tenant builder is never reached: the epoch
+    /// writes below go to the store passed beside it, and nothing here writes
+    /// through the routing store itself.
+    fn routing_store() -> KmsRoutingStore {
+        use ravel_object_store::StoreMetrics;
+        use ravel_object_store::s3::{S3Config, S3HttpConfig};
+        KmsRoutingStore::new(
+            std::sync::Arc::new(MemoryStore::new()),
+            S3Config {
+                bucket: "ravel-test".to_string(),
+                region: "us-east-1".to_string(),
+                endpoint: Some("http://localhost:0".to_string()),
+                access_key_id: "test".to_string(),
+                secret_access_key: "test".to_string(),
+                allow_http: true,
+                force_path_style: true,
+                kms_key_id: None,
+                session_token: None,
+                credentials_file: None,
+                auth: Default::default(),
+                instance_metadata_endpoint: None,
+            },
+            S3HttpConfig::default(),
+            std::sync::Arc::new(StoreMetrics::default()),
+        )
+    }
+
+    fn acme_with(key_arn: &str) -> TenantKmsConfig {
+        parse_tenant_kms_config(&format!("[tenants]\nacme = \"{key_arn}\"\n")).expect("parses")
+    }
+
+    /// A bucket whose `acme` record already holds `key_arn` as written by
+    /// server startup, wrapped so a test counts only its own PUTs.
+    async fn recorded_with(key_arn: &str) -> InstrumentedStore<MemoryStore> {
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme");
+        bootstrap_tenant_epoch(&store, &tenant, &tenant.hash(), key_arn, 1_000, SERVER)
+            .await
+            .expect("server bootstrap");
+        InstrumentedStore::new(store)
+    }
+
+    fn puts(store: &InstrumentedStore<MemoryStore>) -> u64 {
+        store.metrics().snapshot().op(StoreOp::Put).calls
+    }
+
+    async fn epochs_of(store: &dyn ObjectStoreBackend) -> Vec<KeyEpoch> {
+        read_epochs_from_store(store, &TenantId::new("acme").hash())
+            .await
+            .expect("read back")
+            .expect("epoch history exists")
+    }
+
+    #[tokio::test]
+    async fn cli_policy_bootstraps_an_absent_record() {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        configure_tenant_kms_with_policy(
+            &routing_store(),
+            &store,
+            &acme_with(FIRST_KEY),
+            1_000,
+            CLI,
+        )
+        .await
+        .expect("an absent record is bootstrapped");
+
+        let epochs = epochs_of(&store).await;
+        assert_eq!(
+            epochs
+                .iter()
+                .map(|e| (e.epoch, e.key_arn.as_str(), e.activated_ns))
+                .collect::<Vec<_>>(),
+            vec![(0, "", 0), (1, FIRST_KEY, 1_000)],
+            "the first configuration: the default epoch, then the file's key"
+        );
+        assert_eq!(
+            puts(&store),
+            2,
+            "one put per epoch of the first configuration"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_policy_writes_nothing_for_a_matching_record() {
+        let store = recorded_with(FIRST_KEY).await;
+        configure_tenant_kms_with_policy(
+            &routing_store(),
+            &store,
+            &acme_with(FIRST_KEY),
+            2_000,
+            CLI,
+        )
+        .await
+        .expect("a matching record routes");
+        assert_eq!(puts(&store), 0, "a matching record is not rewritten");
+        assert_eq!(epochs_of(&store).await.len(), 2);
+    }
+
+    /// Non-vacuity: force `CLI` to `KeyChangePolicy::RecordRotation` and the
+    /// call succeeds, appending a third epoch.
+    #[tokio::test]
+    async fn cli_policy_refuses_a_differing_record_and_writes_nothing() {
+        let store = recorded_with(FIRST_KEY).await;
+        let err = configure_tenant_kms_with_policy(
+            &routing_store(),
+            &store,
+            &acme_with(SECOND_KEY),
+            2_000,
+            CLI,
+        )
+        .await
+        .expect_err("a key change is refused");
+
+        let hash_hex = TenantId::new("acme").hash().to_hex();
+        assert!(
+            matches!(
+                &err,
+                TenantKmsError::KeyChangeRefused { tenant, hash_hex: h, recorded_key, configured_key }
+                    if tenant == "acme" && *h == hash_hex && recorded_key == FIRST_KEY
+                        && configured_key == SECOND_KEY
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "tenant \"acme\" has key \"{FIRST_KEY}\" recorded as its current key epoch at \
+                 t/{hash_hex}/enc, but --tenant-kms-config names \"{SECOND_KEY}\": a key change \
+                 is recorded by ravel-server at startup, never by this command. Refusing before \
+                 any write; start ravel-server with the new key first, or run this command with \
+                 the file the servers run with"
+            )
+        );
+        assert_eq!(puts(&store), 0, "a refused key change writes nothing");
+        assert_eq!(epochs_of(&store).await.len(), 2, "no epoch was appended");
+    }
+
+    /// The server's entry point keeps recording the rotation.
+    #[tokio::test]
+    async fn server_entry_point_appends_a_rotation_epoch() {
+        let store = recorded_with(FIRST_KEY).await;
+        configure_tenant_kms(&routing_store(), &store, &acme_with(SECOND_KEY), 2_000)
+            .await
+            .expect("server startup records the rotation");
+        let epochs = epochs_of(&store).await;
+        assert_eq!(
+            epochs
+                .iter()
+                .map(|e| (e.epoch, e.key_arn.as_str(), e.activated_ns))
+                .collect::<Vec<_>>(),
+            vec![(0, "", 0), (1, FIRST_KEY, 1_000), (2, SECOND_KEY, 2_000)]
+        );
+        assert_eq!(puts(&store), 1, "exactly one rotation epoch appended");
+    }
+
+    /// A record holding only the bootstrap epoch 0 never recorded a key, so
+    /// finishing it is the first configuration, not a key change.
+    #[tokio::test]
+    async fn cli_policy_finishes_an_unfinished_bootstrap() {
+        let inner = MemoryStore::new();
+        record_key_epoch(&inner, &TenantId::new("acme").hash(), "", 0, 500)
+            .await
+            .expect("epoch 0 alone");
+        let store = InstrumentedStore::new(inner);
+        configure_tenant_kms_with_policy(
+            &routing_store(),
+            &store,
+            &acme_with(FIRST_KEY),
+            1_000,
+            CLI,
+        )
+        .await
+        .expect("the bootstrap is finished");
+        assert_eq!(epochs_of(&store).await.len(), 2);
+        assert_eq!(puts(&store), 1);
     }
 }

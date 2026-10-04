@@ -2739,15 +2739,18 @@ fn check_object_epoch(
     }
 }
 
-/// Printed by `verify-custody` for a tenant with a recorded key epoch: the
-/// control records ravel-cli writes under the Admin credential never route
-/// through the tenant's key (issue #2363), and this check reads write times,
-/// not encryption keys, so nothing below reports them either way.
-const ADMIN_CONTROL_RECORDS_NOTE: &str = "control records: the provisioning records, legal \
-     holds, reconstructed commit records, erasure requests, tenant config record and Parquet \
-     grants record ravel-cli writes under the Admin credential are encrypted under the bucket's \
-     default encryption, not the tenant's key; this check reads write times, not encryption \
-     keys, and reports none of them";
+/// Printed by `verify-custody` for a tenant with a recorded key epoch: what
+/// ravel-cli writes under the tenant's prefix without routing it through the
+/// tenant's key (issue #2363), whether control records or tenant data. This
+/// check reads write times, not encryption keys, so nothing below reports
+/// them either way.
+const UNROUTED_WRITES_NOTE: &str = "control records: the provisioning records, legal holds, \
+     reconstructed commit records, erasure requests, tenant config record and Parquet grants \
+     record ravel-cli writes under the Admin credential are encrypted under the bucket's default \
+     encryption, not the tenant's key. So is this tenant data ravel-cli writes today: load's L0 \
+     segments and commit records, the provisioning record load writes through \
+     validate_or_adopt, and maintain sweep's unnamed-since markers. This check reads write \
+     times, not encryption keys, and reports none of them";
 
 /// `maintain verify-custody`: independently re-verify the content-addressed
 /// chain for a tenant, at rest and after the fact (ADR-0042 decision 5). It
@@ -2829,7 +2832,7 @@ pub async fn verify_custody(
                  time against it",
                 epochs.len()
             );
-            println!("{ADMIN_CONTROL_RECORDS_NOTE}");
+            println!("{UNROUTED_WRITES_NOTE}");
         }
         None => println!(
             "key-epoch history: none recorded; every object is under the deployment default key \
