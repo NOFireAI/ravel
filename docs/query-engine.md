@@ -461,14 +461,28 @@ the partition stream until they resolve and consumed in owned order, so the
 rows, the per-segment counters (`segments_opened`, the route split, the
 opens-by-shape and data-objects-touched accounting, the per-segment timeline
 points) and the per-query request and byte accounting are those of the
-sequential walk. A resolved open, error included, waits for its segment's
+sequential walk whenever the fetch memory budget refuses no open (below). A
+resolved open, error included, waits for its segment's
 turn, so an error is reported for its own segment after the segments before
 it have been emitted.
 
 Each prefetched open holds the fetched column-chunk bytes of its segment,
 reserved against the fetcher's memory budget like any open's, so a partition
 holds at most `share` times one segment's projected bytes for opened
-segments. Three opens stay sequential: a whole-object fast-path open, which is
+segments. That budget is shared across queries, so it can refuse an open the
+sequential walk would not have held at the same time. When it refuses an open
+issued ahead of its turn, or the current open while opens are held behind it,
+the partition does not fail the query: it turns its pipeline off, releases the
+opens it holds behind the current segment (their segments open again at their
+turns), and reopens the refused segment sequentially at its turn. Only a
+refusal of that sequential reopen fails the query, with the typed fetch memory
+error. The scan counts each such fallback in `prefetch_memory_reopens`, at most
+one per partition, and the rows, `segments_opened`, the route split and the
+data objects touched are those of the sequential walk
+(`a_prefetch_refused_by_the_memory_budget_reopens_sequentially`); the request,
+byte and decode figures also carry whatever the refused and released opens had
+already read, and a released segment's open start is marked twice on the
+timeline. Three opens stay sequential: a whole-object fast-path open, which is
 never prefetched and stops the pipeline at its turn because an in-flight
 whole-object open holds a full object per slot; every open on the striped
 route; and the `attrs_raw` fallback reopen, which leaves the prefetches
