@@ -1132,15 +1132,8 @@ mod tests {
         let config = pipeline_config(3, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 9_000 + i, 7)).await
-            }));
-        }
-        for handle in handles {
-            let result = handle.await.expect("submit task");
+        let events = (0..3).map(|i| test_event(tenant, 9_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
             assert!(
                 matches!(result, Err(MaintainError::AuditFlush(_))),
                 "every submit in a failed batch must observe the flush error in required mode, got {result:?}"
@@ -1175,18 +1168,9 @@ mod tests {
         };
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 11_000 + i, 7)).await
-            }));
-        }
-        for handle in handles {
-            handle
-                .await
-                .expect("submit task")
-                .expect("best-effort releases the query with Ok despite the failed flush");
+        let events = (0..3).map(|i| test_event(tenant, 11_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
+            result.expect("best-effort releases the query with Ok despite the failed flush");
         }
         assert_eq!(
             store.fault_count(Op::Put, FaultKind::Timeout),
@@ -1327,16 +1311,13 @@ mod tests {
         let config = pipeline_config(4, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
-        let mut handles = Vec::new();
-        for (i, tenant) in [one, two, one, two].into_iter().enumerate() {
-            let pipeline = pipeline.clone();
-            let now_ns = 17_000 + i as i64;
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, now_ns, 7)).await
-            }));
-        }
-        for handle in handles {
-            handle.await.expect("submit task").expect("submit ok");
+        let events = [one, two, one, two]
+            .into_iter()
+            .enumerate()
+            .map(|(i, tenant)| test_event(tenant, 17_000 + i as i64, 7))
+            .collect();
+        for result in submit_queued(&pipeline, events).await {
+            result.expect("submit ok");
         }
 
         for tenant in [one, two] {
@@ -1381,18 +1362,16 @@ mod tests {
         let config = pipeline_config(2, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
-        let mut handles = Vec::new();
-        for (i, tenant) in [one, two].into_iter().enumerate() {
-            let pipeline = pipeline.clone();
-            let now_ns = 19_000 + i as i64;
-            handles.push(tokio::spawn(async move {
-                (tenant, pipeline.submit(test_event(tenant, now_ns, 7)).await)
-            }));
-        }
+        let tenants = [one, two];
+        let events = tenants
+            .into_iter()
+            .enumerate()
+            .map(|(i, tenant)| test_event(tenant, 19_000 + i as i64, 7))
+            .collect();
+        let results = submit_queued(&pipeline, events).await;
         let mut failed = 0usize;
         let mut released = 0usize;
-        for handle in handles {
-            let (tenant, result) = handle.await.expect("submit task");
+        for (tenant, result) in tenants.into_iter().zip(results) {
             if tenant == one {
                 assert!(
                     matches!(result, Err(MaintainError::AuditFlush(_))),
@@ -1444,18 +1423,9 @@ mod tests {
         let config = pipeline_config(3, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 21_000 + i, 7)).await
-            }));
-        }
-        for handle in handles {
-            handle
-                .await
-                .expect("submit task")
-                .expect("a retried transient timeout must not fail the batch");
+        let events = (0..3).map(|i| test_event(tenant, 21_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
+            result.expect("a retried transient timeout must not fail the batch");
         }
 
         assert_eq!(
@@ -1491,18 +1461,9 @@ mod tests {
         let config = pipeline_config(3, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 22_000 + i, 7)).await
-            }));
-        }
-        for handle in handles {
-            handle
-                .await
-                .expect("submit task")
-                .expect("a retried transient timeout must not fail the batch");
+        let events = (0..3).map(|i| test_event(tenant, 22_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
+            result.expect("a retried transient timeout must not fail the batch");
         }
 
         assert_eq!(
@@ -1545,18 +1506,9 @@ mod tests {
             Arc::new(ravel_commit::SeededRng::new(7)),
         ));
 
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 23_000 + i, 7)).await
-            }));
-        }
-        for handle in handles {
-            handle
-                .await
-                .expect("submit task")
-                .expect("a retried transient timeout must not fail the batch");
+        let events = (0..3).map(|i| test_event(tenant, 23_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
+            result.expect("a retried transient timeout must not fail the batch");
         }
 
         assert_eq!(
@@ -1595,18 +1547,9 @@ mod tests {
         let config = pipeline_config(3, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 23_000 + i, 7)).await
-            }));
-        }
-        for handle in handles {
-            handle
-                .await
-                .expect("submit task")
-                .expect("a retry that finds its own earlier write must succeed, not error");
+        let events = (0..3).map(|i| test_event(tenant, 23_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
+            result.expect("a retry that finds its own earlier write must succeed, not error");
         }
 
         assert_eq!(
@@ -1637,15 +1580,8 @@ mod tests {
         let config = pipeline_config(3, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(backend.clone(), config));
 
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 24_000 + i, 7)).await
-            }));
-        }
-        for handle in handles {
-            let result = handle.await.expect("submit task");
+        let events = (0..3).map(|i| test_event(tenant, 24_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
             match &result {
                 Err(MaintainError::AuditFlush(message)) => {
                     assert!(
@@ -1684,15 +1620,8 @@ mod tests {
         let config = pipeline_config(3, Duration::from_secs(3600));
         let pipeline = Arc::new(AuditPipeline::spawn(store.clone(), config));
 
-        let mut handles = Vec::new();
-        for i in 0..3 {
-            let pipeline = pipeline.clone();
-            handles.push(tokio::spawn(async move {
-                pipeline.submit(test_event(tenant, 25_000 + i, 7)).await
-            }));
-        }
-        for handle in handles {
-            let result = handle.await.expect("submit task");
+        let events = (0..3).map(|i| test_event(tenant, 25_000 + i, 7)).collect();
+        for result in submit_queued(&pipeline, events).await {
             assert!(
                 matches!(result, Err(MaintainError::AuditFlush(_))),
                 "a non-retryable error must still fail the batch, got {result:?}"
