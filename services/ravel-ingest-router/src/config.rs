@@ -821,6 +821,10 @@ mod tests {
             err.to_string().contains("--tenant-token"),
             "error names the flag: {err}"
         );
+        assert!(
+            err.to_string().contains("position 1"),
+            "error names the offending flag's position: {err}"
+        );
     }
 
     #[test]
