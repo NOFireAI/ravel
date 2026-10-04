@@ -345,8 +345,17 @@ impl RlogWriter {
     /// Routes to the row or columnar build pipeline. A writer is one or the
     /// other for its lifetime (ADR-0109 decision 5), and both produce the same
     /// bytes for the same records.
+    ///
+    /// Row-shaped input (`self.records` non-empty, `self.batches` empty) is
+    /// folded into one [`ColumnarLogBatch`] and built through
+    /// [`RlogWriter::build_object_columnar`] (ADR-2467 decision 1): the row
+    /// builder (`build_object`) is reference-only behind the `row-reference`
+    /// feature from here on, and every production encode of row input goes
+    /// through the columnar builder instead. An empty writer (no records, no
+    /// batches) still reaches `build_object`'s empty-object check below, so
+    /// the `LimitExceeded("empty object")` refusal is unchanged.
     fn build(
-        self,
+        mut self,
         level: u32,
         input_set_hash: Vec<u8>,
         part_index: u32,
@@ -364,6 +373,13 @@ impl RlogWriter {
             )));
         }
         let cluster = cluster_order(self.sort_descriptor.as_ref(), self.clustering_generation)?;
+        if !self.records.is_empty() && self.batches.is_empty() {
+            let records = std::mem::take(&mut self.records);
+            let batch = ColumnarLogBatch::fold_records(&records)?;
+            drop(records);
+            batch.validate()?;
+            self.batches = vec![batch];
+        }
         if !self.batches.is_empty() {
             return self.build_object_columnar(level, input_set_hash, part_index, layout, cluster);
         }

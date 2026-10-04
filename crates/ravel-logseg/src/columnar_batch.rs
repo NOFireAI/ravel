@@ -505,6 +505,44 @@ impl ColumnarLogBatch {
     /// the same record become `residual_attrs`. It does not decide the budget,
     /// the stream directory ordering across batches, or the block layout -- all
     /// of which the writer owns.
+    /// Folds row-shaped input into one batch for the routed build path
+    /// (ADR-2467 decision 1): a fallible wrapper around [`Self::from_records`]
+    /// that adds the one check `from_records` does not do.
+    ///
+    /// `from_records` keeps the first `stream_attrs` blob it sees for a
+    /// stream id and silently ignores a later record that disagrees
+    /// (`stream_blob.entry(..).or_insert_with(..)`), matching its contract as
+    /// an infallible bridge for callers that already trust their input. The
+    /// row builder (`RlogWriter::build_object`) does not trust it: two
+    /// records sharing a stream id but carrying different `stream_attrs`
+    /// bytes refuse the whole object with
+    /// [`LogSegError::InconsistentStreamAttrs`], because there is no single
+    /// truthful STREAM_DIR blob to write. The routed path has to refuse the
+    /// same input the same way, so this runs that same check as a pre-pass
+    /// over the records, in push order, before delegating to the unchanged
+    /// `from_records`.
+    pub(crate) fn fold_records(records: &[LogRecord]) -> Result<Self, LogSegError> {
+        let mut streams: HashMap<LogStreamId, &[u8]> = HashMap::new();
+        for r in records {
+            match streams.entry(r.stream_id) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(r.stream_attrs.as_slice());
+                }
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    if *slot.get() != r.stream_attrs.as_slice() {
+                        return Err(LogSegError::InconsistentStreamAttrs(format!(
+                            "stream {} carries two different stream_attrs blobs ({} and {} bytes)",
+                            r.stream_id.to_hex(),
+                            slot.get().len(),
+                            r.stream_attrs.len(),
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(Self::from_records(records))
+    }
+
     pub fn from_records(records: &[LogRecord]) -> Self {
         use std::collections::BTreeMap;
 
