@@ -389,8 +389,9 @@ fn duration_nanos(array: &ArrayRef, value: i64, nanos_per_unit: i64) -> Result<i
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 
 /// A time of day of any unit as nanoseconds since midnight. A negative value,
-/// or one that is a whole day or more, is an error rather than a number no
-/// time of day has.
+/// one that is a whole day or more, or one whose nanosecond count overflows
+/// an i64 is an error rather than a number no time of day has; all three
+/// report the same "is not a time of day" text.
 fn time_of_day_nanos(array: &ArrayRef, value: i64, nanos_per_unit: i64) -> Result<i64, SqlError> {
     value
         .checked_mul(nanos_per_unit)
