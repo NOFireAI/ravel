@@ -19,6 +19,8 @@
 //!   manifest version, replaying the intent when it loses a race (D2).
 //! - [`sweep`] plans and executes deletion of manifest versions superseded for
 //!   longer than a grace period.
+//! - [`repair`] lists a table's manifest versions and deletes the ones above
+//!   [`keys::MAX_MANIFEST_VERSION`], which no writer creates.
 //! - [`clock`] is the injected time source the writer and grants use.
 
 pub mod clock;
@@ -26,6 +28,7 @@ pub mod grants;
 pub mod keys;
 pub mod manifest;
 pub mod names;
+pub mod repair;
 pub mod resolve;
 pub mod sweep;
 pub mod writer;

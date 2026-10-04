@@ -330,15 +330,18 @@ operator credential rather than a service credential:
   `gc-config set`, `provision adopt`, legal holds, `tenant parquet-grant add`
   and `remove`, and the read-only inspection subcommands. No continuously
   running process should hold it.
-- Five `ravel-cli` commands take the Maintain credential instead:
+- Six `ravel-cli` commands take the Maintain credential instead:
   `parquet sweep`, which deletes superseded Parquet table manifests;
+  `parquet repair --delete`, which deletes forged Parquet table manifest
+  versions above the version bound (see
+  [repairing a forged Parquet table version](maintenance.md#repairing-a-forged-parquet-table-version));
   `maintain compact-bucket` and `maintain compact-tenant`, which take
   compaction claims under `sys/maintain/claims/compaction/` and write L1
   segments and compaction records; `maintain sweep`, which deletes superseded
   and expired segments and commit records and quarantines orphans; and
   `catalog fold`, which writes the catalog objects the scheduled fold writes
   (the Query credential also works for it). Admin holds none of those
-  grants, so run these five with the `RAVEL_S3_*` values of the Maintain
+  grants, so run these six with the `RAVEL_S3_*` values of the Maintain
   role.
 - `maintain migrate` runs under none of the shipped templates: the Maintain
   role lacks the delete of the migrate cursor and the `prov` write that

@@ -21,6 +21,21 @@ use crate::names::{NameError, validate_table};
 pub const MANIFEST_SUFFIX: &str = ".pqm";
 /// Digits in a manifest key's zero-padded version, enough for any `u64`.
 pub const VERSION_WIDTH: usize = 20;
+
+/// Highest manifest version a writer creates and a reader resolves: 2^32.
+///
+/// Versions are dense: every DDL statement on a table writes exactly the next
+/// one, so a table reaches this bound only after 2^32 statements, more than a
+/// century at one statement per second. A version above it, up to the
+/// `u64::MAX` a 20-digit key can spell, can only come from a put that did not
+/// go through [`crate::writer::apply`], such as one made directly with the
+/// Query credential, whose create-only grant admits any 20-digit version; at
+/// `u64::MAX` it would leave the table no successor and every later DDL would
+/// fail. [`crate::resolve::newest`] ignores such a version, the writer refuses
+/// to create one, and [`crate::repair`] deletes it. The `u64` version type and
+/// the 20-digit key stay as they are: the bound is a check on values, so every
+/// key this build writes or reads is one an earlier build wrote and read too.
+pub const MAX_MANIFEST_VERSION: u64 = 1 << 32;
 /// Last segment of the grants record key.
 pub const GRANTS_SEGMENT: &str = "grants";
 
@@ -192,6 +207,13 @@ mod tests {
         let k9 = manifest_key(&TENANT_A, "hits", 9).expect("key");
         let k10 = manifest_key(&TENANT_A, "hits", 10).expect("key");
         assert!(k9 < k10);
+    }
+
+    #[test]
+    fn the_version_bound_is_two_to_the_32_and_still_has_a_key() {
+        assert_eq!(MAX_MANIFEST_VERSION, 4_294_967_296);
+        let key = manifest_key(&TENANT_A, "hits", MAX_MANIFEST_VERSION).expect("key");
+        assert!(key.ends_with("/v/00000000004294967296.pqm"), "{key}");
     }
 
     #[test]

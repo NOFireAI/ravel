@@ -19,7 +19,9 @@
 //! every version committed after the writer's resolve is too young for a
 //! sweep to free the key the put targets. [`plan`] only ever selects a version that has a
 //! successor in the same listing, so it does not select a table's newest
-//! version, dropped or live, which the next writer numbers from.
+//! version, dropped or live, which the next writer numbers from. Versions
+//! above [`MAX_MANIFEST_VERSION`] are left out of that listing: they are never
+//! a table's newest, so none counts as a successor, and none is deleted here.
 //!
 //! [`plan`] refuses a grace below the deployment's minimum (its
 //! `--gc-max-query-duration`). Ages come from the store's
@@ -33,7 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use ravel_object_store::{ObjectMeta, ObjectStoreBackend, StoreError, list_all};
 use ravel_types::TenantHash;
 
-use crate::keys::{KeyError, parse_manifest_key, tenant_manifest_prefix};
+use crate::keys::{KeyError, MAX_MANIFEST_VERSION, parse_manifest_key, tenant_manifest_prefix};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SweepError {
@@ -133,7 +135,11 @@ pub async fn plan(
     let tables = manifests_by_table(store, tenant).await?;
     let mut manifest_deletes = BTreeSet::new();
     for versions in tables.values() {
-        for pair in versions.windows(2) {
+        // A version above the bound is never a table's newest
+        // (`resolve::newest`), so it supersedes nothing and is left for
+        // `crate::repair`.
+        let bounded = &versions[..versions.partition_point(|(v, _)| *v <= MAX_MANIFEST_VERSION)];
+        for pair in bounded.windows(2) {
             let (older, successor) = (&pair[0].1, &pair[1].1);
             if past_grace(now_ms, successor.last_modified_unix_ms, grace_ms) {
                 manifest_deletes.insert(older.key.clone());
@@ -177,8 +183,9 @@ mod tests {
     use super::*;
     use crate::clock::FixedClock;
     use crate::keys::{grants_key, manifest_key};
+    use crate::manifest::encode_manifest;
     use crate::resolve;
-    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, file_for};
+    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, file_for, live_manifest};
     use crate::writer::{Intent, Outcome, apply};
 
     const GRACE: u64 = 660_000;
@@ -318,6 +325,47 @@ mod tests {
                 .await
                 .expect("plan"),
             SweepPlan::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_version_above_the_bound_never_supersedes_the_newest() {
+        // Without the bound, the forged versions are v1's successors, and v1
+        // (the table's only legitimate version) is deleted once they age.
+        let store = MemoryStore::new();
+        store.set_clock_ms(0);
+        assert_eq!(commit(&store, "hits", create(&[1])).await, 1);
+        store.set_clock_ms(1_000);
+        for v in [MAX_MANIFEST_VERSION + 1, u64::MAX] {
+            let bytes =
+                encode_manifest(&TENANT_A, &live_manifest("hits", v, &[9])).expect("encode");
+            store
+                .put(
+                    &mkey("hits", v),
+                    Bytes::from(bytes),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put");
+        }
+        let now = (1_001 + GRACE + SKEW_MS) as i64;
+        assert_eq!(
+            plan(&store, &TENANT_A, now, GRACE, GRACE)
+                .await
+                .expect("plan"),
+            SweepPlan::default()
+        );
+
+        // A legitimate successor still supersedes v1; the forged versions
+        // are neither successors nor deleted.
+        assert_eq!(commit(&store, "hits", create(&[2])).await, 2);
+        assert_eq!(
+            plan(&store, &TENANT_A, now, GRACE, GRACE)
+                .await
+                .expect("plan"),
+            SweepPlan {
+                manifest_deletes: vec![mkey("hits", 1)]
+            }
         );
     }
 
