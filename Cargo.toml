@@ -230,6 +230,18 @@ debug = "line-tables-only"
 inherits = "dev"
 debug = false
 
+[profile.ci-opt]
+# The ci profile with third-party dependencies optimised, for lanes that
+# restore a dependency cache. Workspace crates stay unoptimised, with debug
+# assertions and overflow checks on, so they compile as fast as under `ci`;
+# the dependencies (zstd, arrow, datafusion) are where CPU-heavy tests spend
+# their time. A cold build pays for optimising them once, which is why fleet
+# executors and local gates, which build cold, stay on `ci`.
+inherits = "ci"
+
+[profile.ci-opt.package."*"]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

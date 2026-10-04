@@ -833,7 +833,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # 45m. A cold cache means building every dependency optimised, which
+    # measured 18m34s to 28m14s per leg (run 37201668562), before about 4m of
+    # tests. A warm leg is about 10m.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -869,16 +872,19 @@ jobs:
           # charging the budget that holds the main-scoped entries every run
           # restores from (#1643).
           save-if: ${{ github.ref == 'refs/heads/main' }}
-          # Every leg builds the same thing, so they share one entry, under
-          # the name the unsplit job saved it as.
-          shared-key: check
+          # Every leg builds the same thing, so they share one entry. The key
+          # names the cargo profile: an entry is never rewritten under a key
+          # that exists, so a profile change that kept the old key would
+          # restore the old profile's subtree and build dependencies cold on
+          # every run (issue #2519). Change it with the profile.
+          shared-key: check-ci-opt
       # The denominator is the number of legs, taken from the strategy so it
       # follows the shard list: a larger one would leave a partition that no
       # leg runs. That holds only while `shard` is the matrix's one dimension.
       # A second dimension multiplies job-total and not the shard numbers, so
       # it has to come with a fixed denominator here.
       - name: Test
-        run: cargo nextest run --locked --workspace --cargo-profile ci --partition hash:${{ matrix.shard }}/${{ strategy.job-total }}
+        run: cargo nextest run --locked --workspace --cargo-profile ci-opt --partition hash:${{ matrix.shard }}/${{ strategy.job-total }}
       # nextest does not run doctests; keep them covered separately, in one
       # leg, since they are not partitioned. Same `ci` profile as the step
       # above (ADR-0053 D4, and what scripts/gates.sh has always run): on the
@@ -888,7 +894,7 @@ jobs:
       # is dropped.
       - name: Doctests
         if: matrix.shard == 1
-        run: cargo test --locked --doc --profile ci --workspace
+        run: cargo test --locked --doc --profile ci-opt --workspace
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
