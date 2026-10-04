@@ -42,11 +42,20 @@
 //! negative component beside a positive one. Every list layout (`List`,
 //! `LargeList`, `FixedSizeList`, `ListView`, `LargeListView`) is a JSON array
 //! whose elements follow these same rules, and a `Dictionary` with any
-//! integer key type encodes as the value its key addresses. A type with no
-//! arm is an error naming the type. These are all
-//! `SqlError::Internal`: `/api/v1/sql`
-//! answers with only the fixed internal message and logs the detail, while
-//! the `/mcp` tool output carries the error's full text.
+//! integer key type encodes as the value its key addresses.
+//!
+//! # Unencodable results
+//!
+//! A type with no arm, and every value error above, is
+//! [`SqlError::UnencodableResult`]: the column's name, the Arrow type of the
+//! array that failed, and a fixed reason, never the value. It has the same
+//! class as a plan error, so `/api/v1/sql` answers 422 `execution` with that
+//! message, which tells the caller to request Arrow IPC, the encoding that
+//! carries every type exactly. A type with no arm is also logged at `warn`,
+//! since it is a gap in this encoder rather than a value out of range. A
+//! failed downcast, a dictionary key out of bounds, a map whose keys or values
+//! are not Utf8, and an Arrow IPC writer error stay `SqlError::Internal`:
+//! those are faults in the engine, not in the caller's choice of encoding.
 
 use std::fmt::Write as _;
 
@@ -146,8 +155,8 @@ impl QueryOutput {
         for batch in &self.batches {
             for row in 0..batch.num_rows() {
                 let mut cells = Vec::with_capacity(batch.num_columns());
-                for col in batch.columns() {
-                    cells.push(cell_to_json(col, row)?);
+                for (field, col) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+                    cells.push(cell_to_json(field.name(), col, row)?);
                 }
                 rows.push(Json::Array(cells));
             }
@@ -157,11 +166,14 @@ impl QueryOutput {
     }
 }
 
-/// Encode one cell. Unsupported types are an internal error rather than a
-/// lossy stringification: silently rendering a type we do not understand
-/// would be a quiet correctness hole in an endpoint whose whole contract is
-/// exactness.
-fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
+/// Encode one cell of the result column named `column`. A type with no JSON
+/// form, or a value outside what its form can hold, is
+/// [`SqlError::UnencodableResult`] rather than a lossy stringification:
+/// silently rendering a value we cannot represent would be a quiet
+/// correctness hole in an endpoint whose whole contract is exactness. A
+/// nested cell keeps the top-level column's name, and the error names the
+/// type of the innermost array that failed.
+fn cell_to_json(column: &str, array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
     if array.is_null(row) {
         return Ok(Json::Null);
     }
@@ -193,51 +205,61 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
             json!(downcast::<TimestampNanosecondArray>(array, "Timestamp(ns)")?.value(row))
         }
         DataType::Timestamp(TimeUnit::Microsecond, _) => json!(scale_to_nanos(
+            column,
             array,
             downcast::<TimestampMicrosecondArray>(array, "Timestamp(us)")?.value(row),
             1_000,
         )?),
         DataType::Timestamp(TimeUnit::Millisecond, _) => json!(scale_to_nanos(
+            column,
             array,
             downcast::<TimestampMillisecondArray>(array, "Timestamp(ms)")?.value(row),
             1_000_000,
         )?),
         DataType::Timestamp(TimeUnit::Second, _) => json!(scale_to_nanos(
+            column,
             array,
             downcast::<TimestampSecondArray>(array, "Timestamp(s)")?.value(row),
             1_000_000_000,
         )?),
         DataType::Time32(TimeUnit::Second) => json!(time_of_day_nanos(
+            column,
             array,
             i64::from(downcast::<Time32SecondArray>(array, "Time32(s)")?.value(row)),
             1_000_000_000,
         )?),
         DataType::Time32(TimeUnit::Millisecond) => json!(time_of_day_nanos(
+            column,
             array,
             i64::from(downcast::<Time32MillisecondArray>(array, "Time32(ms)")?.value(row)),
             1_000_000,
         )?),
         DataType::Time64(TimeUnit::Microsecond) => json!(time_of_day_nanos(
+            column,
             array,
             downcast::<Time64MicrosecondArray>(array, "Time64(us)")?.value(row),
             1_000,
         )?),
         DataType::Time64(TimeUnit::Nanosecond) => json!(time_of_day_nanos(
+            column,
             array,
             downcast::<Time64NanosecondArray>(array, "Time64(ns)")?.value(row),
             1,
         )?),
         DataType::Duration(TimeUnit::Second) => json!(duration_nanos(
+            column,
             array,
             downcast::<DurationSecondArray>(array, "Duration(s)")?.value(row),
             1_000_000_000,
         )?),
         DataType::Duration(TimeUnit::Millisecond) => json!(duration_nanos(
+            column,
             array,
             downcast::<DurationMillisecondArray>(array, "Duration(ms)")?.value(row),
             1_000_000,
         )?),
         DataType::Duration(TimeUnit::Microsecond) => json!(duration_nanos(
+            column,
             array,
             downcast::<DurationMicrosecondArray>(array, "Duration(us)")?.value(row),
             1_000,
@@ -247,14 +269,14 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
         }
         DataType::Date32 => {
             let days = downcast::<Date32Array>(array, "Date32")?.value(row);
-            json!(date_text(i64::from(days)).ok_or_else(|| not_a_date("Date32", days.into()))?)
+            json!(date_text(i64::from(days)).ok_or_else(|| not_a_date(column, array))?)
         }
         DataType::Date64 => {
             let millis = downcast::<Date64Array>(array, "Date64")?.value(row);
             let text = (millis.rem_euclid(MILLIS_PER_DAY) == 0)
                 .then(|| date_text(millis.div_euclid(MILLIS_PER_DAY)))
                 .flatten()
-                .ok_or_else(|| not_a_date("Date64", millis))?;
+                .ok_or_else(|| not_a_date(column, array))?;
             json!(text)
         }
         DataType::Decimal32(_, scale) => json!(decimal_text(
@@ -296,12 +318,7 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
             let value = downcast::<IntervalDayTimeArray>(array, "Interval(DayTime)")?.value(row);
             let nanoseconds = i64::from(value.milliseconds)
                 .checked_mul(1_000_000)
-                .ok_or_else(|| {
-                    SqlError::Internal(format!(
-                        "{} milliseconds overflow an i64 count of nanoseconds",
-                        array.data_type()
-                    ))
-                })?;
+                .ok_or_else(|| unencodable(column, array, INTERVAL_OVERFLOW))?;
             interval_json(0, value.days, nanoseconds)
         }
         DataType::Interval(IntervalUnit::MonthDayNano) => {
@@ -319,12 +336,12 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
                 DataType::UInt16 => dictionary_entry::<UInt16Type>(array, row)?,
                 DataType::UInt32 => dictionary_entry::<UInt32Type>(array, row)?,
                 DataType::UInt64 => dictionary_entry::<UInt64Type>(array, row)?,
-                _ => return Err(no_json_encoding(array)),
+                _ => return Err(no_json_encoding(column, array)),
             };
             if matches!(**value, DataType::Map(_, _)) {
                 map_to_json(values, index)
             } else {
-                cell_to_json(values, index)
+                cell_to_json(column, values, index)
             }?
         }
         DataType::Map(_, _) => map_to_json(array, row)?,
@@ -333,45 +350,72 @@ fn cell_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
         // encoded by the same rules as a top-level cell, so a nested Utf8 or
         // Map reads exactly as it would in a column of its own. Every list
         // layout encodes the same way.
-        DataType::List(_) => list_json(&downcast::<ListArray>(array, "List")?.value(row))?,
-        DataType::LargeList(_) => {
-            list_json(&downcast::<LargeListArray>(array, "LargeList")?.value(row))?
-        }
-        DataType::FixedSizeList(_, _) => {
-            list_json(&downcast::<FixedSizeListArray>(array, "FixedSizeList")?.value(row))?
-        }
-        DataType::ListView(_) => {
-            list_json(&downcast::<ListViewArray>(array, "ListView")?.value(row))?
-        }
-        DataType::LargeListView(_) => {
-            list_json(&downcast::<LargeListViewArray>(array, "LargeListView")?.value(row))?
-        }
+        DataType::List(_) => list_json(column, &downcast::<ListArray>(array, "List")?.value(row))?,
+        DataType::LargeList(_) => list_json(
+            column,
+            &downcast::<LargeListArray>(array, "LargeList")?.value(row),
+        )?,
+        DataType::FixedSizeList(_, _) => list_json(
+            column,
+            &downcast::<FixedSizeListArray>(array, "FixedSizeList")?.value(row),
+        )?,
+        DataType::ListView(_) => list_json(
+            column,
+            &downcast::<ListViewArray>(array, "ListView")?.value(row),
+        )?,
+        DataType::LargeListView(_) => list_json(
+            column,
+            &downcast::<LargeListViewArray>(array, "LargeListView")?.value(row),
+        )?,
         DataType::Struct(fields) => {
             let columns = downcast::<StructArray>(array, "Struct")?;
             let mut object = JsonMap::with_capacity(fields.len());
             for (i, field) in fields.iter().enumerate() {
                 let child = columns.column(i);
-                object.insert(field.name().to_string(), cell_to_json(child, row)?);
+                object.insert(field.name().to_string(), cell_to_json(column, child, row)?);
             }
             Json::Object(object)
         }
-        _ => return Err(no_json_encoding(array)),
+        _ => return Err(no_json_encoding(column, array)),
     };
     Ok(value)
 }
 
-fn no_json_encoding(array: &ArrayRef) -> SqlError {
-    SqlError::Internal(format!(
-        "no JSON encoding for arrow type {}",
-        array.data_type()
-    ))
+const NO_ARM: &str = "this type has no JSON encoding";
+const EPOCH_NANOS_OVERFLOW: &str = "the value has no i64 count of nanoseconds since the epoch";
+const DURATION_NANOS_OVERFLOW: &str = "the value has no i64 count of nanoseconds";
+const NOT_A_TIME_OF_DAY: &str =
+    "a JSON time must be at least 0 and less than one day since midnight";
+const NOT_A_DATE: &str = "a JSON date must be a whole day from 0000-01-01 to 9999-12-31";
+const INTERVAL_OVERFLOW: &str = "an interval component has no i64 count of nanoseconds";
+
+/// The error for a cell of `column` that `array`'s JSON form cannot hold. It
+/// names the column, the type and a fixed reason, never the value.
+fn unencodable(column: &str, array: &ArrayRef, reason: &'static str) -> SqlError {
+    SqlError::UnencodableResult {
+        column: column.to_string(),
+        data_type: array.data_type().to_string(),
+        reason,
+    }
 }
 
-/// The elements of one list cell, each encoded by the top-level rules.
-fn list_json(values: &ArrayRef) -> Result<Json, SqlError> {
+/// A type with no arm. Unlike a value out of range, this is a gap in the
+/// encoder a new column type can open, so it is logged for the operator too.
+fn no_json_encoding(column: &str, array: &ArrayRef) -> SqlError {
+    tracing::warn!(
+        column,
+        data_type = %array.data_type(),
+        "SQL result column has no JSON encoding"
+    );
+    unencodable(column, array, NO_ARM)
+}
+
+/// The elements of one list cell of `column`, each encoded by the top-level
+/// rules.
+fn list_json(column: &str, values: &ArrayRef) -> Result<Json, SqlError> {
     let mut items = Vec::with_capacity(values.len());
     for i in 0..values.len() {
-        items.push(cell_to_json(values, i)?);
+        items.push(cell_to_json(column, values, i)?);
     }
     Ok(Json::Array(items))
 }
@@ -446,24 +490,28 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 /// A timestamp of a coarser unit as nanoseconds since the epoch, the encoding
 /// `Timestamp(ns)` already has. A value with no i64 nanosecond count is an
 /// error rather than a wrapped number.
-fn scale_to_nanos(array: &ArrayRef, value: i64, nanos_per_unit: i64) -> Result<i64, SqlError> {
-    value.checked_mul(nanos_per_unit).ok_or_else(|| {
-        SqlError::Internal(format!(
-            "{} value {value} overflows an i64 count of nanoseconds since the epoch",
-            array.data_type()
-        ))
-    })
+fn scale_to_nanos(
+    column: &str,
+    array: &ArrayRef,
+    value: i64,
+    nanos_per_unit: i64,
+) -> Result<i64, SqlError> {
+    value
+        .checked_mul(nanos_per_unit)
+        .ok_or_else(|| unencodable(column, array, EPOCH_NANOS_OVERFLOW))
 }
 
 /// A duration of a coarser unit as a signed count of nanoseconds. A value
 /// with no i64 nanosecond count is an error rather than a wrapped number.
-fn duration_nanos(array: &ArrayRef, value: i64, nanos_per_unit: i64) -> Result<i64, SqlError> {
-    value.checked_mul(nanos_per_unit).ok_or_else(|| {
-        SqlError::Internal(format!(
-            "{} value {value} overflows an i64 count of nanoseconds",
-            array.data_type()
-        ))
-    })
+fn duration_nanos(
+    column: &str,
+    array: &ArrayRef,
+    value: i64,
+    nanos_per_unit: i64,
+) -> Result<i64, SqlError> {
+    value
+        .checked_mul(nanos_per_unit)
+        .ok_or_else(|| unencodable(column, array, DURATION_NANOS_OVERFLOW))
 }
 
 const NANOS_PER_DAY: i64 = 86_400_000_000_000;
@@ -471,25 +519,21 @@ const NANOS_PER_DAY: i64 = 86_400_000_000_000;
 /// A time of day of any unit as nanoseconds since midnight. A negative value,
 /// one that is a whole day or more, or one whose nanosecond count overflows
 /// an i64 is an error rather than a number no time of day has; all three
-/// report the same "is not a time of day" text.
-fn time_of_day_nanos(array: &ArrayRef, value: i64, nanos_per_unit: i64) -> Result<i64, SqlError> {
+/// report the same reason.
+fn time_of_day_nanos(
+    column: &str,
+    array: &ArrayRef,
+    value: i64,
+    nanos_per_unit: i64,
+) -> Result<i64, SqlError> {
     value
         .checked_mul(nanos_per_unit)
         .filter(|nanos| (0..NANOS_PER_DAY).contains(nanos))
-        .ok_or_else(|| {
-            SqlError::Internal(format!(
-                "{} value {value} is not a time of day: a JSON time must be at least 0 \
-                 and less than 86400 seconds since midnight",
-                array.data_type()
-            ))
-        })
+        .ok_or_else(|| unencodable(column, array, NOT_A_TIME_OF_DAY))
 }
 
-fn not_a_date(type_name: &str, value: i64) -> SqlError {
-    SqlError::Internal(format!(
-        "{type_name} value {value} has no YYYY-MM-DD form: a JSON date must be a whole day \
-         from 0000-01-01 to 9999-12-31"
-    ))
+fn not_a_date(column: &str, array: &ArrayRef) -> SqlError {
+    unencodable(column, array, NOT_A_DATE)
 }
 
 /// `days` since 1970-01-01 as `YYYY-MM-DD` in the proleptic Gregorian
@@ -840,12 +884,44 @@ mod tests {
         Ok(rows.iter().map(|row| row[0].clone()).collect())
     }
 
-    /// The `SqlError::Internal` message encoding `array` fails with.
-    fn column_error(array: ArrayRef) -> String {
-        match column_json(array) {
-            Err(SqlError::Internal(message)) => message,
-            other => panic!("expected SqlError::Internal, got {other:?}"),
+    /// Encoding `array` as column "c" fails with `UnencodableResult` naming
+    /// the column, the array's type and `reason`, in a message that is also
+    /// the client message and holds none of the digits of `value`.
+    fn assert_unencodable(array: ArrayRef, value: &str, reason: &str) {
+        let data_type = array.data_type().to_string();
+        let err = column_json(array).expect_err("the cell is unencodable");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            format!(
+                "column \"c\" of type {data_type} cannot be encoded as JSON: {reason}; \
+                 request the Arrow IPC format to read it exactly"
+            )
+        );
+        assert_eq!(err.client_message(), message);
+        assert_eq!(err.class(), crate::error::ErrorClass::Unsupported);
+        assert!(
+            !message.contains(value),
+            "the message must not carry the value {value}: {message}"
+        );
+        match err {
+            SqlError::UnencodableResult {
+                column,
+                data_type: reported,
+                reason: reported_reason,
+            } => {
+                assert_eq!(column, "c");
+                assert_eq!(reported, data_type);
+                assert_eq!(reported_reason, reason);
+            }
+            other => panic!("expected SqlError::UnencodableResult, got {other:?}"),
         }
+    }
+
+    /// The digits of `value` without its sign, which is what a leak of the
+    /// value would put in a message.
+    fn digits(value: i64) -> String {
+        value.unsigned_abs().to_string()
     }
 
     #[test]
@@ -907,10 +983,10 @@ mod tests {
     fn date32_outside_four_digit_years_is_a_typed_error() {
         use datafusion::arrow::array::Date32Array;
         for days in [-719_529, 2_932_897, i32::MIN, i32::MAX] {
-            let message = column_error(Arc::new(Date32Array::from(vec![days])) as ArrayRef);
-            assert!(
-                message.contains("Date32") && message.contains(&days.to_string()),
-                "the error names the type and the value: {message}"
+            assert_unencodable(
+                Arc::new(Date32Array::from(vec![days])) as ArrayRef,
+                &digits(days.into()),
+                NOT_A_DATE,
             );
         }
     }
@@ -931,11 +1007,11 @@ mod tests {
     #[test]
     fn date64_that_is_not_a_date_is_a_typed_error() {
         use datafusion::arrow::array::Date64Array;
-        for millis in [1, -1, 2_932_897 * 86_400_000, i64::MIN] {
-            let message = column_error(Arc::new(Date64Array::from(vec![millis])) as ArrayRef);
-            assert!(
-                message.contains("Date64") && message.contains(&millis.to_string()),
-                "the error names the type and the value: {message}"
+        for millis in [123_456_789, -123_456_789, 2_932_897 * 86_400_000, i64::MIN] {
+            assert_unencodable(
+                Arc::new(Date64Array::from(vec![millis])) as ArrayRef,
+                &digits(millis),
+                NOT_A_DATE,
             );
         }
     }
@@ -1020,12 +1096,7 @@ mod tests {
             ),
         ];
         for (array, value) in cases {
-            let data_type = array.data_type().to_string();
-            let message = column_error(array);
-            assert!(
-                message.contains(&data_type) && message.contains(&value.to_string()),
-                "the error names {data_type} and {value}: {message}"
-            );
+            assert_unencodable(array, &digits(value), EPOCH_NANOS_OVERFLOW);
         }
     }
 
@@ -1265,15 +1336,7 @@ mod tests {
             (Arc::new(Time64NanosecondArray::from(vec![-1])), -1),
         ];
         for (array, value) in cases {
-            let data_type = array.data_type().to_string();
-            let message = column_error(array);
-            assert_eq!(
-                message,
-                format!(
-                    "{data_type} value {value} is not a time of day: a JSON time must be at \
-                     least 0 and less than 86400 seconds since midnight"
-                )
-            );
+            assert_unencodable(array, &digits(value), NOT_A_TIME_OF_DAY);
         }
     }
 
@@ -1344,12 +1407,7 @@ mod tests {
             ),
         ];
         for (array, value) in cases {
-            let data_type = array.data_type().to_string();
-            let message = column_error(array);
-            assert_eq!(
-                message,
-                format!("{data_type} value {value} overflows an i64 count of nanoseconds")
-            );
+            assert_unencodable(array, &digits(value), DURATION_NANOS_OVERFLOW);
         }
     }
 
@@ -1362,15 +1420,75 @@ mod tests {
     #[test]
     fn a_type_with_no_arm_is_a_typed_error_naming_it() {
         use datafusion::arrow::array::RunArray;
-        use datafusion::arrow::datatypes::Int32Type;
-        let array: RunArray<Int32Type> = vec!["a", "a", "b"].into_iter().collect();
+        let array: RunArray<Int32Type> = vec!["zq-cell-text", "zq-cell-text"].into_iter().collect();
         let array = Arc::new(array) as ArrayRef;
-        let expected = format!("no JSON encoding for arrow type {}", array.data_type());
         assert!(
-            expected.starts_with("no JSON encoding for arrow type RunEndEncoded"),
-            "{expected}"
+            array.data_type().to_string().starts_with("RunEndEncoded"),
+            "{}",
+            array.data_type()
         );
-        assert_eq!(column_error(array), expected);
+        assert_unencodable(array, "zq-cell-text", NO_ARM);
+    }
+
+    /// A cell nested in a list or a struct is reported under the top-level
+    /// column's name, with the type of the nested array that failed.
+    #[test]
+    fn a_nested_unencodable_cell_names_the_top_level_column_and_the_inner_type() {
+        use datafusion::arrow::datatypes::Field as ArrowField;
+        let dates = Arc::new(Date64Array::from(vec![123_456_789])) as ArrayRef;
+        let list = ListArray::new(
+            Arc::new(ArrowField::new_list_field(DataType::Date64, true)),
+            datafusion::arrow::buffer::OffsetBuffer::from_lengths([1]),
+            dates,
+            None,
+        );
+        match column_json(Arc::new(list) as ArrayRef) {
+            Err(SqlError::UnencodableResult {
+                column, data_type, ..
+            }) => {
+                assert_eq!(column, "c");
+                assert_eq!(data_type, "Date64");
+            }
+            other => panic!("expected SqlError::UnencodableResult, got {other:?}"),
+        }
+    }
+
+    /// The column name comes from the schema field beside the failing array,
+    /// not from the first column or a fixed index.
+    #[test]
+    fn the_unencodable_column_is_named_from_its_own_schema_field() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("fine", DataType::Int8, false),
+            Field::new("when", DataType::Date64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int8Array::from(vec![1])) as ArrayRef,
+                Arc::new(Date64Array::from(vec![123_456_789])),
+            ],
+        )
+        .expect("batch");
+        match QueryOutput::new(schema, vec![batch]).to_json() {
+            Err(SqlError::UnencodableResult { column, .. }) => assert_eq!(column, "when"),
+            other => panic!("expected SqlError::UnencodableResult, got {other:?}"),
+        }
+    }
+
+    /// A map whose keys are not Utf8 is an engine fault, not an encoding
+    /// choice the caller can change, so it stays `Internal`.
+    #[test]
+    fn a_map_with_non_utf8_keys_stays_internal() {
+        use datafusion::arrow::array::{Int32Builder, MapBuilder, StringBuilder};
+        let mut builder = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        builder.keys().append_value(7);
+        builder.values().append_value("v");
+        builder.append(true).expect("map entry");
+        let array = Arc::new(builder.finish()) as ArrayRef;
+        assert!(
+            matches!(column_json(array), Err(SqlError::Internal(_))),
+            "a non-Utf8 map key is an Internal error"
+        );
     }
 
     #[test]

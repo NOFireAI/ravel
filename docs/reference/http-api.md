@@ -155,11 +155,15 @@ string: `NaN`, `+Inf`, and `-Inf`. Other column types are encoded as follows:
 
 A column whose type or value has no JSON encoding (a type with no rule above,
 a timestamp or duration past the i64 nanosecond range, a time that is
-negative or a whole day or more, a date outside years 0000 to 9999, or a
-`Date64` that is not a whole day) fails the query with 500 `internal` and
-the fixed internal message; the server logs the column type and value at
-`warn`. Sending `Accept: application/vnd.apache.arrow.stream` yields an Arrow
-IPC stream instead, which is bit-exact for every type. The SQL surface
+negative or a whole day or more, a date outside years 0000 to 9999, a
+`Date64` that is not a whole day, or an interval component past the i64
+nanosecond range) fails the query with 422 `execution`. The message names
+the column and its Arrow type and gives the reason, never the value:
+`column "<name>" of type <type> cannot be encoded as JSON: <reason>; request
+the Arrow IPC format to read it exactly`. A type with no rule is also logged
+at `warn`. Sending `Accept: application/vnd.apache.arrow.stream` yields an
+Arrow IPC stream instead, which is bit-exact for every type and reads every
+such column. The SQL surface
 registers exactly five tables, one per signal: `samples` (metrics), `logs`,
 `spans` (traces), `alerts` (alert state transitions), and `audit` (audit
 records, including the query-audit trail).
@@ -177,7 +181,9 @@ For the query routes, the status codes come from one shared error mapping:
 
 - 400 `bad_data`: a malformed query, a bad time range, or a non-positive step.
 - 422 `execution`: a resource-budget refusal (too many segments, series,
-  samples, or scanned bytes; an over-wide window), or an unsupported construct.
+  samples, or scanned bytes; an over-wide window), an unsupported construct,
+  or an SQL result column the JSON encoding cannot represent (see
+  `/api/v1/sql` above; Arrow IPC reads it exactly).
 - 500 `internal`: a permanent data-integrity fault in already-stored objects (a
   corrupt segment, an unreconstructable or mismatched commit record, a catalog
   object (commit, compaction or rewrite record, erasure request, HEAD, snapshot
@@ -190,8 +196,7 @@ For the query routes, the status codes come from one shared error mapping:
   the lowest this build supports, a supersession chain of compaction or
   rewrite records that is cyclic, deeper than the resolver's fixed bound, or
   names a predecessor with a different input set, a segment decode job that
-  panicked, a non-monotonic run), or an SQL result column the JSON encoding
-  cannot represent (see `/api/v1/sql` above). It is not retryable, and its
+  panicked, a non-monotonic run). It is not retryable, and its
   message is fixed so no object key or tenant hash leaks.
 - 503 `unavailable`: a transient storage fault, an invalidated snapshot, a
   catalog object (commit, compaction or rewrite record, erasure request, HEAD,
