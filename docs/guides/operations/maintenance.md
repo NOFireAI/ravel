@@ -572,6 +572,42 @@ Two flags configure claiming, and a third no longer has any effect:
   rewrite of the same bucket are kept apart only by the re-list each runs
   just before it publishes, which leaves a short window.
 
+### A log object compaction cannot rewrite
+
+The RLOG writer refuses a `stream_attrs` blob the reader cannot decode (a
+resource or scope attribute nested past the decoder's cap, or a scope name or
+version that is not UTF-8). A log object written before the writer checked
+this can still carry one, and compaction cannot write its records
+into an L1 segment. Compaction leaves that object out of the merge and merges
+the rest of the bucket. The compaction record does not name the skipped object,
+so no sweep deletes it as superseded, and the catalog keeps serving it as an
+L0 object, readable exactly as before: every merged-view read of it still
+fails.
+
+What an operator sees:
+
+- `ravel_maintain_compaction_inputs_skipped_total{signal="logs",reason="unwritable_stream_attrs"}`
+  (or `signal="audit"` for the query-audit shard) moves by one per skipped
+  object. Each object counts once per process; another process, or this one
+  after a restart, that reads the same object counts it again.
+- One `WARN` line per object per process, `compaction skipped an input object
+  it cannot rewrite`, carrying `object_key` (the object's storage key),
+  `reason` and `error` (the decoder's refusal), with the bucket's signal,
+  shard and hour.
+- The bucket compacts as usual. When every input of the bucket is such an
+  object, nothing is published and the bucket reports below-minimum, and the
+  process that skipped them does not read them again.
+
+The object is not deleted and not rewritten by any maintenance path. The
+remedy is to delete that object, or rewrite it, by hand. Until then, an
+erasure request whose window covers it stays pending, because the erasure
+rewrite of a compacted bucket rewrites only the compaction record's outputs,
+and `ravel-cli maintain migrate`, which skips no input, still fails on a bucket
+it rewrites while that bucket has no compaction record and holds the object. A
+`compact-bucket` or `compact-tenant` run skips the object the same
+way and logs the same warning, but it is a separate process with no `/metrics`
+endpoint, so it moves no server counter.
+
 ## Garbage collection and retention
 
 Ravel deletes data through two independent triggers, both driven by the

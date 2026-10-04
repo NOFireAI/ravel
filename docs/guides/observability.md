@@ -57,8 +57,8 @@ where `kind` and `outcome` also split DDL statements by leading keyword and
 by how they ended.
 `reason` is shared by several families: the admission-rejection counter, the
 scrub counters, the alert retention-skip counter, the superseded-inputs-held
-counter, the fragment capability reject counter, and the SQL slice capability
-reject counter. `cache` and `tier` split the read-cache family across its two caches
+counter, the compaction inputs-skipped counter, the fragment capability reject
+counter, and the SQL slice capability reject counter. `cache` and `tier` split the read-cache family across its two caches
 and, when a disk tier is configured, its two tiers; the [caching
 guide](caching.md) documents both. `kind` splits the maintenance
 merge-memory gauge into its transient and total high-water marks. `class`
@@ -1318,13 +1318,14 @@ Labels: `mode`.
 | `ravel_maintain_tenants_maintained` | Gauge. Discovered tenants actually maintained this cycle, after any flag restriction. |
 | `ravel_maintain_tenant_discovery_failures_total` | Maintenance cycles skipped because tenant discovery itself failed. |
 
-### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`, `ravel_maintain_l0_records_pending`, `ravel_maintain_objects_deleted_total`, `ravel_maintain_bytes_reclaimed_total`, `ravel_maintain_retention_lag_seconds`, `ravel_maintain_units_scan_failed`)
+### Maintenance safety (`ravel_maintain_legal_hold_*`, `ravel_maintain_conservation_*`, `ravel_maintain_orphan*`, `ravel_maintain_l0_records_pending`, `ravel_maintain_objects_deleted_total`, `ravel_maintain_bytes_reclaimed_total`, `ravel_maintain_retention_lag_seconds`, `ravel_maintain_units_scan_failed`, `ravel_maintain_compaction_inputs_skipped_total`)
 
 Labels: `mode`, plus `signal` on every series except
 `ravel_maintain_legal_hold_refresh_failures_total` (`mode` only) and
 `ravel_maintain_objects_deleted_total`, which carries `mode` and `kind` and no
-`signal`. `ravel_maintain_superseded_inputs_held_total` adds
-`reason` to `mode` and `signal`. These carry no `tenant_hash` label.
+`signal`. `ravel_maintain_superseded_inputs_held_total` and
+`ravel_maintain_compaction_inputs_skipped_total` add `reason` to `mode` and
+`signal`. These carry no `tenant_hash` label.
 
 | Metric | Meaning |
 |---|---|
@@ -1335,7 +1336,8 @@ Labels: `mode`, plus `signal` on every series except
 | `ravel_maintain_retention_lag_seconds` | Gauge. How far past its retention expiry the oldest still-present expired bucket is, by signal, from this process's most recent completed cycle. 0 when none. A per-cycle maximum over the process's units, so it names the single worst bucket. Three cases: exact when this process tombstoned the bucket; otherwise measured from the earlier of the ingest hour's end plus the window and the tombstone time, which can under-read by up to one hour plus `max_ingest_lag` (three hours at the defaults) and over-read by at most the allowed future clock skew, except transiently after a physical sweep that stopped partway (see below); and, for a bucket holding a rewrite record with no parts, from the tombstone time alone, which never over-reads and under-reads by however long after the bucket expired its tombstone was written, with no fixed bound. A unit whose scan failed, or that a failed provisioning read skipped, contributes nothing: read it beside `ravel_maintain_units_scan_failed`. |
 | `ravel_maintain_units_scan_failed` | Gauge. Units whose retention and compaction scan returned an error in this process's most recent completed cycle, or that a failed provisioning check or shard-generation read skipped unscanned, by signal. While it is nonzero the retention lag does not cover every unit. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
-| `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. Also carries `signal="alerts"` and `signal="audit"` for the alerts shard's orphan sweep and the query-audit shard's input-cleanup sweep, which run outside the maintained signals. The superseded refusal counter and the two superseded hold families below carry those two signals as well; every other per-signal series here covers only metrics, logs and spans. |
+| `ravel_maintain_compaction_inputs_skipped_total` | Input objects compaction left out of its merge instead of failing on them, by signal and `reason`, each object counted once per process. Carries `signal="logs"` and `signal="audit"` (the query-audit shard), the two signals that compact through RLOG, each rendered from zero. `reason="unwritable_stream_attrs"`: a log object carrying a `stream_attrs` blob the RLOG writer refuses, written before the writer checked it. The rest of the bucket is merged; the skipped object stays in storage, unnamed by the compaction record, and a `WARN` line names its key. See [maintenance](operations/maintenance.md#a-log-object-compaction-cannot-rewrite) for what to do. |
+| `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. Also carries `signal="alerts"` and `signal="audit"` for the alerts shard's orphan sweep and the query-audit shard's input-cleanup sweep, which run outside the maintained signals. The superseded refusal counter and the two superseded hold families below carry those two signals as well, and `ravel_maintain_compaction_inputs_skipped_total` carries only logs and audit; every other per-signal series here covers only metrics, logs and spans. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the last completed orphan pass, by signal. |
 | `ravel_maintain_orphans_present` | Gauge. Orphan candidates the last completed orphan pass found, by signal, whether or not the breaker tripped. |
 | `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |
