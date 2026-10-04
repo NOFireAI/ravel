@@ -1173,6 +1173,17 @@ mod tests {
             8,
             "one state row per input row, filtered or not"
         );
+        assert_eq!(
+            state[0].data_type(),
+            &DataType::Decimal128(38, 0),
+            "the sum state column must carry the full-precision decimal type \
+             merge_batch expects, not whatever Decimal128Builder defaults to"
+        );
+        assert_eq!(
+            state[1].data_type(),
+            &DataType::Int64,
+            "the count state column must be Int64"
+        );
         let mut merged = ExactIntegerAvgGroupsAccumulator::new();
         merged
             .merge_batch(&state, &group_indices, None, 6)
