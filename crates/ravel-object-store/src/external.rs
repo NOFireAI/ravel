@@ -26,10 +26,11 @@
 //! anything reads through it: that the store evaluates read preconditions, and
 //! that it is not Ravel's own bucket under another name.
 //!
-//! `ravel-server` opens one per (profile, bucket) a Parquet table query reads
-//! (through `ravel-sql`'s `ProfileStores`), and `ravel-cli tenant
-//! parquet-grant add` opens one to probe a grant; `CREATE EXTERNAL TABLE`
-//! (#2054) will be the next caller.
+//! `ravel-server` opens one per (profile, bucket) a Parquet table query or a
+//! `CREATE EXTERNAL TABLE` (#2054) reads, both through `ravel-sql`'s
+//! `ProfileStores`; the DDL also runs [`probe`]'s checks on the location it
+//! is about to write. `ravel-cli tenant parquet-grant add` opens one to probe
+//! a grant.
 
 use std::path::PathBuf;
 use std::sync::Arc;

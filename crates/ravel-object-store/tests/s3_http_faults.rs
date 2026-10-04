@@ -3257,10 +3257,11 @@ async fn successful_multipart_upload_moves_neither_counter() {
 /// with upload integrity off keeps exactly as many requests in flight as the
 /// permits it holds (issue #2327): one permit when the class has capacity 1,
 /// two when the background class has two. The endpoint holds every part until
-/// one more than the permits are in flight, or one second passes. A put within
+/// one more than the permits are in flight, or three seconds pass. A put within
 /// its permits never reaches that target, so each held part waits the full
-/// second and every part the store sends together is in flight at once; a put
-/// that over-issues reaches it and shows the extra request in the peak.
+/// three seconds and every part the store sends together is in flight at once,
+/// even on a loaded runner; a put that over-issues reaches it and shows the
+/// extra request in the peak.
 #[tokio::test]
 async fn scheduled_large_put_keeps_requests_within_its_permits() {
     // (scheduler sizing, use the background handle, permits the put can hold)
@@ -3269,7 +3270,7 @@ async fn scheduled_large_put_keeps_requests_within_its_permits() {
         (SchedulerConfig::new(8, 2, 1), true, 2),
     ] {
         let fake = FakeS3::start().await;
-        fake.hold(&[Op::UploadPart], permits + 1, Duration::from_secs(1));
+        fake.hold(&[Op::UploadPart], permits + 1, Duration::from_secs(3));
         let classed = ClassedStore::scheduled(Arc::new(fake.store()), config);
         let handle = if background {
             classed.background()
@@ -3365,10 +3366,11 @@ async fn scheduled_large_put_with_integrity_takes_one_permit() {
 /// (issue #2493): one when the class has capacity 1, two when the background
 /// class has two. The read is one truncated unranged GET and then five ranged
 /// ones. The endpoint holds every GET until one more than the permits are in
-/// flight, or one second passes, as the put test above does: a read within its
+/// flight, or three seconds pass, as the put test above does: a read within its
 /// permits never reaches that target, so every request it sends together is in
 /// flight at once; a read that over-issues reaches it and shows the extra
-/// request in the peak.
+/// request in the peak. Three seconds stays inside `small_chunk_http`'s 7 s
+/// `request_timeout`.
 #[tokio::test]
 async fn scheduled_large_get_keeps_requests_within_its_permits() {
     // (scheduler sizing, use the background handle, permits the read can hold)
@@ -3381,7 +3383,7 @@ async fn scheduled_large_get_keeps_requests_within_its_permits() {
         let bound = http.max_request_body_bytes();
         let object = patterned(5 * bound + 123);
         fake.seed("scheduled/large-read", &object);
-        fake.hold(&[Op::Get], permits + 1, Duration::from_secs(1));
+        fake.hold(&[Op::Get], permits + 1, Duration::from_secs(3));
         let classed = ClassedStore::scheduled(Arc::new(fake.store_with_http(http)), config);
         let handle = if background {
             classed.background()
