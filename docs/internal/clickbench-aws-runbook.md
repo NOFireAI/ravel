@@ -7,6 +7,12 @@ A start-to-finish runbook for standing up the AWS environment, loading the
 and how to read its report. This guide is the operational half: the
 infrastructure, and the exact commands in the order they run.
 
+For the ClickBench Parquet lane (ADR-2040 D7), use sections 1 to 6 here to
+stand up the box, then follow
+[ClickBench Parquet lane](clickbench.md#clickbench-parquet-lane) in
+clickbench.md. That lane measures against loopback RustFS on the box, not
+against the S3 bucket this runbook creates.
+
 Total: about 90 minutes of wall clock, most of it the dataset download, the
 first build, and the load.
 
