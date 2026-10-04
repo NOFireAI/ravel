@@ -934,10 +934,13 @@ jobs:
   # The SQL surface. Two things the `check` job cannot
   # cover:
   #
-  # 1. `POST /api/v1/sql` is behind ravel-server's `sql` cargo feature, so
-  #    `cargo clippy --workspace --all-targets` and `cargo test --workspace`
-  #    never compile the handler, its error-to-HTTP redaction boundary, or
-  #    services/ravel-server/tests/sql_endpoint.rs at all.
+  # 1. `POST /api/v1/sql` is behind ravel-server's `sql` cargo feature. A
+  #    workspace run does build it, because ravel-cli's dev-dependency turns
+  #    the feature on, but only unified with the dependency features the
+  #    rest of the workspace adds. This job builds and tests ravel-server
+  #    with `sql` selected on its own, which is the selection a break in
+  #    the handler, its error-to-HTTP redaction boundary, or
+  #    services/ravel-server/tests/sql_endpoint.rs can hide from.
   # 2. The layer-2 differential gate
   #    (crates/ravel-sql/tests/differential.rs) is only as strong as the
   #    number of proptest cases it runs. `check` runs it at the in-file

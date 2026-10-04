@@ -333,8 +333,11 @@ fi
 
 # Feature-gated surfaces (issues #609, #616, #714, #732). ravel-server's `sql`
 # and `flight-sql` features, and ravel-bench's bench-lane features, are off by
-# default, so nothing above compiles the SQL handler, the Flight SQL service,
-# the bench lanes, or their tests. Without these lanes a local run prints "All
+# default, so nothing above compiles the Flight SQL service, the bench lanes,
+# or their tests. The workspace run above does build ravel-server with `sql`
+# on, through ravel-cli's dev-dependency, but only together with the
+# dependency features the rest of the workspace adds: a break that shows with
+# `sql` selected on its own passes it. Without these lanes a local run prints "All
 # gates passed" on a tree CI rejects. That happened while rebasing #511: the
 # workspace gate was green and `--features sql` failed with E0061 on a call
 # site that had gone stale under a textually clean merge. It happened again for
