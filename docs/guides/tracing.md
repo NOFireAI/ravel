@@ -1,42 +1,39 @@
 # Query-path tracing
 
-Ravel instruments the read path with `tracing` spans so a slow query can be
-attributed to a phase. Each crate opens a span around the work it owns, and
-every span carries the same bounded fields the `/metrics` label allowlist
-permits (a tenant hash and per-span byte and request counts), never a query
-text, a metric name, a label value, or an object key.
+Ravel instruments the read path with `tracing` spans, so you can attribute a
+slow query to a phase. Each crate opens a span around the work it owns. Every
+span carries the same bounded fields that the `/metrics` label allowlist
+permits (a tenant hash and per-span byte and request counts). A span never
+carries a query text, a metric name, a label value, or an object key.
 
 ![query-path tracing: spans and OTLP export](../diagrams/tracing-export.svg)
 
-## This guide and the observability guide
+## Related guides
 
-This guide covers the query-path spans: which spans exist, what each records,
-how to turn them on, and how to read them to place a slow query's time in a
-phase. Spans answer "where did the time go" for one request.
+Spans answer "where did the time go" for one request.
 
 The [observability guide](observability.md) is the catalog of `GET /metrics`.
 Metrics answer "how much" in aggregate across the process: request counts,
 byte counts, cache outcomes, error kinds, and the per-query cost estimate
-against the actual. It does not carry per-request timing. Read it to
-understand a sample on the route; read this guide to attribute one query.
+against the actual. Metrics carry no per-request timing.
 
 ## The spans
 
-Spans come in two kinds. Request-level spans wrap a whole query and are
-created at `info` level, so they appear under the default log filter. Phase
-spans wrap one stage of the read path and are created at `debug` level, so
-they are off until you widen the filter (see
-[Turning them on](#turning-them-on)).
+Request-level spans wrap a whole query. They are created at `info` level, so
+they appear under the default log filter.
 
-The tables below give each span's `tracing` target, which is the name that
-appears on the log line and the name a `RUST_LOG` directive matches. That is
-the handle you actually have on a running process: to see a span, name its
-target.
+Phase spans wrap one stage of the read path. They are created at `debug`
+level, so they are off until you widen the filter (see
+[Turn the spans on](#turn-the-spans-on)).
+
+The tables give the `tracing` target of each span. The target is the name on
+the log line and the name that a `RUST_LOG` directive matches. To see a span,
+name its target.
 
 ### Request-level spans (info)
 
-Each transport opens one span for the whole request and records the query's
-final store-request and byte counts once it finishes.
+Each transport opens one span for the whole request. When the query finishes,
+the span records the query's final store-request and byte counts.
 
 | Span | Opened by | `RUST_LOG` target | Fields |
 |---|---|---|---|
@@ -44,17 +41,19 @@ final store-request and byte counts once it finishes.
 | `analytics_query` | the analytics routes | `ravel_server` | `tenant_hash`, `workload_class`, `s3_requests`, `s3_bytes` |
 | `flight_sql_statement` | a Flight SQL statement | `ravel_sql` | `tenant_hash`, `workload_class`, `s3_requests`, `s3_bytes` |
 
-`workload_class` is the literal `interactive` on all three: every query over
-these transports is client-driven. `s3_requests` and `s3_bytes` start empty
-and are recorded from the query's accounting handle when it returns, so they
-are the whole query's authoritative totals, the same numbers the response body
-and `/metrics` are fed from.
+`workload_class` is the literal `interactive` on all three, because every
+query over these transports is client-driven.
+
+`s3_requests` and `s3_bytes` start empty. The span records them from the
+query's accounting handle when the query returns. They are the whole query's
+authoritative totals, the same numbers that feed the response body and
+`/metrics`.
 
 ### Phase spans (debug)
 
 Six span names cover the read-path phases. `page_fetch`, `decode`, and
 `evaluate` each have two callsites (a scalar and a histogram variant, an
-instant and a range variant); the span name is the same at both.
+instant and a range variant). The span name is the same at both.
 
 | Span | Phase it wraps | `RUST_LOG` target | Fields |
 |---|---|---|---|
@@ -68,37 +67,37 @@ instant and a range variant); the span name is the same at both.
 Field notes:
 
 - `catalog_resolve` records `s3_requests`, `s3_bytes`, and `segments_pruned`
-  as the delta this resolve alone added to the query's accounting, not the
-  whole query's total. A query fetches segments after resolving on the same
-  handle, so the resolve span's counts are just the LIST/GET fan-out cost of
-  finding the segments.
-- `segment_open` records `object_size` (the segment's size) at open, and
-  `s3_requests`/`s3_bytes` as that one segment's own GET cost. Concurrent
-  segment opens do not fold into each other's counts.
-- `catalog_decode` records `matcher_count` and `total_size` at open and
-  `series_matched` once the decode finds its matching series.
+  as the delta that this resolve added to the query's accounting. They are
+  not the whole query's total. A query fetches segments after the resolve on
+  the same handle, so the counts on the resolve span are the LIST/GET fan-out
+  cost of finding the segments.
+- `segment_open` records `object_size` (the segment's size) at open. It
+  records `s3_requests`/`s3_bytes` as the GET cost of that one segment.
+  Concurrent segment opens do not add to each other's counts.
+- `catalog_decode` records `matcher_count` and `total_size` at open. It
+  records `series_matched` when the decode finds its matching series.
 - `page_fetch` and `decode` carry `page_kind` and `series_count`. On `decode`,
   `page_kind` is `scalar` or `histogram`. On `page_fetch` it can also be
-  `mixed`: a segment's scalar and histogram pages are fetched in one batch,
-  so when a query selects series of both kinds from the same segment (a
-  PromQL or SQL prefetch that needs both), one `page_fetch` span covers both,
-  its `series_count` is the scalar and histogram series together, and its
-  `s3_requests`/`s3_bytes` are the one batch's GET cost. That fetch is then
-  followed by two `decode` spans, one `scalar` and one `histogram`.
-  `page_fetch` records the GET cost of pulling pages; `decode` records
-  `decompressed_bytes`, the uncompressed size it produced.
-- `evaluate` carries `eval_kind` (`instant` or `range`) and no counts; it is
-  pure in-memory evaluation over already-fetched data, so its cost is time,
-  not bytes.
+  `mixed`.
+- A `mixed` fetch occurs because Ravel fetches the scalar and histogram pages
+  of a segment in one batch. When a query selects series of both kinds from
+  the same segment (a PromQL or SQL prefetch that needs both), one
+  `page_fetch` span covers both. Its `series_count` is the scalar and
+  histogram series together. Its `s3_requests`/`s3_bytes` are the GET cost of
+  the one batch. Two `decode` spans follow that fetch, one `scalar` and one
+  `histogram`.
+- `page_fetch` records the GET cost of pulling pages. `decode` records
+  `decompressed_bytes`, the uncompressed size that it produced.
+- `evaluate` carries `eval_kind` (`instant` or `range`) and no counts. It is
+  in-memory evaluation over data that is already fetched, so its cost is
+  time.
 
-### The logs signal reuses two span names with a different field set
+### Logs spans
 
-The table above is the metric read path. The logs read path, serving RLOG
-objects, reuses the `page_fetch` and `decode` span names for its own two
-phases under the same `ravel_query` target, but carries a different field set
-under them. Both logs spans add
-`signal = "logs"`; the metric spans carry no `signal` field. Match on the span
-name alone and you will see two shapes:
+The logs read path serves RLOG objects. It reuses the `page_fetch` and
+`decode` span names under the same `ravel_query` target, with a different
+field set. Both logs spans add `signal = "logs"`. The metric spans carry no
+`signal` field. A match on the span name alone returns two shapes:
 
 | Span | Signal | Fields |
 |---|---|---|
@@ -108,139 +107,125 @@ name alone and you will see two shapes:
 | `decode` | logs | `signal = "logs"`, `blocks_scanned`, `blocks_total`, `decompressed_bytes` |
 
 - The logs `page_fetch` records `s3_requests`/`s3_bytes` with the same meaning
-  as the metric one (this call's own store-GET cost: one GET on the uncached or
-  cache-miss path, zero on a cache hit). It carries no `page_kind` or
-  `series_count`: RLOG has no scalar/histogram page kinds, and its unit of
-  identity is the log stream, not the metric series, so neither field maps onto
-  this path.
+  as the metric one: the store-GET cost of this call. That is one GET on the
+  uncached or cache-miss path and zero on a cache hit.
+- The logs `page_fetch` carries no `page_kind` or `series_count`. RLOG has no
+  scalar or histogram page kinds, and its unit of identity is the log stream.
 - The logs `decode` records `decompressed_bytes` with the same meaning as the
-  metric one: the uncompressed size zstd produced for this object, covering
-  its directory sections, any POSTINGS probe, and every decoded block page. It
-  also records `blocks_scanned`/`blocks_total`, a pruning-effectiveness signal
-  (how much of the object's block index the scan had to touch after
-  skip-index, POSTINGS, and bloom pruning), analogous to `catalog_resolve`'s
-  `segments_pruned` on the metric path, which is likewise a pruning count and
-  not a byte count.
+  metric one: the uncompressed size that zstd produced for this object. The
+  figure covers the object's directory sections, any POSTINGS probe, and
+  every decoded block page.
+- The logs `decode` also records `blocks_scanned`/`blocks_total`. They show
+  how much of the object's block index the scan had to touch after
+  skip-index, POSTINGS, and bloom pruning. `segments_pruned` on
+  `catalog_resolve` is the equivalent pruning count on the metric path.
 
-## Turning them on
+## Turn the spans on
 
 The request-level spans are `info`, so they are visible under the default
-filter. Both `ravel-server` and `ravel-operator` fall back to an `info` filter
-when `RUST_LOG` is unset, and the server installs a formatting subscriber on
-its own log stream.
+filter. `ravel-server` and `ravel-operator` both use an `info` filter when
+`RUST_LOG` is unset. The server installs a formatting subscriber on its log
+stream.
 
-The phase spans are `debug`, under the two targets the table above names. To
-see all six while keeping the request-level spans visible, set:
+The phase spans are `debug`, under the `ravel_catalog` and `ravel_query`
+targets. To see all six and keep the request-level spans visible, set:
 
 ```sh
 RUST_LOG=info,ravel_catalog=debug,ravel_query=debug
 ```
 
-The leading `info` matters. `EnvFilter` only applies its fallback level when
-`RUST_LOG` is unset; once you set it, targets you do not name drop to the
-implicit `error` default, which would hide the `info`-level request spans in
-`ravel_server` and `ravel_sql`. The `info,` prefix keeps them on while the two
-`=debug` directives add the phase spans. No `ravel_sql=debug` is needed:
-`flight_sql_statement` is an `info` span, and no query-path phase span lives in
-`ravel-sql`.
+Keep the leading `info`. `EnvFilter` applies its fallback level only when
+`RUST_LOG` is unset. When you set `RUST_LOG`, each target that you do not
+name drops to the implicit `error` default. That default hides the
+`info`-level request spans in `ravel_server` and `ravel_sql`.
 
-## Attributing a slow query to a phase
+`ravel_sql=debug` is not necessary. `flight_sql_statement` is an `info` span,
+and `ravel-sql` has no query-path phase span.
 
-The concrete question is: a query is slow, which phase owns the
-time? Read the phase spans nested under the request span for that query. Two
-signals combine.
+## Find the slow phase
 
-- The `s3_requests` and `s3_bytes` fields tell you where the store cost went.
-  If `catalog_resolve` dominates, the LIST/GET fan-out to find segments is the
-  cost; a large `segments_pruned` next to a small byte count means the resolve
-  did its job and the cost is elsewhere. If `segment_open` and `page_fetch`
-  dominate, the query is I/O-bound on segment reads. If `decode`'s
-  `decompressed_bytes` is large but its store cost is zero, the data was
-  already cached and the cost is CPU decompression.
-- `evaluate` carries no counts. Time spent there with small fetch counts means
-  the query is evaluation-bound, not store-bound.
+To find the phase that owns the time of a slow query, read the phase spans
+nested under the request span for that query.
 
-A `segment_open` span records only its own segment's GET bytes, and the
-per-segment bytes sum to no more than the query's authoritative total, so its
-`s3_bytes` attributes one segment's I/O rather than the whole query's.
+| Reading | Meaning |
+|---|---|
+| `catalog_resolve` dominates `s3_requests` and `s3_bytes` | The LIST/GET fan-out to find segments is the cost. |
+| A large `segments_pruned` next to a small byte count on `catalog_resolve` | The resolve pruned well and the cost is elsewhere. |
+| `segment_open` and `page_fetch` dominate `s3_requests` and `s3_bytes` | The query is I/O-bound on segment reads. |
+| `decompressed_bytes` on `decode` is large and its store cost is zero | The data was already cached and the cost is CPU decompression. |
+| Time in `evaluate` with small fetch counts | The query is evaluation-bound, not store-bound. |
+
+A `segment_open` span records only the GET bytes of its own segment. The
+per-segment bytes sum to no more than the query's authoritative total. So
+`s3_bytes` on `segment_open` attributes the I/O of one segment, and not of
+the whole query.
 
 ## OTLP trace export
 
-By default the spans this guide documents stay on the process's own log stream,
-readable only by whoever can watch that process's stdout. Export is an opt-in
-way to also ship those same spans to an OTLP collector, so spans from a fleet of
-processes land in one place and outlive any single process's log buffer. It is
-an addition, not a replacement: the local log stream behaves exactly as before,
-and export sends the same spans in parallel.
+By default the spans stay on the log stream of the process, where only
+someone who can watch its stdout can read them. With export on, the process
+also sends the same spans to an OTLP collector. Spans from a fleet of
+processes then land in one place and outlive the log buffer of any one
+process. The local log stream does not change.
 
-### Turning it on
+### Turn export on
 
-Both `ravel-server` and `ravel-operator` take a `--otlp-trace-endpoint <URL>`
-flag, absent by default. Point it at a collector's OTLP/gRPC endpoint (for
-example `http://otel-collector:4317`) to enable export for that process. The two
-binaries are configured independently, each with its own flag rather than a
-shared config file, because they are separately deployed processes that each
-already carry their own CLI surface. Set the flag on each process you want
-exporting.
+`ravel-server` and `ravel-operator` each take a `--otlp-trace-endpoint <URL>`
+flag, absent by default. To enable export for a process, point the flag at
+the OTLP/gRPC endpoint of a collector (for example
+`http://otel-collector:4317`). Set the flag on each process that must export.
+The two binaries share no configuration file.
 
-There is no second verbosity knob. The OTLP layer is gated by the same
-filter as the log stream, so the `RUST_LOG` setting
-[Turning them on](#turning-them-on)
-already teaches is exactly what export ships: whatever that filter admits to the
-log stream is what reaches the collector. Widen `RUST_LOG` to add phase spans to
-the exported stream the same way you would to see them locally.
+Export has no separate verbosity setting. The same `RUST_LOG` filter gates
+the log stream and the OTLP layer, so the collector receives what the filter
+admits to the log stream. To add phase spans to the exported stream, widen
+`RUST_LOG` as in [Turn the spans on](#turn-the-spans-on).
 
 ### What gets exported
 
-Exactly the spans and fields the [span tables above](#the-spans) already
-document, and nothing more. Export adds a transport, not new content: no query
-text, no metric or label values, no object keys. Nothing
-crosses to the collector that was not already on the `debug`-level log stream.
+Export sends the spans and fields in the [span tables](#the-spans) and
+nothing more: no query text, no metric or label values, no object keys.
+Nothing crosses to the collector that was not already on the `debug`-level
+log stream.
 
 Each exported span carries two resource attributes:
 
 - `service.name`: `ravel-server` or `ravel-operator`, the binary that emitted
   the span.
-- `ravel.mode`: for `ravel-server`, the same value its `/metrics` `mode` label
-  renders (`all`, `gateway`, `query`, or `maintain`), derived from the process's
-  `--mode`. `ravel-operator` has no mode selection and always reports the fixed
-  literal `operator`.
+- `ravel.mode`: for `ravel-server`, the same value as the `mode` label on
+  `/metrics` (`all`, `gateway`, `query`, or `maintain`), derived from the
+  process's `--mode`. `ravel-operator` has no mode selection and always
+  reports the fixed literal `operator`.
 
-Together they distinguish spans from a fleet in the collector the same way
-`/metrics` scrapes are distinguished.
+Together the two attributes distinguish the spans of a fleet in the
+collector, the same way that `/metrics` scrapes are distinguished.
 
-### Best-effort, never blocking
+### Export failures
 
-Export is best-effort. A down, slow, or unreachable collector drops spans and
-never blocks a query, an ingest write, or a `/metrics` scrape, and never
-surfaces an error to the caller. A batch processor sits between the spans and
-the wire, which is what makes that hold.
+Export is best-effort. A down, slow, or unreachable collector drops spans. It
+never blocks a query, an ingest write, or a `/metrics` scrape, and it never
+returns an error to the caller. A batch processor sits between the spans and
+the wire.
 
-Two failure modes, two different signals. A malformed URL fails
-the exporter build at startup: a single "OTLP trace export disabled" warning,
-and the process degrades to the log-only subscriber. A well-formed but
-unreachable or wrong-collector endpoint builds fine -- the exporter dials
-lazily -- so this failure only shows up once the background export task
-actually tries to send; a decorator on the exporter logs one distinct warning
-the first time that happens, then stays quiet for the rest of the process's
-life (so a persistently-down collector does not flood the log every batch
-interval). Either way, the warning names the failure; nothing about it blocks
-a query.
+Each failure logs a warning that names the failure:
+
+| Failure | When it shows | Signal |
+|---|---|---|
+| A malformed URL | At startup, when the exporter build fails | One "OTLP trace export disabled" warning. The process continues with the log-only subscriber. |
+| A well-formed endpoint that is unreachable or is the wrong collector | The first time the background export task tries to send, because the exporter dials lazily | One distinct warning the first time. The exporter then stays quiet for the life of the process, so a collector that stays down does not flood the log every batch interval. |
 
 ## Known gaps
 
-- The `fmt` subscriber the server installs does not emit per-span
-  enter/close lines with wall-clock durations by default; span fields surface
-  as context on events emitted within a span. Reading raw phase durations off
-  a running process requires a subscriber configured to emit span-close
-  events, which the OTLP export above provides: a collector receives every
-  span with its duration.
+- The `fmt` subscriber that the server installs does not emit per-span
+  enter/close lines with wall-clock durations by default. Span fields appear
+  as context on events emitted within a span. To read raw phase durations
+  from a running process, use a subscriber that emits span-close events. OTLP
+  export provides one: a collector receives every span with its duration.
 
 ## Background
 
-The bounded field set every span is held to is
+The bounded field set of every span:
 [ADR-0044](../adrs/0044-query-cost-accounting.md) section 5. The OTLP export
-surface, its single-filter design, its content bound and its best-effort
-guarantee are
+surface, its single filter, its content bound and its best-effort guarantee:
 [ADR-0060](../adrs/0060-query-path-otlp-trace-export.md), decisions 3, 2, 4
 and 6 in that order.
