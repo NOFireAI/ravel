@@ -2749,6 +2749,13 @@ pub const REQUEST_COST_SOURCE_EXPLICIT_FLAG: &str = "explicit-flag";
 /// `--logs-fetch-policy` derived the rate.
 pub const REQUEST_COST_SOURCE_POLICY: &str = "policy";
 
+/// The startup line's `break_even_source` when `cost-based` derived the
+/// projection break-even from the store cost profile (ADR-2414 decision A3).
+pub const BREAK_EVEN_SOURCE_PROFILE: &str = "profile";
+/// The startup line's `break_even_source` when the resolution derived no
+/// projection break-even and the routing threshold serves as it.
+pub const BREAK_EVEN_SOURCE_ROUTING_THRESHOLD: &str = "routing-threshold";
+
 /// [`LogsFetchStamp::policy_source`] when `--logs-fetch-policy` was given
 /// explicitly (ADR-1196). Wins over the default, including on a loopback
 /// endpoint.
@@ -2794,7 +2801,8 @@ pub struct LogsFetchStamp {
     /// The projection break-even in force (ADR-2414 decision A3): `Some` only
     /// when `cost-based` derived a finite rate from the profile, not under an
     /// explicit `--logs-request-cost-bytes`. `None` means the routing
-    /// threshold serves as the break-even, and [`Self::emit`] prints it as 0.
+    /// threshold serves as the break-even, and [`Self::emit`] prints that
+    /// threshold ([`Self::break_even_in_force`]).
     pub projection_break_even_bytes: Option<u64>,
     /// The operator's `--logs-block-range-threshold` when the resolution
     /// overrode it (a saturated rate routes every object whole-object
@@ -2827,6 +2835,21 @@ pub struct LogsFetchStamp {
 }
 
 impl LogsFetchStamp {
+    /// The projection break-even the fetcher runs on and where it came from,
+    /// as the startup line prints them: the profile-derived break-even under
+    /// [`BREAK_EVEN_SOURCE_PROFILE`], else the routing threshold, which
+    /// `LogSegmentFetcher::with_block_range_threshold` pins as the break-even
+    /// when none is set, under [`BREAK_EVEN_SOURCE_ROUTING_THRESHOLD`].
+    pub fn break_even_in_force(&self) -> (u64, &'static str) {
+        match self.projection_break_even_bytes {
+            Some(n) => (n, BREAK_EVEN_SOURCE_PROFILE),
+            None => (
+                self.block_range_threshold,
+                BREAK_EVEN_SOURCE_ROUTING_THRESHOLD,
+            ),
+        }
+    }
+
     /// Whether this process has reached the concurrency `latency-first`'s
     /// measured trade needs. Both the GET permits and the SQL scan width have
     /// to be there: `--store-get-concurrency` alone leaves logs scanning at
@@ -2846,6 +2869,7 @@ impl LogsFetchStamp {
     /// an operator who set a flag that no longer governs must be told, not left
     /// to infer it from a query's shape.
     pub fn emit(&self) {
+        let (break_even, break_even_source) = self.break_even_in_force();
         tracing::info!(
             policy = self.policy,
             policy_source = self.policy_source,
@@ -2854,7 +2878,8 @@ impl LogsFetchStamp {
             request_cost_source = self.request_cost_source,
             rate_term = self.rate_term,
             block_range_threshold = self.block_range_threshold,
-            projection_break_even_bytes = self.projection_break_even_bytes.unwrap_or(0),
+            projection_break_even_bytes = break_even,
+            break_even_source,
             max_fetch_run_bytes = self.max_fetch_run_bytes,
             saturated_profile = self.saturated_profile.as_deref().unwrap_or(""),
             "logs fetch policy resolved"
@@ -11945,15 +11970,31 @@ mod tests {
     /// operator reads names the time term and the break-even, and the
     /// engine config the server builds carries that same break-even, which
     /// is what `build_sql_state` hands the logs fetcher. Under
-    /// `byte-minimal` there is no break-even and the stamp prints 0.
+    /// `byte-minimal`, and under an explicit `--logs-request-cost-bytes`,
+    /// the resolution derives no break-even and the startup line names the
+    /// one in force, the 524,288-byte routing threshold, with
+    /// `break_even_source="routing-threshold"`.
     ///
     /// Prove-the-test: drop `logs_projection_break_even_bytes` from
     /// `apply_to_engine` (leaving `..base`'s `None`) and the engine assertion
     /// reads `None` against `Some(31500000)`; drop the cost-based-only
     /// condition from `resolve_logs_fetch` and the byte-minimal stamp reads
-    /// `Some(9437185)` against `None`.
+    /// `Some(9437185)` against `None`; print `unwrap_or(0)` again and the
+    /// byte-minimal line reads 0 against 524288.
     #[test]
     fn the_default_stamp_carries_the_time_term_and_the_break_even() {
+        fn emitted(stamp: &LogsFetchStamp) -> String {
+            let (captured, _guard) = capture_events(tracing::Level::INFO);
+            stamp.emit();
+            let lines = captured.lock();
+            let resolved: Vec<&String> = lines
+                .iter()
+                .filter(|l| l.contains("logs fetch policy resolved"))
+                .collect();
+            assert_eq!(resolved.len(), 1, "one resolved line, lines: {lines:?}");
+            resolved[0].clone()
+        }
+
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
         let stamp = stamp_from(&cli);
         assert_eq!(stamp.policy, "cost-based");
@@ -11968,6 +12009,12 @@ mod tests {
             Some(31_500_000),
             "the break-even reaches the engine config the fetcher is built from"
         );
+        assert_eq!(stamp.break_even_in_force(), (31_500_000, "profile"));
+        let line = emitted(&stamp);
+        assert!(
+            line.contains(" projection_break_even_bytes=31500000 break_even_source=\"profile\""),
+            "{line}"
+        );
 
         let cli = Cli::try_parse_from(["ravel-server", "--logs-fetch-policy", "byte-minimal"])
             .expect("flag parses");
@@ -11976,13 +12023,30 @@ mod tests {
         assert_eq!(stamp.request_cost_bytes, 1_887_437);
         assert_eq!(stamp.projection_break_even_bytes, None);
         assert_eq!(engine_from(&cli).logs_projection_break_even_bytes, None);
+        assert_eq!(stamp.break_even_in_force(), (524_288, "routing-threshold"));
+        let line = emitted(&stamp);
+        assert!(
+            line.contains(
+                " projection_break_even_bytes=524288 break_even_source=\"routing-threshold\""
+            ),
+            "{line}"
+        );
 
-        // An explicit rate keeps ADR-0904's routing: no break-even.
+        // An explicit rate keeps ADR-0904's routing: no derived break-even,
+        // the routing threshold serves.
         let cli = Cli::try_parse_from(["ravel-server", "--logs-request-cost-bytes", "123456"])
             .expect("flag parses");
         let stamp = stamp_from(&cli);
         assert_eq!(stamp.rate_term, "flag");
         assert_eq!(stamp.projection_break_even_bytes, None);
+        assert_eq!(stamp.break_even_in_force(), (524_288, "routing-threshold"));
+        let line = emitted(&stamp);
+        assert!(
+            line.contains(
+                " projection_break_even_bytes=524288 break_even_source=\"routing-threshold\""
+            ),
+            "{line}"
+        );
     }
 
     /// ADR-2023 decision 1: `--logs-fetch-policy` unset resolves `cost-based`

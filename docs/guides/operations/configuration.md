@@ -1323,9 +1323,11 @@ costs. At the reference profile that is 31,500,000 bytes, so a one-column read
 of a 35 MB object reads its column ranges while every object of 31,500,000
 bytes or less, such as a 3 MB flush object, still reads whole. The same figure
 is the object size at or below which the ranged fetch reads the whole object
-anyway. The startup line reports it as `projection_break_even_bytes`, 0 under
-the other policies and when `--logs-request-cost-bytes` is set, which keep the
-routing threshold as the break-even. The
+anyway. The startup line reports the break-even in force as
+`projection_break_even_bytes` with `break_even_source="profile"`; under the
+other policies and when `--logs-request-cost-bytes` is set, which keep the
+routing threshold as the break-even, it reports that threshold (524,288 bytes
+by default) with `break_even_source="routing-threshold"`. The
 coalescing gap, the largest hole between two wanted ranges that one request
 reads through, stays one request cost (at least 64 KiB) under every policy, so
 at the reference profile it is 6,300,000 bytes.
