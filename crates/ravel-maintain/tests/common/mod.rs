@@ -399,6 +399,30 @@ pub async fn seed_rlog_input(
     seq: u64,
     records: &[ravel_logseg::LogRecord],
 ) -> String {
+    seed_rlog_input_with(store, writer_id, epoch, seq, records, false).await
+}
+
+/// [`seed_rlog_input`], but the writer stores a `stream_attrs` blob the reader
+/// cannot decode instead of refusing it: the shape of an L0 object written
+/// before the writer validated its blobs (issue #2548).
+pub async fn seed_rlog_input_unchecked(
+    store: &dyn ObjectStoreBackend,
+    writer_id: Uuid,
+    epoch: u64,
+    seq: u64,
+    records: &[ravel_logseg::LogRecord],
+) -> String {
+    seed_rlog_input_with(store, writer_id, epoch, seq, records, true).await
+}
+
+async fn seed_rlog_input_with(
+    store: &dyn ObjectStoreBackend,
+    writer_id: Uuid,
+    epoch: u64,
+    seq: u64,
+    records: &[ravel_logseg::LogRecord],
+    unchecked_stream_attrs: bool,
+) -> String {
     use ravel_logseg::writer::ObjectIdentity;
     use ravel_logseg::{RlogConfig, RlogWriter};
     let th = tenant_hash();
@@ -410,6 +434,9 @@ pub async fn seed_rlog_input(
         writer_seq: seq,
     };
     let mut w = RlogWriter::new(RlogConfig::default(), identity);
+    if unchecked_stream_attrs {
+        w = w.with_unchecked_stream_attrs();
+    }
     for r in records {
         w.push(r.clone()).expect("push log record");
     }

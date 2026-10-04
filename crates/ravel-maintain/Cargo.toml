@@ -34,6 +34,10 @@ ravel-segment = { workspace = true }
 # deadline tests race a held PUT against a paused clock.
 tokio = { workspace = true, features = ["test-util"] }
 proptest = { workspace = true }
+# Already a normal dependency; the dev edge only adds `test-support`, so a test
+# can store a `stream_attrs` blob the writer refuses
+# (`RlogWriter::with_unchecked_stream_attrs`, issue #2554).
+ravel-logseg = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
