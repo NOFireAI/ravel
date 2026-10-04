@@ -791,7 +791,12 @@ the operating system releases the lock however the process exits. It then
 sweeps once: another directory under `<cache-dir>/sql-spill` is deleted only
 when this process can take that directory's lock itself, which means its owner
 is gone. A directory whose lock is held, or that has no `.owner.lock`, is left
-in place and logged at INFO with its path. The sweep touches nothing outside
+in place. The sweep logs nothing for a held lock and a WARN with the path for
+a directory whose ownership it cannot settle (no `.owner.lock`, or any other
+error taking the lock); after the sweep, every directory still left there
+other than the process's own is logged at INFO with its path. A `.swept-`
+directory, which an earlier sweep moved aside and did not finish deleting, is
+deleted without a lock check. The sweep touches nothing outside
 `<cache-dir>/sql-spill`, and a process whose spill is off or set by the
 environment does not sweep at all.
 

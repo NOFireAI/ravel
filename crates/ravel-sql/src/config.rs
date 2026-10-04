@@ -120,9 +120,10 @@ const GROUP_VALUES_FIXED_OVERHEAD_CEILING: usize =
     (GROUP_VALUES_FIXED_OVERHEAD_BYTES as f64 * GROUP_VALUES_RESIZE_TRANSIENT_FACTOR) as usize + 1;
 
 /// Environment variable naming the directory under which a query may create
-/// its ephemeral spill scratch (ADR-0954). Read only through
-/// [`SpillConfig::from_env`]; the [`SqlConfig::spill`] field is the source of
-/// truth and this only supplies its default when the caller left it unset.
+/// its ephemeral spill scratch (ADR-0954). Read by
+/// [`SqlConfig::with_spill_resolved`] and [`SpillConfig::from_env`]; the
+/// [`SqlConfig::spill`] field is the source of truth and this only supplies
+/// its default when the caller left it unset.
 pub const ENV_SPILL_DIR: &str = "RAVEL_SQL_SPILL_DIR";
 
 /// Environment variable carrying the per-query scratch byte quota, a positive
@@ -457,10 +458,10 @@ pub struct SqlConfig {
     /// enabled disk manager would also let the `RepartitionExec` that knob
     /// introduces spill unclassified. See `crate::session`'s module doc.
     ///
-    /// This field is the source of truth. [`SqlConfig::with_spill_from_env`]
-    /// fills it from [`ENV_SPILL_DIR`]/[`ENV_SPILL_MAX_BYTES`] only when it is
-    /// still `None`, so an explicit setting is never overridden by the
-    /// environment.
+    /// This field is the source of truth. [`SqlConfig::with_spill_resolved`]
+    /// fills it from [`ENV_SPILL_DIR`]/[`ENV_SPILL_MAX_BYTES`] and a cache
+    /// directory only when it is still `None`, so an explicit setting is never
+    /// overridden by the environment (`--sql-spill off` clears it).
     pub spill: Option<SpillConfig>,
     /// Whether a logs scan publishes its per-segment scan timeline
     /// (`seg_open_start_offset`/`seg_open_ready_offset`/`seg_done_offset`,
@@ -505,19 +506,6 @@ impl From<EngineConfig> for SqlConfig {
 }
 
 impl SqlConfig {
-    /// Fill [`SqlConfig::spill`] from the environment when it is still `None`,
-    /// so a deployment can turn spill on without a code change while an
-    /// explicit in-process setting still wins.
-    ///
-    /// Call once at process startup, next to the other startup-only knobs on
-    /// this struct; nothing here live-reloads.
-    pub fn with_spill_from_env(mut self) -> Result<Self, SpillConfigError> {
-        if self.spill.is_none() {
-            self.spill = SpillConfig::from_env()?;
-        }
-        Ok(self)
-    }
-
     /// Fill [`SqlConfig::spill`] from the full `--cache-dir`-aware precedence
     /// (ADR-0954 amendment, issue #2416) when it is still `None`:
     /// [`SpillConfig::resolve`] over the current environment and
@@ -527,7 +515,8 @@ impl SqlConfig {
     /// value of this field, because it is the deployment's own declared
     /// refusal to spill.
     ///
-    /// Call once at process startup, like [`SqlConfig::with_spill_from_env`].
+    /// Call once at process startup, next to the other startup-only knobs on
+    /// this struct; nothing here live-reloads.
     pub fn with_spill_resolved(
         mut self,
         sql_spill_off: bool,
@@ -634,25 +623,6 @@ mod tests {
             value: "1 GiB".to_string(),
         };
         assert!(bad.to_string().contains("positive decimal"));
-    }
-
-    /// The explicit field wins over the environment: `with_spill_from_env`
-    /// fills only an unset field, so a process that configured spill in code
-    /// cannot have it silently redirected by a stray variable.
-    #[test]
-    fn an_explicit_spill_config_is_not_overridden_by_the_environment() {
-        let explicit = SpillConfig {
-            dir: PathBuf::from("/explicit"),
-            max_bytes: 4096,
-        };
-        let config = SqlConfig {
-            spill: Some(explicit.clone()),
-            ..SqlConfig::default()
-        };
-        let after = config
-            .with_spill_from_env()
-            .expect("an already-set field reads no environment");
-        assert_eq!(after.spill, Some(explicit));
     }
 
     #[test]
@@ -903,9 +873,9 @@ mod tests {
     }
 
     /// `with_spill_resolved` with `sql_spill_off` false and an already-set
-    /// field leaves it untouched, the same invariant
-    /// `with_spill_from_env` pins: an explicit setting is never silently
-    /// replaced.
+    /// field leaves it untouched: a process that configured spill in code
+    /// cannot have it silently replaced by the environment or a cache
+    /// directory.
     #[test]
     fn with_spill_resolved_does_not_override_an_explicit_setting() {
         let explicit = SpillConfig {

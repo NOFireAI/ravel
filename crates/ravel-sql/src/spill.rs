@@ -343,6 +343,43 @@ impl Drop for SpillScratch {
 /// pid liveness.
 const OWNER_LOCK_FILE_NAME: &str = ".owner.lock";
 
+/// Name prefix of an orphaned spill root a sweep has moved aside for
+/// deletion. A sweep creates such a name only while it holds the orphan's
+/// lock, so the tree under it belongs to no live process: a later sweep
+/// deletes it without a lock check.
+const SWEPT_NAME_PREFIX: &str = ".swept-";
+
+/// `remove_dir_all`, where a tree that is already gone counts as removed: two
+/// sweeps may delete the same moved-aside tree at once.
+fn remove_tree(dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// Delete a tree an earlier sweep moved aside under [`SWEPT_NAME_PREFIX`] but
+/// did not finish removing. One that is already gone (this sweep's own, or
+/// a concurrent sweep's, listed after its removal) is not logged.
+fn remove_swept(dir: &Path) {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {
+            tracing::info!(
+                dir = %dir.display(),
+                "removed a SQL spill root an earlier sweep moved aside"
+            );
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %err,
+                "could not remove a SQL spill root an earlier sweep moved aside"
+            );
+        }
+    }
+}
+
 /// How long [`lock_in_place`] keeps retrying a lock that is held while the
 /// lock file is still in place: a sweep holds it only from its lock to its
 /// rename, so contention that outlasts this is a live owner.
@@ -484,7 +521,11 @@ impl SpillRootOwner {
     /// looks above `<cache_dir>/sql-spill`, and never removes a sibling whose
     /// ownership this call cannot settle one way or the other -- an
     /// unreadable directory, a missing lock file, or any lock error other
-    /// than contention is left in place and logged, not guessed at.
+    /// than contention is left in place and logged at WARN, not guessed at. A
+    /// sibling whose lock a live process holds is left in place without a log
+    /// line. A tree an earlier sweep moved aside under a `.swept-` name is
+    /// deleted without a lock check, and an entry gone by the time it is
+    /// reached is skipped without a log line.
     ///
     /// Call once at process startup, after [`SpillRootOwner::acquire`].
     pub fn sweep_orphaned_spill_roots(&self) {
@@ -523,6 +564,14 @@ impl SpillRootOwner {
             if candidate == self.dir {
                 continue;
             }
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(SWEPT_NAME_PREFIX)
+            {
+                remove_swept(&candidate);
+                continue;
+            }
             self.sweep_one(&candidate);
         }
     }
@@ -554,6 +603,9 @@ impl SpillRootOwner {
             .open(&lock_path)
         {
             Ok(file) => file,
+            // Moved away or removed since the listing, by another sweep or by
+            // this one: there is nothing left to settle.
+            Err(_) if !candidate.exists() => return,
             Err(err) => {
                 tracing::warn!(
                     dir = %candidate.display(),
@@ -576,7 +628,7 @@ impl SpillRootOwner {
                     return;
                 };
                 let swept = parent.join(format!(
-                    ".swept-{}-{:016x}-{}",
+                    "{SWEPT_NAME_PREFIX}{}-{:016x}-{}",
                     std::process::id(),
                     scratch_nonce(),
                     SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -592,7 +644,7 @@ impl SpillRootOwner {
                 }
                 drop(lock_file);
                 after_release();
-                match std::fs::remove_dir_all(&swept) {
+                match remove_tree(&swept) {
                     Ok(()) => {
                         tracing::info!(
                             dir = %candidate.display(),
@@ -1043,6 +1095,111 @@ mod tests {
             unprovable_dir.is_dir(),
             "a sibling with no owner lock to test must be left in place, not guessed at"
         );
+    }
+
+    /// The `dir` field of every WARN event `f` emits on this thread, `-` for
+    /// one without it.
+    fn warned_dirs(f: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Clone, Default)]
+        struct Warnings(Arc<std::sync::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                struct Dir(String);
+                impl tracing::field::Visit for Dir {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        if field.name() == "dir" {
+                            self.0 = format!("{value:?}");
+                        }
+                    }
+                }
+                let mut dir = Dir("-".to_string());
+                event.record(&mut dir);
+                self.0.lock().expect("not poisoned").push(dir.0);
+            }
+        }
+        // With one dispatcher registered, a callsite's interest is cached from
+        // whichever thread reaches it first; a second, process-wide one keeps
+        // interest computed across every live dispatcher instead.
+        static KEEP_TWO_DISPATCHERS: OnceLock<tracing::Dispatch> = OnceLock::new();
+        KEEP_TWO_DISPATCHERS
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+        let warnings = Warnings::default();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(warnings.clone()), f);
+        warnings.0.lock().expect("not poisoned").clone()
+    }
+
+    /// A tree an earlier sweep moved aside and did not finish removing (here a
+    /// `.swept-` folder with a file in it and no owner lock) is removed at
+    /// the next startup's sweep, with no WARN. A real orphan beside it is
+    /// still removed and an unprovable sibling still WARNs, so the capture is
+    /// live.
+    ///
+    /// Prove-the-test: drop the `.swept-` branch in
+    /// `sweep_orphaned_spill_roots`, or keep the branch and skip the folder
+    /// instead of calling `remove_swept`, and the folder survives; make every
+    /// lock-open error silent and the unprovable sibling's WARN is missing.
+    #[test]
+    fn a_stale_swept_folder_is_removed_at_startup_without_a_warning() {
+        let root = tempfile::tempdir().expect("temp root");
+        let sql_spill = root.path().join(crate::config::SQL_SPILL_SUBDIR);
+        let swept = sql_spill.join(format!("{SWEPT_NAME_PREFIX}4242-00000000deadbeef-0"));
+        std::fs::create_dir_all(swept.join("ravel-spill-1-2-3")).expect("swept tree");
+        std::fs::write(swept.join("ravel-spill-1-2-3").join("part"), b"spill").expect("swept file");
+        let dead = orphan(root.path(), "inst-dead");
+        let unprovable = sql_spill.join("inst-unprovable");
+        std::fs::create_dir_all(&unprovable).expect("unprovable sibling dir");
+
+        let warned = warned_dirs(|| {
+            let owner = SpillRootOwner::acquire(root.path(), "inst-1").expect("acquire");
+            owner.sweep_orphaned_spill_roots();
+        });
+
+        assert!(!swept.exists(), "the moved-aside tree must be removed");
+        assert!(!dead.exists(), "the orphan must be removed");
+        assert!(unprovable.is_dir(), "the unprovable sibling must stay");
+        assert_eq!(
+            warned,
+            vec![unprovable.display().to_string()],
+            "only the unprovable sibling warns"
+        );
+    }
+
+    /// A sibling the listing returned but that is gone by the time the sweep
+    /// reaches it (moved aside and deleted by a concurrent sweep, or by this
+    /// one) is skipped silently, while a sibling that is present and has no
+    /// owner lock still WARNs.
+    ///
+    /// Prove-the-test: drop the `!candidate.exists()` arm in
+    /// `sweep_one_with` and the vanished row WARNs; make every lock-open
+    /// error silent and the present row does not WARN.
+    #[test]
+    fn a_sibling_gone_before_the_sweep_reaches_it_is_not_a_warning() {
+        let root = tempfile::tempdir().expect("temp root");
+        let owner = SpillRootOwner::acquire(root.path(), "inst-1").expect("acquire");
+        let sql_spill = root.path().join(crate::config::SQL_SPILL_SUBDIR);
+        let vanished = sql_spill.join("inst-vanished");
+        let present = sql_spill.join("inst-unprovable");
+        std::fs::create_dir_all(&present).expect("unprovable sibling dir");
+
+        let warned = warned_dirs(|| {
+            owner.sweep_one(&vanished);
+            owner.sweep_one(&present);
+        });
+
+        assert_eq!(warned, vec![present.display().to_string()]);
     }
 
     const MIB: u64 = 1024 * 1024;

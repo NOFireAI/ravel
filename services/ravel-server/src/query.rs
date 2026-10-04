@@ -3142,9 +3142,9 @@ mod tests {
     /// the cache inputs out: inputs carrying both `off` and a cache dir build
     /// an executor with spill disabled.
     ///
-    /// Prove-the-test: call `.with_spill_from_env()` in
-    /// `build_sql_state_inner` instead of `.with_spill_resolved(...)` and the
-    /// auto row reads `None`; pass `false` instead of `spill.off` and the
+    /// Prove-the-test: pass `None` instead of the cache inputs to
+    /// `.with_spill_resolved(...)` in `build_sql_state_inner` and the auto row
+    /// reads `None`; pass `false` instead of `spill.off` and the
     /// direct off row reads the cache-dir config; subtract only the fetcher
     /// cache's bound and the 40 GiB row reads 17,716,740,096.
     #[test]
