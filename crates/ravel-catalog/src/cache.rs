@@ -1052,12 +1052,12 @@ impl DecodedCaches {
 #[allow(clippy::expect_used)]
 mod tests {
     use bytes::Bytes;
-    use ravel_cache::CacheKey;
+    use ravel_cache::{Cache, CacheKey, CacheLimits, DiskCache, TieredCache};
     use ravel_commit::keys;
     use ravel_commit::publish::{self, RetryPolicy};
     use ravel_commit::record::{self, NewCommitRecord};
     use ravel_object_store::memory::MemoryStore;
-    use ravel_object_store::{GetRange, ObjectStoreBackend};
+    use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
     use ravel_types::TimeRange;
     use ravel_types::accounting::AccountedOp;
 
@@ -2733,5 +2733,77 @@ mod tests {
             None,
             "a RAM-only byte cache (no --cache-dir) has no disk tier to report"
         );
+    }
+
+    /// The RAM-only test above cannot catch `ram_len`/`disk_len` (or their byte
+    /// counterparts) being swapped between [`Catalog::byte_cache_ram_residency`]
+    /// and [`Catalog::byte_cache_disk_residency`]: with no disk tier, the disk
+    /// side always reads `None` regardless of which accessor reads which field.
+    /// A tiered cache with a DIFFERENT entry count on each tier is the only way
+    /// to prove the wiring, not just that each accessor returns something.
+    ///
+    /// Prove-the-test: swap the bodies of `byte_cache_ram_residency` and
+    /// `byte_cache_disk_residency` in `catalog.rs` (or just the `tiered.ram_len()`
+    /// / `tiered.disk_len()` calls inside them) and this test fails, since 1 and
+    /// 2 land on the wrong side.
+    #[tokio::test]
+    async fn byte_cache_tiered_residency_reports_ram_and_disk_separately() {
+        let limits = CacheLimits::new(64 << 20, 10_000, 16 << 20);
+
+        // RAM tier: one entry, inserted directly so the disk tier is never
+        // touched by it.
+        let ram: Cache<Arc<StoreError>> = Cache::new(limits);
+        let ram_payload = Bytes::from_static(b"issue-2488-tiered-ram-payload");
+        let ram_key = CacheKey::new(
+            byte_cache_tenant().0,
+            [0x11; 32],
+            0,
+            ram_payload.len() as u64,
+        );
+        ram.insert(ram_key, ram_payload.clone());
+
+        // Disk tier: two entries, inserted directly so the RAM tier stays at
+        // the single entry above. RAM and disk entry counts now differ (1 vs
+        // 2), so a swap between the two accessors is observable.
+        let disk_dir = std::env::temp_dir().join(format!(
+            "ravel-catalog-tiered-residency-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let disk = DiskCache::new(disk_dir.clone(), limits);
+        let disk_payload_a = b"issue-2488-tiered-disk-payload-a".as_slice();
+        let disk_payload_b = b"issue-2488-tiered-disk-payload-bb".as_slice();
+        let disk_key_a = CacheKey::new(
+            byte_cache_tenant().0,
+            [0x22; 32],
+            0,
+            disk_payload_a.len() as u64,
+        );
+        let disk_key_b = CacheKey::new(
+            byte_cache_tenant().0,
+            [0x33; 32],
+            0,
+            disk_payload_b.len() as u64,
+        );
+        disk.insert(disk_key_a, disk_payload_a);
+        disk.insert(disk_key_b, disk_payload_b);
+        let disk_total_bytes = (disk_payload_a.len() + disk_payload_b.len()) as u64;
+
+        let tiered = TieredCache::new(ram, disk);
+        let mut catalog = Catalog::new(Arc::new(MemoryStore::new()), byte_cache_catalog_config(1))
+            .expect("catalog");
+        catalog.set_tiered_byte_cache_for_test(tiered);
+
+        assert_eq!(
+            catalog.byte_cache_ram_residency(),
+            Some((1, ram_payload.len() as u64)),
+            "the RAM tier holds exactly the one entry inserted directly into it"
+        );
+        assert_eq!(
+            catalog.byte_cache_disk_residency(),
+            Some((2, disk_total_bytes)),
+            "the disk tier holds exactly the two entries inserted directly into it"
+        );
+
+        let _ = std::fs::remove_dir_all(&disk_dir);
     }
 }
