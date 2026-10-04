@@ -1967,6 +1967,33 @@ impl Catalog {
         }
     }
 
+    /// Live (not cumulative) resident entry count and payload bytes for the
+    /// byte cache's RAM tier (ADR-0046, #1170, #2488), or `None` when the byte
+    /// cache is disabled. The server threads this to `/metrics` so the catalog
+    /// byte cache's residency renders under `cache="catalog"` alongside the
+    /// fetcher cache's live residency gauges, the same `(len, total_bytes)`
+    /// reading [`ravel_query::ReadCache`]'s RAM tier exposes for that cache.
+    pub fn byte_cache_ram_residency(&self) -> Option<(usize, u64)> {
+        self.byte_cache.as_ref().map(|cache| match cache {
+            ByteCache::Ram(ram) => (ram.len(), ram.total_bytes()),
+            ByteCache::Tiered(tiered) => (tiered.ram_len(), tiered.ram_total_bytes()),
+        })
+    }
+
+    /// Live (not cumulative) resident entry count and payload bytes for the
+    /// byte cache's disk tier, or `None` when the byte cache is disabled or
+    /// RAM-only (no `--cache-dir`). The counterpart to
+    /// [`Catalog::byte_cache_ram_residency`] above: `None` for
+    /// [`ByteCache::Ram`] (there is no disk tier) and
+    /// `Some((`[`TieredCache::disk_len`]`, `[`TieredCache::disk_total_bytes`]`))`
+    /// for [`ByteCache::Tiered`].
+    pub fn byte_cache_disk_residency(&self) -> Option<(usize, u64)> {
+        match self.byte_cache.as_ref()? {
+            ByteCache::Ram(_) => None,
+            ByteCache::Tiered(tiered) => Some((tiered.disk_len(), tiered.disk_total_bytes())),
+        }
+    }
+
     /// Cumulative column-statistics cache evictions (issue #905): entries the
     /// byte budget ([`CatalogConfig::column_stats_cache_max_bytes`]) dropped to
     /// stay within its limit. The server threads this to `/metrics`. A climbing
