@@ -173,7 +173,9 @@ What the pinned datafusion 54.1.0 accumulators actually do
    bits are sound because `total_cmp` selects an input value and never
    synthesizes one; (c) proptest over the full adversarial pool, grouped
    and ungrouped, asserting bit-identical results; (d) the suite re-runs
-   on every DataFusion version bump per the upgrade policy.
+   on every DataFusion version bump per the upgrade policy. Items (b) and
+   (c) are narrowed for NaN results by the NaN propagation amendment
+   below.
 7. **Sequencing**: two steps. First, exclusion: decision 2 lands with
    `avg`/`mean` still excluded, closing the live unverified surface
    immediately. Second, admission: decisions 3, 4 and 6 land together,
@@ -208,3 +210,51 @@ What the pinned datafusion 54.1.0 accumulators actually do
   consistent with the exactness invariant.
 - ADR-0023 continues to own grouped min/max total-order semantics;
   nothing here changes its scope.
+
+## Amendment: NaN propagation
+
+<!-- amendment-applies: sections="Decision" pointer="NaN propagation amendment" -->
+
+Dated 2026-10-04. Tracked in issue #2558.
+
+Decision 6 asked for two things that cannot both hold for a result that is
+NaN. Item (b) asked for engine-versus-reference bit equality of NaN results
+on the same host, on the reasoning that NaN payload propagation through f64
+addition is hardware-chosen. Item (c) asked the full-pool proptest to assert
+bit-identical results. Both assumed that one host gives one answer.
+
+It does not. When both operands of an addition are NaN, IEEE 754 requires a
+quiet NaN and leaves which operand's sign and payload it carries to the
+implementation. On x86-64 `addsd` returns the first operand's. The compiler
+chooses which operand is first: LLVM treats `fadd` as commutative and may
+swap them. The engine's fold and the reference's fold are the same
+expression, `acc + v`, compiled in two different crates, so they can differ
+on one host whenever the two crates are optimised differently.
+
+That was observed. Every gate build compiled both crates unoptimised, and
+the folds agreed. With third-party dependencies at `opt-level = 2`, grouped
+`sum`, whose fold lives in DataFusion, returned `0x7FF8000000000001` for a
+group where the reference returned `0xFFF8000000000001`: the same NaN with
+the other sign, on the first generated case. The differential gate already
+carried this carve-out for `avg`, described in its module header; grouped
+`sum` was still compared bit for bit.
+
+What the gate asserts from now on, for `avg` and for grouped `sum`:
+
+- A result that is NaN on either side must be NaN on both. Its sign and
+  payload are not compared.
+- Every other result is compared bit for bit, including signed zeros and
+  signed infinities.
+
+What this does not change:
+
+- Ravel returns a conforming result. Neither bit pattern above is wrong.
+- Nothing stored is affected. The difference is in the result of an
+  aggregate over NaN inputs, computed at query time, and only for a group
+  that holds NaNs of different sign or payload.
+- min/max are untouched: `total_cmp` selects an input value and never
+  synthesizes one, so their NaN bits stay asserted, as decision 6 says.
+
+A user-visible consequence, which the user documentation must not
+contradict: the sign and payload of a NaN returned by `sum`, `avg` or `mean`
+are not specified, and may differ between builds of Ravel.
