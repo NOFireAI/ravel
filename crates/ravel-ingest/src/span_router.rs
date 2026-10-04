@@ -140,7 +140,7 @@ impl SpanIngestRouter {
         let rng: Arc<dyn RngSource> = Arc::new(SystemRng);
         let backstop_ceiling = BufferBudgetCeiling::unlimited();
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<SpanShardHandle>>| {
-            let scope: Arc<dyn FlushScope<SpanShardMsg>> = Arc::new(SwitchScope::new(weak.clone()));
+            let weak = weak.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -149,6 +149,8 @@ impl SpanIngestRouter {
             let metrics = Arc::clone(&metrics);
             let backstop_ceiling = backstop_ceiling.clone();
             let factory = move |shard_count: u32| -> Vec<SpanShardHandle> {
+                let scope: Arc<dyn FlushScope<SpanShardMsg>> =
+                    Arc::new(SwitchScope::new(weak.clone(), shard_count));
                 let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);

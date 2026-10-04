@@ -63,6 +63,9 @@ struct ShardHandle {
     /// it before enqueue, which is the only place a buffered-mode write can be
     /// refused, since that write is acknowledged at enqueue.
     cap_flag: DeferralCapFlag,
+    /// The flush scope of this shard's set, handed to every incarnation of the
+    /// actor so a respawn keeps the set's shard count.
+    scope: Arc<dyn FlushScope<ShardMsg>>,
 }
 
 /// Supervisor state guarded together so a death observation, the respawn that
@@ -95,6 +98,7 @@ impl ShardHandle {
         tx: mpsc::Sender<ShardMsg>,
         flush_floor_ns: Arc<AtomicI64>,
         cap_flag: DeferralCapFlag,
+        scope: Arc<dyn FlushScope<ShardMsg>>,
     ) -> Self {
         ShardHandle {
             inner: Mutex::new(ShardInner {
@@ -106,6 +110,7 @@ impl ShardHandle {
             }),
             flush_floor_ns,
             cap_flag,
+            scope,
         }
     }
 
@@ -259,7 +264,7 @@ impl IngestRouter {
         // Each generation's shard-actor set gets a fresh writer identity, so
         // two sets never collide on a commit key for the same shard index.
         let switch = Arc::new_cyclic(|weak: &Weak<GenerationSwitch<ShardHandle>>| {
-            let scope: Arc<dyn FlushScope<ShardMsg>> = Arc::new(SwitchScope::new(weak.clone()));
+            let weak = weak.clone();
             let store = Arc::clone(&store);
             let refresh_store = Arc::clone(&store);
             let clock = Arc::clone(&clock);
@@ -270,6 +275,8 @@ impl IngestRouter {
             #[cfg(feature = "stage-timing")]
             let stage_timings = Arc::clone(&stage_timings);
             let factory = move |shard_count: u32| -> Vec<ShardHandle> {
+                let scope: Arc<dyn FlushScope<ShardMsg>> =
+                    Arc::new(SwitchScope::new(weak.clone(), shard_count));
                 let writer_id = rng.new_uuid();
                 let epoch =
                     u64::try_from(clock.now_ns().div_euclid(1_000_000_000).max(0)).unwrap_or(0);
@@ -299,7 +306,7 @@ impl IngestRouter {
                             Arc::clone(&stage_timings),
                         );
                         tokio::spawn(actor.run());
-                        ShardHandle::new(tx, flush_floor_ns, cap_flag)
+                        ShardHandle::new(tx, flush_floor_ns, cap_flag, Arc::clone(&scope))
                     })
                     .collect()
             };
@@ -747,6 +754,7 @@ impl IngestRouter {
             shard,
             Arc::clone(&handle.flush_floor_ns),
             handle.cap_flag.clone(),
+            Arc::clone(&handle.scope),
         );
     }
 
@@ -765,6 +773,7 @@ impl IngestRouter {
         shard: u32,
         flush_floor_ns: Arc<AtomicI64>,
         cap_flag: DeferralCapFlag,
+        scope: Arc<dyn FlushScope<ShardMsg>>,
     ) -> mpsc::Sender<ShardMsg> {
         let writer_id = self.rng.new_uuid();
         let epoch =
@@ -784,7 +793,7 @@ impl IngestRouter {
             flush_floor_ns,
             self.backstop_ceiling.clone(),
             cap_flag,
-            Arc::new(SwitchScope::new(Arc::downgrade(&self.switch))),
+            scope,
             #[cfg(feature = "stage-timing")]
             Arc::clone(&self.stage_timings),
         );

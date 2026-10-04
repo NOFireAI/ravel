@@ -552,6 +552,12 @@ onward routes with the new count. Guarantees:
   is answered `Abandoned` (503, outcome unknown): the rows are written by
   another shard. A target shard that is dead, or whose mailbox closes before
   the rows arrive, leaves them with the shard that held them, which retries.
+  Nor does a late flush write under an hour its routing generation does not
+  own (ADR-1642 generation-mismatch amendment): when one generation owns the pinned hour alone and routes
+  at another shard count, the rows are handed to that generation's shards the
+  same way, so every row of an hour the query planner treats as one
+  generation's sits at that generation's index. Inside the activation
+  overlap no generation owns the hour and the flush writes in place.
   Two exceptions remain:
   - A shutdown or channel-close drain that still cannot confirm the view after
     re-reading the provisioning record, or cannot reach a live shard of the
@@ -559,6 +565,10 @@ onward routes with the new count. Guarantees:
     the target was not live the rows are known to be outside the scan set:
     stored but returned by no query, logged at ERROR with the tenant, shard
     and hour, and counted on `ravel_ingest_teardown_unscanned_writes_total`.
+    A teardown write of rows handed back for an hour another generation owns
+    stays inside the scan set, so readers find them, but a distributed
+    pushdown over that hour can split their series across two slices; it is
+    logged at WARN.
   - A writer or reshard-append clock skewed beyond the tolerated clock skew
     (one hour) can make the view's scan set wider than the true one.
 - Commit tokens are unaffected: a token minted under any generation resolves
