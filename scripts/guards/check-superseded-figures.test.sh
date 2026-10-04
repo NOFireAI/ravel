@@ -95,18 +95,19 @@ check "rejects_superseded_clickbench_pair_in_a_user_guide" "${d}" 1 \
   "docs/guides/cost-model.md:4: superseded-figure:"
 
 # The same revert against the real page: the shipped cost-model.md with the two
-# deleted lines put back where they were. This is the regression the ticket is
-# about, so it is checked against the page itself, not a stand-in.
+# deleted lines put back into the list item they were deleted from. This is the
+# regression the ticket is about, so it is checked against the page itself, not
+# a stand-in.
 d="$(new_repo revert_of_the_real_page)"
 cp "${REPO_ROOT}/docs/guides/cost-model.md" "${d}/docs/guides/cost-model.md"
 DELETED_1='   measures slower and heavier, not faster: 486.0s and 463.79 GB transferred'
 DELETED_2='   against 285.8s and 150.28 GB for the ranged shape, on the same'
 export DELETED_1 DELETED_2
-anchor_at="$(awk '/measures slower and heavier, not faster/ { print NR; exit }' \
+anchor_at="$(awk '/Setting the flag at all replaces that rate/ { print NR; exit }' \
   "${d}/docs/guides/cost-model.md")"
 awk '
   { print }
-  /measures slower and heavier, not faster/ && !done {
+  /Setting the flag at all replaces that rate/ && !done {
     print ENVIRON["DELETED_1"]
     print ENVIRON["DELETED_2"]
     done = 1
