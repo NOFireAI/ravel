@@ -23,7 +23,7 @@ use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_memory::MemoryBudget;
 use ravel_object_store::external::probe::{PreconditionProbeFailure, RavelBucketProbeFailure};
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
-use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
+use ravel_object_store::instrument::{InstrumentedStore, STORE_OP_COUNT, StoreOp};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -35,8 +35,8 @@ use ravel_pqtable::grants::{self, GrantsError};
 use ravel_pqtable::writer::WriteError;
 use ravel_query::{GetLimiter, LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    DEFAULT_PARQUET_METADATA_CACHE_BYTES, DdlExecuteError, DdlOutcome, ExternalStoreMap,
-    ParquetSources, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlOutcome,
+    DEFAULT_PARQUET_METADATA_CACHE_BYTES, DdlCost, DdlExecuteError, DdlOutcome, DdlPhase,
+    ExternalStoreMap, ParquetSources, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlOutcome,
 };
 use ravel_types::{TenantHash, TenantId};
 use util::request;
@@ -221,6 +221,7 @@ async fn create_external_table_then_read_back() {
             deadline(),
         )
         .await
+        .result
         .expect("create");
 
     match outcome {
@@ -272,6 +273,7 @@ async fn create_external_table_over_a_single_object_location_then_read_back() {
             deadline(),
         )
         .await
+        .result
         .expect("create over a single-object location");
 
     match outcome {
@@ -318,6 +320,7 @@ async fn create_external_table_over_a_single_object_without_the_parquet_suffix()
             deadline(),
         )
         .await
+        .result
         .expect("create over a single object with no .parquet suffix");
 
     match outcome {
@@ -351,6 +354,7 @@ async fn create_external_table_over_a_zero_byte_single_object_is_refused() {
             deadline(),
         )
         .await
+        .result
         .expect_err("a zero-byte single object must be refused");
 
     assert!(
@@ -379,6 +383,7 @@ async fn ravel_cast_naming_a_column_absent_from_the_snapshot_schema_is_refused()
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("a cast naming an absent column must be refused");
 
     assert!(
@@ -418,6 +423,7 @@ async fn ravel_cast_option_naming_a_mixed_case_column_casts_and_reads_back() {
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect("create with a mixed-case ravel.cast column");
     match outcome {
         DdlOutcome::Created {
@@ -454,6 +460,7 @@ async fn create_if_not_exists_on_existing_table_is_a_no_op() {
     lake.executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect("first create");
 
     let sql_if_not_exists = format!(
@@ -463,6 +470,7 @@ async fn create_if_not_exists_on_existing_table_is_a_no_op() {
         .executor
         .execute_ddl(t, &sql_if_not_exists, CREATED_BY, deadline())
         .await
+        .result
         .expect("second create is a no-op, not an error");
 
     assert_eq!(
@@ -484,12 +492,14 @@ async fn plain_create_on_existing_table_is_table_exists() {
     lake.executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect("first create");
 
     let err = lake
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("plain CREATE over an existing table must fail");
 
     assert!(
@@ -525,6 +535,7 @@ async fn create_if_not_exists_on_existing_table_issues_no_lake_store_calls() {
     lake.executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect("first create");
 
     let before = lake_store.metrics().snapshot();
@@ -536,6 +547,7 @@ async fn create_if_not_exists_on_existing_table_issues_no_lake_store_calls() {
         .executor
         .execute_ddl(t, &sql_if_not_exists, CREATED_BY, deadline())
         .await
+        .result
         .expect("second create is a no-op, not an error");
     assert_eq!(
         outcome,
@@ -568,6 +580,7 @@ async fn create_if_not_exists_on_existing_table_issues_no_lake_store_calls() {
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("plain CREATE over an existing table must fail");
     assert!(
         matches!(err, DdlExecuteError::Write(WriteError::TableExists { ref table }) if table == "hits"),
@@ -600,6 +613,7 @@ async fn or_replace_commits_a_new_version_over_an_existing_table() {
     lake.executor
         .execute_ddl(t, &create, CREATED_BY, deadline())
         .await
+        .result
         .expect("first create");
 
     lake.put_file("t/hits/1.parquet", parquet_bytes(&[2], &["b"], &[1.5]))
@@ -610,6 +624,7 @@ async fn or_replace_commits_a_new_version_over_an_existing_table() {
         .executor
         .execute_ddl(t, &replace, CREATED_BY, deadline())
         .await
+        .result
         .expect("replace");
 
     match outcome {
@@ -638,12 +653,14 @@ async fn drop_table_commits_a_tombstone_version() {
     lake.executor
         .execute_ddl(t, &create, CREATED_BY, deadline())
         .await
+        .result
         .expect("create");
 
     let outcome = lake
         .executor
         .execute_ddl(t, "DROP TABLE hits", CREATED_BY, deadline())
         .await
+        .result
         .expect("drop");
 
     assert_eq!(
@@ -671,11 +688,13 @@ async fn create_after_drop_on_the_same_name_proceeds() {
     lake.executor
         .execute_ddl(t, &create, CREATED_BY, deadline())
         .await
+        .result
         .expect("first create");
 
     lake.executor
         .execute_ddl(t, "DROP TABLE hits", CREATED_BY, deadline())
         .await
+        .result
         .expect("drop");
 
     lake.put_file("t/hits/1.parquet", parquet_bytes(&[2], &["b"], &[1.5]))
@@ -684,6 +703,7 @@ async fn create_after_drop_on_the_same_name_proceeds() {
         .executor
         .execute_ddl(t, &create, CREATED_BY, deadline())
         .await
+        .result
         .expect("create after drop must proceed, not report TableExists");
 
     match outcome {
@@ -709,6 +729,7 @@ async fn drop_if_exists_on_a_missing_table_is_a_no_op() {
         .executor
         .execute_ddl(t, "DROP TABLE IF EXISTS ghost", CREATED_BY, deadline())
         .await
+        .result
         .expect("drop if exists on a missing table is a no-op, not an error");
 
     assert_eq!(
@@ -728,6 +749,7 @@ async fn drop_without_if_exists_on_a_missing_table_is_table_not_found() {
         .executor
         .execute_ddl(t, "DROP TABLE ghost", CREATED_BY, deadline())
         .await
+        .result
         .expect_err("plain DROP on a missing table must fail");
 
     assert!(
@@ -758,6 +780,7 @@ async fn tenant_isolation_a_grant_on_one_tenant_does_not_admit_another() {
         .executor
         .execute_ddl(stranger, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("a tenant with no grant on this location must be refused");
 
     assert!(
@@ -834,6 +857,7 @@ async fn ravel_bucket_location_is_refused() {
     let err = executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("a location inside Ravel's own bucket must be refused");
 
     assert!(
@@ -871,6 +895,7 @@ async fn folder_marker_object_is_not_treated_as_the_probe_object() {
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("a bare folder marker must not qualify as the probe object");
 
     assert!(
@@ -907,6 +932,7 @@ async fn sibling_directory_sharing_the_same_string_prefix_is_not_a_match() {
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("a sibling directory's file must not qualify as the probe object");
 
     assert!(
@@ -938,6 +964,7 @@ async fn zero_byte_object_under_the_location_is_not_treated_as_a_match() {
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("a zero-byte object must not qualify as the probe object");
 
     assert!(
@@ -983,6 +1010,7 @@ async fn precondition_probe_failure_is_refused_before_any_manifest_write() {
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("a store that refuses a matching pin must be refused");
 
     assert!(
@@ -1030,6 +1058,7 @@ async fn manifest_is_written_under_the_callers_tenant_not_any_other() {
     lake.executor
         .execute_ddl(caller, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect("create");
 
     let caller_tables = ravel_pqtable::resolve::tables(lake.ravel.inner(), &caller)
@@ -1069,6 +1098,7 @@ async fn memory_budget_refusal_leaves_no_manifest() {
         .executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect_err("a 1-byte process memory budget cannot decode this file's footer");
 
     assert!(
@@ -1251,6 +1281,7 @@ async fn exhausted_resolve_to_put_budget_forces_a_second_resolve() {
     let outcome = executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect("create succeeds once the second resolve lands inside budget");
 
     match outcome {
@@ -1338,6 +1369,7 @@ async fn creates_lists_with_slow_resolve(grace_ms: Option<u64>, advance_ns: i64)
     executor
         .execute_ddl(t, &sql, CREATED_BY, deadline())
         .await
+        .result
         .expect("create succeeds");
     listing.list_calls()
 }
@@ -1474,15 +1506,32 @@ async fn whole_statement_deadline_expires_during_the_grants_read_and_writes_no_m
 
     let short_deadline = Duration::from_millis(20);
     let sql = format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'");
-    let err = executor
+    let execution = executor
         .execute_ddl(t, &sql, CREATED_BY, short_deadline)
-        .await
+        .await;
+    let err = execution
+        .result
         .expect_err("a grants read that never returns must fail with the statement deadline");
 
     assert!(
         matches!(err, DdlExecuteError::Deadline { deadline } if deadline == short_deadline),
         "{err:?}"
     );
+    // The cost survives the deadline: the existence check's LIST completed,
+    // and the stalled grants GET was issued, so both are counted.
+    let cost = execution.cost;
+    assert_eq!(
+        op_counts(&cost, DdlPhase::Write),
+        vec![("list", 1)],
+        "{cost:?}"
+    );
+    assert_eq!(
+        op_counts(&cost, DdlPhase::Grant),
+        vec![("get", 1)],
+        "{cost:?}"
+    );
+    assert_eq!(cost.total_requests(), 2, "{cost:?}");
+    assert_eq!(cost.total_bytes(), 0, "{cost:?}");
 
     let tables = ravel_pqtable::resolve::tables(ravel_inner.as_ref(), &t)
         .await
@@ -1491,4 +1540,256 @@ async fn whole_statement_deadline_expires_during_the_grants_read_and_writes_no_m
         tables.is_empty(),
         "no manifest may be written when the grants read never completed"
     );
+}
+
+/// The nonzero request counts of one phase, as `(op, count)` in
+/// [`StoreOp::ALL`] order, so a test can pin a phase's whole request mix in
+/// one assertion.
+fn op_counts(cost: &DdlCost, phase: DdlPhase) -> Vec<(&'static str, u64)> {
+    StoreOp::ALL
+        .into_iter()
+        .map(|op| (op.name(), cost.phase(phase).requests(op)))
+        .filter(|(_, count)| *count > 0)
+        .collect()
+}
+
+/// Requests per [`StoreOp`] and GET bytes the counting stores have completed
+/// so far, summed over all of them.
+fn counted(stores: &[&InstrumentedStore<MemoryStore>]) -> ([u64; STORE_OP_COUNT], u64) {
+    let mut requests = [0; STORE_OP_COUNT];
+    let mut get_bytes = 0;
+    for store in stores {
+        let snapshot = store.metrics().snapshot();
+        for op in StoreOp::ALL {
+            requests[op.index()] += snapshot.op(op).calls;
+        }
+        get_bytes += snapshot.op(StoreOp::Get).bytes;
+    }
+    (requests, get_bytes)
+}
+
+/// Asserts the sum of `cost`'s requests across every phase equals, op by op,
+/// what the counting stores completed between `before` and `after`, and that
+/// its bytes equal their GET bytes over the same span: every request the
+/// statement made is in exactly one phase, and none is missing.
+fn assert_cost_matches_stores(
+    cost: &DdlCost,
+    before: ([u64; STORE_OP_COUNT], u64),
+    after: ([u64; STORE_OP_COUNT], u64),
+) {
+    for op in StoreOp::ALL {
+        let costed: u64 = DdlPhase::ALL
+            .into_iter()
+            .map(|phase| cost.phase(phase).requests(op))
+            .sum();
+        assert_eq!(
+            costed,
+            after.0[op.index()] - before.0[op.index()],
+            "{op:?} requests: the per-phase cost must sum to what the stores saw; {cost:?}"
+        );
+    }
+    assert_eq!(
+        cost.total_bytes(),
+        after.1 - before.1,
+        "GET bytes: the per-phase cost must sum to what the stores saw; {cost:?}"
+    );
+}
+
+/// A [`Lake`] whose lake store is a counting store too, so the requests of
+/// both stores a `CREATE` touches can be compared with its [`DdlCost`].
+fn counted_lake() -> (Lake, Arc<InstrumentedStore<MemoryStore>>) {
+    let lake_store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let lake = Lake::unlimited(Arc::clone(&lake_store) as Arc<dyn ObjectStoreBackend>);
+    (lake, lake_store)
+}
+
+#[tokio::test]
+async fn ddl_cost_sums_to_the_store_requests_and_pins_each_phase_for_create_and_drop() {
+    const FILES: u64 = 3;
+    let (lake, lake_store) = counted_lake();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    for i in 0..FILES {
+        lake.put_file(
+            &format!("t/hits/{i}.parquet"),
+            parquet_bytes(&[i as i64], &["a"], &[0.5]),
+        )
+        .await;
+    }
+
+    let before = counted(&[&lake.ravel, &lake_store]);
+    let execution = lake
+        .executor
+        .execute_ddl(
+            t,
+            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'"),
+            CREATED_BY,
+            deadline(),
+        )
+        .await;
+    let after = counted(&[&lake.ravel, &lake_store]);
+    assert!(
+        matches!(execution.result, Ok(DdlOutcome::Created { files, .. }) if files == FILES as usize),
+        "{:?}",
+        execution.result
+    );
+    let cost = execution.cost;
+    assert_cost_matches_stores(&cost, before, after);
+
+    // The grants record, one GET.
+    assert_eq!(op_counts(&cost, DdlPhase::Grant), vec![("get", 1)]);
+    // One listing page to find the probe object; the precondition probe's
+    // HEAD (`pin_of`) and two pinned GETs; the Ravel-bucket probe's PUT and
+    // DELETE on Ravel's own store and its two GETs on the lake store.
+    assert_eq!(
+        op_counts(&cost, DdlPhase::Probe),
+        vec![
+            ("put", 1),
+            ("get", 4),
+            ("head", 1),
+            ("list", 1),
+            ("delete", 1)
+        ]
+    );
+    // Only the matching-pin read returns bytes, and it reads one byte.
+    assert_eq!(cost.phase(DdlPhase::Probe).bytes(), 1);
+    // The snapshot lists once and reads one footer per file.
+    assert_eq!(
+        op_counts(&cost, DdlPhase::Snapshot),
+        vec![("get", FILES), ("list", 1)]
+    );
+    assert!(cost.phase(DdlPhase::Snapshot).bytes() > 0, "{cost:?}");
+    // The existence check's LIST, then `writer::apply`'s own resolve LIST
+    // and its conditional PUT.
+    assert_eq!(
+        op_counts(&cost, DdlPhase::Write),
+        vec![("put", 1), ("list", 2)]
+    );
+
+    let before = counted(&[&lake.ravel, &lake_store]);
+    let execution = lake
+        .executor
+        .execute_ddl(t, "DROP TABLE hits", CREATED_BY, deadline())
+        .await;
+    let after = counted(&[&lake.ravel, &lake_store]);
+    assert!(
+        matches!(execution.result, Ok(DdlOutcome::Dropped { version: 2, .. })),
+        "{:?}",
+        execution.result
+    );
+    let cost = execution.cost;
+    assert_cost_matches_stores(&cost, before, after);
+    // A DROP is all write: resolve the newest version (LIST, then GET of
+    // version 1) and put the dropped version.
+    for phase in [DdlPhase::Grant, DdlPhase::Probe, DdlPhase::Snapshot] {
+        assert_eq!(op_counts(&cost, phase), vec![], "{phase:?}");
+    }
+    assert_eq!(
+        op_counts(&cost, DdlPhase::Write),
+        vec![("put", 1), ("get", 1), ("list", 1)]
+    );
+    assert_eq!(after.1 - before.1, cost.phase(DdlPhase::Write).bytes());
+    assert!(cost.phase(DdlPhase::Write).bytes() > 0, "{cost:?}");
+}
+
+#[tokio::test]
+async fn a_create_refused_at_the_grant_still_reports_its_cost() {
+    let (lake, lake_store) = counted_lake();
+    let owner = tenant("acme");
+    let stranger = tenant("other");
+    lake.grant(&owner).await;
+    lake.put_file("t/hits/0.parquet", parquet_bytes(&[1], &["a"], &[0.5]))
+        .await;
+
+    let before = counted(&[&lake.ravel, &lake_store]);
+    let execution = lake
+        .executor
+        .execute_ddl(
+            stranger,
+            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'"),
+            CREATED_BY,
+            deadline(),
+        )
+        .await;
+    let after = counted(&[&lake.ravel, &lake_store]);
+    assert!(
+        matches!(execution.result, Err(DdlExecuteError::Location(_))),
+        "{:?}",
+        execution.result
+    );
+    let cost = execution.cost;
+    assert_cost_matches_stores(&cost, before, after);
+    assert_eq!(op_counts(&cost, DdlPhase::Write), vec![("list", 1)]);
+    assert_eq!(op_counts(&cost, DdlPhase::Grant), vec![("get", 1)]);
+    assert_eq!(op_counts(&cost, DdlPhase::Probe), vec![]);
+    assert_eq!(op_counts(&cost, DdlPhase::Snapshot), vec![]);
+    assert_eq!(cost.total_bytes(), 0, "the stranger has no grants record");
+}
+
+#[tokio::test]
+async fn a_create_failing_in_the_snapshot_still_reports_its_cost() {
+    // Not a Parquet file: the probes qualify it (a nonzero object the grant
+    // admits), and the snapshot's footer read then refuses it.
+    let (lake, lake_store) = counted_lake();
+    let t = tenant("acme");
+    lake.grant(&t).await;
+    lake.put_file(
+        "t/hits/0.parquet",
+        Bytes::from_static(b"definitely not parquet"),
+    )
+    .await;
+
+    let before = counted(&[&lake.ravel, &lake_store]);
+    let execution = lake
+        .executor
+        .execute_ddl(
+            t,
+            &format!("CREATE EXTERNAL TABLE hits STORED AS PARQUET LOCATION '{GRANT}/hits/'"),
+            CREATED_BY,
+            deadline(),
+        )
+        .await;
+    let after = counted(&[&lake.ravel, &lake_store]);
+    assert!(
+        matches!(execution.result, Err(DdlExecuteError::Snapshot { .. })),
+        "{:?}",
+        execution.result
+    );
+    let cost = execution.cost;
+    assert_cost_matches_stores(&cost, before, after);
+    assert_eq!(op_counts(&cost, DdlPhase::Grant), vec![("get", 1)]);
+    assert_eq!(
+        op_counts(&cost, DdlPhase::Probe),
+        vec![
+            ("put", 1),
+            ("get", 4),
+            ("head", 1),
+            ("list", 1),
+            ("delete", 1)
+        ]
+    );
+    assert_eq!(
+        op_counts(&cost, DdlPhase::Snapshot),
+        vec![("get", 1), ("list", 1)]
+    );
+    // Only the existence check ran; the refused snapshot left nothing to write.
+    assert_eq!(op_counts(&cost, DdlPhase::Write), vec![("list", 1)]);
+}
+
+#[tokio::test]
+async fn a_statement_refused_by_validation_reports_zero_cost() {
+    let (lake, lake_store) = counted_lake();
+    let before = counted(&[&lake.ravel, &lake_store]);
+    let execution = lake
+        .executor
+        .execute_ddl(tenant("acme"), "SELECT 1", CREATED_BY, deadline())
+        .await;
+    let after = counted(&[&lake.ravel, &lake_store]);
+    assert!(
+        matches!(execution.result, Err(DdlExecuteError::Validation(_))),
+        "{:?}",
+        execution.result
+    );
+    assert_eq!(execution.cost, DdlCost::default());
+    assert_eq!(before, after);
 }
