@@ -302,6 +302,30 @@ and refuses the object with that decoder's `LogSegError::Corrupted` on any
 blob it rejects, a scope name or version that is not UTF-8 included, so a
 blob the writer stores always decodes.
 
+### Attribute nesting depth
+
+One depth rule bounds every canonical attribute set the format stores: the
+two sets in a STREAM_DIR blob and the `attrs_raw` overflow column (FIELD_DIR,
+below). The encoding itself has no depth limit; the rule narrows what a
+writer stores and a reader accepts, not what the bytes mean. A top-level
+attribute set sits at level 0 and each of its values at level 1. A list's
+elements sit one level below the list. A map costs two levels: its entry set
+sits one level below the map, and the entry values one level below that. A
+value or entry set past level 32 (`ravel_logseg::MAX_ATTR_DEPTH`) is refused.
+So 15 maps nested around a scalar fit and 16 do not, and 31 lists nested
+around a scalar fit and 32 do not.
+
+`ravel_logseg::attr_value_fits_depth` states the rule over a decoded value,
+and it is the one definition: both decoders (`decode_stream_attrs` for
+STREAM_DIR blobs, the `attrs_raw` decoder for the overflow column) refuse a
+set holding a value it rejects, with `LogSegError::Corrupted`, and stop at
+the cap rather than recursing past it, lists included. The writer refuses an
+`attrs_raw` value that does not fit with the `attrs_raw` decoder's error, on
+the row and the columnar path, before it builds any bytes, as it refuses a
+STREAM_DIR blob that does not decode. OTLP log admission applies the same
+predicate to every resource, scope and record attribute, so a value past the
+rule is rejected at ingest rather than at the flush.
+
 ## FIELD_DIR (uncompressed form)
 
 ```
@@ -1459,7 +1483,9 @@ All violations are `Corrupted`, never panics:
   mismatch.
 - overlong or truncated varint; trailing bytes past a declared structure;
   unsorted STREAM_DIR or FIELD_DIR; entry count over the configured cap;
-  unknown field type byte; unknown encoding or compression tag.
+  unknown field type byte; unknown encoding or compression tag; a STREAM_DIR
+  attribute set or `attrs_raw` value nested past the attribute depth rule
+  ("Attribute nesting depth" above).
 - codec: id out of dictionary range; delta/double-delta accumulation
   overflow; FOR `bit_width > 64` or packed length mismatch; a codec not
   consuming exactly its bytes; a GCD i64 page with `gcd < 2`, an inner tag

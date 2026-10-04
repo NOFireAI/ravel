@@ -159,16 +159,28 @@ pub enum LogRejection {
     #[error("attribute {key} is a string-table reference (strindex) with no value of its own")]
     UnsupportedAttributeValue { key: String },
 
-    /// An array or kvlist attribute value nests deeper than
-    /// [`crate::logs_normalize::MAX_ATTRIBUTE_NESTING_DEPTH`] levels. Rejected
-    /// rather than converted so the recursive
-    /// [`crate::logs_normalize`] converter cannot be driven past a bounded
-    /// depth by a hostile or malformed payload, independent of the decoder's
-    /// own recursion limit. Dropped as a single attribute when it sits on a
-    /// record, like [`LogRejection::MissingAttributeValue`]; a resource or
-    /// scope attribute that trips it rejects that group instead, the same as
-    /// any other conversion failure there.
-    #[error("attribute {key} nests more than {max} levels deep")]
+    /// An array or kvlist attribute value nests deeper than log storage holds.
+    /// A log attribute nested past what the segment format holds is rejected
+    /// at admission: at most 15 kvlists may nest around a scalar, an array
+    /// level costing half a kvlist level (so 31 arrays fit). That is
+    /// [`ravel_logseg::attr_value_fits_depth`], the rule both segment decoders
+    /// enforce, so an admitted attribute is never refused when its segment is
+    /// written or read.
+    ///
+    /// `max` is that limit in levels,
+    /// [`crate::logs_normalize::MAX_STORED_ATTRIBUTE_LEVELS`]: an array adds
+    /// one level for its elements, a kvlist one for its entries and one more
+    /// for their values. A value nested past the converter's own stack guard,
+    /// [`crate::logs_normalize::MAX_ATTRIBUTE_NESTING_DEPTH`], is rejected
+    /// through this variant with the same `max`, without being recursed
+    /// through, so a hostile payload cannot drive the converter past a bounded
+    /// depth. Dropped as a single attribute when it sits on a record, like
+    /// [`LogRejection::MissingAttributeValue`]; a resource or scope attribute
+    /// that trips it rejects that group instead, the same as any other
+    /// conversion failure there.
+    #[error(
+        "attribute {key} nests more than {max} levels deep (an array adds one level, a kvlist two)"
+    )]
     AttributeTooDeeplyNested { key: String, max: usize },
 
     /// `reason` applied identically to `count` log records that share one
@@ -390,7 +402,7 @@ mod tests {
             LogRejection::UnsupportedAttributeValue { key: "k".into() },
             LogRejection::AttributeTooDeeplyNested {
                 key: "k".into(),
-                max: 100,
+                max: 31,
             },
         ];
         for v in &variants {
