@@ -2409,6 +2409,12 @@ pub struct CatalogCountersSnapshot {
     /// tenant_hash mismatch or an out-of-prefix listing result. Unlike the
     /// two counters above, each of these also failed its query.
     pub isolation_breaches: u64,
+    /// Column-statistics objects HEAD referenced that the reader refused to
+    /// decode ([`ravel_catalog::Catalog::column_stats_decode_refusals`]).
+    pub column_stats_decode_refusals: u64,
+    /// Column-statistics decode jobs that panicked on the read CPU gate
+    /// ([`ravel_catalog::Catalog::column_stats_decode_panics`]).
+    pub column_stats_decode_panics: u64,
     /// Fold liveness, one entry per signal the fold covers.
     pub fold: [CatalogFoldCounters; crate::fold::FOLD_SIGNALS.len()],
     /// Supervisor restarts of each signal's fold loop, in
@@ -2426,6 +2432,8 @@ impl Default for CatalogCountersSnapshot {
             interlock_violations: 0,
             compaction_input_set_conflicts: 0,
             isolation_breaches: 0,
+            column_stats_decode_refusals: 0,
+            column_stats_decode_panics: 0,
             fold: CatalogFoldCounters::zeroed_per_signal(),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
         }
@@ -2443,6 +2451,8 @@ impl CatalogCountersSnapshot {
             interlock_violations: catalog.interlock_violations(),
             compaction_input_set_conflicts: catalog.compaction_input_set_conflicts(),
             isolation_breaches: catalog.isolation_breaches(),
+            column_stats_decode_refusals: catalog.column_stats_decode_refusals(),
+            column_stats_decode_panics: catalog.column_stats_decode_panics(),
             fold: crate::fold::FOLD_SIGNALS.map(|signal| CatalogFoldCounters {
                 signal,
                 cycles: catalog.fold_cycles(signal),
@@ -2503,6 +2513,32 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
         "ravel_catalog_isolation_breach_total",
         &[Label::Mode(mode)],
         snapshot.isolation_breaches,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_column_stats_decode_refusals_total",
+        "Column-statistics objects HEAD referenced that the reader refused to decode; the tenant runs with no column statistics for them.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_decode_refusals_total",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_decode_refusals,
+    );
+
+    write_header(
+        out,
+        "ravel_catalog_column_stats_decode_panics_total",
+        "Column-statistics decode jobs that panicked on the read CPU gate; the query falls back to reading the data.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_column_stats_decode_panics_total",
+        &[Label::Mode(mode)],
+        snapshot.column_stats_decode_panics,
     );
 
     // The three fold families carry a `signal` label because the fold is one
@@ -9844,6 +9880,63 @@ mod tests {
             body.contains("ravel_catalog_isolation_breach_total{mode=\"gateway\"} 5"),
             "isolation-breach counter must render its current value:\n{body}"
         );
+    }
+
+    /// The two column-statistics decode counters render under their own
+    /// names, each with its own value, in a mode that runs no fold.
+    #[test]
+    fn column_stats_decode_counters_render_at_metrics() {
+        let catalog = CatalogCountersSnapshot {
+            column_stats_decode_refusals: 6,
+            column_stats_decode_panics: 7,
+            ..Default::default()
+        };
+        let body = render(
+            Mode::Gateway,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &catalog,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            true,
+        );
+
+        for expected in [
+            "# TYPE ravel_catalog_column_stats_decode_refusals_total counter",
+            "ravel_catalog_column_stats_decode_refusals_total{mode=\"gateway\"} 6",
+            "# TYPE ravel_catalog_column_stats_decode_panics_total counter",
+            "ravel_catalog_column_stats_decode_panics_total{mode=\"gateway\"} 7",
+        ] {
+            assert_eq!(
+                body.lines().filter(|line| *line == expected).count(),
+                1,
+                "expected exactly one `{expected}` line:\n{body}"
+            );
+        }
     }
 
     /// The fold-liveness family reaches `/metrics` as one series per folded

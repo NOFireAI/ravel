@@ -1,12 +1,16 @@
-//! Startup validation of the flush cadence against the read-side scan slack
-//! (ADR-0076 decision 4, ADR-1642 deferral cap amendment), through the library
-//! entry point.
+//! Startup validation of the flush cadence (ADR-0076 decision 4, ADR-1642
+//! deferral cap amendment), through the library entry point.
 //!
-//! A cadence that spends the whole `FLUSH_BOUND_SLACK_HOURS` slack leaves the
-//! flush deferral cap at 0, and a shard whose flush queue filled would then
-//! refuse every write from the first trigger it defers. `start` refuses that
-//! cadence for a `ServerConfig` built in code, in every mode, with the same
-//! typed error `Cli::validate` returns; one second below the limit starts.
+//! A cadence that spends the whole `FLUSH_BOUND_SLACK_HOURS` flush slack
+//! leaves the flush deferral cap at 0, and a shard whose flush queue filled
+//! would then refuse every write from the first trigger it defers. `start`
+//! refuses that cadence for a `ServerConfig` built in code, in every mode,
+//! with the same typed error `Cli::validate` returns; one second below the
+//! limit starts. The same holds for an idle delay below the fast one, a fast
+//! delay whose strict visibility budget reaches
+//! `MAX_STRICT_VISIBILITY_BUDGET_NS`, and a `min_flush_bytes` at or above
+//! `target_bytes`: each is refused with its own variant, and the value at the
+//! limit starts.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -155,13 +159,14 @@ async fn a_cadence_one_second_below_the_limit_starts() {
 }
 
 /// An idle delay whose sum with the flush lifetime exceeds the slack is
-/// refused by the slack check, which runs first, with its own variant.
+/// refused by the slack check, which runs before the cap check, with its own
+/// variant.
 #[tokio::test]
-async fn an_idle_delay_past_the_scan_slack_refuses_startup() {
+async fn an_idle_delay_past_the_flush_slack_refuses_startup() {
     let err = start_with_idle(Mode::All, Duration::from_secs(3601))
         .await
         .err()
-        .expect("an idle delay past the scan slack must refuse startup");
+        .expect("an idle delay past the flush slack must refuse startup");
     assert!(
         matches!(
             err.downcast_ref::<FlushCadenceError>(),
@@ -181,31 +186,195 @@ async fn an_idle_delay_past_the_scan_slack_refuses_startup() {
 /// enters the trigger bound only with `adaptive_flush_delay` on. With fast =
 /// idle = 3599.5 s that threshold is 3599.9 s, plus the 0.2 s flush tick is
 /// 3600.1 s against the 3600 s the slack leaves after the flush lifetime: cap
-/// 0, refused. With adaptive off the bound is 3599.7 s and the 0.3 s cap
-/// starts. Without the reserve the widest threshold, 3599.4 s, falls below
-/// fast and the adaptive case starts too, so this pins both terms. The CLI
-/// cannot reach this cadence: its `MAX_STRICT_VISIBILITY_BUDGET_NS` check
-/// refuses a 3599.5 s `--max-flush-delay` first.
+/// 0. With adaptive off the bound is 3599.7 s and the cap is 0.3 s. Without
+/// the reserve the widest threshold, 3599.4 s, falls below fast and the
+/// adaptive cap is positive too, so this pins both terms. `start` cannot reach
+/// that cap check with this cadence: the strict visibility budget check runs
+/// first and refuses a 3599.5 s `max_flush_delay` whether adaptive is on or
+/// off, so the cap is asserted on the `IngestConfig` `start` would build.
 #[tokio::test]
 async fn the_adaptive_corridor_counts_against_the_deferral_cap() {
     let delay = Duration::from_millis(3_599_500);
-    let err = start_config(config_with_cadence(Mode::All, delay, delay, true))
+    for adaptive in [true, false] {
+        let err = start_config(config_with_cadence(Mode::All, delay, delay, adaptive))
+            .await
+            .err()
+            .expect("a 3599.5 s max_flush_delay must refuse startup");
+        assert!(
+            matches!(
+                err.downcast_ref::<FlushCadenceError>(),
+                Some(FlushCadenceError::StrictVisibilityBudgetTooHigh { .. })
+            ),
+            "expected FlushCadenceError::StrictVisibilityBudgetTooHigh with adaptive \
+             {adaptive}, got: {err:#}"
+        );
+    }
+
+    let adaptive = ingest_config_as_start_builds(delay, delay, true);
+    assert_eq!(adaptive.flush_deferral_cap_ns(), 0);
+    let fixed = ingest_config_as_start_builds(delay, delay, false);
+    assert_eq!(fixed.flush_deferral_cap_ns(), 300_000_000);
+}
+
+/// The `IngestConfig` fields `start` derives from a cadence, every other field
+/// at its default.
+fn ingest_config_as_start_builds(
+    fast: Duration,
+    idle: Duration,
+    adaptive_flush_delay: bool,
+) -> ravel_ingest::IngestConfig {
+    ravel_ingest::IngestConfig {
+        max_flush_delay: fast,
+        max_flush_delay_idle: idle,
+        adaptive_flush_delay,
+        strict_visibility_budget_ns: i64::try_from(fast.as_nanos())
+            .unwrap_or(i64::MAX)
+            .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS),
+        ..ravel_ingest::IngestConfig::default()
+    }
+}
+
+fn assert_cadence_error(
+    err: &anyhow::Error,
+    want: fn(&FlushCadenceError) -> bool,
+    what: &str,
+    needles: &[&str],
+) {
+    let got = err.downcast_ref::<FlushCadenceError>();
+    assert!(
+        got.is_some_and(want),
+        "expected FlushCadenceError::{what}, got: {err:#}"
+    );
+    let msg = format!("{err:#}");
+    for needle in needles {
+        assert!(msg.contains(needle), "expected {needle:?} in: {msg}");
+    }
+}
+
+/// An idle delay one nanosecond below the fast one is refused with
+/// `IdleFlushDelayBelowFast`, in a writing mode and in a mode that builds no
+/// ingest router; an idle delay equal to the fast one starts.
+#[tokio::test]
+async fn an_idle_delay_below_the_fast_delay_refuses_startup() {
+    let fast = Duration::from_secs(2);
+    for mode in [Mode::All, Mode::Query] {
+        let config = config_with_cadence(mode, fast, fast - Duration::from_nanos(1), false);
+        let err = start_config(config)
+            .await
+            .err()
+            .expect("an idle delay below the fast delay must refuse startup");
+        assert_cadence_error(
+            &err,
+            |e| matches!(e, FlushCadenceError::IdleFlushDelayBelowFast { .. }),
+            "IdleFlushDelayBelowFast",
+            &["--max-flush-delay-idle", "is less than --max-flush-delay"],
+        );
+    }
+
+    let running = start_config(config_with_cadence(Mode::All, fast, fast, false))
+        .await
+        .expect("an idle delay equal to the fast delay must start");
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A 2.5 s fast delay derives a strict visibility budget of exactly the 3 s
+/// `MAX_STRICT_VISIBILITY_BUDGET_NS`, which is refused at equality, in a
+/// writing mode and in a mode that builds no ingest router. One nanosecond
+/// less starts.
+#[tokio::test]
+async fn a_strict_visibility_budget_at_the_ceiling_refuses_startup() {
+    let limit = Duration::from_nanos(
+        (ravel_server::config::MAX_STRICT_VISIBILITY_BUDGET_NS
+            - ravel_ingest::STRICT_VISIBILITY_RESERVE_NS) as u64,
+    );
+    assert_eq!(limit, Duration::from_millis(2_500));
+    let idle = Duration::from_secs(40);
+    for mode in [Mode::All, Mode::Query] {
+        let err = start_config(config_with_cadence(mode, limit, idle, false))
+            .await
+            .err()
+            .expect("a strict visibility budget at the ceiling must refuse startup");
+        assert_cadence_error(
+            &err,
+            |e| {
+                matches!(
+                    e,
+                    FlushCadenceError::StrictVisibilityBudgetTooHigh {
+                        strict_visibility_budget_ns: 3_000_000_000,
+                        ..
+                    }
+                )
+            },
+            "StrictVisibilityBudgetTooHigh",
+            &["--max-flush-delay", "MAX_STRICT_VISIBILITY_BUDGET_NS (3s)"],
+        );
+    }
+
+    let below = limit - Duration::from_nanos(1);
+    let running = start_config(config_with_cadence(Mode::All, below, idle, false))
+        .await
+        .expect("a strict visibility budget below the ceiling must start");
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A `min_flush_bytes` equal to the ingest pipeline's `target_bytes` is
+/// refused, in a writing mode and in a mode that builds no ingest router; one
+/// byte less starts.
+#[tokio::test]
+async fn a_min_flush_bytes_at_target_bytes_refuses_startup() {
+    let target_bytes = ravel_ingest::IngestConfig::default().target_bytes;
+    for mode in [Mode::All, Mode::Query] {
+        let mut config = config_with_idle(mode, Duration::from_secs(40));
+        config.min_flush_bytes = target_bytes;
+        let err = start_config(config)
+            .await
+            .err()
+            .expect("a min_flush_bytes at target_bytes must refuse startup");
+        assert_cadence_error(
+            &err,
+            |e| {
+                matches!(
+                    e,
+                    FlushCadenceError::MinFlushBytesNotBelowTargetBytes { .. }
+                )
+            },
+            "MinFlushBytesNotBelowTargetBytes",
+            &["--min-flush-bytes", "target_bytes"],
+        );
+    }
+
+    let mut config = config_with_idle(Mode::All, Duration::from_secs(40));
+    config.min_flush_bytes = target_bytes - 1;
+    let running = start_config(config)
+        .await
+        .expect("a min_flush_bytes below target_bytes must start");
+    running.shutdown().await.expect("clean shutdown");
+}
+
+/// A 1000-year fast delay with a 40 s idle delay breaks three rules: the idle
+/// delay is below the fast one, the strict visibility budget saturates past
+/// its ceiling, and the trigger bound saturates at `i64::MAX`, leaving a
+/// deferral cap of 0. The inversion check runs first, in `start` as in
+/// `Cli::validate`, so that is the refusal. The cap `start` would compute for
+/// the same cadence is asserted too: with a truncating cast the 1000 years
+/// wrap negative, the bound falls back to the 40 s idle delay, and the cap
+/// comes out positive.
+#[tokio::test]
+async fn a_millennium_fast_delay_refuses_startup() {
+    let millennium = Duration::from_secs(1000 * 365 * 86_400);
+    let idle = Duration::from_secs(40);
+    let err = start_config(config_with_cadence(Mode::All, millennium, idle, false))
         .await
         .err()
-        .expect("an adaptive cadence leaving no deferral cap must refuse startup");
-    assert!(
-        matches!(
-            err.downcast_ref::<FlushCadenceError>(),
-            Some(FlushCadenceError::ZeroFlushDeferralCap {
-                adaptive_flush_delay: true,
-                ..
-            })
-        ),
-        "expected FlushCadenceError::ZeroFlushDeferralCap with the adaptive flag, got: {err:#}"
+        .expect("a 1000-year max_flush_delay must refuse startup");
+    assert_cadence_error(
+        &err,
+        |e| matches!(e, FlushCadenceError::IdleFlushDelayBelowFast { .. }),
+        "IdleFlushDelayBelowFast",
+        &["--max-flush-delay-idle", "is less than --max-flush-delay"],
     );
 
-    let running = start_config(config_with_cadence(Mode::All, delay, delay, false))
-        .await
-        .expect("the same cadence with adaptive off leaves a positive cap and must start");
-    running.shutdown().await.expect("clean shutdown");
+    let ingest = ingest_config_as_start_builds(millennium, idle, false);
+    assert_eq!(ingest.flush_trigger_age_bound_ns(), i64::MAX);
+    assert_eq!(ingest.flush_deferral_cap_ns(), 0);
 }

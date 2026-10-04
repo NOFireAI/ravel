@@ -5,10 +5,12 @@ Status: Accepted (2026-09-12). Amended 2026-09-20 (issue #1740, see
 "Amendment (2026-10-03): the deferral cap" below) and 2026-10-03 (issue
 #2410, see "Amendment (2026-10-03): the scan-set check at flush open" below),
 2026-10-03 (issue #2438, see "Amendment (2026-10-03): the zero deferral cap
-refusal binds the library entry" below), and 2026-10-04 (issue #2429, see
+refusal binds the library entry" below), 2026-10-04 (issue #2429, see
 "Amendment (2026-10-04): the hand-back also fires on a generation mismatch"
-below). Supersedes ADR-0067 decision 2. Issues #1292, #1641, #1740, #1916,
-#2410, #2438, and #2429.
+below), and 2026-10-04 (issue #2465, see "Amendment (2026-10-04): every
+startup cadence check binds the library entry" below). Supersedes ADR-0067
+decision 2. Issues #1292, #1641, #1740, #1916, #2410, #2438, #2429, and
+#2465.
 
 ## Context
 
@@ -792,7 +794,8 @@ refuses cadences that entry did not refuse before: the cap check does not cover
 every configuration the slack check refuses, because
 `IngestConfig::flush_trigger_age_bound_ns` truncates the delays with an `as
 i64` cast, so an idle delay past `i64::MAX` nanoseconds (a 1000-year one, say)
-wraps negative and leaves a positive cap, and only the slack check refuses it.
+wraps negative and leaves a positive cap, and only the slack check refuses it
+(the cast saturates since the startup cadence amendment below).
 Refusing more configurations at startup is the safer direction.
 
 **Tests.** `services/ravel-server/tests/flush_deferral_cap_startup.rs` builds
@@ -802,7 +805,8 @@ refused with the slack variant. With `max_flush_delay` and
 `max_flush_delay_idle` both 3599.5 s, `adaptive_flush_delay` on is refused with
 the cap variant and off starts, which pins the adaptive flag and the strict
 visibility reserve in the cap computation; the CLI refuses that cadence earlier,
-by `MAX_STRICT_VISIBILITY_BUDGET_NS`.
+by `MAX_STRICT_VISIBILITY_BUDGET_NS`, and so does `start` since the startup
+cadence amendment below.
 
 ## Amendment (2026-10-04): the hand-back also fires on a generation mismatch (issue #2429)
 
@@ -983,3 +987,48 @@ its rows written exactly once by the teardown, which pins the absorb in
 a 4-shard and a 3-shard flush, 4 to 3 to 4 where equal counts write in place,
 a 3 to 4 increase handing back up, the owner being the generation active at
 the reading, and the rule that only a strictly smaller set is awaited.
+
+## Amendment (2026-10-04): every startup cadence check binds the library entry (issue #2465)
+
+<!-- amendment-applies: sections="Amendment (2026-10-03): the zero deferral cap refusal binds the library entry (issue #2438)" pointer="startup cadence amendment" -->
+
+The library-entry amendment moved two cadence checks out of `Cli::validate`
+and left three there: an idle delay below the fast one, a fast delay whose
+derived strict visibility budget reaches `MAX_STRICT_VISIBILITY_BUDGET_NS`,
+and a `min_flush_bytes` at or above the ingest default `target_bytes`. A
+`ServerConfig` built in code that broke any of them still started.
+
+**Decision.** Each is one function in `ravel-server`'s `lib.rs`, called by
+both `Cli::validate` and `start_with_heartbeat`, in every mode, returning its
+own `FlushCadenceError` variant (`IdleFlushDelayBelowFast`,
+`StrictVisibilityBudgetTooHigh`, `MinFlushBytesNotBelowTargetBytes`) with the
+text `Cli::validate` already printed. The arithmetic and the limits are
+unchanged. Both entries run the five cadence checks in one order: the
+inversion, the flush slack, the strict visibility budget, the deferral cap,
+`min_flush_bytes`. The inversion goes first because the slack check reads
+the idle delay as the worst-case age, which holds only once it is the larger
+delay.
+
+`IngestConfig::flush_trigger_age_bound_ns` and `flush_deferral_cap_ns` now
+convert every duration with a saturating conversion, as does the idle age
+threshold. A delay past `i64::MAX` nanoseconds gives a trigger bound of
+`i64::MAX` and a cap of 0, so the cap check refuses it too. Through `start`
+no such delay reaches the cap check: the inversion, slack and budget checks
+each refuse first. A 1000-year fast delay with a 40 s idle one is refused as
+an inversion.
+
+The adaptive-corridor case the library-entry amendment's tests named, both
+delays at 3599.5 s, is now refused by `start` with
+`StrictVisibilityBudgetTooHigh` whether adaptive delay is on or off, as the
+CLI refused it. The cap's adaptive term is pinned on the `IngestConfig`
+`start` builds instead. With the budget limit binding `start`, the adaptive
+corridor's widest ceiling stays under 2.9 s, so it cannot drive the cap to 0
+for any cadence `start` accepts.
+
+**Tests.** `services/ravel-server/tests/flush_deferral_cap_startup.rs` refuses
+each of the three through `start` in `Mode::All` and `Mode::Query` with its
+variant and starts each at its limit: an idle delay equal to the fast one, a
+fast delay one nanosecond under 2.5 s, and a `min_flush_bytes` one byte under
+`target_bytes`. `ravel-ingest`'s
+`a_delay_past_i64_nanos_saturates_the_bound_and_the_cap` pins the saturation
+at the overflow boundary.
