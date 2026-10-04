@@ -86,13 +86,41 @@ Earlier memory figures on this epic (#2469, #2475, #2477) were computed with a
 formula that counts reallocation growth twice and are retracted on those
 issues; #2480 records how that was found. Nothing in this ADR rests on them.
 
+### Wide records
+
+The corpus above has four attributes per record. A wide tenant has a hundred
+or more, and `from_records` pivots rows into columns, so the same two routes
+were measured on 20,000 records of 105 dynamic attributes each, all promoted
+to columns (issue #2563, result branch
+`task/f0ad66d4-941e-40a0-82b3-a8d43af5eb45/result`, file
+`stage1-width-gate.md`; arm64 macOS, load 3.7 to 6.4, arms interleaved). The
+columnar arm calls `from_records` on the records directly, as before, and
+the object bytes are identical between arms.
+
+| Shape | Row builder | Columnar route | Columnar / row | Peak, row | Peak, columnar | Lower by |
+|---|---|---|---|---|---|---|
+| Wide, 1 stream | 1,134 ms | 980 ms | 0.86 (0.85 to 0.92) | 364.2 MB | 322.1 MB | 11.6% |
+| Wide, 1,000 streams | 1,163 ms | 991 ms | 0.84 (0.82 to 0.85) | 360.9 MB | 323.5 MB | 10.4% |
+
+The four-attribute corpus, run in the same session as a control, reproduced
+the peaks above within 80 bytes on this different architecture.
+
+Two things differ from the narrow case. The columnar route is faster, by 14%
+to 16%, where on narrow records it was level. And the memory saving is
+smaller, about 11% against about 30%: the row builder's per-row material is
+153 MB here and the columnar batch that replaces it is 128 MB. The input
+itself is 184 MB, half of the row builder's peak, and the columnar route's
+peak falls inside `from_records` with every record and the whole batch
+alive. On wide records, then, most of what can be saved is that overlap,
+which is decision 2's subject, not decision 1's.
+
 ### What the measurement does not cover
 
-The corpus has four attributes per record, one of them a string. A wide
-tenant has a hundred or more columns, and `from_records` pivots rows into
-columns; its cost at that width was not measured. The profiler sees the Rust
-heap only, so zstd's own allocations are outside every figure here. The
-figures are for 20,000-record objects.
+The profiler sees the Rust heap only, so zstd's own allocations are outside
+every figure here. The figures are for 20,000-record objects. The routed
+path itself, a row-mode writer folding at `finish`, has not been measured on
+either corpus; both columnar arms fed the records to `from_records`
+directly. Decision 2's effect has not been measured at all.
 
 ## Decision
 
@@ -113,7 +141,8 @@ figures are for 20,000-record objects.
    this today: it keeps the first blob it sees for a stream id and has no
    conflict check, so the fold carries the check itself.
 
-2. **The fold consumes the records.** `finish` owns the records, so the fold
+2. **The fold consumes the records. On wide records this is the main memory
+   lever.** `finish` owns the records, so the fold
    takes them by value and releases each record's strings and attribute
    vectors as it is folded, instead of building the whole batch beside the
    whole input. The measured columnar peak is exactly that overlap (11.6 MB
@@ -151,13 +180,12 @@ figures are for 20,000-record objects.
    rewired to call the reference builder directly; otherwise the test
    compares the columnar builder with itself.
 
-4. **A width gate before decision 1 lands.** The implementing task measures
-   encode wall time on a wide shape (at least 100 dynamic columns per record)
-   for the row builder and for the routed path, interleaved. If the routed
-   path is slower than 1.15 times the row builder there, decision 1 does not
-   land as written; the result is reported and this ADR is amended with what
-   the measurement shows. Peak memory on the wide shape is measured in the
-   same task and reported, with no bar.
+4. **A width gate before decision 1 lands, which has passed.** The bar was
+   set before the measurement: on a wide shape (at least 100 dynamic columns
+   per record), the columnar route slower than 1.15 times the row builder
+   would have stopped decision 1 from landing as written. It measured 0.86
+   and 0.84 (see "Wide records"). Peak memory on the wide shape had no bar
+   and is reported there.
 
 5. **The stream directory is encoded once, from borrowed blobs.**
    The writer gains an encode-side entry point that takes borrowed entries
@@ -232,9 +260,16 @@ flowchart TD
   would see a higher peak than today, by 1% to 6%. The ingest flush and
   compaction's part builder hand their records to `push` by value; the other
   callers were not checked for a retained copy.
-- Encode time for row-shaped input is expected within a few percent of
-  today's on narrow records. On wide records it is unknown until decision 4's
-  gate runs.
+- Encode time for row-shaped input is level with today's on narrow records
+  and 14% to 16% lower on 105-column records, as measured on the columnar
+  route.
+- On wide records decision 1 alone saves about 11% of the peak. The rest of
+  what is available there is the overlap between the records and the batch,
+  184 MB and 128 MB on the measured corpus, which only decision 2 reduces. A
+  fold that removed the overlap entirely would bring the peak toward the
+  larger of the two; a real one still holds the unfolded remainder and the
+  growing batch together, so that is a ceiling on the saving and not a
+  forecast.
 - One production builder instead of two. A defect in the columnar builder
   now reaches ingest and compaction as well as bulk load.
 - The reference row builder must keep compiling and keep matching. A change

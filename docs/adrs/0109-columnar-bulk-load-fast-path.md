@@ -414,8 +414,9 @@ holds is "the columnar path is bulk-load only" and the reason given for it.
 The pivot from rows to columns now happens once per flush inside the writer,
 not per request, and ADR-2467 measured it: on its corpus the routed encode
 takes 0.93 to 1.00 times the row builder's time, and ADR-2467 estimates its
-peak memory at 23% to 25% under the row builder's. ADR-2467 gates the change
-on a wide-column measurement.
+peak memory at 23% to 25% under the row builder's. On 105-column records the
+columnar route measured 0.84 to 0.86 times the row builder's time, which
+passed the gate ADR-2467 set for the change.
 
 Decision 7. The requirement is unchanged: the two builders produce
 byte-identical objects for the same records, and both differential tests stay.
