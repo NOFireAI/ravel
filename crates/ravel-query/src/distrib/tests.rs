@@ -48,6 +48,7 @@ use crate::distrib::client::{
     DistribError, RemoteSliceFetcher, SliceFetcher, SliceLogResponse, SliceResponse,
     SliceSpanResponse,
 };
+use crate::distrib::codec::CodecError;
 use crate::distrib::federation::{Federation, RemoteCluster};
 use crate::distrib::partition::DistribThresholds;
 use crate::distrib::proto::series_fetch_server::SeriesFetch;
@@ -3084,22 +3085,15 @@ fn erased_histogram_series_is_dropped_before_the_wire() {
     });
 }
 
-// --- RLOG-family and Spans distributed fan-out (#284/#285, removed by #1912) -
+// --- RLOG-family and Spans distributed fan-out (#284/#285) ------------------
 //
-// The client half of both fan-outs is gone: `RemoteSliceFetcher` no longer
-// overrides `fetch_logs`/`fetch_spans`, so nothing in this crate decodes a
-// remote's log or span slice, and the differential suites that drove those
-// decoders over a loopback worker went with them (their subject, the removed
-// `decode_log_slice_frames`/`decode_span_slice_frames`, no longer exists).
-// `SliceStreamDecoder::push` (mod.rs) refuses a `LogRecord` or `Span` frame
-// with `FrameSignalUnsupported`, but that only explains the removal of the
-// subset of those suites whose slices actually carried such a frame; any
-// suite whose slices carried none (an empty-result or all-metrics case, say)
-// could in principle have kept running through `SliceStreamDecoder` -- it was
-// removed only because its decoder was, not because the decoder would have
-// refused it. What survives here is the span TOTAL-ORDER pinning below
-// (`span_order_key` and `span_cmp`), which is coordinator-side and independent
-// of any transport.
+// The worker's log and span slice serving and the coordinator's log and span
+// fan-out are covered end to end over the loopback worker by the issue #1946
+// suites at the end of this file, through the test-only
+// `LogSliceStreamDecoder`/`SpanSliceStreamDecoder` and `LoopbackSliceFetcher`.
+// Production stays unwired: `RemoteSliceFetcher` keeps the `Unsupported`
+// defaults for `fetch_logs`/`fetch_spans`. The span total-order pins below are
+// coordinator-side and independent of any transport.
 
 const TA: [u8; 16] = [0xAA; 16];
 const TB: [u8; 16] = [0xBB; 16];
@@ -4577,12 +4571,11 @@ fn log_record(service: &str, ts: i64, body: &str, attrs: &[(&str, &str)]) -> Log
 /// Every field of the log total order participates in the key.
 ///
 /// The counterpart of [`span_order_key_discriminates_every_field`] for the log
-/// side. It exists because #1912 deleted the differential suites that were the
-/// only exercise of the coordinator-side log fan-out, and unlike the span side
-/// nothing else pinned the log order at all: a field silently dropped from
-/// `log_record_order_key` reorders a distributed log read against a local one
-/// with no test anywhere failing. This pin is transport-independent, so it
-/// survives whatever shape the log slice boundary eventually takes.
+/// side: a field silently dropped from `log_record_order_key` reorders a
+/// distributed log read against a local one only on a corpus where that field
+/// decides the order, so every field is pinned here directly. This pin is
+/// transport-independent; [`distributed_log_fetch_equals_local_bitwise`] covers
+/// the order end to end.
 #[test]
 fn log_record_order_key_discriminates_every_field() {
     let base = log_record("alpha", 10, "body", &[("k", "v")]);
@@ -5321,16 +5314,27 @@ async fn write_log_segment(store: &MemoryStore, key: u64, count: i64) -> Segment
             attrs: Vec::new(),
         })
         .collect();
+    write_log_records(store, key, 0, &records).await
+}
 
+/// Writes `records` as one real RLOG object on `shard` and returns a matching
+/// L0 `SegmentRef` whose event-time range is the records' own, on the same
+/// uniqueness terms as [`write_log_segment`].
+async fn write_log_records(
+    store: &MemoryStore,
+    key: u64,
+    shard: u32,
+    records: &[LogRecord],
+) -> SegmentRef {
     let identity = LogObjectIdentity {
         tenant_hash: TENANT.0,
-        shard: 0,
+        shard,
         writer_id: [key as u8; 16],
         writer_epoch: 1,
         writer_seq: key,
     };
     let mut writer = RlogWriter::new(RlogConfig::default(), identity);
-    for record in &records {
+    for record in records {
         writer.push(record.clone()).expect("push record");
     }
     let bytes = writer.finish().expect("finish rlog object");
@@ -5344,12 +5348,12 @@ async fn write_log_segment(store: &MemoryStore, key: u64, count: i64) -> Segment
     SegmentRef {
         data_object_key: object_key,
         object_size: size,
-        min_event_ts_ns: 0,
-        max_event_ts_ns: count - 1,
+        min_event_ts_ns: records.iter().map(|r| r.ts_ns).min().unwrap_or(0),
+        max_event_ts_ns: records.iter().map(|r| r.ts_ns).max().unwrap_or(0),
         ingest_hour_bucket: 0,
         sample_count: records.len() as u64,
         series_count: 0,
-        shard: 0,
+        shard,
         content_hash: [key as u8; 32],
         writer_id: Uuid::from_u128(u128::from(key) + 100),
         writer_epoch: 1,
@@ -5377,16 +5381,27 @@ async fn write_span_segment(store: &MemoryStore, key: u64, count: u8) -> Segment
             attrs: Vec::new(),
         })
         .collect();
+    write_span_records(store, key, 0, &records).await
+}
 
+/// Writes `records` as one real RSPAN object on `shard` and returns a matching
+/// L0 `SegmentRef` whose event-time range runs from the earliest start to the
+/// latest end, on the same uniqueness terms as [`write_log_segment`].
+async fn write_span_records(
+    store: &MemoryStore,
+    key: u64,
+    shard: u32,
+    records: &[SpanRecord],
+) -> SegmentRef {
     let identity = SpanObjectIdentity {
         tenant_hash: TENANT.0,
-        shard: 0,
+        shard,
         writer_id: [key as u8; 16],
         writer_epoch: 1,
         writer_seq: key,
     };
     let mut writer = RspanWriter::new(RspanConfig::default(), identity);
-    for record in &records {
+    for record in records {
         writer.push(record.clone());
     }
     let bytes = writer.finish().expect("finish rspan object");
@@ -5400,12 +5415,12 @@ async fn write_span_segment(store: &MemoryStore, key: u64, count: u8) -> Segment
     SegmentRef {
         data_object_key: object_key,
         object_size: size,
-        min_event_ts_ns: 0,
-        max_event_ts_ns: i64::from(count) + 10,
+        min_event_ts_ns: records.iter().map(|r| r.start_ts_ns).min().unwrap_or(0),
+        max_event_ts_ns: records.iter().map(|r| r.end_ts_ns).max().unwrap_or(0),
         ingest_hour_bucket: 0,
         sample_count: records.len() as u64,
         series_count: 0,
-        shard: 0,
+        shard,
         content_hash: [key as u8 ^ 0x5a; 32],
         writer_id: Uuid::from_u128(u128::from(key) + 200),
         writer_epoch: 1,
@@ -5601,4 +5616,2004 @@ fn failed_span_slice_reports_the_segments_it_already_paid_for() {
              neither bytes nor a request on this path"
         );
     });
+}
+
+// ---- issue #1946: log and span slices over the loopback worker -------------
+
+/// The per-slice frame and wire-byte caps of a record-slice decoder, checked
+/// exactly as [`crate::distrib::SliceStreamDecoder::push`] checks them: the
+/// frame count first, then the frame's protobuf-encoded length, both before the
+/// frame's payload is decoded or kept, so a refusal holds one frame past the cap
+/// and nothing else.
+struct SliceCaps {
+    max_frames: usize,
+    max_bytes: u64,
+    frames: usize,
+    bytes: u64,
+}
+
+impl SliceCaps {
+    /// The caps a production coordinator decodes a metrics slice under.
+    fn new() -> Self {
+        SliceCaps {
+            max_frames: crate::distrib::codec::MAX_SLICE_RESPONSE_FRAMES,
+            max_bytes: crate::distrib::codec::slice_byte_cap(&EngineConfig::default()),
+            frames: 0,
+            bytes: 0,
+        }
+    }
+
+    fn admit(&mut self, frame: &pb::FetchResponse) -> Result<(), DistribError> {
+        use prost::Message;
+        self.frames += 1;
+        if self.frames > self.max_frames {
+            return Err(DistribError::Codec(CodecError::SliceFrameCapExceeded {
+                frames: self.frames,
+                max: self.max_frames,
+            }));
+        }
+        self.bytes = self.bytes.saturating_add(frame.encoded_len() as u64);
+        if self.bytes > self.max_bytes {
+            return Err(DistribError::Codec(CodecError::SliceByteCapExceeded {
+                bytes: self.bytes,
+                max: self.max_bytes,
+            }));
+        }
+        Ok(())
+    }
+}
+
+/// A record slice's terminal summary, read back.
+struct RecordSummary {
+    status: pb::status::Code,
+    status_message: String,
+    accounting: QueryAccountingSnapshot,
+    stats: crate::fetcher::FetchStats,
+    /// The record count the worker reported (it rides `series_returned`).
+    returned: u64,
+}
+
+fn accept_summary(
+    slot: &mut Option<pb::Summary>,
+    summary: pb::Summary,
+) -> Result<(), DistribError> {
+    if slot.is_some() {
+        return Err(DistribError::MultipleSummaries);
+    }
+    *slot = Some(summary);
+    Ok(())
+}
+
+fn read_summary(summary: Option<pb::Summary>) -> Result<RecordSummary, DistribError> {
+    let summary = summary.ok_or(DistribError::NoSummary)?;
+    let status = summary
+        .status
+        .ok_or(DistribError::Codec(CodecError::MissingStatus))?;
+    Ok(RecordSummary {
+        status: crate::distrib::codec::decode_status_code(status.code)?,
+        status_message: status.message,
+        accounting: summary
+            .accounting
+            .map(crate::distrib::codec::decode_accounting)
+            .unwrap_or_default(),
+        stats: crate::fetcher::FetchStats {
+            raw_f64_pages: summary.raw_f64_pages,
+            raw_f64_bytes: summary.raw_f64_bytes,
+            histogram_series_skipped: 0,
+        },
+        returned: summary.series_returned,
+    })
+}
+
+/// Test support: the bounded, incremental decoder for one log slice's frames,
+/// the log sibling of [`crate::distrib::SliceStreamDecoder`]. The same frame and
+/// byte caps and the same typed refusals; a frame of any other signal is refused
+/// with [`DistribError::FrameSignalUnsupported`]; the terminal summary ends the
+/// slice. Production keeps the `Unsupported` default for log slices, so nothing
+/// outside these tests decodes a `LogRecord` frame.
+struct LogSliceStreamDecoder {
+    caps: SliceCaps,
+    records: Vec<LogRecord>,
+    summary: Option<pb::Summary>,
+}
+
+impl LogSliceStreamDecoder {
+    fn new() -> Self {
+        LogSliceStreamDecoder {
+            caps: SliceCaps::new(),
+            records: Vec::new(),
+            summary: None,
+        }
+    }
+
+    fn with_max_frames(mut self, max_frames: usize) -> Self {
+        self.caps.max_frames = max_frames;
+        self
+    }
+
+    fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.caps.max_bytes = max_bytes;
+        self
+    }
+
+    /// Whether the terminal summary has arrived; the reader stops pulling here.
+    fn finished(&self) -> bool {
+        self.summary.is_some()
+    }
+
+    fn push(&mut self, frame: pb::FetchResponse) -> Result<(), DistribError> {
+        use pb::fetch_response::Frame;
+        self.caps.admit(&frame)?;
+        match frame.frame {
+            Some(Frame::LogRecord(record)) => self
+                .records
+                .push(crate::distrib::codec::decode_log_record(record)?),
+            Some(Frame::Summary(summary)) => accept_summary(&mut self.summary, summary)?,
+            Some(Frame::Series(_)) => return Err(DistribError::FrameSignalUnsupported("series")),
+            Some(Frame::Hist(_)) => return Err(DistribError::FrameSignalUnsupported("histogram")),
+            Some(Frame::Span(_)) => return Err(DistribError::FrameSignalUnsupported("span")),
+            Some(Frame::PartialAggregate(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("partial-aggregate"));
+            }
+            None => return Err(DistribError::EmptyFrame),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<SliceLogResponse, DistribError> {
+        let summary = read_summary(self.summary)?;
+        Ok(SliceLogResponse {
+            records: self.records,
+            accounting: summary.accounting,
+            stats: summary.stats,
+            records_returned: summary.returned,
+            status: summary.status,
+            status_message: summary.status_message,
+        })
+    }
+}
+
+/// Test support: the span sibling of [`LogSliceStreamDecoder`], on the same
+/// terms.
+struct SpanSliceStreamDecoder {
+    caps: SliceCaps,
+    spans: Vec<SpanRow>,
+    summary: Option<pb::Summary>,
+}
+
+impl SpanSliceStreamDecoder {
+    fn new() -> Self {
+        SpanSliceStreamDecoder {
+            caps: SliceCaps::new(),
+            spans: Vec::new(),
+            summary: None,
+        }
+    }
+
+    fn with_max_frames(mut self, max_frames: usize) -> Self {
+        self.caps.max_frames = max_frames;
+        self
+    }
+
+    fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.caps.max_bytes = max_bytes;
+        self
+    }
+
+    fn finished(&self) -> bool {
+        self.summary.is_some()
+    }
+
+    fn push(&mut self, frame: pb::FetchResponse) -> Result<(), DistribError> {
+        use pb::fetch_response::Frame;
+        self.caps.admit(&frame)?;
+        match frame.frame {
+            Some(Frame::Span(span)) => self
+                .spans
+                .push(crate::distrib::codec::decode_span_frame(span)?),
+            Some(Frame::Summary(summary)) => accept_summary(&mut self.summary, summary)?,
+            Some(Frame::Series(_)) => return Err(DistribError::FrameSignalUnsupported("series")),
+            Some(Frame::Hist(_)) => return Err(DistribError::FrameSignalUnsupported("histogram")),
+            Some(Frame::LogRecord(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("log-record"));
+            }
+            Some(Frame::PartialAggregate(_)) => {
+                return Err(DistribError::FrameSignalUnsupported("partial-aggregate"));
+            }
+            None => return Err(DistribError::EmptyFrame),
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<SliceSpanResponse, DistribError> {
+        let summary = read_summary(self.summary)?;
+        Ok(SliceSpanResponse {
+            spans: self.spans,
+            accounting: summary.accounting,
+            stats: summary.stats,
+            spans_returned: summary.returned,
+            status: summary.status,
+            status_message: summary.status_message,
+        })
+    }
+}
+
+/// What one log or span slice brought across the boundary.
+#[derive(Debug, Clone, PartialEq)]
+struct CrossedSlice {
+    status: pb::status::Code,
+    /// Record frames decoded off the stream.
+    records: usize,
+    /// The record count the worker's summary reported.
+    returned: u64,
+}
+
+/// Test support: a [`SliceFetcher`] over a loopback worker that overrides
+/// `fetch_logs` and `fetch_spans` with the bounded decoders above, so
+/// `Distributed::fetch_logs`/`fetch_spans` run their real fan-out and fold over
+/// frames a real worker served over `tonic`. Metrics delegate to
+/// [`RemoteSliceFetcher`]. Every decoded log or span slice is recorded in
+/// `crossed`, in completion order.
+struct LoopbackSliceFetcher {
+    metrics: RemoteSliceFetcher,
+    channel: Channel,
+    max_frames: Option<usize>,
+    max_bytes: Option<u64>,
+    crossed: Arc<std::sync::Mutex<Vec<CrossedSlice>>>,
+}
+
+impl LoopbackSliceFetcher {
+    fn new(channel: Channel) -> Self {
+        LoopbackSliceFetcher {
+            metrics: RemoteSliceFetcher::new(channel.clone()),
+            channel,
+            max_frames: None,
+            max_bytes: None,
+            crossed: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn with_max_frames(mut self, max_frames: usize) -> Self {
+        self.max_frames = Some(max_frames);
+        self
+    }
+
+    fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = Some(max_bytes);
+        self
+    }
+
+    fn crossed(&self) -> Arc<std::sync::Mutex<Vec<CrossedSlice>>> {
+        Arc::clone(&self.crossed)
+    }
+
+    fn record(&self, slice: CrossedSlice) {
+        self.crossed.lock().expect("crossed slices").push(slice);
+    }
+
+    async fn open(
+        &self,
+        request: pb::FetchRequest,
+    ) -> Result<tonic::Streaming<pb::FetchResponse>, DistribError> {
+        crate::distrib::proto::series_fetch_client::SeriesFetchClient::new(self.channel.clone())
+            .fetch(request)
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|s| DistribError::Transport(s.to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for LoopbackSliceFetcher {
+    async fn fetch(&self, request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        self.metrics.fetch(request).await
+    }
+
+    async fn fetch_logs(
+        &self,
+        request: pb::FetchRequest,
+    ) -> Result<SliceLogResponse, DistribError> {
+        let mut stream = self.open(request).await?;
+        let mut decoder = LogSliceStreamDecoder::new();
+        if let Some(max_frames) = self.max_frames {
+            decoder = decoder.with_max_frames(max_frames);
+        }
+        if let Some(max_bytes) = self.max_bytes {
+            decoder = decoder.with_max_bytes(max_bytes);
+        }
+        // A refusal returns from here, dropping the stream: nothing past the
+        // cap is pulled.
+        while !decoder.finished() {
+            let Some(frame) = stream
+                .message()
+                .await
+                .map_err(|s| DistribError::Transport(s.to_string()))?
+            else {
+                break;
+            };
+            decoder.push(frame)?;
+        }
+        let response = decoder.finish()?;
+        self.record(CrossedSlice {
+            status: response.status,
+            records: response.records.len(),
+            returned: response.records_returned,
+        });
+        Ok(response)
+    }
+
+    async fn fetch_spans(
+        &self,
+        request: pb::FetchRequest,
+    ) -> Result<SliceSpanResponse, DistribError> {
+        let mut stream = self.open(request).await?;
+        let mut decoder = SpanSliceStreamDecoder::new();
+        if let Some(max_frames) = self.max_frames {
+            decoder = decoder.with_max_frames(max_frames);
+        }
+        if let Some(max_bytes) = self.max_bytes {
+            decoder = decoder.with_max_bytes(max_bytes);
+        }
+        while !decoder.finished() {
+            let Some(frame) = stream
+                .message()
+                .await
+                .map_err(|s| DistribError::Transport(s.to_string()))?
+            else {
+                break;
+            };
+            decoder.push(frame)?;
+        }
+        let response = decoder.finish()?;
+        self.record(CrossedSlice {
+            status: response.status,
+            records: response.spans.len(),
+            returned: response.spans_returned,
+        });
+        Ok(response)
+    }
+}
+
+type WorkerStream = std::pin::Pin<
+    Box<dyn futures::Stream<Item = Result<pb::FetchResponse, tonic::Status>> + Send + 'static>,
+>;
+
+/// A worker that counts every frame its transport pulls off the slice stream,
+/// so a test can tell a reader that stopped at a cap from one that drained.
+struct CountingWorker<S> {
+    inner: S,
+    produced: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[tonic::async_trait]
+impl<S: SeriesFetch> SeriesFetch for CountingWorker<S> {
+    type FetchStream = WorkerStream;
+
+    async fn fetch(
+        &self,
+        request: tonic::Request<pb::FetchRequest>,
+    ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
+        let stream = self.inner.fetch(request).await?.into_inner();
+        let produced = Arc::clone(&self.produced);
+        Ok(tonic::Response::new(Box::pin(futures::StreamExt::inspect(
+            stream,
+            move |_| {
+                produced.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        ))))
+    }
+}
+
+/// Serves `service` on `127.0.0.1:0` and returns a lazily connected channel to
+/// it plus the server task (abort it to shut the worker down).
+async fn serve_loopback<S: SeriesFetch>(service: S) -> (Channel, JoinHandle<()>) {
+    let server = crate::distrib::proto::series_fetch_server::SeriesFetchServer::new(service);
+    let incoming = TcpIncoming::bind("127.0.0.1:0".parse().expect("addr")).expect("bind");
+    let addr = incoming.local_addr().expect("local addr");
+    let handle = tokio::spawn(async move {
+        Server::builder()
+            .add_service(server)
+            .serve_with_incoming(incoming)
+            .await
+            .expect("serve");
+    });
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect_lazy();
+    (channel, handle)
+}
+
+/// A loopback worker over `store` whose resolver knows `resolvable`, with the
+/// log and span fetch paths wired as asked, behind a [`LoopbackSliceFetcher`].
+/// The counter is every frame the worker's transport pulled.
+async fn spawn_slice_worker(
+    store: Arc<MemoryStore>,
+    resolvable: Vec<SegmentRef>,
+    logs: bool,
+    spans: bool,
+) -> (
+    LoopbackSliceFetcher,
+    JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let backend: Arc<dyn ObjectStoreBackend> = store;
+    let mut service = SeriesFetchService::new(
+        SegmentFetcher::new(Arc::clone(&backend)),
+        Arc::new(SnapshotSegmentResolver::new(resolvable)),
+    );
+    if logs {
+        service = service.with_log_fetcher(LogSegmentFetcher::new(Arc::clone(&backend)));
+    }
+    if spans {
+        service = service.with_span_fetcher(SpanSegmentFetcher::new(backend));
+    }
+    let produced = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (channel, server) = serve_loopback(CountingWorker {
+        inner: service,
+        produced: Arc::clone(&produced),
+    })
+    .await;
+    (LoopbackSliceFetcher::new(channel), server, produced)
+}
+
+fn fan_out(max_parallel_slices: usize) -> DistribThresholds {
+    DistribThresholds {
+        min_store_bytes: 0,
+        min_segments: 0,
+        max_parallel_slices,
+    }
+}
+
+fn snapshot_of(segments: &[SegmentRef]) -> Snapshot {
+    Snapshot {
+        segments: segments.to_vec(),
+        segments_pruned: 0,
+        pending_erasure: Vec::new(),
+    }
+}
+
+/// The local log reference: every segment read through `LogSegmentFetcher` over
+/// the whole time range, concatenated in `segments` order, plus what it cost.
+async fn local_log_records(
+    store: &Arc<MemoryStore>,
+    segments: &[SegmentRef],
+    erasure: &[ErasurePredicate],
+) -> (Vec<LogRecord>, QueryAccountingSnapshot) {
+    let fetcher = LogSegmentFetcher::new(Arc::clone(store) as Arc<dyn ObjectStoreBackend>);
+    let accounting = QueryAccounting::new();
+    let query = LogQuery::new(i64::MIN, i64::MAX).with_erasure(erasure.to_vec());
+    let mut records = Vec::new();
+    for seg in segments {
+        if let Some(out) = fetcher
+            .fetch_accounted_with_tenant(seg, TENANT, &query, &accounting)
+            .await
+            .expect("local log fetch")
+        {
+            records.extend(out.records);
+        }
+    }
+    (records, accounting.snapshot())
+}
+
+/// The local span reference, on the same terms as [`local_log_records`], with
+/// erasure applied through `is_erased_span` as the local span scan applies it.
+async fn local_span_rows(
+    store: &Arc<MemoryStore>,
+    segments: &[SegmentRef],
+    erasure: &[ErasurePredicate],
+) -> (Vec<SpanRow>, QueryAccountingSnapshot) {
+    let fetcher = SpanSegmentFetcher::new(Arc::clone(store) as Arc<dyn ObjectStoreBackend>);
+    let accounting = QueryAccounting::new();
+    let query = SpanQuery::ts_range(i64::MIN, i64::MAX);
+    let mut rows = Vec::new();
+    for seg in segments {
+        if let Some(out) = fetcher
+            .fetch_accounted(seg, TENANT, &query, None, None, &[], &accounting)
+            .await
+            .expect("local span fetch")
+        {
+            rows.extend(out.records);
+        }
+    }
+    rows.retain(|row| {
+        !crate::erasure::is_erased_span(&row.record.attrs, row.record.start_ts_ns, erasure)
+    });
+    (rows, accounting.snapshot())
+}
+
+/// The part of `local` a slice summary can carry: the page-byte and open
+/// counters are process-local and not on the wire (`codec::decode_accounting`),
+/// so a fan-out folds every counter except those.
+fn wire_visible(local: QueryAccountingSnapshot) -> QueryAccountingSnapshot {
+    crate::distrib::codec::decode_accounting(crate::distrib::codec::encode_accounting(&local))
+}
+
+/// Sorts `records` under the documented RLOG total order (ADR-0071, log and
+/// span fan-out amendment, "Shipped status"), written out here field by field
+/// rather than through `log_record_order_key`, so a change to the production key
+/// diverges from it.
+fn documented_log_order(records: &mut [LogRecord]) {
+    records.sort_by_cached_key(|r| {
+        let mut attrs = Vec::new();
+        for pair in &r.attrs {
+            attrs.extend_from_slice(&ravel_types::logstream::canonical_attr_bytes(
+                std::slice::from_ref(pair),
+            ));
+        }
+        (
+            r.ts_ns,
+            r.stream_id.0,
+            r.stream_attrs.clone(),
+            r.observed_ts_ns,
+            r.severity_num,
+            r.severity_text.clone(),
+            r.body.clone(),
+            r.trace_id,
+            r.span_id,
+            r.flags,
+            attrs,
+        )
+    });
+}
+
+/// Sorts `rows` under the documented span total order, through the
+/// `span_order_key` reference definition rather than the production `span_cmp`.
+fn documented_span_order(rows: &mut [SpanRow]) {
+    rows.sort_by_cached_key(span_order_key);
+}
+
+/// Each record as its wire encoding, so a comparison is bit for bit (`f64`
+/// attribute values cross as their bit patterns).
+fn log_wire(records: &[LogRecord]) -> Vec<Vec<u8>> {
+    use prost::Message;
+    records
+        .iter()
+        .map(|r| crate::distrib::codec::encode_log_record(r).encode_to_vec())
+        .collect()
+}
+
+fn span_wire(rows: &[SpanRow]) -> Vec<Vec<u8>> {
+    use prost::Message;
+    rows.iter()
+        .map(|r| crate::distrib::codec::encode_span_frame(r).encode_to_vec())
+        .collect()
+}
+
+fn assert_same_sequence(what: &str, got: &[Vec<u8>], want: &[Vec<u8>]) {
+    assert_eq!(got.len(), want.len(), "{what}: record count differs");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(g, w, "{what}: record {i} differs");
+    }
+}
+
+fn severity(i: u8) -> (u8, &'static str) {
+    match i % 3 {
+        0 => (9, "INFO"),
+        1 => (13, "WARN"),
+        _ => (17, "ERROR"),
+    }
+}
+
+/// Attribute value bit patterns whose distinctions a `==` comparison loses.
+fn float_bits() -> Vec<u64> {
+    vec![
+        0.0f64.to_bits(),
+        (-0.0f64).to_bits(),
+        f64::NAN.to_bits(),
+        0x7ff8_0000_0000_0001,
+        1.5f64.to_bits(),
+    ]
+}
+
+fn arb_log_record() -> impl Strategy<Value = LogRecord> {
+    (
+        (0u8..3, 0i64..12, 0i64..3, 0u8..3),
+        (
+            0u8..3,
+            prop::option::of(0u8..2),
+            prop::option::of(1u8..3),
+            0u32..2,
+        ),
+        (
+            prop::option::of(0u8..3),
+            prop::option::of(prop::sample::select(float_bits())),
+        ),
+    )
+        .prop_map(
+            |((service, ts, observed, sev), (body, trace, span, flags), (user, float))| {
+                let (stream_id, stream_attrs) = log_stream(&format!("svc{service}"));
+                let (severity_num, severity_text) = severity(sev);
+                let mut attrs = Vec::new();
+                if let Some(bits) = float {
+                    attrs.push(("f".to_string(), AttrValue::F64(f64::from_bits(bits))));
+                }
+                if let Some(user) = user {
+                    attrs.push(("user".to_string(), AttrValue::Str(format!("u{user}"))));
+                }
+                LogRecord {
+                    stream_id,
+                    stream_attrs,
+                    ts_ns: ts,
+                    observed_ts_ns: ts + observed,
+                    severity_num,
+                    severity_text: severity_text.to_string(),
+                    body: format!("body {body}"),
+                    trace_id: trace.map(|t| [0xA0 + t; 16]),
+                    span_id: span.map(|s| [s; 8]),
+                    flags,
+                    attrs,
+                }
+            },
+        )
+}
+
+fn span_status(i: u8) -> ravel_rspan::StatusCode {
+    match i % 3 {
+        0 => ravel_rspan::StatusCode::Unset,
+        1 => ravel_rspan::StatusCode::Ok,
+        _ => ravel_rspan::StatusCode::Error,
+    }
+}
+
+/// A span with its attribute keys in ascending order, as RSPAN stores them.
+#[allow(clippy::too_many_arguments)]
+fn span(
+    trace: u8,
+    span_id: u8,
+    parent: Option<u8>,
+    name: &str,
+    start: i64,
+    end: i64,
+    status: u8,
+    service: Option<&str>,
+    user: Option<&str>,
+) -> SpanRecord {
+    let mut attrs = Vec::new();
+    if let Some(service) = service {
+        attrs.push(("service.name".to_string(), service.to_string()));
+    }
+    if let Some(user) = user {
+        attrs.push(("user".to_string(), user.to_string()));
+    }
+    SpanRecord {
+        trace_id: [0xA0 + trace; 16],
+        span_id: [span_id; 8],
+        parent_span_id: parent.map(|p| [p; 8]),
+        name: name.to_string(),
+        start_ts_ns: start,
+        end_ts_ns: end,
+        status_code: span_status(status),
+        status_message: None,
+        attrs,
+    }
+}
+
+fn arb_span_record() -> impl Strategy<Value = SpanRecord> {
+    (
+        (0u8..3, 1u8..4, prop::option::of(1u8..4), 0u8..2),
+        (0i64..12, 0i64..5, 0u8..3, prop::option::of(0u8..2)),
+        (prop::option::of(0u8..2), prop::option::of(0u8..3)),
+    )
+        .prop_map(
+            |((trace, span_id, parent, name), (start, dur, status, message), (svc, user))| {
+                let service = svc.map(|s| format!("svc{s}"));
+                let user = user.map(|u| format!("u{u}"));
+                SpanRecord {
+                    status_message: message.map(|m| format!("msg{m}")),
+                    ..span(
+                        trace,
+                        span_id,
+                        parent,
+                        &format!("op{name}"),
+                        start,
+                        start + dur,
+                        status,
+                        service.as_deref(),
+                        user.as_deref(),
+                    )
+                }
+            },
+        )
+}
+
+/// One proptest log differential: write the corpus, then assert the worker's
+/// emission order for one slice of every segment, the coordinator's merged
+/// result over `cap` slices, the folded accounting, and every slice summary.
+async fn run_log_differential(corpus: Vec<(u32, Vec<LogRecord>)>, cap: usize) {
+    let store = Arc::new(MemoryStore::new());
+    let mut segments = Vec::new();
+    for (key, (shard, records)) in corpus.iter().enumerate() {
+        segments.push(write_log_records(&store, key as u64 + 1, *shard, records).await);
+    }
+    let (local, local_cost) = local_log_records(&store, &segments, &[]).await;
+    let local_cost = wire_visible(local_cost);
+    let mut expected = local.clone();
+    documented_log_order(&mut expected);
+
+    let (fetcher, server, _produced) =
+        spawn_slice_worker(Arc::clone(&store), segments.clone(), true, true).await;
+    let crossed = fetcher.crossed();
+
+    // The order the worker emits: each pinned segment's local read order,
+    // segment after segment. The coordinator, not the worker, orders.
+    let one = SliceFetcher::fetch_logs(&fetcher, signal_request(&segments, Signal::Logs))
+        .await
+        .expect("one log slice over every segment");
+    assert_eq!(one.status, pb::status::Code::Ok);
+    assert_same_sequence(
+        "worker emission order",
+        &log_wire(&one.records),
+        &log_wire(&local),
+    );
+    assert_eq!(one.records_returned, local.len() as u64);
+    assert_eq!(one.accounting, local_cost);
+    crossed.lock().expect("crossed").clear();
+
+    let snapshot = snapshot_of(&segments);
+    let distributed = Distributed::new(Arc::new(fetcher), fan_out(cap));
+    let accounting = QueryAccounting::new();
+    let got = distributed
+        .fetch_logs(
+            TENANT,
+            Signal::Logs,
+            &snapshot,
+            &[],
+            &[],
+            &accounting,
+            &EngineConfig::default(),
+            test_deadline(),
+        )
+        .await
+        .expect("distributed log fetch")
+        .expect("served, not a local fallback");
+    server.abort();
+
+    assert_same_sequence(
+        "coordinator merge vs the documented log order",
+        &log_wire(&got),
+        &log_wire(&expected),
+    );
+    assert_eq!(
+        accounting.snapshot(),
+        local_cost,
+        "the fan-out folds exactly the cost a local read pays"
+    );
+    let crossed = crossed.lock().expect("crossed").clone();
+    assert_eq!(
+        crossed.len(),
+        crate::distrib::partition::partition_snapshot(&snapshot, cap).len()
+    );
+    for slice in &crossed {
+        assert_eq!(slice.status, pb::status::Code::Ok);
+        assert_eq!(slice.returned, slice.records as u64, "{slice:?}");
+    }
+    assert_eq!(
+        crossed.iter().map(|s| s.records).sum::<usize>(),
+        local.len()
+    );
+}
+
+/// The span sibling of [`run_log_differential`].
+async fn run_span_differential(corpus: Vec<(u32, Vec<SpanRecord>)>, cap: usize) {
+    let store = Arc::new(MemoryStore::new());
+    let mut segments = Vec::new();
+    for (key, (shard, records)) in corpus.iter().enumerate() {
+        segments.push(write_span_records(&store, key as u64 + 1, *shard, records).await);
+    }
+    let (local, local_cost) = local_span_rows(&store, &segments, &[]).await;
+    let local_cost = wire_visible(local_cost);
+    let mut expected = local.clone();
+    documented_span_order(&mut expected);
+
+    let (fetcher, server, _produced) =
+        spawn_slice_worker(Arc::clone(&store), segments.clone(), true, true).await;
+    let crossed = fetcher.crossed();
+
+    let one = SliceFetcher::fetch_spans(&fetcher, signal_request(&segments, Signal::Spans))
+        .await
+        .expect("one span slice over every segment");
+    assert_eq!(one.status, pb::status::Code::Ok);
+    assert_same_sequence(
+        "worker emission order",
+        &span_wire(&one.spans),
+        &span_wire(&local),
+    );
+    assert_eq!(one.spans_returned, local.len() as u64);
+    assert_eq!(one.accounting, local_cost);
+    crossed.lock().expect("crossed").clear();
+
+    let snapshot = snapshot_of(&segments);
+    let distributed = Distributed::new(Arc::new(fetcher), fan_out(cap));
+    let accounting = QueryAccounting::new();
+    let got = distributed
+        .fetch_spans(
+            TENANT,
+            Signal::Spans,
+            &snapshot,
+            &[],
+            &[],
+            &accounting,
+            &EngineConfig::default(),
+            test_deadline(),
+        )
+        .await
+        .expect("distributed span fetch")
+        .expect("served, not a local fallback");
+    server.abort();
+
+    assert_same_sequence(
+        "coordinator merge vs the documented span order",
+        &span_wire(&got),
+        &span_wire(&expected),
+    );
+    assert_eq!(accounting.snapshot(), local_cost);
+    let crossed = crossed.lock().expect("crossed").clone();
+    assert_eq!(
+        crossed.len(),
+        crate::distrib::partition::partition_snapshot(&snapshot, cap).len()
+    );
+    for slice in &crossed {
+        assert_eq!(slice.status, pb::status::Code::Ok);
+        assert_eq!(slice.returned, slice.records as u64, "{slice:?}");
+    }
+    assert_eq!(
+        crossed.iter().map(|s| s.records).sum::<usize>(),
+        local.len()
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// A distributed log fetch over the loopback worker equals the local fetch
+    /// of the same segments merged under the documented total order, bit for
+    /// bit, for arbitrary corpora and slice counts; the worker emits each
+    /// segment's local read order; the folded cost and every slice summary
+    /// match.
+    ///
+    /// Mutation proof: RED when `log_record_order_key` (mod.rs) swaps its
+    /// `ts_ns` and `stream_id` fields, or when `merge_log_records` sorts with
+    /// `b.0.cmp(&a.0)`: the merge then disagrees with the documented order.
+    #[test]
+    fn distributed_log_fetch_equals_local_bitwise(
+        corpus in prop::collection::vec(
+            (0u32..4, prop::collection::vec(arb_log_record(), 1..10)),
+            1..6,
+        ),
+        cap in 1usize..=4,
+    ) {
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(run_log_differential(corpus, cap));
+    }
+
+    /// The span sibling of `distributed_log_fetch_equals_local_bitwise`.
+    ///
+    /// Mutation proof: RED when `span_cmp` (mod.rs) compares `span_id` before
+    /// `trace_id`, or when `merge_spans` sorts with the comparator reversed.
+    #[test]
+    fn distributed_span_fetch_equals_local_bitwise(
+        corpus in prop::collection::vec(
+            (0u32..4, prop::collection::vec(arb_span_record(), 1..10)),
+            1..6,
+        ),
+        cap in 1usize..=4,
+    ) {
+        let rt = Runtime::new().expect("runtime");
+        rt.block_on(run_span_differential(corpus, cap));
+    }
+}
+
+/// Runs `fetch_logs` over `snapshot` through `fetcher` with `cap` slices.
+async fn distributed_logs(
+    fetcher: Arc<dyn SliceFetcher>,
+    snapshot: &Snapshot,
+    erasure: &[ErasurePredicate],
+    cap: usize,
+    accounting: &QueryAccounting,
+) -> Result<Option<Vec<LogRecord>>, QueryError> {
+    Distributed::new(fetcher, fan_out(cap))
+        .fetch_logs(
+            TENANT,
+            Signal::Logs,
+            snapshot,
+            &[],
+            erasure,
+            accounting,
+            &EngineConfig::default(),
+            test_deadline(),
+        )
+        .await
+}
+
+/// Runs `fetch_spans` over `snapshot` through `fetcher` with `cap` slices.
+async fn distributed_spans(
+    fetcher: Arc<dyn SliceFetcher>,
+    snapshot: &Snapshot,
+    erasure: &[ErasurePredicate],
+    cap: usize,
+    accounting: &QueryAccounting,
+) -> Result<Option<Vec<SpanRow>>, QueryError> {
+    Distributed::new(fetcher, fan_out(cap))
+        .fetch_spans(
+            TENANT,
+            Signal::Spans,
+            snapshot,
+            &[],
+            erasure,
+            accounting,
+            &EngineConfig::default(),
+            test_deadline(),
+        )
+        .await
+}
+
+fn crossed_now(crossed: &Arc<std::sync::Mutex<Vec<CrossedSlice>>>) -> Vec<CrossedSlice> {
+    let mut slices = crossed.lock().expect("crossed").clone();
+    slices.sort_by_key(|s| s.records);
+    slices
+}
+
+fn user_erasure(user: &str) -> Vec<ErasurePredicate> {
+    vec![ErasurePredicate::windowless(vec![(
+        "user".to_string(),
+        user.to_string(),
+    )])]
+}
+
+/// Three segments on three shards whose records interleave in time, with the
+/// `alpha` stream in every one of them. Read as one slice, the worker emits the
+/// records segment after segment, which is not the total order; read as three
+/// slices, the stream straddles all three. Either way the coordinator merge
+/// produces the documented order. The precondition assertion keeps the corpus
+/// honest: if the concatenation were already sorted, the merge would not be
+/// under test.
+///
+/// Mutation proof: RED when `merge_log_records` (mod.rs) sorts with
+/// `b.0.cmp(&a.0)`, when its `sort_by` is deleted (slice-order concatenation),
+/// or when `log_record_order_key` leads with `stream_id` instead of `ts_ns`.
+#[test]
+fn log_slice_over_several_segments_merges_into_the_total_order() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        for key in 1..=3u64 {
+            let records: Vec<LogRecord> = (0..3)
+                .map(|i| {
+                    let service = if i == 1 { "beta" } else { "alpha" };
+                    log_record(service, i * 3 + key as i64, "line", &[])
+                })
+                .collect();
+            segments.push(write_log_records(&store, key, key as u32 - 1, &records).await);
+        }
+        let (local, _) = local_log_records(&store, &segments, &[]).await;
+        let mut expected = local.clone();
+        documented_log_order(&mut expected);
+        assert_ne!(
+            log_wire(&local),
+            log_wire(&expected),
+            "precondition: segment order is not already the total order"
+        );
+
+        let (fetcher, server, _produced) =
+            spawn_slice_worker(Arc::clone(&store), segments.clone(), true, true).await;
+        let crossed = fetcher.crossed();
+        let fetcher = Arc::new(fetcher);
+        let one = fetcher
+            .fetch_logs(signal_request(&segments, Signal::Logs))
+            .await
+            .expect("one log slice");
+        assert_same_sequence(
+            "worker emission",
+            &log_wire(&one.records),
+            &log_wire(&local),
+        );
+        for (cap, per_slice) in [(1, vec![9]), (3, vec![3, 3, 3])] {
+            crossed.lock().expect("crossed").clear();
+            let got = distributed_logs(
+                Arc::clone(&fetcher) as Arc<dyn SliceFetcher>,
+                &snapshot_of(&segments),
+                &[],
+                cap,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("distributed log fetch")
+            .expect("served");
+            assert_same_sequence(
+                &format!("coordinator merge over {cap} slice(s)"),
+                &log_wire(&got),
+                &log_wire(&expected),
+            );
+            let slices: Vec<usize> = crossed_now(&crossed).iter().map(|s| s.records).collect();
+            assert_eq!(slices, per_slice, "records per slice at cap {cap}");
+        }
+        server.abort();
+    });
+}
+
+/// The span sibling of
+/// [`log_slice_over_several_segments_merges_into_the_total_order`]: three
+/// segments on three shards, each holding one span of each of three traces, so
+/// every trace straddles every slice when read as three.
+///
+/// Mutation proof: RED when `merge_spans` (mod.rs) reverses its comparator,
+/// when its `sort_by` is deleted, or when `span_cmp` compares `span_id` before
+/// `trace_id`.
+#[test]
+fn span_slice_over_several_segments_merges_into_the_total_order() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        for key in 1..=3u8 {
+            let records: Vec<SpanRecord> = (0..3u8)
+                .map(|trace| {
+                    let start = i64::from(2 - trace) * 10 + i64::from(key);
+                    span(
+                        trace,
+                        key,
+                        None,
+                        "op",
+                        start,
+                        start + 5,
+                        0,
+                        Some("svc"),
+                        None,
+                    )
+                })
+                .collect();
+            segments.push(
+                write_span_records(&store, u64::from(key), u32::from(key) - 1, &records).await,
+            );
+        }
+        let (local, _) = local_span_rows(&store, &segments, &[]).await;
+        let mut expected = local.clone();
+        documented_span_order(&mut expected);
+        assert_ne!(
+            span_wire(&local),
+            span_wire(&expected),
+            "precondition: segment order is not already the total order"
+        );
+
+        let (fetcher, server, _produced) =
+            spawn_slice_worker(Arc::clone(&store), segments.clone(), true, true).await;
+        let crossed = fetcher.crossed();
+        let fetcher = Arc::new(fetcher);
+        let one = fetcher
+            .fetch_spans(signal_request(&segments, Signal::Spans))
+            .await
+            .expect("one span slice");
+        assert_same_sequence(
+            "worker emission",
+            &span_wire(&one.spans),
+            &span_wire(&local),
+        );
+        for (cap, per_slice) in [(1, vec![9]), (3, vec![3, 3, 3])] {
+            crossed.lock().expect("crossed").clear();
+            let got = distributed_spans(
+                Arc::clone(&fetcher) as Arc<dyn SliceFetcher>,
+                &snapshot_of(&segments),
+                &[],
+                cap,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("distributed span fetch")
+            .expect("served");
+            assert_same_sequence(
+                &format!("coordinator merge over {cap} slice(s)"),
+                &span_wire(&got),
+                &span_wire(&expected),
+            );
+            let slices: Vec<usize> = crossed_now(&crossed).iter().map(|s| s.records).collect();
+            assert_eq!(slices, per_slice, "spans per slice at cap {cap}");
+        }
+        server.abort();
+    });
+}
+
+/// A slice whose every record is erased is served as an empty `Ok` slice, not
+/// read as a fallback or a failure: the query still gets the other slice's
+/// records, equal to the local read.
+///
+/// Mutation proof: RED when `run_slice_logs` (service.rs) builds its query
+/// without `.with_erasure(erasure)`: the shard-1 slice then carries its two
+/// records and the crossed-slice assertion fails.
+#[test]
+fn an_empty_log_slice_is_served_not_fallen_back() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let kept: Vec<LogRecord> = (0..3)
+            .map(|i| log_record("alpha", i, "kept", &[("user", "u1")]))
+            .collect();
+        let erased: Vec<LogRecord> = (0..2)
+            .map(|i| log_record("beta", i, "erased", &[("user", "u0")]))
+            .collect();
+        let segments = vec![
+            write_log_records(&store, 1, 0, &kept).await,
+            write_log_records(&store, 2, 1, &erased).await,
+        ];
+        let erasure = user_erasure("u0");
+        let (mut expected, _) = local_log_records(&store, &segments, &erasure).await;
+        documented_log_order(&mut expected);
+        assert_eq!(expected.len(), 3);
+
+        let (fetcher, server, _produced) =
+            spawn_slice_worker(Arc::clone(&store), segments.clone(), true, true).await;
+        let crossed = fetcher.crossed();
+        let got = distributed_logs(
+            Arc::new(fetcher),
+            &snapshot_of(&segments),
+            &erasure,
+            2,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("distributed log fetch")
+        .expect("an empty slice is served, never a local fallback");
+        server.abort();
+        assert_same_sequence("served records", &log_wire(&got), &log_wire(&expected));
+        assert_eq!(
+            crossed_now(&crossed),
+            vec![
+                CrossedSlice {
+                    status: pb::status::Code::Ok,
+                    records: 0,
+                    returned: 0,
+                },
+                CrossedSlice {
+                    status: pb::status::Code::Ok,
+                    records: 3,
+                    returned: 3,
+                },
+            ]
+        );
+    });
+}
+
+/// The span sibling of [`an_empty_log_slice_is_served_not_fallen_back`].
+///
+/// Mutation proof: RED when the erasure `retain` in `run_slice_spans`
+/// (service.rs) is deleted.
+#[test]
+fn an_empty_span_slice_is_served_not_fallen_back() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let kept: Vec<SpanRecord> = (0..3u8)
+            .map(|i| span(0, i + 1, None, "op", 1, 2, 0, None, Some("u1")))
+            .collect();
+        let erased: Vec<SpanRecord> = (0..2u8)
+            .map(|i| span(1, i + 1, None, "op", 1, 2, 0, None, Some("u0")))
+            .collect();
+        let segments = vec![
+            write_span_records(&store, 1, 0, &kept).await,
+            write_span_records(&store, 2, 1, &erased).await,
+        ];
+        let erasure = user_erasure("u0");
+        let (mut expected, _) = local_span_rows(&store, &segments, &erasure).await;
+        documented_span_order(&mut expected);
+        assert_eq!(expected.len(), 3);
+
+        let (fetcher, server, _produced) =
+            spawn_slice_worker(Arc::clone(&store), segments.clone(), true, true).await;
+        let crossed = fetcher.crossed();
+        let got = distributed_spans(
+            Arc::new(fetcher),
+            &snapshot_of(&segments),
+            &erasure,
+            2,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("distributed span fetch")
+        .expect("an empty slice is served, never a local fallback");
+        server.abort();
+        assert_same_sequence("served spans", &span_wire(&got), &span_wire(&expected));
+        assert_eq!(
+            crossed_now(&crossed),
+            vec![
+                CrossedSlice {
+                    status: pb::status::Code::Ok,
+                    records: 0,
+                    returned: 0,
+                },
+                CrossedSlice {
+                    status: pb::status::Code::Ok,
+                    records: 3,
+                    returned: 3,
+                },
+            ]
+        );
+    });
+}
+
+/// The erasure fixture: two shards, three of seven records carrying the
+/// erased subject `user=u0`.
+fn erasure_log_corpus() -> [Vec<LogRecord>; 2] {
+    [
+        vec![
+            log_record("alpha", 0, "a", &[("user", "u0")]),
+            log_record("alpha", 1, "b", &[("user", "u1")]),
+            log_record("alpha", 2, "c", &[]),
+            log_record("alpha", 3, "d", &[("user", "u0")]),
+        ],
+        vec![
+            log_record("beta", 0, "e", &[("user", "u1")]),
+            log_record("beta", 1, "f", &[("user", "u0")]),
+            log_record("beta", 2, "g", &[("user", "u2")]),
+        ],
+    ]
+}
+
+/// The worker applies the request's erasure predicates before it streams, so
+/// an erased record never crosses the boundary: of seven records, exactly the
+/// four survivors are decoded, and the transport pulled exactly those four
+/// record frames plus one summary per slice. The baseline run without erasure
+/// proves the fixture's erased records really are served otherwise.
+///
+/// Mutation proof: RED when `run_slice_logs` (service.rs) builds its query
+/// without `.with_erasure(erasure)`: seven records cross and both counts fail.
+#[test]
+fn worker_erases_log_records_before_the_wire() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let [first, second] = erasure_log_corpus();
+        let segments = vec![
+            write_log_records(&store, 1, 0, &first).await,
+            write_log_records(&store, 2, 1, &second).await,
+        ];
+        let snapshot = snapshot_of(&segments);
+
+        let run = |erasure: Vec<ErasurePredicate>| {
+            let store = Arc::clone(&store);
+            let segments = segments.clone();
+            let snapshot = snapshot.clone();
+            async move {
+                let (fetcher, server, produced) =
+                    spawn_slice_worker(store, segments, true, true).await;
+                let crossed = fetcher.crossed();
+                let got = distributed_logs(
+                    Arc::new(fetcher),
+                    &snapshot,
+                    &erasure,
+                    2,
+                    &QueryAccounting::new(),
+                )
+                .await
+                .expect("distributed log fetch")
+                .expect("served");
+                server.abort();
+                let crossed: usize = crossed_now(&crossed).iter().map(|s| s.records).sum();
+                (
+                    got,
+                    crossed,
+                    produced.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            }
+        };
+
+        let (all, crossed, produced) = run(Vec::new()).await;
+        assert_eq!((all.len(), crossed, produced), (7, 7, 7 + 2));
+
+        let erasure = user_erasure("u0");
+        let (mut expected, _) = local_log_records(&store, &segments, &erasure).await;
+        documented_log_order(&mut expected);
+        let (got, crossed, produced) = run(erasure).await;
+        assert_same_sequence("erased fetch", &log_wire(&got), &log_wire(&expected));
+        assert!(
+            got.iter().all(|r| !r
+                .attrs
+                .contains(&("user".to_string(), AttrValue::Str("u0".to_string())))),
+            "no erased record is in the result"
+        );
+        assert_eq!(crossed, 4, "only the four survivors were decoded");
+        assert_eq!(
+            produced,
+            4 + 2,
+            "the transport carried four record frames and two summaries"
+        );
+    });
+}
+
+/// The span sibling of [`worker_erases_log_records_before_the_wire`].
+///
+/// Mutation proof: RED when the erasure `retain` in `run_slice_spans`
+/// (service.rs) is deleted.
+#[test]
+fn worker_erases_spans_before_the_wire() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let store = Arc::new(MemoryStore::new());
+        let first = vec![
+            span(0, 1, None, "op", 0, 1, 0, None, Some("u0")),
+            span(0, 2, None, "op", 1, 2, 0, None, Some("u1")),
+            span(0, 3, None, "op", 2, 3, 0, Some("svc"), None),
+            span(0, 4, None, "op", 3, 4, 0, None, Some("u0")),
+        ];
+        let second = vec![
+            span(1, 1, None, "op", 0, 1, 0, None, Some("u1")),
+            span(1, 2, None, "op", 1, 2, 0, None, Some("u0")),
+            span(1, 3, None, "op", 2, 3, 0, None, Some("u2")),
+        ];
+        let segments = vec![
+            write_span_records(&store, 1, 0, &first).await,
+            write_span_records(&store, 2, 1, &second).await,
+        ];
+        let snapshot = snapshot_of(&segments);
+
+        let run = |erasure: Vec<ErasurePredicate>| {
+            let store = Arc::clone(&store);
+            let segments = segments.clone();
+            let snapshot = snapshot.clone();
+            async move {
+                let (fetcher, server, produced) =
+                    spawn_slice_worker(store, segments, true, true).await;
+                let crossed = fetcher.crossed();
+                let got = distributed_spans(
+                    Arc::new(fetcher),
+                    &snapshot,
+                    &erasure,
+                    2,
+                    &QueryAccounting::new(),
+                )
+                .await
+                .expect("distributed span fetch")
+                .expect("served");
+                server.abort();
+                let crossed: usize = crossed_now(&crossed).iter().map(|s| s.records).sum();
+                (
+                    got,
+                    crossed,
+                    produced.load(std::sync::atomic::Ordering::SeqCst),
+                )
+            }
+        };
+
+        let (all, crossed, produced) = run(Vec::new()).await;
+        assert_eq!((all.len(), crossed, produced), (7, 7, 7 + 2));
+
+        let erasure = user_erasure("u0");
+        let (mut expected, _) = local_span_rows(&store, &segments, &erasure).await;
+        documented_span_order(&mut expected);
+        let (got, crossed, produced) = run(erasure).await;
+        assert_same_sequence("erased fetch", &span_wire(&got), &span_wire(&expected));
+        assert!(
+            got.iter().all(|r| !r
+                .record
+                .attrs
+                .contains(&("user".to_string(), "u0".to_string()))),
+            "no erased span is in the result"
+        );
+        assert_eq!(crossed, 4, "only the four survivors were decoded");
+        assert_eq!(produced, 4 + 2);
+    });
+}
+
+/// Routes each slice to a worker by the shard of its first pinned segment and
+/// makes `first_shard`'s slice complete before any other, so a test fixes the
+/// order in which the coordinator sees two slice outcomes. Records each slice's
+/// status in completion order.
+struct OrderedRouter {
+    workers: Vec<(u32, LoopbackSliceFetcher)>,
+    first_shard: u32,
+    first_done: tokio::sync::Notify,
+    arrivals: std::sync::Mutex<Vec<pb::status::Code>>,
+}
+
+impl OrderedRouter {
+    fn route(&self, request: &pb::FetchRequest) -> (u32, &LoopbackSliceFetcher) {
+        let shard = match &request.scope {
+            Some(pb::fetch_request::Scope::Pinned(pinned)) => pinned.segments[0].shard,
+            other => panic!("a fan-out slice is pinned, got {other:?}"),
+        };
+        let worker = self
+            .workers
+            .iter()
+            .find(|(s, _)| *s == shard)
+            .map(|(_, w)| w)
+            .expect("a worker for every shard");
+        (shard, worker)
+    }
+
+    async fn wait_turn(&self, shard: u32) {
+        if shard != self.first_shard {
+            self.first_done.notified().await;
+        }
+    }
+
+    fn arrived(&self, shard: u32, status: pb::status::Code) {
+        self.arrivals.lock().expect("arrivals").push(status);
+        if shard == self.first_shard {
+            self.first_done.notify_one();
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SliceFetcher for OrderedRouter {
+    async fn fetch(&self, _request: pb::FetchRequest) -> Result<SliceResponse, DistribError> {
+        Err(DistribError::Transport(
+            "metrics are not routed here".to_string(),
+        ))
+    }
+
+    async fn fetch_logs(
+        &self,
+        request: pb::FetchRequest,
+    ) -> Result<SliceLogResponse, DistribError> {
+        let (shard, worker) = self.route(&request);
+        self.wait_turn(shard).await;
+        let response = worker.fetch_logs(request).await?;
+        self.arrived(shard, response.status);
+        Ok(response)
+    }
+
+    async fn fetch_spans(
+        &self,
+        request: pb::FetchRequest,
+    ) -> Result<SliceSpanResponse, DistribError> {
+        let (shard, worker) = self.route(&request);
+        self.wait_turn(shard).await;
+        let response = worker.fetch_spans(request).await?;
+        self.arrived(shard, response.status);
+        Ok(response)
+    }
+}
+
+/// One fan-out of `signal` over two slices: shard 0 goes to a worker with no
+/// log or span fetch path (`Unsupported`), shard 1 to a worker whose resolver
+/// knows no segment (`SnapshotInvalidated`), with `first_shard`'s slice landing
+/// first. Returns whether the fetch was served, fell back, or failed, plus the
+/// slice statuses in the order the coordinator saw them.
+async fn precedence_outcome(
+    signal: Signal,
+    first_shard: u32,
+) -> (Result<Option<usize>, QueryError>, Vec<pb::status::Code>) {
+    let store = Arc::new(MemoryStore::new());
+    let segments = match signal {
+        Signal::Logs => vec![
+            write_log_records(&store, 1, 0, &[log_record("alpha", 1, "x", &[])]).await,
+            write_log_records(&store, 2, 1, &[log_record("beta", 2, "y", &[])]).await,
+        ],
+        _ => vec![
+            write_span_records(&store, 1, 0, &[span(0, 1, None, "op", 1, 2, 0, None, None)]).await,
+            write_span_records(&store, 2, 1, &[span(1, 1, None, "op", 1, 2, 0, None, None)]).await,
+        ],
+    };
+    let (unsupported, unsupported_server, _) =
+        spawn_slice_worker(Arc::clone(&store), segments.clone(), false, false).await;
+    let (invalidated, invalidated_server, _) =
+        spawn_slice_worker(Arc::clone(&store), Vec::new(), true, true).await;
+    let router = Arc::new(OrderedRouter {
+        workers: vec![(0, unsupported), (1, invalidated)],
+        first_shard,
+        first_done: tokio::sync::Notify::new(),
+        arrivals: std::sync::Mutex::new(Vec::new()),
+    });
+    let snapshot = snapshot_of(&segments);
+    let accounting = QueryAccounting::new();
+    let outcome = match signal {
+        Signal::Logs => distributed_logs(router.clone(), &snapshot, &[], 2, &accounting)
+            .await
+            .map(|r| r.map(|v| v.len())),
+        _ => distributed_spans(router.clone(), &snapshot, &[], 2, &accounting)
+            .await
+            .map(|r| r.map(|v| v.len())),
+    };
+    unsupported_server.abort();
+    invalidated_server.abort();
+    let arrivals = router.arrivals.lock().expect("arrivals").clone();
+    (outcome, arrivals)
+}
+
+/// An invalidated slice outranks an `Unsupported` one whichever lands first:
+/// the query re-resolves (`Store { NotFound }`) rather than falling back to a
+/// local read of a snapshot that is already stale. Both orders are driven over
+/// real workers, and the recorded arrivals prove each order really happened.
+///
+/// Mutation proof: RED when the `if invalidated` and `if unsupported` blocks
+/// after the collect loop of `Distributed::fetch_logs` or `fetch_spans`
+/// (mod.rs) swap places, and when the `Unsupported` arm of `fetch_logs` returns
+/// `Ok(None)` at once instead of setting its flag: the fetch then falls back in
+/// both orders.
+#[test]
+fn an_invalidated_record_slice_outranks_an_unsupported_one_in_either_order() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        use pb::status::Code::{SnapshotInvalidated, Unsupported};
+        let mut wrong = Vec::new();
+        for signal in [Signal::Logs, Signal::Spans] {
+            for (first_shard, order) in [
+                (0, vec![Unsupported, SnapshotInvalidated]),
+                (1, vec![SnapshotInvalidated, Unsupported]),
+            ] {
+                let (outcome, arrivals) = precedence_outcome(signal, first_shard).await;
+                // A coordinator may stop reading after the first slice, so only
+                // the first arrival is the precondition; the outcome is the claim.
+                assert_eq!(
+                    arrivals.first(),
+                    order.first(),
+                    "{signal:?}: the first slice landed as arranged"
+                );
+                if arrivals != order {
+                    wrong.push(format!("{signal:?} {order:?}: slices landed {arrivals:?}"));
+                }
+                if !matches!(
+                    outcome,
+                    Err(QueryError::Fetch(crate::fetcher::FetchError::Store {
+                        source: ravel_object_store::StoreError::NotFound,
+                        ..
+                    }))
+                ) {
+                    wrong.push(format!("{signal:?} {order:?}: {outcome:?}"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "an invalidated slice must re-resolve the query:\n{}",
+            wrong.join("\n")
+        );
+    });
+}
+
+/// Record frames per flood slice, and the size of each record's payload. Each
+/// frame is about 16 KiB on the wire, so the HTTP/2 windows hold a bounded
+/// number of them ahead of the reader.
+const FLOOD_RECORDS: usize = 1024;
+const FLOOD_PAYLOAD: usize = 16 * 1024;
+/// How far past the cap the worker may produce before flow control stops it:
+/// the client's 2 MiB stream window plus the server's send buffer is about 150
+/// of these frames. A constant, far below `FLOOD_RECORDS`.
+const FLOOD_MAX_OVERRUN: usize = 384;
+
+/// One segment of [`FLOOD_RECORDS`] records of `signal`, and each record
+/// frame's encoded length in the order the worker emits them.
+async fn flood_segment(store: &Arc<MemoryStore>, signal: Signal) -> (SegmentRef, Vec<u64>) {
+    use prost::Message;
+    let payload = "x".repeat(FLOOD_PAYLOAD);
+    if signal == Signal::Logs {
+        let records: Vec<LogRecord> = (0..FLOOD_RECORDS as i64)
+            .map(|i| log_record("flood", i, &format!("{i:06}{payload}"), &[]))
+            .collect();
+        let seg = write_log_records(store, 1, 0, &records).await;
+        let (local, _) = local_log_records(store, std::slice::from_ref(&seg), &[]).await;
+        let lens = local
+            .iter()
+            .map(|r| {
+                pb::FetchResponse {
+                    frame: Some(pb::fetch_response::Frame::LogRecord(
+                        crate::distrib::codec::encode_log_record(r),
+                    )),
+                }
+                .encoded_len() as u64
+            })
+            .collect();
+        (seg, lens)
+    } else {
+        let records: Vec<SpanRecord> = (0..FLOOD_RECORDS as i64)
+            .map(|i| SpanRecord {
+                trace_id: (i as u128).to_be_bytes(),
+                name: format!("{i:06}{payload}"),
+                ..span(0, 1, None, "", i, i + 1, 0, None, None)
+            })
+            .collect();
+        let seg = write_span_records(store, 1, 0, &records).await;
+        let (local, _) = local_span_rows(store, std::slice::from_ref(&seg), &[]).await;
+        let lens = local
+            .iter()
+            .map(|r| {
+                pb::FetchResponse {
+                    frame: Some(pb::fetch_response::Frame::Span(
+                        crate::distrib::codec::encode_span_frame(r),
+                    )),
+                }
+                .encoded_len() as u64
+            })
+            .collect();
+        (seg, lens)
+    }
+}
+
+/// Fans `signal` out over `seg` through a loopback fetcher carrying the given
+/// caps, expects a refusal, and returns it with the number of frames the
+/// worker produced once the refused stream has settled.
+async fn refused_at_cap(
+    store: &Arc<MemoryStore>,
+    seg: &SegmentRef,
+    signal: Signal,
+    max_frames: Option<usize>,
+    max_bytes: Option<u64>,
+) -> (QueryError, usize) {
+    let (mut fetcher, server, produced) =
+        spawn_slice_worker(Arc::clone(store), vec![seg.clone()], true, true).await;
+    if let Some(max_frames) = max_frames {
+        fetcher = fetcher.with_max_frames(max_frames);
+    }
+    if let Some(max_bytes) = max_bytes {
+        fetcher = fetcher.with_max_bytes(max_bytes);
+    }
+    let snapshot = snapshot_of(std::slice::from_ref(seg));
+    let accounting = QueryAccounting::new();
+    let err = match signal {
+        Signal::Logs => distributed_logs(Arc::new(fetcher), &snapshot, &[], 1, &accounting)
+            .await
+            .map(|_| ())
+            .expect_err("a slice past the cap is refused"),
+        _ => distributed_spans(Arc::new(fetcher), &snapshot, &[], 1, &accounting)
+            .await
+            .map(|_| ())
+            .expect_err("a slice past the cap is refused"),
+    };
+    // Let the reset reach the worker, so the count below is where it stopped,
+    // not a snapshot taken while it was still filling the window.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let produced = produced.load(std::sync::atomic::Ordering::SeqCst);
+    server.abort();
+    (err, produced)
+}
+
+/// The frame cap refuses a log or span slice on the first frame past it, naming
+/// the exact counts in the budget-class error the coordinator maps it to, and
+/// the reader stops there: the worker produced a bounded overrun past the cap,
+/// not the whole slice.
+///
+/// Mutation proof: RED when `SliceCaps::admit` trips at `max_frames + 1`
+/// instead of `max_frames` (the error names 66 frames, not 65), and when the
+/// fetcher's read loop drains the stream before pushing frames (the worker
+/// produces all 1025 frames).
+#[test]
+fn record_slice_frame_cap_refuses_at_the_cap_and_the_worker_stops() {
+    const CAP: usize = 64;
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        for signal in [Signal::Logs, Signal::Spans] {
+            let store = Arc::new(MemoryStore::new());
+            let (seg, _lens) = flood_segment(&store, signal).await;
+            let (err, produced) = refused_at_cap(&store, &seg, signal, Some(CAP), None).await;
+            match err {
+                QueryError::TooManySliceFrames { frames, max } => assert_eq!(
+                    (frames, max),
+                    (CAP + 1, CAP),
+                    "{signal:?}: the refusal trips on the first frame past the cap"
+                ),
+                other => panic!("{signal:?}: expected a frame-cap refusal, got {other:?}"),
+            }
+            assert!(
+                produced > CAP && produced <= CAP + 1 + FLOOD_MAX_OVERRUN,
+                "{signal:?}: the worker stopped near the cap, produced {produced}"
+            );
+            assert!(
+                produced < FLOOD_RECORDS + 1,
+                "{signal:?}: the worker did not drain the slice, produced {produced}"
+            );
+        }
+    });
+}
+
+/// The byte cap refuses on the first frame whose bytes cross it, naming the
+/// exact byte count. The cap sits one byte below the eighth frame's running
+/// total, so the eighth frame is the first one past it by exactly one byte, and
+/// the reader stops there.
+///
+/// Mutation proof: RED when `SliceCaps::admit` tests `bytes > max_bytes + 1`
+/// (the eighth frame no longer trips and the error names nine frames' bytes),
+/// and when the fetcher's read loop drains the stream before pushing frames.
+#[test]
+fn record_slice_byte_cap_refuses_at_the_cap_and_the_worker_stops() {
+    const TRIP_FRAME: usize = 8;
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        for signal in [Signal::Logs, Signal::Spans] {
+            let store = Arc::new(MemoryStore::new());
+            let (seg, lens) = flood_segment(&store, signal).await;
+            let crossing: u64 = lens[..TRIP_FRAME].iter().sum();
+            let cap = crossing - 1;
+            let (err, produced) = refused_at_cap(&store, &seg, signal, None, Some(cap)).await;
+            match err {
+                QueryError::TooManySliceBytes { bytes, max } => assert_eq!(
+                    (bytes, max),
+                    (crossing, cap),
+                    "{signal:?}: the refusal names the bytes through the first frame past the cap"
+                ),
+                other => panic!("{signal:?}: expected a byte-cap refusal, got {other:?}"),
+            }
+            assert!(
+                (TRIP_FRAME..=TRIP_FRAME + FLOOD_MAX_OVERRUN).contains(&produced),
+                "{signal:?}: the worker stopped near the cap, produced {produced}"
+            );
+            assert!(
+                produced < FLOOD_RECORDS + 1,
+                "{signal:?}: the worker did not drain the slice, produced {produced}"
+            );
+        }
+    });
+}
+
+/// A store whose GETs of one key never complete. Reaching that GET is the
+/// moment the test's query deadline passes, so a slice is stopped exactly
+/// after its earlier segments were paid for and before the stalled one is.
+struct StallStore {
+    inner: Arc<MemoryStore>,
+    stall_key: String,
+    deadline: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl ObjectStoreBackend for StallStore {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+
+    async fn get(
+        &self,
+        key: &str,
+        range: ravel_object_store::GetRange,
+    ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+        if key == self.stall_key {
+            self.deadline.notify_one();
+            std::future::pending::<()>().await;
+        }
+        self.inner.get(key, range).await
+    }
+
+    async fn put_multipart<'a>(
+        &'a self,
+        key: &str,
+    ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+    {
+        self.inner.put_multipart(key).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+        self.inner.head(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &str,
+        page: Option<ravel_object_store::PageToken>,
+    ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+        self.inner.list(prefix, page).await
+    }
+
+    async fn list_delimited(
+        &self,
+        prefix: &str,
+    ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+        self.inner.list_delimited(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+        self.inner.delete(key).await
+    }
+
+    fn capabilities(&self) -> ravel_object_store::Capabilities {
+        self.inner.capabilities()
+    }
+}
+
+/// A worker that stops a slice when its query's deadline passes, in the shape
+/// of the server's fragment service (`run_until_deadline` in
+/// `services/ravel-server/src/distrib.rs`): the run is dropped and the slice
+/// ends in-band with [`expired_slice_summary`] carrying what the run had spent.
+/// The deadline is `deadline` firing.
+///
+/// [`expired_slice_summary`]: crate::distrib::service::expired_slice_summary
+struct DeadlineWorker {
+    store: Arc<dyn ObjectStoreBackend>,
+    segments: Vec<SegmentRef>,
+    deadline: Arc<tokio::sync::Notify>,
+}
+
+#[tonic::async_trait]
+impl SeriesFetch for DeadlineWorker {
+    type FetchStream = WorkerStream;
+
+    async fn fetch(
+        &self,
+        request: tonic::Request<pb::FetchRequest>,
+    ) -> Result<tonic::Response<Self::FetchStream>, tonic::Status> {
+        let spent = QueryAccounting::new();
+        let service = SeriesFetchService::new(
+            SegmentFetcher::new(Arc::clone(&self.store)),
+            Arc::new(SnapshotSegmentResolver::new(self.segments.clone())),
+        )
+        .with_log_fetcher(LogSegmentFetcher::new(Arc::clone(&self.store)))
+        .with_span_fetcher(SpanSegmentFetcher::new(Arc::clone(&self.store)))
+        .with_slice_accounting(spent.clone());
+        let stream: WorkerStream = tokio::select! {
+            biased;
+            () = self.deadline.notified() => {
+                let summary = crate::distrib::service::expired_slice_summary(
+                    &spent.snapshot(),
+                    "slice stopped: the query's deadline passed while it ran".to_string(),
+                );
+                Box::pin(futures::stream::iter([Ok(summary)]))
+            }
+            served = SeriesFetch::fetch(&service, request) => served?.into_inner(),
+        };
+        Ok(tonic::Response::new(stream))
+    }
+}
+
+/// A log or span slice whose deadline passes after its first segment was
+/// fetched and while its second is in flight ends in the expired `TIMEOUT`
+/// summary, and the coordinator fails the query with `DeadlineExceeded` naming
+/// the request's own deadline, after folding exactly what the first segment
+/// cost. No record crosses.
+///
+/// Mutation proof: RED when the `Timeout` arm of `Distributed::fetch_logs` or
+/// `fetch_spans` (mod.rs) is deleted, sending the slice to the catch-all
+/// `Distrib` error, and when `expired_slice_summary` (service.rs) reports any
+/// status but `Timeout`.
+#[test]
+fn a_record_slice_stopped_at_its_deadline_fails_the_query_with_its_spend() {
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        for signal in [Signal::Logs, Signal::Spans] {
+            let store = Arc::new(MemoryStore::new());
+            let (first, second) = if signal == Signal::Logs {
+                let records: Vec<LogRecord> = (0..4)
+                    .map(|i| log_record("alpha", i, "line", &[]))
+                    .collect();
+                (
+                    write_log_records(&store, 1, 0, &records).await,
+                    write_log_records(&store, 2, 0, &records).await,
+                )
+            } else {
+                let records: Vec<SpanRecord> = (0..4u8)
+                    .map(|i| span(0, i + 1, None, "op", i64::from(i), 9, 0, None, None))
+                    .collect();
+                (
+                    write_span_records(&store, 1, 0, &records).await,
+                    write_span_records(&store, 2, 0, &records).await,
+                )
+            };
+            let oracle = if signal == Signal::Logs {
+                local_log_records(&store, std::slice::from_ref(&first), &[])
+                    .await
+                    .1
+            } else {
+                local_span_rows(&store, std::slice::from_ref(&first), &[])
+                    .await
+                    .1
+            };
+            let oracle = wire_visible(oracle);
+            assert!(oracle.total_s3_bytes() > 0, "the first segment costs bytes");
+
+            let deadline = Arc::new(tokio::sync::Notify::new());
+            let stalling: Arc<dyn ObjectStoreBackend> = Arc::new(StallStore {
+                inner: Arc::clone(&store),
+                stall_key: second.data_object_key.clone(),
+                deadline: Arc::clone(&deadline),
+            });
+            let segments = vec![first, second];
+            let (channel, server) = serve_loopback(DeadlineWorker {
+                store: stalling,
+                segments: segments.clone(),
+                deadline,
+            })
+            .await;
+            let fetcher = LoopbackSliceFetcher::new(channel);
+            let crossed = fetcher.crossed();
+            let snapshot = snapshot_of(&segments);
+            let accounting = QueryAccounting::new();
+            let err = match signal {
+                Signal::Logs => distributed_logs(Arc::new(fetcher), &snapshot, &[], 1, &accounting)
+                    .await
+                    .map(|_| ()),
+                _ => distributed_spans(Arc::new(fetcher), &snapshot, &[], 1, &accounting)
+                    .await
+                    .map(|_| ()),
+            }
+            .expect_err("a slice stopped at its deadline fails the query");
+            server.abort();
+
+            assert!(
+                matches!(
+                    err,
+                    QueryError::DeadlineExceeded { deadline } if deadline == test_deadline().request
+                ),
+                "{signal:?}: got {err:?}"
+            );
+            assert_eq!(
+                crossed_now(&crossed),
+                vec![CrossedSlice {
+                    status: pb::status::Code::Timeout,
+                    records: 0,
+                    returned: 0,
+                }],
+                "{signal:?}: the expired summary ended the slice and no record crossed"
+            );
+            assert_eq!(
+                accounting.snapshot(),
+                oracle,
+                "{signal:?}: the query reports exactly the first segment's cost"
+            );
+        }
+    });
+}
+
+/// The record decoders refuse a frame of any other signal, an empty frame and a
+/// second summary with the typed errors the metrics decoder uses, and a slice
+/// without a summary does not finish.
+///
+/// Mutation proof: RED when the log decoder's `Series` arm accepts the frame
+/// instead of refusing it, or when `accept_summary` lets a second summary
+/// replace the first.
+#[test]
+fn record_decoders_refuse_foreign_frames_and_need_one_summary() {
+    use pb::fetch_response::Frame;
+    let frame = |f: Frame| pb::FetchResponse { frame: Some(f) };
+    let summary = || frame(Frame::Summary(pb::Summary::default()));
+
+    let refusal = |err: DistribError| match err {
+        DistribError::FrameSignalUnsupported(kind) => kind,
+        other => panic!("expected a typed signal refusal, got {other:?}"),
+    };
+    let mut logs = LogSliceStreamDecoder::new();
+    assert_eq!(
+        refusal(
+            logs.push(frame(Frame::Series(pb::SeriesFrame::default())))
+                .expect_err("series")
+        ),
+        "series"
+    );
+    assert_eq!(
+        refusal(
+            logs.push(frame(Frame::Span(pb::SpanFrame::default())))
+                .expect_err("span")
+        ),
+        "span"
+    );
+    let mut spans = SpanSliceStreamDecoder::new();
+    assert_eq!(
+        refusal(
+            spans
+                .push(frame(Frame::LogRecord(pb::LogRecordFrame::default())))
+                .expect_err("log record")
+        ),
+        "log-record"
+    );
+    assert_eq!(
+        refusal(
+            spans
+                .push(frame(Frame::Series(pb::SeriesFrame::default())))
+                .expect_err("series")
+        ),
+        "series"
+    );
+    assert!(matches!(
+        spans.push(pb::FetchResponse { frame: None }),
+        Err(DistribError::EmptyFrame)
+    ));
+
+    assert!(matches!(
+        LogSliceStreamDecoder::new().finish(),
+        Err(DistribError::NoSummary)
+    ));
+    assert!(matches!(
+        SpanSliceStreamDecoder::new().finish(),
+        Err(DistribError::NoSummary)
+    ));
+    let mut logs = LogSliceStreamDecoder::new();
+    logs.push(summary()).expect("one summary");
+    assert!(logs.finished(), "the summary ends the slice");
+    assert!(matches!(
+        logs.push(summary()),
+        Err(DistribError::MultipleSummaries)
+    ));
 }
