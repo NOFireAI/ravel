@@ -151,7 +151,7 @@ is enough.
 Expected on the reference box after A1 to A3 (pre-registered on #1248
 before A3's run): the one-column statement under 2 s cold at 32 partitions
 (see the three-request-cost amendment below for the read shape the five-request-cost
-break-even gave that statement; it records no wall time),
+break-even gave that statement and the 1.97 s it measured at three),
 the stock cold suite under 200 s over the same 42 statements the 241.4 s
 baseline covers, with q33 reported beside it under its own band (B3), and
 the tuned arm re-registered for 35 MB objects with partitions at most the
@@ -315,12 +315,17 @@ one-column projection measured 4.19 GETs per object under `latency-first`
 (918 over 219 objects) and 4.40 under `cost-based` for the 107 objects that
 read ranged, moving 0.89 to 0.95 MB per object. With those figures the
 inequality puts the break-even between 3.19 and 3.40 request costs (20.1 to
-21.4 MB). The constant is a whole number of requests, and k = 4
-(`COST_BASED_RANGED_REQUESTS`, three request costs) was chosen over k = 5 by
-its outcome on the reference tenant's sizes, not derived: at four request
-costs about 51 objects still read whole and the statement moves 14 to 16
-percent of the corpus, and at two request costs only 3 to 5 more objects
-flip than at three.
+21.4 MB). The constant is a whole number of request costs, and three
+(`COST_BASED_RANGED_REQUESTS` = 4) was chosen over four and over two by its
+outcome on the reference tenant's sizes, not derived. At four request costs
+about 51 objects would still read whole and the statement would move 14 to
+16 percent of the corpus (estimated from the size histogram). At two, only 3
+to 5 more objects would flip than at three (estimated the same way). At
+three, measured on the reference box before this amendment merged: the
+one-column statement issues 877 scan GETs and moves 343,883,059 wire bytes,
+4.4 percent of the corpus, in 1.97 s cold, and the stock cold suite takes
+130.3 s over the 42-statement basis against 149.5 and 155.0 s for two runs
+of the unamended build in the same session (issue #2555).
 
 **What five request costs produced.** At 31,500,000 bytes on the reference
 profile, the 112 of those 219 objects at or below about 32.4 MB (the size at
@@ -357,8 +362,13 @@ does and is routed ranged; if its pages then cover 75% of the object the
 coverage crossover reads it whole after the probe and directory reads, and
 below that it pays the ranged requests for a smaller saving than estimated.
 Lowering the break-even from five request costs to three widens the band of
-object sizes where that misroute can happen. This amendment records no wall
-time for the one-column statement A3 expected under 2 s.
+object sizes where that misroute can happen. On the reference box the two
+wide statements of the suite moved inside their noise (4.83 and 6.02 s cold
+against 4.86 and 6.36 s), and three selective statements were 0.1 to 0.45 s
+slower cold in the one sweep taken, not attributed. The one-column
+statement A3 expected under 2 s measured 1.97 s cold in a probe and 2.05 s
+in the sweep: at the band's edge, not inside it with margin, because with
+877 requests over 32 partitions it is bound by requests, not bytes.
 
 Pinned by `the_cost_based_break_even_is_three_request_costs` (ravel-query
 config), `a_3mb_l0_object_reads_whole_on_the_reference_profile`,
