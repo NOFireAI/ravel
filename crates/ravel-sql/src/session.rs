@@ -758,8 +758,11 @@ pub fn build_session(
     // crate leaves off. The planner builds its `date_part` call from the UDF
     // value, not by name, so the scalar allowlist below does not gate this
     // path. The planner set is pinned by
-    // `registered_expr_planners_are_pinned_for_every_table`, and what each
-    // planner admits, syntax by syntax, by `tests/expr_planner_surface.rs`.
+    // `registered_expr_planners_are_pinned_for_every_table`, and whether each
+    // syntax plans by `tests/expr_planner_surface.rs`. Neither sees which
+    // function a planner rewrites to: re-read every registered planner on
+    // every DataFusion upgrade, since a new rewrite target under an unchanged
+    // name and syntax would not fail closed.
     ctx.register_expr_planner(Arc::new(DatetimeFunctionPlanner))?;
 
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration
@@ -1539,9 +1542,11 @@ mod tests {
     /// The expression planners every session carries, in registration order
     /// (issue #2476). A planner builds its rewrite target from the function
     /// value, not by name, so the scalar allowlist above never sees what it
-    /// rewrites to: this pin is the drift guard for that path. A planner
-    /// appearing, disappearing, or moving fails here; what each one admits is
-    /// pinned per syntax by `tests/expr_planner_surface.rs`.
+    /// rewrites to: this pin is the drift guard for the planner set. A planner
+    /// appearing, disappearing, or moving fails here; whether each syntax
+    /// plans is pinned by `tests/expr_planner_surface.rs`. Neither guard sees
+    /// which function a planner rewrites to, so a changed rewrite target
+    /// under an unchanged planner name and syntax passes both.
     ///
     /// Each name is the planner's `Debug` output cut at the first character
     /// that cannot be part of a Rust identifier. Every planner below derives
