@@ -296,6 +296,12 @@ the whole object with `LogSegError::InconsistentStreamAttrs` rather than
 silently keeping one of them. That is writer input validation, not object
 corruption.
 
+The writer also decodes every STREAM_DIR blob with the reader's decoder
+(`ravel_logseg::record::decode_stream_attrs`, through `stream_attr_pairs`)
+and refuses the object with that decoder's `LogSegError::Corrupted` on any
+blob it rejects, a scope name or version that is not UTF-8 included, so a
+blob the writer stores always decodes.
+
 ## FIELD_DIR (uncompressed form)
 
 ```

@@ -631,6 +631,18 @@ mod tests {
         assert_both_refuse(&blob);
     }
 
+    /// The nesting cap counts every map and list level, the same in both
+    /// functions: 20 nested maps is past `MAX_ATTR_DEPTH` for the decoder.
+    #[test]
+    fn stream_attr_pairs_refuses_nesting_past_the_depth_cap() {
+        let mut nested = AttrValue::I64(1);
+        for _ in 0..20 {
+            nested = AttrValue::Map(vec![("m".into(), nested)]);
+        }
+        let blob = stream_attrs_bytes(&[("deep".into(), nested)], "sc", "1", &[]);
+        assert_both_refuse(&blob);
+    }
+
     fn arb_value() -> impl Strategy<Value = AttrValue> {
         let leaf = prop_oneof![
             ".*".prop_map(AttrValue::Str),
@@ -677,5 +689,82 @@ mod tests {
                 canonical_attr_bytes(&scope_attrs)
             );
         }
+
+        /// Every blob the encoder produces decodes under both functions, and
+        /// `stream_attr_pairs` yields the resource entries then the scope
+        /// attributes, in decoded order.
+        #[test]
+        fn encoded_stream_attrs_decode_under_both_functions(
+            resource in arb_attrs(),
+            scope_name in ".{0,8}",
+            scope_version in ".{0,8}",
+            scope_attrs in arb_attrs(),
+        ) {
+            let blob = stream_attrs_bytes(&resource, &scope_name, &scope_version, &scope_attrs);
+            let decoded = decode_stream_attrs(&blob).expect("decode_stream_attrs");
+            let pairs = crate::reader::stream_attr_pairs(&blob).expect("stream_attr_pairs");
+            let mut want = decoded.resource;
+            want.extend(decoded.scope_attrs);
+            prop_assert_eq!(canonical_attr_bytes(&pairs), canonical_attr_bytes(&want));
+            let keys: Vec<&str> = pairs.iter().map(|(k, _)| k.as_str()).collect();
+            let want_keys: Vec<&str> = want.iter().map(|(k, _)| k.as_str()).collect();
+            prop_assert_eq!(keys, want_keys);
+        }
+
+        /// Arbitrary bytes in the scope name and version: both functions accept
+        /// exactly when both strings are UTF-8, and refuse with the same error
+        /// otherwise.
+        #[test]
+        fn stream_attr_decoders_agree_on_arbitrary_scope_bytes(
+            resource in arb_attrs(),
+            scope_name in proptest::collection::vec(any::<u8>(), 0..12),
+            scope_version in proptest::collection::vec(any::<u8>(), 0..12),
+            scope_attrs in arb_attrs(),
+        ) {
+            let blob =
+                stream_attrs_bytes_raw_scope(&resource, &scope_name, &scope_version, &scope_attrs);
+            let valid = std::str::from_utf8(&scope_name).is_ok()
+                && std::str::from_utf8(&scope_version).is_ok();
+            prop_assert_eq!(decode_stream_attrs(&blob).is_ok(), valid);
+            assert_decoders_agree(&blob)?;
+        }
+
+        /// Arbitrary byte sequences, and encoded blobs with one byte
+        /// overwritten: the two functions agree on Ok versus Err, and on the
+        /// error.
+        #[test]
+        fn stream_attr_decoders_agree_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..64),
+            resource in arb_attrs(),
+            scope_attrs in arb_attrs(),
+            at in any::<proptest::sample::Index>(),
+            byte in any::<u8>(),
+        ) {
+            assert_decoders_agree(&bytes)?;
+            let mut blob = stream_attrs_bytes(&resource, "scope", "1.0", &scope_attrs);
+            let i = at.index(blob.len());
+            blob[i] = byte;
+            assert_decoders_agree(&blob)?;
+        }
+    }
+
+    fn assert_decoders_agree(blob: &[u8]) -> Result<(), TestCaseError> {
+        match (
+            decode_stream_attrs(blob),
+            crate::reader::stream_attr_pairs(blob),
+        ) {
+            (Ok(_), Ok(_)) => {}
+            (Err(LogSegError::Corrupted(want)), Err(LogSegError::Corrupted(got))) => {
+                prop_assert_eq!(got, want);
+            }
+            (want, got) => {
+                return Err(TestCaseError::fail(format!(
+                    "decoders disagree: decode_stream_attrs {:?}, stream_attr_pairs {:?}",
+                    want.map(|_| ()),
+                    got.map(|_| ())
+                )));
+            }
+        }
+        Ok(())
     }
 }
