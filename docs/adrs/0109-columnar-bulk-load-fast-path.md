@@ -175,6 +175,10 @@ representations. OTLP ingest is untouched: it arrives row-shaped over the
 wire, so converting it to columnar per request would add a pivot rather
 than remove one.
 
+Since ADR-2467 the shard buffer rule here stands and the scope does not: a
+row-major buffer is pivoted to columnar inside the writer at flush; see the
+ADR-2467 amendment below.
+
 That refusal is an API-level guard, not a behavior change on any live path.
 The loader builds its own `LogIngestRouter` in its own process
 (`load_instrumented`), while OTLP traffic goes through the server's router,
@@ -396,18 +400,30 @@ operator-facing precision for no measurable saving.
 
 ## Amendment (2026-10-04): the row builder is the test-only reference (ADR-2467)
 
-<!-- amendment-applies: sections="7. Byte-identical output is the acceptance anchor, at two levels" pointer="ADR-2467 amendment" -->
+<!-- amendment-applies: sections="5. A tenant's shard buffer is columnar or row-major, never both|7. Byte-identical output is the acceptance anchor, at two levels" pointer="ADR-2467 amendment" -->
 
 ADR-2467 routes row-shaped input through the columnar builder: a writer that
 received records by `push` folds them into one batch at `finish`. The row
 builder stops being a production path and stays in the crate as a test-only
 reference.
 
-Decision 7's requirement is unchanged: the two builders produce byte-identical
-objects for the same records, and the two differential tests stay. What
-changes is how the writer-level test reaches the row builder. It used to push
-records through `RlogWriter::push`; that entry point now leads to the columnar
-builder, so the test's row arm calls the reference builder directly. The
-end-to-end test in `services/ravel-cli` is unaffected.
+Decision 5. The buffer rule stands: a tenant's shard buffer is columnar or
+row-major, never both, and OTLP ingest still buffers rows. What no longer
+holds is "the columnar path is bulk-load only" and the reason given for it.
+The pivot from rows to columns now happens once per flush inside the writer,
+not per request, and ADR-2467 measured it: on its corpus the routed encode
+takes 0.93 to 1.00 times the row builder's time and holds 25% to 31% less
+memory at its peak. ADR-2467 gates the change on a wide-column measurement.
+
+Decision 7. The requirement is unchanged: the two builders produce
+byte-identical objects for the same records, and both differential tests stay.
+What each one compares changes. The writer-level test used to push records
+through `RlogWriter::push`; that entry point now leads to the columnar
+builder, so its row arm calls the reference builder directly, and it remains
+the test that holds the two object builders to each other. The end-to-end
+test in `services/ravel-cli` needs no code change, and what it anchors
+narrows: both of its arms now encode through the columnar builder, so it
+compares the loader's batch builder with the record-based fold, two batch
+builders, and no longer two object builders.
 
 Refs: #586, #519, #541, #560, #570, #584, #585, #660

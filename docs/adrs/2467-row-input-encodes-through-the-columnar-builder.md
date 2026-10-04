@@ -53,7 +53,8 @@ What holds the row builder's peak at 1 stream:
 | 3.20 MB | 20,000 | per-row column vector |
 | 0.88 MB | 40,000 | per-row owned values |
 
-Input is 28% of that peak. The 15.3 MB below the first two rows exists only
+The first two rows are the input: 12.6 MB, 44% of that peak. The 15.3 MB
+below them exists only
 because the row builder owns a struct per row.
 
 The columnar builder's peak at 1 and 1,000 streams falls at the end of
@@ -89,7 +90,9 @@ figures are for 20,000-record objects.
    `push` and `finish`. Every error the row builder returns for an input, the
    routed path returns for the same input; in particular two records with one
    stream id and different stream attrs are still refused with
-   `InconsistentStreamAttrs`.
+   `InconsistentStreamAttrs`. `ColumnarLogBatch::from_records` does not do
+   this today: it keeps the first blob it sees for a stream id and has no
+   conflict check, so the fold carries the check itself.
 
 2. **The fold consumes the records.** `finish` owns the records, so the fold
    takes them by value and releases each record's strings and attribute
@@ -99,14 +102,19 @@ figures are for 20,000-record objects.
    it yields is not known; the task that implements it pre-registers a figure
    and measures it with the Stage 0 profiler.
 
-3. **The row builder becomes the test-only reference.** `build_object`,
-   `resolve_row` and `ResolvedRow` stay in the crate behind `#[cfg(test)]` (or
-   a test-support feature if another crate's tests need them). ADR-0109
-   decision 7's writer-level differential test drives its row arm through
-   `push` and `finish`, which after decision 1 is the columnar builder, so
-   that arm is rewired to call the reference builder directly; otherwise the
-   test compares the columnar builder with itself. The reference is not
-   reachable from a production build.
+3. **The row builder becomes a reference, behind a cargo feature.** The row
+   builder is `build_object`, `resolve_row` and `ResolvedRow`, plus the
+   block-level row encoder they feed: `write_block`, `row_column` and
+   `winner_value` in `block.rs`. All of it moves behind one off-by-default
+   feature of `ravel-logseg`, enabled by the crate's own tests and benches.
+   `#[cfg(test)]` alone is not enough, because the `wide_gather` bench, which
+   is ADR-0109's standing evidence for the row gather's cost, imports
+   `ResolvedRow` and `write_block` and a bench is its own compilation unit.
+   A production build does not enable the feature and cannot reach the
+   reference. ADR-0109 decision 7's writer-level differential test drives its
+   row arm through `push` and `finish`, which after decision 1 is the
+   columnar builder, so that arm is rewired to call the reference builder
+   directly; otherwise the test compares the columnar builder with itself.
 
 4. **A width gate before decision 1 lands.** The implementing task measures
    encode wall time on a wide shape (at least 100 dynamic columns per record)
