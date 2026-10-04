@@ -1090,12 +1090,14 @@ const Q33_TOP_GROUPS: u64 = 500;
 const Q33_ROWS: u64 = Q33_GROUPS + 2 * Q33_TOP_GROUPS;
 
 /// The rows of group `g`: `a = "a<g>"` (zero padded, so string order is
-/// group order), `b = "b<g mod 3>"`, `x = 1`, `y = g`. `x` is constant so
-/// `sum(x)` equals the count and decides no tie, and `avg(y)` is the group's
-/// own number, which shows which groups won.
-fn q33_row(g: u64) -> (String, String, i64, i64) {
+/// group order), `b = "b<g mod 3>"`, `x = 1`, `y = g`, and `w = g` as an
+/// `Int32`. `x` is constant so `sum(x)` equals the count and decides no tie,
+/// and `avg(y)` (or `avg(w)`) is the group's own number, which shows which
+/// groups won.
+fn q33_row(g: u64) -> (String, String, i64, i64, i32) {
     let y = i64::try_from(g).expect("small");
-    (format!("a{g:07}"), format!("b{}", g % 3), 1, y)
+    let w = i32::try_from(g).expect("small");
+    (format!("a{g:07}"), format!("b{}", g % 3), 1, y, w)
 }
 
 /// The q33 table as one Parquet object of 8,192-row row groups. Groups are
@@ -1103,7 +1105,7 @@ fn q33_row(g: u64) -> (String, String, i64, i64) {
 /// two extra rows of each top group are appended at the end, so neither the
 /// arrival order nor a hash order coincides with the sorted order.
 fn q33_parquet() -> bytes::Bytes {
-    use datafusion::arrow::array::{ArrayRef, StringArray};
+    use datafusion::arrow::array::{ArrayRef, Int32Array, StringArray};
     use parquet::arrow::ArrowWriter;
     use parquet::file::properties::WriterProperties;
 
@@ -1116,6 +1118,7 @@ fn q33_parquet() -> bytes::Bytes {
         Field::new("b", DataType::Utf8, false),
         Field::new("x", DataType::Int64, false),
         Field::new("y", DataType::Int64, false),
+        Field::new("w", DataType::Int32, false),
     ]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -1124,6 +1127,7 @@ fn q33_parquet() -> bytes::Bytes {
             Arc::new(StringArray::from_iter_values(rows.iter().map(|r| &r.1))),
             Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
             Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.3))),
+            Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.4))),
         ],
     )
     .expect("batch");
@@ -1394,6 +1398,29 @@ async fn an_order_by_alias_named_like_a_group_key_gives_the_same_top_ten_spilled
     let (spilled, in_memory) = spilled_and_in_memory(sql).await;
     assert_eq!(spilled.rows, in_memory.rows, "row for row");
     assert_eq!(spilled.column_f64(2), q33_expected_top_ten());
+}
+
+/// Issue #2416: `avg` over an `Int32` column is spill-exact only once the
+/// analyzer has coerced its argument to `Int64`, so the plan `ctx.sql`
+/// returns, before analysis, is not spill-eligible even apart from its sort
+/// order. The executed plan's tiebreak rewrite is gated on the `Sort`'s shape
+/// and group key types alone, so it still makes the order total, the
+/// executed-plan re-check passes, and the statement spills with the same top
+/// ten as in memory and with spill off.
+///
+/// Prove-the-test: gate the executed-plan rewrite on
+/// `plan_is_spill_eligible_ignoring_sort_order(&plan)` again and the re-check
+/// fails, so the quarter-budget run is refused with `ResourcesExhausted`
+/// instead of spilling; gate it on a shape check that also requires every
+/// `avg` argument to resolve to `Int64` and the same refusal follows.
+#[tokio::test]
+async fn an_int32_average_gets_the_tie_order_and_spills_with_the_same_top_ten() {
+    let sql = "SELECT a, b, count(*) AS c, avg(w) AS aw FROM q33 \
+               GROUP BY a, b ORDER BY c DESC LIMIT 10";
+    let (spilled, in_memory) = spilled_and_in_memory(sql).await;
+    assert_eq!(spilled.rows, in_memory.rows, "row for row");
+    assert_eq!(spilled.column_f64(3), q33_expected_top_ten());
+    assert_eq!(spilled.rows[0], "a0000000|b0|3|0.0");
 }
 
 /// Issue #2416: a statement the tie-order rewrite cannot apply to (its own
