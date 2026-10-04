@@ -502,9 +502,9 @@ async fn clickbench_q19_plans_and_groups_by_extracted_minute() {
 fn typed_bytes() -> Bytes {
     use datafusion::arrow::array::{
         BinaryArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array,
-        Decimal256Array, DurationMillisecondArray, Float16Array, Int8Array, Int16Array, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
-        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-        TimestampSecondArray, UInt16Array,
+        Decimal256Array, DurationMillisecondArray, Float16Array, Int8Array, Int16Array,
+        Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray, UInt16Array,
     };
     use datafusion::arrow::datatypes::{ArrowPrimitiveType, Float16Type, TimeUnit, i256};
     type F16 = <Float16Type as ArrowPrimitiveType>::Native;

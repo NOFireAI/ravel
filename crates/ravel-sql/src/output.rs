@@ -45,9 +45,9 @@ use datafusion::arrow::array::{
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
     DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
-    DurationSecondArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray, StringArray,
-    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+    DurationSecondArray, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, ListArray, MapArray,
+    StringArray, StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
     Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
@@ -1257,9 +1257,7 @@ mod tests {
                 9_223_372_036_855,
             ),
             (
-                Arc::new(DurationMicrosecondArray::from(vec![
-                    -9_223_372_036_854_776,
-                ])),
+                Arc::new(DurationMicrosecondArray::from(vec![-9_223_372_036_854_776])),
                 -9_223_372_036_854_776,
             ),
         ];
