@@ -1,9 +1,8 @@
 # Correlation: from a metric to a trace
 
 An exemplar links a metric sample to the trace that produced it. Ravel
-stores exemplars, caps them at admission, and serves them over the
-Prometheus exemplar endpoint. This guide covers the storage, the cap, the
-query, and the Grafana link.
+stores exemplars from OTLP ingest, caps them at admission, and serves them
+over the Prometheus exemplar endpoint.
 
 ## What an exemplar is
 
@@ -14,19 +13,18 @@ id, the sample value, a timestamp, and optional attributes. An operator uses
 the exemplar to open the trace behind a metric point.
 
 Prometheus and OpenTelemetry both treat an exemplar as illustrative. An
-exemplar is a sampled signal, not a complete record of every request.
+exemplar is a sampled signal. It does not record every request.
 
 ## How Ravel stores an exemplar
 
-Exemplars are stored only from OTLP ingest. Remote Write and OTAP decode any
-exemplars a request carries and then discard them, so a metric ingested over
-those paths has none, whatever the sender attached.
+Ravel stores exemplars from OTLP ingest only. Remote Write and OTAP decode
+the exemplars that a request carries and then discard them. A metric ingested
+over those paths has no exemplars.
 
 Ravel stores exemplars in the RSEG `EXEMPLARS` section (kind 10). Each object
-holds at most one `EXEMPLARS`
-section. The section is present only when at least one sample in the object
-carried an exemplar. Absence is always legal and means the object has no
-exemplars.
+holds at most one `EXEMPLARS` section. The section is present only when at
+least one sample in the object carried an exemplar. An object without the
+section is valid and has no exemplars.
 
 Each exemplar record attaches to one series through a `series_index`. The
 `series_index` is the position of the series in the object's sorted
@@ -35,10 +33,9 @@ value, the trace id, the span id, and the attributes. The trace id is 16
 bytes and the span id is 8 bytes. An all-zero id means absent.
 
 Records are sorted by `(series_index, ts_ns)`, ascending. Two records can
-share a key. The format does not promise that two records with the same key
-differ only in the trace id. Two records with the same key can differ in the
-trace id, the span id, the value, or the attributes. A reader that collapses
-records must key on every field that it would otherwise lose.
+share a key. Two records with the same key can differ in the trace id, the
+span id, the value, or the attributes. A reader that collapses records must
+key on every field, or it loses the fields outside the key.
 
 To see the stored exemplars in one object, run the segment inspector.
 
@@ -64,44 +61,39 @@ Ravel caps exemplars at admission. The cap keeps at most one exemplar per
 series per window. The default window is 10 seconds. The cap keeps the newest
 exemplar within each window and drops the rest.
 
-The cap is a security control. A trace id is high-entropy by construction.
-Without the cap, a client can attach a distinct trace id to every sample.
-That input multiplies the object size and defeats the dictionary in the
-format. The cap bounds the exemplar cost per series, so a client cannot set
-the worst case.
+The cap is a security control. Without the cap, a client can attach a
+distinct trace id to every sample. That input multiplies the object size and
+defeats the dictionary in the format. The cap bounds the exemplar cost per
+series.
 
-The cap runs per shard actor. There is no cross-shard coordination, so the
-cap matches the shape of the cardinality limiter.
+The cap runs per shard actor, with no cross-shard coordination.
 
-Ravel counts every exemplar that it stores and every exemplar that it drops.
-The ingest metrics hold two counters. The `exemplars_written_total` counter
-counts stored exemplars. The `exemplars_dropped_total` counter counts dropped
-exemplars. If the cap engages, the `exemplars_dropped_total` counter rises.
+`GET /metrics` exposes two counters under the ingest family:
 
-`GET /metrics` exposes both counters under the ingest family.
-`ravel_ingest_exemplars_written_total` counts the exemplars that Ravel stored
-on flushed objects. `ravel_ingest_exemplars_dropped_total` counts the
-exemplars that the cap discarded. Both carry the `mode` and `signal` labels,
-and both carry only the `signal="metrics"` series, because exemplars ride on
-metric points. A rising drop count means the cap is engaging, and an operator
-reads that from outside the process rather than from the flush logs.
+- `ravel_ingest_exemplars_written_total` counts the exemplars that Ravel
+  stored on flushed objects.
+- `ravel_ingest_exemplars_dropped_total` counts the exemplars that the cap
+  discarded.
+
+Both counters carry the `mode` and `signal` labels. Both carry only the
+`signal="metrics"` series, because exemplars ride on metric points. A rising
+drop count means that the cap is engaging.
 
 ## Erasure removes matching exemplars
 
 A subject-erasure request removes an exemplar the same way it removes a
-sample: any exemplar matching the request's predicate is dropped from the
-rewrite output, including one whose own timestamp falls inside the erasure
-window but whose enclosing object survives because other series or samples
-in it did not match.
+sample. The rewrite output drops each exemplar that matches the predicate of
+the request. This includes an exemplar whose own timestamp falls inside the
+erasure window while its enclosing object survives. The object survives when
+other series or samples in it did not match.
 
 ## How to query exemplars
 
 Query exemplars over `GET`/`POST /api/v1/query_exemplars`. The endpoint takes
-the Prometheus `query`, `start`, and `end` parameters. The endpoint reads
-exemplars from the segments that the `[start, end]` window matches. The
-endpoint ignores `offset` and `@`, which matches Prometheus. The endpoint
-keeps a returned exemplar only when the exemplar's own timestamp falls inside
-`[start, end]`.
+the Prometheus `query`, `start`, and `end` parameters. It reads exemplars
+from the segments that the `[start, end]` window matches. It keeps a returned
+exemplar only when the exemplar's own timestamp falls inside `[start, end]`.
+It ignores `offset` and `@`, which matches Prometheus.
 
 To request the exemplars for a metric selector, run the following command.
 
@@ -151,14 +143,14 @@ stored identity, which covers the series, the timestamp, the trace id, the
 span id, the value, and the attributes. An exact duplicate collapses to one
 exemplar. Two exemplars that differ in any stored field both survive.
 
-## How to configure the Grafana link
+## Configure the Grafana link
 
 Grafana reads a label from the exemplar and opens a trace in a tracing data
 source. The conventional label is `trace_id`. The trace id and the span id
 ride in `labels` under the `trace_id` and `span_id` keys. Both ids are
 hex-encoded. An all-zero id is absent, so Ravel omits its label.
 
-To configure the metric-to-trace link, follow these steps.
+To configure the metric-to-trace link, do these steps.
 
 1. Open the Prometheus data source configuration in Grafana.
 2. Find the Exemplars section in the configuration.
