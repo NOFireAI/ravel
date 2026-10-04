@@ -70,7 +70,7 @@
 //!   proptest and goldens therefore assert exact bits for every
 //!   architecture-independent result (finite sums, signed infinities, `-0.0`
 //!   preservation, empty -> NULL) and assert the *property* that a NaN result
-//!   is NaN, via [`avg_cells_match`]. This is the avg analogue of sum's
+//!   is NaN, via [`cells_match_up_to_nan_bits`]. This is the avg analogue of sum's
 //!   restricted-pool deviation.
 //!
 //! # The one restriction, and why
@@ -89,7 +89,16 @@
 //! avoid -- ungrouped `sum` is proptested only over values whose
 //! partial sums are exactly representable (integer-valued f64 with a bounded
 //! magnitude), where every association order provably yields identical bits.
-//! Grouped `sum` keeps the full value pool. NaN and infinity in ungrouped
+//! Grouped `sum` keeps the full value pool, with the same NaN carve-out as
+//! `avg` and for the same reason: its fold is `acc + v` on both sides, and
+//! which operand's NaN an addition returns is the compiler's choice. The
+//! engine side is compiled in datafusion and the reference in this test
+//! crate, so the two can differ whenever the two crates are built at
+//! different optimisation levels. They did, in the sign bit, as soon as
+//! dependencies were built at `opt-level = 2` (issue #2558), and the shipped
+//! binaries build everything optimised. A grouped sum that is NaN is therefore
+//! asserted to be NaN on both sides, and every other grouped sum is asserted
+//! bit for bit. NaN and infinity in ungrouped
 //! `sum` are covered by golden cases that assert the properties that *are*
 //! well defined (a NaN result is NaN; an infinite result has the right sign)
 //! rather than a payload the lane order chooses. This applies property
@@ -150,14 +159,15 @@ async fn assert_all(fixture: &Fixture, tenant: &TenantId, queries: &[Query]) {
     }
 }
 
-/// Compare an `avg` result cell against the reference with the NaN-payload
-/// carve-out documented in the module header: two float cells that both decode
-/// to NaN match (the payload is compiler/hardware-chosen through f64 addition),
-/// and every other cell -- including finite values, signed infinities, and
-/// signed zeros -- must be bit-identical. This is strictly stronger than a
-/// tolerance: the only bits it forgives are the NaN mantissa, which the ADR
-/// itself declares not portable (decision 6b).
-fn avg_cells_match(got: &Cell, want: &Cell) -> bool {
+/// Compare an `avg` or grouped `sum` result cell against the reference with
+/// the NaN carve-out documented in the module header: two float cells that
+/// both decode to NaN match (which NaN an f64 addition returns is compiler-
+/// and hardware-chosen), and every other cell -- including finite values,
+/// signed infinities, and signed zeros -- must be bit-identical. This is
+/// strictly stronger than a tolerance: the only bits it forgives are a NaN's
+/// sign and payload, which the ADR itself declares not portable (decision 6b).
+/// [`nan_carve_out_forgives_only_the_bits_of_a_nan`] pins both halves.
+fn cells_match_up_to_nan_bits(got: &Cell, want: &Cell) -> bool {
     match (got, want) {
         (Cell::FloatBits(g), Cell::FloatBits(w)) => {
             let (gf, wf) = (f64::from_bits(*g), f64::from_bits(*w));
@@ -171,11 +181,53 @@ fn avg_cells_match(got: &Cell, want: &Cell) -> bool {
     }
 }
 
-/// Like [`assert_bit_identical`] but compares each cell with [`avg_cells_match`],
-/// which forgives only the NaN-payload bits. Used by the `avg` shapes, whose
-/// results are bit-identical to the reference except for the hardware- and
-/// compiler-chosen NaN payload (module header, ADR-0022 decision 6b).
-async fn assert_avg_matches(fixture: &Fixture, tenant: &TenantId, query: &Query) {
+/// The carve-out must forgive a NaN's sign and payload and nothing else. A
+/// matcher that compared floats by value would also pass `-0.0` against `0.0`,
+/// and one that treated any two non-finite cells as equal would pass a wrong
+/// infinity; both are bits the gate exists to pin.
+#[test]
+fn nan_carve_out_forgives_only_the_bits_of_a_nan() {
+    let float = |bits: u64| Cell::FloatBits(bits);
+    let nan = float(0x7ff8_0000_0000_0001);
+    let nan_other_sign = float(0xfff8_0000_0000_0001);
+    let nan_other_payload = float(0x7ff8_0000_0000_00aa);
+
+    // Forgiven: the two bit patterns issue #2558 observed, and a payload.
+    assert!(cells_match_up_to_nan_bits(&nan, &nan_other_sign));
+    assert!(cells_match_up_to_nan_bits(&nan, &nan_other_payload));
+
+    // Not forgiven: a NaN against anything that is not a NaN, either way.
+    for other in [f64::INFINITY, f64::NEG_INFINITY, 0.0, 1.0] {
+        let other = float(other.to_bits());
+        assert!(!cells_match_up_to_nan_bits(&nan, &other));
+        assert!(!cells_match_up_to_nan_bits(&other, &nan));
+    }
+    assert!(!cells_match_up_to_nan_bits(&nan, &Cell::Null));
+
+    // Not forgiven: any difference between two non-NaN floats.
+    let differing = [
+        (0.0f64, -0.0f64),
+        (f64::INFINITY, f64::NEG_INFINITY),
+        (1.0, f64::from_bits(1.0f64.to_bits() + 1)),
+        (f64::MIN_POSITIVE, 0.0),
+    ];
+    for (a, b) in differing {
+        let (a, b) = (float(a.to_bits()), float(b.to_bits()));
+        assert!(!cells_match_up_to_nan_bits(&a, &b));
+        assert!(cells_match_up_to_nan_bits(&a, &a));
+    }
+
+    // Non-float cells are compared exactly.
+    assert!(!cells_match_up_to_nan_bits(&Cell::Int(1), &Cell::Int(2)));
+    assert!(cells_match_up_to_nan_bits(&Cell::Null, &Cell::Null));
+}
+
+/// Like [`assert_bit_identical`] but compares each cell with [`cells_match_up_to_nan_bits`],
+/// which forgives only a NaN's sign and payload. Used by the `avg` shapes and
+/// by grouped `sum` over the full value pool, whose results are bit-identical
+/// to the reference except for the hardware- and compiler-chosen NaN (module
+/// header, ADR-0022 decision 6b).
+async fn assert_matches_up_to_nan_bits(fixture: &Fixture, tenant: &TenantId, query: &Query) {
     let snapshot = fixture.snapshot(tenant).await;
     let reference = util::reference_rows(&fixture.fetcher, tenant.hash(), &snapshot).await;
 
@@ -198,7 +250,7 @@ async fn assert_avg_matches(fixture: &Fixture, tenant: &TenantId, query: &Query)
         assert_eq!(g.len(), w.len(), "row {i} width differs for: {sql}");
         for (gc, wc) in g.iter().zip(w.iter()) {
             assert!(
-                avg_cells_match(gc, wc),
+                cells_match_up_to_nan_bits(gc, wc),
                 "row {i} differs for: {sql}\ngot  {got:?}\nwant {want:?}"
             );
         }
@@ -225,11 +277,17 @@ proptest! {
                 Query { shape: Shape::Projection { limit: None }, pred: pred.clone() },
                 Query { shape: Shape::SelectionAggregates, pred: pred.clone() },
                 Query { shape: Shape::GroupedSelectionAggregates, pred: pred.clone() },
-                // Grouped sum folds sequentially in row order, so the full
-                // value pool is fair game for it.
-                Query { shape: Shape::GroupedSum, pred },
             ];
             assert_all(&fixture, &tenant, &queries).await;
+            // Grouped sum folds sequentially in row order, so the full value
+            // pool is fair game for it, except for which NaN an addition of
+            // two NaNs returns (module header, issue #2558).
+            assert_matches_up_to_nan_bits(
+                &fixture,
+                &tenant,
+                &Query { shape: Shape::GroupedSum, pred },
+            )
+            .await;
         });
     }
 
@@ -259,7 +317,7 @@ proptest! {
     /// the independent sequential reference [`avg_sequential`]. Every
     /// architecture-independent result is bit-identical; a NaN result is
     /// compared as NaN, not by payload (see the module header and
-    /// [`avg_cells_match`]). Ungrouped `avg` takes the full pool where
+    /// [`cells_match_up_to_nan_bits`]). Ungrouped `avg` takes the full pool where
     /// ungrouped `sum` cannot: the UDAF's numerator is a scalar fold, not
     /// arrow's lane-parallel kernel.
     #[test]
@@ -271,7 +329,7 @@ proptest! {
             let tenant = tenant_id("gate");
             let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
             for shape in [Shape::Avg, Shape::GroupedAvg] {
-                assert_avg_matches(
+                assert_matches_up_to_nan_bits(
                     &fixture,
                     &tenant,
                     &Query { shape, pred: pred.clone() },
