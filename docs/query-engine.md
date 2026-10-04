@@ -2054,8 +2054,9 @@ for their signal. For the RLOG family it is the fetcher-level pre-filter
 per-record attributes only. The authoritative log exclusion,
 `retain_unerased_log_records` over the merged resource, scope, and record view,
 is not part of the fetch on either path: it runs in every reader that hands log
-records to a caller (the `logs`, `alerts`, and `audit` table scans and the
-export path). A record erased only through a resource or scope attribute can
+records to a caller (the `logs`, `alerts`, and `audit` table scans, the
+export path, and the PromQL log-derived series lane, before it counts a record
+into a series). A record erased only through a resource or scope attribute can
 therefore cross the slice boundary; the reader's scan layer drops it before any
 caller sees it. The pre-filter is per record, so it filters a stream whose
 segments straddle two slices the same way in each. The worker-side erasure

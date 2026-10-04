@@ -54,7 +54,7 @@ use ravel_promql::{LabelMatcher, MatchOp, SeriesData};
 use ravel_types::logstream::{AttrValue, LogStreamId};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TenantHash, TimeRange};
 
-use crate::erasure::ErasurePredicate;
+use crate::erasure::{ErasurePredicate, retain_unerased_log_records};
 use crate::phase_accounting::PhaseAccounting;
 use crate::{ByteLimit, LogFetchError, LogQuery, LogSegmentFetcher, RequestLimit};
 
@@ -759,10 +759,15 @@ pub async fn fetch_log_series(
         segments_fetched += 1;
         fetched_segments.push(seg_idx);
 
-        while let Some(records) = scan.next_block_on_gate().await? {
+        while let Some(mut records) = scan.next_block_on_gate().await? {
             if let Some(err) = deadline_exceeded(req.deadline) {
                 return Err(err);
             }
+            // The query's `with_erasure` pre-filter sees per-record attributes
+            // only; this is the authoritative ADR-0064 decision 2 exclusion
+            // over the merged resource + scope + record view, run before any
+            // record is counted into a series.
+            retain_unerased_log_records(&mut records, req.erasure)?;
             for record in &records {
                 if !severity_post
                     .iter()
