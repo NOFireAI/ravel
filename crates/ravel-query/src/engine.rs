@@ -5483,6 +5483,19 @@ mod tests {
 
     use super::*;
 
+    /// An engine over a fresh, never-published `MemoryStore`, so every
+    /// snapshot it resolves is empty and its HEAD cache starts cold.
+    fn empty_store_engine() -> QueryEngine {
+        let store: Arc<dyn ObjectStoreBackend> =
+            Arc::new(ravel_object_store::memory::MemoryStore::new());
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(&store),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        QueryEngine::new(Arc::new(catalog), store, EngineConfig::default())
+    }
+
     /// A query whose snapshot resolves to zero segments never enters the
     /// segment-fetch loop, so the incremental `max_s3_requests` check there
     /// never runs. A caller-lowered budget of zero (ADR-1374 decision 3) must
@@ -5491,14 +5504,7 @@ mod tests {
     /// must not change behavior for the same fixture.
     #[tokio::test]
     async fn lowered_request_budget_is_enforced_after_resolve() {
-        let store: Arc<dyn ObjectStoreBackend> =
-            Arc::new(ravel_object_store::memory::MemoryStore::new());
-        let catalog = ravel_catalog::Catalog::new(
-            Arc::clone(&store),
-            ravel_catalog::CatalogConfig::default(),
-        )
-        .expect("catalog");
-        let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+        let engine = empty_store_engine();
         let tenant_hash = ravel_types::TenantId::new("acme").hash();
         // No segments are ever published to this store, so the window is
         // arbitrary: the snapshot resolves empty regardless of its bounds.
@@ -5547,8 +5553,11 @@ mod tests {
 
         // Control: the server's default ceiling is far above any resolve
         // cost, so the identical fixture succeeds under it, and the
-        // accounted request count is the same exact number.
-        let (_series, stats) = engine
+        // accounted request count is the same exact number. It runs on a
+        // fresh engine: the trip cached this tenant's NotFound HEAD
+        // (ADR-2509 decision 3), so a second resolve on `engine` would skip
+        // that GET and not be the identical fixture.
+        let (_series, stats) = empty_store_engine()
             .resolve_series_with_budgets(tenant_hash, &[], window, &[], now_ns, deadline, None)
             .await
             .expect("the server default ceiling must not trip on the resolve's own cost");
@@ -5569,14 +5578,7 @@ mod tests {
     /// (`requests_remaining` below in `prefetch`).
     #[tokio::test]
     async fn mixed_metrics_and_log_lanes_share_the_request_budget_after_resolve() {
-        let store: Arc<dyn ObjectStoreBackend> =
-            Arc::new(ravel_object_store::memory::MemoryStore::new());
-        let catalog = ravel_catalog::Catalog::new(
-            Arc::clone(&store),
-            ravel_catalog::CatalogConfig::default(),
-        )
-        .expect("catalog");
-        let engine = QueryEngine::new(Arc::new(catalog), store, EngineConfig::default());
+        let engine = empty_store_engine();
         let tenant_hash = ravel_types::TenantId::new("acme-mixed").hash();
         let now_ns = 60 * 1_000_000_000;
         let t_ms = now_ns / 1_000_000;
@@ -5634,13 +5636,16 @@ mod tests {
 
         // Control: a budget sized for both lanes' combined resolve cost
         // succeeds, and accounts the same combined total the trip reported.
+        // A fresh engine, because the trip cached both lanes' NotFound HEADs
+        // (ADR-2509 decision 3) and a warm rerun would cost less than the
+        // budget it is meant to prove sufficient.
         let combined_budgets = RequestBudgets {
             max_store_requests: Some(RequestLimit::Bounded(
                 METRICS_LANE_REQUESTS + LOG_LANE_REQUESTS,
             )),
             ..Default::default()
         };
-        let (_value, _annotations, stats) = engine
+        let (_value, _annotations, stats) = empty_store_engine()
             .instant_with_budgets(
                 tenant_hash,
                 query,
