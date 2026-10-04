@@ -201,6 +201,10 @@ role's reads of `sys/tenancy`, `sys/qualification`, `sys/gc` and the other keys
 whose absence is a normal state therefore also need a list grant on exactly
 those keys; the bootstrap-key list amendment below adds it.
 
+The Gateway row's `idem/<key>` (dedup lookup) is a read of one marker key per
+hour of the dedup window, most of them absent, and the marker lookup amendment
+below grants the list of exactly that key an absent key needs on AWS S3.
+
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
 runs inside the same `Mode::Maintain` process as compaction and retention
@@ -1658,7 +1662,8 @@ under `t/*/*/maint/*` by `MaintainList`, so they gain nothing. Left out:
 `sys/t/<hash>`, the alert lease and the compaction claims are written with
 `CreateIfAbsent` first and read only after that write reports the object
 exists; the idempotency markers are found by a prefix listing, not a
-single-key read; and a data object a concurrent compaction deleted is a race,
+single-key read (no longer so, see the marker lookup amendment below); and a
+data object a concurrent compaction deleted is a race,
 not a bootstrap state, whose key cannot be named without a `*`.
 
 A list request whose prefix is one of these keys can return only that key,
@@ -1740,3 +1745,69 @@ under the bucket default.
 Recorded as an appended amendment, with inline pointers added to the
 2026-10-02 amendment, one of which corrects its list of the `ravel-cli`
 commands that take the Maintain credential.
+
+## Amendment (2026-10-03): the keyed-ingest marker lookup probes exact keys
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries" pointer="marker lookup amendment" -->
+<!-- amendment-supersedes: phrase="found by a prefix listing" pointer="marker lookup amendment" -->
+
+Issue #2462. A keyed log or span write (one carrying
+`x-ravel-idempotency-key`) looks up its marker before writing. The lookup used
+to list `t/<hash>/<sig>/idem/<keyhash32>.`, and no gateway list grant covered
+that prefix, so on AWS S3 every keyed lookup was refused and the log and span
+ingest paths logged a warning and wrote anyway. No grant could have made that
+listing work: the S3 adapter appends `/` to every list prefix, so S3 received
+`.../idem/<keyhash32>./`, under which no marker key sits. ADR-0051's marker
+probe amendment replaces the listing with a GET of the exact marker key
+(`marker_key` in `crates/ravel-ingest/src/idempotency.rs`) for each ingest hour
+of the dedup window, the hours nearest the current one first.
+
+Decisions:
+
+1. The gateway template grants no list on an `idem/` prefix, and `GatewayList`
+   carries no idempotency pattern. The probe's GET is granted by
+   `GatewayRead`'s `t/*/*/idem/*`.
+2. On AWS S3 a GET of an absent key answers 403 unless a list grant covers that
+   key (the bootstrap-key list amendment above), and most probes are of absent
+   keys: every probe of a first write, and for a retry every hour above the
+   one that hits. `GatewayListTenantBootstrapKeys` therefore gains the marker
+   key for each signal that writes markers:
+   `t/????????????????????????????????/l/idem/????????????????????????????????.????????T??.idm`
+   and the same pattern with `s`. The tenant hash, the keyhash and the ingest
+   hour are spelled one `?` per character around the literal `.`, `T` and
+   `.idm`, so a list request the grant admits returns at most that one marker
+   key. This change adds no listing of the `idem/` directory beyond what
+   `GatewayList`'s pre-existing `t/` prefix already allows, and a list of
+   `t/` returns every key under it, markers included. Metrics ingest takes no
+   key and does no lookup. No other statement changes and every `Deny` stays.
+3. A keyed write whose probe fails with a store error (anything but
+   `NotFound`) is not acknowledged. It fails with the retryable error a failed
+   flush returns (HTTP 503, gRPC `UNAVAILABLE`) before the request's own data
+   is written, so the client's retry is safe. The client-facing message names
+   no key, tenant hash or store error; the gateway logs the GET, the key and
+   the store error at WARN and counts the refusal on
+   `ravel_ingest_idempotency_lookup_failures_total`. A lookup still running
+   at half of the request's `ack_deadline` is refused the same way
+   (ADR-0051's probe amendment). A write without a key looks no marker up and is unaffected.
+
+`crates/ravel-commit/tests/iam_templates.rs` builds the marker key the way
+`marker_key` does, pinned to the same literal a test beside `marker_key` pins,
+and checks for both signals that `GatewayRead` admits its GET, that
+`GatewayListTenantBootstrapKeys` admits a list of exactly that key, and that no
+`Deny` withdraws either. It also checks that no gateway list grant's
+`s3:prefix` admits a list request for the `idem/` directory, a key's
+`<keyhash32>.` prefix, a marker key cut inside its
+hour or extended past `.idm`, a tenant segment 31 or 33 characters wide, a
+keyhash one character short or long, or the marker key under another signal
+letter. The ingest tests in `services/ravel-server/src/logs_ingest.rs` and
+`traces_ingest.rs` refuse the marker GET with `FaultStore` and assert that the
+keyed write fails retryably with zero PUTs, one WARN line and one count.
+
+Net effect on §1: Gateway's dedup lookup is a read of one marker key per hour
+of the window, granted by `GatewayRead`, with a list grant on exactly that key.
+The bootstrap-key list amendment's note that the markers are found by a prefix
+listing no longer holds: the marker key is one of the per-tenant keys a role
+reads where absence is a normal state.
+
+Recorded as an appended amendment, with an inline pointer added to §1 and to
+the bootstrap-key list amendment.
