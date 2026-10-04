@@ -49,6 +49,7 @@ use ravel_catalog::MAX_SHARD_COUNT;
 use ravel_types::TenantHash;
 
 use crate::attribution::TenantPutAttribution;
+use crate::generation::HandBackReason;
 
 /// Shard indices [`IngestMetrics::new`] preallocates per-shard skew
 /// accumulators for.
@@ -311,6 +312,9 @@ pub struct IngestMetrics {
     /// under the tenant's current generation instead (ADR-1642 scan-set
     /// amendment).
     rerouted_flushes: AtomicU64,
+    /// The part of `rerouted_flushes` handed back for
+    /// [`HandBackReason::GenerationMismatch`] (issue #2429).
+    rerouted_flushes_generation_mismatch: AtomicU64,
     /// Hand-back episodes that could not deliver rows to a target shard of the
     /// tenant's current generation, because the target was dead, condemned or
     /// its mailbox closed, at the liveness check or at the send. The rows stay
@@ -782,9 +786,14 @@ pub struct IngestMetricsSnapshot {
     pub exemplars_dropped_total: u64,
     pub stale_provisioning_flushes: u64,
     pub grace_extended_stale_flushes: u64,
-    /// Flushes handed back instead of written outside the scan set (ADR-1642
-    /// scan-set amendment).
+    /// Flushes handed back instead of written outside the scan set, or into
+    /// an hour another generation owns (ADR-1642 scan-set amendment), for
+    /// every [`HandBackReason`].
     pub rerouted_flushes: u64,
+    /// The part of `rerouted_flushes` whose reason was
+    /// [`HandBackReason::GenerationMismatch`]; the rest were
+    /// [`HandBackReason::RetiredIndex`].
+    pub rerouted_flushes_generation_mismatch: u64,
     /// Hand-back episodes that left rows in the source buffer because a
     /// target shard was not live. Exported as
     /// `ravel_ingest_hand_back_failures_total`.
@@ -1138,9 +1147,12 @@ impl IngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One flush handed back instead of written outside the scan set
-    /// (ADR-1642 scan-set amendment).
-    pub(crate) fn record_rerouted_flush(&self) {
+    /// One flush handed back for `reason` (ADR-1642 scan-set amendment).
+    pub(crate) fn record_rerouted_flush(&self, reason: HandBackReason) {
+        if reason == HandBackReason::GenerationMismatch {
+            self.rerouted_flushes_generation_mismatch
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.rerouted_flushes.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1220,6 +1232,9 @@ impl IngestMetrics {
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
             rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
+            rerouted_flushes_generation_mismatch: self
+                .rerouted_flushes_generation_mismatch
+                .load(Ordering::Relaxed),
             hand_back_failures: self.hand_back_failures.load(Ordering::Relaxed),
             teardown_unscanned_writes: self.teardown_unscanned_writes.load(Ordering::Relaxed),
             metadata_flush_gets_total: self.metadata_flush_gets.load(Ordering::Relaxed),

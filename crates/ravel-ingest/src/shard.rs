@@ -56,7 +56,7 @@ use crate::config::{
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
 use crate::generation::{
-    FlushScope, HandBackArrival, SCAN_SET_HANDBACK_ABANDONED, ScanCheck, reread_and_check,
+    FlushScope, HandBackArrival, HandBackReason, ScanCheck, reread_and_check, send_hand_back,
 };
 use crate::metrics::{FlushTrigger, IngestMetrics};
 #[cfg(feature = "stage-timing")]
@@ -1340,7 +1340,8 @@ impl ShardActor {
 
     /// Hands `buf`'s rows to the shards of the `count`-shard set that
     /// `shard_for` routes them to, instead of writing them under this shard's
-    /// index outside the scan set of the hour it would pin (ADR-1642 scan-set
+    /// index outside the scan set of the hour it would pin, or into an hour
+    /// another generation owns, as `reason` says (ADR-1642 scan-set
     /// amendment). Every target's liveness is checked before anything is taken
     /// apart, so a dead or closed target returns the buffer untouched for the
     /// caller to keep. Past that point strict waiters are answered `Abandoned`
@@ -1355,15 +1356,18 @@ impl ShardActor {
     /// answered, so nothing is acknowledged twice. Returns whether any target
     /// took rows.
     ///
-    /// The send awaits the target's mailbox on this actor. A hand-back always
-    /// goes to a strictly smaller set than this one (the target count is at
-    /// most `scan_count`, which this index is not below), so a chain of such
-    /// waits ends and cannot cycle.
+    /// The send awaits the target's mailbox on this actor only when the target
+    /// set is strictly smaller than this one ([`FlushScope::may_wait_on`]), so
+    /// a chain of such waits ends and cannot cycle. A retired-index hand-back
+    /// always qualifies (the target count is at most `scan_count`, which this
+    /// index is not below); a generation-mismatch hand-back to a larger set
+    /// sends only into a mailbox with room, and a full one fails the send.
     async fn hand_back(
         &mut self,
         tenant: &TenantId,
         mut buf: TenantBuf,
         count: u32,
+        reason: HandBackReason,
     ) -> Result<bool, TenantBuf> {
         let mut targets: Vec<u32> = buf
             .series
@@ -1384,7 +1388,7 @@ impl ShardActor {
         let waiters = std::mem::take(&mut buf.waiters);
         self.ctx.ack_waiters(
             waiters,
-            Err(WriteError::Abandoned(SCAN_SET_HANDBACK_ABANDONED.into())),
+            Err(WriteError::Abandoned(reason.abandoned_message().into())),
         );
         let TenantBuf {
             series,
@@ -1430,6 +1434,7 @@ impl ShardActor {
                 .or_default()
                 .push(exemplar);
         }
+        let wait = self.scope.may_wait_on(count);
         let mut delivered = false;
         let mut kept = false;
         for (target, tx) in targets.into_iter().zip(senders) {
@@ -1440,7 +1445,7 @@ impl ShardActor {
                 charges: charges.clone(),
                 arrival,
             };
-            let Err(mpsc::error::SendError(msg)) = tx.send(msg).await else {
+            let Err(msg) = send_hand_back(&tx, msg, wait).await else {
                 delivered = true;
                 continue;
             };
@@ -1467,8 +1472,9 @@ impl ShardActor {
                     shard = self.shard,
                     target,
                     tenant_hash = %tenant.hash().to_hex(),
-                    "ravel-ingest: hand-back target shard closed before its rows arrived; \
-                     keeping them in this shard's buffer for the next flush to retry"
+                    "ravel-ingest: hand-back target shard closed before its rows arrived, \
+                     or its mailbox was full on a send that may not wait; keeping them in \
+                     this shard's buffer for the next flush to retry"
                 );
             }
             kept = true;
@@ -2091,7 +2097,8 @@ impl ShardActor {
             }
         };
         // ADR-1642 scan-set amendment: write under this shard index only if
-        // the read side scans it for the hour this flush is about to pin.
+        // the read side scans it for the hour this flush is about to pin, and
+        // no other generation owns that hour alone (issue #2429).
         let buf = match self
             .scan_check(tenant_hash, ingest_hour_bucket, raw_ns)
             .await
@@ -2102,24 +2109,44 @@ impl ShardActor {
             }
             ScanCheck::HandBack {
                 scan_count,
-                active_count,
-            } => match self.hand_back(&tenant, buf, active_count).await {
+                target_count,
+                reason,
+            } => match self.hand_back(&tenant, buf, target_count, reason).await {
                 Ok(delivered) => {
                     if delivered {
-                        self.metrics.record_rerouted_flush();
+                        self.metrics.record_rerouted_flush(reason);
                         if !std::mem::replace(&mut self.handing_back, true) {
                             tracing::warn!(
                                 signal = ?self.ctx.signal,
                                 shard = self.shard,
                                 ingest_hour_bucket,
                                 scan_count,
-                                active_count,
+                                target_count,
+                                reason = reason.label(),
                                 "ravel-ingest: flush would write outside the read-side scan set \
-                                 of its ingest hour; handing its rows to the current shard generation"
+                                 of its ingest hour, or into an hour another shard generation \
+                                 owns; handing its rows to that hour's shard generation"
                             );
                         }
                     }
                     return;
+                }
+                Err(buf)
+                    if reason == HandBackReason::GenerationMismatch
+                        && !matches!(lag_check, LagCheck::Enforced) =>
+                {
+                    tracing::warn!(
+                        signal = ?self.ctx.signal,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        target_count,
+                        "ravel-ingest: teardown bypass pass: writing a flush in place in an \
+                         ingest hour another shard generation owns, because a hand-back target \
+                         shard is dead or closed; readers find the rows, but a pushdown split \
+                         over this hour may see their series at two shard indices"
+                    );
+                    buf
                 }
                 Err(mut buf) => {
                     buf.stale_view_counted = false;
@@ -2131,7 +2158,7 @@ impl ShardActor {
                                 shard = self.shard,
                                 tenant_hash = %tenant_hash.to_hex(),
                                 ingest_hour_bucket,
-                                active_count,
+                                target_count,
                                 "ravel-ingest: a hand-back target shard of the tenant's current \
                                  generation is dead or closed; keeping the rows in this shard's \
                                  buffer until it is live again (the next write routed to a dead \
@@ -2148,7 +2175,7 @@ impl ShardActor {
                         tenant_hash = %tenant_hash.to_hex(),
                         ingest_hour_bucket,
                         scan_count,
-                        active_count,
+                        target_count,
                         "ravel-ingest: teardown bypass pass: writing a flush in place under a \
                          shard index readers do not scan for its ingest hour, because a \
                          hand-back target shard is dead or closed; the rows are stored but no \
@@ -3646,7 +3673,8 @@ mod tests {
     /// Handing back to a two-shard set, which these rows split across.
     const HAND_BACK: ScanCheck = ScanCheck::HandBack {
         scan_count: 3,
-        active_count: 2,
+        target_count: 2,
+        reason: HandBackReason::RetiredIndex,
     };
 
     impl HandBackRig {

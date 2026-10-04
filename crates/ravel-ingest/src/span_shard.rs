@@ -66,7 +66,7 @@ use crate::config::{
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::generation::{
-    FlushScope, HandBackArrival, SCAN_SET_HANDBACK_ABANDONED, ScanCheck, reread_and_check,
+    FlushScope, HandBackArrival, HandBackReason, ScanCheck, reread_and_check, send_hand_back,
 };
 use crate::metrics::FlushTrigger;
 use crate::span_error::SpanWriteError;
@@ -893,12 +893,14 @@ impl SpanShardActor {
     /// buffer back untouched if one is not live, then strict waiters answered
     /// `Abandoned` and a clone of every charge to each target. A failed send
     /// returns its spans and charges to this shard's buffer, as in the metrics
-    /// actor. Returns whether any target took spans.
+    /// actor, and so does a full mailbox on a send that may not wait. Returns
+    /// whether any target took spans.
     async fn hand_back(
         &mut self,
         tenant: &TenantId,
         mut buf: SpanTenantBuf,
         count: u32,
+        reason: HandBackReason,
     ) -> Result<bool, SpanTenantBuf> {
         let mut targets: Vec<u32> = buf
             .spans
@@ -918,9 +920,7 @@ impl SpanShardActor {
         let waiters = std::mem::take(&mut buf.waiters);
         self.ctx.ack_waiters(
             waiters,
-            Err(SpanWriteError::Abandoned(
-                SCAN_SET_HANDBACK_ABANDONED.into(),
-            )),
+            Err(SpanWriteError::Abandoned(reason.abandoned_message().into())),
         );
         let SpanTenantBuf {
             spans,
@@ -944,6 +944,7 @@ impl SpanShardActor {
                 .or_default()
                 .push(span);
         }
+        let wait = self.scope.may_wait_on(count);
         let mut delivered = false;
         let mut kept = false;
         for (target, tx) in targets.into_iter().zip(senders) {
@@ -953,7 +954,7 @@ impl SpanShardActor {
                 charges: charges.clone(),
                 arrival,
             };
-            let Err(mpsc::error::SendError(msg)) = tx.send(msg).await else {
+            let Err(msg) = send_hand_back(&tx, msg, wait).await else {
                 delivered = true;
                 continue;
             };
@@ -977,7 +978,8 @@ impl SpanShardActor {
                     target,
                     tenant_hash = %tenant.hash().to_hex(),
                     "ravel-ingest: hand-back target span shard closed before its spans \
-                     arrived; keeping them in this shard's buffer for the next flush to retry"
+                     arrived, or its mailbox was full on a send that may not wait; keeping \
+                     them in this shard's buffer for the next flush to retry"
                 );
             }
             kept = true;
@@ -1514,7 +1516,8 @@ impl SpanShardActor {
             }
         };
         // ADR-1642 scan-set amendment: write under this shard index only if
-        // the read side scans it for the hour this flush is about to pin.
+        // the read side scans it for the hour this flush is about to pin, and
+        // no other generation owns that hour alone (issue #2429).
         let buf = match self
             .scan_check(tenant_hash, ingest_hour_bucket, raw_ns)
             .await
@@ -1525,24 +1528,44 @@ impl SpanShardActor {
             }
             ScanCheck::HandBack {
                 scan_count,
-                active_count,
-            } => match self.hand_back(&tenant, buf, active_count).await {
+                target_count,
+                reason,
+            } => match self.hand_back(&tenant, buf, target_count, reason).await {
                 Ok(delivered) => {
                     if delivered {
-                        self.metrics.record_rerouted_flush();
+                        self.metrics.record_rerouted_flush(reason);
                         if !std::mem::replace(&mut self.handing_back, true) {
                             tracing::warn!(
                                 signal = ?Signal::Spans,
                                 shard = self.shard,
                                 ingest_hour_bucket,
                                 scan_count,
-                                active_count,
+                                target_count,
+                                reason = reason.label(),
                                 "ravel-ingest: flush would write outside the read-side scan set \
-                                 of its ingest hour; handing its rows to the current shard generation"
+                                 of its ingest hour, or into an hour another shard generation \
+                                 owns; handing its rows to that hour's shard generation"
                             );
                         }
                     }
                     return;
+                }
+                Err(buf)
+                    if reason == HandBackReason::GenerationMismatch
+                        && !matches!(lag_check, LagCheck::Enforced) =>
+                {
+                    tracing::warn!(
+                        signal = ?Signal::Spans,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        target_count,
+                        "ravel-ingest: teardown bypass pass: writing a flush in place in an \
+                         ingest hour another shard generation owns, because a hand-back target \
+                         shard is dead or condemned; readers find the spans, but a pushdown \
+                         split over this hour may see their traces at two shard indices"
+                    );
+                    buf
                 }
                 Err(mut buf) => {
                     buf.stale_view_counted = false;
@@ -1554,7 +1577,7 @@ impl SpanShardActor {
                                 shard = self.shard,
                                 tenant_hash = %tenant_hash.to_hex(),
                                 ingest_hour_bucket,
-                                active_count,
+                                target_count,
                                 "ravel-ingest: a hand-back target span shard of the tenant's \
                                  current generation is dead or condemned; keeping the spans in \
                                  this shard's buffer, where they stay until a target is live or \
@@ -1571,7 +1594,7 @@ impl SpanShardActor {
                         tenant_hash = %tenant_hash.to_hex(),
                         ingest_hour_bucket,
                         scan_count,
-                        active_count,
+                        target_count,
                         "ravel-ingest: teardown bypass pass: writing a flush in place under a \
                          shard index readers do not scan for its ingest hour, because a \
                          hand-back target shard is dead or condemned; the spans are stored \
@@ -2632,7 +2655,8 @@ mod tests {
 
     const HAND_BACK: ScanCheck = ScanCheck::HandBack {
         scan_count: 3,
-        active_count: 2,
+        target_count: 2,
+        reason: HandBackReason::RetiredIndex,
     };
 
     impl HandBackRig {

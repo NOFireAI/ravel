@@ -26,7 +26,7 @@ use std::time::Duration;
 use common::{TestClock, make_point, tenant};
 use ravel_catalog::{
     AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, append_generation, read_generations,
-    scan_count, validate_or_adopt,
+    scan_count, stable_generation_for_hour, validate_or_adopt,
 };
 use ravel_commit::{keys, record};
 use ravel_ingest::{
@@ -96,6 +96,7 @@ fn start_of(hour: u32) -> i64 {
 struct Counters {
     buffered: u64,
     rerouted: u64,
+    rerouted_generation_mismatch: u64,
     stale: u64,
     deferred: u64,
     in_flight: u64,
@@ -176,6 +177,7 @@ impl Pipe for IngestRouter {
         Counters {
             buffered: snap.buffered_points_total,
             rerouted: snap.rerouted_flushes,
+            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
             stale: snap.stale_provisioning_flushes,
             deferred: self
                 .metrics()
@@ -282,6 +284,7 @@ impl Pipe for LogIngestRouter {
         Counters {
             buffered: snap.buffered_records_total,
             rerouted: snap.rerouted_flushes,
+            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
             stale: snap.stale_provisioning_flushes,
             deferred: self
                 .metrics()
@@ -358,6 +361,7 @@ impl Pipe for SpanIngestRouter {
         Counters {
             buffered: snap.buffered_spans_total,
             rerouted: snap.rerouted_flushes,
+            rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
             stale: snap.stale_provisioning_flushes,
             deferred: self
                 .metrics()
@@ -815,35 +819,175 @@ async fn retired_index_inside_the_window_writes_in_place<P: Pipe>() {
     );
 }
 
-/// A flush on an index the successor still covers writes in place however
-/// long it was deferred.
+/// An index the successor also covers, and the row keys on it under the
+/// 4-shard set that the 3-shard successor routes to a different index, so a
+/// row written under `COVERED_SHARD` and the same row routed by the successor
+/// can never be confused.
+const COVERED_SHARD: u32 = 1;
+
+fn covered_rows<P: Pipe>(tenant: &TenantId, n: usize) -> Vec<usize> {
+    (0..10_000)
+        .filter(|&i| {
+            P::shard_of(tenant, i, OLD_COUNT) == COVERED_SHARD
+                && P::shard_of(tenant, i, NEW_COUNT) != COVERED_SHARD
+        })
+        .skip(1)
+        .take(n)
+        .collect()
+}
+
+/// Every row of every object committed under `(shard, hour)`, sorted.
+async fn rows_at<P: Pipe>(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    shard: u32,
+    hour: u32,
+) -> Vec<i64> {
+    let mut rows = Vec::new();
+    for commit in commits_at(store, tenant, P::SIGNAL, shard, hour).await {
+        let bytes = store
+            .get(&commit, GetRange::Full)
+            .await
+            .expect("get commit record")
+            .data;
+        let decoded = record::decode(&bytes).expect("decode commit record");
+        let data = store
+            .get(&decoded.object_key, GetRange::Full)
+            .await
+            .expect("get data object")
+            .data;
+        rows.extend(P::rows(&data));
+    }
+    rows.sort_unstable();
+    rows
+}
+
+/// Ticks until any commit record of `tenant` exists under one of `shards` in
+/// `hour`, at most 200 ticks.
+async fn wait_for_commit<P: Pipe>(world: &World<P>, shards: &[u32], hour: u32) {
+    let store = world.store.as_ref();
+    for _ in 0..10 {
+        for &shard in shards {
+            if !commits_at(store, &world.deferred, P::SIGNAL, shard, hour)
+                .await
+                .is_empty()
+            {
+                return;
+            }
+        }
+        ticks(&world.clock, 20).await;
+    }
+}
+
+/// Issue #2429. A buffer routed by generation 0 (4 shards) on an index the
+/// 3-shard successor also covers is deferred until its flush would pin an hour
+/// generation 1 owns alone, `S + 5` hours past the activation. The index is
+/// inside the scan set, so the retired-index check passes it; written in
+/// place, its rows would sit under the index generation 0 routed them to, in
+/// an hour `ravel_catalog::stable_generation_for_hour` attributes to
+/// generation 1, whose routing puts every one of these rows at another index.
+/// The read side scans both and still finds them, but
+/// `ravel_query::distrib::pushdown::is_pushdown_eligible` passes such an hour
+/// and `ravel_query::distrib::partition::partition_snapshot` splits its work
+/// by shard index, so a series at two indices in it is counted by two slice
+/// workers that each assume they hold all of it. That pushdown split is what
+/// the hand-back protects: this test asserts the precondition it relies on,
+/// every row of the hour at the index generation 1 routes it to.
 ///
-/// Guard: the `shard < scan` arm of `GenerationSwitch::scan_check`. Without
-/// it an index of a retiring set that the successor still covers falls to the
-/// untrusted arm, and the flush never opens.
-async fn covered_index_writes_in_place_however_late<P: Pipe>() {
+/// So the flush writes nothing under its own index in that hour, the rows are
+/// handed back and re-routed under generation 1, each lands at generation 1's
+/// index for its key, and the scan rule finds every row exactly once.
+///
+/// Guards: the `owner != self_count` hand-back arm of
+/// `GenerationSwitch::scan_check` (generation.rs). With it removed the flush
+/// writes in place: rows appear under `COVERED_SHARD` in `pin_hour` and
+/// `rerouted` stays 0.
+async fn covered_index_in_a_successor_owned_hour_hands_back<P: Pipe>() {
     let world = World::<P>::new().await;
-    let shard = 1;
-    let keys = rows_on::<P>(&world.deferred, shard, 1, 3);
-    world.defer(shard, &keys).await;
+    let keys = covered_rows::<P>(&world.deferred, 6);
+    let mut by_target: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+    for &i in &keys {
+        by_target
+            .entry(P::shard_of(&world.deferred, i, NEW_COUNT))
+            .or_default()
+            .push(i);
+    }
+    assert_eq!(keys.len(), 6);
+    world.defer(COVERED_SHARD, &keys).await;
     world.reshard_down().await;
 
     let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
     world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    let generations = persisted_generations(world.store.as_ref(), &world.deferred, P::SIGNAL).await;
+    assert_eq!(
+        stable_generation_for_hour(&generations, pin_hour, DEFAULT_SCAN_SLACK_HOURS),
+        Some(1),
+        "generation 1 owns the pinned hour alone"
+    );
+    assert!(COVERED_SHARD < scan_count(&generations, pin_hour, DEFAULT_SCAN_SLACK_HOURS));
+
+    let targets: Vec<u32> = std::iter::once(COVERED_SHARD)
+        .chain(by_target.keys().copied())
+        .collect();
+    wait_for_commit(&world, &targets, pin_hour).await;
+    world.router.flush().await;
     let store = world.store.as_ref();
-    let mut landed = false;
-    for _ in 0..10 {
-        landed = !commits_at(store, &world.deferred, P::SIGNAL, shard, pin_hour)
-            .await
-            .is_empty();
-        if landed {
-            break;
-        }
-        ticks(&world.clock, 20).await;
+    assert_eq!(
+        rows_at::<P>(store, &world.deferred, COVERED_SHARD, pin_hour).await,
+        Vec::<i64>::new(),
+        "nothing routed by generation 0 is written under shard {COVERED_SHARD} in hour \
+         {pin_hour}, which generation 1 owns; counters {:?}",
+        world.router.counters()
+    );
+    let counters = world.router.counters();
+    assert_eq!(counters.rerouted, 1, "the flush is handed back once");
+    assert_eq!(
+        counters.rerouted_generation_mismatch, 1,
+        "and counted under the generation-mismatch reason"
+    );
+    for (&target, target_keys) in &by_target {
+        assert_eq!(
+            rows_at::<P>(store, &world.deferred, target, pin_hour).await,
+            expected(target_keys),
+            "the rows generation 1 routes to shard {target} land there, in hour {pin_hour}"
+        );
     }
-    assert!(
-        landed,
-        "the flush writes under shard {shard} in hour {pin_hour}"
+    assert_eq!(
+        scanned_rows::<P>(store, &world.deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "the scan rule finds every row exactly once"
+    );
+}
+
+/// The same buffer, opening one hour after the activation, inside the
+/// overlap where both generations' shards can hold the hour's data and
+/// `stable_generation_for_hour` names no owner: it writes in place under its
+/// own index, as before issue #2429.
+///
+/// Guard: the `Some(owner)` match on `stable_generation_for_hour` in
+/// `GenerationSwitch::scan_check`. Treating an unowned hour as the active
+/// generation's hands this flush back, and nothing lands under
+/// `COVERED_SHARD` in `pin_hour`.
+async fn covered_index_inside_the_overlap_writes_in_place<P: Pipe>() {
+    let world = World::<P>::new().await;
+    let keys = covered_rows::<P>(&world.deferred, 3);
+    world.defer(COVERED_SHARD, &keys).await;
+    world.reshard_down().await;
+
+    let pin_hour = ACTIVATION_HOUR + 1;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    let generations = persisted_generations(world.store.as_ref(), &world.deferred, P::SIGNAL).await;
+    assert_eq!(
+        stable_generation_for_hour(&generations, pin_hour, DEFAULT_SCAN_SLACK_HOURS),
+        None,
+        "no generation owns an hour inside the activation overlap"
+    );
+    wait_for_commit(&world, &[COVERED_SHARD], pin_hour).await;
+    let store = world.store.as_ref();
+    assert_eq!(
+        rows_at::<P>(store, &world.deferred, COVERED_SHARD, pin_hour).await,
+        expected(&keys),
+        "the flush writes under shard {COVERED_SHARD} in hour {pin_hour}"
     );
     assert_eq!(
         world.router.counters().rerouted,
@@ -1203,7 +1347,8 @@ scan_set_cases!(
     IngestRouter,
     metrics_retired_index_past_the_window_hands_back => retired_index_past_the_window_hands_back,
     metrics_retired_index_inside_the_window_writes_in_place => retired_index_inside_the_window_writes_in_place,
-    metrics_covered_index_writes_in_place_however_late => covered_index_writes_in_place_however_late,
+    metrics_covered_index_in_a_successor_owned_hour_hands_back => covered_index_in_a_successor_owned_hour_hands_back,
+    metrics_covered_index_inside_the_overlap_writes_in_place => covered_index_inside_the_overlap_writes_in_place,
     metrics_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     metrics_charges_follow_the_rows => charges_follow_the_rows,
     metrics_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
@@ -1216,7 +1361,8 @@ scan_set_cases!(
     LogIngestRouter,
     logs_retired_index_past_the_window_hands_back => retired_index_past_the_window_hands_back,
     logs_retired_index_inside_the_window_writes_in_place => retired_index_inside_the_window_writes_in_place,
-    logs_covered_index_writes_in_place_however_late => covered_index_writes_in_place_however_late,
+    logs_covered_index_in_a_successor_owned_hour_hands_back => covered_index_in_a_successor_owned_hour_hands_back,
+    logs_covered_index_inside_the_overlap_writes_in_place => covered_index_inside_the_overlap_writes_in_place,
     logs_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     logs_charges_follow_the_rows => charges_follow_the_rows,
     logs_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
@@ -1229,7 +1375,8 @@ scan_set_cases!(
     SpanIngestRouter,
     spans_retired_index_past_the_window_hands_back => retired_index_past_the_window_hands_back,
     spans_retired_index_inside_the_window_writes_in_place => retired_index_inside_the_window_writes_in_place,
-    spans_covered_index_writes_in_place_however_late => covered_index_writes_in_place_however_late,
+    spans_covered_index_in_a_successor_owned_hour_hands_back => covered_index_in_a_successor_owned_hour_hands_back,
+    spans_covered_index_inside_the_overlap_writes_in_place => covered_index_inside_the_overlap_writes_in_place,
     spans_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     spans_charges_follow_the_rows => charges_follow_the_rows,
     spans_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
