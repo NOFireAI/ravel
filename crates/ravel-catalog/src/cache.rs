@@ -539,6 +539,24 @@ struct HeadCacheEntry {
     cached_at_mono_ns: u64,
 }
 
+impl HeadCacheEntry {
+    /// The same inclusive TTL rule [`HeadCache::get`] serves by.
+    fn is_fresh(&self, now_mono_ns: u64, ttl_ns: i64) -> bool {
+        let age_ns = now_mono_ns.saturating_sub(self.cached_at_mono_ns);
+        i64::try_from(age_ns).is_ok_and(|age_ns| age_ns <= ttl_ns)
+    }
+}
+
+/// What an insert into [`HeadCache`] is judged against.
+#[derive(Clone, Copy)]
+pub(crate) struct HeadCacheBounds {
+    /// A reading, taken for this insert, of the clock later passed to
+    /// [`HeadCache::get`].
+    pub(crate) now_mono_ns: u64,
+    pub(crate) ttl_ns: i64,
+    pub(crate) capacity: usize,
+}
+
 /// State behind [`HeadCache`]'s single lock: the entry map plus its
 /// insertion order, so capacity-cap eviction can pop the oldest (tenant, signal) pair
 /// without a second, separately-lockable structure racing the first.
@@ -546,6 +564,38 @@ struct HeadCacheEntry {
 struct HeadCacheState {
     entries: HashMap<(TenantHash, Signal), HeadCacheEntry>,
     order: std::collections::VecDeque<(TenantHash, Signal)>,
+}
+
+impl HeadCacheState {
+    /// Drop every entry [`HeadCache::get`] would no longer serve.
+    fn drop_expired(&mut self, now_mono_ns: u64, ttl_ns: i64) {
+        self.entries
+            .retain(|_, entry| entry.is_fresh(now_mono_ns, ttl_ns));
+        let entries = &self.entries;
+        self.order.retain(|key| entries.contains_key(key));
+    }
+
+    /// Evict the oldest absence, else the oldest entry. Returns false when
+    /// the cache is empty.
+    fn evict_one_preferring_absence(&mut self) -> bool {
+        let entries = &self.entries;
+        let position = self
+            .order
+            .iter()
+            .position(|key| {
+                entries
+                    .get(key)
+                    .is_some_and(|entry| matches!(entry.head, CachedHead::Absent))
+            })
+            .or_else(|| (!self.order.is_empty()).then_some(0));
+        let Some(position) = position else {
+            return false;
+        };
+        if let Some(key) = self.order.remove(position) {
+            self.entries.remove(&key);
+        }
+        true
+    }
 }
 
 /// Decoded-HEAD cache, one entry per (tenant, signal), with a TTL
@@ -560,7 +610,10 @@ struct HeadCacheState {
 ///
 /// An absence entry ([`CachedHead::Absent`]) counts against the same capacity
 /// but is only admitted while it evicts nothing: at capacity a new absence is
-/// not cached, so it never displaces a present HEAD.
+/// not cached, so it never displaces a present HEAD. A present HEAD inserted
+/// at capacity evicts the oldest absence first and the oldest present HEAD
+/// only when no absence is held, and an absence never replaces an unexpired
+/// present HEAD. Both inserts drop expired entries before judging capacity.
 #[derive(Default)]
 pub(crate) struct HeadCache {
     state: Mutex<HeadCacheState>,
@@ -579,12 +632,9 @@ impl HeadCache {
     ) -> Option<CachedHead> {
         let state = self.state.lock();
         let fresh = state.entries.get(&(*tenant, signal)).and_then(|entry| {
-            let age_ns = clock.now_nanos().saturating_sub(entry.cached_at_mono_ns);
-            if i64::try_from(age_ns).is_ok_and(|age_ns| age_ns <= ttl_ns) {
-                Some((entry.head.clone(), entry.bytes))
-            } else {
-                None
-            }
+            entry
+                .is_fresh(clock.now_nanos(), ttl_ns)
+                .then(|| (entry.head.clone(), entry.bytes))
         });
         drop(state);
         match fresh {
@@ -602,7 +652,9 @@ impl HeadCache {
 
     /// Cache `head` for (tenant, signal). `stamp_mono_ns` is a reading of the
     /// same monotonic clock later passed to [`HeadCache::get`], taken at or
-    /// before the GET that read `head` was issued.
+    /// before the GET that read `head` was issued. A new pair at capacity
+    /// evicts the oldest absence, or the oldest present HEAD when no absence
+    /// is held.
     pub(crate) fn insert(
         &self,
         tenant: TenantHash,
@@ -610,11 +662,20 @@ impl HeadCache {
         head: Arc<SnapshotHead>,
         bytes: u64,
         stamp_mono_ns: u64,
-        capacity: usize,
+        bounds: HeadCacheBounds,
     ) {
+        let capacity = bounds.capacity.max(1);
         let mut state = self.state.lock();
         let entry_key = (tenant, signal);
         if !state.entries.contains_key(&entry_key) {
+            if state.entries.len() >= capacity {
+                state.drop_expired(bounds.now_mono_ns, bounds.ttl_ns);
+            }
+            while state.entries.len() >= capacity {
+                if !state.evict_one_preferring_absence() {
+                    break;
+                }
+            }
             state.order.push_back(entry_key);
         }
         state.entries.insert(
@@ -625,31 +686,42 @@ impl HeadCache {
                 cached_at_mono_ns: stamp_mono_ns,
             },
         );
-        while state.order.len() > capacity.max(1) {
-            if let Some(oldest) = state.order.pop_front() {
-                state.entries.remove(&oldest);
-            }
-        }
     }
 
     /// Record that (tenant, signal) has no HEAD, stamped like
-    /// [`HeadCache::insert`]. Replaces an existing entry for the pair; for a
-    /// pair not yet held it is skipped when the cache is at `capacity`, so an
-    /// absence never evicts another entry.
+    /// [`HeadCache::insert`]. Replaces an existing absence or an expired
+    /// present HEAD for the pair, never an unexpired present HEAD: a GET that
+    /// returned NotFound may finish after a peer's GET cached the HEAD
+    /// published since. For a pair not yet held it is skipped when the cache
+    /// is at capacity after expired entries are dropped, so an absence never
+    /// evicts another entry.
     pub(crate) fn insert_absent(
         &self,
         tenant: TenantHash,
         signal: Signal,
         stamp_mono_ns: u64,
-        capacity: usize,
+        bounds: HeadCacheBounds,
     ) {
         let mut state = self.state.lock();
         let entry_key = (tenant, signal);
-        if !state.entries.contains_key(&entry_key) {
-            if state.entries.len() >= capacity.max(1) {
+        match state.entries.get(&entry_key) {
+            Some(entry)
+                if matches!(entry.head, CachedHead::Present(_))
+                    && entry.is_fresh(bounds.now_mono_ns, bounds.ttl_ns) =>
+            {
                 return;
             }
-            state.order.push_back(entry_key);
+            Some(_) => {}
+            None => {
+                let capacity = bounds.capacity.max(1);
+                if state.entries.len() >= capacity {
+                    state.drop_expired(bounds.now_mono_ns, bounds.ttl_ns);
+                }
+                if state.entries.len() >= capacity {
+                    return;
+                }
+                state.order.push_back(entry_key);
+            }
         }
         state.entries.insert(
             entry_key,
@@ -1830,6 +1902,16 @@ mod tests {
         }
     }
 
+    /// Insert bounds at `now_mono_ns` with the 500 ns TTL these tests read
+    /// back with.
+    fn bounds(now_mono_ns: u64, capacity: usize) -> HeadCacheBounds {
+        HeadCacheBounds {
+            now_mono_ns,
+            ttl_ns: 500,
+            capacity,
+        }
+    }
+
     fn head(tenant_hash: [u8; 16], watermark_hour: u32) -> SnapshotHead {
         SnapshotHead {
             format_version: 1,
@@ -1861,7 +1943,7 @@ mod tests {
             Arc::new(head([5; 16], 10)),
             77,
             1_000,
-            10,
+            bounds(1_000, 10),
         );
         let cached = cache
             .get(&tenant, Signal::Metrics, &MonoAt(1_000), 500, &accounting)
@@ -1888,7 +1970,7 @@ mod tests {
             Arc::new(head([6; 16], 1)),
             1,
             0,
-            10,
+            bounds(0, 10),
         );
         assert!(
             cache
@@ -1913,7 +1995,7 @@ mod tests {
             Arc::new(head([7; 16], 1)),
             1,
             0,
-            10,
+            bounds(0, 10),
         );
         assert!(
             cache
@@ -1938,7 +2020,7 @@ mod tests {
                 Arc::new(head([i; 16], u32::from(i))),
                 1,
                 0,
-                3,
+                bounds(0, 3),
             );
         }
         for i in 0..2u8 {
@@ -1962,8 +2044,7 @@ mod tests {
     }
 
     /// An absence is admitted only while it evicts nothing: at capacity a new
-    /// absence is dropped and every present HEAD stays cached, an absence for a
-    /// pair already held replaces that pair's entry in place, and a later
+    /// absence is dropped and every present HEAD stays cached, and a later
     /// present insert replaces an absence.
     #[test]
     fn head_cache_absence_never_evicts_a_present_head() {
@@ -1976,11 +2057,11 @@ mod tests {
                 Arc::new(head([i; 16], u32::from(i))),
                 1,
                 0,
-                3,
+                bounds(0, 3),
             );
         }
         let newcomer = TenantHash([9; 16]);
-        cache.insert_absent(newcomer, Signal::Metrics, 0, 3);
+        cache.insert_absent(newcomer, Signal::Metrics, 0, bounds(0, 3));
         assert!(
             cache
                 .get(&newcomer, Signal::Metrics, &MonoAt(0), 500, &accounting)
@@ -2003,32 +2084,164 @@ mod tests {
             );
         }
 
+        let absent_first = HeadCache::default();
         let held = TenantHash([1; 16]);
-        cache.insert_absent(held, Signal::Metrics, 0, 3);
+        absent_first.insert_absent(held, Signal::Metrics, 0, bounds(0, 3));
         assert!(matches!(
-            cache.get(&held, Signal::Metrics, &MonoAt(0), 500, &accounting),
+            absent_first.get(&held, Signal::Metrics, &MonoAt(0), 500, &accounting),
             Some(CachedHead::Absent)
         ));
-        for i in [0u8, 2] {
-            assert!(matches!(
-                cache.get(
-                    &TenantHash([i; 16]),
-                    Signal::Metrics,
-                    &MonoAt(0),
-                    500,
-                    &accounting
-                ),
-                Some(CachedHead::Present(_))
-            ));
-        }
-
-        cache.insert(held, Signal::Metrics, Arc::new(head([1; 16], 7)), 1, 0, 3);
+        absent_first.insert(
+            held,
+            Signal::Metrics,
+            Arc::new(head([1; 16], 7)),
+            1,
+            0,
+            bounds(0, 3),
+        );
         let Some(CachedHead::Present(present)) =
-            cache.get(&held, Signal::Metrics, &MonoAt(0), 500, &accounting)
+            absent_first.get(&held, Signal::Metrics, &MonoAt(0), 500, &accounting)
         else {
             panic!("a present insert replaces the absence");
         };
         assert_eq!(present.watermark_hour, 7);
+    }
+
+    /// A NotFound GET that finishes after a peer cached the HEAD published
+    /// since must not overwrite that HEAD; once the HEAD has expired, an
+    /// absence replaces it.
+    #[test]
+    fn head_cache_absence_never_replaces_an_unexpired_present_head() {
+        let cache = HeadCache::default();
+        let accounting = QueryAccounting::new();
+        let tenant = TenantHash([3; 16]);
+        cache.insert(
+            tenant,
+            Signal::Logs,
+            Arc::new(head([3; 16], 4)),
+            1,
+            100,
+            bounds(100, 4),
+        );
+        // The slow GET was issued before the peer's, so its stamp is older.
+        cache.insert_absent(tenant, Signal::Logs, 50, bounds(120, 4));
+        let Some(CachedHead::Present(present)) =
+            cache.get(&tenant, Signal::Logs, &MonoAt(120), 500, &accounting)
+        else {
+            panic!("the present HEAD survives a late absence");
+        };
+        assert_eq!(present.watermark_hour, 4);
+
+        cache.insert_absent(tenant, Signal::Logs, 601, bounds(601, 4));
+        assert!(matches!(
+            cache.get(&tenant, Signal::Logs, &MonoAt(601), 500, &accounting),
+            Some(CachedHead::Absent)
+        ));
+    }
+
+    /// ADR-2509 decision 3: never-folded tenants cannot push folded tenants'
+    /// HEADs out. A present insert at capacity evicts the oldest absence, and
+    /// evicts a present HEAD (the oldest) only once no absence is held.
+    #[test]
+    fn head_cache_present_insert_evicts_an_absence_before_a_present_head() {
+        let cache = HeadCache::default();
+        let accounting = QueryAccounting::new();
+        let present = |i: u8| {
+            cache.insert(
+                TenantHash([i; 16]),
+                Signal::Metrics,
+                Arc::new(head([i; 16], u32::from(i))),
+                1,
+                0,
+                bounds(0, 4),
+            );
+        };
+        let held = |i: u8| {
+            cache.get(
+                &TenantHash([i; 16]),
+                Signal::Metrics,
+                &MonoAt(0),
+                500,
+                &accounting,
+            )
+        };
+        let is_present = |i: u8| matches!(held(i), Some(CachedHead::Present(_)));
+
+        present(0);
+        cache.insert_absent(TenantHash([1; 16]), Signal::Metrics, 0, bounds(0, 4));
+        cache.insert_absent(TenantHash([2; 16]), Signal::Metrics, 0, bounds(0, 4));
+        present(3);
+
+        present(4);
+        assert!(held(1).is_none(), "the oldest absence goes first");
+        assert!(matches!(held(2), Some(CachedHead::Absent)));
+        assert!(is_present(0), "the oldest present HEAD outlives absences");
+
+        present(5);
+        assert!(held(2).is_none(), "the remaining absence goes next");
+        assert!(is_present(0));
+
+        present(6);
+        assert!(held(0).is_none(), "with no absence, the oldest HEAD goes");
+        for i in [3u8, 4, 5, 6] {
+            assert!(is_present(i), "present HEAD {i} stays cached");
+        }
+    }
+
+    /// Expired entries are dropped before capacity is judged: a cache full of
+    /// expired absences and HEADs still admits a new absence.
+    #[test]
+    fn head_cache_expired_entries_do_not_block_new_absences() {
+        let cache = HeadCache::default();
+        let accounting = QueryAccounting::new();
+        cache.insert_absent(TenantHash([0; 16]), Signal::Logs, 0, bounds(0, 2));
+        cache.insert(
+            TenantHash([1; 16]),
+            Signal::Logs,
+            Arc::new(head([1; 16], 1)),
+            1,
+            0,
+            bounds(0, 2),
+        );
+
+        let newcomer = TenantHash([2; 16]);
+        cache.insert_absent(newcomer, Signal::Logs, 501, bounds(501, 2));
+        assert!(matches!(
+            cache.get(&newcomer, Signal::Logs, &MonoAt(501), 500, &accounting),
+            Some(CachedHead::Absent)
+        ));
+    }
+
+    /// A present insert at capacity drops an expired entry rather than
+    /// evicting an older-inserted HEAD that is still fresh.
+    #[test]
+    fn head_cache_present_insert_drops_expired_before_evicting_a_fresh_head() {
+        let cache = HeadCache::default();
+        let accounting = QueryAccounting::new();
+        let insert = |i: u8, stamp: u64, now: u64| {
+            cache.insert(
+                TenantHash([i; 16]),
+                Signal::Logs,
+                Arc::new(head([i; 16], u32::from(i))),
+                1,
+                stamp,
+                bounds(now, 2),
+            );
+        };
+        insert(0, 400, 400);
+        // Inserted second, from a GET stamped earlier: expired first.
+        insert(1, 0, 400);
+        insert(2, 600, 600);
+        assert!(matches!(
+            cache.get(
+                &TenantHash([0; 16]),
+                Signal::Logs,
+                &MonoAt(600),
+                500,
+                &accounting
+            ),
+            Some(CachedHead::Present(_))
+        ));
     }
 
     /// Below capacity an absence is cached and expires on the same TTL rule as
@@ -2038,7 +2251,7 @@ mod tests {
         let cache = HeadCache::default();
         let accounting = QueryAccounting::new();
         let tenant = TenantHash([8; 16]);
-        cache.insert_absent(tenant, Signal::Logs, 100, 4);
+        cache.insert_absent(tenant, Signal::Logs, 100, bounds(100, 4));
         assert!(matches!(
             cache.get(&tenant, Signal::Logs, &MonoAt(600), 500, &accounting),
             Some(CachedHead::Absent)

@@ -6184,13 +6184,18 @@ mod tests {
         // Seed the decoded-HEAD cache directly for both tenants so each has an
         // observable per-tenant outer-map entry to assert on.
         let acc = QueryAccounting::new();
+        let bounds = || crate::cache::HeadCacheBounds {
+            now_mono_ns: catalog.monotonic_clock().now_nanos(),
+            ttl_ns: i64::MAX,
+            capacity: 8,
+        };
         catalog.head_cache().insert(
             idle,
             Signal::Metrics,
             Arc::new(synthetic_head(idle)),
             1,
             catalog.monotonic_clock().now_nanos(),
-            8,
+            bounds(),
         );
         catalog.head_cache().insert(
             active,
@@ -6198,7 +6203,7 @@ mod tests {
             Arc::new(synthetic_head(active)),
             1,
             catalog.monotonic_clock().now_nanos(),
-            8,
+            bounds(),
         );
 
         // The active tenant resolves again right before the sweep, so its

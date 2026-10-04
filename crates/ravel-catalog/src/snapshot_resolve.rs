@@ -26,7 +26,7 @@ use ravel_types::accounting::QueryAccounting;
 use ravel_types::{Signal, TenantHash, TimeRange};
 use uuid::Uuid;
 
-use crate::cache::CachedHead;
+use crate::cache::{CachedHead, HeadCacheBounds};
 use crate::catalog::Catalog;
 use crate::charged::{Charged, ChargedPart, ChargedPostings};
 use crate::declared_stats::{self, DeclaredColumnStats};
@@ -651,7 +651,7 @@ impl Catalog {
                         *tenant,
                         signal,
                         stamp_mono_ns,
-                        self.config().head_cache_capacity,
+                        self.head_cache_bounds(),
                     );
                 }
                 return Ok(None);
@@ -700,9 +700,19 @@ impl Catalog {
             head.clone(),
             bytes,
             stamp_mono_ns,
-            self.config().head_cache_capacity,
+            self.head_cache_bounds(),
         );
         Ok(Some((head, revalidated)))
+    }
+
+    /// The bounds a [`crate::cache::HeadCache`] insert is judged against,
+    /// with the clock read now.
+    fn head_cache_bounds(&self) -> HeadCacheBounds {
+        HeadCacheBounds {
+            now_mono_ns: self.monotonic_clock().now_nanos(),
+            ttl_ns: self.config().head_cache_ttl_ns,
+            capacity: self.config().head_cache_capacity,
+        }
     }
 
     /// Validate a HEAD's `shard_count` against the generation history under
