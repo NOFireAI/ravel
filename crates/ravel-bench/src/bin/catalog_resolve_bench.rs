@@ -19,7 +19,7 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::s3::{S3Config, S3Store};
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
-    PageToken, PutOptions, PutOutcome, StoreError,
+    PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
 };
 use ravel_query::{EngineConfig, QueryEngine};
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput, WrittenSegment};
@@ -160,6 +160,25 @@ impl ObjectStoreBackend for CountingStore {
         self.inner.get(key, range).await
     }
 
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        self.counters.get.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_pinned(key, range, pin).await
+    }
+
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        self.counters.get.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_with_pin(key, range).await
+    }
+
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        self.inner.pin_of(key).await
+    }
+
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
         self.inner.head(key).await
     }
@@ -167,6 +186,16 @@ impl ObjectStoreBackend for CountingStore {
     async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
         self.counters.list.fetch_add(1, Ordering::Relaxed);
         self.inner.list(prefix, page).await
+    }
+
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.counters.list.fetch_add(1, Ordering::Relaxed);
+        self.inner.list_after(prefix, start_after, page).await
     }
 
     async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
@@ -185,6 +214,10 @@ impl ObjectStoreBackend for CountingStore {
             multipart: false,
             ..self.inner.capabilities()
         }
+    }
+
+    fn observed_store_time_ns(&self) -> Option<i64> {
+        self.inner.observed_store_time_ns()
     }
 }
 
