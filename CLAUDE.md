@@ -120,7 +120,9 @@ and test gates on every push. Where cargo-nextest is installed, `cargo
 nextest run` is an accepted equivalent of `cargo test` (CI's check job
 runs it with the `ci-opt` profile, which is `ci` with third-party
 dependencies optimised; use `ci` locally, since a cold build pays for that
-optimisation); doctests still need `cargo test --doc`.
+optimisation, and `cargo nextest run --locked --workspace --cargo-profile
+ci-opt` to reproduce a failure that appears only in CI); doctests still need
+`cargo test --doc`.
 
 One narrowing for commits that can only land through a PR on protected
 `main`: when the exact tree was already taken through the full gate list
