@@ -3,9 +3,9 @@
 Status: Accepted (2026-10-04). Issue #2467.
 No persistent format changes. Every RLOG object stays byte-identical; this
 decision changes which in-memory path builds it.
-Amends ADR-0109 decision 7 in one respect: the row builder stops being a
-production path and stays as the differential reference. ADR-0109 carries an
-amendment section pointing here.
+Amends ADR-0109 decisions 5 and 7: the columnar path is no longer bulk-load
+only, and the row builder stops being a production path and stays as the
+differential reference. ADR-0109 carries an amendment section pointing here.
 
 ## Context
 
@@ -106,15 +106,29 @@ figures are for 20,000-record objects.
    builder is `build_object`, `resolve_row` and `ResolvedRow`, plus the
    block-level row encoder they feed: `write_block`, `row_column` and
    `winner_value` in `block.rs`. All of it moves behind one off-by-default
-   feature of `ravel-logseg`, enabled by the crate's own tests and benches.
-   `#[cfg(test)]` alone is not enough, because the `wide_gather` bench, which
-   is ADR-0109's standing evidence for the row gather's cost, imports
-   `ResolvedRow` and `write_block` and a bench is its own compilation unit.
-   A production build does not enable the feature and cannot reach the
-   reference. ADR-0109 decision 7's writer-level differential test drives its
-   row arm through `push` and `finish`, which after decision 1 is the
-   columnar builder, so that arm is rewired to call the reference builder
-   directly; otherwise the test compares the columnar builder with itself.
+   feature of `ravel-logseg`. `#[cfg(test)]` alone is not enough, because
+   four things outside the crate's own unit tests use that surface, and each
+   is its own compilation unit:
+
+   - `ravel-logseg`'s `wide_gather` bench, ADR-0109's standing evidence for
+     the row gather's cost. The crate enables the feature for its own tests
+     and benches.
+   - `ravel-sql`'s unit tests in `logs_scan.rs` and its `logs_columnar`
+     integration test. `ravel-sql` enables the feature in its
+     dev-dependencies only.
+   - `ravel-bench`'s `page_codec_bakeoff` bin, which is in that crate's
+     default build today. `ravel-bench` gains a feature that forwards to
+     this one, and the bin takes it as a required feature, as the crate's
+     other optional bins do.
+
+   The four shipped binaries are built one package at a time and none of
+   them depends on `ravel-bench` or on another crate's dev-dependencies, so
+   none of them enables the feature. A workspace build with all targets does
+   enable it, through `ravel-sql`'s dev-dependency. ADR-0109 decision 7's
+   writer-level differential test drives its row arm through `push` and
+   `finish`, which after decision 1 is the columnar builder, so that arm is
+   rewired to call the reference builder directly; otherwise the test
+   compares the columnar builder with itself.
 
 4. **A width gate before decision 1 lands.** The implementing task measures
    encode wall time on a wide shape (at least 100 dynamic columns per record)
@@ -125,10 +139,12 @@ figures are for 20,000-record objects.
    same task and reported, with no bar.
 
 5. **The stream directory is encoded once, from borrowed blobs.**
-   `StreamDir::encode` writes into a buffer sized for its content, reading
-   each stream's attrs blob from where the writer already holds it, instead
-   of copying every blob into an entry and again into a growing buffer. The
-   directory is built immediately before it is written and dropped after.
+   The writer gains an encode-side entry point that takes borrowed entries
+   (a stream id, a borrowed attrs blob and the block range) and writes them
+   into a buffer sized for its content, instead of copying every blob into
+   an owned `StreamEntry` and again into a growing buffer. The owned
+   `StreamDir` and `StreamEntry` the reader decodes into are unchanged. The
+   directory is encoded immediately before it is written.
 
 6. **Structures are released after their last read.** The per-block stat and
    indexed-term scratch (1.31 MB at these shapes), the skip index, the page
@@ -156,7 +172,7 @@ flowchart TD
         C2["push_columnar(batch)"] --> BC["build_object_columnar"]
         BA --> BC
         BC --> O2["RLOG object, same bytes"]
-        T["build_object<br/>cfg(test) reference"] -.->|"byte-identity tests"| O2
+        T["build_object<br/>reference, behind a cargo feature"] -.->|"byte-identity tests"| O2
     end
 ```
 
@@ -197,7 +213,7 @@ flowchart TD
   gate runs.
 - One production builder instead of two. A defect in the columnar builder
   now reaches ingest and compaction as well as bulk load.
-- The test-only row builder must keep compiling and keep matching. A change
+- The reference row builder must keep compiling and keep matching. A change
   to the columnar builder that alters object bytes still fails the
   byte-identity tests, as today.
 - Encoded objects do not change.
