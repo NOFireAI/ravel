@@ -4,9 +4,9 @@ Status: Accepted (2026-10-04); decisions 1 to 4 parked by the amendment of
 2026-10-05. Issue #2467.
 No persistent format changes. Every RLOG object stays byte-identical; this
 decision changes which in-memory path builds it.
-Amends ADR-0109 decisions 5 and 7: the columnar path is no longer bulk-load
-only, and the row builder stops being a production path and stays as the
-differential reference. ADR-0109 carries an amendment section pointing here.
+As accepted, this ADR amended ADR-0109 decisions 5 and 7. The amendment of
+2026-10-05 below withdraws that: those two decisions stand as ADR-0109 wrote
+them, and ADR-0109 carries both amendments.
 
 ## Context
 
@@ -345,13 +345,24 @@ What changes:
   rows are resolved, and the resolved rows are last read in the block loop;
   after it only their count is used. Each is dropped after that last read,
   the rows with their count kept, before the trailing sections are
-  assembled. In both builders the skip index, the
-  page and field directories and the bloom entries are dropped after their
-  last read. The profile in "Stage 0: the true peak" puts the row builder's
-  peak at 20,000 streams in section assembly, with the resolved rows still
-  alive, so this is where that shape's saving is. How much it saves is not
-  measured; the task that implements it pre-registers a figure and measures
-  it with the same profiler.
+  assembled. In the columnar builder the per-block stat and indexed-term
+  scratch is dropped after the block loop. In both builders the skip index,
+  the page and field directories and the bloom entries are dropped after
+  their last read. Where the row builder's peak falls at 20,000 streams is
+  not stated in "Stage 0: the true peak", which breaks that builder's peak
+  down only at 1 stream. It is read from the site table of the same
+  measurement (`stage0f-true-peak.md` on the #2485 result branch, row arm,
+  20,000 streams), which lists the stream directory's encode buffer, one
+  resolved-row vector, the per-row material and the stream seeds as live
+  together at the peak. That places the peak in section assembly with the
+  rows and seeds still alive, which is why the saving for that shape is
+  expected here. It is an inference from the site list, not a located
+  measurement, and the saving itself is unmeasured: the task that implements
+  this pre-registers a figure and measures it with the same profiler.
+- **Decision 7's out-of-scope list is narrowed by one item.** It excluded
+  the stream seeds, meaning their size: 160 bytes per stream on both
+  builders, 3.2 MB at 20,000 streams. Their size stays out of scope. How
+  long they are held is now in scope, under decision 6.
 - **Consequences that no longer hold:** the estimated 23% to 25% lower peak,
   the lower encode time on wide records, one production builder instead of
   two, and `ColumnarLogBatch::validate` running on every row-shaped encode.
