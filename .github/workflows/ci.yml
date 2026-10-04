@@ -374,6 +374,13 @@ jobs:
         run: bash scripts/guards/check-promql-unreachable.test.sh
       - name: PromQL-unreachable guard (issue #1701)
         run: bash scripts/guards/check-promql-unreachable.sh
+      # Published binaries are built on the optimised release profile (issue
+      # #2528). Other profiles are tuned for test speed; this pins the one the
+      # shipping Dockerfile builds on. Cases first, same reason as above.
+      - name: Release-profile guard cases (issue #2528)
+        run: bash scripts/guards/check-release-profile.test.sh
+      - name: Release-profile guard (issue #2528)
+        run: bash scripts/guards/check-release-profile.sh
       # A user guide must not keep a figure a later record superseded (issue
       # #1736): an operator picks a flag value from it. Cases first, same reason
       # as the guards above, and this one passes everything if its anchor page
