@@ -9707,11 +9707,13 @@ mod fast_path_prefetch_tests {
         );
     }
 
-    /// What partition 0 produced under a fetch memory budget of `limit`
-    /// bytes: its rows, `segments_opened`, `fast_path_ranged_segments`,
+    /// What partition 0 of a two-partition exec produced, executed alone,
+    /// under a fetch memory budget of `limit` bytes: its rows,
+    /// `segments_opened`, `fast_path_ranged_segments`,
     /// `prefetch_memory_reopens`, and the scan phase's data objects touched,
     /// or the error the stream ended with. `pipelined: false` turns the
-    /// pipeline off the way [`sequential`] does.
+    /// pipeline off the way [`sequential`] does. Every reservation is checked
+    /// released before an error is returned.
     async fn budgeted(
         limit: u64,
         pipelined: bool,
@@ -9739,8 +9741,12 @@ mod fast_path_prefetch_tests {
         .await
         .expect("the scan ends rather than retrying a refused open forever");
         drop(stream);
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "every fetch reservation is released, on success and on error"
+        );
         drained?;
-        assert_eq!(budget.reserved(), 0, "every fetch reservation is released");
         Ok((
             rows,
             metric_total(plan.as_ref(), "segments_opened"),
@@ -9750,20 +9756,18 @@ mod fast_path_prefetch_tests {
         ))
     }
 
-    /// A ranged prefetch the fetch memory budget refuses does not fail a
-    /// query the sequential walk runs: at the smallest budget the sequential
-    /// walk completes in, the pipelined walk (share 2) holds two opens at
-    /// once, is refused, turns its pipeline off and reopens the refused
-    /// segment sequentially, and returns the sequential walk's rows,
-    /// segments opened, ranged-route count and data objects touched, with
-    /// the fallback counted exactly once. One byte below that budget the
-    /// sequential reopen is refused too, and the query fails with the typed
-    /// refusal instead of retrying.
+    /// One partition, partition 0 of a two-partition exec executed alone: a
+    /// ranged prefetch the fetch memory budget refuses does not fail a query
+    /// the sequential walk runs. At the smallest budget the sequential walk
+    /// completes in, the pipelined walk (share 2) is refused its second open,
+    /// turns the pipeline off and retries the refused segment once at its
+    /// turn, and returns the sequential walk's rows, segments opened,
+    /// ranged-route count and data objects touched, with the retry counted
+    /// exactly once. One byte below that budget the retry is refused too, and
+    /// the query fails with the typed refusal, every reservation released.
     ///
     /// Fails against failing the query on the prefetch's refusal (the first
-    /// pipelined run errors), against a reopen that keeps the opens behind
-    /// the refused one in flight (they hold the bytes the reopen needs, so it
-    /// is refused again), and against retrying every refusal (the run one
+    /// pipelined run errors) and against retrying every refusal (the run one
     /// byte short never ends, and the timeout fires).
     #[tokio::test]
     async fn a_prefetch_refused_by_the_memory_budget_reopens_sequentially() {
@@ -9823,5 +9827,647 @@ mod fast_path_prefetch_tests {
                 "the typed refusal surfaces (pipelined {pipelined}): {err}"
             );
         }
+    }
+
+    /// The largest budget [`fits_with`] bisects from; every run fits in it.
+    const CEILING: u64 = 1 << 24;
+
+    /// How [`run_statement`] drives the partitions of one exec.
+    #[derive(Clone)]
+    enum Drive {
+        /// One item from each live partition in turn, partition 0 first.
+        Lockstep,
+        /// One spawned task per partition.
+        Spawned,
+        /// Each listed partition to its end, in the order given.
+        Order(Vec<usize>),
+    }
+
+    /// What every partition of one statement produced.
+    struct Statement {
+        /// Each partition's timestamps, in emitted order.
+        rows: Vec<Vec<i64>>,
+        plan: Arc<dyn ExecutionPlan>,
+        scan: QueryAccountingSnapshot,
+    }
+
+    impl Statement {
+        fn metric(&self, name: &str) -> usize {
+            metric_total(self.plan.as_ref(), name)
+        }
+    }
+
+    /// The fixture's rows for `segments`, in that order.
+    fn rows_of(segments: &[usize]) -> Vec<i64> {
+        segments
+            .iter()
+            .flat_map(|&s| (0..BLOCKS).map(move |j| s as i64 * SPAN + j))
+            .collect()
+    }
+
+    /// Executes every partition of ONE exec over the fixture (segment
+    /// `overflow`, if any, falling back to the `attrs_raw` reopen), at
+    /// `partitions` partitions and 4 GET permits, under one fetch memory
+    /// budget of `limit` bytes, driven by `drive`. Every stream is dropped
+    /// and the budget's reserved bytes are asserted 0 before any error is
+    /// returned. `pipelined: false` turns the pipeline off the way
+    /// [`sequential`] does.
+    async fn run_statement(
+        limit: u64,
+        partitions: usize,
+        overflow: Option<usize>,
+        pipelined: bool,
+        drive: Drive,
+    ) -> Result<Statement, DataFusionError> {
+        let (store, segments) = fixture(overflow).await;
+        let accounting = PhaseAccounting::new();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
+        let exec = Arc::new(exec_with(
+            fetcher,
+            &segments,
+            partitions,
+            accounting.clone(),
+        ));
+        let plan: Arc<dyn ExecutionPlan> = if pipelined {
+            exec
+        } else {
+            exec.with_fetch(Some(usize::MAX)).expect("fetch pushdown")
+        };
+        let streams: Vec<SendableRecordBatchStream> = (0..partitions)
+            .map(|p| {
+                plan.execute(p, Arc::new(TaskContext::default()))
+                    .expect("execute")
+            })
+            .collect();
+        let mut rows = vec![Vec::new(); partitions];
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            drive_streams(streams, drive, &mut rows),
+        )
+        .await
+        .expect("the statement ends rather than waiting or retrying forever");
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "every stream dropped releases every fetch reservation"
+        );
+        outcome?;
+        Ok(Statement {
+            rows,
+            plan,
+            scan: accounting.scan().snapshot(),
+        })
+    }
+
+    /// Drives `streams` (partition `p` at index `p`) to their ends, or to the
+    /// first error, collecting each partition's timestamps into `rows`. Every
+    /// stream is dropped before this returns.
+    async fn drive_streams(
+        streams: Vec<SendableRecordBatchStream>,
+        drive: Drive,
+        rows: &mut [Vec<i64>],
+    ) -> Result<(), DataFusionError> {
+        match drive {
+            Drive::Lockstep => {
+                let mut live: Vec<Option<SendableRecordBatchStream>> =
+                    streams.into_iter().map(Some).collect();
+                while live.iter().any(Option::is_some) {
+                    for (p, slot) in live.iter_mut().enumerate() {
+                        let Some(stream) = slot.as_mut() else {
+                            continue;
+                        };
+                        match stream.next().await {
+                            Some(Ok(batch)) => rows[p].extend(timestamps(&[batch])),
+                            Some(Err(e)) => return Err(e),
+                            None => *slot = None,
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Drive::Spawned => {
+                let tasks: Vec<_> = streams
+                    .into_iter()
+                    .map(|mut stream| {
+                        tokio::spawn(async move {
+                            let mut out = Vec::new();
+                            while let Some(item) = stream.next().await {
+                                out.extend(timestamps(&[item?]));
+                            }
+                            Ok::<_, DataFusionError>(out)
+                        })
+                    })
+                    .collect();
+                let mut first_error = None;
+                for (p, task) in tasks.into_iter().enumerate() {
+                    match task.await.expect("partition task") {
+                        Ok(out) => rows[p] = out,
+                        Err(e) => {
+                            first_error.get_or_insert(e);
+                        }
+                    }
+                }
+                first_error.map_or(Ok(()), Err)
+            }
+            Drive::Order(order) => {
+                let mut live: Vec<Option<SendableRecordBatchStream>> =
+                    streams.into_iter().map(Some).collect();
+                for p in order {
+                    let Some(mut stream) = live[p].take() else {
+                        continue;
+                    };
+                    while let Some(item) = stream.next().await {
+                        rows[p].extend(timestamps(&[item?]));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The smallest budget at which `partitions` partitions with the
+    /// pipeline off, driven by `drive`, complete.
+    async fn fits_with(partitions: usize, overflow: Option<usize>, drive: Drive) -> u64 {
+        assert!(
+            run_statement(CEILING, partitions, overflow, false, drive.clone())
+                .await
+                .is_ok(),
+            "the ceiling fits"
+        );
+        let (mut lo, mut hi) = (0u64, CEILING);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if run_statement(mid, partitions, overflow, false, drive.clone())
+                .await
+                .is_ok()
+            {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        hi
+    }
+
+    /// Whether partition `p`'s slot holds a prefetch that resolved with an
+    /// open scan.
+    fn holds_open_prefetch(exec: &LogsScanExec, p: usize) -> bool {
+        exec.prefetch_pool
+            .slot(p)
+            .expect("slot")
+            .prefetched
+            .iter()
+            .any(|f| matches!(&f.open, PrefetchOpen::Ready { opened, .. } if matches!(**opened, Ok(Some(_)))))
+    }
+
+    /// What [`reopen_refused`] observed.
+    struct ReopenRun {
+        rows: [Vec<i64>; 2],
+        exec: Arc<LogsScanExec>,
+        /// Whether partition 1 held its current open and an open prefetch
+        /// while partition 0's `attrs_raw` reopen GET was held.
+        sibling_held_both: bool,
+        /// Calls the hold gate held for the reopen, counted when partition 0
+        /// was parked on it.
+        reopen_held: usize,
+    }
+
+    /// The overflow fixture (segment 0's last block falls back to the
+    /// `attrs_raw` reopen) at two partitions under a budget of `limit`, in a
+    /// forced order: partition 0 drains segment 0's three clean blocks and
+    /// parks on its reopen's first GET, held by a gate on segment 0's key;
+    /// only then is partition 1 polled until it has emitted its first batch,
+    /// which leaves it holding segment 1's open and segment 3's prefetch;
+    /// then the gate releases everything and partition 0, then partition 1,
+    /// run to their ends. Every stream is dropped and reserved bytes are
+    /// asserted 0 before an error is returned.
+    async fn reopen_refused(limit: u64) -> Result<ReopenRun, DataFusionError> {
+        let (store, segments) = fixture(Some(0)).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
+        let exec = Arc::new(exec_with(fetcher, &segments, 2, PhaseAccounting::new()));
+        let gate = store.hold(Op::Get, Some(key(0)), Occurrence::Always);
+        let mut s0 = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute 0");
+        let mut s1 = exec
+            .execute(1, Arc::new(TaskContext::default()))
+            .expect("execute 1");
+        let mut rows = [Vec::new(), Vec::new()];
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            let reopen_held = loop {
+                match futures::poll!(s0.next()) {
+                    Poll::Ready(Some(item)) => rows[0].extend(timestamps(&[item?])),
+                    Poll::Ready(None) => {
+                        return Err(DataFusionError::Internal(
+                            "partition 0 ended before its reopen".into(),
+                        ));
+                    }
+                    Poll::Pending => {
+                        if rows[0].len() == BLOCKS as usize - 1 && held_on(&gate, 0) {
+                            break gate.held_count();
+                        }
+                        for id in gate.held() {
+                            gate.release(id);
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                }
+            };
+            loop {
+                match futures::poll!(s1.next()) {
+                    Poll::Ready(Some(item)) => {
+                        rows[1].extend(timestamps(&[item?]));
+                        break;
+                    }
+                    Poll::Ready(None) => {
+                        return Err(DataFusionError::Internal(
+                            "partition 1 ended before its first batch".into(),
+                        ));
+                    }
+                    Poll::Pending => tokio::task::yield_now().await,
+                }
+            }
+            let sibling_held_both = holds_open_prefetch(&exec, 1);
+            let releaser = release_all(gate.clone());
+            let drained = async {
+                while let Some(item) = s0.next().await {
+                    rows[0].extend(timestamps(&[item?]));
+                }
+                while let Some(item) = s1.next().await {
+                    rows[1].extend(timestamps(&[item?]));
+                }
+                Ok::<(), DataFusionError>(())
+            }
+            .await;
+            releaser.abort();
+            drained.map(|()| (sibling_held_both, reopen_held))
+        })
+        .await
+        .expect("the statement ends rather than waiting or retrying forever");
+        drop(s0);
+        drop(s1);
+        assert_eq!(budget.reserved(), 0, "every fetch reservation is released");
+        let (sibling_held_both, reopen_held) = outcome?;
+        Ok(ReopenRun {
+            rows,
+            exec,
+            sibling_held_both,
+            reopen_held,
+        })
+    }
+
+    /// `name`'s value on partition `p` alone.
+    fn partition_metric(plan: &dyn ExecutionPlan, name: &str, p: usize) -> usize {
+        plan.metrics()
+            .expect("metrics")
+            .iter()
+            .filter(|m| {
+                m.value().name() == name && m.labels().is_empty() && m.partition() == Some(p)
+            })
+            .map(|m| m.value().as_usize())
+            .sum()
+    }
+
+    /// The smallest budget the one-partition pipeline-off run completes in.
+    async fn fits_1() -> u64 {
+        fits_with(1, None, Drive::Order(vec![0])).await
+    }
+
+    /// The smallest budget the two-partition pipeline-off run, driven in
+    /// lockstep, completes in.
+    async fn fits_2(overflow: Option<usize>) -> u64 {
+        fits_with(2, overflow, Drive::Lockstep).await
+    }
+
+    /// At two partitions in lockstep and the budget the pipeline-off run
+    /// needs, partition 0 holds its current open and a prefetch when
+    /// partition 1's first open is refused: the refusal drops partition 0's
+    /// prefetch, hands its segment back, and partition 1's retry succeeds.
+    /// Rows per partition, segments opened, the route split and data objects
+    /// touched are the pipeline-off run's.
+    ///
+    /// Fails against the branch before the pool (partition 1 holds nothing
+    /// behind its open and fails with no retry), against dropping only the
+    /// refused partition's own prefetches (the retry is refused again),
+    /// and against dropping without handing the segments back (segment 2's
+    /// rows are missing).
+    #[tokio::test]
+    async fn a_refused_open_drops_every_partitions_prefetches_and_retries_once() {
+        assert_eq!(fast_path_prefetch_share(4, 2), 2);
+        let fits_1 = fits_1().await;
+        let fits_2 = fits_2(None).await;
+        assert!(fits_2 >= fits_1, "{fits_2} >= {fits_1}");
+        let off = run_statement(fits_2, 2, None, false, Drive::Lockstep)
+            .await
+            .expect("the pipeline-off run fits");
+        assert_eq!(off.rows, [rows_of(&[0, 2, 4]), rows_of(&[1, 3, 5])]);
+        let on = run_statement(fits_2, 2, None, true, Drive::Lockstep)
+            .await
+            .expect("the pipelined run retries instead of failing");
+        assert_eq!(on.rows, off.rows);
+        assert_eq!(
+            (
+                on.metric("segments_opened"),
+                on.metric("fast_path_ranged_segments"),
+                on.scan.data_objects_touched
+            ),
+            (6, 6, 6)
+        );
+        let reopens = on.metric("prefetch_memory_reopens");
+        assert!(
+            (1..=2).contains(&reopens),
+            "a refusal occurs and each partition retries at most once: {reopens}"
+        );
+        let revocations = on.metric("prefetch_revocations");
+        assert!(
+            revocations <= 2,
+            "at most one prefetch per partition: {revocations}"
+        );
+        assert_eq!(off.metric("prefetch_memory_reopens"), 0);
+    }
+
+    /// Two partitions on spawned tasks at the two-partition pipeline-off
+    /// budget both complete with the pipeline-off rows. One byte below the
+    /// one-partition pipeline-off budget, which no interleaving of the two
+    /// tasks completes in, the run ends with the typed refusal inside the
+    /// timeout. Both runs release every reservation once their streams are
+    /// dropped ([`run_statement`]), and so does dropping both streams after
+    /// their first batch, while each slot holds an open prefetch and the
+    /// plan is still alive.
+    ///
+    /// Fails against retrying every refusal (the run one byte short never
+    /// ends and the timeout fires) and against a `Drop` that does not clear
+    /// the stream's slot (the cancelled prefetches stay reserved).
+    #[test]
+    fn all_partitions_spawned_match_the_sequential_walk_below_the_pipelined_peak() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(async {
+                let fits_1 = fits_1().await;
+                let fits_2 = fits_2(None).await;
+                let off = run_statement(fits_2, 2, None, false, Drive::Lockstep)
+                    .await
+                    .expect("pipeline off fits");
+                let spawned = run_statement(fits_2, 2, None, true, Drive::Spawned)
+                    .await
+                    .expect("both spawned partitions complete");
+                let sorted = |rows: &[Vec<i64>]| {
+                    let mut all: Vec<i64> = rows.concat();
+                    all.sort_unstable();
+                    all
+                };
+                assert_eq!(sorted(&spawned.rows), sorted(&off.rows));
+                assert_eq!(
+                    spawned.rows, off.rows,
+                    "each partition's own rows, in order"
+                );
+                assert_eq!(spawned.metric("segments_opened"), 6);
+
+                let err = run_statement(fits_1 - 1, 2, None, true, Drive::Spawned)
+                    .await
+                    .err()
+                    .expect("one byte below the one-partition fit refuses");
+                assert!(is_fetch_memory_refusal(&err), "typed refusal: {err}");
+
+                let (store, segments) = fixture(None).await;
+                let budget = Arc::new(ravel_memory::MemoryBudget::new(CEILING));
+                let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
+                let exec = exec_with(fetcher, &segments, 2, PhaseAccounting::new());
+                let mut streams: Vec<SendableRecordBatchStream> = (0..2)
+                    .map(|p| {
+                        exec.execute(p, Arc::new(TaskContext::default()))
+                            .expect("execute")
+                    })
+                    .collect();
+                for stream in &mut streams {
+                    stream
+                        .next()
+                        .await
+                        .expect("a first batch")
+                        .expect("first batch");
+                }
+                assert!(
+                    holds_open_prefetch(&exec, 0) && holds_open_prefetch(&exec, 1),
+                    "each slot holds an open prefetch when the streams are dropped"
+                );
+                drop(streams);
+                assert_eq!(
+                    budget.reserved(),
+                    0,
+                    "dropped streams release their prefetches with the plan still alive"
+                );
+            });
+        }));
+        rt.shutdown_timeout(Duration::from_secs(1));
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// Partition 1 alone is polled until it holds its current open and a
+    /// prefetch, at the two-partition pipeline-off budget. Then only
+    /// partition 0 is polled: its first open is refused, it drops partition
+    /// 1's prefetch from its own task, retries and finishes segments 0, 2
+    /// and 4 with partition 1 never polled in between. Partition 1 then
+    /// reopens segment 3 from the segments handed back to it.
+    ///
+    /// Fails against any design in which the refused open waits for
+    /// partition 1 to be polled (the timeout fires), against dropping only
+    /// partition 0's own prefetches (its retry is refused again), and
+    /// against handing segment 3 back into partition 0's work (partition 0's
+    /// rows gain segment 3, partition 1's lose it).
+    #[tokio::test]
+    async fn the_refused_partition_completes_without_its_sibling_being_polled() {
+        let fits_2 = fits_2(None).await;
+        let off = run_statement(fits_2, 2, None, false, Drive::Lockstep)
+            .await
+            .expect("pipeline off fits");
+        let (store, segments) = fixture(None).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(fits_2));
+        let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
+        let exec = exec_with(fetcher, &segments, 2, PhaseAccounting::new());
+        let mut s0 = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute 0");
+        let mut s1 = exec
+            .execute(1, Arc::new(TaskContext::default()))
+            .expect("execute 1");
+
+        let mut rows1 = timestamps(&[s1
+            .next()
+            .await
+            .expect("partition 1's first batch")
+            .expect("batch")]);
+        assert!(
+            holds_open_prefetch(&exec, 1),
+            "partition 1 holds segment 3's prefetch"
+        );
+
+        let rows0 = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut rows = Vec::new();
+            while let Some(item) = s0.next().await {
+                rows.extend(timestamps(&[item.expect("partition 0 completes")]));
+            }
+            rows
+        })
+        .await
+        .expect("partition 0 completes without partition 1 being polled");
+        assert_eq!(rows0, off.rows[0]);
+        assert_eq!(partition_metric(&exec, "prefetch_memory_reopens", 0), 1);
+        assert_eq!(partition_metric(&exec, "prefetch_revocations", 0), 1);
+        drop(s0);
+        assert!(
+            budget.reserved() > 0,
+            "partition 1's current open is still held"
+        );
+
+        while let Some(item) = s1.next().await {
+            rows1.extend(timestamps(&[item.expect("partition 1 completes")]));
+        }
+        assert_eq!(rows1, off.rows[1], "segment 3 is reopened from handed_back");
+        drop(s1);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// One partition owning all six segments, share 4, at the budget the
+    /// pipeline-off run needs: segment 0 opens, the three prefetches behind
+    /// it are refused, and the first of them is consumed refused at its
+    /// turn, which drops the other two and retries it once. The dropped
+    /// segments go back to work in owned order, so rows come segment 0 to
+    /// segment 5, in order.
+    ///
+    /// Fails against popping from the front in the revoker's drain or in the
+    /// owner's hand-back drain (segments 2 and 3 swap), against dropping
+    /// without handing back (segments 2 and 3 are missing), against leaving
+    /// the pipeline on (the retried segment's prefetches are refused and
+    /// retried again, two reopens), and against failing the query at the
+    /// consumed prefetch's refusal.
+    #[tokio::test]
+    async fn released_prefetches_go_back_to_work_in_owned_order() {
+        assert_eq!(fast_path_prefetch_share(4, 1), 4);
+        let fits_1 = fits_1().await;
+        let run = run_statement(fits_1, 1, None, true, Drive::Order(vec![0]))
+            .await
+            .expect("the pipelined run retries instead of failing");
+        assert_eq!(run.rows, [rows_of(&[0, 1, 2, 3, 4, 5])]);
+        assert_eq!(run.metric("segments_opened"), 6);
+        assert_eq!(run.metric("prefetch_memory_reopens"), 1);
+        assert_eq!(
+            run.metric("prefetch_revocations"),
+            2,
+            "segments 2 and 3's refused prefetches"
+        );
+    }
+
+    /// The fixture variant whose segment 0 falls back to the `attrs_raw`
+    /// reopen, in the order [`reopen_refused`] forces: partition 1 takes its
+    /// current open and a prefetch while partition 0 is parked on its
+    /// reopen's first GET, so the reopen is refused once released. The
+    /// refusal drops both partitions' prefetches and retries the row-path
+    /// reopen with the same `skip`; rows per partition are the pipeline-off
+    /// run's, with no duplicate.
+    ///
+    /// The budget is the smallest at which partition 1 holds both opens at
+    /// that point, bisected.
+    ///
+    /// Fails against the reopen's refusal still failing the query, against
+    /// retrying it as a fast-path open (segment 0's first three rows come
+    /// twice), against losing `skip` (the same), and against not handing
+    /// segment 3 back (partition 1 loses its rows).
+    #[tokio::test]
+    async fn a_refused_attrs_raw_reopen_drops_the_prefetches_behind_it() {
+        let fits_2 = fits_2(Some(0)).await;
+        let off = run_statement(fits_2, 2, Some(0), false, Drive::Lockstep)
+            .await
+            .expect("pipeline off fits");
+        assert_eq!(off.rows, [rows_of(&[0, 2, 4]), rows_of(&[1, 3, 5])]);
+        assert_eq!(off.metric("reopens"), 1);
+
+        let both = |run: Result<ReopenRun, DataFusionError>| {
+            run.map(|r| r.sibling_held_both).unwrap_or(false)
+        };
+        assert!(both(reopen_refused(CEILING).await));
+        let (mut lo, mut hi) = (fits_2, CEILING);
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if both(reopen_refused(mid).await) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let run = reopen_refused(hi)
+            .await
+            .expect("the refused reopen is retried");
+        assert!(run.sibling_held_both);
+        assert_eq!(
+            run.reopen_held, 1,
+            "the gate parked partition 0 on the reopen"
+        );
+        assert_eq!(run.rows.to_vec(), off.rows);
+        let plan = run.exec.as_ref();
+        assert_eq!(metric_total(plan, "reopens"), 1);
+        assert_eq!(partition_metric(plan, "prefetch_memory_reopens", 0), 1);
+        assert_eq!(metric_total(plan, "prefetch_memory_reopens"), 1);
+        assert!(partition_metric(plan, "prefetch_revocations", 0) >= 1);
+    }
+
+    /// Two statements over clones of one fetcher share one budget, one
+    /// partition each, share 4, at twice the one-partition pipeline-off
+    /// budget. Statement 1 is driven to its first batch; statement 2's first
+    /// open is then refused, its own pool holds nothing to drop, its one
+    /// retry is refused too, and it ends with the typed refusal at once,
+    /// leaving the budget where it found it. Statement 1 then completes.
+    ///
+    /// Fails against a refused open that waits for statement 1 (the timeout
+    /// fires) and against retrying more than once (two reopens counted).
+    #[tokio::test]
+    async fn another_statements_prefetches_fail_an_open_fast_and_typed() {
+        let limit = 2 * fits_1().await;
+        let (store, segments) = fixture(None).await;
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let fetcher = ranged_fetcher(&store, 4).with_memory_budget(Arc::clone(&budget));
+        let one = exec_with(fetcher.clone(), &segments, 1, PhaseAccounting::new());
+        let two = exec_with(fetcher, &segments, 1, PhaseAccounting::new());
+        let mut s1 = one
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute 1");
+        let mut rows1 = timestamps(&[s1
+            .next()
+            .await
+            .expect("statement 1's first batch")
+            .expect("batch")]);
+        let before = budget.reserved();
+        assert!(before > 0, "statement 1 holds its opens");
+
+        let mut s2 = two
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute 2");
+        let ended = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(item) = s2.next().await {
+                item?;
+            }
+            Ok::<(), DataFusionError>(())
+        })
+        .await
+        .expect("statement 2 ends rather than waiting for statement 1");
+        let err = ended.expect_err("statement 2 is refused twice");
+        assert!(is_fetch_memory_refusal(&err), "typed refusal: {err}");
+        assert_eq!(metric_total(&two, "prefetch_memory_reopens"), 1);
+        drop(s2);
+        assert_eq!(budget.reserved(), before);
+
+        while let Some(item) = s1.next().await {
+            rows1.extend(timestamps(&[item.expect("statement 1 completes")]));
+        }
+        assert_eq!(rows1, rows_of(&[0, 1, 2, 3, 4, 5]));
+        drop(s1);
+        assert_eq!(budget.reserved(), 0);
     }
 }
