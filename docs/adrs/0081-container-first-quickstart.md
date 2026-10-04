@@ -155,7 +155,8 @@ radius there for no benefit to this one.
 This job must be exempt from that gate, because a README-only edit is precisely
 the change it exists to catch. It carries its own path filter: `README.md`,
 `deploy/docker-compose/**`, `demo/**`, `scripts/check-readme-commands.sh`,
-`Dockerfile.prebuilt`, and `services/ravel-server/**`.
+`Dockerfile.prebuilt`, and `services/ravel-server/**`. A5 in the Amendments
+section below narrows when the last of those paths triggers the job.
 
 **8. A weekly lane runs the same script against the published image.**
 
@@ -296,6 +297,21 @@ either. `RAVEL_READY_QUERY_URL` consequently has no default at all: an empty
 value is a hard error when the readiness poll runs, and each caller supplies the
 query for the generator it actually runs. A marked block may still assert only
 shapes both generators produce, which is what decision 5 was reaching for.
+
+**A5 (2026-10-04). Decision 7's `services/ravel-server/**` path triggers the
+job on the push to `main` only.** A change to that path was the reason the
+heavy path ran in 56 of 165 merge-queue runs between 2026-09-30 and 2026-10-04,
+each a release build of 12 minutes at the median. The job is advisory (see
+Consequences), so neither the pull request nor the merge queue waited on it:
+the cost bought a signal beside the review, not a gate. A change that touches
+only the server now skips the build on `pull_request` and `merge_group` events
+and runs it on the push, where a break is still reported against the commit
+that caused it. The other paths in decision 7, which are the quickstart's own
+files, trigger the job on every event as before, so a README or compose edit
+is still checked on the pull request that makes it. If the job is promoted to
+a required check, this amendment has to be revisited first: a required check
+that skips server changes before the merge would gate nothing for them.
+Tracked in issue #2520.
 
 One thing outside this ADR that A2 exposes: `scripts/demo.sh` passes no
 tenant-hash flag either, so the from-source demo only works because a previous

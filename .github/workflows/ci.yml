@@ -2228,10 +2228,25 @@ jobs:
           fi
           merge_base=$(git merge-base "$base" "${{ github.sha }}")
           changed=$(git diff --name-only "$merge_base" "${{ github.sha }}")
-          filter='^README\.md$|^deploy/docker-compose/|^deploy/otel/|^deploy/grafana/|^demo/|^scripts/check-readme-commands\.sh$|^scripts/check_readme_commands\.py$|^scripts/check-collector-delivery\.sh$|^scripts/ci-create-bucket\.sh$|^Dockerfile\.prebuilt$|^services/ravel-server/'
+          # Two path sets (ADR-0081 amendment A5, issue #2520). A change to
+          # the quickstart's own files runs the job on every event. A change
+          # that only touches the server runs it on the push to main and not
+          # on the pull request or the merge-queue run: that case was a third
+          # of all runs, each a 12-minute release build, and the job is
+          # advisory, so the landing never waited on it.
+          filter='^README\.md$|^deploy/docker-compose/|^deploy/otel/|^deploy/grafana/|^demo/|^scripts/check-readme-commands\.sh$|^scripts/check_readme_commands\.py$|^scripts/check-collector-delivery\.sh$|^scripts/ci-create-bucket\.sh$|^Dockerfile\.prebuilt$'
+          server_filter='^services/ravel-server/'
           if echo "$changed" | grep -qE "$filter"; then
             echo "::notice::quickstart-relevant path changed, running the job"
             echo "run=true" >> "$GITHUB_OUTPUT"
+          elif echo "$changed" | grep -qE "$server_filter"; then
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "::notice::server change on main, running the job"
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::notice::server-only change; the quickstart build runs on the push to main, skipping here"
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "::notice::no quickstart-relevant path changed, skipping build/bring-up"
             echo "run=false" >> "$GITHUB_OUTPUT"
