@@ -115,8 +115,11 @@ stage-timing in both crates transitively, but a `-p ravel-bench` selection
 builds them as dependencies and cargo never compiles a dependency's
 `#[cfg(test)]` module, so their own gated tests run in neither. Do
 not skip them: a workspace gate can print "All gates passed" on a tree where
-`--features sql` fails to compile, because the broken call site sits in a
-target the default feature set never builds.
+a feature lane fails. For `flight-sql` and the ravel-bench features that is
+because no workspace run compiles them at all. For `sql` it is because the
+workspace run builds `ravel-server` with the dependency features the rest of
+the workspace adds, so a break that only appears with `sql` selected on its
+own passes there.
 
 ### Fast local iteration
 
