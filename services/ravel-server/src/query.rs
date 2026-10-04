@@ -637,6 +637,8 @@ pub struct CacheDirSpillInputs {
     /// Free bytes on the volume backing `<cache_dir>/sql-spill`, measured once
     /// at startup with [`ravel_sql::measure_free_bytes`].
     pub free_bytes: u64,
+    /// [`crate::config::SqlSpillSettings::read_cache_bytes`].
+    pub read_cache_bytes: u64,
     /// [`crate::config::SqlSpillSettings::memory_budget_bytes`].
     pub memory_budget_bytes: u64,
 }
@@ -648,9 +650,22 @@ impl CacheDirSpillInputs {
             cache_dir: &self.cache_dir,
             instance_id: &self.instance_id,
             free_bytes: self.free_bytes,
+            read_cache_bytes: self.read_cache_bytes,
             memory_budget_bytes: self.memory_budget_bytes,
         }
     }
+}
+
+/// The space figures a derived spill ceiling, or its refusal, was computed
+/// from: the measured free bytes and the read cache's disk-tier bound
+/// subtracted from them.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpillSpace {
+    /// [`CacheDirSpillInputs::free_bytes`].
+    pub free_bytes: u64,
+    /// [`CacheDirSpillInputs::read_cache_bytes`].
+    pub read_cache_bytes: u64,
 }
 
 /// The two arguments [`build_sql_state_with_parquet`] hands
@@ -676,6 +691,9 @@ pub struct ResolvedSqlSpill {
     pub dir_source: &'static str,
     /// One of the `SQL_SPILL_SOURCE_*` constants.
     pub max_bytes_source: &'static str,
+    /// `Some` when the ceiling was derived from `--cache-dir`'s free space,
+    /// or spill is off because that space was too little.
+    pub space: Option<SpillSpace>,
 }
 
 #[cfg(feature = "sql")]
@@ -684,8 +702,13 @@ impl ResolvedSqlSpill {
     /// `performance default resolved` layout
     /// [`crate::config::ResolvedPerformanceDefaults::emit`] uses. Both lines
     /// are written whether or not spill is enabled; a disabled spill reads
-    /// `value="none"` with the reason as its source.
+    /// `value="none"` with the reason as its source. When the ceiling was
+    /// derived from `--cache-dir`, or refused for lack of space there, the
+    /// `sql_spill_max_bytes` line also carries `free_bytes` and
+    /// `read_cache_bytes`, the two figures it was derived from.
     pub fn emit(&self) {
+        let free_bytes = self.space.map(|space| space.free_bytes);
+        let read_cache_bytes = self.space.map(|space| space.read_cache_bytes);
         match &self.config {
             Some(config) => {
                 let dir = config.dir.display().to_string();
@@ -699,6 +722,8 @@ impl ResolvedSqlSpill {
                     setting = "sql_spill_max_bytes",
                     value = config.max_bytes,
                     source = self.max_bytes_source,
+                    free_bytes,
+                    read_cache_bytes,
                     "performance default resolved"
                 );
             }
@@ -713,13 +738,18 @@ impl ResolvedSqlSpill {
                     setting = "sql_spill_max_bytes",
                     value = "none",
                     source = self.max_bytes_source,
+                    free_bytes,
+                    read_cache_bytes,
                     "performance default resolved"
                 );
                 if self.max_bytes_source == SQL_SPILL_SOURCE_INSUFFICIENT_SPACE {
                     tracing::warn!(
-                        "SQL spill is off: half the free space under --cache-dir is below the \
-                         1 GiB floor of a derived spill ceiling; free space on that volume, or \
-                         set RAVEL_SQL_SPILL_MAX_BYTES to choose the ceiling"
+                        free_bytes,
+                        read_cache_bytes,
+                        "SQL spill is off: the free space under --cache-dir minus the read \
+                         cache's disk-tier bound, halved, is below the 1 GiB floor of a derived \
+                         spill ceiling; free space on that volume, or set \
+                         RAVEL_SQL_SPILL_MAX_BYTES to choose the ceiling"
                     );
                 }
             }
@@ -751,6 +781,7 @@ pub fn resolve_sql_spill(
             config: None,
             dir_source: SQL_SPILL_SOURCE_FLAG_OFF,
             max_bytes_source: SQL_SPILL_SOURCE_FLAG_OFF,
+            space: None,
         });
     }
     let cache_dir = inputs
@@ -783,10 +814,20 @@ pub fn resolve_sql_spill(
         (Some(_), false, true) => (SQL_SPILL_SOURCE_CACHE_DIR, SQL_SPILL_SOURCE_ENV_OVERRIDE),
         (Some(_), false, false) => (SQL_SPILL_SOURCE_CACHE_DIR, SQL_SPILL_SOURCE_DERIVED),
     };
+    let space = match max_bytes_source {
+        SQL_SPILL_SOURCE_DERIVED | SQL_SPILL_SOURCE_INSUFFICIENT_SPACE => {
+            inputs.cache_dir.as_ref().map(|cache| SpillSpace {
+                free_bytes: cache.free_bytes,
+                read_cache_bytes: cache.read_cache_bytes,
+            })
+        }
+        _ => None,
+    };
     Ok(ResolvedSqlSpill {
         config,
         dir_source,
         max_bytes_source,
+        space,
     })
 }
 
@@ -863,6 +904,7 @@ fn prepare_sql_spill_with(
                 cache_dir: cache_dir.to_path_buf(),
                 instance_id: instance_id.to_string(),
                 free_bytes,
+                read_cache_bytes: settings.read_cache_bytes,
                 memory_budget_bytes: settings.memory_budget_bytes,
             })
         }
@@ -2681,6 +2723,7 @@ mod tests {
         crate::config::SqlSpillSettings {
             off,
             memory_budget_bytes,
+            read_cache_bytes: 0,
         }
     }
 
@@ -2869,6 +2912,10 @@ mod tests {
                     config: None,
                     dir_source: SQL_SPILL_SOURCE_INSUFFICIENT_SPACE,
                     max_bytes_source: SQL_SPILL_SOURCE_INSUFFICIENT_SPACE,
+                    space: Some(SpillSpace {
+                        free_bytes,
+                        read_cache_bytes: 0,
+                    }),
                 },
                 "free_bytes={free_bytes}"
             );
@@ -2898,6 +2945,10 @@ mod tests {
                 }),
                 dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
                 max_bytes_source: SQL_SPILL_SOURCE_DERIVED,
+                space: Some(SpillSpace {
+                    free_bytes: 2 * GIB,
+                    read_cache_bytes: 0,
+                }),
             }
         );
         drop(at_floor);
@@ -2984,6 +3035,7 @@ mod tests {
                 }),
                 dir_source: SQL_SPILL_SOURCE_ENV,
                 max_bytes_source: SQL_SPILL_SOURCE_ENV,
+                space: None,
             }
         );
         assert!(env.inputs.cache_dir.is_none() && env.owner.is_none());
@@ -3006,6 +3058,7 @@ mod tests {
                 config: None,
                 dir_source: SQL_SPILL_SOURCE_FLAG_OFF,
                 max_bytes_source: SQL_SPILL_SOURCE_FLAG_OFF,
+                space: None,
             }
         );
         assert!(off.inputs.off && off.inputs.cache_dir.is_none() && off.owner.is_none());
@@ -3023,6 +3076,7 @@ mod tests {
                 config: None,
                 dir_source: SQL_SPILL_SOURCE_UNSET,
                 max_bytes_source: SQL_SPILL_SOURCE_UNSET,
+                space: None,
             }
         );
 
@@ -3043,6 +3097,7 @@ mod tests {
                 }),
                 dir_source: SQL_SPILL_SOURCE_CACHE_DIR,
                 max_bytes_source: SQL_SPILL_SOURCE_ENV_OVERRIDE,
+                space: None,
             }
         );
         drop(quota_alone);
@@ -3078,7 +3133,10 @@ mod tests {
     /// `query_budgets`, `prepare_sql_spill_with`, and
     /// `build_sql_state_with_parquet`. On the injected reference host
     /// (`memory_budget_bytes` 30,064,771,072) with 300 GiB free, the cap binds:
-    /// 120,259,084,288.
+    /// 120,259,084,288. With 40 GiB free, the read cache's disk-tier bound
+    /// (7,516,192,768 fetcher plus 1,503,238,553 catalog) comes off first:
+    /// (42,949,672,960 - 9,019,431,321) / 2 = 16,965,120,819, and with 200 GiB
+    /// free, the configuration guide's example, 102,864,466,739.
     ///
     /// The builder honours `off` itself, not only through `prepare` leaving
     /// the cache inputs out: inputs carrying both `off` and a cache dir build
@@ -3087,13 +3145,14 @@ mod tests {
     /// Prove-the-test: call `.with_spill_from_env()` in
     /// `build_sql_state_inner` instead of `.with_spill_resolved(...)` and the
     /// auto row reads `None`; pass `false` instead of `spill.off` and the
-    /// direct off row reads the cache-dir config.
+    /// direct off row reads the cache-dir config; subtract only the fetcher
+    /// cache's bound and the 40 GiB row reads 17,716,740,096.
     #[test]
     fn sql_spill_and_cache_dir_reach_the_executor_from_cli() {
         use clap::Parser;
 
         assert_spill_env_unset();
-        let state_for = |args: &[&str], cache_dir: &std::path::Path| {
+        let state_with_free = |args: &[&str], cache_dir: &std::path::Path, free_bytes: u64| {
             let mut argv = vec!["ravel-server", "--cache-dir"];
             let cache_arg = cache_dir.to_str().expect("utf-8 temp path");
             argv.push(cache_arg);
@@ -3108,10 +3167,13 @@ mod tests {
                 budgets.sql_spill,
                 None,
                 None,
-                300 * GIB,
+                free_bytes,
             )
             .expect("spill resolves");
             executor_spill(&startup.inputs)
+        };
+        let state_for = |args: &[&str], cache_dir: &std::path::Path| {
+            state_with_free(args, cache_dir, 300 * GIB)
         };
 
         let cache = tempfile::tempdir().expect("cache dir");
@@ -3122,6 +3184,17 @@ mod tests {
                 max_bytes: 120_259_084_288,
             })
         );
+        for (free_bytes, expected) in [(40 * GIB, 16_965_120_819), (200 * GIB, 102_864_466_739)] {
+            let cache = tempfile::tempdir().expect("cache dir");
+            assert_eq!(
+                state_with_free(&[], cache.path(), free_bytes),
+                Some(ravel_sql::SpillConfig {
+                    dir: cache.path().join("sql-spill").join(INSTANCE),
+                    max_bytes: expected,
+                }),
+                "free_bytes={free_bytes}"
+            );
+        }
         let cache = tempfile::tempdir().expect("cache dir");
         assert_eq!(state_for(&["--sql-spill", "off"], cache.path()), None);
         assert_eq!(
@@ -3131,6 +3204,7 @@ mod tests {
                     cache_dir: cache.path().to_path_buf(),
                     instance_id: INSTANCE.to_string(),
                     free_bytes: 300 * GIB,
+                    read_cache_bytes: 9_019_431_321,
                     memory_budget_bytes: 30_064_771_072,
                 }),
             }),
@@ -3251,6 +3325,82 @@ mod tests {
             assert!(dir_line.contains(&dir_fields), "{label}: {dir_line}");
             let max_line = resolved_line(&lines, "sql_spill_max_bytes");
             assert!(max_line.contains(&max_fields), "{label}: {max_line}");
+        }
+    }
+
+    /// The ceiling is derived from the measured free bytes less the read
+    /// cache's disk-tier bound, and the `sql_spill_max_bytes` line records
+    /// both: 10 GiB free under a 9 GiB bound leaves 1 GiB, half of which is
+    /// below the floor, so spill is off; 40 GiB free under the same bound
+    /// derives half of 31 GiB, 16,642,998,272. A ceiling the env sets records
+    /// neither figure.
+    ///
+    /// Prove-the-test: pass `cache_dir.free_bytes` instead of
+    /// `cache_dir.spillable_free_bytes()` in `ravel_sql::SpillConfig::resolve`
+    /// and the 10 GiB row reads `value=5368709120 source="derived"`; leave
+    /// `read_cache_bytes` off the `CacheDirSpillInputs` `prepare_sql_spill_with`
+    /// builds (0) and the 10 GiB row reads the same value with
+    /// `read_cache_bytes=0`.
+    #[test]
+    fn the_derived_ceiling_subtracts_the_read_cache_bound_and_logs_both() {
+        const BOUND: u64 = 9 * GIB;
+        let cache = tempfile::tempdir().expect("cache dir");
+        let explicit = cache.path().join("explicit");
+        let cases = [
+            (
+                "10 GiB free",
+                None,
+                10 * GIB,
+                " value=\"none\" source=\"cache-dir-insufficient-space\"".to_string(),
+                Some(10 * GIB),
+            ),
+            (
+                "40 GiB free",
+                None,
+                40 * GIB,
+                " value=16642998272 source=\"derived\"".to_string(),
+                Some(40 * GIB),
+            ),
+            (
+                "env pair",
+                os(explicit.to_str().expect("utf-8 temp path")),
+                40 * GIB,
+                " value=4096 source=\"env\"".to_string(),
+                None,
+            ),
+        ];
+        for (label, env_dir, free_bytes, max_fields, recorded_free) in cases {
+            let (capture, guard) = capture_info();
+            let startup = prepare(
+                Some(cache.path()),
+                crate::config::SqlSpillSettings {
+                    off: false,
+                    memory_budget_bytes: u64::MAX,
+                    read_cache_bytes: BOUND,
+                },
+                env_dir,
+                env_dir.map(|_| std::ffi::OsStr::new("4096")),
+                free_bytes,
+            )
+            .expect("spill resolves");
+            drop(guard);
+            drop(startup);
+            let lines = capture.0.lock().clone();
+            let max_line = resolved_line(&lines, "sql_spill_max_bytes");
+            assert!(max_line.contains(&max_fields), "{label}: {max_line}");
+            match recorded_free {
+                Some(free) => {
+                    assert!(
+                        max_line.contains(&format!(" free_bytes={free}"))
+                            && max_line.contains(&format!(" read_cache_bytes={BOUND}")),
+                        "{label}: {max_line}"
+                    );
+                }
+                None => assert!(
+                    !max_line.contains("free_bytes") && !max_line.contains("read_cache_bytes"),
+                    "{label}: {max_line}"
+                ),
+            }
         }
     }
 

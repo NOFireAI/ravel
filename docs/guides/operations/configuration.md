@@ -733,15 +733,27 @@ configured:
 `RAVEL_SQL_SPILL_MAX_BYTES` alone with no `--cache-dir`, refuses startup with
 an error naming the missing variable.
 
-The derived ceiling is half the free bytes on the volume backing
-`<cache-dir>/sql-spill`, measured once at startup, capped at four times the
-process memory budget (`memory_budget_bytes` in the startup log), and raised
-to 1 GiB when that cap is below 1 GiB. When half the free bytes is below
-1 GiB, spill is off instead: both startup lines read `value=none
+The derived ceiling starts from the free bytes on the volume backing
+`<cache-dir>/sql-spill`, measured once at startup, less the most the read
+cache's disk tier in the same directory may hold (`cache_max_bytes` plus
+`catalog_cache_max_bytes` in the startup log, or nothing under
+`--disable-cache`). It is half of that, capped at four times the process
+memory budget (`memory_budget_bytes` in the startup log), and raised to
+1 GiB when that cap is below 1 GiB:
+
+```text
+min((free_bytes - read_cache_bytes) / 2, 4 * memory_budget_bytes), at least 1 GiB
+```
+
+When `(free_bytes - read_cache_bytes) / 2` is below 1 GiB, spill is off
+instead: both startup lines read `value=none
 source=cache-dir-insufficient-space` and a WARN line says why. A derived
-ceiling is therefore never below 1 GiB and never more than half the free
-bytes. On a volume with 200 GiB free and the 30,064,771,072-byte budget of a
-30 GiB host, that is 107,374,182,400 bytes: half the free space, below the
+ceiling is therefore never below 1 GiB and never more than half of what the
+read cache leaves free. The `sql_spill_max_bytes` line carries the two
+figures it was derived from as `free_bytes` and `read_cache_bytes`. On a
+volume with 200 GiB free and the defaults of a 30 GiB host (a
+30,064,771,072-byte budget, a 9,019,431,321-byte read cache), that is
+102,864,466,739 bytes: half of what the read cache leaves, below the
 120,259,084,288-byte cap.
 
 The ceiling is one budget for the whole process. A qualifying query reserves

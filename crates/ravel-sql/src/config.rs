@@ -203,8 +203,21 @@ pub struct CacheDirSpill<'a> {
     /// Free bytes on the volume backing `cache_dir`, measured once at
     /// startup ([`measure_free_bytes`]).
     pub free_bytes: u64,
+    /// The most the read cache's disk tier under the same `cache_dir` may
+    /// hold. That tier can still grow after `free_bytes` is measured, so its
+    /// whole bound is subtracted from `free_bytes` before the ceiling is
+    /// derived.
+    pub read_cache_bytes: u64,
     /// The process memory budget ([`derive_spill_max_bytes`]'s cap input).
     pub memory_budget_bytes: u64,
+}
+
+impl CacheDirSpill<'_> {
+    /// The free bytes a derived spill ceiling is taken from: `free_bytes`
+    /// less `read_cache_bytes`, saturating at zero.
+    pub fn spillable_free_bytes(&self) -> u64 {
+        self.free_bytes.saturating_sub(self.read_cache_bytes)
+    }
 }
 
 /// Both halves of the spill configuration. Spill is enabled for a query only
@@ -277,8 +290,9 @@ impl SpillConfig {
     ///    derived from it (`crate::config::cache_spill_dir`), and the
     ///    ceiling is `env_quota` when it alone is set (the env quota overrides
     ///    the derived ceiling under a `--cache-dir` deployment), else
-    ///    [`derive_spill_max_bytes`] of `cache_dir`'s free bytes and memory
-    ///    budget. When that derivation finds too little free space it is
+    ///    [`derive_spill_max_bytes`] of `cache_dir`'s
+    ///    [`CacheDirSpill::spillable_free_bytes`] and memory budget. When
+    ///    that derivation finds too little free space it is
     ///    `Ok(None)`: spill off.
     /// 3. Neither 1 nor 2: `Ok(None)`, the no-spill default.
     ///
@@ -309,9 +323,10 @@ impl SpillConfig {
         let Some(cache_dir) = cache_dir else {
             return Ok(None);
         };
-        let Some(max_bytes) =
-            derive_spill_max_bytes(cache_dir.free_bytes, cache_dir.memory_budget_bytes)
-        else {
+        let Some(max_bytes) = derive_spill_max_bytes(
+            cache_dir.spillable_free_bytes(),
+            cache_dir.memory_budget_bytes,
+        ) else {
             return Ok(None);
         };
         Ok(Some(SpillConfig {
@@ -663,7 +678,43 @@ mod tests {
             cache_dir: Path::new("/var/cache/ravel"),
             instance_id: "inst-1",
             free_bytes,
+            read_cache_bytes: 0,
             memory_budget_bytes,
+        }
+    }
+
+    /// The derived ceiling is taken from the free bytes less the read cache's
+    /// disk-tier bound: 10 GiB free with a 9 GiB bound leaves 1 GiB, whose
+    /// half is below the floor, so spill is off; 40 GiB free with the same
+    /// bound derives half of 31 GiB; a bound above the free bytes saturates
+    /// at zero rather than wrapping.
+    ///
+    /// Prove-the-test: pass `cache_dir.free_bytes` instead of
+    /// `cache_dir.spillable_free_bytes()` in `SpillConfig::resolve` and the
+    /// 10 GiB row reads `Some(5368709120)`; subtract with wrapping arithmetic
+    /// and the 1 GiB row reads a ceiling near `u64::MAX / 2`.
+    #[test]
+    fn resolve_derives_from_free_bytes_less_the_read_cache_bound() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for (free_bytes, read_cache_bytes, expected) in [
+            (10 * GIB, 9 * GIB, None),
+            (40 * GIB, 9 * GIB, Some(31 * GIB / 2)),
+            (GIB, 9 * GIB, None),
+        ] {
+            let resolved = SpillConfig::resolve(
+                None,
+                None,
+                Some(CacheDirSpill {
+                    read_cache_bytes,
+                    ..cache_dir_spill(free_bytes, u64::MAX)
+                }),
+            )
+            .expect("a cache-dir-only resolution never errors");
+            assert_eq!(
+                resolved.map(|config| config.max_bytes),
+                expected,
+                "free_bytes={free_bytes} read_cache_bytes={read_cache_bytes}"
+            );
         }
     }
 
