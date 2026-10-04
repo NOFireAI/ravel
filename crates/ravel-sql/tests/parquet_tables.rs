@@ -496,15 +496,22 @@ async fn clickbench_q19_plans_and_groups_by_extracted_minute() {
 }
 
 /// Two rows of one column per Arrow type the JSON encoder had no arm for
-/// before issue #2390, written to Parquet with the Arrow schema embedded so
-/// the reader restores each type. The reader hands both `Binary` and
-/// `LargeBinary` back as `BinaryView`, so one binary column covers both.
+/// before issues #2390 and #2496, written to Parquet with the Arrow schema
+/// embedded so the reader restores each type. The reader hands both `Binary`
+/// and `LargeBinary` back as `BinaryView`, so one binary column covers both.
 fn typed_bytes() -> Bytes {
     use datafusion::arrow::array::{
-        BinaryArray, Date32Array, Date64Array, Decimal128Array, Int8Array, Int16Array,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray, UInt16Array,
+        BinaryArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array, Float16Array,
+        Int8Array, Int16Array, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+        Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampSecondArray, UInt16Array,
     };
-    use datafusion::arrow::datatypes::TimeUnit;
+    use datafusion::arrow::datatypes::{ArrowPrimitiveType, Float16Type, TimeUnit, i256};
+    type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+
+    let beyond_i128 = i256::from_i128(i128::MAX)
+        .checked_add(i256::ONE)
+        .expect("in range");
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("i8", DataType::Int8, false),
@@ -525,6 +532,12 @@ fn typed_bytes() -> Bytes {
         ),
         Field::new("dec", DataType::Decimal128(10, 2), false),
         Field::new("bin", DataType::Binary, false),
+        Field::new("dec256", DataType::Decimal256(40, 2), false),
+        Field::new("f16", DataType::Float16, false),
+        Field::new("t32_s", DataType::Time32(TimeUnit::Second), false),
+        Field::new("t32_ms", DataType::Time32(TimeUnit::Millisecond), false),
+        Field::new("t64_us", DataType::Time64(TimeUnit::Microsecond), false),
+        Field::new("t64_ns", DataType::Time64(TimeUnit::Nanosecond), false),
     ]));
     let batch = RecordBatch::try_new(
         Arc::clone(&schema),
@@ -549,6 +562,16 @@ fn typed_bytes() -> Bytes {
                     .expect("decimal"),
             ),
             Arc::new(BinaryArray::from(vec![&[0xbe_u8][..], &[0xef][..]])),
+            Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(-5), beyond_i128])
+                    .with_precision_and_scale(40, 2)
+                    .expect("decimal"),
+            ),
+            Arc::new(Float16Array::from(vec![F16::NAN, F16::from_f64(1.5)])),
+            Arc::new(Time32SecondArray::from(vec![0, 86_399])),
+            Arc::new(Time32MillisecondArray::from(vec![1, 3_661_123])),
+            Arc::new(Time64MicrosecondArray::from(vec![1, 3_661_123_456])),
+            Arc::new(Time64NanosecondArray::from(vec![1, 86_399_999_999_999])),
         ],
     )
     .expect("batch");
@@ -559,10 +582,11 @@ fn typed_bytes() -> Bytes {
     Bytes::from(out)
 }
 
-/// Issue #2390: a Parquet table's Int8, Int16, UInt16, Date32, Date64,
-/// second/millisecond/microsecond timestamp, Decimal128 and binary columns
-/// encode through the JSON output path the SQL endpoint serves, instead of
-/// failing with "no JSON encoding for arrow type".
+/// Issues #2390 and #2496: a Parquet table's Int8, Int16, UInt16, Date32,
+/// Date64, second/millisecond/microsecond timestamp, Decimal128, binary,
+/// Decimal256, Float16 and time-of-day columns encode through the JSON output
+/// path the SQL endpoint serves, instead of failing with "no JSON encoding for
+/// arrow type".
 #[tokio::test]
 async fn parquet_column_types_encode_as_json() {
     let lake = Lake::configured();
@@ -602,6 +626,12 @@ async fn parquet_column_types_encode_as_json() {
         ("ts_us", "Timestamp(µs)"),
         ("dec", "Decimal128(10, 2)"),
         ("bin", "BinaryView"),
+        ("dec256", "Decimal256(40, 2)"),
+        ("f16", "Float16"),
+        ("t32_s", "Time32(s)"),
+        ("t32_ms", "Time32(ms)"),
+        ("t64_us", "Time64(µs)"),
+        ("t64_ns", "Time64(ns)"),
     ];
     assert_eq!(
         types,
@@ -625,7 +655,13 @@ async fn parquet_column_types_encode_as_json() {
                 -1_000_000,
                 -1_000,
                 "-0.05",
-                "be"
+                "be",
+                "-0.05",
+                "NaN",
+                0,
+                1_000_000,
+                1_000,
+                1
             ],
             [
                 8,
@@ -637,7 +673,13 @@ async fn parquet_column_types_encode_as_json() {
                 1_700_000_000_123_000_000_i64,
                 1_700_000_000_123_456_000_i64,
                 "123.45",
-                "ef"
+                "ef",
+                "1701411834604692317316873037158841057.28",
+                1.5,
+                86_399_000_000_000_i64,
+                3_661_123_000_000_i64,
+                3_661_123_456_000_i64,
+                86_399_999_999_999_i64
             ]
         ])
     );
