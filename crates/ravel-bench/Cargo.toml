@@ -11,7 +11,14 @@ ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-codec = { workspace = true }
 ravel-segment = { workspace = true }
-ravel-logseg = { workspace = true }
+# `features = ["row-reference"]`: `src/bin/page_codec_bakeoff.rs` drives
+# `ravel_logseg::block::write_block` and `ravel_logseg::record::ResolvedRow`
+# directly (the per-block row-major page encoder, exercising codec choice in
+# isolation from a whole object), both gated behind `row-reference` since
+# ADR-2467 decision 3 (issue #2564) made the row builder reference-only. The
+# bin is in the default build (no `required-features`), so the feature must be
+# on here, not only in ravel-logseg's own dev-dependencies.
+ravel-logseg = { workspace = true, features = ["row-reference"] }
 ravel-otlp = { workspace = true }
 ravel-ingest = { workspace = true }
 ravel-object-store = { workspace = true }

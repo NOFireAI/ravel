@@ -200,6 +200,16 @@ flight-sql = [
 ]
 
 [dev-dependencies]
+# Turns on ravel-logseg's `row-reference` feature for this crate's own
+# `#[cfg(test)]` and integration-test call sites that drive
+# `ravel_logseg::block::write_block`/`ResolvedRow` directly
+# (`src/logs_scan.rs`'s test module, `tests/logs_columnar.rs`): ADR-2467
+# decision 3 (issue #2564) made the row builder reference-only behind this
+# feature. Cargo unifies features across dependency kinds for one build, so
+# this dev-only edge turns the feature on for `cargo test` while the plain
+# `ravel-logseg = { workspace = true }` dependency above (used for production
+# types, not gated) leaves a `cargo build -p ravel-sql` unaffected.
+ravel-logseg = { workspace = true, features = ["row-reference"] }
 # test-util for `#[tokio::test(start_paused = true)]`: the explain deadline
 # test holds a commit-record GET open and asserts the typed
 # `DeadlineExceeded`, which needs the runtime's injected clock rather than a
