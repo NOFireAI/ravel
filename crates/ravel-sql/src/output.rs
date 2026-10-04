@@ -1163,6 +1163,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn duration_seconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationSecondArray;
+        let array = Arc::new(DurationSecondArray::from(vec![90, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(90_000_000_000_i64), json!(-1_000_000_000)]
+        );
+    }
+
+    #[test]
+    fn duration_milliseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationMillisecondArray;
+        let array = Arc::new(DurationMillisecondArray::from(vec![1_500, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_500_000_000), json!(-1_000_000)]
+        );
+    }
+
+    #[test]
+    fn duration_microseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationMicrosecondArray;
+        let array = Arc::new(DurationMicrosecondArray::from(vec![1_500, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_500_000), json!(-1_000)]
+        );
+    }
+
+    #[test]
+    fn duration_nanoseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationNanosecondArray;
+        let array =
+            Arc::new(DurationNanosecondArray::from(vec![i64::MAX, -1, i64::MIN])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(i64::MAX), json!(-1), json!(i64::MIN)]
+        );
+    }
+
+    /// One unit past the i64 nanosecond range on either side has no JSON
+    /// nanosecond count.
+    #[test]
+    fn duration_overflowing_i64_nanoseconds_is_a_typed_error() {
+        use datafusion::arrow::array::{
+            DurationMicrosecondArray, DurationMillisecondArray, DurationSecondArray,
+        };
+        let cases: Vec<(ArrayRef, i64)> = vec![
+            (
+                Arc::new(DurationSecondArray::from(vec![9_223_372_037])),
+                9_223_372_037,
+            ),
+            (
+                Arc::new(DurationSecondArray::from(vec![-9_223_372_037])),
+                -9_223_372_037,
+            ),
+            (
+                Arc::new(DurationMillisecondArray::from(vec![9_223_372_036_855])),
+                9_223_372_036_855,
+            ),
+            (
+                Arc::new(DurationMicrosecondArray::from(vec![
+                    -9_223_372_036_854_776,
+                ])),
+                -9_223_372_036_854_776,
+            ),
+        ];
+        for (array, value) in cases {
+            let data_type = array.data_type().to_string();
+            let message = column_error(array);
+            assert_eq!(
+                message,
+                format!("{data_type} value {value} overflows an i64 count of nanoseconds")
+            );
+        }
+    }
+
     /// No display-formatter fallback: a type with no arm still fails, naming
     /// the type.
     #[test]
