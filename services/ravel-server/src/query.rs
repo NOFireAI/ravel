@@ -3159,7 +3159,14 @@ mod tests {
             argv.extend_from_slice(args);
             let cli = crate::Cli::try_parse_from(argv).expect("flags parse");
             let resolved = cli
-                .resolve_performance(crate::config::HostProfile::new(16, Some(32_212_254_720)))
+                .resolve_performance(crate::config::HostProfile::new(
+                    16,
+                    Some(32_212_254_720),
+                    Some(32_212_254_720),
+                    None,
+                    None,
+                    None,
+                ))
                 .expect("performance defaults resolve");
             let budgets = cli.query_budgets(&resolved).expect("budgets resolve");
             let startup = prepare(
