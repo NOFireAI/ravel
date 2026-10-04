@@ -7,7 +7,7 @@
 //! writer creates one, so it was put by something else, and letting it win
 //! would hand the table to whoever put it. [`newest`] resolves the highest
 //! version at or below the bound instead. A `.pqm` key under a table's `v/`
-//! prefix whose 20 characters name no version at all
+//! prefix whose slot names no version at all
 //! ([`ListedManifestKey::InvalidVersion`]) is treated the same way: every
 //! listing here, and the sweep's, skips it rather than failing. Each listing
 //! that finds either kind is counted, and the table is reported once per
@@ -26,8 +26,8 @@ use crate::keys::{
 use crate::manifest::{Manifest, ManifestError, decode_manifest};
 
 /// A table whose listing holds manifest version keys no reader resolves:
-/// versions above [`MAX_MANIFEST_VERSION`], or `.pqm` keys whose 20 characters
-/// name no version. Logged once per table per process;
+/// versions above [`MAX_MANIFEST_VERSION`], or `.pqm` keys whose slot names no
+/// version. Logged once per table per process;
 /// [`above_bound_resolves`] counts every listing that saw one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
@@ -48,22 +48,42 @@ pub struct AboveBoundVersions {
 }
 
 /// How many (tenant hash, table) pairs [`ABOVE_BOUND`] records. Past it, a
-/// listing of a table not yet recorded is warned about every time and not
-/// counted, so the map cannot grow with the number of tables someone forges
-/// keys under.
+/// listing of a table not yet recorded is not counted, so the map cannot grow
+/// with the number of tables someone forges keys under. The warning is then
+/// rate limited to one in every [`ABOVE_BOUND_WARN_EVERY`] such listings: a
+/// credential forging keys under more than this many table names otherwise
+/// turns the once-per-table warning into one per resolve and controls the log
+/// volume.
 pub const ABOVE_BOUND_TABLES_MAX: usize = 4096;
 
-/// Listings that saw a version key no reader resolves, per (tenant hash,
-/// table), for at most [`ABOVE_BOUND_TABLES_MAX`] pairs.
-static ABOVE_BOUND: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
+/// Once [`ABOVE_BOUND`] is full, warn on one in every this many listings of a
+/// table it has no room for. Bounds the log volume without hiding the
+/// condition, which [`above_bound_resolves`] cannot report for such a table.
+pub const ABOVE_BOUND_WARN_EVERY: u64 = 1024;
 
-/// Count one listing of `key` in `seen`, which holds at most `cap` entries.
-/// Returns true when the caller should log it: the first time `key` is
-/// recorded, and on every listing of a key the full map has no room for.
+/// The per-process warning state: listings that saw a version key no reader
+/// resolves, per (tenant hash, table), for at most [`ABOVE_BOUND_TABLES_MAX`]
+/// pairs, and a saturating count of listings the full map had no room for.
+struct AboveBoundState {
+    seen: BTreeMap<(String, String), u64>,
+    overflow: u64,
+}
+
+static ABOVE_BOUND: Mutex<AboveBoundState> = Mutex::new(AboveBoundState {
+    seen: BTreeMap::new(),
+    overflow: 0,
+});
+
+/// Count one listing of `key` in `seen`, which holds at most `cap` entries,
+/// and in `overflow` once it is full. Returns true when the caller should log
+/// it: the first time `key` is recorded, and on one in every `warn_every`
+/// listings of a key the full map has no room for.
 fn record_in(
     seen: &mut BTreeMap<(String, String), u64>,
+    overflow: &mut u64,
     key: (String, String),
     cap: usize,
+    warn_every: u64,
 ) -> bool {
     if let Some(count) = seen.get_mut(&key) {
         *count = count.saturating_add(1);
@@ -71,8 +91,11 @@ fn record_in(
     }
     if seen.len() < cap {
         seen.insert(key, 1);
+        return true;
     }
-    true
+    let nth = *overflow;
+    *overflow = overflow.saturating_add(1);
+    nth % warn_every == 0
 }
 
 /// Count and, the first time, log one listing of `table` that found
@@ -102,11 +125,14 @@ pub(crate) fn note_unresolvable(
         bound: MAX_MANIFEST_VERSION,
     };
     let log = {
-        let mut seen = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut state = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        let AboveBoundState { seen, overflow } = &mut *state;
         record_in(
-            &mut seen,
+            seen,
+            overflow,
             (warning.tenant_hash.clone(), warning.table.clone()),
             ABOVE_BOUND_TABLES_MAX,
+            ABOVE_BOUND_WARN_EVERY,
         )
     };
     if log {
@@ -121,11 +147,13 @@ pub(crate) fn note_unresolvable(
 
 /// How many listings of `table` in this process found a manifest version key
 /// no reader resolves: a version above [`MAX_MANIFEST_VERSION`], or a key
-/// whose 20 characters name no version. Zero for a table first seen after
+/// whose slot names no version. Zero for a table first seen after
 /// [`ABOVE_BOUND_TABLES_MAX`] others were recorded.
 pub fn above_bound_resolves(tenant: &TenantHash, table: &str) -> u64 {
-    let seen = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
-    seen.get(&(tenant.to_hex(), table.to_string()))
+    let state = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    state
+        .seen
+        .get(&(tenant.to_hex(), table.to_string()))
         .copied()
         .unwrap_or(0)
 }
@@ -199,7 +227,7 @@ pub struct TableListing {
     /// Every manifest version, ascending, including any above
     /// [`MAX_MANIFEST_VERSION`].
     pub versions: Vec<u64>,
-    /// The `.pqm` keys whose 20 characters name no version
+    /// The `.pqm` keys whose slot names no version
     /// ([`ListedManifestKey::InvalidVersion`]), ascending. No reader resolves
     /// them.
     pub invalid_keys: Vec<String>,
@@ -282,9 +310,9 @@ pub async fn versions(
 ///
 /// One LIST of `t/<tenant_hash>/pq/t/` answers for every table, so an
 /// inspection of a whole tenant costs the same listing a sweep does rather
-/// than one per table. Keys whose 20 characters name no version are skipped
-/// and counted as in [`versions`]; any other key under that prefix that is not
-/// a manifest key is [`ResolveError::ForeignKey`].
+/// than one per table. Keys whose slot names no version are skipped and
+/// counted as in [`versions`]; any other key under that prefix that is not a
+/// manifest key is [`ResolveError::ForeignKey`].
 pub async fn table_listings(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -328,7 +356,7 @@ pub async fn read_version(
 /// a dropped table does not exist, and a writer needs the dropped version's
 /// number to write the next one.
 ///
-/// Versions above the bound, and keys whose 20 characters name no version,
+/// Versions above the bound, and keys whose slot names no version,
 /// are not read. Each listing that holds one is counted
 /// ([`above_bound_resolves`]), and the first in this process for the table is
 /// logged at `warn` as an [`AboveBoundVersions`].
@@ -603,22 +631,89 @@ pub(crate) mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_nested_key_under_a_table_v_prefix_is_skipped_by_every_listing() {
+        // The Query grant's `*` binds `hits/v/q`, so this key sits under the
+        // table's own `v/` prefix with an extra segment before a second `v/`.
+        // Before #2430 it failed `versions`, `newest` and the tenant listing.
+        const NESTED: &str = "q/v/00000000000000000001";
+        const TENANT: TenantHash = TenantHash([0x5a; 16]);
+        let (logs, _guard) = capture_logs();
+        let store = MemoryStore::with_page_size(2);
+        for v in [1, 2] {
+            put_version(&store, &TENANT, v).await;
+        }
+        put_invalid(&store, &TENANT, NESTED).await;
+        // The per-table listing yields the legitimate newest with no error.
+        assert_eq!(
+            versions(&store, &TENANT, "hits").await.expect("versions"),
+            vec![1, 2]
+        );
+        assert_eq!(
+            newest(&store, &TENANT, "hits").await.expect("resolve"),
+            Some(live_manifest("hits", 2, &[2]))
+        );
+        // And so does the tenant-wide listing.
+        assert_eq!(
+            tables(&store, &TENANT).await.expect("tables"),
+            BTreeMap::from([("hits".to_string(), vec![1, 2])])
+        );
+        assert_eq!(above_bound_resolves(&TENANT, "hits"), 3);
+        assert_eq!(warnings_naming(&logs, NESTED), 1);
+    }
+
     #[test]
     fn the_warning_map_stops_recording_at_its_cap_and_still_asks_for_a_warn() {
         let mut seen = BTreeMap::new();
+        let mut overflow = 0;
         let key = |t: &str| ("tenant".to_string(), t.to_string());
-        assert!(record_in(&mut seen, key("a"), 2));
-        assert!(!record_in(&mut seen, key("a"), 2));
-        assert!(record_in(&mut seen, key("b"), 2));
+        // `warn_every` of 1: every overflow listing still warns, isolating
+        // the map-growth behaviour from the rate limit tested below.
+        assert!(record_in(&mut seen, &mut overflow, key("a"), 2, 1));
+        assert!(!record_in(&mut seen, &mut overflow, key("a"), 2, 1));
+        assert!(record_in(&mut seen, &mut overflow, key("b"), 2, 1));
         // Full: a new table warns every time and is not recorded.
-        assert!(record_in(&mut seen, key("c"), 2));
-        assert!(record_in(&mut seen, key("c"), 2));
+        assert!(record_in(&mut seen, &mut overflow, key("c"), 2, 1));
+        assert!(record_in(&mut seen, &mut overflow, key("c"), 2, 1));
         assert_eq!(seen.len(), 2);
         assert_eq!(seen.get(&key("a")), Some(&2));
         assert_eq!(seen.get(&key("c")), None);
         // A recorded table keeps counting.
-        assert!(!record_in(&mut seen, key("b"), 2));
+        assert!(!record_in(&mut seen, &mut overflow, key("b"), 2, 1));
         assert_eq!(seen.get(&key("b")), Some(&2));
+        assert_eq!(overflow, 2, "both overflow listings of c counted");
+    }
+
+    #[test]
+    fn a_full_map_rate_limits_the_overflow_warning_and_still_counts_every_listing() {
+        let mut seen = BTreeMap::new();
+        let mut overflow = 0;
+        // A cap of 1, filled once, so every further distinct table takes the
+        // overflow path.
+        assert!(record_in(
+            &mut seen,
+            &mut overflow,
+            ("t".to_string(), "recorded".to_string()),
+            1,
+            ABOVE_BOUND_WARN_EVERY
+        ));
+        // 4096 resolves of distinct unrecorded tables: one warn in every
+        // `ABOVE_BOUND_WARN_EVERY`, so at most 4.
+        let mut warns = 0;
+        for i in 0..4096 {
+            if record_in(
+                &mut seen,
+                &mut overflow,
+                ("t".to_string(), format!("forged{i}")),
+                1,
+                ABOVE_BOUND_WARN_EVERY,
+            ) {
+                warns += 1;
+            }
+        }
+        assert_eq!(warns, 4, "one warn per {ABOVE_BOUND_WARN_EVERY} of 4096");
+        assert_eq!(overflow, 4096, "every overflow listing counted");
+        assert_eq!(seen.len(), 1, "the map did not grow past its cap");
     }
 
     #[tokio::test]
@@ -692,13 +787,13 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_foreign_key_under_a_table_prefix_is_refused() {
-        // Only a key that is not `<20 characters>.pqm` directly under `v/`
-        // is foreign; one whose 20 characters name no version is skipped.
+        // Only a key whose suffix is not `.pqm` directly under `v/` is
+        // foreign; a `.pqm` key under the prefix whose slot names no version
+        // (any length, nested or not) is skipped.
         let prefix = manifest_prefix(&TENANT_A, "hits").expect("prefix");
         for junk in [
             format!("{prefix}notes.txt"),
             format!("{prefix}00000000000000000001.parquet"),
-            format!("{prefix}0000000000000000001.pqm"),
         ] {
             let store = MemoryStore::new();
             put_version(&store, &TENANT_A, 1).await;

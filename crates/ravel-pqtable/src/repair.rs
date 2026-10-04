@@ -1,7 +1,7 @@
 //! Removing forged manifest versions (ADR-2040, version bound amendment).
 //!
 //! No writer creates a version above [`MAX_MANIFEST_VERSION`] or a `.pqm` key
-//! whose 20 characters name no version, so one was put by something else: the
+//! whose slot names no version, so one was put by something else: the
 //! Query credential's create-only grant admits any 20-character version.
 //! Readers and the sweep already skip both ([`crate::resolve::newest`],
 //! [`crate::sweep::plan`]); [`list`] flags them and [`delete_flagged`]
@@ -65,8 +65,8 @@ pub enum RepairError {
 pub enum ListedVersion {
     /// A manifest version of this table.
     Number(u64),
-    /// A `.pqm` key whose 20 characters `slot` name no version: more than
-    /// `u64::MAX`, zero, or not all decimal digits.
+    /// A `.pqm` key whose `slot` names no version: the wrong length, an extra
+    /// path segment, more than `u64::MAX`, zero, or not all decimal digits.
     Invalid { slot: String, reason: String },
     /// Not a manifest version key of this table.
     NotAVersion { reason: String },
@@ -137,8 +137,8 @@ fn classify(tenant: &TenantHash, table: &str, key: &str) -> (ListedVersion, bool
 
 /// Every key under `table`'s `v/` prefix, in listing (ascending key) order,
 /// each flagged when it names a version above [`MAX_MANIFEST_VERSION`] or is
-/// a `.pqm` key whose 20 characters name no version. One paginated LIST; no
-/// manifest is read.
+/// a `.pqm` key whose slot names no version. One paginated LIST; no manifest
+/// is read.
 pub async fn list(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -286,6 +286,9 @@ mod tests {
     const OVERFLOW: &str = "99999999999999999999";
     const ZERO: &str = "00000000000000000000";
     const NON_DIGIT: &str = "abcdefghijklmnopqrst";
+    /// An extra path segment between the table's `v/` and a second `v/`, which
+    /// the Query grant's `*` binds. Sorts after `notes.txt` (`q` > `n`).
+    const NESTED: &str = "q/v/00000000000000000001";
 
     /// The `.pqm` key of `hits` whose 20 version characters are `slot`.
     fn invalid_key(slot: &str) -> String {
@@ -303,8 +306,8 @@ mod tests {
     }
 
     /// Versions 1, the bound, one above it and u64::MAX of `hits`, keys whose
-    /// version characters overflow a u64, are zero and are not digits,
-    /// version 7 of another tenant, and junk.
+    /// version characters overflow a u64, are zero, are not digits and sit
+    /// under an extra path segment, version 7 of another tenant, and junk.
     async fn forged_store() -> MemoryStore {
         let store = MemoryStore::with_page_size(2);
         for v in [1, MAX_MANIFEST_VERSION, MAX_MANIFEST_VERSION + 1, u64::MAX] {
@@ -315,6 +318,7 @@ mod tests {
             invalid_key(OVERFLOW),
             invalid_key(ZERO),
             invalid_key(NON_DIGIT),
+            invalid_key(NESTED),
             notes_key(),
         ] {
             store
@@ -344,6 +348,7 @@ mod tests {
                 (invalid_key(OVERFLOW), true),
                 (invalid_key(NON_DIGIT), true),
                 (notes_key(), false),
+                (invalid_key(NESTED), true),
             ]
         );
         assert_eq!(got[1].version, ListedVersion::Number(1));
@@ -351,6 +356,7 @@ mod tests {
             (&got[0], ZERO, "version is zero"),
             (&got[6], OVERFLOW, "version does not fit in a u64"),
             (&got[7], NON_DIGIT, "version is not 20 decimal digits"),
+            (&got[9], NESTED, "version is not 20 decimal digits"),
         ] {
             assert_eq!(
                 entry.version,
@@ -408,10 +414,11 @@ mod tests {
                 mkey(u64::MAX),
                 invalid_key(OVERFLOW),
                 invalid_key(NON_DIGIT),
+                invalid_key(NESTED),
             ]
         );
         assert_eq!(deleted, flagged);
-        assert_eq!(store.metrics().snapshot().op(StoreOp::Delete).calls, 5);
+        assert_eq!(store.metrics().snapshot().op(StoreOp::Delete).calls, 6);
         let left: Vec<String> = list(&store, &TENANT_A, "hits")
             .await
             .expect("list")
@@ -454,7 +461,7 @@ mod tests {
         assert_eq!(store.metrics().snapshot().op(StoreOp::Delete).calls, 0);
         assert_eq!(
             list(&store, &TENANT_A, "hits").await.expect("list").len(),
-            8
+            9
         );
     }
 
@@ -518,7 +525,7 @@ mod tests {
         assert_eq!(store.metrics().snapshot().op(StoreOp::Delete).calls, 0);
         assert_eq!(
             list(&store, &TENANT_A, "hits").await.expect("list").len(),
-            8
+            9
         );
     }
 

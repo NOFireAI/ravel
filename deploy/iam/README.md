@@ -610,18 +610,22 @@ against the Ravel bucket (ADR-0055, HTTP DDL amendment):
   key shaped like a manifest version is writable. The table segment has to be
   `*`, because table names run from 1 to 63 bytes; IAM's `*` also matches
   `/`, so the grant also reaches keys such as
-  `t/<tenant_hash>/pq/t/a/b/v/<20 chars>.pqm` or a 20-character version that
-  is not 20 digits. Every such key is still inside that tenant's manifest
-  keyspace, which the role can already create versions in. A `.pqm` key
-  under a real table's `v/` prefix whose 20 characters name no version (too
-  large for a `u64`, zero, or not all digits) is skipped, counted and warned
-  about by every listing, as a version above the bound is, and
-  `ravel-cli parquet repair --delete` removes it. A key whose table segment
-  is not a valid table name, such as the `a/b` one, is still refused as
-  foreign: it makes the tenant's `parquet ls` and manifest sweep fail with a
-  foreign-key error, though no table's resolve, until the Maintain
-  credential deletes it. That is the same class of harm as the
-  maximal-version wedge below, confined to the manifest keyspace.
+  `t/<tenant_hash>/pq/t/a/b/v/<20 chars>.pqm`, a key under a real table's own
+  `v/` prefix with an extra path segment
+  (`t/<tenant_hash>/pq/t/hits/v/q/v/<20 chars>.pqm`, where the `*` binds
+  `hits/v/q`), or a version slot that is not 20 digits. Every such key is
+  still inside that tenant's manifest keyspace, which the role can already
+  create versions in. A `.pqm` key under a real table's `v/` prefix whose
+  slot names no version (the wrong length, an extra path segment, too large
+  for a `u64`, zero, or not all digits) is skipped, counted and warned about
+  by every listing, as a version above the bound is, and
+  `ravel-cli parquet repair --delete` removes it. A key whose segment between
+  `pq/t/` and `/v/` is not a single valid table name, such as the `a/b` one,
+  is still refused as foreign: it makes the tenant's `parquet ls` and
+  manifest sweep fail with a foreign-key error, though no table's resolve,
+  until the Maintain credential deletes it; validating that segment is issue
+  #2510. That is the same class of harm as the maximal-version wedge below,
+  confined to the manifest keyspace.
 
   Creating a new version is not harmless: the newest version is the table
   for every reader. A compromised Query credential can define, redefine or

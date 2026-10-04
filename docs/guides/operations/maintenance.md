@@ -1315,10 +1315,12 @@ as any fresh node. The local cache is disposable by construction.
 A Parquet table's definition is its newest manifest version under
 `t/<hash>/pq/t/<table>/v/`, and each `CREATE`, `CREATE OR REPLACE` or `DROP`
 writes the next number. No statement writes a version above 4294967296
-(2^32), or a `.pqm` key whose 20 characters are not a version number (20
-digits too large for a `u64`, twenty zeros, or not all digits). One
-there was put straight into the bucket, for example with a stolen Query
-credential, which can create manifest versions.
+(2^32), or a `.pqm` key under a table's `v/` prefix whose slot is not a
+version number (the wrong length, an extra path segment such as
+`t/<hash>/pq/t/<table>/v/q/v/<20 digits>.pqm`, 20 digits too large for a
+`u64`, twenty zeros, or not all digits). One there was put straight into the
+bucket, for example with a stolen Query credential, which can create manifest
+versions.
 
 Ravel skips such a key: queries and DDL use the newest version at or below
 the bound, so the table keeps its last legitimate definition and DDL on it
@@ -1351,8 +1353,10 @@ To remove them:
 
    Each key prints escaped, with `stored_unix_ms` (when the store wrote it,
    by the store's clock), `created_by` and `statement`. Versions above the
-   bound are marked `FLAGGED: above the version bound`, and keys whose twenty
-   characters name no version are marked `FLAGGED: names no version`.
+   bound are marked `FLAGGED: above the version bound`, and keys under the
+   prefix whose slot names no version (the wrong length, an extra path
+   segment, too large, zero, or not digits) are marked
+   `FLAGGED: names no version`.
 2. Rotate the credential the version was written with. The repair removes
    the version, not the access that wrote it.
 3. Delete the flagged versions with the Maintain credential, the only role

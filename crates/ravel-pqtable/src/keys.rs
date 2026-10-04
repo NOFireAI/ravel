@@ -144,10 +144,11 @@ pub enum ListedManifestKey {
     /// A manifest version key, exactly as [`parse_manifest_key`] reads it.
     Version(ParsedManifestKey),
     /// `t/<tenant_hash>/pq/t/<table>/v/<slot>.pqm` with a valid table name and
-    /// a `slot` of 20 characters that is not a version in `1..=u64::MAX`: more
-    /// than `u64::MAX`, all zeros, or not all decimal digits. The Query grant
-    /// spells the version as 20 single-character wildcards, so it admits these
-    /// keys; readers skip them as they skip a version above
+    /// a `slot` that is not a version in `1..=u64::MAX`: the wrong length, an
+    /// extra path segment, more than `u64::MAX`, all zeros, or not all decimal
+    /// digits. The Query grant spells the version as 20 single-character
+    /// wildcards, but its `*` binds any run of segments before `/v/`, so it
+    /// admits these keys; readers skip them as they skip a version above
     /// [`MAX_MANIFEST_VERSION`].
     InvalidVersion {
         tenant_hash: TenantHash,
@@ -197,16 +198,14 @@ pub fn parse_manifest_key(key: &str) -> Result<ParsedManifestKey, KeyError> {
 }
 
 /// Parse a key a manifest listing returned. A key [`parse_manifest_key`]
-/// accepts is [`ListedManifestKey::Version`]; one whose only fault is a
-/// 20-character version that names no version is
+/// accepts is [`ListedManifestKey::Version`]; one under a valid table's `v/`
+/// prefix ending in `.pqm` whose `slot` names no version is
 /// [`ListedManifestKey::InvalidVersion`]. Every other key is an error, as it
-/// is for [`parse_manifest_key`].
+/// is for [`parse_manifest_key`]: a suffix other than `.pqm`, a key outside a
+/// valid table's `v/` prefix, or a table segment [`validate_table`] refuses.
 pub fn parse_listed_manifest_key(key: &str) -> Result<ListedManifestKey, KeyError> {
     let (tenant_hash, table, slot) = split_manifest_key(key)?;
-    if slot.chars().count() != VERSION_WIDTH {
-        return Err(malformed(key, "version is not 20 characters"));
-    }
-    let reason = if !slot.bytes().all(|b| b.is_ascii_digit()) {
+    let reason = if slot.len() != VERSION_WIDTH || !slot.bytes().all(|b| b.is_ascii_digit()) {
         "version is not 20 decimal digits"
     } else {
         match slot.parse::<u64>() {
@@ -343,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn a_listed_key_with_an_invalid_twenty_character_version_is_named_not_refused() {
+    fn a_listed_key_whose_slot_names_no_version_is_named_not_refused() {
         let th = "a1".repeat(16);
         let ok = format!("t/{th}/pq/t/hits/v/00000000000000000007.pqm");
         assert_eq!(
@@ -359,6 +358,13 @@ mod tests {
                 "version is not 20 decimal digits",
             ),
             ("000000000/0000000001", "version is not 20 decimal digits"),
+            // Wrong length: 19 and 21 digits.
+            ("0000000000000000001", "version is not 20 decimal digits"),
+            ("000000000000000000001", "version is not 20 decimal digits"),
+            // An extra path segment between the table's `v/` and a second
+            // `v/`, which the Query grant's `*` binds. The slot the parser
+            // reads is everything between the first `v/` and `.pqm`.
+            ("q/v/00000000000000000001", "version is not 20 decimal digits"),
         ] {
             let key = format!("t/{th}/pq/t/hits/v/{slot}.pqm");
             assert_eq!(
@@ -372,9 +378,9 @@ mod tests {
                 "{key:?}"
             );
         }
+        // Only a key with a non-`.pqm` suffix, outside a valid table's `v/`
+        // prefix, or under an invalid table segment stays foreign.
         for key in [
-            format!("t/{th}/pq/t/hits/v/0000000000000000001.pqm"),
-            format!("t/{th}/pq/t/hits/v/000000000000000000001.pqm"),
             format!("t/{th}/pq/t/hits/v/00000000000000000001.parquet"),
             format!("t/{th}/pq/t/hits/x/00000000000000000001.pqm"),
             format!("t/{th}/pq/t/Hits/v/00000000000000000001.pqm"),

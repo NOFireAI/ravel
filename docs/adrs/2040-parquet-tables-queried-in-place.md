@@ -1088,10 +1088,12 @@ answers it 422 with that message, the class it uses for a well-formed
 statement it refuses (`DdlErrorClass::Unsupported`), not 500.
 
 **Keys that name no version.** The Query grant spells the version as 20
-single-character wildcards, so it also admits a `.pqm` key under a table's
-`v/` prefix whose 20 characters are not a version in `1..=u64::MAX`: 20
-digits above `u64::MAX`, twenty zeros, or characters that are not all
-digits. `keys::parse_listed_manifest_key` names such a key
+single-character wildcards, but its `*` binds any run of segments before
+`/v/`, so it also admits a `.pqm` key under a table's `v/` prefix whose slot
+is not a version in `1..=u64::MAX`: the wrong length, an extra path segment
+(such as `t/<tenant_hash>/pq/t/hits/v/q/v/<20 digits>.pqm`, where the `*`
+binds `hits/v/q`), 20 digits above `u64::MAX`, twenty zeros, or characters
+that are not all digits. `keys::parse_listed_manifest_key` names such a key
 `ListedManifestKey::InvalidVersion` instead of refusing it, and every
 listing treats it exactly like a version above the bound: `resolve::versions`
 (and so `resolve::newest`), `resolve::tables` and the sweep's listing skip
@@ -1172,12 +1174,15 @@ after checking the audit log. Versions above the bound and keys that name no
 version cost every reader: the sweep never removes them, and every
 `resolve::newest` pages through all of them into memory, so one credential
 can make every resolve of a table arbitrarily expensive until
-`parquet repair --delete` removes them. A key under `t/<tenant_hash>/pq/t/`
-whose table segment is not a valid table name (such as
+`parquet repair --delete` removes them. A key whose segment between `pq/t/`
+and `/v/` is not a single valid table name (such as
 `t/<tenant_hash>/pq/t/a/b/v/<20 chars>.pqm`, which the Query grant's `*`
 admits) is still refused as foreign by the tenant-wide listings, so it fails
 `parquet ls` and `parquet sweep` for the whole tenant, though no table's
-resolve. Narrowing the Query grant, item 1 of issue #2430, remains the root
+resolve; validating that segment is issue #2510. A key whose extra segments
+sit under a valid table's own `v/` prefix, by contrast, is now a key that
+names no version, skipped and flagged like the rest. Narrowing the Query
+grant, item 1 of issue #2430, remains the root
 fix for all of these; until then the sweep also still deletes predecessors
 on the word of a manifest no one can attribute, when that manifest is at or
 below the bound.

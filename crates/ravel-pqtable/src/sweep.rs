@@ -21,7 +21,7 @@
 //! successor in the same listing, so it does not select a table's newest
 //! version, dropped or live, which the next writer numbers from. Versions
 //! above [`MAX_MANIFEST_VERSION`] are left out of that pairing, and so are
-//! `.pqm` keys whose 20 characters name no version, which the listing skips
+//! `.pqm` keys whose slot names no version, which the listing skips
 //! and counts as [`crate::resolve::versions`] does: none is a table's newest,
 //! so none counts as a successor, and none is deleted here.
 //!
@@ -463,6 +463,44 @@ mod tests {
             assert_eq!(resolve::above_bound_resolves(&tenant, "hits"), 2, "{slot}");
             assert_eq!(warnings_naming(&logs, slot), 1, "{slot}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_nested_key_under_a_table_v_prefix_is_skipped_by_the_sweep() {
+        use crate::resolve::tests::{capture_logs, put_invalid, warnings_naming};
+
+        // The nested shape (`hits/v/q/v/<20>.pqm`) sits under the table's own
+        // `v/` prefix, so the sweep listing skips and counts it instead of
+        // failing, and still supersedes v1 with v2.
+        const NESTED: &str = "q/v/00000000000000000001";
+        const TENANT: TenantHash = TenantHash([0x5b; 16]);
+        let (logs, _guard) = capture_logs();
+        let store = MemoryStore::with_page_size(2);
+        store.set_clock_ms(0);
+        for v in [1, 2] {
+            let bytes =
+                encode_manifest(&TENANT, &live_manifest("hits", v, &[1])).expect("encode");
+            store
+                .put(
+                    &manifest_key(&TENANT, "hits", v).expect("key"),
+                    Bytes::from(bytes),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put");
+        }
+        put_invalid(&store, &TENANT, NESTED).await;
+        let now = (1 + GRACE + SKEW_MS) as i64;
+        assert_eq!(
+            plan(&store, &TENANT, now, GRACE, GRACE)
+                .await
+                .expect("plan"),
+            SweepPlan {
+                manifest_deletes: vec![manifest_key(&TENANT, "hits", 1).expect("key")]
+            }
+        );
+        assert_eq!(resolve::above_bound_resolves(&TENANT, "hits"), 1);
+        assert_eq!(warnings_naming(&logs, NESTED), 1);
     }
 
     #[tokio::test]

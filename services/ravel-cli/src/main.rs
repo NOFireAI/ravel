@@ -911,9 +911,10 @@ enum ParquetCommand {
     /// no version; with `--delete`, delete exactly the flagged ones; with
     /// `--delete-version N`, delete exactly version N.
     ///
-    /// No DDL statement writes a version above the bound (2^32) or a key whose
-    /// 20 characters are not a version number, so one there was put directly
-    /// in the bucket, for example with a stolen Query credential. Readers and
+    /// No DDL statement writes a version above the bound (2^32) or a `.pqm`
+    /// key under a table's `v/` prefix whose slot is not a version number, so
+    /// one there was put directly in the bucket, for example with a stolen
+    /// Query credential. Readers and
     /// the sweep already skip it; `--delete` removes it. A forged version at
     /// or below the bound is not flagged: as the newest it serves as the
     /// table, and exactly at the bound it blocks every later DDL. Remove one
@@ -4281,6 +4282,20 @@ mod tests {
             (
                 &[
                     "ravel", "parquet", "repair", "--tenant", "t", "--table", "hits", "--delete",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "parquet",
+                    "repair",
+                    "--tenant",
+                    "t",
+                    "--table",
+                    "hits",
+                    "--delete-version",
+                    "5",
                 ],
                 true,
             ),
