@@ -1917,13 +1917,22 @@ fn validate_idle_flush_byte_floor(config: &ServerConfig) -> anyhow::Result<()> {
     })
 }
 
-/// Why a flush cadence was refused at startup: it spends the read-side scan
-/// slack `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` encodes. Returned by
-/// [`start`] for every caller and every [`Mode`], and by `Cli::validate`
-/// through the same functions, so the library and the command line refuse
-/// the same cadences with the same text.
+/// Why a flush cadence was refused at startup: its idle delay is below its
+/// fast delay, it spends the flush slack `ravel_catalog::FLUSH_BOUND_SLACK_HOURS`
+/// encodes, its strict visibility budget reaches
+/// [`config::MAX_STRICT_VISIBILITY_BUDGET_NS`], or its `min_flush_bytes`
+/// reaches `target_bytes`. Returned by [`start`] for every caller and every
+/// [`Mode`], and by `Cli::validate` through the same functions in the same
+/// order, so the library and the command line refuse the same cadences with
+/// the same text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlushCadenceError {
+    /// `max_flush_delay_idle` is below `max_flush_delay`, so the idle tier
+    /// would flush faster than the strict tier (ADR-0076 decision 4).
+    IdleFlushDelayBelowFast {
+        max_flush_delay: Duration,
+        max_flush_delay_idle: Duration,
+    },
     /// `max_flush_delay_idle` plus the ingest pipeline's `max_flush_lifetime`
     /// exceeds `FLUSH_BOUND_SLACK_HOURS` (ADR-0076 decision 4).
     FlushBoundExceedsSlack {
@@ -1941,19 +1950,69 @@ pub enum FlushCadenceError {
         flush_trigger_age_bound_ns: i64,
         flush_tick: Duration,
     },
+    /// The strict visibility budget `start` derives from `max_flush_delay`
+    /// meets or exceeds [`config::MAX_STRICT_VISIBILITY_BUDGET_NS`].
+    StrictVisibilityBudgetTooHigh {
+        max_flush_delay: Duration,
+        strict_visibility_budget_ns: i64,
+    },
+    /// `min_flush_bytes` meets or exceeds the ingest pipeline's `target_bytes`,
+    /// so the idle tier's byte-priority trigger can never fire.
+    MinFlushBytesNotBelowTargetBytes {
+        min_flush_bytes: usize,
+        target_bytes: usize,
+    },
 }
 
 impl std::fmt::Display for FlushCadenceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::IdleFlushDelayBelowFast {
+                max_flush_delay,
+                max_flush_delay_idle,
+            } => write!(
+                f,
+                "--max-flush-delay-idle {:?} is less than --max-flush-delay {:?}: the idle/no- \
+                 waiter tier would flush faster than the strict/waiter-present tier, inverting \
+                 ADR-0076 decision 4's design where strict acks are the fast path. Raise \
+                 --max-flush-delay-idle to at least --max-flush-delay.",
+                max_flush_delay_idle, max_flush_delay,
+            ),
+            Self::StrictVisibilityBudgetTooHigh {
+                max_flush_delay,
+                strict_visibility_budget_ns,
+            } => write!(
+                f,
+                "--max-flush-delay {:?} derives a strict_visibility_budget_ns of {:?}ns, which \
+                 meets or exceeds MAX_STRICT_VISIBILITY_BUDGET_NS ({}s): in strict mode a client \
+                 waits for that budget plus two PUT round trips before its ack returns, and a \
+                 value this high risks the OTLP client's own export timeout firing first, \
+                 producing retries and duplicate logs/spans instead of the fewer requests this \
+                 ADR is for. Lower --max-flush-delay.",
+                max_flush_delay,
+                strict_visibility_budget_ns,
+                config::MAX_STRICT_VISIBILITY_BUDGET_NS as f64 / 1e9,
+            ),
+            Self::MinFlushBytesNotBelowTargetBytes {
+                min_flush_bytes,
+                target_bytes,
+            } => write!(
+                f,
+                "--min-flush-bytes {} meets or exceeds the ingest pipeline's target_bytes ({}): \
+                 a buffer would always hit target_bytes' own size trigger before it could ever \
+                 be treated as idle, making the min_flush_bytes byte-priority trigger \
+                 unreachable. Lower --min-flush-bytes below target_bytes.",
+                min_flush_bytes, target_bytes,
+            ),
             Self::FlushBoundExceedsSlack {
                 max_flush_delay_idle,
                 max_flush_lifetime,
             } => write!(
                 f,
                 "--max-flush-delay-idle {:?} plus the ingest pipeline's max_flush_lifetime ({:?}) \
-                 exceeds FLUSH_BOUND_SLACK_HOURS ({} h): the read-side scan slack \
-                 ravel_catalog::FLUSH_BOUND_SLACK_HOURS encodes would no longer cover a \
+                 exceeds FLUSH_BOUND_SLACK_HOURS ({} h): the flush slack \
+                 ravel_catalog::FLUSH_BOUND_SLACK_HOURS encodes, the flush-timing part of the \
+                 read-side scan slack, would no longer cover a \
                  straggler flush pinned under a retiring shard-count generation, an \
                  invisibility hazard. Lower --max-flush-delay-idle, or revisit \
                  FLUSH_BOUND_SLACK_HOURS in ravel-catalog in lockstep (ADR-0076 decision 4).",
@@ -1997,9 +2056,62 @@ impl std::fmt::Display for FlushCadenceError {
 
 impl std::error::Error for FlushCadenceError {}
 
+/// Refuses an idle flush delay below the fast one (ADR-0076 decision 4): the
+/// idle tier (no strict waiter, below `min_flush_bytes`) must never flush
+/// faster than the fast tier, since strict acks are the fast path. Equal is
+/// admitted; both tiers then share one threshold. Checked first, in `start`
+/// and in `Cli::validate`: [`validate_flush_bound_slack`] reads the idle
+/// delay as the worst-case age, which holds only once it is the larger one.
+pub(crate) fn validate_flush_delay_order(
+    max_flush_delay: Duration,
+    max_flush_delay_idle: Duration,
+) -> Result<(), FlushCadenceError> {
+    if max_flush_delay_idle < max_flush_delay {
+        return Err(FlushCadenceError::IdleFlushDelayBelowFast {
+            max_flush_delay,
+            max_flush_delay_idle,
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a `max_flush_delay` whose derived strict visibility budget (the
+/// delay plus `ravel_ingest::STRICT_VISIBILITY_RESERVE_NS`, the value `start`
+/// hands every ingest pipeline) meets or exceeds
+/// [`config::MAX_STRICT_VISIBILITY_BUDGET_NS`].
+pub(crate) fn validate_strict_visibility_budget(
+    max_flush_delay: Duration,
+) -> Result<(), FlushCadenceError> {
+    let strict_visibility_budget_ns = config::duration_nanos_saturating(max_flush_delay)
+        .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS);
+    if strict_visibility_budget_ns >= config::MAX_STRICT_VISIBILITY_BUDGET_NS {
+        return Err(FlushCadenceError::StrictVisibilityBudgetTooHigh {
+            max_flush_delay,
+            strict_visibility_budget_ns,
+        });
+    }
+    Ok(())
+}
+
+/// Refuses a `min_flush_bytes` at or above the ingest pipeline's default
+/// `target_bytes`, which is not an operator flag: past it the size trigger
+/// always fires first and the idle tier's byte-priority trigger is
+/// unreachable.
+pub(crate) fn validate_min_flush_bytes(min_flush_bytes: usize) -> Result<(), FlushCadenceError> {
+    let target_bytes = IngestConfig::default().target_bytes;
+    if min_flush_bytes >= target_bytes {
+        return Err(FlushCadenceError::MinFlushBytesNotBelowTargetBytes {
+            min_flush_bytes,
+            target_bytes,
+        });
+    }
+    Ok(())
+}
+
 /// Refuses an idle flush delay that, plus the ingest pipeline's default
-/// `max_flush_lifetime`, exceeds the read-side scan slack (ADR-0076 decision
-/// 4). The issue #1740 deferral term is bounded separately, by
+/// `max_flush_lifetime`, exceeds the flush slack
+/// `ravel_catalog::FLUSH_BOUND_SLACK_HOURS` (ADR-0076 decision 4). The issue
+/// #1740 deferral term is bounded separately, by
 /// [`validate_flush_deferral_cap`].
 pub(crate) fn validate_flush_bound_slack(
     max_flush_delay_idle: Duration,
@@ -2209,12 +2321,16 @@ pub async fn start_with_heartbeat(
     heartbeat: health_listener::Heartbeat,
 ) -> anyhow::Result<Running> {
     validate_idle_flush_byte_floor(&config)?;
+    // The same checks, in the same order, as `Cli::validate`.
+    validate_flush_delay_order(config.max_flush_delay, config.max_flush_delay_idle)?;
     validate_flush_bound_slack(config.max_flush_delay_idle)?;
+    validate_strict_visibility_budget(config.max_flush_delay)?;
     validate_flush_deferral_cap(
         config.max_flush_delay,
         config.max_flush_delay_idle,
         config.adaptive_flush_delay,
     )?;
+    validate_min_flush_bytes(config.min_flush_bytes)?;
     validate_loop_intervals(&config)?;
 
     // Install the rustls process-level crypto provider before any TLS endpoint

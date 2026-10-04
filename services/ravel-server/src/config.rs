@@ -1681,7 +1681,9 @@ pub struct Cli {
     /// `ravel_ingest_queued_flushes`, both by `{mode, signal}`.
     /// Nothing is acked and nothing is dropped, so a refusal is a deferral,
     /// not a shed. A deferral is backed by the flush deferral cap, the 2 h
-    /// read-side scan slack less `max_flush_lifetime`, the slowest flush
+    /// flush slack (the flush-timing part of the 3 h read-side scan slack,
+    /// which adds one hour of clock skew) less `max_flush_lifetime`, the
+    /// slowest flush
     /// trigger (the largest of `--max-flush-delay`, `--max-flush-delay-idle`
     /// and, under `--adaptive-flush-delay`, the adaptive corridor's widest
     /// ceiling) and one flush tick (3559.8 s at the defaults): once a shard's
@@ -6684,16 +6686,10 @@ impl Cli {
         // acks are supposed to be the fast path. Equal is fine (both tiers
         // then share one threshold); only a strictly smaller idle ceiling
         // inverts the design.
-        if flush_cadence.max_flush_delay_idle < flush_cadence.max_flush_delay {
-            anyhow::bail!(
-                "--max-flush-delay-idle {:?} is less than --max-flush-delay {:?}: the idle/no- \
-                 waiter tier would flush faster than the strict/waiter-present tier, inverting \
-                 ADR-0076 decision 4's design where strict acks are the fast path. Raise \
-                 --max-flush-delay-idle to at least --max-flush-delay.",
-                flush_cadence.max_flush_delay_idle,
-                flush_cadence.max_flush_delay,
-            );
-        }
+        crate::validate_flush_delay_order(
+            flush_cadence.max_flush_delay,
+            flush_cadence.max_flush_delay_idle,
+        )?;
 
         // Bug3's check above makes max_flush_delay_idle the validated
         // larger-or-equal worst-case bound: a buffer with no strict waiter is
@@ -6716,21 +6712,7 @@ impl Cli {
         // generation of a shard-count decrease.
         crate::validate_flush_bound_slack(flush_cadence.max_flush_delay_idle)?;
 
-        let strict_visibility_budget_ns = duration_nanos_saturating(flush_cadence.max_flush_delay)
-            .saturating_add(ravel_ingest::STRICT_VISIBILITY_RESERVE_NS);
-        if strict_visibility_budget_ns >= MAX_STRICT_VISIBILITY_BUDGET_NS {
-            anyhow::bail!(
-                "--max-flush-delay {:?} derives a strict_visibility_budget_ns of {:?}ns, which \
-                 meets or exceeds MAX_STRICT_VISIBILITY_BUDGET_NS ({}s): in strict mode a client \
-                 waits for that budget plus two PUT round trips before its ack returns, and a \
-                 value this high risks the OTLP client's own export timeout firing first, \
-                 producing retries and duplicate logs/spans instead of the fewer requests this \
-                 ADR is for. Lower --max-flush-delay.",
-                flush_cadence.max_flush_delay,
-                strict_visibility_budget_ns,
-                MAX_STRICT_VISIBILITY_BUDGET_NS as f64 / 1e9,
-            );
-        }
+        crate::validate_strict_visibility_budget(flush_cadence.max_flush_delay)?;
 
         // ADR-1642 deferral cap amendment: the cap is what the read-side
         // slack leaves once the flush lifetime and the slowest flush trigger
@@ -6750,17 +6732,7 @@ impl Cli {
         // max_flush_lifetime. A `min_flush_bytes` at or above it makes the
         // idle-tier byte-priority trigger unreachable, defeating its
         // purpose.
-        let target_bytes = ravel_ingest::IngestConfig::default().target_bytes;
-        if flush_cadence.min_flush_bytes >= target_bytes {
-            anyhow::bail!(
-                "--min-flush-bytes {} meets or exceeds the ingest pipeline's target_bytes ({}): \
-                 a buffer would always hit target_bytes' own size trigger before it could ever \
-                 be treated as idle, making the min_flush_bytes byte-priority trigger \
-                 unreachable. Lower --min-flush-bytes below target_bytes.",
-                flush_cadence.min_flush_bytes,
-                target_bytes,
-            );
-        }
+        crate::validate_min_flush_bytes(flush_cadence.min_flush_bytes)?;
 
         // Issue #1744: see `resolve_gc_max_flush_lifetime_ns` for why this
         // must refuse a below-floor value, whether it came from the flag or
@@ -12811,6 +12783,13 @@ mod tests {
             .validate()
             .expect_err("startup must reject --max-flush-delay-idle 1s < --max-flush-delay 3s");
         assert!(
+            matches!(
+                err.downcast_ref::<crate::FlushCadenceError>(),
+                Some(crate::FlushCadenceError::IdleFlushDelayBelowFast { .. })
+            ),
+            "expected FlushCadenceError::IdleFlushDelayBelowFast, got: {err:#}"
+        );
+        assert!(
             err.to_string().contains("--max-flush-delay-idle")
                 && err.to_string().contains("less than"),
             "expected the tier-inversion error, got: {err}"
@@ -13021,6 +13000,13 @@ mod tests {
              MAX_STRICT_VISIBILITY_BUDGET_NS",
         );
         assert!(
+            matches!(
+                err.downcast_ref::<crate::FlushCadenceError>(),
+                Some(crate::FlushCadenceError::StrictVisibilityBudgetTooHigh { .. })
+            ),
+            "expected FlushCadenceError::StrictVisibilityBudgetTooHigh, got: {err:#}"
+        );
+        assert!(
             err.to_string().contains("MAX_STRICT_VISIBILITY_BUDGET_NS"),
             "expected a MAX_STRICT_VISIBILITY_BUDGET_NS error, got: {err}"
         );
@@ -13062,6 +13048,13 @@ mod tests {
         let err = cli
             .validate()
             .expect_err("startup must reject --min-flush-bytes == target_bytes");
+        assert!(
+            matches!(
+                err.downcast_ref::<crate::FlushCadenceError>(),
+                Some(crate::FlushCadenceError::MinFlushBytesNotBelowTargetBytes { .. })
+            ),
+            "expected FlushCadenceError::MinFlushBytesNotBelowTargetBytes, got: {err:#}"
+        );
         assert!(
             err.to_string().contains("target_bytes"),
             "expected a target_bytes error, got: {err}"
