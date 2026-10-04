@@ -749,9 +749,11 @@ async fn a_zero_survivor_skip_decidable_plan_records_no_touch() {
     let (records, bytes) = above_threshold_object();
     let (seg, counting, store) = counted_store("logs/skip-zero.rlog", &bytes, &records).await;
 
-    // The shipped byte-minimal routing threshold, so the object is above it and
-    // the skip-decidable branch is the one that runs.
-    let fetcher = LogSegmentFetcher::new(store);
+    // The shipped byte-minimal routing threshold, pinned the way the server
+    // pins it (which also pins the ranged fetch's own crossover), so the
+    // object is above it and the skip-decidable branch is the one that runs.
+    let fetcher = LogSegmentFetcher::new(store)
+        .with_block_range_threshold(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD);
     assert_eq!(
         fetcher.block_range_threshold(),
         DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD
@@ -792,7 +794,8 @@ async fn a_surviving_skip_decidable_plan_records_exactly_one_touch() {
     let (records, bytes) = above_threshold_object();
     let (seg, counting, store) = counted_store("logs/skip-live.rlog", &bytes, &records).await;
 
-    let fetcher = LogSegmentFetcher::new(store);
+    let fetcher = LogSegmentFetcher::new(store)
+        .with_block_range_threshold(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD);
     let accounting = QueryAccounting::new();
 
     let (survivors, _dirs, _stats, footer, _whole_object) = fetcher
@@ -1048,8 +1051,10 @@ async fn cost_based_at_the_reference_profile_routes_whole_object() {
 /// `cost-based` saturates only on a profile with neither byte prices nor
 /// timings (ADR-2414 decision A3), so its arm runs on the reference prices
 /// without the timings. At the reference profile itself the rate is the
-/// finite time term, the routing threshold stays at 512 KiB, and the plan
-/// phase probes the above-threshold object like byte-minimal does.
+/// finite time term and the routing threshold stays at 512 KiB, but the
+/// object sits under the 31,500,000-byte projection break-even, so the plan
+/// phase still issues no probe and reads it in one GET: the scan would read
+/// it whole at that break-even, and a probe first would read it twice.
 #[tokio::test]
 async fn a_saturated_resolution_issues_no_plan_footer_probe() {
     let (records, bytes) = above_threshold_object();
@@ -1123,9 +1128,168 @@ async fn a_saturated_resolution_issues_no_plan_footer_probe() {
         .await
         .expect("plan")
         .expect("relevant");
-    assert!(
-        counting.probe_count() > 0,
-        "cost-based at the reference profile keeps the 512 KiB routing threshold, \
-         so the plan phase probes an above-threshold object"
+    assert_eq!(
+        (counting.probe_count(), counting.get_count()),
+        (0, 1),
+        "cost-based at the reference profile reads an object under the \
+         break-even whole in one GET, with no plan-phase probe"
+    );
+}
+
+/// A plan with one fetcher configuration, returning the probe count, the GET
+/// count, the largest single GET, and whether the plan carried a footer and a
+/// whole object forward.
+async fn plan_counts(
+    key: &str,
+    bytes: &[u8],
+    records: &[LogRecord],
+    query: &LogQuery,
+    configure: impl FnOnce(LogSegmentFetcher) -> LogSegmentFetcher,
+) -> (u64, u64, u64, bool, bool) {
+    let (seg, counting, store) = counted_store(key, bytes, records).await;
+    let fetcher = configure(LogSegmentFetcher::new(store));
+    let (_, _, _, footer, carried) = fetcher
+        .plan_segment(&seg, TENANT, query, &QueryAccounting::new())
+        .await
+        .expect("plan")
+        .expect("relevant");
+    (
+        counting.probe_count(),
+        counting.get_count(),
+        counting.max_get_len(),
+        footer.is_some(),
+        carried.is_some(),
+    )
+}
+
+/// ADR-2414 decision A3 on the planned route: both footer-carrying
+/// `plan_segment` branches (the predicate-free fast path and the
+/// skip-decidable branch) read an object at or below the larger of the
+/// routing threshold and the projection break-even whole, in one GET with no
+/// probe, and carry it to the scan; above that bound they probe and read the
+/// directories ranged. At or below the break-even the scan's ranged fetch reads
+/// the object whole, so a plan-phase probe there would read it twice under two
+/// cache keys, the per-object GET overhead ADR-2023 measured.
+///
+/// The scan that follows the under-the-break-even plan opens on the carried
+/// bytes and issues no GET of its own.
+#[tokio::test]
+async fn the_planned_route_reads_an_object_under_the_break_even_whole() {
+    let (records, bytes) = above_threshold_object();
+    let size = bytes.len() as u64;
+    let reference = cost_based_at_reference();
+    assert_eq!(reference.block_range_threshold, 524_288);
+    assert_eq!(reference.projection_break_even_bytes, Some(31_500_000));
+    assert!(size > 524_288 && size <= 31_500_000);
+
+    let fast = LogQuery::new(i64::MIN, i64::MAX);
+    let skip = coded_query(0, 1_000);
+    for (name, query) in [("fast", &fast), ("skip", &skip)] {
+        let whole = (0, 1, size, false, true);
+        let at_reference = plan_counts(
+            &format!("logs/be-ref-{name}.rlog"),
+            &bytes,
+            &records,
+            query,
+            |f| {
+                f.with_block_range_threshold(reference.block_range_threshold)
+                    .with_request_cost_bytes(reference.request_cost_bytes)
+                    .with_projection_break_even_bytes(reference.projection_break_even_bytes)
+            },
+        )
+        .await;
+        assert_eq!(
+            at_reference, whole,
+            "{name}: under the reference break-even the plan reads whole, no probe"
+        );
+
+        let at_size = plan_counts(
+            &format!("logs/be-at-{name}.rlog"),
+            &bytes,
+            &records,
+            query,
+            |f| {
+                f.with_block_range_threshold(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD)
+                    .with_projection_break_even_bytes(Some(size))
+            },
+        )
+        .await;
+        assert_eq!(
+            at_size, whole,
+            "{name}: an object exactly at the break-even reads whole"
+        );
+
+        // A break-even below the routing threshold leaves the threshold the
+        // bound: the plan reads whole on the larger of the two.
+        let threshold_bound = plan_counts(
+            &format!("logs/be-th-{name}.rlog"),
+            &bytes,
+            &records,
+            query,
+            |f| {
+                f.with_block_range_threshold(size)
+                    .with_projection_break_even_bytes(Some(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD))
+            },
+        )
+        .await;
+        assert_eq!(
+            threshold_bound, whole,
+            "{name}: the routing threshold bounds the plan when it is the larger"
+        );
+
+        let (probes, gets, max_get, footer, carried) = plan_counts(
+            &format!("logs/be-above-{name}.rlog"),
+            &bytes,
+            &records,
+            query,
+            |f| {
+                f.with_block_range_threshold(DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD)
+                    .with_projection_break_even_bytes(Some(size - 1))
+            },
+        )
+        .await;
+        assert_eq!(
+            probes, 1,
+            "{name}: above the break-even the plan probes once"
+        );
+        assert!(
+            gets >= 2 && max_get < size / 4,
+            "{name}: above the break-even the plan reads the directories ranged, \
+             got {gets} GETs with a largest of {max_get} bytes of {size}"
+        );
+        assert!(
+            footer && !carried,
+            "{name}: the ranged plan carries a footer, not the object"
+        );
+    }
+
+    // The scan after an under-the-break-even plan reuses the carried object.
+    let (seg, counting, store) = counted_store("logs/be-scan.rlog", &bytes, &records).await;
+    let fetcher = fetcher_from(&reference, store);
+    let (indices, _, _, footer, carried) = fetcher
+        .plan_segment(&seg, TENANT, &skip, &QueryAccounting::new())
+        .await
+        .expect("plan")
+        .expect("relevant");
+    assert_eq!(counting.get_count(), 1);
+    let scan = fetcher
+        .scan_accounted_with_tenant_subset(
+            &seg,
+            TENANT,
+            &skip,
+            &ravel_logseg::ColumnSelection::all(),
+            &(0..indices.len()).collect::<Vec<_>>(),
+            footer.as_ref(),
+            carried,
+            &QueryAccounting::new(),
+        )
+        .await
+        .expect("scan")
+        .expect("relevant");
+    drop(scan);
+    assert_eq!(
+        (counting.probe_count(), counting.get_count()),
+        (0, 1),
+        "plan and scan together read the object once"
     );
 }
