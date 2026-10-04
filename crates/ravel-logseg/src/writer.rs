@@ -1767,6 +1767,12 @@ impl RlogWriter {
         drop(perm);
         drop(g_ts);
         drop(g_obs);
+        drop(g_sev);
+        drop(g_flags);
+        drop(g_trace);
+        drop(g_span);
+        drop(g_stream_id);
+        drop(g_batch);
         drop(g_stream_ref);
         drop(g_body);
         drop(g_sevtext);
