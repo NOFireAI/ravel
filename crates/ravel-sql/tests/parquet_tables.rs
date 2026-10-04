@@ -29,7 +29,9 @@ use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_parquet::ParquetReadError;
 use ravel_pqtable::clock::FixedClock;
 use ravel_pqtable::grants;
-use ravel_pqtable::manifest::ParquetFile;
+use ravel_pqtable::keys::manifest_key;
+use ravel_pqtable::manifest::{APPLY_NONCE_LEN, Manifest, ParquetFile, encode_manifest};
+use ravel_pqtable::resolve;
 use ravel_pqtable::writer::{self, Intent};
 use ravel_query::{
     ByteLimit, EngineConfig, GetLimiter, LogSegmentFetcher, QueryPhase, RequestBudgets,
@@ -1202,6 +1204,59 @@ async fn a_dropped_table_is_an_unknown_table() {
     lake.hits_for(&acme).await;
     drop_table(&lake, &acme, "hits").await;
     unknown_table_error(&lake, &acme, "SELECT * FROM hits").await;
+}
+
+/// A forged newest version above the manifest version bound does not win:
+/// the query serves the newest version at or below the bound, the table is
+/// counted as holding a forged version, and DDL on it still commits.
+///
+/// FLIP: resolving the highest listed version reads the forged drop, so
+/// `hits` is an unknown table.
+#[tokio::test]
+async fn a_forged_parquet_version_above_the_bound_is_ignored_and_the_older_one_served() {
+    let lake = Lake::configured();
+    // A tenant no other test uses: the forged-version count is per process.
+    let acme = tenant("acme-forged-version");
+    lake.hits_for(&acme).await;
+    let sql = "SELECT id FROM hits ORDER BY id";
+    let before = rows(&lake.execute(&acme, sql).await.expect("query"));
+    assert_eq!(before.len(), 6, "{before:?}");
+
+    let forged = Manifest {
+        table: "hits".to_string(),
+        version: u64::MAX,
+        dropped: true,
+        location: String::new(),
+        grant: String::new(),
+        files: Vec::new(),
+        options: BTreeMap::new(),
+        created_by: "forger".to_string(),
+        created_unix_ns: NOW,
+        statement: "DROP TABLE hits".to_string(),
+        apply_nonce: vec![0; APPLY_NONCE_LEN],
+    };
+    lake.ravel
+        .inner()
+        .put(
+            &manifest_key(&acme, "hits", u64::MAX).expect("key"),
+            Bytes::from(encode_manifest(&acme, &forged).expect("encode")),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("forged put");
+
+    let after = rows(&lake.execute(&acme, sql).await.expect("query"));
+    assert_eq!(after, before);
+    assert!(resolve::above_bound_resolves(&acme, "hits") > 0);
+
+    drop_table(&lake, &acme, "hits").await;
+    assert_eq!(
+        resolve::versions(lake.ravel.inner(), &acme, "hits")
+            .await
+            .expect("versions"),
+        vec![1, 2, u64::MAX]
+    );
+    unknown_table_error(&lake, &acme, sql).await;
 }
 
 /// A dropped table beside a signal table is an unknown table, not a

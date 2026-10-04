@@ -21,6 +21,24 @@ use crate::names::{NameError, validate_table};
 pub const MANIFEST_SUFFIX: &str = ".pqm";
 /// Digits in a manifest key's zero-padded version, enough for any `u64`.
 pub const VERSION_WIDTH: usize = 20;
+
+/// Highest manifest version a writer creates and a reader resolves: 2^32.
+///
+/// Versions are dense: every DDL statement on a table writes exactly the next
+/// one, so a table reaches this bound only after 2^32 statements, more than a
+/// century at one statement per second. A version above it, up to the
+/// `u64::MAX` a 20-digit key can spell, can only come from a put that did not
+/// go through [`crate::writer::apply`], such as one made directly with the
+/// Query credential, whose create-only grant admits any 20-digit version; at
+/// `u64::MAX` it would leave the table no successor and every later DDL would
+/// fail. [`crate::resolve::newest`] ignores such a version, the writer refuses
+/// to create one, and [`crate::repair`] deletes it. The bound does not tell a
+/// forged version at or below it from a legitimate one: one put exactly at the
+/// bound still leaves the writer no next version, until an operator removes
+/// it with [`crate::repair::delete_version`]. The `u64` version type and
+/// the 20-digit key stay as they are: the bound is a check on values, so every
+/// key this build writes or reads is one an earlier build wrote and read too.
+pub const MAX_MANIFEST_VERSION: u64 = 1 << 32;
 /// Last segment of the grants record key.
 pub const GRANTS_SEGMENT: &str = "grants";
 
@@ -120,8 +138,29 @@ pub fn parse_grants_key(key: &str) -> Result<TenantHash, KeyError> {
     Ok(tenant_hash)
 }
 
-/// Parse a key produced by [`manifest_key`].
-pub fn parse_manifest_key(key: &str) -> Result<ParsedManifestKey, KeyError> {
+/// A key listed under a manifest prefix, as a reader treats it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListedManifestKey {
+    /// A manifest version key, exactly as [`parse_manifest_key`] reads it.
+    Version(ParsedManifestKey),
+    /// `t/<tenant_hash>/pq/t/<table>/v/<slot>.pqm` with a valid table name and
+    /// a `slot` that is not a version in `1..=u64::MAX`: the wrong length, an
+    /// extra path segment, more than `u64::MAX`, all zeros, or not all decimal
+    /// digits. The Query grant spells the version as 20 single-character
+    /// wildcards, but its `*` binds any run of segments before `/v/`, so it
+    /// admits these keys; readers skip them as they skip a version above
+    /// [`MAX_MANIFEST_VERSION`].
+    InvalidVersion {
+        tenant_hash: TenantHash,
+        table: String,
+        slot: String,
+        reason: &'static str,
+    },
+}
+
+/// Split a manifest-shaped key into its tenant, its validated table name and
+/// the text between `v/` and the `.pqm` suffix.
+fn split_manifest_key(key: &str) -> Result<(TenantHash, &str, &str), KeyError> {
     let (tenant_hash, after_pq) = split_tenant_pq(key)?;
     let Some(rest) = after_pq.strip_prefix("t/") else {
         return Err(malformed(key, "unexpected Parquet table key kind"));
@@ -133,9 +172,15 @@ pub fn parse_manifest_key(key: &str) -> Result<ParsedManifestKey, KeyError> {
     let Some(filename) = after_table.strip_prefix("v/") else {
         return Err(malformed(key, "expected a \"v/\" segment"));
     };
-    let Some(digits) = filename.strip_suffix(MANIFEST_SUFFIX) else {
+    let Some(slot) = filename.strip_suffix(MANIFEST_SUFFIX) else {
         return Err(malformed(key, "expected a .pqm suffix"));
     };
+    Ok((tenant_hash, table, slot))
+}
+
+/// Parse a key produced by [`manifest_key`].
+pub fn parse_manifest_key(key: &str) -> Result<ParsedManifestKey, KeyError> {
+    let (tenant_hash, table, digits) = split_manifest_key(key)?;
     if digits.len() != VERSION_WIDTH || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(malformed(key, "version is not 20 decimal digits"));
     }
@@ -149,6 +194,31 @@ pub fn parse_manifest_key(key: &str) -> Result<ParsedManifestKey, KeyError> {
         tenant_hash,
         table: table.to_string(),
         version,
+    })
+}
+
+/// Parse a key a manifest listing returned. A key [`parse_manifest_key`]
+/// accepts is [`ListedManifestKey::Version`]; one under a valid table's `v/`
+/// prefix ending in `.pqm` whose `slot` names no version is
+/// [`ListedManifestKey::InvalidVersion`]. Every other key is an error, as it
+/// is for [`parse_manifest_key`]: a suffix other than `.pqm`, a key outside a
+/// valid table's `v/` prefix, or a table segment [`validate_table`] refuses.
+pub fn parse_listed_manifest_key(key: &str) -> Result<ListedManifestKey, KeyError> {
+    let (tenant_hash, table, slot) = split_manifest_key(key)?;
+    let reason = if slot.len() != VERSION_WIDTH || !slot.bytes().all(|b| b.is_ascii_digit()) {
+        "version is not 20 decimal digits"
+    } else {
+        match slot.parse::<u64>() {
+            Err(_) => "version does not fit in a u64",
+            Ok(0) => "version is zero",
+            Ok(_) => return parse_manifest_key(key).map(ListedManifestKey::Version),
+        }
+    };
+    Ok(ListedManifestKey::InvalidVersion {
+        tenant_hash,
+        table: table.to_string(),
+        slot: slot.to_string(),
+        reason,
     })
 }
 
@@ -192,6 +262,13 @@ mod tests {
         let k9 = manifest_key(&TENANT_A, "hits", 9).expect("key");
         let k10 = manifest_key(&TENANT_A, "hits", 10).expect("key");
         assert!(k9 < k10);
+    }
+
+    #[test]
+    fn the_version_bound_is_two_to_the_32_and_still_has_a_key() {
+        assert_eq!(MAX_MANIFEST_VERSION, 4_294_967_296);
+        let key = manifest_key(&TENANT_A, "hits", MAX_MANIFEST_VERSION).expect("key");
+        assert!(key.ends_with("/v/00000000004294967296.pqm"), "{key}");
     }
 
     #[test]
@@ -261,6 +338,58 @@ mod tests {
         ];
         for key in &manifest_bad {
             assert!(parse_manifest_key(key).is_err(), "{key:?} parsed");
+        }
+    }
+
+    #[test]
+    fn a_listed_key_whose_slot_names_no_version_is_named_not_refused() {
+        let th = "a1".repeat(16);
+        let ok = format!("t/{th}/pq/t/hits/v/00000000000000000007.pqm");
+        assert_eq!(
+            parse_listed_manifest_key(&ok).expect("parse"),
+            ListedManifestKey::Version(parse_manifest_key(&ok).expect("parse"))
+        );
+        for (slot, reason) in [
+            ("99999999999999999999", "version does not fit in a u64"),
+            ("00000000000000000000", "version is zero"),
+            ("abcdefghijklmnopqrst", "version is not 20 decimal digits"),
+            (
+                "0000000000000000000\u{e9}",
+                "version is not 20 decimal digits",
+            ),
+            ("000000000/0000000001", "version is not 20 decimal digits"),
+            // Wrong length: 19 and 21 digits.
+            ("0000000000000000001", "version is not 20 decimal digits"),
+            ("000000000000000000001", "version is not 20 decimal digits"),
+            // An extra path segment between the table's `v/` and a second
+            // `v/`, which the Query grant's `*` binds. The slot the parser
+            // reads is everything between the first `v/` and `.pqm`.
+            (
+                "q/v/00000000000000000001",
+                "version is not 20 decimal digits",
+            ),
+        ] {
+            let key = format!("t/{th}/pq/t/hits/v/{slot}.pqm");
+            assert_eq!(
+                parse_listed_manifest_key(&key).expect("parse"),
+                ListedManifestKey::InvalidVersion {
+                    tenant_hash: TENANT_A,
+                    table: "hits".into(),
+                    slot: slot.into(),
+                    reason,
+                },
+                "{key:?}"
+            );
+        }
+        // Only a key with a non-`.pqm` suffix, outside a valid table's `v/`
+        // prefix, or under an invalid table segment stays foreign.
+        for key in [
+            format!("t/{th}/pq/t/hits/v/00000000000000000001.parquet"),
+            format!("t/{th}/pq/t/hits/x/00000000000000000001.pqm"),
+            format!("t/{th}/pq/t/Hits/v/00000000000000000001.pqm"),
+            format!("t/{th}/pq/t/hits/notes.txt"),
+        ] {
+            assert!(parse_listed_manifest_key(&key).is_err(), "{key:?} parsed");
         }
     }
 }
