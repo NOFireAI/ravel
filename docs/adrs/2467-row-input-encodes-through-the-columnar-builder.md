@@ -63,6 +63,21 @@ built from them (8.2 MB) are both alive; `build_object_columnar` adds nothing
 to it. At 20,000 streams it falls in section assembly, where
 `StreamDir::encode` holds a single 2.9 MB buffer and the stream seeds 3.2 MB.
 
+The two arms did not hold their input the same way, and the difference
+matters for what this decision delivers. The row arm pushed its records into
+the writer, whose record vector grows by doubling: 32,768 slots for 20,000
+records, 5.24 MB. The columnar arm called `from_records` on the corpus
+vector directly, which is sized exactly: 3.2 MB. So the columnar arm's
+11.6 MB of records is 2.04 MB lighter than the same records held by a
+writer. A row-mode writer that folds at `finish` holds the doubled vector,
+so the measured columnar figure is not the routed path's figure. Adding the
+2.04 MB where the peak falls while the records are alive gives an estimate
+for the routed path of 21.9 MB at 1 stream and 23.3 MB at 1,000 streams,
+24% and 23% under the row builder. At 20,000 streams the measured peak falls
+after the records are dropped, so it stands at 30.9 MB, 25% lower, provided
+the earlier point with the larger vector does not exceed it, which was not
+measured. These are derived, not measured.
+
 Encode wall time, the same two routes, five interleaved runs (issue #2475,
 which is unaffected by the correction below): the columnar route for row input
 is 0.98, 0.93 and 1.00 times the row builder's.
@@ -83,8 +98,12 @@ figures are for 20,000-record objects.
 
 1. **A row-mode `RlogWriter` encodes through the columnar builder.** At
    `finish`, a writer that received records by `push` folds them into one
-   `ColumnarLogBatch`, drops the records, and runs `build_object_columnar`.
-   The drop is part of the decision: with the records still alive the peak is
+   `ColumnarLogBatch`, drops the records, validates the batch with
+   `ColumnarLogBatch::validate`, and runs `build_object_columnar` on it. The
+   order is fixed: the records are taken out of the writer before the batch
+   is handed to the columnar builder, and the fold does not go through
+   `push_columnar`, which refuses a writer that still holds records. The
+   drop is part of the decision: with the records still alive the peak is
    higher than today's, not lower. No caller changes: the ingest flush,
    compaction, erasure rewrite, alerting and the audit writer keep calling
    `push` and `finish`. Every error the row builder returns for an input, the
@@ -105,7 +124,9 @@ figures are for 20,000-record objects.
 3. **The row builder becomes a reference, behind a cargo feature.** The row
    builder is `build_object`, `resolve_row` and `ResolvedRow`, plus the
    block-level row encoder they feed: `write_block`, `row_column` and
-   `winner_value` in `block.rs`. All of it moves behind one off-by-default
+   `winner_value` in `block.rs`, and the two private helpers only
+   `build_object` calls, `chunk_blocks` and `row_estimate`. All of it moves
+   behind one off-by-default
    feature of `ravel-logseg`. `#[cfg(test)]` alone is not enough, because
    four things outside the crate's own unit tests use that surface, and each
    is its own compilation unit:
@@ -117,14 +138,14 @@ figures are for 20,000-record objects.
      integration test. `ravel-sql` enables the feature in its
      dev-dependencies only.
    - `ravel-bench`'s `page_codec_bakeoff` bin, which is in that crate's
-     default build today. `ravel-bench` gains a feature that forwards to
-     this one, and the bin takes it as a required feature, as the crate's
-     other optional bins do.
+     default build. `ravel-bench` enables the feature on its regular
+     dependency on `ravel-logseg`, so the bin stays in the default build and
+     every lane that compiles `ravel-bench` today still compiles it.
 
    The four shipped binaries are built one package at a time and none of
    them depends on `ravel-bench` or on another crate's dev-dependencies, so
-   none of them enables the feature. A workspace build with all targets does
-   enable it, through `ravel-sql`'s dev-dependency. ADR-0109 decision 7's
+   none of them enables the feature. A build that includes `ravel-bench`, or
+   `ravel-sql`'s tests, does enable it; that covers a whole-workspace build. ADR-0109 decision 7's
    writer-level differential test drives its row arm through `push` and
    `finish`, which after decision 1 is the columnar builder, so that arm is
    rewired to call the reference builder directly; otherwise the test
@@ -199,11 +220,14 @@ flowchart TD
 
 ## Consequences
 
-- On the measured corpus, the peak heap of a row-shaped encode falls by 25%
-  to 31% from decision 1. Decision 2 may lower it further; that part is
-  unmeasured.
-- `ColumnarLogBatch::validate` now runs on every row-shaped encode, since the
-  fold's batch goes through `push_columnar`. It is one linear pass.
+- On the measured corpus, the columnar builder fed the records directly
+  peaks 25% to 31% under the row builder. The routed path also holds the
+  writer's doubled record vector, so its estimated peak is 23% to 25% under,
+  from decision 1. That estimate is derived; the task that implements
+  decision 1 measures the routed path itself. Decision 2 may lower it
+  further; that part is unmeasured.
+- `ColumnarLogBatch::validate` now runs on every row-shaped encode, called by
+  the fold. It is one linear pass.
 - A caller that keeps its own copy of the records alongside the writer's
   would see a higher peak than today, by 1% to 6%. The ingest flush and
   compaction's part builder hand their records to `push` by value; the other

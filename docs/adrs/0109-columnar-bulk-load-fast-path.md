@@ -413,8 +413,9 @@ row-major, never both, and OTLP ingest still buffers rows. What no longer
 holds is "the columnar path is bulk-load only" and the reason given for it.
 The pivot from rows to columns now happens once per flush inside the writer,
 not per request, and ADR-2467 measured it: on its corpus the routed encode
-takes 0.93 to 1.00 times the row builder's time and holds 25% to 31% less
-memory at its peak. ADR-2467 gates the change on a wide-column measurement.
+takes 0.93 to 1.00 times the row builder's time, and ADR-2467 estimates its
+peak memory at 23% to 25% under the row builder's. ADR-2467 gates the change
+on a wide-column measurement.
 
 Decision 7. The requirement is unchanged: the two builders produce
 byte-identical objects for the same records, and both differential tests stay.
