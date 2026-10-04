@@ -75,12 +75,13 @@ impl MemoryBudget {
         self.handoff_overlap.load(Ordering::Acquire)
     }
 
-    /// Bytes currently reserved through [`reserve`] (the fetch layer's RAII
-    /// `Reservation` API: `SegmentFetcher`, `LogSegmentFetcher`,
-    /// `SpanSegmentFetcher`), a subset of `reserved()`. `try_reserve` and
-    /// `reserve_unchecked` (the raw counter API SQL's `TenantMemoryAccountant`
-    /// uses exclusively) never touch this counter, so it never counts SQL's
-    /// share.
+    /// Bytes currently reserved through [`reserve`] (the RAII `Reservation`
+    /// API, whose callers include `SegmentFetcher`, `LogSegmentFetcher`,
+    /// `SpanSegmentFetcher`, and the DDL footer reads `ravel-parquet`'s
+    /// `snapshot_location` makes for `CREATE EXTERNAL TABLE`), a subset of
+    /// `reserved()`. `try_reserve` and `reserve_unchecked` (the raw counter
+    /// API SQL's `TenantMemoryAccountant` uses exclusively) never touch this
+    /// counter, so it never counts SQL execution's share.
     ///
     /// [`reserve`]: MemoryBudget::reserve
     pub fn fetch_reserved(&self) -> u64 {

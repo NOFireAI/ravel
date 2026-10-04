@@ -554,10 +554,6 @@ impl TenantResolver for OidcResolver {
             Some(tenant) if !tenant.is_empty() => TenantId::new(tenant.to_string()),
             _ => return Err(AuthError),
         };
-        // Strict boolean check: a string "true", a number, or an array is not a
-        // capability grant, only the JSON boolean `true` is (ADR-2040 decision
-        // 4). With no ddl claim configured, `ddl_claim` is `None` and `get` on a
-        // `None` claim name never runs, so the capability is never granted.
         let ddl = self
             .ddl_claim
             .as_ref()
