@@ -669,9 +669,11 @@ against the Ravel bucket (ADR-0055, HTTP DDL amendment):
 - `QueryWrite` gains `sys/pq-probe/*`, and `QueryProbeDelete` grants
   `s3:DeleteObject` on `sys/pq-probe/*` only: before every `CREATE`,
   `probe_not_ravel_bucket` PUTs `sys/pq-probe/<random>` (`Overwrite`) and
-  DELETEs it on every path it returns through. Nothing in Ravel reaps that
-  prefix, so a lifecycle rule on `sys/pq-probe/` bounds what a cancelled
-  probe leaves behind.
+  DELETEs it on every path it returns through; a cancelled probe's drop guard
+  issues the same DELETE from a background task, under the same grant.
+  Nothing in Ravel reaps that prefix, so a lifecycle rule on `sys/pq-probe/`
+  bounds what a probe leaves behind when that background delete fails or never
+  runs.
 
 The manifest listing, manifest reads and grants-record read were already in
 `QueryList` and `QueryRead`. The `LOCATION` listing, HEAD and footer reads and
