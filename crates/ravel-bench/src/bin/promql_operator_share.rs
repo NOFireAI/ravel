@@ -29,19 +29,28 @@ use ravel_promql::op_timers;
 use ravel_query::{EngineConfig, QueryEngine, QueryPhase, phase_timers};
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId};
 
-/// Series per metric. Two metrics (A, B), [`SERIES_PER_METRIC`] each, for
-/// 200,000 series total.
-const SERIES_PER_METRIC: usize = 100_000;
-/// `sum by (grp_major, grp_minor) (metric_a)` must produce exactly this many
-/// groups: `grp_major`/`grp_minor` are assigned from `i % TOTAL_GROUPS`, so
-/// every one of the 100,000 series of metric A lands in one of exactly this
-/// many (group-label) combinations, each hit `SERIES_PER_METRIC /
-/// TOTAL_GROUPS` times.
-const TOTAL_GROUPS: usize = 10_000;
-/// Number of metric-A series (the first `MATCHED` by index) that carry an
-/// identical non-`__name__` label set to a metric-B series, and hence have a
-/// one-to-one match; the rest of each metric has none.
-const MATCHED: usize = 50_000;
+/// Default series per metric (two metrics, A and B, so 2x series total)
+/// absent an override; see [`series_per_metric`]. Issue #2543.
+const SERIES_PER_METRIC_DEFAULT: usize = 100_000;
+
+/// Reads `PROMQL_OP_SHARE_SERIES_PER_METRIC` (series per metric; two metrics,
+/// so 2x series total), falling back to [`SERIES_PER_METRIC_DEFAULT`] when
+/// unset. Issue #2543: this became a runtime value, not a const, so the same
+/// binary can be measured at more than one size. The caller derives
+/// `TOTAL_GROUPS = series_per_metric / 10` (so `sum by (grp_major,
+/// grp_minor)` keeps exactly `series_per_metric / TOTAL_GROUPS` = 10 series
+/// per group) and `MATCHED = series_per_metric / 2` (so exactly half of each
+/// metric's series one-to-one matches the other metric's), which requires
+/// `series_per_metric` to be divisible by 10.
+fn series_per_metric() -> usize {
+    match std::env::var("PROMQL_OP_SHARE_SERIES_PER_METRIC") {
+        Ok(v) => v
+            .parse()
+            .expect("PROMQL_OP_SHARE_SERIES_PER_METRIC must be a positive integer"),
+        Err(std::env::VarError::NotPresent) => SERIES_PER_METRIC_DEFAULT,
+        Err(e) => panic!("PROMQL_OP_SHARE_SERIES_PER_METRIC: {e}"),
+    }
+}
 
 const METRIC_A: &str = "promql_op_share_a";
 const METRIC_B: &str = "promql_op_share_b";
@@ -94,17 +103,23 @@ const BAND_FUTURE_REMAINDER: Band = Band { lo: 0.0, hi: 5.0 };
 const LABELS_PER_SERIES: u64 = 7;
 
 /// Build one series' label set and `SeriesId`. `i` ranges over
-/// `0..SERIES_PER_METRIC`, independently for each metric: the group-label
-/// pair depends only on `i % TOTAL_GROUPS`, so metric A's grouping is exact
+/// `0..series_per_metric`, independently for each metric: the group-label
+/// pair depends only on `i % total_groups`, so metric A's grouping is exact
 /// regardless of the match partition below. `series_key` is what actually
-/// decides matching: for `i < MATCHED` it is identical across A and B (a
-/// one-to-one partner exists), and for `i >= MATCHED` it is tagged by metric
+/// decides matching: for `i < matched` it is identical across A and B (a
+/// one-to-one partner exists), and for `i >= matched` it is tagged by metric
 /// so it can equal no label set on the other side.
-fn build_series(tenant: &TenantId, metric: &str, i: usize) -> (SeriesId, LabelSet) {
-    let group = i % TOTAL_GROUPS;
+fn build_series(
+    tenant: &TenantId,
+    metric: &str,
+    i: usize,
+    total_groups: usize,
+    matched: usize,
+) -> (SeriesId, LabelSet) {
+    let group = i % total_groups;
     let grp_major = group % 100;
     let grp_minor = group / 100;
-    let series_key = if i < MATCHED {
+    let series_key = if i < matched {
         format!("paired-{i:06}")
     } else if metric == METRIC_A {
         format!("solo-a-{i:06}")
@@ -146,11 +161,16 @@ fn build_series(tenant: &TenantId, metric: &str, i: usize) -> (SeriesId, LabelSe
     (series_id, labels)
 }
 
-fn build_points(tenant: &TenantId) -> Vec<NormalizedPoint> {
-    let mut points = Vec::with_capacity(SERIES_PER_METRIC * 2);
+fn build_points(
+    tenant: &TenantId,
+    series_per_metric: usize,
+    total_groups: usize,
+    matched: usize,
+) -> Vec<NormalizedPoint> {
+    let mut points = Vec::with_capacity(series_per_metric * 2);
     for metric in [METRIC_A, METRIC_B] {
-        for i in 0..SERIES_PER_METRIC {
-            let (series_id, labels) = build_series(tenant, metric, i);
+        for i in 0..series_per_metric {
+            let (series_id, labels) = build_series(tenant, metric, i, total_groups, matched);
             points.push(NormalizedPoint {
                 series_id,
                 labels: Arc::new(labels),
@@ -189,12 +209,48 @@ fn mean(values: &[u64]) -> f64 {
     values.iter().sum::<u64>() as f64 / values.len() as f64
 }
 
+/// A digest of a full instant-vector query result, order-independent and
+/// exact on the sample value's bit pattern (never `==` on the float itself,
+/// per this repo's float-comparison convention): one line per series,
+/// `label=value,...|<value bits as hex>` (a `LabelSet` is already sorted by
+/// name, so each series' own line is canonical), the lines sorted so the
+/// result is independent of which order the engine returned the series in,
+/// then hashed with `blake3` (already a workspace dependency). Issue #2543:
+/// lets the before/after binaries be compared value-for-value, not only by
+/// count.
+fn result_digest(value: &Value) -> String {
+    let Value::Vector(v) = value else {
+        panic!("expected an instant vector, got {}", value.type_name());
+    };
+    let mut lines: Vec<String> = v
+        .iter()
+        .map(|s| {
+            let labels = s
+                .labels
+                .iter()
+                .map(|l| format!("{}={}", l.name, l.value))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{labels}|{:016x}", s.value.to_bits())
+        })
+        .collect();
+    lines.sort();
+    let mut hasher = blake3::Hasher::new();
+    for line in &lines {
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
 /// Every figure one instant-query execution produces: wall time, the
 /// operator-counter deltas (issue #2445), and the phase-timer deltas
 /// (issue #2468), plus the per-query (not diffed) fetch request/byte
 /// counts and segment count `QueryStats` already carries.
 struct QueryInstantSample {
     matched: usize,
+    /// See [`result_digest`]. Issue #2543.
+    digest: String,
     wall_ns: u64,
     agg_ns: u64,
     agg_calls: u64,
@@ -321,6 +377,7 @@ async fn run_instant(
         .expect("instant query");
     let wall_ns = start.elapsed().as_nanos() as u64;
 
+    let digest = result_digest(&value);
     let matched = match value {
         Value::Vector(v) => v.len(),
         _ => 0,
@@ -347,6 +404,7 @@ async fn run_instant(
 
     QueryInstantSample {
         matched,
+        digest,
         wall_ns,
         agg_ns: op_timers::AGG_NS.load(Ordering::Relaxed) - agg_ns_before,
         agg_calls: op_timers::AGG_CALLS.load(Ordering::Relaxed) - agg_calls_before,
@@ -726,7 +784,16 @@ async fn main() {
         .expect("catalog config"),
     );
 
-    let points = build_points(&tenant);
+    let series_per_metric = series_per_metric();
+    assert_eq!(
+        series_per_metric % 10,
+        0,
+        "series_per_metric={series_per_metric} must be divisible by 10 (TOTAL_GROUPS = series_per_metric / 10)"
+    );
+    let total_groups = series_per_metric / 10;
+    let matched = series_per_metric / 2;
+
+    let points = build_points(&tenant, series_per_metric, total_groups, matched);
     let batch_size = 2_000;
     let ack_deadline = Duration::from_secs(30);
     let mut handles = Vec::new();
@@ -760,14 +827,14 @@ async fn main() {
 
     // `EngineConfig::default()`'s `max_series` (10_000, `DEFAULT_MAX_SERIES`)
     // caps the raw series a fetch may return before aggregation collapses
-    // them; Q_AGG's selector alone matches all `SERIES_PER_METRIC` series of
+    // them; Q_AGG's selector alone matches all `series_per_metric` series of
     // metric A pre-aggregation, so the cap must be raised past that for this
     // bench's known volume, not past Q_MATCH's combined selector need.
     let engine = QueryEngine::new(
         Arc::clone(&catalog),
         Arc::clone(&store),
         EngineConfig {
-            max_series: SERIES_PER_METRIC * 2 + 1,
+            max_series: series_per_metric * 2 + 1,
             ..EngineConfig::default()
         },
     );
@@ -810,15 +877,21 @@ async fn main() {
 
     // --- Assertions (exit non-zero on violation) ---
     let mut failures = Vec::new();
-    if agg_matched != TOTAL_GROUPS {
+    if agg_matched != total_groups {
         failures.push(format!(
-            "Q_AGG matched {agg_matched} series, want exactly {TOTAL_GROUPS}"
+            "Q_AGG matched {agg_matched} series, want exactly {total_groups}"
         ));
     }
-    if match_matched != MATCHED {
+    if match_matched != matched {
         failures.push(format!(
-            "Q_MATCH matched {match_matched} series, want exactly {MATCHED}"
+            "Q_MATCH matched {match_matched} series, want exactly {matched}"
         ));
+    }
+    if agg_samples.iter().any(|s| s.digest != agg_samples[0].digest) {
+        failures.push("Q_AGG: result_digest differs across samples within this process run (want identical: the fixture never changes between queries)".to_string());
+    }
+    if match_samples.iter().any(|s| s.digest != match_samples[0].digest) {
+        failures.push("Q_MATCH: result_digest differs across samples within this process run (want identical: the fixture never changes between queries)".to_string());
     }
     if agg_samples.iter().any(|s| s.agg_calls != 1) {
         failures.push("AGG_CALLS did not advance by exactly 1 per Q_AGG execution".to_string());
@@ -1045,9 +1118,12 @@ async fn main() {
     );
 
     println!("promql_operator_share report");
+    println!("  series_per_metric : {series_per_metric} (total_groups={total_groups} matched={matched})");
     println!("  accepted_points   : {accepted}");
-    println!("  Q_AGG matched     : {agg_matched} (want {TOTAL_GROUPS})");
-    println!("  Q_MATCH matched   : {match_matched} (want {MATCHED})");
+    println!("  Q_AGG matched     : {agg_matched} (want {total_groups})");
+    println!("  Q_MATCH matched   : {match_matched} (want {matched})");
+    println!("  Q_AGG   result_digest : {}", agg_samples[0].digest);
+    println!("  Q_MATCH result_digest : {}", match_samples[0].digest);
     println!(
         "  Q_AGG   total_ns  : min={:.0} median={:.0} max={:.0}",
         agg_total.min, agg_total.median, agg_total.max
@@ -1228,13 +1304,13 @@ async fn main() {
         &agg_samples,
         &agg_run_means,
         true,
-        SERIES_PER_METRIC as u64,
+        series_per_metric as u64,
     );
     print_stage0b_fanout(
         "Q_MATCH",
         &match_samples,
         &match_run_means,
         false,
-        (SERIES_PER_METRIC * 2) as u64,
+        (series_per_metric * 2) as u64,
     );
 }
