@@ -193,11 +193,22 @@ pub(crate) fn marker_lookup_deadline(signal: Signal, deadline: Duration) -> Stri
     MARKER_LOOKUP_FAILED_MESSAGE.to_string()
 }
 
+/// The share of a keyed request's `ack_deadline` its marker lookup may use:
+/// half. The router write enqueues the request's records into the shard
+/// channels before it waits for their acknowledgement, so a write left with
+/// little or no budget can time out after its data is durable; no marker is
+/// written, and the client's retry finds none and ingests the batch again.
+/// Bounding the lookup to half leaves the write the other half.
+pub(crate) fn marker_lookup_share(ack_deadline: Duration) -> Duration {
+    ack_deadline / 2
+}
+
 /// The marker lookup of a keyed write (ADR-0051 section 5), bounded by
-/// `deadline`, the request's whole `ack_deadline`; the caller gives the router
-/// write only what the lookup leaves of it ([`remaining_budget`]). A lookup
-/// that fails or runs past it returns the client-facing refusal message,
-/// already logged and counted; the caller refuses the write with it.
+/// `deadline`, the request's [`marker_lookup_share`] of its `ack_deadline`;
+/// the caller gives the router write what the lookup leaves of the whole
+/// budget ([`router_write_budget`]). A lookup that fails or runs past
+/// `deadline` returns the client-facing refusal message, already logged and
+/// counted; the caller refuses the write with it.
 pub(crate) async fn lookup_marker_within(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
@@ -222,10 +233,23 @@ pub(crate) async fn lookup_marker_within(
 }
 
 /// What is left at this instant of a request's `ack_deadline` budget that
-/// ends at `deadline`, zero once it has passed. The router write gets this,
-/// so a keyed request's marker lookup and its write share one budget.
+/// ends at `deadline`, zero once it has passed.
 pub(crate) fn remaining_budget(deadline: tokio::time::Instant) -> Duration {
     deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+/// The budget the router write of a request gets. A keyed request passes the
+/// end of the `ack_deadline` budget its marker lookup shares with the write
+/// and gets what is left of it ([`remaining_budget`]); an unkeyed request
+/// looks nothing up and gets the whole `ack_deadline`.
+pub(crate) fn router_write_budget(
+    keyed_deadline: Option<tokio::time::Instant>,
+    ack_deadline: Duration,
+) -> Duration {
+    let budget = keyed_deadline.map_or(ack_deadline, remaining_budget);
+    #[cfg(test)]
+    marker_lookup_test_support::record_router_write_budget(budget);
+    budget
 }
 
 /// Upper bound on the assembled `error_message` byte length, the same cap and
@@ -278,9 +302,11 @@ pub async fn handle_export_logs(
     // One hour-bucket computation, shared by the lookup and the marker write
     // so they cannot drift within a request (see `request_ingest_hour_bucket`).
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
-    // One `ack_deadline` budget per request, started before the lookup: the
-    // router write gets what the lookup leaves of it.
-    let deadline = tokio::time::Instant::now() + state.ack_deadline;
+    // One `ack_deadline` budget per keyed request, started before the lookup:
+    // the lookup may use its share and the router write gets what is left.
+    let keyed_deadline = idempotency_key
+        .is_some()
+        .then(|| tokio::time::Instant::now() + state.ack_deadline);
 
     // Replay (ADR-0051 section 5): a keyed retry whose marker is still inside
     // the dedup window skips admission, normalize, and the router write, and
@@ -293,7 +319,7 @@ pub async fn handle_export_logs(
             Signal::Logs,
             key,
             bucket,
-            state.ack_deadline,
+            marker_lookup_share(state.ack_deadline),
         )
         .await
         {
@@ -376,7 +402,12 @@ pub async fn handle_export_logs(
 
     let receipt = state
         .router
-        .write(tenant.clone(), records, mode, remaining_budget(deadline))
+        .write(
+            tenant.clone(),
+            records,
+            mode,
+            router_write_budget(keyed_deadline, state.ack_deadline),
+        )
         .await
         .map_err(|err| {
             // A PartialWrite's durable siblings are real, durably committed
@@ -547,6 +578,7 @@ mod tests {
         FIRST_BATCH_PROBES, LOOKUP_DEADLINE_WARNING, LOOKUP_FAILED_WARNING, LOOKUP_FAILURE_COUNTER,
         LookupFailureWarning, LookupFailureWarnings, PAUSED_CLOCK_SLACK, STORE_ERROR_TEXT,
         SlowLookupStalledWriteStore, marker_get_refusals, marker_probe_store, put_count,
+        take_router_write_budgets,
     };
     use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
@@ -1393,20 +1425,22 @@ mod tests {
     }
 
     /// Issue #2462: a keyed write whose marker GETs never answer is refused
-    /// once the lookup has run for the write's `ack_deadline`, with the same
-    /// retryable message and counter as a refused GET and a WARN line that
-    /// names the deadline. None of the request's own data is written; the
-    /// recovery manifest and provisioning record are created before the
-    /// lookup on a tenant's first write and are out of this assertion's scope
-    /// (both are disabled in this fixture). The clock is paused, so the
-    /// elapsed time is the timer's, not the machine's.
+    /// once the lookup has run for its share of the write's `ack_deadline`,
+    /// exactly half of it, with the same retryable message and counter as a
+    /// refused GET and a WARN line that names that share. None of the
+    /// request's own data is written; the recovery manifest and provisioning
+    /// record are created before the lookup on a tenant's first write and are
+    /// out of this assertion's scope (both are disabled in this fixture). The
+    /// clock is paused, so the elapsed time is the timer's, not the machine's.
     ///
-    /// Non-vacuity: calling `read_marker` without the `tokio::time::timeout`
-    /// in `lookup_marker_within` never returns, so the test hangs; dropping
-    /// the `tracing::warn!` or the `fetch_add` in `marker_lookup_deadline`
-    /// fails the capture or the counter check.
+    /// Non-vacuity: returning the whole `ack_deadline` from
+    /// `marker_lookup_share` refuses after five seconds, not two and a half,
+    /// and fails the elapsed check; calling `read_marker` without the
+    /// `tokio::time::timeout` in `lookup_marker_within` never returns, so the
+    /// test hangs; dropping the `tracing::warn!` or the `fetch_add` in
+    /// `marker_lookup_deadline` fails the capture or the counter check.
     #[tokio::test(start_paused = true)]
-    async fn keyed_write_whose_marker_lookup_hangs_is_refused_at_the_deadline() {
+    async fn keyed_write_whose_marker_lookup_hangs_is_refused_at_half_the_deadline() {
         use ravel_object_store::fault::{Occurrence, Op};
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -1429,7 +1463,7 @@ mod tests {
             Some(b"idem-2462-deadline".to_vec()),
         )
         .await
-        .expect_err("a lookup past the deadline must fail the keyed write");
+        .expect_err("a lookup past its share of the deadline must fail the keyed write");
         let elapsed = started.elapsed();
 
         let LogIngestRequestError::Write(LogWriteError::Abandoned(message)) = &err else {
@@ -1437,12 +1471,12 @@ mod tests {
         };
         assert!(err.is_retryable(), "{err:?} must be retryable");
         assert_eq!(message, MARKER_LOOKUP_FAILED_MESSAGE);
+        let share = state.ack_deadline / 2;
         // hygiene-allow: wall-clock -- `started` is a tokio Instant under a
         // paused clock, so `elapsed` is the timer's deadline, not the machine's.
         assert!(
-            elapsed >= state.ack_deadline && elapsed <= state.ack_deadline + PAUSED_CLOCK_SLACK,
-            "refused after {elapsed:?}, deadline {:?}",
-            state.ack_deadline
+            elapsed >= share && elapsed <= share + PAUSED_CLOCK_SLACK,
+            "refused after {elapsed:?}, half the deadline is {share:?}"
         );
         assert_eq!(
             held.held_count(),
@@ -1460,7 +1494,7 @@ mod tests {
                 message: LOOKUP_DEADLINE_WARNING.to_string(),
                 signal: "l".to_string(),
                 request: "GET".to_string(),
-                deadline: format!("{:?}", state.ack_deadline),
+                deadline: format!("{share:?}"),
                 ..LookupFailureWarning::default()
             }],
             "exactly one WARN line, naming the deadline"
@@ -1473,20 +1507,20 @@ mod tests {
     }
 
     /// Issue #2462: a keyed request's lookup and its router write share one
-    /// `ack_deadline`. A lookup that takes four of the five seconds leaves the
-    /// strict write one second to be acknowledged, so a write whose data PUT
-    /// never answers fails with the router's retryable ack timeout five
-    /// seconds after the request started, not nine. The clock is paused, so
+    /// `ack_deadline`. A lookup that takes two of the five seconds leaves the
+    /// strict write three seconds to be acknowledged, so a write whose data
+    /// PUT never answers fails with the router's retryable ack timeout five
+    /// seconds after the request started, not seven. The clock is paused, so
     /// the elapsed time is the timer's, not the machine's.
     ///
     /// Non-vacuity: passing `state.ack_deadline` to `router.write` instead of
-    /// `remaining_budget(deadline)` refuses the write after nine seconds.
+    /// `router_write_budget(..)` refuses the write after seven seconds.
     #[tokio::test(start_paused = true)]
     async fn keyed_write_gets_only_the_budget_its_lookup_left() {
-        let lookup_takes = Duration::from_secs(4);
+        let lookup_takes = Duration::from_secs(2);
         let store = Arc::new(SlowLookupStalledWriteStore::new(lookup_takes));
         let state = state_with_store(1, store.clone());
-        assert!(lookup_takes < state.ack_deadline);
+        assert!(lookup_takes < state.ack_deadline / 2);
 
         let started = tokio::time::Instant::now();
         let err = handle_export_logs(
@@ -1519,6 +1553,74 @@ mod tests {
             "refused after {elapsed:?}, one budget is {:?}",
             state.ack_deadline
         );
+    }
+
+    /// Issue #2462: a lookup that answers just inside its share of the
+    /// deadline leaves the router write at least the other half. The lookup
+    /// takes one millisecond less than half of `ack_deadline`, so the router
+    /// write receives half of it plus that millisecond. The clock is paused.
+    ///
+    /// Non-vacuity: returning a third of `ack_deadline` from
+    /// `marker_lookup_share` refuses the lookup before it answers, so no
+    /// router write runs and the expected budget is never captured.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_write_whose_lookup_answers_inside_its_share_keeps_half_the_budget() {
+        let ack_deadline = Duration::from_secs(5);
+        let lookup_takes = ack_deadline / 2 - Duration::from_millis(1);
+        let store = Arc::new(SlowLookupStalledWriteStore::new(lookup_takes));
+        let state = state_with_store(1, store.clone());
+        assert_eq!(state.ack_deadline, ack_deadline);
+        take_router_write_budgets();
+
+        let err = handle_export_logs(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![record("hello", Vec::new())]),
+            BASE_TS_NS,
+            Some(b"idem-2462-share".to_vec()),
+        )
+        .await
+        .expect_err("a write whose data PUT never answers must time out");
+
+        assert!(
+            matches!(err, LogIngestRequestError::Write(LogWriteError::AckTimeout)),
+            "the lookup must answer and the write time out, got {err:?}"
+        );
+        let received = ack_deadline - lookup_takes;
+        assert!(received >= ack_deadline / 2);
+        assert_eq!(
+            take_router_write_budgets(),
+            [received],
+            "the router write receives what the lookup left, at least half"
+        );
+    }
+
+    /// An unkeyed write looks nothing up, so its router write receives the
+    /// whole `ack_deadline`, not a budget counted from the handler's start.
+    /// The clock is not paused, so time passes between that start and the
+    /// router write and a counted budget comes out short.
+    ///
+    /// Non-vacuity: starting the shared deadline for an unkeyed request too
+    /// (`Some(..)` in place of `idempotency_key.is_some().then(..)`) makes the
+    /// captured budget fall short of `ack_deadline`.
+    #[tokio::test]
+    async fn unkeyed_write_gets_the_whole_ack_deadline() {
+        let state = state();
+        take_router_write_budgets();
+
+        handle_export_logs(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![record("hello", Vec::new())]),
+            BASE_TS_NS,
+            None,
+        )
+        .await
+        .expect("an unkeyed write succeeds");
+
+        assert_eq!(take_router_write_budgets(), [state.ack_deadline]);
     }
 
     /// A hanging marker GET does not touch a request without a key: it never
@@ -1775,6 +1877,24 @@ pub(crate) mod marker_lookup_test_support {
         fn capabilities(&self) -> ravel_object_store::Capabilities {
             self.inner.capabilities()
         }
+    }
+
+    thread_local! {
+        static ROUTER_WRITE_BUDGETS: std::cell::RefCell<Vec<std::time::Duration>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Record the budget a router write received, on this thread. A
+    /// `#[tokio::test]` runs its handler on the test's own thread, so a test
+    /// reads exactly its own writes.
+    pub(crate) fn record_router_write_budget(budget: std::time::Duration) {
+        ROUTER_WRITE_BUDGETS.with_borrow_mut(|budgets| budgets.push(budget));
+    }
+
+    /// Take the budgets every router write on this thread received so far,
+    /// oldest first.
+    pub(crate) fn take_router_write_budgets() -> Vec<std::time::Duration> {
+        ROUTER_WRITE_BUDGETS.with_borrow_mut(std::mem::take)
     }
 
     /// The WARN message `marker_lookup_failure` writes.

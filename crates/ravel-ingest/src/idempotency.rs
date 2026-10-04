@@ -28,6 +28,8 @@
 //! There is no dual-reader question: the `idem/` prefix is new, no old data
 //! exists under it, and no existing read, resolve, or sweep path lists it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use blake3::Hasher;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -59,6 +61,26 @@ pub const IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS: u32 = 1;
 /// miss at the default window costs about four round trips of latency rather
 /// than twenty-six.
 pub const IDEM_MARKER_PROBE_CONCURRENCY: usize = 8;
+
+/// Marker GETs [`read_marker`] has issued, logs then spans, hits and misses
+/// alike. Process-global, like the ingest path's lookup-failure count.
+static PROBE_GETS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn probe_gets_slot(signal: Signal) -> Option<&'static AtomicU64> {
+    match signal {
+        Signal::Logs => Some(&PROBE_GETS[0]),
+        Signal::Spans => Some(&PROBE_GETS[1]),
+        _ => None,
+    }
+}
+
+/// The marker GETs [`read_marker`] has issued for `signal` in this process,
+/// hits and misses alike, rendered as
+/// `ravel_ingest_idempotency_probe_gets_total`. Zero for a signal that writes
+/// no markers.
+pub fn idempotency_probe_gets(signal: Signal) -> u64 {
+    probe_gets_slot(signal).map_or(0, |slot| slot.load(Ordering::Relaxed))
+}
 
 const MAGIC: &[u8; 4] = b"RIDM";
 const VERSION: u16 = 1;
@@ -400,7 +422,13 @@ async fn probe_batch(
     // mapping closure, which keeps the lookup future `Send` for the handlers.
     let probes: Vec<_> = hours
         .iter()
-        .map(|&hour| probe_key(store, marker_key(tenant_id, signal, client_key, hour)))
+        .map(|&hour| {
+            probe_key(
+                store,
+                signal,
+                marker_key(tenant_id, signal, client_key, hour),
+            )
+        })
         .collect();
     let results: Vec<(String, Result<LookupOutcome, StoreError>)> = futures::stream::iter(probes)
         .buffered(IDEM_MARKER_PROBE_CONCURRENCY)
@@ -419,8 +447,12 @@ async fn probe_batch(
 
 async fn probe_key(
     store: &dyn ObjectStoreBackend,
+    signal: Signal,
     key: String,
 ) -> (String, Result<LookupOutcome, StoreError>) {
+    if let Some(slot) = probe_gets_slot(signal) {
+        slot.fetch_add(1, Ordering::Relaxed);
+    }
     let result = read_marker_at(store, &key).await;
     (key, result)
 }
@@ -579,6 +611,7 @@ mod tests {
     /// store appends `/` to that prefix.
     #[tokio::test]
     async fn marker_is_found_across_the_window_on_a_segment_aligned_store() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         let store = SegmentAlignedStore::new();
         let tenant = tenant("acme");
         let written_at = 495_972u32;
@@ -613,6 +646,61 @@ mod tests {
         }
     }
 
+    /// Held by every test here that calls [`read_marker`], so a test reading
+    /// a delta of the process-global probe counter counts only its own GETs.
+    static PROBE_GETS_COUNTER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Every marker GET the lookup issues is counted once under its signal,
+    /// hits and misses alike, and under no other signal. With a 24-hour
+    /// window a keyed write's first lookup misses after 26 probes (the 24
+    /// hours back, the current hour and the one forward skew hour); its
+    /// retry, once the marker exists at the current hour, hits in the first
+    /// batch after 3 probes (the forward skew hour, the current hour and the
+    /// one before it).
+    ///
+    /// Non-vacuity: dropping the `fetch_add` in `probe_key` leaves both deltas
+    /// at zero; counting once per batch instead of per probe counts 2 and 1.
+    #[tokio::test]
+    async fn each_marker_probe_get_is_counted_once_under_its_signal() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
+        let tenant = tenant("acme");
+        let now = 495_972u32;
+        let window = 24;
+        for (signal, other) in [(Signal::Logs, Signal::Spans), (Signal::Spans, Signal::Logs)] {
+            let store = SegmentAlignedStore::new();
+            let other_before = idempotency_probe_gets(other);
+
+            let before = idempotency_probe_gets(signal);
+            let first = read_marker(&store, &tenant, signal, b"counted", now, window)
+                .await
+                .expect("lookup");
+            assert_eq!(first, LookupOutcome::Miss);
+            let miss_probes = idempotency_probe_gets(signal) - before;
+            assert_eq!(
+                miss_probes, 26,
+                "{signal:?}: one probe per hour of the window"
+            );
+            assert_eq!(store.take_gets().len() as u64, miss_probes);
+
+            let written = receipt(1, "v2:token-counted");
+            write_marker(&store, &tenant, signal, b"counted", now, &written)
+                .await
+                .expect("write");
+            store.take_gets();
+            let before = idempotency_probe_gets(signal);
+            let retry = read_marker(&store, &tenant, signal, b"counted", now, window)
+                .await
+                .expect("lookup");
+            assert_eq!(retry, LookupOutcome::Hit(written));
+            let hit_probes = idempotency_probe_gets(signal) - before;
+            assert_eq!(hit_probes, 3, "{signal:?}: the first batch's probes");
+            assert_eq!(store.take_gets().len() as u64, hit_probes);
+
+            assert_eq!(idempotency_probe_gets(other), other_before);
+        }
+        assert_eq!(idempotency_probe_gets(Signal::Metrics), 0);
+    }
+
     /// Sorted, so a batch's GETs compare as a set: the probes of one batch
     /// run concurrently and their issue order is not part of the contract.
     fn sorted(mut keys: Vec<String>) -> Vec<String> {
@@ -631,6 +719,7 @@ mod tests {
     /// receipt is returned after three GETs at the default skew.
     #[tokio::test]
     async fn a_hit_near_now_costs_only_the_first_batch() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         let store = SegmentAlignedStore::new();
         let tenant = tenant("acme");
         let now = 495_972u32;
@@ -662,6 +751,7 @@ mod tests {
     /// 24-hour default, the newest of the fan-out's markers winning.
     #[tokio::test]
     async fn a_hit_below_the_first_batch_costs_the_full_fan_out() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         let store = SegmentAlignedStore::new();
         let tenant = tenant("acme");
         let now = 495_972u32;
@@ -691,6 +781,7 @@ mod tests {
     /// before any of the fan-out's.
     #[tokio::test]
     async fn a_miss_probes_each_hour_of_the_window_once() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         let store = SegmentAlignedStore::new();
         let tenant = tenant("acme");
         let now = 495_972u32;
@@ -720,6 +811,7 @@ mod tests {
     /// on both sides of each.
     #[tokio::test]
     async fn batched_lookup_matches_a_sequential_newest_first_scan() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 
         /// `Err` carries the key of the refused GET.
@@ -899,6 +991,7 @@ mod tests {
     /// the first batch's three.
     #[tokio::test]
     async fn probes_run_concurrently_up_to_the_bound() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let tenant = tenant("acme");
@@ -942,6 +1035,7 @@ mod tests {
     /// store error.
     #[tokio::test]
     async fn a_failed_probe_fails_the_lookup() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         use ravel_object_store::fault::{
             FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
         };
@@ -989,6 +1083,7 @@ mod tests {
     /// `now - 1`, since the newest-first scan would have stopped at `now`.
     #[tokio::test]
     async fn an_error_newer_than_a_hit_in_the_same_batch_fails_the_lookup() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         use ravel_object_store::fault::{
             FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
         };
@@ -1028,6 +1123,7 @@ mod tests {
     /// older hour, so the error there does not turn a replay into a refusal.
     #[tokio::test]
     async fn a_newer_hit_wins_over_an_older_error_in_the_same_batch() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         use ravel_object_store::fault::{
             FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault,
         };
@@ -1057,6 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn marker_replay_returns_stored_receipt() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         let store = MemoryStore::new();
         let tenant = tenant("acme");
         // A representative multi-shard ack: the x-ravel-commit-token header
@@ -1083,6 +1180,7 @@ mod tests {
 
     #[tokio::test]
     async fn corrupt_marker_is_typed_miss() {
+        let _probes = PROBE_GETS_COUNTER.lock().await;
         let store = MemoryStore::new();
         let tenant = tenant("acme");
         let receipt = receipt(7, "v2:token-xyz");

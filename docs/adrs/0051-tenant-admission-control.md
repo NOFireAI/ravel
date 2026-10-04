@@ -798,19 +798,31 @@ keyed write fails with a retryable 503 / gRPC `UNAVAILABLE` before the
 request's own data is written, so the retry is safe. At the default 24-hour window and one hour of forward
 tolerance a hit at `now + 1`, `now` or `now - 1` costs 3 GETs and one round
 trip; any other hit, or a miss, costs 26 GETs in about four round trips.
+Every GET is counted on `ravel_ingest_idempotency_probe_gets_total`, by
+signal, hits and misses alike.
 
 The lookup and the router write it gates share one `ack_deadline` budget per
-request. The deadline starts before the lookup, the gateway wraps the lookup
-in a timeout of that length (`lookup_marker_within` in
-`services/ravel-server/src/logs_ingest.rs`), and the router write gets only
-what is left of it when the write starts as its acknowledgement deadline, so under S3 throttling
-the lookup's time comes out of that deadline instead of adding a second full
-one to the request. A lookup still
-running at the deadline is refused exactly like a failed probe (the same
-retryable error, client message and
+keyed request, and the lookup may use half of it. The deadline starts before
+the lookup; the gateway wraps the lookup in a timeout of half of
+`ack_deadline` (`marker_lookup_share` and `lookup_marker_within` in
+`services/ravel-server/src/logs_ingest.rs`), and the router write gets what
+is left of the whole budget when it starts as its acknowledgement deadline,
+so under S3 throttling the lookup's time comes out of that deadline instead
+of adding a second full one to the request. Why half and not all of it: the
+router write enqueues the request's records into the shard channels before
+it waits for their acknowledgement, so a strict write left little or no
+budget can return its ack timeout while the shards go on to flush the data
+durably. No marker is written for that write, and the client's retry with
+the same key finds none and ingests the batch a second time, the duplicate
+the key exists to prevent. A lookup still running at its half is refused
+exactly like a failed probe, before any of the request's data is written
+(the same retryable error, client message and
 `ravel_ingest_idempotency_lookup_failures_total` count), with a WARN line
-that names the deadline rather than a key. A strict write left no budget at
-all fails with the router's own ack timeout, which is retryable too.
+that names the lookup's deadline rather than a key. The write therefore
+starts with at least half of `ack_deadline`, less only the in-memory
+normalization and admission that run between the lookup and the write. A
+request without a key does no lookup, and its write gets the whole
+`ack_deadline`.
 
 Why exact-key GETs and not a segment-aligned listing:
 
@@ -831,8 +843,8 @@ Why exact-key GETs and not a segment-aligned listing:
 Section 5's honest residuals are unchanged.
 
 Net effect on section 5: "one prefix LIST" becomes one GET per hour of the
-window, the hours nearest `now` first, inside the one `ack_deadline` budget
-the request's write also draws on, and "one LIST plus one PUT" becomes up to
+window, the hours nearest `now` first, inside half of the one `ack_deadline`
+budget the request's write also draws on, and "one LIST plus one PUT" becomes up to
 `dedup_window + IDEM_MARKER_FORWARD_SKEW_TOLERANCE_HOURS + 1` GETs plus one
 PUT. Recorded as an appended amendment, with an inline pointer added to
 section 5.

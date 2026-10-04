@@ -321,10 +321,16 @@ gateway cannot tell whether the request already landed, so the keyed request
 is not acknowledged: it fails with the retryable error a failed flush returns
 (HTTP 503 / gRPC `UNAVAILABLE`) before the request's own data is written, so
 it is safe to retry. A marker found at a newer hour than the failing probe
-still replays its receipt. The response says
+still replays its receipt. The lookup may use half of the request's
+`ack_deadline`: a lookup still running then is refused the same way, before
+any of the request's data is written. The write gets what is left of that one
+`ack_deadline`, at least half of it less the in-memory normalization and
+admission between the two, never a zero budget under which a strict write
+could time out after its records were enqueued, flush durably with no marker
+written, and be stored twice by the retry. The response says
 only that the idempotency marker lookup failed; the store error and the marker
 key go to the gateway's log. A request without a key performs no lookup and is
-unaffected. A `write_marker` failure after a
+unaffected: its write gets the whole `ack_deadline`. A `write_marker` failure after a
 durable commit is logged and the request still acks success, because the data
 is already committed; the retry then reingests (at-least-once) since no marker
 exists.

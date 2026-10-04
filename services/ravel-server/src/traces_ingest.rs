@@ -163,9 +163,11 @@ pub async fn handle_export_traces(
     .map_err(|e| SpanIngestRequestError::Provisioning(e.to_string()))?;
     // One hour-bucket computation shared by the lookup and the marker write.
     let hour_bucket = request_ingest_hour_bucket(ingest_ts_ns);
-    // One `ack_deadline` budget per request, started before the lookup: the
-    // router write gets what the lookup leaves of it.
-    let deadline = tokio::time::Instant::now() + state.ack_deadline;
+    // One `ack_deadline` budget per keyed request, started before the lookup:
+    // the lookup may use its share and the router write gets what is left.
+    let keyed_deadline = idempotency_key
+        .is_some()
+        .then(|| tokio::time::Instant::now() + state.ack_deadline);
 
     // Replay (ADR-0051 section 5): a keyed retry whose marker is still inside
     // the dedup window skips normalize and the router write and returns the
@@ -177,7 +179,7 @@ pub async fn handle_export_traces(
             Signal::Spans,
             key,
             bucket,
-            state.ack_deadline,
+            crate::logs_ingest::marker_lookup_share(state.ack_deadline),
         )
         .await
         {
@@ -238,7 +240,7 @@ pub async fn handle_export_traces(
             tenant.clone(),
             normalized.spans,
             mode,
-            crate::logs_ingest::remaining_budget(deadline),
+            crate::logs_ingest::router_write_budget(keyed_deadline, state.ack_deadline),
         )
         .await
         .map_err(|err| {
@@ -392,6 +394,7 @@ mod tests {
         FIRST_BATCH_PROBES, LOOKUP_DEADLINE_WARNING, LOOKUP_FAILED_WARNING, LOOKUP_FAILURE_COUNTER,
         LookupFailureWarning, LookupFailureWarnings, PAUSED_CLOCK_SLACK, STORE_ERROR_TEXT,
         SlowLookupStalledWriteStore, marker_get_refusals, marker_probe_store, put_count,
+        take_router_write_budgets,
     };
     use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 
@@ -966,19 +969,22 @@ mod tests {
     }
 
     /// Issue #2462: a keyed span write whose marker GETs never answer is
-    /// refused once the lookup has run for the write's `ack_deadline`, with
-    /// the same retryable message and counter as a refused GET and a WARN line
-    /// that names the deadline. None of the request's own data is written; the
-    /// recovery manifest and provisioning record are created before the
-    /// lookup on a tenant's first write and are out of this assertion's scope
-    /// (both are disabled in this fixture). The clock is paused, so the
-    /// elapsed time is the timer's, not the machine's.
+    /// refused once the lookup has run for its share of the write's
+    /// `ack_deadline`, exactly half of it, with the same retryable message and
+    /// counter as a refused GET and a WARN line that names that share. None
+    /// of the request's own data is written; the recovery manifest and
+    /// provisioning record are created before the lookup on a tenant's first
+    /// write and are out of this assertion's scope (both are disabled in this
+    /// fixture). The clock is paused, so the elapsed time is the timer's, not
+    /// the machine's.
     ///
-    /// Non-vacuity: replacing `crate::logs_ingest::lookup_marker_within` in
-    /// `handle_export_traces` with an unbounded `read_marker` never returns,
-    /// so the test hangs.
+    /// Non-vacuity: passing `state.ack_deadline` to `lookup_marker_within` in
+    /// `handle_export_traces` in place of its `marker_lookup_share` refuses
+    /// after five seconds, not two and a half, and fails the elapsed check;
+    /// replacing `crate::logs_ingest::lookup_marker_within` with an unbounded
+    /// `read_marker` never returns, so the test hangs.
     #[tokio::test(start_paused = true)]
-    async fn keyed_write_whose_marker_lookup_hangs_is_refused_at_the_deadline() {
+    async fn keyed_write_whose_marker_lookup_hangs_is_refused_at_half_the_deadline() {
         use ravel_object_store::fault::{Occurrence, Op};
         use tracing_subscriber::layer::SubscriberExt as _;
 
@@ -1002,7 +1008,7 @@ mod tests {
         )
         .await
         else {
-            panic!("a lookup past the deadline must fail the keyed write");
+            panic!("a lookup past its share of the deadline must fail the keyed write");
         };
         let elapsed = started.elapsed();
 
@@ -1011,12 +1017,12 @@ mod tests {
         };
         assert!(err.is_retryable(), "{err:?} must be retryable");
         assert_eq!(message, crate::logs_ingest::MARKER_LOOKUP_FAILED_MESSAGE);
+        let share = state.ack_deadline / 2;
         // hygiene-allow: wall-clock -- `started` is a tokio Instant under a
         // paused clock, so `elapsed` is the timer's deadline, not the machine's.
         assert!(
-            elapsed >= state.ack_deadline && elapsed <= state.ack_deadline + PAUSED_CLOCK_SLACK,
-            "refused after {elapsed:?}, deadline {:?}",
-            state.ack_deadline
+            elapsed >= share && elapsed <= share + PAUSED_CLOCK_SLACK,
+            "refused after {elapsed:?}, half the deadline is {share:?}"
         );
         assert_eq!(held.held_count(), FIRST_BATCH_PROBES as usize);
         assert_eq!(
@@ -1030,7 +1036,7 @@ mod tests {
                 message: LOOKUP_DEADLINE_WARNING.to_string(),
                 signal: "s".to_string(),
                 request: "GET".to_string(),
-                deadline: format!("{:?}", state.ack_deadline),
+                deadline: format!("{share:?}"),
                 ..LookupFailureWarning::default()
             }],
             "exactly one WARN line, naming the deadline"
@@ -1043,19 +1049,19 @@ mod tests {
     }
 
     /// Issue #2462: the spans twin of the logs test of the same name. A lookup
-    /// that takes four of the five seconds of `ack_deadline` leaves the strict
-    /// write one, so a write whose data PUT never answers fails with the
+    /// that takes two of the five seconds of `ack_deadline` leaves the strict
+    /// write three, so a write whose data PUT never answers fails with the
     /// router's retryable ack timeout five seconds after the request started,
-    /// not nine. The clock is paused.
+    /// not seven. The clock is paused.
     ///
     /// Non-vacuity: passing `state.ack_deadline` to `router.write` instead of
-    /// `remaining_budget(deadline)` refuses the write after nine seconds.
+    /// `router_write_budget(..)` refuses the write after seven seconds.
     #[tokio::test(start_paused = true)]
     async fn keyed_write_gets_only_the_budget_its_lookup_left() {
-        let lookup_takes = Duration::from_secs(4);
+        let lookup_takes = Duration::from_secs(2);
         let store = Arc::new(SlowLookupStalledWriteStore::new(lookup_takes));
         let state = state_with_store(store.clone());
-        assert!(lookup_takes < state.ack_deadline);
+        assert!(lookup_takes < state.ack_deadline / 2);
 
         let started = tokio::time::Instant::now();
         let Err(err) = handle_export_traces(
@@ -1092,6 +1098,80 @@ mod tests {
             "refused after {elapsed:?}, one budget is {:?}",
             state.ack_deadline
         );
+    }
+
+    /// Issue #2462: the spans twin of the logs test of the same name. A lookup
+    /// that answers one millisecond before half of `ack_deadline` leaves the
+    /// router write half of it plus that millisecond. The clock is paused.
+    ///
+    /// Non-vacuity: returning a third of `ack_deadline` from
+    /// `marker_lookup_share` refuses the lookup before it answers, so no
+    /// router write runs and the expected budget is never captured.
+    #[tokio::test(start_paused = true)]
+    async fn keyed_write_whose_lookup_answers_inside_its_share_keeps_half_the_budget() {
+        let ack_deadline = Duration::from_secs(5);
+        let lookup_takes = ack_deadline / 2 - Duration::from_millis(1);
+        let store = Arc::new(SlowLookupStalledWriteStore::new(lookup_takes));
+        let state = state_with_store(store.clone());
+        assert_eq!(state.ack_deadline, ack_deadline);
+        take_router_write_budgets();
+
+        let Err(err) = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![span("GET /x", Vec::new())]),
+            MARKER_TEST_INGEST_TS_NS,
+            Some(b"idem-2462-share".to_vec()),
+        )
+        .await
+        else {
+            panic!("a write whose data PUT never answers must time out");
+        };
+
+        assert!(
+            matches!(
+                err,
+                SpanIngestRequestError::Write(SpanWriteError::AckTimeout)
+            ),
+            "the lookup must answer and the write time out, got {err:?}"
+        );
+        let received = ack_deadline - lookup_takes;
+        assert!(received >= ack_deadline / 2);
+        assert_eq!(
+            take_router_write_budgets(),
+            [received],
+            "the router write receives what the lookup left, at least half"
+        );
+    }
+
+    /// An unkeyed span write looks nothing up, so its router write receives
+    /// the whole `ack_deadline`, not a budget counted from the handler's
+    /// start. The clock is not paused, so time passes between that start and
+    /// the router write and a counted budget comes out short.
+    ///
+    /// Non-vacuity: starting the shared deadline for an unkeyed request too
+    /// (`Some(..)` in place of `idempotency_key.is_some().then(..)`) makes the
+    /// captured budget fall short of `ack_deadline`.
+    #[tokio::test]
+    async fn unkeyed_write_gets_the_whole_ack_deadline() {
+        let state = state();
+        take_router_write_budgets();
+
+        let Ok(_outcome) = handle_export_traces(
+            &state,
+            TenantId::new("acme"),
+            WriteMode::Strict,
+            request(vec![span("GET /x", Vec::new())]),
+            MARKER_TEST_INGEST_TS_NS,
+            None,
+        )
+        .await
+        else {
+            panic!("an unkeyed write succeeds");
+        };
+
+        assert_eq!(take_router_write_budgets(), [state.ack_deadline]);
     }
 
     /// A hanging marker GET does not touch a request without a key: it never
