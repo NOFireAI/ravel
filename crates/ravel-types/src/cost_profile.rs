@@ -234,9 +234,10 @@ impl StoreCostProfile {
         Ok(())
     }
 
-    /// The timings rule both directions share: both set or neither. One
-    /// timing alone cannot form a request cost, and accepting it would leave
-    /// the profile pricing as if the operator had written neither.
+    /// The timings rule both directions share: both set or neither, and
+    /// neither zero. One timing alone cannot form a request cost, and
+    /// accepting it would leave the profile pricing as if the operator had
+    /// written neither.
     fn validate_timings(&self) -> Result<(), CostProfileError> {
         match (
             self.request_latency_micros,
@@ -247,6 +248,12 @@ impl StoreCostProfile {
             }),
             (None, Some(_)) => Err(CostProfileError::IncompleteTimings {
                 missing: "request_latency_micros",
+            }),
+            (Some(0), Some(_)) => Err(CostProfileError::ZeroTiming {
+                field: "request_latency_micros",
+            }),
+            (Some(_), Some(0)) => Err(CostProfileError::ZeroTiming {
+                field: "per_connection_throughput_bytes_per_s",
             }),
             _ => Ok(()),
         }
@@ -349,6 +356,15 @@ pub enum CostProfileError {
     IncompleteTimings {
         /// The timing field the document left out.
         missing: &'static str,
+    },
+    /// The profile sets a request timing to zero. A zero timing makes the
+    /// time term's request cost zero, which on a profile with free bytes the
+    /// cost-based rate floors to one byte: ranged reads nearly everywhere,
+    /// from a figure nobody measured.
+    #[error("store cost profile sets {field} to 0; a measured request timing is positive")]
+    ZeroTiming {
+        /// The timing field set to zero.
+        field: &'static str,
     },
     /// The profile could not be rendered back to TOML.
     #[error("could not render store cost profile as TOML: {0}")]
@@ -689,6 +705,49 @@ timings_measured = "2026-10-03, the 32 GB reference box of the reference suite, 
             half.to_toml_string(),
             Err(CostProfileError::IncompleteTimings {
                 missing: "per_connection_throughput_bytes_per_s"
+            })
+        ));
+    }
+
+    #[test]
+    fn a_zero_timing_fails_to_load_naming_it() {
+        let prices = "name = \"zero-timing\"\nput_class_nanodollars = 5000\n\
+                      get_class_nanodollars = 400\ntransfer_nanodollars_per_gib = 0\n\
+                      retrieval_nanodollars_per_gib = 0\n";
+        for (latency, throughput, field) in [
+            (0, 90_000_000, "request_latency_micros"),
+            (70_000, 0, "per_connection_throughput_bytes_per_s"),
+            (0, 0, "request_latency_micros"),
+        ] {
+            let doc = format!(
+                "{prices}request_latency_micros = {latency}\n\
+                 per_connection_throughput_bytes_per_s = {throughput}\n"
+            );
+            let err = StoreCostProfile::from_toml_str(&doc).expect_err("a zero timing is refused");
+            assert!(
+                matches!(err, CostProfileError::ZeroTiming { field: f } if f == field),
+                "{doc}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(&format!("sets {field} to 0")),
+                "the error names the field: {err}"
+            );
+        }
+        // One microsecond and one byte per second load: only zero is refused.
+        let smallest = format!(
+            "{prices}request_latency_micros = 1\nper_connection_throughput_bytes_per_s = 1\n"
+        );
+        assert!(StoreCostProfile::from_toml_str(&smallest).is_ok());
+
+        // The renderer shares the rule.
+        let zero = StoreCostProfile {
+            request_latency_micros: Some(0),
+            ..StoreCostProfile::reference()
+        };
+        assert!(matches!(
+            zero.to_toml_string(),
+            Err(CostProfileError::ZeroTiming {
+                field: "request_latency_micros"
             })
         ));
     }
