@@ -1380,7 +1380,15 @@ impl LogSegmentFetcher {
     /// the object whole anyway, so a plan-phase probe there would read it a
     /// second time under another cache key. Off cost-based
     /// [`Self::with_block_range_threshold`] pins both to the same value.
-    fn plan_whole_object_bound(&self) -> u64 {
+    ///
+    /// Every plan-phase read that probes an object gates on this bound:
+    /// [`plan_segment`](Self::plan_segment)'s two guards,
+    /// [`plan_segment_block_stats`](Self::plan_segment_block_stats), and the
+    /// log-series route's STREAM_DIR read. Public so the SQL executor's I/O
+    /// shape reports a read's dependency depth against the bound the plan
+    /// routes on.
+    #[must_use]
+    pub fn plan_whole_object_bound(&self) -> u64 {
         self.block_range_threshold
             .max(self.block_range.effective_projection_break_even())
     }
@@ -2316,10 +2324,10 @@ impl LogSegmentFetcher {
     ///   so the stored figures would over-report. Erasure is included even though
     ///   it filters rows rather than blocks, for exactly that reason: an erased
     ///   row is still counted in the block's `record_count`;
-    /// - `seg_ref.object_size <= self.block_range_threshold`. The read pays off
-    ///   only above the threshold, mirroring
-    ///   [`plan_segment_fast`](Self::plan_segment_fast)'s own gate: at or below
-    ///   it, the whole-object funnel already takes one GET, and
+    /// - `seg_ref.object_size <= self.plan_whole_object_bound()`, the bound
+    ///   [`plan_segment`](Self::plan_segment)'s guard on its fast path applies
+    ///   ([`plan_whole_object_bound`](Self::plan_whole_object_bound)): at or
+    ///   below it, the whole-object funnel already takes one GET, and
     ///   [`BlockRangeFetcher::fetch_skip_index`] has no whole-object crossover of
     ///   its own, so it would read the same object under a second cache key.
     ///
@@ -2341,7 +2349,7 @@ impl LogSegmentFetcher {
         if !query.is_block_predicate_free() {
             return Ok(None);
         }
-        if seg_ref.object_size <= self.block_range_threshold {
+        if seg_ref.object_size <= self.plan_whole_object_bound() {
             return Ok(None);
         }
 
@@ -3327,20 +3335,17 @@ impl LogSegmentFetcher {
     /// stream-attrs blob, for the caller to decode with
     /// [`ravel_logseg::record::decode_stream_attrs`].
     ///
-    /// At or below [`Self::block_range_threshold`] this reads the object
-    /// whole, via [`whole_object_bytes`](Self::whole_object_bytes), the read
-    /// [`tenant_bytes`](Self::tenant_bytes) takes there too: a ranged probe
-    /// would pay for a second cache key on an object
-    /// [`fetch_footer`](Self::fetch_footer)'s doc explains is already read
-    /// whole in one GET below the threshold. Above it, it probes and reads
+    /// At or below [`Self::plan_whole_object_bound`], the bound
+    /// [`plan_segment`](Self::plan_segment)'s guards apply (the larger of the
+    /// routing threshold and the projection break-even, ADR-2414 decision
+    /// A3), this reads the object whole, via
+    /// [`whole_object_bytes`](Self::whole_object_bytes): one GET and no probe.
+    /// A segment that matches is then scanned, and at or below that bound the
+    /// scan reads the object whole too, so a ranged probe here would only add
+    /// requests under a second cache key. Above it, it probes and reads
     /// STREAM_DIR ranged, the path that saves the BLOCKS bytes the ADR-1103
-    /// cost model counts on. Unlike [`plan_segment`](Self::plan_segment) and
-    /// the ranged fetch, it does not move that bound up to the projection
-    /// break-even (ADR-2414 decision A3). A segment none of whose streams
-    /// match is pruned on this read alone; one that matches is then scanned,
-    /// and under `cost-based` an object above the routing threshold but at or
-    /// below the break-even is read whole by that scan, after this probe and
-    /// section read.
+    /// cost model counts on; a segment none of whose streams match is pruned
+    /// on that read alone.
     pub(crate) async fn fetch_stream_dir(
         &self,
         seg_ref: &SegmentRef,
@@ -3348,7 +3353,7 @@ impl LogSegmentFetcher {
         accounting: &QueryAccounting,
     ) -> Result<Option<Vec<(LogStreamId, Vec<u8>)>>, LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
-        let dir: Option<StreamDir> = if seg_ref.object_size > self.block_range_threshold {
+        let dir: Option<StreamDir> = if seg_ref.object_size > self.plan_whole_object_bound() {
             // The `page_fetch` phase span the other plan paths carry (#782), so
             // the trace shows the probe and section GETs this method issues.
             // `s3_bytes` reports block bytes only, which are structurally zero
@@ -10321,6 +10326,99 @@ mod fetch_stream_dir_tests {
             "both branches must decode the same STREAM_DIR entries for the same object"
         );
     }
+
+    /// A record whose body is `len` characters a linear congruential
+    /// generator picks from 64 symbols, so the object stays large after zstd.
+    fn noisy_record(ts: i64, len: usize) -> LogRecord {
+        let mut state = (ts as u64).wrapping_mul(6_364_136_223_846_793_005) | 1;
+        let body: String = (0..len)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                char::from(b'0' + ((state >> 58) as u8))
+            })
+            .collect();
+        LogRecord { body, ..record(ts) }
+    }
+
+    /// (GETs, GET bytes, suffix probes) one `fetch_stream_dir` call issues
+    /// against `seg` at the given routing threshold and projection break-even.
+    async fn stream_dir_reads(
+        bytes: &[u8],
+        seg: &SegmentRef,
+        threshold: u64,
+        break_even: u64,
+    ) -> (u64, u64, usize) {
+        use super::plan_block_stats_tests::RangeRecordingStore;
+        let inner = store_with_object(bytes.to_vec()).await;
+        let store = Arc::new(RangeRecordingStore::new(inner));
+        let f = LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(threshold)
+            .with_projection_break_even_bytes(Some(break_even))
+            .with_suffix_len(4096);
+        let acc = QueryAccounting::new();
+        let entries = f
+            .fetch_stream_dir(seg, TENANT, &acc)
+            .await
+            .expect("fetch_stream_dir")
+            .expect("STREAM_DIR present");
+        assert_eq!(entries.len(), 1, "one stream, every record shares it");
+        let probes = store
+            .ranges()
+            .iter()
+            .filter(|r| matches!(r, GetRange::Suffix(_)))
+            .count();
+        let snap = acc.snapshot();
+        assert_eq!(
+            snap.s3_requests(AccountedOp::Get),
+            store.get_count(),
+            "the accounting counts every GET the store served"
+        );
+        (store.get_count(), snap.s3_bytes(AccountedOp::Get), probes)
+    }
+
+    /// The log-series route's STREAM_DIR read gates on
+    /// `plan_whole_object_bound`, the larger of the routing threshold and the
+    /// projection break-even: an object at or under it is one whole-object
+    /// GET with no probe, the read the scan that follows takes too. The object
+    /// stays fixed and the bound moves around it.
+    ///
+    /// Fails against gating on the routing threshold alone (the first two
+    /// cases probe at threshold 0) and against gating on the break-even
+    /// alone, without the max (the fourth case probes at a break-even one byte
+    /// under the object).
+    #[tokio::test]
+    async fn the_log_series_route_reads_an_object_under_the_break_even_whole() {
+        let records: Vec<LogRecord> = (0..64).map(|ts| noisy_record(ts, 2048)).collect();
+        let bytes = build_object(&records);
+        let size = bytes.len() as u64;
+        let seg = seg_ref(size, &records);
+        assert!(
+            size > 16 * 4096,
+            "fixture precondition: the object is many probe windows long: {size}"
+        );
+
+        for break_even in [size + 1, size] {
+            let (gets, get_bytes, probes) = stream_dir_reads(&bytes, &seg, 0, break_even).await;
+            assert_eq!(gets, 1, "break-even {break_even}: one whole-object GET");
+            assert_eq!(get_bytes, size, "break-even {break_even}: the whole object");
+            assert_eq!(probes, 0, "break-even {break_even}: no probe");
+        }
+
+        let (gets, get_bytes, probes) = stream_dir_reads(&bytes, &seg, 0, size - 1).await;
+        assert!(gets >= 2, "above the bound: probe then section, got {gets}");
+        assert!(
+            get_bytes * 2 < size,
+            "above the bound the read moves under half the object: {get_bytes} of {size}"
+        );
+        assert_eq!(probes, 1, "above the bound one suffix probe");
+
+        let (gets, get_bytes, probes) = stream_dir_reads(&bytes, &seg, size, size - 1).await;
+        assert_eq!(gets, 1, "the routing threshold still bounds the read");
+        assert_eq!(get_bytes, size);
+        assert_eq!(probes, 0);
+    }
 }
 
 #[cfg(test)]
@@ -10365,14 +10463,14 @@ mod plan_block_stats_tests {
     /// Counts `get` calls and records the range of each, so a test can pin both
     /// how many reads happened and which bytes they covered. Everything else
     /// delegates to the inner [`MemoryStore`].
-    struct RangeRecordingStore {
+    pub(super) struct RangeRecordingStore {
         inner: Arc<MemoryStore>,
         gets: AtomicU64,
         ranges: Mutex<Vec<GetRange>>,
     }
 
     impl RangeRecordingStore {
-        fn new(inner: Arc<MemoryStore>) -> Self {
+        pub(super) fn new(inner: Arc<MemoryStore>) -> Self {
             RangeRecordingStore {
                 inner,
                 gets: AtomicU64::new(0),
@@ -10380,11 +10478,11 @@ mod plan_block_stats_tests {
             }
         }
 
-        fn get_count(&self) -> u64 {
+        pub(super) fn get_count(&self) -> u64 {
             self.gets.load(Ordering::SeqCst)
         }
 
-        fn ranges(&self) -> Vec<GetRange> {
+        pub(super) fn ranges(&self) -> Vec<GetRange> {
             self.ranges.lock().expect("ranges lock").clone()
         }
     }
