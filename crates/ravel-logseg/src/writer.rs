@@ -353,9 +353,49 @@ impl RlogWriter {
     /// ([`WriteStats`]) not otherwise recoverable from the object bytes.
     #[cfg(feature = "row-reference")]
     pub fn finish_row_reference_with_stats(self) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        self.build_row_reference(0, Vec::new(), 0)
+    }
+
+    /// Reference-only counterpart to [`RlogWriter::finish_compacted`]: the
+    /// same compaction-identity footer fields, built through
+    /// [`RlogWriter::build_object`] directly.
+    #[cfg(feature = "row-reference")]
+    pub fn finish_row_reference_compacted(
+        self,
+        level: u32,
+        input_set_hash: Vec<u8>,
+        part_index: u32,
+    ) -> Result<Vec<u8>, LogSegError> {
+        self.finish_row_reference_compacted_with_stats(level, input_set_hash, part_index)
+            .map(|(bytes, _)| bytes)
+    }
+
+    /// Like [`RlogWriter::finish_row_reference_compacted`], but also returns
+    /// counters ([`WriteStats`]) not otherwise recoverable from the object
+    /// bytes.
+    #[cfg(feature = "row-reference")]
+    pub fn finish_row_reference_compacted_with_stats(
+        self,
+        level: u32,
+        input_set_hash: Vec<u8>,
+        part_index: u32,
+    ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
+        self.build_row_reference(level, input_set_hash, part_index)
+    }
+
+    /// Shared core behind every `finish_row_reference*` entry point: the same
+    /// pre-check and layout `build` runs, but calling `build_object` directly
+    /// instead of routing through the columnar fold.
+    #[cfg(feature = "row-reference")]
+    fn build_row_reference(
+        self,
+        level: u32,
+        input_set_hash: Vec<u8>,
+        part_index: u32,
+    ) -> Result<(Vec<u8>, WriteStats), LogSegError> {
         let cluster = self.cluster_for_build()?;
         let layout = self.layout();
-        self.build_object(0, Vec::new(), 0, layout, cluster)
+        self.build_object(level, input_set_hash, part_index, layout, cluster)
     }
 
     /// The row-group layout this writer's configuration asks for.
@@ -5448,10 +5488,15 @@ mod tests {
         }
     }
 
-    /// The ADR-0109 decision 7 acceptance anchor: the columnar build path
-    /// (`push_columnar` + `finish_with_stats`) produces byte-identical object
-    /// bytes and field-identical `WriteStats` to the row path
-    /// (`push` + `finish_with_stats`) for the same records.
+    /// The ADR-0109 decision 7 acceptance anchor, amended by ADR-2467: the
+    /// columnar build path (`push_columnar` + `finish_with_stats`) produces
+    /// byte-identical object bytes and field-identical `WriteStats` to the
+    /// row path. `push` + `finish_with_stats` now also routes through the
+    /// columnar builder (ADR-2467 decision 1), so the row arm here calls the
+    /// feature-gated reference builder (`finish_row_reference_with_stats`)
+    /// directly through `row_object`, to hold two independent producers
+    /// against each other rather than comparing the columnar builder with
+    /// itself.
     mod columnar_differential {
         use super::*;
         use crate::columnar_batch::ColumnarLogBatch;
@@ -5600,7 +5645,7 @@ mod tests {
             for r in recs {
                 w.push(r.clone()).expect("row push");
             }
-            w.finish_with_stats().expect("row finish")
+            w.finish_row_reference_with_stats().expect("row finish")
         }
 
         fn columnar_object(

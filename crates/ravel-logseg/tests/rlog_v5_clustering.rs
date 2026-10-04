@@ -92,6 +92,10 @@ fn writer(cfg: &RlogConfig, d: Option<&SortDescriptor>, generation: u64) -> Rlog
     RlogWriter::new(*cfg, identity()).with_sort_descriptor(d.cloned(), generation)
 }
 
+/// The reference row builder ([`RlogWriter::finish_row_reference`]), not
+/// `push` + `finish`: `finish` now routes row input through the columnar
+/// builder too (ADR-2467 decision 1), so comparing its output against
+/// [`write_columnar`] would compare the columnar builder with itself.
 fn write_rows(
     cfg: &RlogConfig,
     d: Option<&SortDescriptor>,
@@ -102,7 +106,7 @@ fn write_rows(
     for r in records {
         w.push(r.clone())?;
     }
-    w.finish()
+    w.finish_row_reference()
 }
 
 /// One columnar batch of `records`, dictionary-shaped when `dict` is set, so
@@ -357,7 +361,7 @@ fn row_and_columnar_paths_identical_under_a_key() {
     for r in &records {
         w.push(r.clone()).expect("push");
     }
-    let (overflowed, stats) = w.finish_with_stats().expect("row path, no budget");
+    let (overflowed, stats) = w.finish_row_reference_with_stats().expect("row path, no budget");
     assert_eq!(stats.dynamic_columns_used, 0);
     let cols = write_columnar(&no_columns, Some(&d), 3, &records, 4).expect("columnar, no budget");
     assert!(
@@ -552,7 +556,7 @@ fn write_scoped(scope: &BloomScope) -> Vec<u8> {
     for r in bloom_records() {
         w.push(r).expect("push");
     }
-    let rows = w.finish().expect("finish");
+    let rows = w.finish_row_reference().expect("finish");
     for dict in [false, true] {
         let mut w = writer();
         w.push_columnar(batch(&bloom_records(), dict))
@@ -725,9 +729,9 @@ fn with_footer_descriptor(object: &[u8], d: Option<&SortDescriptor>) -> Vec<u8> 
     out
 }
 
-/// `records` built under `d` through `finish`, `finish_compacted` and
-/// `finish_compacted_with_stats`, each on the row path and then the columnar
-/// path (one plain and one dictionary-shaped batch).
+/// `records` built under `d` through the plain, compacted and
+/// compacted-with-stats entry points, each on the reference row builder and
+/// then the columnar path (one plain and one dictionary-shaped batch).
 fn every_entry_point(
     d: &SortDescriptor,
     generation: u64,
@@ -750,12 +754,12 @@ fn every_entry_point(
     };
     let hash = vec![0xAA, 0xBB];
     vec![
-        rows().finish(),
+        rows().finish_row_reference(),
         cols().finish(),
-        rows().finish_compacted(1, hash.clone(), 2),
+        rows().finish_row_reference_compacted(1, hash.clone(), 2),
         cols().finish_compacted(1, hash.clone(), 2),
         rows()
-            .finish_compacted_with_stats(1, hash.clone(), 2)
+            .finish_row_reference_compacted_with_stats(1, hash.clone(), 2)
             .map(|(o, _)| o),
         cols()
             .finish_compacted_with_stats(1, hash.clone(), 2)
@@ -1039,10 +1043,10 @@ fn compacted_objects_carry_and_validate_the_descriptor() {
 
     let d = descriptor(&[("tenant", SortKeyType::Str)]);
     let rows = row_writer(&d)
-        .finish_compacted(1, hash.clone(), 2)
+        .finish_row_reference_compacted(1, hash.clone(), 2)
         .expect("row path");
     let (rows_stats, _) = row_writer(&d)
-        .finish_compacted_with_stats(1, hash.clone(), 2)
+        .finish_row_reference_compacted_with_stats(1, hash.clone(), 2)
         .expect("row path, with stats");
     let cols = columnar_writer(&d)
         .finish_compacted(1, hash.clone(), 2)
@@ -1069,9 +1073,9 @@ fn compacted_objects_carry_and_validate_the_descriptor() {
     // still recorded.
     let missing = descriptor(&[("missing", SortKeyType::Str)]);
     let accepted = [
-        row_writer(&missing).finish_compacted(1, hash.clone(), 2),
+        row_writer(&missing).finish_row_reference_compacted(1, hash.clone(), 2),
         row_writer(&missing)
-            .finish_compacted_with_stats(1, hash.clone(), 2)
+            .finish_row_reference_compacted_with_stats(1, hash.clone(), 2)
             .map(|(o, _)| o),
         columnar_writer(&missing).finish_compacted(1, hash.clone(), 2),
         columnar_writer(&missing)
