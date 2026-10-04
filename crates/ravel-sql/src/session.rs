@@ -1574,7 +1574,9 @@ mod tests {
             "DatetimeFunctionPlanner",
         ];
 
-        fn planner_name(planner: &Arc<dyn datafusion::logical_expr::planner::ExprPlanner>) -> String {
+        fn planner_name(
+            planner: &Arc<dyn datafusion::logical_expr::planner::ExprPlanner>,
+        ) -> String {
             format!("{planner:?}")
                 .chars()
                 .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -1588,10 +1590,7 @@ mod tests {
             ("spans", spans_table(&store)),
             ("alerts", alerts_table(&store)),
             ("audit", audit_table(&store)),
-            (
-                "parquet",
-                parquet_table(ravel_types::TenantHash([0u8; 16])),
-            ),
+            ("parquet", parquet_table(ravel_types::TenantHash([0u8; 16]))),
         ] {
             let ctx = build_session(
                 &SqlConfig::default(),
@@ -1601,7 +1600,12 @@ mod tests {
                 SpillDecision::Disabled,
             )
             .expect("session builds");
-            let registered: Vec<String> = ctx.state().expr_planners().iter().map(planner_name).collect();
+            let registered: Vec<String> = ctx
+                .state()
+                .expr_planners()
+                .iter()
+                .map(planner_name)
+                .collect();
             assert_eq!(
                 registered, EXPECTED,
                 "{label}: the registered expression planners changed. Each planner \

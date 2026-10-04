@@ -187,11 +187,7 @@ const CANARIES: [(&str, &str, Outcome); 18] = [
         Outcome::RefusedAtPlan,
     ),
     // plan_dictionary_literal: CoreFunctionPlanner, to `named_struct`.
-    (
-        "plan_dictionary_literal",
-        "SELECT {'a': 1}",
-        Outcome::Plans,
-    ),
+    ("plan_dictionary_literal", "SELECT {'a': 1}", Outcome::Plans),
     // plan_extract: DatetimeFunctionPlanner, to `date_part`.
     (
         "plan_extract",
@@ -212,11 +208,7 @@ const CANARIES: [(&str, &str, Outcome); 18] = [
         Outcome::RefusedAtPlan,
     ),
     // plan_struct_literal: CoreFunctionPlanner, to `struct`.
-    (
-        "plan_struct_literal",
-        "SELECT STRUCT(1, 2)",
-        Outcome::Plans,
-    ),
+    ("plan_struct_literal", "SELECT STRUCT(1, 2)", Outcome::Plans),
     // plan_struct_literal: CoreFunctionPlanner, to `named_struct`.
     (
         "plan_struct_literal (named)",
