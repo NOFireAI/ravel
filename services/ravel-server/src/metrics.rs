@@ -309,6 +309,19 @@ pub enum Label {
     /// [`crate::alerting`], since the outcomes are the alerting loop's own, not
     /// a dimension this renderer invents.
     AlertOutcome(crate::alerting::AlertTickOutcome),
+    /// Which leading keyword routed a SQL DDL statement (issue #2374):
+    /// `create` or `drop`. Shares the `kind` key with `MergeMemoryKind` and
+    /// `DeletedObjectKind`.
+    #[cfg(feature = "sql")]
+    DdlKind(ravel_sql::DdlKind),
+    /// How a SQL DDL statement ended: `created`, `dropped`, `noop` or
+    /// `error`. Shares the `outcome` key with `AlertOutcome`.
+    #[cfg(feature = "sql")]
+    DdlOutcome(DdlStatementOutcome),
+    /// Which phase of a SQL DDL statement issued a store request: `grant`,
+    /// `probe`, `snapshot` or `write`.
+    #[cfg(feature = "sql")]
+    DdlPhase(ravel_sql::DdlPhase),
     /// The allocator this process runs under (#1170): `"jemalloc"` on every
     /// target this repo builds, or whatever [`crate::mem_stats::read`] names
     /// otherwise. A bare `&'static str` rather than a closed enum because the
@@ -539,6 +552,12 @@ impl Label {
             Label::MergeMemoryKind(_) => "kind",
             Label::DeletedObjectKind(_) => "kind",
             Label::AlertOutcome(_) => "outcome",
+            #[cfg(feature = "sql")]
+            Label::DdlKind(_) => "kind",
+            #[cfg(feature = "sql")]
+            Label::DdlOutcome(_) => "outcome",
+            #[cfg(feature = "sql")]
+            Label::DdlPhase(_) => "phase",
             Label::Allocator(_) => "allocator",
             Label::AllocatorStat(_) => "stat",
             Label::MemoryComponent(_) => "component",
@@ -575,6 +594,12 @@ impl Label {
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
             Label::DeletedObjectKind(kind) => kind.name().to_string(),
             Label::AlertOutcome(outcome) => alert_outcome_name(*outcome).to_string(),
+            #[cfg(feature = "sql")]
+            Label::DdlKind(kind) => kind.name().to_string(),
+            #[cfg(feature = "sql")]
+            Label::DdlOutcome(outcome) => outcome.name().to_string(),
+            #[cfg(feature = "sql")]
+            Label::DdlPhase(phase) => phase.name().to_string(),
             Label::Allocator(name) => name.to_string(),
             Label::AllocatorStat(stat) => stat.name().to_string(),
             Label::MemoryComponent(component) => component.name().to_string(),
@@ -5952,6 +5977,161 @@ pub struct QueryOutcomeRow {
     pub counters: QueryCostCounters,
 }
 
+/// How one SQL DDL statement ended, the `outcome` label on
+/// `ravel_sql_ddl_statements_total`. `Error` covers every refusal and
+/// failure, from the missing `ddl` capability to a failed manifest write.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DdlStatementOutcome {
+    Created,
+    Dropped,
+    NoOp,
+    Error,
+}
+
+#[cfg(feature = "sql")]
+impl DdlStatementOutcome {
+    pub fn of(outcome: &ravel_sql::DdlOutcome) -> Self {
+        match outcome {
+            ravel_sql::DdlOutcome::Created { .. } => DdlStatementOutcome::Created,
+            ravel_sql::DdlOutcome::Dropped { .. } => DdlStatementOutcome::Dropped,
+            ravel_sql::DdlOutcome::NoOp { .. } => DdlStatementOutcome::NoOp,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            DdlStatementOutcome::Created => "created",
+            DdlStatementOutcome::Dropped => "dropped",
+            DdlStatementOutcome::NoOp => "noop",
+            DdlStatementOutcome::Error => "error",
+        }
+    }
+}
+
+/// One tenant bucket's summed DDL store cost, indexed by
+/// [`ravel_sql::DdlPhase::index`] and then [`StoreOp::index`].
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DdlCostCounters {
+    requests: [[u64; ravel_object_store::instrument::STORE_OP_COUNT]; ravel_sql::DDL_PHASE_COUNT],
+    bytes: [u64; ravel_sql::DDL_PHASE_COUNT],
+}
+
+#[cfg(feature = "sql")]
+#[derive(Debug, Default)]
+struct DdlAccounting {
+    statements: HashMap<(Option<TenantHash>, ravel_sql::DdlKind, DdlStatementOutcome), u64>,
+    cost: HashMap<Option<TenantHash>, DdlCostCounters>,
+}
+
+/// One (tenant bucket, kind, outcome) row of `ravel_sql_ddl_statements_total`.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DdlStatementRow {
+    pub tenant: Option<TenantHash>,
+    pub kind: ravel_sql::DdlKind,
+    pub outcome: DdlStatementOutcome,
+    pub statements: u64,
+}
+
+/// One tenant bucket's rows of the two DDL store-cost families, indexed by
+/// [`ravel_sql::DdlPhase::index`] and then [`StoreOp::index`].
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DdlCostRow {
+    pub tenant: Option<TenantHash>,
+    pub requests:
+        [[u64; ravel_object_store::instrument::STORE_OP_COUNT]; ravel_sql::DDL_PHASE_COUNT],
+    pub bytes: [u64; ravel_sql::DDL_PHASE_COUNT],
+}
+
+/// What [`QueryAccountingMetrics::ddl_snapshot`] returns.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DdlCostSnapshot {
+    pub statements: Vec<DdlStatementRow>,
+    pub cost: Vec<DdlCostRow>,
+}
+
+/// The SQL DDL families (issue #2374): statements by `kind` and `outcome`,
+/// and their store requests by `phase` and `op` and bytes by `phase`, each
+/// beside `mode` and `tenant_hash` (folded as [`QueryAccountingMetrics`]
+/// folds). A tenant bucket that has run a statement renders every
+/// (phase, op) and every phase, zeros included. DDL cost never enters the
+/// `ravel_query_*` family.
+#[cfg(feature = "sql")]
+fn render_sql_ddl_family(out: &mut String, mode: Mode, snapshot: &DdlCostSnapshot) {
+    write_header(
+        out,
+        "ravel_sql_ddl_statements_total",
+        "SQL DDL statements handled by POST /api/v1/sql, by tenant, leading keyword and outcome.",
+        "counter",
+    );
+    for row in &snapshot.statements {
+        write_sample(
+            out,
+            "ravel_sql_ddl_statements_total",
+            &[
+                Label::Mode(mode),
+                Label::TenantHash(tenant_label(row.tenant)),
+                Label::DdlKind(row.kind),
+                Label::DdlOutcome(row.outcome),
+            ],
+            row.statements,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_sql_ddl_store_requests_total",
+        "Object-store requests issued by SQL DDL statements, counted when issued whether they \
+         succeed or fail, by tenant, phase and operation.",
+        "counter",
+    );
+    for row in &snapshot.cost {
+        for phase in ravel_sql::DdlPhase::ALL {
+            for op in StoreOp::ALL {
+                write_sample(
+                    out,
+                    "ravel_sql_ddl_store_requests_total",
+                    &[
+                        Label::Mode(mode),
+                        Label::TenantHash(tenant_label(row.tenant)),
+                        Label::DdlPhase(phase),
+                        Label::Op(op),
+                    ],
+                    row.requests[phase.index()][op.index()],
+                );
+            }
+        }
+    }
+
+    write_header(
+        out,
+        "ravel_sql_ddl_store_bytes_total",
+        &format!(
+            "Object-store bytes read by SQL DDL statements, by tenant and phase. {}.",
+            ravel_sql::DDL_COST_BYTES
+        ),
+        "counter",
+    );
+    for row in &snapshot.cost {
+        for phase in ravel_sql::DdlPhase::ALL {
+            write_sample(
+                out,
+                "ravel_sql_ddl_store_bytes_total",
+                &[
+                    Label::Mode(mode),
+                    Label::TenantHash(tenant_label(row.tenant)),
+                    Label::DdlPhase(phase),
+                ],
+                row.bytes[phase.index()],
+            );
+        }
+    }
+}
+
 /// Process-global aggregator for per-query cost accounting (ADR-0044 section
 /// 4), written once per completed query by every query handler and read at
 /// scrape time by [`metrics_handler`]. One instance per process, shared with
@@ -5980,6 +6160,13 @@ pub struct QueryAccountingMetrics {
     /// see [`QueryOutcomeRow`] for why it is a separate map.
     outcomes:
         parking_lot::Mutex<HashMap<(Option<TenantHash>, QueryOutcomeStatus), QueryCostCounters>>,
+    /// SQL DDL statements and their store cost (issue #2374). Kept here, not
+    /// in a struct of its own, so it folds tenants by this same `configured`
+    /// allowlist and reaches both the SQL handler and the `/metrics` route
+    /// through the handle they already share. Never read by the
+    /// `ravel_query_*` renderer.
+    #[cfg(feature = "sql")]
+    ddl: parking_lot::Mutex<DdlAccounting>,
 }
 
 impl QueryAccountingMetrics {
@@ -5991,7 +6178,75 @@ impl QueryAccountingMetrics {
             configured,
             rows: parking_lot::Mutex::new(HashMap::new()),
             outcomes: parking_lot::Mutex::new(HashMap::new()),
+            #[cfg(feature = "sql")]
+            ddl: parking_lot::Mutex::new(DdlAccounting::default()),
         }
+    }
+
+    /// Fold one SQL DDL statement into its (tenant bucket, kind, outcome)
+    /// count and its tenant bucket's per-phase store cost, with the same
+    /// record-time tenant fold as [`QueryAccountingMetrics::record`]. Called
+    /// once per statement by `sql::run_ddl`, refused or executed alike.
+    #[cfg(feature = "sql")]
+    pub fn record_ddl(
+        &self,
+        tenant_hash: TenantHash,
+        kind: ravel_sql::DdlKind,
+        outcome: DdlStatementOutcome,
+        cost: &ravel_sql::DdlCost,
+    ) {
+        let bucket = self
+            .configured
+            .contains(&tenant_hash)
+            .then_some(tenant_hash);
+        let mut ddl = self.ddl.lock();
+        let statements = ddl.statements.entry((bucket, kind, outcome)).or_default();
+        *statements = statements.saturating_add(1);
+        let row = ddl.cost.entry(bucket).or_default();
+        for phase in ravel_sql::DdlPhase::ALL {
+            let phase_cost = cost.phase(phase);
+            for op in StoreOp::ALL {
+                let slot = &mut row.requests[phase.index()][op.index()];
+                *slot = slot.saturating_add(phase_cost.requests(op));
+            }
+            let slot = &mut row.bytes[phase.index()];
+            *slot = slot.saturating_add(phase_cost.bytes());
+        }
+    }
+
+    /// A stable-ordered copy of the DDL rows, for rendering: statements by
+    /// tenant label, kind and outcome; cost by tenant label.
+    #[cfg(feature = "sql")]
+    pub fn ddl_snapshot(&self) -> DdlCostSnapshot {
+        let ddl = self.ddl.lock();
+        let mut statements: Vec<DdlStatementRow> = ddl
+            .statements
+            .iter()
+            .map(|((tenant, kind, outcome), statements)| DdlStatementRow {
+                tenant: *tenant,
+                kind: *kind,
+                outcome: *outcome,
+                statements: *statements,
+            })
+            .collect();
+        statements.sort_by(|a, b| {
+            tenant_label(a.tenant)
+                .value()
+                .cmp(&tenant_label(b.tenant).value())
+                .then_with(|| a.kind.name().cmp(b.kind.name()))
+                .then_with(|| a.outcome.name().cmp(b.outcome.name()))
+        });
+        let mut cost: Vec<DdlCostRow> = ddl
+            .cost
+            .iter()
+            .map(|(tenant, counters)| DdlCostRow {
+                tenant: *tenant,
+                requests: counters.requests,
+                bytes: counters.bytes,
+            })
+            .collect();
+        cost.sort_by_key(|row| tenant_label(row.tenant).value());
+        DdlCostSnapshot { statements, cost }
     }
 
     /// Fold one completed query's actual counters and its pre-execution
@@ -7445,6 +7700,13 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
             .map(SqlSliceRejectSnapshot::from_counters)
             .as_ref(),
     );
+    // Appended for the same reason: DDL exists only in a `sql` build.
+    #[cfg(feature = "sql")]
+    render_sql_ddl_family(
+        &mut body,
+        state.mode,
+        &state.query_accounting.ddl_snapshot(),
+    );
     // Appended after `render` rather than threaded through it: the CPU gate
     // and runtime figures are read here, at scrape time, like every other
     // family, and `render`'s positional signature is shared by every render
@@ -7783,6 +8045,14 @@ mod tests {
                 Label::MergeMemoryKind(_) => "kind",
                 Label::DeletedObjectKind(_) => "kind",
                 Label::AlertOutcome(_) => "outcome",
+                // Asserted by `sql_ddl_family_renders_exact_samples`, since
+                // `one_of_each` is the default build's set.
+                #[cfg(feature = "sql")]
+                Label::DdlKind(_) => "kind",
+                #[cfg(feature = "sql")]
+                Label::DdlOutcome(_) => "outcome",
+                #[cfg(feature = "sql")]
+                Label::DdlPhase(_) => "phase",
                 Label::Allocator(_) => "allocator",
                 Label::AllocatorStat(_) => "stat",
                 Label::MemoryComponent(_) => "component",
@@ -10997,6 +11267,186 @@ mod tests {
         let mut off = String::new();
         render_sql_slice_reject_family(&mut off, Mode::Query, None);
         assert_eq!(off, "", "no Flight service must render no family");
+    }
+
+    /// The three DDL families (issue #2374): one counter header each, the
+    /// bytes HELP carrying `DDL_COST_BYTES` word for word, each statement row
+    /// under `{mode, tenant_hash, kind, outcome}`, and every (phase, op) and
+    /// every phase of a tenant bucket rendered with its own figure, zeros
+    /// included.
+    #[cfg(feature = "sql")]
+    #[test]
+    fn sql_ddl_family_renders_exact_samples() {
+        use ravel_sql::{DdlKind, DdlPhase};
+
+        let mut requests =
+            [[0u64; ravel_object_store::instrument::STORE_OP_COUNT]; ravel_sql::DDL_PHASE_COUNT];
+        requests[DdlPhase::Grant.index()][StoreOp::Get.index()] = 1;
+        requests[DdlPhase::Probe.index()][StoreOp::Head.index()] = 2;
+        requests[DdlPhase::Snapshot.index()][StoreOp::List.index()] = 3;
+        requests[DdlPhase::Write.index()][StoreOp::Put.index()] = 4;
+        let snapshot = DdlCostSnapshot {
+            statements: vec![
+                DdlStatementRow {
+                    tenant: None,
+                    kind: DdlKind::Create,
+                    outcome: DdlStatementOutcome::Created,
+                    statements: 5,
+                },
+                DdlStatementRow {
+                    tenant: None,
+                    kind: DdlKind::Drop,
+                    outcome: DdlStatementOutcome::Error,
+                    statements: 6,
+                },
+            ],
+            cost: vec![DdlCostRow {
+                tenant: None,
+                requests,
+                bytes: [7, 8, 9, 10],
+            }],
+        };
+        let mut body = String::new();
+        render_sql_ddl_family(&mut body, Mode::Query, &snapshot);
+        for name in [
+            "ravel_sql_ddl_statements_total",
+            "ravel_sql_ddl_store_requests_total",
+            "ravel_sql_ddl_store_bytes_total",
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {name} counter\n")).count(),
+                1,
+                "exactly one counter TYPE header for {name}:\n{body}"
+            );
+        }
+        assert!(
+            body.contains(&format!(
+                "# HELP ravel_sql_ddl_store_bytes_total Object-store bytes read by SQL DDL \
+                 statements, by tenant and phase. {}.\n",
+                ravel_sql::DDL_COST_BYTES
+            )),
+            "{body}"
+        );
+
+        let samples: Vec<&str> = body.lines().filter(|l| !l.starts_with('#')).collect();
+        let statements: Vec<&str> = samples
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("ravel_sql_ddl_statements_total"))
+            .collect();
+        assert_eq!(
+            statements,
+            vec![
+                "ravel_sql_ddl_statements_total{mode=\"query\",tenant_hash=\"other\",kind=\"create\",outcome=\"created\"} 5",
+                "ravel_sql_ddl_statements_total{mode=\"query\",tenant_hash=\"other\",kind=\"drop\",outcome=\"error\"} 6",
+            ],
+        );
+        let request_samples: Vec<&str> = samples
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("ravel_sql_ddl_store_requests_total"))
+            .collect();
+        assert_eq!(
+            request_samples.len(),
+            ravel_sql::DDL_PHASE_COUNT * ravel_object_store::instrument::STORE_OP_COUNT
+        );
+        for (phase, op, value) in [
+            ("grant", "get", 1),
+            ("probe", "head", 2),
+            ("snapshot", "list", 3),
+            ("write", "put", 4),
+            ("write", "get", 0),
+            ("grant", "list_delimited", 0),
+        ] {
+            let line = format!(
+                "ravel_sql_ddl_store_requests_total{{mode=\"query\",tenant_hash=\"other\",\
+                 phase=\"{phase}\",op=\"{op}\"}} {value}"
+            );
+            assert!(request_samples.contains(&line.as_str()), "{line}\n{body}");
+        }
+        let byte_samples: Vec<&str> = samples
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("ravel_sql_ddl_store_bytes_total"))
+            .collect();
+        assert_eq!(
+            byte_samples,
+            vec![
+                "ravel_sql_ddl_store_bytes_total{mode=\"query\",tenant_hash=\"other\",phase=\"grant\"} 7",
+                "ravel_sql_ddl_store_bytes_total{mode=\"query\",tenant_hash=\"other\",phase=\"probe\"} 8",
+                "ravel_sql_ddl_store_bytes_total{mode=\"query\",tenant_hash=\"other\",phase=\"snapshot\"} 9",
+                "ravel_sql_ddl_store_bytes_total{mode=\"query\",tenant_hash=\"other\",phase=\"write\"} 10",
+            ],
+        );
+        assert_eq!(Label::DdlKind(DdlKind::Drop).key(), "kind");
+        assert_eq!(
+            Label::DdlOutcome(DdlStatementOutcome::NoOp).key(),
+            "outcome"
+        );
+        assert_eq!(Label::DdlPhase(DdlPhase::Probe).key(), "phase");
+
+        // Nothing recorded: the three headers and no sample.
+        let mut empty = String::new();
+        render_sql_ddl_family(&mut empty, Mode::Query, &DdlCostSnapshot::default());
+        assert_eq!(empty.lines().filter(|l| !l.starts_with('#')).count(), 0);
+    }
+
+    /// `record_ddl` folds tenants by the same allowlist as `record`: a
+    /// configured tenant keeps its own `tenant_hash`, every other tenant sums
+    /// into `other`, and each call counts one statement.
+    #[cfg(feature = "sql")]
+    #[test]
+    fn record_ddl_folds_tenants_and_counts_each_statement_once() {
+        use ravel_sql::{DdlCost, DdlKind};
+        use ravel_types::TenantId;
+
+        let configured = TenantId::new("ddl-configured").hash();
+        let metrics = QueryAccountingMetrics::new(HashSet::from([configured]));
+        let cost = DdlCost::default();
+        metrics.record_ddl(
+            configured,
+            DdlKind::Create,
+            DdlStatementOutcome::Created,
+            &cost,
+        );
+        for name in ["ddl-folded-a", "ddl-folded-b"] {
+            metrics.record_ddl(
+                TenantId::new(name).hash(),
+                DdlKind::Create,
+                DdlStatementOutcome::Created,
+                &cost,
+            );
+        }
+        metrics.record_ddl(configured, DdlKind::Drop, DdlStatementOutcome::NoOp, &cost);
+
+        let snapshot = metrics.ddl_snapshot();
+        let mut statements: Vec<(Option<TenantHash>, &str, &str, u64)> = snapshot
+            .statements
+            .iter()
+            .map(|row| {
+                (
+                    row.tenant,
+                    row.kind.name(),
+                    row.outcome.name(),
+                    row.statements,
+                )
+            })
+            .collect();
+        statements.sort_by_key(|row| (row.0.is_none(), row.1, row.2));
+        assert_eq!(
+            statements,
+            vec![
+                (Some(configured), "create", "created", 1),
+                (Some(configured), "drop", "noop", 1),
+                (None, "create", "created", 2),
+            ]
+        );
+        assert_eq!(snapshot.cost.len(), 2, "one cost row per tenant bucket");
+        assert!(
+            metrics.snapshot().is_empty(),
+            "DDL never adds a ravel_query_* row"
+        );
+        assert!(metrics.outcome_snapshot().is_empty());
     }
 
     #[test]

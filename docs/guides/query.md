@@ -579,7 +579,10 @@ ravel-cli --parquet-profiles profiles.json tenant parquet-grant add \
 
 A success is a JSON body with `outcome` (`created`, `dropped`, or `noop`) and
 the table name, even when `Accept` asks for Arrow; creating a table that
-already exists is a 409 and dropping one that does not is a 404.
+already exists is a 409 and dropping one that does not is a 404. A DDL
+statement's object-store requests and bytes are not in the response and not
+in the per-query cost family; `/metrics` reports them per phase in the
+[`ravel_sql_ddl_*` families](observability.md#sql-ddl-statements-and-their-store-cost-ravel_sql_ddl_).
 
 ```sh
 curl -X POST http://127.0.0.1:4318/api/v1/sql \
