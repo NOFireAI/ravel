@@ -216,13 +216,14 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for CountingBackend<S> {
         read
     }
 
-    /// Counted via [`Counters::record_pinned_get`], for the same reason as
-    /// [`Self::get_pinned`].
+    /// Counted via [`Counters::record_pinned_get`] whatever the outcome, for
+    /// the same reasons as [`Self::get_pinned`]: a read of a missing key is
+    /// still a paid request, and adds 0 bytes.
     async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
-        let read = self.inner.get_with_pin(key, range).await?;
-        self.counters
-            .record_pinned_get(read.outcome.data.len() as u64);
-        Ok(read)
+        let read = self.inner.get_with_pin(key, range).await;
+        let bytes = read.as_ref().map_or(0, |r| r.outcome.data.len() as u64);
+        self.counters.record_pinned_get(bytes);
+        read
     }
 
     /// Counted via [`Counters::record_pin_of`]: a `pin_of` is still one HEAD
@@ -504,6 +505,20 @@ mod tests {
         let counters = store.counters();
         assert_eq!(counters.pinned_get_count(), 1);
         assert_eq!(counters.get_count(), 1, "a refused pinned get is a GET");
+        assert_eq!(counters.pinned_get_bytes(), 0);
+        assert_eq!(counters.get_bytes(), 0);
+
+        let err = store
+            .get_with_pin("missing", GetRange::Full)
+            .await
+            .expect_err("a missing key must be refused");
+        assert!(
+            matches!(err, StoreError::NotFound),
+            "got {err:?}, want NotFound"
+        );
+        let counters = store.counters();
+        assert_eq!(counters.pinned_get_count(), 2);
+        assert_eq!(counters.get_count(), 2, "a refused get_with_pin is a GET");
         assert_eq!(counters.pinned_get_bytes(), 0);
         assert_eq!(counters.get_bytes(), 0);
     }
