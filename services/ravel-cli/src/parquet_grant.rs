@@ -170,7 +170,7 @@ pub async fn add_grant(
                 profile.name
             )
         })?;
-    probe_not_ravel_bucket(ravel_store.as_ref(), ravel_store, external.as_ref())
+    probe_not_ravel_bucket(ravel_store, ravel_store, external.as_ref())
         .await
         .with_context(|| format!("the bucket behind {url:?} did not qualify as external"))?;
 
@@ -609,9 +609,11 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
     }
 
-    /// A grant cancelled while the bucket probe's identity read is in flight,
-    /// as an interrupted `ravel parquet grant` is, still leaves no probe
-    /// object in Ravel's bucket: the probe's drop guard deletes it.
+    /// A grant future dropped while the bucket probe's identity read is in
+    /// flight still leaves no probe object in Ravel's bucket: the probe's drop
+    /// guard deletes it. This is in-process cancellation only. The binary
+    /// applies no deadline and installs no signal handler, so a SIGINT ends
+    /// the process without running the guard.
     #[tokio::test]
     async fn a_grant_cancelled_mid_probe_leaves_no_probe_object() {
         let ravel = ravel_bucket();
