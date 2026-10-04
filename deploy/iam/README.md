@@ -493,8 +493,11 @@ named by `spec.storage.s3.credentials_secret_ref` rather than any of these
 templates. The tenant config record `t/<tenant_hash>/config` is likewise
 written only by `ravel-cli` under Admin, never by a server role. The Maintain
 role reads the alert state memo and writes neither it nor the lease, and no role
-deletes either; nothing releases the lease. No `ravel-cli` command writes
-`t/<tenant_hash>/enc`, and nothing lists it.
+deletes either; nothing releases the lease. The four `ravel-cli` commands
+that take `--tenant-kms-config` write `t/<tenant_hash>/enc` under the Maintain
+credential, and only when it is absent: they create a tenant's first epochs
+and never append to an existing record (see "Which credential each
+`ravel-cli` command takes" below). Nothing lists it.
 
 `sys/auth`, `sys/t/*` and `t/*/enc` are also deny-delete in every template (see
 the delete-grant section above): no role deletes any of them, a deleted
@@ -517,7 +520,7 @@ rather than refused; see "Bootstrap keys" below.
 
 ### Which credential each `ravel-cli` command takes
 
-`ravel-cli` takes the Admin credential by default. Five commands take the
+`ravel-cli` takes the Admin credential by default. Six commands take the
 Maintain credential instead, because `maintain.json` grants everything they
 issue and `admin.json` does not:
 
@@ -525,6 +528,9 @@ issue and `admin.json` does not:
 - `maintain compact-bucket` and `maintain compact-tenant` take claims under
   `sys/maintain/claims/compaction/` and write L1 segments and compaction
   records.
+- `maintain migrate` rewrites L1 segments and compaction records, writes and
+  deletes its cursor, and raises the format floor in
+  `t/<tenant_hash>/<signal>/prov` (its grants are listed below).
 - `maintain sweep` reads legal holds, commit records and the catalog, deletes
   superseded and expired L0, L1 and commit objects, copies orphans to
   `quarantine/` and deletes them there, and creates `sys/gc` on a fresh
@@ -533,9 +539,32 @@ issue and `admin.json` does not:
   catalog snapshot parts, `HEAD` and index objects, the same keys the
   scheduled fold in maintain mode writes. `query.json` also grants all of it.
 
-Admin gains nothing for them. `ravel-cli` builds no per-tenant KMS routing
-store, so these writes, like every other `ravel-cli` write, land under the
-bucket's default encryption rather than a routed tenant's key.
+Admin gains nothing for them.
+
+Under `--tenant-kms-config`, the Maintain-credential commands that write
+tenant data take the same flag as the servers and route the same way:
+`maintain compact-bucket`, `maintain compact-tenant`, `maintain migrate` and
+`catalog fold`. Each builds the servers' KMS routing store and reads its own
+tenant's `t/<tenant_hash>/enc` epoch record first. When the record is absent
+it writes the tenant's first epochs (`MaintainWrite` `t/*/enc`), under the
+bucket default like every control record. When the record's current key is
+the file's it writes nothing to it. When the record's current key differs it
+refuses the whole command before any write: only ravel-server's startup
+records a key change (ADR-0062 decision 1b), and the record is append-only.
+It then writes that tenant's L1 segments, compaction records, catalog
+snapshot parts, `HEAD` and index objects, and `maintain migrate`'s cursor and
+floor raise in `prov`, under the tenant's key (`MaintainTenantKms`, which
+already grants `kms:Encrypt` and `kms:GenerateDataKey*`). No grant changes
+for it.
+`maintain_cli_data_writes_are_routed_and_maintain_can_encrypt_them` in
+`crates/ravel-commit/tests/iam_templates.rs` checks those key classes against
+this template. `parquet sweep` writes nothing, and `maintain sweep` writes
+only its unnamed-since markers under `t/`, so neither takes the flag. No Admin
+command takes it: Admin is decrypt-only on the tenant keys, so its control
+records (provisioning records, legal holds, reconstructed commit records,
+erasure requests, the tenant config record and the Parquet grants record)
+land under the bucket's default encryption whatever the file says. That is
+why `admin` is the one role in `ROUTED_WRITE_EXEMPT_ROLES`.
 
 `maintain migrate` takes the Maintain credential (ADR-0066 decision 5).
 `maintain.json` grants its reads, its L1 part and compaction-record writes

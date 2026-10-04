@@ -528,18 +528,47 @@ objects written under it, with `AccessDenied`. With the keys in place:
   would let a leaked Admin credential mint ciphertext under tenant keys it has
   no write role for.
 
-One gap to plan around rather than assume covered. `ravel-cli` does not route
-its writes through the per-tenant key: it builds no KMS routing store, so what
-it writes under `t/<hash>/` lands under the bucket's default encryption, not the
-tenant's key, whichever credential runs it. That covers Admin's writes
-(provenance records, legal holds, reconstructed commit records, erasure
-requests, the tenant config record and the Parquet location grants record) and
-the L1 segments and compaction records `maintain compact-bucket` and
-`compact-tenant` write under the Maintain credential. Admin's missing
+`ravel-cli` separates tenant data from control records. The commands that
+write tenant data under the Maintain credential take the same
+`--tenant-kms-config` flag, read the same file, and route the same way the
+server does: `maintain compact-bucket`, `maintain compact-tenant` and
+`maintain migrate` (L1 segments and compaction records, and for `migrate` its
+cursor and the floor raise in `prov`) and `catalog fold` (catalog snapshot
+parts, `HEAD` and index objects). Pass them the file the servers use. For a
+tenant the file names, the command first reads that tenant's `t/<hash>/enc`
+key-epoch record. When the record is absent the command creates it, as server
+startup does; when its current key is the file's the command leaves it alone;
+when its current key differs the command refuses before any write, because
+only server startup records a key change and the record is append-only. It
+then writes its data under `t/<hash>/` under the tenant's key. The epoch
+record itself is a control record, written under the bucket's default
+encryption. The command applies only the entry for its own `--tenant`. A
+tenant the file does not name is written under the bucket's default
+encryption, as the server writes it. The flag requires
+`--store s3`, and a `--dry-run` reads and validates the file and writes
+nothing. Maintain already holds encrypt and generate-data-key on the tenant
+keys and the `t/*/enc` write, so this needs no new grant.
+
+Admin stays decrypt-only, so no Admin command takes the flag, and what Admin
+writes under `t/<hash>/` stays under the bucket's default encryption whatever
+the file says: provisioning records, legal holds, reconstructed commit
+records, erasure requests, the tenant config record and the Parquet location
+grants record. These are control records, not tenant data. Admin's missing
 generate-data-key refuses none of these writes unless the bucket's default
 encryption is itself a customer-managed KMS key, in which case Admin needs
-generate-data-key on that key. A deployment that needs these writes under a
-tenant's own key cannot get that from `ravel-cli` today.
+generate-data-key on that key. `maintain verify-custody` checks write times
+against the key-epoch history, not the key each object is encrypted under, so
+it reports none of these records; for a tenant with a recorded epoch it prints
+a `control records:` line saying so.
+
+Two other `ravel-cli` writers under `t/<hash>/` take no `--tenant-kms-config`
+and write under the bucket's default encryption. `maintain sweep` runs under
+the Maintain credential and writes only unnamed-since markers there; the
+quarantine copies it writes are outside `t/` and so would not route in the
+server either. `load`, the bulk loader, writes L0 segments, their commit
+records and, through `validate_or_adopt`, the tenant's provisioning record; a
+deployment that needs bulk-loaded data under a tenant's own key
+cannot get that from `ravel-cli` today.
 The `t/<hash>/enc` epoch record has its own grant: Gateway, Query and Maintain
 read and write it, because startup bootstraps it in every mode, and Admin reads
 it for `verify-custody`. Every template denies its deletion.
