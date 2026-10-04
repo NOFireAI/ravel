@@ -171,6 +171,7 @@ script pair is deleted.
 - nextest test sharding across runners: real complexity (partition
   stitching, per-shard caches) targeted at `check`'s 9-11m test step, and
   cheaper wins (D2-D4) come first. Revisit if `check` exceeds ~20m.
+  Revisited and adopted in the check sharding amendment below.
 - Remote build cache (sccache to S3, Bazel-class systems): premature
   against a 10 GB GHA budget not yet proven insufficient after D4 reduces
   the configuration count.
@@ -299,3 +300,65 @@ the main-push build failing; the epic ledger should read it so.
   authority to accept a lower floor stays in-repo behind PR review.
 - Added cost per main push: one gist read, one compare, one gist write.
   Zero added test execution anywhere.
+
+## Amendment: check sharding
+
+<!-- amendment-applies: sections="Rejected alternatives" pointer="check sharding amendment" -->
+
+Dated 2026-10-04. Tracked in issue #2518 under epic #2526.
+
+Rejected alternatives turned down nextest sharding across runners and set
+the revisit trigger at `check` exceeding about 20 minutes. This amendment
+adopts sharding before that trigger is met, and records why the trigger
+was the wrong one.
+
+### What changed since the rejection
+
+- The job is 18.2 minutes at the median over 2026-09-30 to 2026-10-04,
+  under the 20-minute trigger. Its test step is no longer the 9 to 11
+  minutes the rejection priced: it ran 641 seconds for 9,483 tests, and
+  the suite grew from 8,321 to 9,483 tests inside those four days.
+- The test step is CPU-bound. The tests summed to 2,374 CPU-seconds, which
+  is 594 seconds on a four-core runner, so nothing done inside one runner
+  recovers more than about 47 seconds. The cheaper wins the rejection
+  deferred to are spent: D2 to D4 landed, and the job is still the
+  second-longest in the workflow.
+- The two costs the rejection named did not materialise. There is no
+  partition stitching: nextest's hash partition assigns every test to
+  exactly one of N legs, and the leg count comes from the strategy. There
+  are no per-shard caches: every leg builds the same workspace, so the
+  legs share the one cache entry the unsplit job saved.
+- A wall-time trigger on one job was the wrong measure. A pull request
+  pays for two runs back to back, its own and the merge queue's, so the
+  longest job is paid twice per landing. `features` held that place at
+  23.7 minutes and was split into a matrix first (issue #1793); `check`
+  is the longest job once that lands.
+
+### Decision
+
+`check` runs as a `check-shard` matrix of four legs, each building the
+workspace and running one hash partition, with doctests in one leg. A
+`check` job that reports on the matrix keeps the required-check name, and
+fails on a failed or cancelled leg, on a failed `changes` job, and on a
+matrix result that does not match what a docs-only change expects.
+
+### Cost
+
+Measured on one run of each form on the same tree apart from the workflow
+file (runs 37192194679 and 37192261796):
+
+| | wall | runner minutes | tests run |
+|---|---|---|---|
+| one job | 17 min 47 s | 17.8 | 9,553 |
+| four legs | 11 min 54 s (slowest leg) | 42.4 | 9,553 |
+
+The split costs about 25 more runner minutes per run, all of it three
+extra workspace builds of about 7 minutes each. It buys about 6 minutes of
+wall time per run, twice per landing. Runner queue time was 0.0 minutes at
+the median and 0.1 at the 90th percentile before the split; if three more
+concurrent jobs per run push the 90th percentile above 1 minute, the leg
+count comes down.
+
+The build is now 60 to 70 percent of each leg, so a fifth leg would buy
+almost nothing. The next lever is the build itself (issue #2523), not
+more legs.

@@ -872,18 +872,20 @@ jobs:
           # Every leg builds the same thing, so they share one entry, under
           # the name the unsplit job saved it as.
           shared-key: check
-      # The denominator is the number of matrix entries, taken from the
-      # strategy so it cannot drift from the list: a larger one would leave a
-      # partition that no leg runs.
+      # The denominator is the number of legs, taken from the strategy so it
+      # follows the shard list: a larger one would leave a partition that no
+      # leg runs. That holds only while `shard` is the matrix's one dimension.
+      # A second dimension multiplies job-total and not the shard numbers, so
+      # it has to come with a fixed denominator here.
       - name: Test
         run: cargo nextest run --locked --workspace --cargo-profile ci --partition hash:${{ matrix.shard }}/${{ strategy.job-total }}
       # nextest does not run doctests; keep them covered separately, in one
-      # leg, since they are not partitioned. Same
-      # `ci` profile as the step above (ADR-0053 D4, and what scripts/gates.sh
-      # has always run): on the default profile this is a second target
-      # subtree and so a second build of the workspace inside one job.
-      # profile.ci inherits dev, so debug_assertions and overflow checks are
-      # unchanged and only debug info is dropped.
+      # leg, since they are not partitioned. Same `ci` profile as the step
+      # above (ADR-0053 D4, and what scripts/gates.sh has always run): on the
+      # default profile this is a second target subtree and so a second build
+      # of the workspace inside one job. profile.ci inherits dev, so
+      # debug_assertions and overflow checks are unchanged and only debug info
+      # is dropped.
       - name: Doctests
         if: matrix.shard == 1
         run: cargo test --locked --doc --profile ci --workspace
