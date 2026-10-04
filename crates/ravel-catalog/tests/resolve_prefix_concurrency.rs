@@ -16,7 +16,9 @@ use ravel_catalog::{Catalog, CatalogConfig, CatalogError, Snapshot};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
-use ravel_object_store::fault::{FaultPlan, FaultStore, GateHandle, Occurrence, Op};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, GateHandle, Occurrence, Op, Rule, ScriptedFault,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -164,7 +166,19 @@ fn wrap(
     Arc<FaultStore<Arc<MemoryStore>>>,
     ListLog,
 ) {
-    let fault = Arc::new(FaultStore::new(inner, FaultPlan::empty()));
+    wrap_with_plan(inner, FaultPlan::empty())
+}
+
+/// [`wrap`] with `plan` scripted on the `FaultStore`.
+fn wrap_with_plan(
+    inner: Arc<MemoryStore>,
+    plan: FaultPlan,
+) -> (
+    Arc<CountingStore>,
+    Arc<FaultStore<Arc<MemoryStore>>>,
+    ListLog,
+) {
+    let fault = Arc::new(FaultStore::new(inner, plan));
     let log = ListLog::default();
     let counting = Arc::new(CountingStore {
         inner: fault.clone(),
@@ -316,9 +330,59 @@ async fn prefix_listing_cap_is_exact_under_concurrency() {
     }
 }
 
-/// The same multi-shard, multi-page corpus resolved by the prefix path (shards
-/// completing in reverse order) and by the bounded path gives identical
-/// snapshots: the same keys in the same order.
+/// A store error on one shard's LIST fails the whole resolve. The other
+/// three shards list successfully, and none of their keys come back as a
+/// partial `Ok`.
+#[tokio::test]
+async fn prefix_listing_store_error_on_one_shard_fails_the_resolve() {
+    const FAILING: u32 = 2;
+    let inner = Arc::new(MemoryStore::new());
+    for shard in 0..SHARDS {
+        publish_at(inner.as_ref(), shard, 30 + shard, 4).await;
+    }
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::List,
+            ScriptedFault::Permanent("injected shard LIST failure".to_string()),
+        )
+        .with_key_contains(shard_prefix(FAILING)),
+    );
+    let (counting, fault, log) = wrap_with_plan(inner, plan);
+    let catalog = Catalog::new(counting, base_config()).expect("catalog");
+
+    let (range, now_ns) = window();
+    let result = catalog
+        .resolve(&tenant(), Signal::Metrics, range, &[], now_ns)
+        .await;
+
+    assert_eq!(
+        fault.fault_count(Op::List, FaultKind::Permanent),
+        1,
+        "the injected LIST error fired once, on the failing shard"
+    );
+    let listed: BTreeSet<String> = log.commit_lists().into_iter().collect();
+    assert!(
+        listed.contains(&shard_prefix(FAILING)),
+        "the failing shard's LIST reached the store; listed: {listed:?}"
+    );
+    match result {
+        Err(CatalogError::Store(StoreError::Permanent(message))) => {
+            assert_eq!(message, "injected shard LIST failure");
+        }
+        Err(other) => panic!("expected the injected store error, got {other:?}"),
+        Ok(snapshot) => panic!(
+            "a failed shard must fail the resolve, got {} segments as Ok",
+            snapshot.segments.len()
+        ),
+    }
+}
+
+/// The same multi-shard, multi-page corpus resolved by the prefix path and by
+/// the bounded path gives identical snapshots: the same keys in the same
+/// order. Shard 0's pages are held until every other shard has drained, so
+/// the shards complete out of shard order; the resolved order still matches
+/// because resolve sorts the segments by their own fields, never by when
+/// their shard's listing finished.
 #[tokio::test]
 async fn prefix_listing_key_set_matches_sequential() {
     let inner = Arc::new(MemoryStore::with_page_size(2));
@@ -356,16 +420,49 @@ async fn prefix_listing_key_set_matches_sequential() {
         Some(COMMIT_LIST_MARK.to_string()),
         Occurrence::Always,
     );
-    // Release only the held page of the highest shard each time, so later
-    // shards finish before earlier ones.
+    // Release every held page except shard 0's. Shard 0 is let go only once
+    // it is the sole shard held, that is once every other shard has drained.
+    let shard0 = shard_prefix(0);
+    let lists_at_shard0_release: Mutex<Option<Vec<String>>> = Mutex::new(None);
     let (result, max_held) = resolve_releasing(&prefix, &gate, |held| {
-        held.iter()
-            .max_by(|a, b| a.2.cmp(&b.2))
-            .map(|h| vec![h.0])
-            .unwrap_or_default()
+        let others: Vec<u64> = held.iter().filter(|h| h.2 != shard0).map(|h| h.0).collect();
+        if !others.is_empty() {
+            return others;
+        }
+        lists_at_shard0_release
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| log.commit_lists());
+        held.iter().map(|h| h.0).collect()
     })
     .await;
     let prefix_snapshot = result.expect("prefix resolve");
+
+    let at_release = lists_at_shard0_release
+        .into_inner()
+        .unwrap()
+        .expect("shard 0 was held and then released");
+    let final_lists = log.commit_lists();
+    let pages_of = |lists: &[String], shard: u32| {
+        let prefix = shard_prefix(shard);
+        lists.iter().filter(|p| **p == prefix).count()
+    };
+    assert_eq!(
+        pages_of(&at_release, 0),
+        1,
+        "shard 0 had issued only its first page when the others finished"
+    );
+    for shard in 1..SHARDS {
+        assert_eq!(
+            pages_of(&at_release, shard),
+            pages_of(&final_lists, shard),
+            "shard {shard} had drained every page before shard 0's first returned"
+        );
+    }
+    assert!(
+        pages_of(&final_lists, 0) > 1,
+        "shard 0 pages after its first, so it completes last"
+    );
 
     assert_eq!(
         max_held, SHARDS as usize,

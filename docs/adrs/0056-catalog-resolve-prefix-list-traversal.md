@@ -334,8 +334,11 @@ from the previous page.
   never issued.
 - **What can vary between runs** is which shard's reservation is refused, and
   how many of the reserved pages were issued before the abort.
-- The shard results are merged in shard order before they are partitioned, so
-  the resolved key set and its order are unchanged. The envelope argument
-  above counts total pages, which concurrency does not change.
+- The shard results are merged in the order the shards complete, which varies
+  between runs, and the resolved key set and its order are still unchanged.
+  Each key is grouped under its own `(shard, hour)` bucket, so no bucket mixes
+  keys from two shards, and resolve sorts the segments it returns by their own
+  record fields, not by listing order. The envelope argument above counts
+  total pages, which concurrency does not change.
 
 Pinned by `crates/ravel-catalog/tests/resolve_prefix_concurrency.rs`.

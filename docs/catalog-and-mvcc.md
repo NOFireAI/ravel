@@ -1303,8 +1303,11 @@ carries them as a comma-separated list in `x-ravel-commit-token`.
      concurrency and a window whose pages exceed the cap is refused with
      `WindowTooWide` on every run (ADR-2509). Which shard reaches the cap, and
      how many reserved LISTs were issued before the refusal, can vary between
-     runs. Shard results are merged in shard order before step 2. Cost
-     `O(objects above the watermark / page_size)`.
+     runs. Shard results are merged in completion order, which can vary; a
+     key is grouped under its own `(shard, hour)` bucket and the resolved
+     snapshot's segment order is set by the catalog sort ("Cross-segment
+     duplicate samples"), so neither the key set nor the order depends on
+     it. Cost `O(objects above the watermark / page_size)`.
    Both traversals produce the identical key set and partition it identically
    (step 2 onward).
 2. Partition the listed keys by shape (L0 commit record, compaction
