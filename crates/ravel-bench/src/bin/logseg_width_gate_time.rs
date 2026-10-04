@@ -15,7 +15,9 @@
 //! wired into `cargo bench`.
 //!
 //! Run directly:
-//!   cargo run -p ravel-bench --release --bin logseg_width_gate_time
+//!   cargo run -p ravel-bench --release --bin logseg_width_gate_time [-- <shape>]
+//! With no argument every shape runs in one process; with a shape name only
+//! that shape runs.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 #[path = "../../../ravel-logseg/benches/common/mod.rs"]
@@ -326,9 +328,20 @@ fn main() {
         );
     }
 
+    let selected: Option<String> = std::env::args().nth(1);
+    if let Some(sel) = &selected
+        && !SHAPES.iter().any(|s| s.0 == sel)
+    {
+        eprintln!("unknown shape {sel:?}; expected one of {:?}", SHAPES.map(|s| s.0));
+        std::process::exit(2);
+    }
+
     let mut corrects = Vec::new();
     let mut corpora: Vec<(&'static str, Vec<LogRecord>)> = Vec::new();
     for &(name, streams, records_per_stream, is_wide) in &SHAPES {
+        if selected.as_deref().is_some_and(|sel| sel != name) {
+            continue;
+        }
         let corpus = build_corpus_for(streams, records_per_stream, is_wide);
         let c = check_correctness(name, &corpus);
         println!(
