@@ -178,19 +178,39 @@ fn profile_labels(baseline: &ProfileStamp, candidate: &ProfileStamp) -> (String,
     )
 }
 
-/// Every priced field of a profile, for the same-name refusal above.
+/// Every priced field of a profile and its two timings, which also move the
+/// cost-based rate (ADR-2414 decision A3), for the same-name refusal above.
 fn price_digest(profile: Option<&StoreCostProfile>) -> String {
+    fn timing(t: Option<u64>) -> String {
+        t.map_or_else(|| "none".to_string(), |v| v.to_string())
+    }
     match profile {
         None => "(no prices)".to_string(),
         Some(p) => format!(
-            "(put={} get={} delete={} transfer_per_gib={} retrieval_per_gib={})",
+            "(put={} get={} delete={} transfer_per_gib={} retrieval_per_gib={} \
+             request_latency_micros={} per_connection_throughput_bytes_per_s={})",
             p.put_class_nanodollars,
             p.get_class_nanodollars,
             p.delete_class_nanodollars,
             p.transfer_nanodollars_per_gib,
             p.retrieval_nanodollars_per_gib,
+            timing(p.request_latency_micros),
+            timing(p.per_connection_throughput_bytes_per_s),
         ),
     }
+}
+
+/// Whether two effective profiles price a run the same way: equal in every
+/// field except `timings_measured`, which records where the timings came
+/// from and moves no figure.
+fn same_pricing_basis(a: Option<&StoreCostProfile>, b: Option<&StoreCostProfile>) -> bool {
+    fn basis(p: &StoreCostProfile) -> StoreCostProfile {
+        StoreCostProfile {
+            timings_measured: None,
+            ..p.clone()
+        }
+    }
+    a.map(basis) == b.map(basis)
 }
 
 /// The effective-policy stamp value the plan-shape absolutes are defined over:
@@ -1010,9 +1030,13 @@ pub fn compare(
 
     // Profile guard: the effective profile is the one that governed pricing.
     // Two reports whose effective profiles differ cannot be compared. Equality
-    // is over the whole profile, not its name: a profile edited in place keeps
-    // its name while repricing every figure stamped with it.
-    if baseline.profile.effective != candidate.profile.effective {
+    // is over every field that moves a figure, not the name: a profile edited
+    // in place keeps its name while repricing every figure stamped with it.
+    // The timings' provenance note is left out; it moves nothing.
+    if !same_pricing_basis(
+        baseline.profile.effective.as_ref(),
+        candidate.profile.effective.as_ref(),
+    ) {
         let (baseline, candidate) = profile_labels(&baseline.profile, &candidate.profile);
         return Err(CompareError::ProfileMismatch {
             baseline,
@@ -1498,6 +1522,64 @@ mod tests {
         );
         assert!(msg.contains("get=400"), "shows the baseline price: {msg}");
         assert!(msg.contains("get=800"), "shows the candidate price: {msg}");
+    }
+
+    /// A report stamped before the reference profile recorded timings meets
+    /// one stamped after: the prices and the name match, the rate does not,
+    /// so the comparison refuses and the message shows both timings.
+    #[test]
+    fn an_untimed_and_a_timed_reference_profile_refuse_naming_the_timings() {
+        let mut base = baseline_report();
+        base.profile.effective = Some(StoreCostProfile {
+            request_latency_micros: None,
+            per_connection_throughput_bytes_per_s: None,
+            timings_measured: None,
+            ..StoreCostProfile::reference()
+        });
+        let mut cand = baseline_report();
+        cand.profile.effective = Some(StoreCostProfile::reference());
+
+        let err = compare(&base, &cand, &Bands::defaults()).expect_err("must refuse");
+        let CompareError::ProfileMismatch {
+            baseline,
+            candidate,
+        } = &err
+        else {
+            panic!("expected a profile mismatch, got {err:?}");
+        };
+        assert!(
+            baseline.ends_with(
+                " request_latency_micros=none per_connection_throughput_bytes_per_s=none)"
+            ),
+            "{baseline}"
+        );
+        assert!(
+            candidate.ends_with(
+                " request_latency_micros=70000 per_connection_throughput_bytes_per_s=90000000)"
+            ),
+            "{candidate}"
+        );
+        assert_ne!(
+            baseline, candidate,
+            "the two labels tell the profiles apart"
+        );
+    }
+
+    /// Two profiles that differ only in where their timings were measured
+    /// price every figure the same way, so they compare.
+    #[test]
+    fn profiles_differing_only_in_timings_provenance_compare() {
+        let mut base = baseline_report();
+        base.profile.effective = Some(StoreCostProfile::reference());
+        let mut cand = baseline_report();
+        cand.profile.effective = Some(StoreCostProfile {
+            timings_measured: Some("another note".to_string()),
+            ..StoreCostProfile::reference()
+        });
+        assert_ne!(base.profile.effective, cand.profile.effective);
+        let comparison =
+            compare(&base, &cand, &Bands::defaults()).expect("provenance alone does not refuse");
+        assert!(!comparison.regressed());
     }
 
     #[test]
