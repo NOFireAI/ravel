@@ -69,7 +69,8 @@ use crate::config::{
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::generation::{
-    FlushScope, HandBackArrival, SCAN_SET_HANDBACK_ABANDONED, ScanCheck, reread_and_check,
+    FlushScope, HandBackArrival, HandBackReason, HandedBack, ScanCheck, mismatch_retry_spent,
+    reread_and_check, send_hand_back,
 };
 use crate::log_declared_stats::{DeclaredStatAccum, declared_type_tag};
 use crate::log_error::LogWriteError;
@@ -382,9 +383,29 @@ struct LogTenantBuf {
     stale_view_counted: bool,
     /// See [`crate::shard`]'s `TenantBuf::hand_back_blocked`.
     hand_back_blocked: bool,
+    /// See [`crate::shard`]'s `TenantBuf::mismatch_held_since_ns`.
+    mismatch_held_since_ns: Option<i64>,
 }
 
 impl LogTenantBuf {
+    /// Merges records that are already admitted and charged: records handed
+    /// back to this shard, or records a failed hand-back send returned.
+    fn absorb(
+        &mut self,
+        payload: FlushPayload,
+        charges: Vec<Arc<IngestByteCharge>>,
+        arrival: HandBackArrival,
+    ) -> Result<(), LogWriteError> {
+        self.merge_hand_back(payload)?;
+        self.charges.extend(charges);
+        arrival.fold_into(
+            &mut self.oldest_arrival_ns,
+            &mut self.min_ingest_ts_ns,
+            &mut self.max_ingest_ts_ns,
+        );
+        Ok(())
+    }
+
     fn note_arrival(&mut self, arrival_ns: i64) {
         self.oldest_arrival_ns.get_or_insert(arrival_ns);
         self.min_ingest_ts_ns = Some(match self.min_ingest_ts_ns {
@@ -1146,6 +1167,8 @@ pub(crate) struct LogShardActor {
     /// Set by a hand-back and cleared by the next flush that opens in place,
     /// so a run of hand-backs on this shard logs one WARN.
     handing_back: bool,
+    /// See [`crate::shard`]'s `ShardActor::mismatch_in_place`.
+    mismatch_in_place: bool,
     /// See [`crate::shard`]'s `ShardActor::drain_rereads`.
     drain_rereads: Option<HashSet<TenantHash>>,
 }
@@ -1202,6 +1225,7 @@ impl LogShardActor {
             cap_flag,
             scope,
             handing_back: false,
+            mismatch_in_place: false,
             drain_rereads: None,
         }
     }
@@ -1259,8 +1283,10 @@ impl LogShardActor {
                             let _ = done.send(());
                         }
                         Some(LogShardMsg::Shutdown { done }) => {
+                            let unprocessed = self.close_mailbox().await;
                             self.flush_all(FlushTrigger::Manual, DrainIntent::Teardown)
                                 .await;
+                            drop(unprocessed);
                             let _ = done.send(());
                             break;
                         }
@@ -1297,6 +1323,27 @@ impl LogShardActor {
                 }
             }
         }
+    }
+
+    /// Closes this actor's mailbox before its teardown flush and absorbs every
+    /// hand-back already queued; see `shard::ShardActor::close_mailbox`.
+    async fn close_mailbox(&mut self) -> Vec<LogShardMsg> {
+        self.rx.close();
+        let mut unprocessed = Vec::new();
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                LogShardMsg::HandBack {
+                    tenant,
+                    payload,
+                    charges,
+                    arrival,
+                } => {
+                    self.absorb_records(&tenant, payload, charges, arrival);
+                }
+                other => unprocessed.push(other),
+            }
+        }
+        unprocessed
     }
 
     /// Buffers `records` for `tenant` and opens a size-triggered flush if the
@@ -1412,7 +1459,7 @@ impl LogShardActor {
         arrival: HandBackArrival,
     ) -> bool {
         let buf = self.tenants.entry(tenant.clone()).or_default();
-        if let Err(err) = buf.merge_hand_back(payload) {
+        if let Err(err) = buf.absorb(payload, charges, arrival) {
             tracing::error!(
                 shard = self.shard,
                 error = %err,
@@ -1421,12 +1468,6 @@ impl LogShardActor {
             );
             return false;
         }
-        buf.charges.extend(charges);
-        arrival.fold_into(
-            &mut buf.oldest_arrival_ns,
-            &mut buf.min_ingest_ts_ns,
-            &mut buf.max_ingest_ts_ns,
-        );
         true
     }
 
@@ -1436,14 +1477,16 @@ impl LogShardActor {
     /// buffer back untouched if one is not live, then strict waiters answered
     /// `Abandoned` and a clone of every charge to each target. Columnar batches
     /// are re-partitioned by the same rule the router's columnar path uses. A
-    /// failed send returns its records and charges to this shard's buffer, as
-    /// in the metrics actor. Returns whether any target took records.
+    /// failed send returns its records and charges in [`HandedBack::kept`],
+    /// as in the metrics actor, and so does a full mailbox on a send that may
+    /// not wait.
     async fn hand_back(
         &mut self,
         tenant: &TenantId,
         mut buf: LogTenantBuf,
         count: u32,
-    ) -> Result<bool, LogTenantBuf> {
+        reason: HandBackReason,
+    ) -> HandedBack<LogTenantBuf> {
         let mut targets: Vec<u32> = match &buf.content {
             BufContent::Empty => Vec::new(),
             BufContent::Rows(records) => records
@@ -1465,14 +1508,20 @@ impl LogShardActor {
         for &target in &targets {
             match self.scope.live_sender(count, target) {
                 Some(tx) => senders.push(tx),
-                None => return Err(buf),
+                None => {
+                    return HandedBack {
+                        delivered: false,
+                        kept: Some(buf),
+                        target_dead: true,
+                    };
+                }
             }
         }
 
         let waiters = std::mem::take(&mut buf.waiters);
         self.ctx.ack_waiters(
             waiters,
-            Err(LogWriteError::Abandoned(SCAN_SET_HANDBACK_ABANDONED.into())),
+            Err(LogWriteError::Abandoned(reason.abandoned_message().into())),
         );
         let LogTenantBuf {
             content,
@@ -1482,6 +1531,7 @@ impl LogShardActor {
             charges,
             deferred_since_ns,
             hand_back_blocked,
+            mismatch_held_since_ns,
             ..
         } = buf;
         let arrival = HandBackArrival {
@@ -1516,8 +1566,10 @@ impl LogShardActor {
                 }
             }
         }
+        let wait = self.scope.may_wait_on(count);
         let mut delivered = false;
-        let mut kept = false;
+        let mut kept: Option<LogTenantBuf> = None;
+        let mut target_dead = false;
         for (target, tx) in targets.into_iter().zip(senders) {
             let Some(payload) = payloads.remove(&target) else {
                 continue;
@@ -1528,39 +1580,39 @@ impl LogShardActor {
                 charges: charges.clone(),
                 arrival,
             };
-            let Err(mpsc::error::SendError(msg)) = tx.send(msg).await else {
+            let Err(refused) = send_hand_back(&tx, msg, wait).await else {
                 delivered = true;
                 continue;
             };
+            target_dead |= refused.closed;
             let LogShardMsg::HandBack {
                 payload,
                 charges: returned,
                 ..
-            } = msg
+            } = refused.msg
             else {
                 continue;
             };
-            let charges = if kept { Vec::new() } else { returned };
-            if self.absorb_records(tenant, payload, charges, arrival)
-                && let Some(buf) = self.tenants.get_mut(tenant)
-            {
-                buf.deferred_since_ns = buf.deferred_since_ns.or(deferred_since_ns);
-                buf.hand_back_blocked = true;
-            }
-            if !kept && !hand_back_blocked {
-                self.metrics.record_hand_back_failure();
+            let charges = if kept.is_some() { Vec::new() } else { returned };
+            let rest = kept.get_or_insert_with(|| LogTenantBuf {
+                deferred_since_ns,
+                hand_back_blocked,
+                mismatch_held_since_ns,
+                ..LogTenantBuf::default()
+            });
+            if let Err(err) = rest.absorb(payload, charges, arrival) {
                 tracing::error!(
-                    signal = ?Signal::Logs,
                     shard = self.shard,
-                    target,
-                    tenant_hash = %tenant.hash().to_hex(),
-                    "ravel-ingest: hand-back target log shard closed before its records \
-                     arrived; keeping them in this shard's buffer for the next flush to retry"
+                    error = %err,
+                    "ravel-ingest: returned hand-back log records could not merge; dropping them"
                 );
             }
-            kept = true;
         }
-        Ok(delivered)
+        HandedBack {
+            delivered,
+            kept,
+            target_dead,
+        }
     }
 
     /// The scan-set check at flush open, re-reading an untrusted view once per
@@ -1799,13 +1851,35 @@ impl LogShardActor {
     /// is reported: an ERROR and the `flush_all_residue_tenants` bump on a
     /// [`DrainIntent::Teardown`], a WARN on [`DrainIntent::Retryable`], where
     /// the residue is still in the tenant map with its arrival bookkeeping and
-    /// the actor is still running to flush it.
+    /// the actor is still running to flush it. Records a generation-mismatch
+    /// hand-back returned from a full mailbox get one last pass that writes
+    /// them in place, and can still be left buffered by the cases
+    /// `shard::ShardActor::flush_all` names.
     async fn flush_all(&mut self, trigger: FlushTrigger, intent: DrainIntent) {
         self.drain_rereads = Some(HashSet::new());
         let mut passes = 0;
         while !self.tenants.is_empty() && passes < MAX_FLUSH_ALL_PASSES {
             self.flush_all_pass(trigger, LagCheck::Enforced).await;
             passes += 1;
+            if self.holds_mismatch_rows() {
+                tokio::task::yield_now().await;
+            }
+        }
+        if matches!(intent, DrainIntent::Retryable) && self.holds_mismatch_rows() {
+            self.mismatch_in_place = true;
+            let held: Vec<TenantId> = self
+                .tenants
+                .iter()
+                .filter(|(_, buf)| buf.mismatch_held_since_ns.is_some())
+                .map(|(tenant, _)| tenant.clone())
+                .collect();
+            for tenant in held {
+                if let Some(buf) = self.tenants.remove(&tenant) {
+                    self.flush_tenant(tenant, buf, trigger, LagCheck::Enforced)
+                        .await;
+                }
+            }
+            self.mismatch_in_place = false;
         }
         let mut bypass_passes = 0;
         if matches!(intent, DrainIntent::Teardown) {
@@ -1848,6 +1922,14 @@ impl LogShardActor {
         self.drain_rereads = None;
         self.join_all_flushes().await;
         self.refresh_oldest_deferral();
+    }
+
+    /// Whether a buffer still holds records a generation-mismatch hand-back
+    /// left undelivered.
+    fn holds_mismatch_rows(&self) -> bool {
+        self.tenants
+            .values()
+            .any(|buf| buf.mismatch_held_since_ns.is_some())
     }
 
     /// One drain pass: a fresh snapshot of the buffered tenant keys, each
@@ -2172,7 +2254,8 @@ impl LogShardActor {
             }
         };
         // ADR-1642 scan-set amendment: write under this shard index only if
-        // the read side scans it for the hour this flush is about to pin.
+        // the read side scans it for the hour this flush is about to pin, and
+        // no other generation owns that hour alone (issue #2429).
         let buf = match self
             .scan_check(tenant_hash, ingest_hour_bucket, raw_ns)
             .await
@@ -2182,46 +2265,105 @@ impl LogShardActor {
                 buf
             }
             ScanCheck::HandBack {
+                target_count,
+                reason: HandBackReason::GenerationMismatch,
+                ..
+            } if mismatch_retry_spent(
+                buf.mismatch_held_since_ns,
+                buf.deferred_since_ns,
+                raw_ns,
+                self.deferral_cap_ns,
+            ) =>
+            {
+                // This flush opens at or past the cap, so, as on the deferral
+                // path, no strict waiter is acknowledged from it.
+                let waiters = std::mem::take(&mut buf.waiters);
+                self.ctx.ack_waiters(
+                    waiters,
+                    Err(LogWriteError::Abandoned(DEFERRAL_CAP_ABANDONED.into())),
+                );
+                self.metrics.record_generation_mismatch_written_in_place();
+                tracing::warn!(
+                    signal = ?Signal::Logs,
+                    shard = self.shard,
+                    tenant_hash = %tenant_hash.to_hex(),
+                    ingest_hour_bucket,
+                    target_count,
+                    "ravel-ingest: a generation-mismatch hand-back kept failing for the flush \
+                     deferral cap; writing the flush in place in an ingest hour another shard \
+                     generation owns; readers find the records, but a pushdown split over this \
+                     hour may see their streams at two shard indices"
+                );
+                buf
+            }
+            ScanCheck::HandBack {
                 scan_count,
-                active_count,
-            } => match self.hand_back(&tenant, buf, active_count).await {
-                Ok(delivered) => {
-                    if delivered {
-                        self.metrics.record_rerouted_flush();
-                        if !std::mem::replace(&mut self.handing_back, true) {
-                            tracing::warn!(
-                                signal = ?Signal::Logs,
-                                shard = self.shard,
-                                ingest_hour_bucket,
-                                scan_count,
-                                active_count,
-                                "ravel-ingest: flush would write outside the read-side scan set \
-                                 of its ingest hour; handing its rows to the current shard generation"
-                            );
-                        }
+                target_count,
+                reason,
+            } => {
+                let handed = self.hand_back(&tenant, buf, target_count, reason).await;
+                if handed.delivered {
+                    self.metrics.record_rerouted_flush(reason);
+                    if !std::mem::replace(&mut self.handing_back, true) {
+                        tracing::warn!(
+                            signal = ?Signal::Logs,
+                            shard = self.shard,
+                            ingest_hour_bucket,
+                            scan_count,
+                            target_count,
+                            reason = reason.label(),
+                            "ravel-ingest: flush would write outside the read-side scan set \
+                             of its ingest hour, or into an hour another shard generation \
+                             owns; handing its rows to that hour's shard generation"
+                        );
                     }
-                    return;
                 }
-                Err(mut buf) => {
-                    buf.stale_view_counted = false;
-                    if matches!(lag_check, LagCheck::Enforced) {
-                        if !std::mem::replace(&mut buf.hand_back_blocked, true) {
-                            self.metrics.record_hand_back_failure();
-                            tracing::error!(
-                                signal = ?Signal::Logs,
-                                shard = self.shard,
-                                tenant_hash = %tenant_hash.to_hex(),
-                                ingest_hour_bucket,
-                                active_count,
-                                "ravel-ingest: a hand-back target log shard of the tenant's \
-                                 current generation is dead or condemned; keeping the records in \
-                                 this shard's buffer, where they stay until a target is live or \
-                                 the teardown drain writes them"
-                            );
-                        }
-                        self.tenants.insert(tenant, buf);
-                        return;
+                let target_dead = handed.target_dead;
+                let Some(mut buf) = handed.kept else {
+                    return;
+                };
+                buf.stale_view_counted = false;
+                let enforced = matches!(lag_check, LagCheck::Enforced);
+                // A target that is not live cannot take the records on a
+                // later flush, so only a full mailbox is retried.
+                if reason == HandBackReason::GenerationMismatch
+                    && (target_dead || !enforced || self.mismatch_in_place)
+                {
+                    self.metrics.record_generation_mismatch_written_in_place();
+                    tracing::warn!(
+                        signal = ?Signal::Logs,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        target_count,
+                        target_dead,
+                        "ravel-ingest: writing a flush in place in an ingest hour another \
+                         shard generation owns, because a hand-back target shard is dead, \
+                         condemned or closed, or a drain found its mailbox still full; \
+                         readers find the records, but a pushdown split over this hour may \
+                         see their streams at two shard indices"
+                    );
+                    buf
+                } else if enforced {
+                    if reason == HandBackReason::GenerationMismatch {
+                        buf.mismatch_held_since_ns.get_or_insert(raw_ns);
                     }
+                    if !std::mem::replace(&mut buf.hand_back_blocked, true) {
+                        self.metrics.record_hand_back_failure();
+                        tracing::error!(
+                            signal = ?Signal::Logs,
+                            shard = self.shard,
+                            tenant_hash = %tenant_hash.to_hex(),
+                            ingest_hour_bucket,
+                            target_count,
+                            "ravel-ingest: a hand-back target log shard is dead, condemned, \
+                             closed, or its mailbox full on a send that may not wait; keeping \
+                             the records in this shard's buffer for a later flush to retry"
+                        );
+                    }
+                    self.tenants.insert(tenant, buf);
+                    return;
+                } else {
                     self.metrics.record_teardown_unscanned_write();
                     tracing::error!(
                         signal = ?Signal::Logs,
@@ -2229,7 +2371,7 @@ impl LogShardActor {
                         tenant_hash = %tenant_hash.to_hex(),
                         ingest_hour_bucket,
                         scan_count,
-                        active_count,
+                        target_count,
                         "ravel-ingest: teardown bypass pass: writing a flush in place under a \
                          shard index readers do not scan for its ingest hour, because a \
                          hand-back target shard is dead or condemned; the records are stored \
@@ -2237,7 +2379,7 @@ impl LogShardActor {
                     );
                     buf
                 }
-            },
+            }
             ScanCheck::Unknown => {
                 let mut buf = buf;
                 if !std::mem::replace(&mut buf.stale_view_counted, true) {
@@ -4038,30 +4180,113 @@ mod tests {
         metrics: Arc<LogIngestMetrics>,
         store: Arc<dyn ObjectStoreBackend>,
         budget: Arc<IngestByteBudget>,
+        clock: Arc<TestClock>,
         task: JoinHandle<()>,
     }
 
     const HAND_BACK: ScanCheck = ScanCheck::HandBack {
         scan_count: 3,
-        active_count: 2,
+        target_count: 2,
+        reason: HandBackReason::RetiredIndex,
     };
+
+    /// The same two-shard target, for an hour another generation owns.
+    const MISMATCH: ScanCheck = ScanCheck::HandBack {
+        scan_count: 4,
+        target_count: 2,
+        reason: HandBackReason::GenerationMismatch,
+    };
+
+    /// See `crate::shard`'s `ticking_config`.
+    fn ticking_config() -> IngestConfig {
+        IngestConfig {
+            shard_count: 4,
+            max_flush_delay: Duration::from_millis(50),
+            max_flush_delay_idle: Duration::from_millis(50),
+            flush_tick: Duration::from_millis(10),
+            ..IngestConfig::default()
+        }
+    }
+
+    /// A hand-back target whose two-slot mailbox is already full.
+    fn full_target() -> (mpsc::Sender<LogShardMsg>, mpsc::Receiver<LogShardMsg>) {
+        let (tx, rx) = mpsc::channel(2);
+        fill(&tx);
+        (tx, rx)
+    }
+
+    fn fill(tx: &mpsc::Sender<LogShardMsg>) {
+        while tx
+            .try_send(LogShardMsg::FlushNow {
+                done: oneshot::channel().0,
+            })
+            .is_ok()
+        {}
+    }
+
+    /// Advances the clock one 10 ms tick at a time, yielding after each,
+    /// until `probe` holds or 400 ticks pass.
+    async fn tick_until(clock: &TestClock, mut probe: impl FnMut() -> bool) -> bool {
+        for _ in 0..400 {
+            if probe() {
+                return true;
+            }
+            clock.advance_ns(10_000_000);
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        probe()
+    }
+
+    /// Yields, without moving the clock, until `probe` holds or the budget
+    /// runs out.
+    async fn yields_until(mut probe: impl FnMut() -> bool) -> bool {
+        for _ in 0..10_000 {
+            if probe() {
+                return true;
+            }
+            tokio::task::yield_now().await;
+        }
+        probe()
+    }
 
     impl HandBackRig {
         fn new(target: Option<mpsc::Sender<LogShardMsg>>) -> Self {
-            let scope = crate::generation::ScriptedScope::new(HAND_BACK, target);
-            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-            let metrics = Arc::new(LogIngestMetrics::default());
             let config = IngestConfig {
                 shard_count: 4,
                 ..IngestConfig::default()
             };
+            Self::with(HAND_BACK, target, config)
+        }
+
+        fn with(
+            verdict: ScanCheck,
+            target: Option<mpsc::Sender<LogShardMsg>>,
+            config: IngestConfig,
+        ) -> Self {
+            let (rig, start) = Self::parked(verdict, target, config);
+            start.send(()).expect("actor task waits for its start");
+            rig
+        }
+
+        /// See `crate::shard`'s `HandBackRig::parked`.
+        fn parked(
+            verdict: ScanCheck,
+            target: Option<mpsc::Sender<LogShardMsg>>,
+            config: IngestConfig,
+        ) -> (Self, oneshot::Sender<()>) {
+            let scope = crate::generation::ScriptedScope::new(verdict, target);
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let metrics = Arc::new(LogIngestMetrics::default());
+            let clock = TestClock::new(BASE_NS);
             let (tx, rx) = mpsc::channel(64);
             let actor = LogShardActor::new(
                 3,
                 Uuid::new_v4(),
                 1,
                 Arc::clone(&store),
-                TestClock::new(BASE_NS),
+                clock.clone(),
                 Arc::new(ravel_commit::rng::SystemRng),
                 config,
                 Arc::clone(&metrics),
@@ -4075,19 +4300,85 @@ mod tests {
                 #[cfg(feature = "stage-timing")]
                 Arc::new(LogStageTimings::new()),
             );
-            HandBackRig {
+            let (start, started) = oneshot::channel::<()>();
+            let rig = HandBackRig {
                 tx,
                 scope,
                 metrics,
                 store,
                 budget: IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1 << 30)),
-                task: tokio::spawn(actor.run()),
+                clock,
+                task: tokio::spawn(async move {
+                    if started.await.is_ok() {
+                        actor.run().await;
+                    }
+                }),
+            };
+            (rig, start)
+        }
+
+        /// Commit records written under this rig's shard index, 3.
+        async fn own_commits(&self) -> usize {
+            list_all(self.store.as_ref(), "t/")
+                .await
+                .expect("list")
+                .into_iter()
+                .filter(|o| o.key.contains("/c/0003/"))
+                .count()
+        }
+
+        /// Records across the commit records written under shard index 3.
+        async fn own_records(&self) -> u64 {
+            let mut records = 0;
+            for object in list_all(self.store.as_ref(), "t/").await.expect("list") {
+                if object.key.contains("/c/0003/") {
+                    let bytes = self
+                        .store
+                        .get(&object.key, GetRange::Full)
+                        .await
+                        .expect("get commit record")
+                        .data;
+                    records += record::decode(&bytes).expect("decode").sample_count;
+                }
             }
+            records
         }
 
         /// Buffers six records of tenant `acme` on six streams, under one
         /// charge of `bytes`.
         async fn write(&self, bytes: u64) -> Arc<IngestByteCharge> {
+            self.write_acked(bytes, None).await
+        }
+
+        /// [`Self::write`] with a strict waiter, answered on the returned
+        /// receiver.
+        async fn write_strict(
+            &self,
+            bytes: u64,
+        ) -> (
+            Arc<IngestByteCharge>,
+            oneshot::Receiver<Result<CommitToken, LogWriteError>>,
+        ) {
+            let (ack, answer) = oneshot::channel();
+            (self.write_acked(bytes, Some(ack)).await, answer)
+        }
+
+        async fn write_acked(&self, bytes: u64, ack: Option<LogAck>) -> Arc<IngestByteCharge> {
+            let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
+            self.tx
+                .send(LogShardMsg::Write {
+                    tenant: TenantId::new("acme"),
+                    records: Self::six_records(),
+                    ack,
+                    charge: Some(Arc::clone(&charge)),
+                })
+                .await
+                .expect("send write");
+            charge
+        }
+
+        /// Six records on six streams, which split across a two-shard set.
+        fn six_records() -> Vec<NormalizedLogRecord> {
             let records: Vec<NormalizedLogRecord> = (0..6)
                 .map(|i| {
                     norm_record(
@@ -4103,17 +4394,7 @@ mod tests {
                 .map(|r| shard_for_log(&r.stream_id, 2))
                 .collect();
             assert_eq!(targets.len(), 2, "the records split across both targets");
-            let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
-            self.tx
-                .send(LogShardMsg::Write {
-                    tenant: TenantId::new("acme"),
-                    records,
-                    ack: None,
-                    charge: Some(Arc::clone(&charge)),
-                })
-                .await
-                .expect("send write");
-            charge
+            records
         }
 
         async fn flush_now(&self) {
@@ -4153,8 +4434,7 @@ mod tests {
     /// The log counterpart of `crate::shard`'s
     /// `a_target_closed_after_the_liveness_check_returns_the_rows`.
     ///
-    /// Guard: the `self.absorb_records(..)` call in `hand_back`'s failed-send
-    /// branch.
+    /// Guard: the `rest.absorb(..)` call in `hand_back`'s failed-send branch.
     #[tokio::test]
     async fn a_target_closed_after_the_liveness_check_returns_the_records() {
         let (closed, inbox) = mpsc::channel(16);
@@ -4190,8 +4470,8 @@ mod tests {
 
     /// A dead or condemned target keeps the whole buffer, counted once.
     ///
-    /// Guard: `self.tenants.insert(tenant, buf)` in `flush_tenant`'s
-    /// `Err(mut buf)` arm.
+    /// Guard: `self.tenants.insert(tenant, buf)` in the `else if enforced`
+    /// branch of `flush_tenant`'s hand-back arm.
     #[tokio::test]
     async fn a_dead_target_keeps_the_whole_source_buffer() {
         let rig = HandBackRig::new(None);
@@ -4217,9 +4497,9 @@ mod tests {
     /// A teardown whose hand-back target is not live writes in place and
     /// counts it.
     ///
-    /// Guard: `self.metrics.record_teardown_unscanned_write()` in
-    /// `flush_tenant`'s `Err(mut buf)` arm, and the `buf` it falls through
-    /// with.
+    /// Guard: `self.metrics.record_teardown_unscanned_write()` in the last
+    /// branch of `flush_tenant`'s hand-back arm, and the `buf` it falls
+    /// through with.
     #[tokio::test]
     async fn a_teardown_with_a_dead_target_writes_in_place_and_counts_it() {
         let rig = HandBackRig::new(None);
@@ -4243,6 +4523,260 @@ mod tests {
             .filter(|k| k.contains("/c/0003/"))
             .collect();
         assert_eq!(commits.len(), 1, "one commit under shard 3, {commits:?}");
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_full_upward_mailbox_is_retried_until_the_deferral_cap`.
+    ///
+    /// Guards: the `mismatch_retry_spent(..)` arm of `flush_tenant` and its
+    /// waiter strip, and the `rest.absorb(..)` call in `hand_back`.
+    #[tokio::test]
+    async fn a_full_upward_mailbox_is_retried_until_the_deferral_cap() {
+        let config = ticking_config();
+        let (target, mut inbox) = full_target();
+        let rig = HandBackRig::with(MISMATCH, Some(target.clone()), config);
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+
+        assert!(
+            tick_until(&rig.clock, || rig.metrics.snapshot().hand_back_failures
+                == 1)
+            .await,
+            "the age trigger tries the hand-back"
+        );
+        let snap = rig.metrics.snapshot();
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            4_096,
+            "the records and their charge are back in the source buffer"
+        );
+        assert_eq!(snap.rerouted_flushes, 0);
+        assert_eq!(snap.generation_mismatch_written_in_place, 0);
+
+        while inbox.try_recv().is_ok() {}
+        assert!(
+            tick_until(&rig.clock, || rig.metrics.snapshot().rerouted_flushes == 1).await,
+            "a later trigger with room hands the records over"
+        );
+        let (mut records, mut charges) = (0, Vec::new());
+        while let Ok(msg) = inbox.try_recv() {
+            if let LogShardMsg::HandBack {
+                payload,
+                charges: c,
+                ..
+            } = msg
+            {
+                records += match payload {
+                    FlushPayload::Rows(rows) => rows.len(),
+                    FlushPayload::Columnar(batches) => batches.iter().map(|b| b.num_rows).sum(),
+                };
+                charges.extend(c);
+            }
+        }
+        assert_eq!(records, 6, "every record is handed over");
+        assert_eq!(
+            rig.metrics.snapshot().rerouted_flushes_generation_mismatch,
+            1
+        );
+        drop(charges);
+        assert_eq!(rig.budget.in_flight_bytes(), 0);
+
+        fill(&target);
+        drop(rig.write(4_096).await);
+        assert!(
+            tick_until(&rig.clock, || rig.metrics.snapshot().hand_back_failures
+                == 2)
+            .await,
+            "the second buffer's hand-back fails on the full mailbox"
+        );
+        let cap_ns = config.flush_deferral_cap_ns();
+        rig.clock.advance_ns(cap_ns - 1);
+        assert!(!yields_until(|| rig.budget.in_flight_bytes() == 0).await);
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            0,
+            "retried, not written, short of the cap"
+        );
+        // A strict write joining after that retry is still attached when the
+        // cap is reached.
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        // Before the clock moves, or the tick can win the actor's select and
+        // write the buffer before the strict write joins it.
+        assert!(
+            yields_until(|| rig.tx.capacity() == rig.tx.max_capacity()).await,
+            "the actor takes the strict write"
+        );
+        assert!(
+            tick_until(&rig.clock, || rig.budget.in_flight_bytes() == 0).await,
+            "written once the deferral reaches the cap"
+        );
+        for _ in 0..5 {
+            rig.clock.advance_ns(10_000_000);
+            yields_until(|| false).await;
+        }
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(snap.rerouted_flushes, 1);
+        assert_eq!(rig.own_commits().await, 1, "written under shard 3");
+        match answer.await.expect("waiter answered") {
+            Err(LogWriteError::Abandoned(msg)) => assert_eq!(
+                msg, DEFERRAL_CAP_ABANDONED,
+                "not acknowledged from a flush at the cap"
+            ),
+            other => panic!("expected the deferral-cap Abandoned, got {other:?}"),
+        }
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_drain_with_a_full_upward_target_answers_with_nothing_buffered`.
+    ///
+    /// Guard: the `DrainIntent::Retryable` last pass in `flush_all`.
+    #[tokio::test]
+    async fn a_drain_with_a_full_upward_target_answers_with_nothing_buffered() {
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let (target, _inbox) = full_target();
+        let rig = HandBackRig::with(MISMATCH, Some(target), config);
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(
+            rig.budget.in_flight_bytes(),
+            0,
+            "nothing is left buffered when the drain answers"
+        );
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(snap.rerouted_flushes, 0);
+        assert_eq!(rig.own_commits().await, 1, "written under shard 3");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// See `crate::shard`'s `first_mismatch_flush`.
+    async fn first_mismatch_flush(
+        rig: &HandBackRig,
+    ) -> crate::log_metrics::LogIngestMetricsSnapshot {
+        assert!(
+            tick_until(&rig.clock, || {
+                let snap = rig.metrics.snapshot();
+                snap.generation_mismatch_written_in_place + snap.hand_back_failures > 0
+            })
+            .await,
+            "the age trigger opens the flush"
+        );
+        for _ in 0..5 {
+            rig.clock.advance_ns(10_000_000);
+            yields_until(|| false).await;
+        }
+        rig.metrics.snapshot()
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_mismatch_to_a_target_not_live_at_the_check_is_written_in_place_at_once`.
+    ///
+    /// Guard: `target_dead` in the condition of the in-place branch of
+    /// `flush_tenant`'s hand-back arm. Without it `hand_back_failures` reads
+    /// 1 and nothing is written.
+    #[tokio::test]
+    async fn a_mismatch_to_a_target_not_live_at_the_check_is_written_in_place_at_once() {
+        let rig = HandBackRig::with(MISMATCH, None, ticking_config());
+        rig.scope.set_wait(false);
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+
+        let snap = first_mismatch_flush(&rig).await;
+        assert_eq!(snap.hand_back_failures, 0, "not kept for a retry");
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(snap.flushes_by_age, 1, "exactly one flush");
+        assert_eq!(snap.rerouted_flushes, 0);
+        answer
+            .await
+            .expect("waiter answered")
+            .expect("the in-place write acknowledges the strict waiter");
+        assert!(yields_until(|| rig.budget.in_flight_bytes() == 0).await);
+        assert_eq!(rig.own_commits().await, 1, "written under shard 3");
+        assert_eq!(rig.own_records().await, 6, "every record, once");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_mismatch_to_a_target_closed_at_the_send_is_written_in_place_at_once`.
+    ///
+    /// Guard: `target_dead |= refused.closed` in `hand_back`.
+    #[tokio::test]
+    async fn a_mismatch_to_a_target_closed_at_the_send_is_written_in_place_at_once() {
+        let (closed, inbox) = mpsc::channel(16);
+        drop(inbox);
+        let rig = HandBackRig::with(MISMATCH, Some(closed), ticking_config());
+        rig.scope.set_wait(false);
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+
+        let snap = first_mismatch_flush(&rig).await;
+        assert_eq!(snap.hand_back_failures, 0, "not kept for a retry");
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(snap.flushes_by_age, 1, "exactly one flush");
+        assert!(matches!(
+            answer.await.expect("waiter answered"),
+            Err(LogWriteError::Abandoned(_))
+        ));
+        assert!(yields_until(|| rig.budget.in_flight_bytes() == 0).await);
+        assert_eq!(rig.own_commits().await, 1, "written under shard 3");
+        assert_eq!(rig.own_records().await, 6, "every record, once");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_hand_back_queued_behind_shutdown_is_written_exactly_once`.
+    ///
+    /// Guard: the `self.absorb_records(..)` call in `close_mailbox`. Pushing
+    /// the queued `HandBack` to `unprocessed` instead drops it after the
+    /// drain, and the commit count reads 0.
+    #[tokio::test]
+    async fn a_hand_back_queued_behind_shutdown_is_written_exactly_once() {
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let (rig, start) = HandBackRig::parked(ScanCheck::InScanSet, None, config);
+        let charge = Arc::new(rig.budget.try_charge(4_096).expect("charge"));
+        let (done, answered) = oneshot::channel();
+        rig.tx
+            .send(LogShardMsg::Shutdown { done })
+            .await
+            .expect("send Shutdown");
+        rig.tx
+            .send(LogShardMsg::HandBack {
+                tenant: TenantId::new("acme"),
+                payload: FlushPayload::Rows(HandBackRig::six_records()),
+                charges: vec![Arc::clone(&charge)],
+                arrival: HandBackArrival {
+                    oldest_arrival_ns: Some(BASE_NS),
+                    min_ingest_ts_ns: Some(BASE_NS),
+                    max_ingest_ts_ns: Some(BASE_NS),
+                },
+            })
+            .await
+            .expect("send HandBack behind Shutdown");
+        drop(charge);
+        start.send(()).expect("actor task waits for its start");
+
+        answered.await.expect("Shutdown answered");
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.flush_all_residue_tenants, 0);
+        assert_eq!(rig.budget.in_flight_bytes(), 0, "the charge is released");
+        assert_eq!(rig.own_commits().await, 1, "one teardown write");
+        assert_eq!(rig.own_records().await, 6, "every handed-back record, once");
         rig.task.await.expect("actor ends");
     }
 }

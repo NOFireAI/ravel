@@ -791,7 +791,9 @@ impl IngestConfig {
     /// flush itself) less [`Self::flush_trigger_age_bound_ns`]. A row has
     /// waited at most that bound when its buffer's deferral starts, unless it
     /// is held under a non-zero `idle_flush_byte_floor`. A strict waiter is
-    /// only acknowledged from a flush that opens inside the cap, so an
+    /// only acknowledged from a flush that opens inside the cap (a deferred
+    /// buffer, and one whose generation-mismatch hand-back was retried for
+    /// the cap, answer theirs `Abandoned` and are then written), so an
     /// acknowledged strict row's routing-to-pin span plus the flush lifetime
     /// stays inside the slack, and the shard starts refusing new writes while
     /// a flush opening then would still fit every buffered row outside the

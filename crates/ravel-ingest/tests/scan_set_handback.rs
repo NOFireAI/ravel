@@ -13,6 +13,9 @@
 //! indices below `ravel_catalog::scan_count(h)` and decode every object they
 //! name.
 //!
+//! The increase cases start at 3 shards and reshard up to 4, where a late
+//! flush hands its rows up to a larger set (issue #2429).
+//!
 //! Every wait is a cooperative poll plus an injected-clock advance. No
 //! wall-clock sleep, no `tokio::time::timeout`, no `Instant`.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -20,13 +23,13 @@
 mod common;
 
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{TestClock, make_point, tenant};
 use ravel_catalog::{
     AbsentPolicy, DEFAULT_SCAN_SLACK_HOURS, ShardGeneration, append_generation, read_generations,
-    scan_count, validate_or_adopt,
+    scan_count, stable_generation_for_hour, validate_or_adopt,
 };
 use ravel_commit::{keys, record};
 use ravel_ingest::{
@@ -44,6 +47,7 @@ use ravel_segment::{ReaderLimits, SeriesEntryV4};
 use ravel_types::logstream::{AttrValue, log_stream_id};
 use ravel_types::{Signal, TenantId, shard_for, shard_for_log};
 use tokio::task::JoinHandle;
+use tracing_subscriber::layer::SubscriberExt;
 
 const HOUR_NS: i64 = 3_600_000_000_000;
 /// The hour every case starts in, and its first second.
@@ -96,10 +100,18 @@ fn start_of(hour: u32) -> i64 {
 struct Counters {
     buffered: u64,
     rerouted: u64,
+    rerouted_generation_mismatch: u64,
     stale: u64,
     deferred: u64,
     in_flight: u64,
+    hand_back_failures: u64,
+    unscanned: u64,
+    mismatch_in_place: u64,
 }
+
+/// Reads a router's counters through a shared metrics handle, so a case can
+/// read them after `shutdown` consumed the router.
+type CounterSource = Box<dyn Fn() -> Counters + Send + Sync>;
 
 /// What a case needs from one pipeline's router.
 trait Pipe: Send + Sync + Sized + 'static {
@@ -119,11 +131,12 @@ trait Pipe: Send + Sync + Sized + 'static {
     ) -> JoinHandle<String>;
     /// The shard row `i` of `tenant` routes to under `count` shards.
     fn shard_of(tenant: &TenantId, i: usize, count: u32) -> u32;
-    fn counters(&self) -> Counters;
+    fn counter_source(&self) -> CounterSource;
+    fn counters(&self) -> Counters {
+        (self.counter_source())()
+    }
     fn flush(&self) -> impl Future<Output = ()> + Send;
     fn shutdown(self) -> impl Future<Output = ()> + Send + 'static;
-    /// Reads the teardown-unscanned-writes counter, usable after `shutdown`.
-    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static;
     /// Event times of every row in one data object.
     fn rows(data: &[u8]) -> Vec<i64>;
 }
@@ -171,25 +184,30 @@ impl Pipe for IngestRouter {
         shard_for(&metric_point(tenant, i).series_id, count)
     }
 
-    fn counters(&self) -> Counters {
-        let snap = self.metrics().snapshot();
-        Counters {
-            buffered: snap.buffered_points_total,
-            rerouted: snap.rerouted_flushes,
-            stale: snap.stale_provisioning_flushes,
-            deferred: self
-                .metrics()
-                .shard_skew_by_shard()
-                .into_iter()
-                .map(|(_, s)| s.flush_trigger_deferred)
-                .sum(),
-            in_flight: self
-                .metrics()
-                .in_flight_flushes_by_shard()
-                .into_iter()
-                .map(|(_, n)| n)
-                .sum(),
-        }
+    fn counter_source(&self) -> CounterSource {
+        let metrics = self.metrics_handle();
+        Box::new(move || {
+            let snap = metrics.snapshot();
+            Counters {
+                buffered: snap.buffered_points_total,
+                rerouted: snap.rerouted_flushes,
+                rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
+                stale: snap.stale_provisioning_flushes,
+                deferred: metrics
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flush_trigger_deferred)
+                    .sum(),
+                in_flight: metrics
+                    .in_flight_flushes_by_shard()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+                hand_back_failures: snap.hand_back_failures,
+                unscanned: snap.teardown_unscanned_writes,
+                mismatch_in_place: snap.generation_mismatch_written_in_place,
+            }
+        })
     }
 
     async fn flush(&self) {
@@ -198,11 +216,6 @@ impl Pipe for IngestRouter {
 
     fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
         Self::shutdown(self)
-    }
-
-    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
-        let metrics = self.metrics_handle();
-        move || metrics.snapshot().teardown_unscanned_writes
     }
 
     fn rows(data: &[u8]) -> Vec<i64> {
@@ -277,25 +290,30 @@ impl Pipe for LogIngestRouter {
         shard_for_log(&log_record(i).stream_id, count)
     }
 
-    fn counters(&self) -> Counters {
-        let snap = self.metrics().snapshot();
-        Counters {
-            buffered: snap.buffered_records_total,
-            rerouted: snap.rerouted_flushes,
-            stale: snap.stale_provisioning_flushes,
-            deferred: self
-                .metrics()
-                .shard_skew_by_shard()
-                .into_iter()
-                .map(|(_, s)| s.flush_trigger_deferred)
-                .sum(),
-            in_flight: self
-                .metrics()
-                .in_flight_flushes_by_shard()
-                .into_iter()
-                .map(|(_, n)| n)
-                .sum(),
-        }
+    fn counter_source(&self) -> CounterSource {
+        let metrics = self.metrics_handle();
+        Box::new(move || {
+            let snap = metrics.snapshot();
+            Counters {
+                buffered: snap.buffered_records_total,
+                rerouted: snap.rerouted_flushes,
+                rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
+                stale: snap.stale_provisioning_flushes,
+                deferred: metrics
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flush_trigger_deferred)
+                    .sum(),
+                in_flight: metrics
+                    .in_flight_flushes_by_shard()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+                hand_back_failures: snap.hand_back_failures,
+                unscanned: snap.teardown_unscanned_writes,
+                mismatch_in_place: snap.generation_mismatch_written_in_place,
+            }
+        })
     }
 
     async fn flush(&self) {
@@ -304,11 +322,6 @@ impl Pipe for LogIngestRouter {
 
     fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
         Self::shutdown(self)
-    }
-
-    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
-        let metrics = self.metrics_handle();
-        move || metrics.snapshot().teardown_unscanned_writes
     }
 
     fn rows(data: &[u8]) -> Vec<i64> {
@@ -353,25 +366,30 @@ impl Pipe for SpanIngestRouter {
         shard_for_span(&span(i).trace_id, count)
     }
 
-    fn counters(&self) -> Counters {
-        let snap = self.metrics().snapshot();
-        Counters {
-            buffered: snap.buffered_spans_total,
-            rerouted: snap.rerouted_flushes,
-            stale: snap.stale_provisioning_flushes,
-            deferred: self
-                .metrics()
-                .shard_skew_by_shard()
-                .into_iter()
-                .map(|(_, s)| s.flush_trigger_deferred)
-                .sum(),
-            in_flight: self
-                .metrics()
-                .in_flight_flushes_by_shard()
-                .into_iter()
-                .map(|(_, n)| n)
-                .sum(),
-        }
+    fn counter_source(&self) -> CounterSource {
+        let metrics = self.metrics_handle();
+        Box::new(move || {
+            let snap = metrics.snapshot();
+            Counters {
+                buffered: snap.buffered_spans_total,
+                rerouted: snap.rerouted_flushes,
+                rerouted_generation_mismatch: snap.rerouted_flushes_generation_mismatch,
+                stale: snap.stale_provisioning_flushes,
+                deferred: metrics
+                    .shard_skew_by_shard()
+                    .into_iter()
+                    .map(|(_, s)| s.flush_trigger_deferred)
+                    .sum(),
+                in_flight: metrics
+                    .in_flight_flushes_by_shard()
+                    .into_iter()
+                    .map(|(_, n)| n)
+                    .sum(),
+                hand_back_failures: snap.hand_back_failures,
+                unscanned: snap.teardown_unscanned_writes,
+                mismatch_in_place: snap.generation_mismatch_written_in_place,
+            }
+        })
     }
 
     async fn flush(&self) {
@@ -380,11 +398,6 @@ impl Pipe for SpanIngestRouter {
 
     fn shutdown(self) -> impl Future<Output = ()> + Send + 'static {
         Self::shutdown(self)
-    }
-
-    fn unscanned_writes(&self) -> impl Fn() -> u64 + Send + 'static {
-        let metrics = self.metrics_handle();
-        move || metrics.snapshot().teardown_unscanned_writes
     }
 
     fn rows(data: &[u8]) -> Vec<i64> {
@@ -454,8 +467,19 @@ fn span(i: usize) -> NormalizedSpan {
 /// The first `n` row keys of `tenant` on shard `shard` of the 4-shard set,
 /// skipping `skip` matches so two tenants of one case never share a key.
 fn rows_on<P: Pipe>(tenant: &TenantId, shard: u32, skip: usize, n: usize) -> Vec<usize> {
+    rows_on_count::<P>(tenant, OLD_COUNT, shard, skip, n)
+}
+
+/// [`rows_on`] for a set of `count` shards.
+fn rows_on_count<P: Pipe>(
+    tenant: &TenantId,
+    count: u32,
+    shard: u32,
+    skip: usize,
+    n: usize,
+) -> Vec<usize> {
     (0..10_000)
-        .filter(|&i| P::shard_of(tenant, i, OLD_COUNT) == shard)
+        .filter(|&i| P::shard_of(tenant, i, count) == shard)
         .skip(skip)
         .take(n)
         .collect()
@@ -614,6 +638,8 @@ struct World<P> {
     router: Arc<P>,
     parked: TenantId,
     deferred: TenantId,
+    /// Generation 0's shard count, the router's configured `shard_count`.
+    initial: u32,
 }
 
 impl<P: Pipe> World<P> {
@@ -622,6 +648,7 @@ impl<P: Pipe> World<P> {
     }
 
     async fn with_config(config: IngestConfig) -> Self {
+        let initial = config.shard_count;
         let fault = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
         let store: Arc<dyn ObjectStoreBackend> = fault.clone();
         let clock = TestClock::new(T0_NS);
@@ -633,7 +660,7 @@ impl<P: Pipe> World<P> {
                 store.as_ref(),
                 &t.hash(),
                 P::SIGNAL,
-                OLD_COUNT,
+                initial,
                 T0_NS,
                 AbsentPolicy::CreateFromConfig,
             )
@@ -654,23 +681,30 @@ impl<P: Pipe> World<P> {
             router,
             parked,
             deferred,
+            initial,
         }
     }
 
     /// Appends the 3-shard successor to both tenants' records. The router has
     /// already read generation 0 and is not told.
     async fn reshard_down(&self) {
+        self.reshard_to(NEW_COUNT).await;
+    }
+
+    /// Appends a `count`-shard generation 1, activating at `ACTIVATION_HOUR`,
+    /// to both tenants' records, without telling the router.
+    async fn reshard_to(&self, count: u32) {
         for t in [&self.parked, &self.deferred] {
             append_generation(
                 self.store.as_ref(),
                 &t.hash(),
                 P::SIGNAL,
-                NEW_COUNT,
+                count,
                 ACTIVATION_HOUR,
                 self.clock.now(),
             )
             .await
-            .expect("append the 3-shard generation");
+            .expect("append generation 1");
         }
     }
 
@@ -691,7 +725,7 @@ impl<P: Pipe> World<P> {
         let gate = self
             .fault
             .hold(Op::Put, Some(parked_data), Occurrence::Nth(1));
-        let parked_key = rows_on::<P>(&self.parked, shard, 0, 1)[0];
+        let parked_key = rows_on_count::<P>(&self.parked, self.initial, shard, 0, 1)[0];
         let parked = self
             .router
             .send_row(&self.parked, parked_key, WriteMode::Buffered);
@@ -730,7 +764,9 @@ impl<P: Pipe> World<P> {
 /// each actor (`flush_tenant` in shard.rs, log_shard.rs, span_shard.rs). With
 /// the first made unconditional, or the second replaced by
 /// `ScanCheck::InScanSet`, the flush writes under shard 3 in hour
-/// `ACTIVATION_HOUR + S` and nothing is handed back.
+/// `ACTIVATION_HOUR + S` and nothing is handed back. And the reason test in
+/// each metrics registry's `record_rerouted_flush`: counting every hand-back
+/// as a generation mismatch moves `rerouted_generation_mismatch` to 1.
 async fn retired_index_past_the_window_hands_back<P: Pipe>() {
     let world = World::<P>::new().await;
     let keys = rows_on::<P>(&world.deferred, RETIRED_SHARD, 1, 6);
@@ -756,6 +792,11 @@ async fn retired_index_past_the_window_hands_back<P: Pipe>() {
         drive(&world.clock, || world.router.counters().rerouted == 1).await,
         "the flush is handed back, counters {:?}",
         world.router.counters()
+    );
+    assert_eq!(
+        world.router.counters().rerouted_generation_mismatch,
+        0,
+        "a retired-index hand-back is not counted as a generation mismatch"
     );
     let store = world.store.as_ref();
     world.router.flush().await;
@@ -815,35 +856,175 @@ async fn retired_index_inside_the_window_writes_in_place<P: Pipe>() {
     );
 }
 
-/// A flush on an index the successor still covers writes in place however
-/// long it was deferred.
+/// An index the successor also covers, and the row keys on it under the
+/// 4-shard set that the 3-shard successor routes to a different index, so a
+/// row written under `COVERED_SHARD` and the same row routed by the successor
+/// can never be confused.
+const COVERED_SHARD: u32 = 1;
+
+fn covered_rows<P: Pipe>(tenant: &TenantId, n: usize) -> Vec<usize> {
+    (0..10_000)
+        .filter(|&i| {
+            P::shard_of(tenant, i, OLD_COUNT) == COVERED_SHARD
+                && P::shard_of(tenant, i, NEW_COUNT) != COVERED_SHARD
+        })
+        .skip(1)
+        .take(n)
+        .collect()
+}
+
+/// Every row of every object committed under `(shard, hour)`, sorted.
+async fn rows_at<P: Pipe>(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    shard: u32,
+    hour: u32,
+) -> Vec<i64> {
+    let mut rows = Vec::new();
+    for commit in commits_at(store, tenant, P::SIGNAL, shard, hour).await {
+        let bytes = store
+            .get(&commit, GetRange::Full)
+            .await
+            .expect("get commit record")
+            .data;
+        let decoded = record::decode(&bytes).expect("decode commit record");
+        let data = store
+            .get(&decoded.object_key, GetRange::Full)
+            .await
+            .expect("get data object")
+            .data;
+        rows.extend(P::rows(&data));
+    }
+    rows.sort_unstable();
+    rows
+}
+
+/// Ticks until any commit record of `tenant` exists under one of `shards` in
+/// `hour`, at most 200 ticks.
+async fn wait_for_commit<P: Pipe>(world: &World<P>, shards: &[u32], hour: u32) {
+    let store = world.store.as_ref();
+    for _ in 0..10 {
+        for &shard in shards {
+            if !commits_at(store, &world.deferred, P::SIGNAL, shard, hour)
+                .await
+                .is_empty()
+            {
+                return;
+            }
+        }
+        ticks(&world.clock, 20).await;
+    }
+}
+
+/// Issue #2429. A buffer routed by generation 0 (4 shards) on an index the
+/// 3-shard successor also covers is deferred until its flush would pin an hour
+/// generation 1 owns alone, `S + 5` hours past the activation. The index is
+/// inside the scan set, so the retired-index check passes it; written in
+/// place, its rows would sit under the index generation 0 routed them to, in
+/// an hour `ravel_catalog::stable_generation_for_hour` attributes to
+/// generation 1, whose routing puts every one of these rows at another index.
+/// The read side scans both and still finds them, but
+/// `ravel_query::distrib::pushdown::is_pushdown_eligible` passes such an hour
+/// and `ravel_query::distrib::partition::partition_snapshot` splits its work
+/// by shard index, so a series at two indices in it is counted by two slice
+/// workers that each assume they hold all of it. That pushdown split is what
+/// the hand-back protects: this test asserts the precondition it relies on,
+/// every row of the hour at the index generation 1 routes it to.
 ///
-/// Guard: the `shard < scan` arm of `GenerationSwitch::scan_check`. Without
-/// it an index of a retiring set that the successor still covers falls to the
-/// untrusted arm, and the flush never opens.
-async fn covered_index_writes_in_place_however_late<P: Pipe>() {
+/// So the flush writes nothing under its own index in that hour, the rows are
+/// handed back and re-routed under generation 1, each lands at generation 1's
+/// index for its key, and the scan rule finds every row exactly once.
+///
+/// Guards: the `owner != self_count` hand-back arm of
+/// `GenerationSwitch::scan_check` (generation.rs). With it removed the flush
+/// writes in place: rows appear under `COVERED_SHARD` in `pin_hour` and
+/// `rerouted` stays 0.
+async fn covered_index_in_a_successor_owned_hour_hands_back<P: Pipe>() {
     let world = World::<P>::new().await;
-    let shard = 1;
-    let keys = rows_on::<P>(&world.deferred, shard, 1, 3);
-    world.defer(shard, &keys).await;
+    let keys = covered_rows::<P>(&world.deferred, 6);
+    let mut by_target: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+    for &i in &keys {
+        by_target
+            .entry(P::shard_of(&world.deferred, i, NEW_COUNT))
+            .or_default()
+            .push(i);
+    }
+    assert_eq!(keys.len(), 6);
+    world.defer(COVERED_SHARD, &keys).await;
     world.reshard_down().await;
 
     let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
     world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    let generations = persisted_generations(world.store.as_ref(), &world.deferred, P::SIGNAL).await;
+    assert_eq!(
+        stable_generation_for_hour(&generations, pin_hour, DEFAULT_SCAN_SLACK_HOURS),
+        Some(1),
+        "generation 1 owns the pinned hour alone"
+    );
+    assert!(COVERED_SHARD < scan_count(&generations, pin_hour, DEFAULT_SCAN_SLACK_HOURS));
+
+    let targets: Vec<u32> = std::iter::once(COVERED_SHARD)
+        .chain(by_target.keys().copied())
+        .collect();
+    wait_for_commit(&world, &targets, pin_hour).await;
+    world.router.flush().await;
     let store = world.store.as_ref();
-    let mut landed = false;
-    for _ in 0..10 {
-        landed = !commits_at(store, &world.deferred, P::SIGNAL, shard, pin_hour)
-            .await
-            .is_empty();
-        if landed {
-            break;
-        }
-        ticks(&world.clock, 20).await;
+    assert_eq!(
+        rows_at::<P>(store, &world.deferred, COVERED_SHARD, pin_hour).await,
+        Vec::<i64>::new(),
+        "nothing routed by generation 0 is written under shard {COVERED_SHARD} in hour \
+         {pin_hour}, which generation 1 owns; counters {:?}",
+        world.router.counters()
+    );
+    let counters = world.router.counters();
+    assert_eq!(counters.rerouted, 1, "the flush is handed back once");
+    assert_eq!(
+        counters.rerouted_generation_mismatch, 1,
+        "and counted under the generation-mismatch reason"
+    );
+    for (&target, target_keys) in &by_target {
+        assert_eq!(
+            rows_at::<P>(store, &world.deferred, target, pin_hour).await,
+            expected(target_keys),
+            "the rows generation 1 routes to shard {target} land there, in hour {pin_hour}"
+        );
     }
-    assert!(
-        landed,
-        "the flush writes under shard {shard} in hour {pin_hour}"
+    assert_eq!(
+        scanned_rows::<P>(store, &world.deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "the scan rule finds every row exactly once"
+    );
+}
+
+/// The same buffer, opening one hour after the activation, inside the
+/// overlap where both generations' shards can hold the hour's data and
+/// `stable_generation_for_hour` names no owner: it writes in place under its
+/// own index, as before issue #2429.
+///
+/// Guard: the `Some(owner)` match on `stable_generation_for_hour` in
+/// `GenerationSwitch::scan_check`. Treating an unowned hour as the active
+/// generation's hands this flush back, and nothing lands under
+/// `COVERED_SHARD` in `pin_hour`.
+async fn covered_index_inside_the_overlap_writes_in_place<P: Pipe>() {
+    let world = World::<P>::new().await;
+    let keys = covered_rows::<P>(&world.deferred, 3);
+    world.defer(COVERED_SHARD, &keys).await;
+    world.reshard_down().await;
+
+    let pin_hour = ACTIVATION_HOUR + 1;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    let generations = persisted_generations(world.store.as_ref(), &world.deferred, P::SIGNAL).await;
+    assert_eq!(
+        stable_generation_for_hour(&generations, pin_hour, DEFAULT_SCAN_SLACK_HOURS),
+        None,
+        "no generation owns an hour inside the activation overlap"
+    );
+    wait_for_commit(&world, &[COVERED_SHARD], pin_hour).await;
+    let store = world.store.as_ref();
+    assert_eq!(
+        rows_at::<P>(store, &world.deferred, COVERED_SHARD, pin_hour).await,
+        expected(&keys),
+        "the flush writes under shard {COVERED_SHARD} in hour {pin_hour}"
     );
     assert_eq!(
         world.router.counters().rerouted,
@@ -1079,10 +1260,14 @@ async fn shutdown_drains_the_largest_set_first<P: Pipe>() {
         ..
     } = world;
     let router = Arc::into_inner(router).expect("sole router owner");
-    let unscanned = router.unscanned_writes();
+    let counters = router.counter_source();
     router.shutdown().await;
 
-    assert_eq!(unscanned(), 0, "nothing was written outside the scan set");
+    assert_eq!(
+        counters().unscanned,
+        0,
+        "nothing was written outside the scan set"
+    );
     assert_eq!(
         keys_under_shard(store.as_ref(), &deferred, P::SIGNAL, RETIRED_SHARD).await,
         Vec::<String>::new()
@@ -1188,6 +1373,437 @@ async fn strict_waiter_on_a_handed_back_buffer_is_abandoned<P: Pipe>() {
     );
 }
 
+/// The increase cases start at 3 shards and reshard up to 4.
+const UP_FROM: u32 = NEW_COUNT;
+const UP_TO: u32 = OLD_COUNT;
+
+fn up_config() -> IngestConfig {
+    IngestConfig {
+        shard_count: UP_FROM,
+        ..config()
+    }
+}
+
+/// The 4-shard index whose teardown flush the race case holds.
+const HELD_SHARD: u32 = 1;
+/// The 3-shard index the race case's late buffer sits on. Its rows route to
+/// `HELD_SHARD` under 4 shards.
+const SOURCE_SHARD: u32 = 2;
+
+/// A hand-back sent to a set that is shutting down is never lost. Shutdown
+/// drains the 4-shard set first; one of its actors is held inside its teardown
+/// flush by a held data PUT. Meanwhile a 3-shard buffer whose flush opens in an
+/// hour the 4-shard generation owns hands its rows up to exactly that actor.
+/// The actor closed its mailbox before the teardown flush, so the target is
+/// not live and the source writes the rows in place on that same flush.
+/// Every acknowledged row is stored exactly once. This covers only the
+/// refused-as-closed half of `close_mailbox`; the absorb of a hand-back
+/// queued before the close is pinned by each shard module's
+/// `a_hand_back_queued_behind_shutdown_is_written_exactly_once`.
+///
+/// Guard: the `self.rx.close()` call in each actor's `close_mailbox`. Without
+/// it the drain never leaves `close_mailbox`, since the switch still holds
+/// senders to that mailbox, so the held actor's teardown flush never reaches
+/// its data PUT and shutdown does not finish. Rows are not lost that way;
+/// the drain hangs.
+async fn a_hand_back_to_a_draining_set_is_never_lost<P: Pipe>() {
+    let world = World::<P>::with_config(up_config()).await;
+    let keys: Vec<usize> = (0..10_000)
+        .filter(|&i| {
+            P::shard_of(&world.deferred, i, UP_FROM) == SOURCE_SHARD
+                && P::shard_of(&world.deferred, i, UP_TO) == HELD_SHARD
+        })
+        .take(3)
+        .collect();
+    assert_eq!(keys.len(), 3);
+    let parked_key = rows_on_count::<P>(&world.parked, UP_TO, HELD_SHARD, 0, 1)[0];
+    for &i in &keys {
+        let write = world
+            .router
+            .send_row(&world.deferred, i, WriteMode::Buffered);
+        assert_eq!(write.await.expect("write task"), "ok");
+    }
+    world.reshard_to(UP_TO).await;
+    // The late buffer's flush finds its view past the trust horizon and stays
+    // closed until this re-read is released, inside the drain window.
+    let prov = ravel_catalog::provisioning_key(&world.deferred.hash(), P::SIGNAL);
+    let reread = world
+        .fault
+        .hold(Op::Get, Some(prov.clone()), Occurrence::Nth(1));
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    assert!(
+        drive(&world.clock, || world.router.counters().stale == 1).await,
+        "the late flush stays closed on the held re-read, counters {:?}",
+        world.router.counters()
+    );
+    let held_gets = held(&reread, Op::Get, &prov);
+    assert_eq!(held_gets.len(), 1, "the re-read is held");
+
+    let parked_data = format!(
+        "t/{}/{}/l0/",
+        world.parked.hash().to_hex(),
+        P::SIGNAL.key_prefix()
+    );
+    let put = world
+        .fault
+        .hold(Op::Put, Some(parked_data.clone()), Occurrence::Nth(1));
+    let write = world
+        .router
+        .send_row(&world.parked, parked_key, WriteMode::Buffered);
+    assert_eq!(write.await.expect("write task"), "ok");
+
+    let World {
+        router,
+        store,
+        clock,
+        parked,
+        deferred,
+        ..
+    } = world;
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let counters = router.counter_source();
+    let shutdown = tokio::spawn(router.shutdown());
+    assert!(
+        settle(|| !held(&put, Op::Put, &parked_data).is_empty()).await,
+        "the 4-shard set's teardown flush reaches its data PUT"
+    );
+    assert!(
+        !shutdown.is_finished(),
+        "the 4-shard set is held in its teardown flush"
+    );
+
+    assert!(reread.release(held_gets[0]));
+    assert!(
+        drive(&clock, || {
+            let c = counters();
+            c.rerouted + c.hand_back_failures + c.mismatch_in_place > 0
+        })
+        .await,
+        "the late flush tries to hand its rows up while the 4-shard set drains, \
+         counters {:?}",
+        counters()
+    );
+    let held_puts = held(&put, Op::Put, &parked_data);
+    assert_eq!(held_puts.len(), 1, "the teardown flush is still held");
+    assert!(put.release(held_puts[0]));
+    shutdown.await.expect("shutdown task");
+
+    let store = store.as_ref();
+    assert_eq!(
+        scanned_rows::<P>(store, &deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "every acknowledged row of the late buffer is stored exactly once, counters {:?}",
+        counters()
+    );
+    assert_eq!(
+        scanned_rows::<P>(store, &parked, H0..=pin_hour + 1).await,
+        expected(&[parked_key]),
+        "the held teardown flush lands"
+    );
+    let c = counters();
+    assert_eq!(c.rerouted, 0, "the draining set accepted nothing");
+    assert_eq!(
+        c.hand_back_failures, 0,
+        "a closed target is not retried, so no hand-back is kept"
+    );
+    assert_eq!(c.unscanned, 0);
+    assert_eq!(
+        c.mismatch_in_place, 1,
+        "the flush that found the target closed counts its in-place write"
+    );
+    assert_eq!(
+        rows_at::<P>(store, &deferred, SOURCE_SHARD, pin_hour).await,
+        expected(&keys),
+        "the source wrote the rows in place"
+    );
+}
+
+/// Issue #2429 on an increase, 3 shards to 4: a buffer routed by generation 0
+/// on the 3-shard set is deferred until its flush would pin an hour the
+/// 4-shard generation owns alone. Its rows are handed up to the 4-shard set,
+/// a send that may not wait and here finds room, each lands at generation
+/// 1's index for its key, and the scan rule finds every row exactly once.
+///
+/// Guard: the `Ok(Some(owner)) if owner != count` hand-back arm of
+/// `GenerationSwitch::scan_check` (generation.rs). With it disabled the flush
+/// writes in place under `COVERED_SHARD` in `pin_hour`.
+async fn an_increase_hands_a_late_buffer_up_to_the_owner<P: Pipe>() {
+    let world = World::<P>::with_config(up_config()).await;
+    let keys: Vec<usize> = (0..10_000)
+        .filter(|&i| {
+            P::shard_of(&world.deferred, i, UP_FROM) == COVERED_SHARD
+                && P::shard_of(&world.deferred, i, UP_TO) != COVERED_SHARD
+        })
+        .skip(1)
+        .take(6)
+        .collect();
+    assert_eq!(keys.len(), 6);
+    let mut by_target: std::collections::BTreeMap<u32, Vec<usize>> = Default::default();
+    for &i in &keys {
+        by_target
+            .entry(P::shard_of(&world.deferred, i, UP_TO))
+            .or_default()
+            .push(i);
+    }
+    world.defer(COVERED_SHARD, &keys).await;
+    world.reshard_to(UP_TO).await;
+
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    let generations = persisted_generations(world.store.as_ref(), &world.deferred, P::SIGNAL).await;
+    assert_eq!(
+        stable_generation_for_hour(&generations, pin_hour, DEFAULT_SCAN_SLACK_HOURS),
+        Some(1),
+        "the 4-shard generation owns the pinned hour alone"
+    );
+    let targets: Vec<u32> = std::iter::once(COVERED_SHARD)
+        .chain(by_target.keys().copied())
+        .collect();
+    wait_for_commit(&world, &targets, pin_hour).await;
+    world.router.flush().await;
+
+    let store = world.store.as_ref();
+    assert_eq!(
+        rows_at::<P>(store, &world.deferred, COVERED_SHARD, pin_hour).await,
+        Vec::<i64>::new(),
+        "nothing routed by the 3-shard generation is written under shard {COVERED_SHARD} \
+         in hour {pin_hour}; counters {:?}",
+        world.router.counters()
+    );
+    let counters = world.router.counters();
+    assert_eq!(counters.rerouted, 1, "the flush is handed up once");
+    assert_eq!(counters.rerouted_generation_mismatch, 1);
+    assert_eq!(counters.mismatch_in_place, 0);
+    for (&target, target_keys) in &by_target {
+        assert_eq!(
+            rows_at::<P>(store, &world.deferred, target, pin_hour).await,
+            expected(target_keys),
+            "the rows the 4-shard generation routes to shard {target} land there"
+        );
+    }
+    assert_eq!(
+        scanned_rows::<P>(store, &world.deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "the scan rule finds every row exactly once"
+    );
+}
+
+/// A strict waiter whose buffer is handed back for a generation mismatch is
+/// answered with the retryable outcome-unknown `Abandoned` carrying the
+/// mismatch message, never an `Ok`, and its row is still written once.
+///
+/// Guard: the `Ok(Some(owner)) if owner != count` hand-back arm of
+/// `GenerationSwitch::scan_check`. With it disabled the flush writes in place
+/// and acknowledges the waiter `Ok`.
+async fn strict_waiter_on_a_mismatched_buffer_is_abandoned<P: Pipe>() {
+    let world = World::<P>::new().await;
+    let keys = covered_rows::<P>(&world.deferred, 1);
+    let handle = world
+        .router
+        .send_row(&world.deferred, keys[0], WriteMode::Strict);
+    assert!(
+        settle(|| world.router.counters().buffered == 1).await,
+        "the strict row is buffered on the 4-shard set before the reshard"
+    );
+    world.reshard_down().await;
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    assert!(
+        drive(&world.clock, || handle.is_finished()).await,
+        "the strict write is answered"
+    );
+    let answer = handle.await.expect("strict write task");
+    assert!(
+        answer.contains("Abandoned") && answer.contains("another generation owns"),
+        "the waiter gets the outcome-unknown Abandoned for a mismatch, got {answer}"
+    );
+    let counters = world.router.counters();
+    assert_eq!(counters.rerouted, 1);
+    assert_eq!(counters.rerouted_generation_mismatch, 1);
+    world.router.flush().await;
+    assert_eq!(
+        scanned_rows::<P>(world.store.as_ref(), &world.deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "the abandoned waiter's row is written once"
+    );
+}
+
+/// Collects the message of every WARN event on the thread that installed it,
+/// until the capture is dropped.
+///
+/// The layer behind it is the process-wide default, installed once, and not
+/// a thread-scoped `set_default`: a callsite another test thread registers
+/// while a scoped default is being registered can cache an interest that
+/// leaves the scoped subscriber out, and the capture then sees nothing.
+#[derive(Clone, Default)]
+struct WarnCapture {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+thread_local! {
+    static THREAD_CAPTURE: std::cell::RefCell<Option<WarnCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hands each WARN event to the capture installed on its thread, if any.
+struct ThreadWarnLayer;
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadWarnLayer {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if *metadata.level() == tracing::Level::WARN {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        THREAD_CAPTURE.with(|slot| {
+            if let Some(capture) = slot.borrow().as_ref() {
+                let mut visitor = MessageVisitor::default();
+                event.record(&mut visitor);
+                capture.messages.lock().expect("lock").push(visitor.0);
+            }
+        });
+    }
+}
+
+#[derive(Default)]
+struct MessageVisitor(String);
+
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+/// Removes this thread's capture when dropped.
+struct WarnCaptureGuard;
+
+impl Drop for WarnCaptureGuard {
+    fn drop(&mut self) {
+        THREAD_CAPTURE.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+impl WarnCapture {
+    /// Captures this thread's WARN events until the guard drops.
+    fn install(&self) -> WarnCaptureGuard {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(ThreadWarnLayer),
+            )
+            .expect("no other global subscriber in this test binary");
+        });
+        THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(self.clone()));
+        WarnCaptureGuard
+    }
+
+    fn count(&self, needle: &str) -> usize {
+        self.messages
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count()
+    }
+}
+
+/// A teardown whose generation-mismatch hand-back finds its target set
+/// already drained writes the rows in place, where readers find them, logs a
+/// WARN and counts the write once on the in-place counter, not on the
+/// unscanned one.
+///
+/// Guard: the in-place branch of each actor's hand-back arm in
+/// `flush_tenant`, which a target that is not live reaches on the first
+/// pass. Without it the enforced passes keep the rows and the bypass passes
+/// take the unscanned-write branch: no WARN, the in-place counter reads 0 and
+/// the unscanned counter 1.
+async fn a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone<P: Pipe>() {
+    let capture = WarnCapture::default();
+    let _capture = capture.install();
+    // Not `drain_only_config`: its day-long age clocks spend the whole
+    // read-side slack, so its deferral cap is 0 and the bounded retry, not
+    // the teardown, would write the rows in place.
+    let world = World::<P>::with_config(up_config()).await;
+    let keys: Vec<usize> = (0..10_000)
+        .filter(|&i| {
+            P::shard_of(&world.deferred, i, UP_FROM) == SOURCE_SHARD
+                && P::shard_of(&world.deferred, i, UP_TO) != SOURCE_SHARD
+        })
+        .take(3)
+        .collect();
+    for &i in &keys {
+        let write = world
+            .router
+            .send_row(&world.deferred, i, WriteMode::Buffered);
+        assert_eq!(write.await.expect("write task"), "ok");
+    }
+    world.reshard_to(UP_TO).await;
+    // One clock move: the late buffer's age trigger fires once, finds its
+    // view past the trust horizon and stays closed. Its first hand-back is
+    // tried by the teardown, after the 4-shard set has closed.
+    let pin_hour = ACTIVATION_HOUR + DEFAULT_SCAN_SLACK_HOURS + 5;
+    world.clock.set_ns(start_of(pin_hour) + 1_000_000_000);
+    assert!(
+        settle(|| world.router.counters().stale == 1).await,
+        "the late flush stays closed on an untrusted view"
+    );
+    // A write after the activation builds the 4-shard set, which shutdown
+    // drains, and closes, before the 3-shard set.
+    let other = world.router.send_row(&world.parked, 0, WriteMode::Buffered);
+    assert_eq!(other.await.expect("write task"), "ok");
+
+    let World {
+        router,
+        store,
+        deferred,
+        ..
+    } = world;
+    let router = Arc::into_inner(router).expect("sole router owner");
+    let counters = router.counter_source();
+    router.shutdown().await;
+
+    let c = counters();
+    assert_eq!(
+        c.mismatch_in_place, 1,
+        "one buffer written in place, counters {c:?}"
+    );
+    assert_eq!(c.unscanned, 0);
+    assert_eq!(c.rerouted, 0);
+    assert_eq!(
+        capture.count("writing a flush in place in an ingest hour another shard generation owns"),
+        1,
+        "the in-place write is logged once, {:?}",
+        capture.messages.lock().expect("lock")
+    );
+    let store = store.as_ref();
+    assert_eq!(
+        rows_at::<P>(store, &deferred, SOURCE_SHARD, pin_hour).await,
+        expected(&keys),
+        "written in place under the source index"
+    );
+    assert_eq!(
+        scanned_rows::<P>(store, &deferred, H0..=pin_hour + 1).await,
+        expected(&keys),
+        "the scan rule finds every row exactly once"
+    );
+}
+
 macro_rules! scan_set_cases {
     ($pipe:ty, $($name:ident => $case:ident),+ $(,)?) => {
         $(
@@ -1203,37 +1819,52 @@ scan_set_cases!(
     IngestRouter,
     metrics_retired_index_past_the_window_hands_back => retired_index_past_the_window_hands_back,
     metrics_retired_index_inside_the_window_writes_in_place => retired_index_inside_the_window_writes_in_place,
-    metrics_covered_index_writes_in_place_however_late => covered_index_writes_in_place_however_late,
+    metrics_covered_index_in_a_successor_owned_hour_hands_back => covered_index_in_a_successor_owned_hour_hands_back,
+    metrics_covered_index_inside_the_overlap_writes_in_place => covered_index_inside_the_overlap_writes_in_place,
     metrics_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     metrics_charges_follow_the_rows => charges_follow_the_rows,
     metrics_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
     metrics_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
     metrics_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     metrics_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
+    metrics_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
+    metrics_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
+    metrics_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
+    metrics_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
 );
 
 scan_set_cases!(
     LogIngestRouter,
     logs_retired_index_past_the_window_hands_back => retired_index_past_the_window_hands_back,
     logs_retired_index_inside_the_window_writes_in_place => retired_index_inside_the_window_writes_in_place,
-    logs_covered_index_writes_in_place_however_late => covered_index_writes_in_place_however_late,
+    logs_covered_index_in_a_successor_owned_hour_hands_back => covered_index_in_a_successor_owned_hour_hands_back,
+    logs_covered_index_inside_the_overlap_writes_in_place => covered_index_inside_the_overlap_writes_in_place,
     logs_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     logs_charges_follow_the_rows => charges_follow_the_rows,
     logs_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
     logs_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
     logs_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     logs_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
+    logs_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
+    logs_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
+    logs_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
+    logs_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
 );
 
 scan_set_cases!(
     SpanIngestRouter,
     spans_retired_index_past_the_window_hands_back => retired_index_past_the_window_hands_back,
     spans_retired_index_inside_the_window_writes_in_place => retired_index_inside_the_window_writes_in_place,
-    spans_covered_index_writes_in_place_however_late => covered_index_writes_in_place_however_late,
+    spans_covered_index_in_a_successor_owned_hour_hands_back => covered_index_in_a_successor_owned_hour_hands_back,
+    spans_covered_index_inside_the_overlap_writes_in_place => covered_index_inside_the_overlap_writes_in_place,
     spans_unrefreshable_view_keeps_the_flush_closed => unrefreshable_view_keeps_the_flush_closed,
     spans_charges_follow_the_rows => charges_follow_the_rows,
     spans_strict_waiter_on_a_handed_back_buffer_is_abandoned => strict_waiter_on_a_handed_back_buffer_is_abandoned,
     spans_one_drain_hands_back_and_flushes => one_drain_hands_back_and_flushes,
     spans_shutdown_drains_the_largest_set_first => shutdown_drains_the_largest_set_first,
     spans_shutdown_drains_a_set_a_hand_back_built => shutdown_drains_a_set_a_hand_back_built,
+    spans_a_hand_back_to_a_draining_set_is_never_lost => a_hand_back_to_a_draining_set_is_never_lost,
+    spans_an_increase_hands_a_late_buffer_up_to_the_owner => an_increase_hands_a_late_buffer_up_to_the_owner,
+    spans_strict_waiter_on_a_mismatched_buffer_is_abandoned => strict_waiter_on_a_mismatched_buffer_is_abandoned,
+    spans_a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone => a_teardown_writes_a_mismatch_in_place_when_its_target_is_gone,
 );
