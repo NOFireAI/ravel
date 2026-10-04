@@ -223,7 +223,10 @@ async fn snapshot_with_limit(
 /// that is correct whatever the real size is, so `size` has no bearing on
 /// it. On a store without it, `size` shapes where that first explicit-range
 /// read lands; a stale `size` costs one retry rather than a misplaced read
-/// (see [`read_file`]).
+/// (see [`read_file`]). A `size` of 0, or one that over-reports by more than
+/// [`FOOTER_PREFETCH`] so the range starts past the object's end, leaves no
+/// range to issue; that read recovers through one HEAD instead (see
+/// [`head_corrected_read`]).
 struct Candidate {
     key: String,
     etag: String,
@@ -505,7 +508,10 @@ fn tail_range(size: u64) -> FooterRange {
 /// response. If that response's own reported size disagrees with
 /// `listed_size`, the listing was stale: retry once, placed from the size
 /// this read just reported, and refuse `FileChanged` if the retry's own
-/// reported size disagrees too.
+/// reported size disagrees too. A first response carrying more bytes than
+/// its range asked for is refused as [`SnapshotError::Corrupt`] before its
+/// reported size is compared, since a discarded response never reaches
+/// [`read_file`]'s own length check.
 ///
 /// A `listed_size` of 0 is not evidence the object is empty: it issues no
 /// zero-length range at all. Nor is a `listed_size` that over-reports by
@@ -538,16 +544,9 @@ async fn first_footer_read(
     if listed_size == 0 {
         return head_corrected_read(store, limiter, memory, accounting, key, pin).await;
     }
-    let first = pinned_get(
-        store,
-        limiter,
-        memory,
-        accounting,
-        key,
-        tail_range(listed_size),
-        pin,
-    )
-    .await;
+    let requested = tail_range(listed_size);
+    let requested_len = requested.len();
+    let first = pinned_get(store, limiter, memory, accounting, key, requested, pin).await;
     let (tail, reservation) = match first {
         Ok(ok) => ok,
         Err(SnapshotError::Store {
@@ -556,6 +555,19 @@ async fn first_footer_read(
         }) => return head_corrected_read(store, limiter, memory, accounting, key, pin).await,
         Err(err) => return Err(err),
     };
+    // The retry below discards this response, so `read_file`'s length check
+    // never sees it: a store that ignored the range must be refused here,
+    // before the bytes outlive their smaller reservation.
+    let fetched = tail.outcome.data.len() as u64;
+    if fetched > requested_len {
+        return Err(SnapshotError::Corrupt {
+            key: key.to_string(),
+            message: format!(
+                "footer read of {requested_len} bytes returned {fetched} bytes, more than \
+                 requested"
+            ),
+        });
+    }
     if tail.outcome.total_size == listed_size {
         return Ok((tail, reservation));
     }
@@ -887,6 +899,9 @@ mod tests {
         /// Report `suffix_range: false`, as the Azure external store does,
         /// instead of the inner `MemoryStore`'s `true`.
         force_no_suffix_range: bool,
+        /// Answer every `get_pinned` with the whole object, whatever range
+        /// was requested, as an endpoint that ignores `Range` does.
+        ignore_range: bool,
         /// Serve `.csv` keys instead of `.parquet` ones from `synthetic`, so
         /// a synthetic listing can exercise the skip-and-count path instead
         /// of the candidate path.
@@ -978,7 +993,12 @@ mod tests {
             if self.misreport_listing {
                 sent_pin.etag = sent_pin.etag.trim_start_matches("listed:").to_string();
             }
-            let mut read = self.inner.get_pinned(key, range, &sent_pin).await?;
+            let sent_range = if self.ignore_range {
+                GetRange::Full
+            } else {
+                range
+            };
+            let mut read = self.inner.get_pinned(key, sent_range, &sent_pin).await?;
             if let Some((n, ref version)) = self.lie_pin_version_on_call
                 && n == call
             {
@@ -1316,6 +1336,41 @@ mod tests {
             Err(SnapshotError::FileChanged { key }) => assert_eq!(key, "data/a.parquet"),
             other => panic!("expected FileChanged, got {other:?}"),
         }
+    }
+
+    /// Without `suffix_range`, a stale listed size discards the first
+    /// footer read's response for a retry, so `read_file`'s length check
+    /// never sees it. An endpoint that ignores `Range` answers that read with
+    /// the whole object, more bytes than the range's reservation covers: it
+    /// is refused at the first read, with no retry issued. Mutation that
+    /// fails it: dropping the length check in `first_footer_read`, after
+    /// which the retry (also the whole object, which is then exactly the
+    /// tail it asked for) snapshots the file with two GETs.
+    #[tokio::test]
+    async fn a_store_ignoring_range_on_a_stale_listed_size_refuses_before_the_retry() {
+        let bytes = parquet_bytes(&[4, 5], &["p", "q"]);
+        let real_size = bytes.len() as u64;
+        let store = Scripted {
+            force_no_suffix_range: true,
+            ignore_range: true,
+            lie_listed_size: Some(real_size - 10),
+            ..Scripted::default()
+        };
+        put(&store, "data/a.parquet", bytes).await;
+        assert_corrupt(
+            snapshot(&store, "s3://lake/data/").await,
+            "data/a.parquet",
+            &format!(
+                "footer read of {} bytes returned {real_size} bytes, more than requested",
+                real_size - 10
+            ),
+        );
+        let ranges: Vec<GetRange> = store
+            .gets()
+            .into_iter()
+            .map(|(_, range, _)| range)
+            .collect();
+        assert_eq!(ranges, [GetRange::Range(0, real_size - 10)]);
     }
 
     fn assert_corrupt(result: Result<LocationSnapshot, SnapshotError>, key: &str, needle: &str) {
