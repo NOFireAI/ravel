@@ -364,7 +364,7 @@ async fn buffered_mode_header_is_honored() {
 }
 
 /// The deepest kvlist nest the log segment format holds around a scalar
-/// (`ravel_logseg::attr_value_fits_depth`: a kvlist costs two of its 31
+/// (`ravel_logseg::attr_value_fits_storage`: a kvlist costs two of its 31
 /// levels).
 const FITTING_KVLISTS: usize = 15;
 
@@ -403,9 +403,12 @@ fn resource_logs(resource_attrs: Vec<KeyValue>, body: &str, ts_ns: i64) -> Resou
 
 /// A resource attribute at the deepest nest the segment format holds is
 /// admitted, flushed and read back intact; one a kvlist level deeper is
-/// rejected at admission, so it never reaches the flush, and the records
-/// exported beside it (a sibling resource in its own request, and a
-/// concurrent request) still commit.
+/// rejected at admission: its request reports one rejected record with the
+/// depth message. Once both exports return, the durable records are the
+/// fitting one and the sibling resource's from the rejected request. The two
+/// requests are sent concurrently, but nothing here makes them share a flush
+/// batch, so this does not show that a refused value would have failed a
+/// batch.
 #[tokio::test]
 async fn resource_attribute_depth_is_checked_at_admission_not_at_flush() {
     let (running, store) = start_test_server().await;

@@ -60,8 +60,8 @@ pub use reader::{
     stream_attr_pairs,
 };
 pub use record::{
-    FieldSel, FieldType, LogRecord, MAX_ATTR_DEPTH, Predicate, attr_value_fits_depth,
-    stream_attrs_bytes,
+    FieldSel, FieldType, LogRecord, MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, Predicate,
+    attr_value_fits_storage, stream_attrs_bytes,
 };
 pub use source::{ByteSource, SparseObject};
 pub use writer::{BloomScope, ObjectIdentity, RlogConfig, RlogWriter};

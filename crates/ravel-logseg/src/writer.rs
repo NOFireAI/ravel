@@ -30,7 +30,7 @@ use crate::footer::{
 use crate::page::{SealedPage, seal_page};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
-use crate::reader::{check_attrs_raw_depth, stream_attr_pairs};
+use crate::reader::{check_attrs_raw_decodable, stream_attr_pairs};
 use crate::record::{
     COL_BODY, COL_SEVERITY_TEXT, ColumnValue, FIRST_DYNAMIC_COL, FieldType, LogRecord, ResolvedRow,
     canonical_value_bytes, resolve_value,
@@ -1288,7 +1288,7 @@ impl RlogWriter {
         let mut g_attrs_raw: Vec<Option<Vec<u8>>> = vec![None; total_rows];
         for grow in 0..total_rows {
             if !g_overflow[grow].is_empty() {
-                check_attrs_raw_depth(&g_overflow[grow])?;
+                check_attrs_raw_decodable(&g_overflow[grow])?;
                 g_attrs_raw[grow] = Some(canonical_attr_bytes(&g_overflow[grow]));
             }
         }
@@ -1938,9 +1938,9 @@ fn stream_level_column_eligible(
 /// Resolves one record into storage form: dense stream ref, dynamic columns
 /// split by type, overflow attributes canonicalized into `attrs_raw`, the
 /// merged-view POSTINGS terms this record contributes, and its per-name NumStat
-/// winners. Overflow attributes that fail the write-side depth rule
-/// ([`crate::record::attr_value_fits_depth`]) refuse the record with the
-/// `attrs_raw` decoder's too-deep error.
+/// winners. Overflow attributes the `attrs_raw` decoder would refuse
+/// ([`check_attrs_raw_decodable`]) refuse the record with that decoder's
+/// error.
 ///
 /// The last two are two projections of one merged view
 /// ([`StampScratch::finish`]), not two independently derived answers: they must
@@ -1997,7 +1997,7 @@ fn resolve_row(
     let attrs_raw = if overflow.is_empty() {
         None
     } else {
-        check_attrs_raw_depth(&overflow)?;
+        check_attrs_raw_decodable(&overflow)?;
         Some(canonical_attr_bytes(&overflow))
     };
     let mut indexed_terms: Vec<(u32, ColumnValue)> = Vec::new();
@@ -4555,58 +4555,155 @@ mod tests {
         assert_eq!(fd.len(), 1000);
     }
 
-    /// An `attrs_raw` value past the attribute depth rule is refused at finish,
-    /// on the row path and the columnar path, with the `attrs_raw` decoder's
-    /// own error, so no object carrying it is produced; the deepest value that
-    /// fits is written and reads back intact.
-    #[test]
-    fn attrs_raw_past_the_depth_rule_is_refused_at_finish() {
-        // No dynamic columns, so every attribute folds into `attrs_raw`.
+    /// `levels` maps (or lists) nested around `leaf`, built without recursion.
+    fn nest_attr(levels: usize, map: bool, leaf: AttrValue) -> AttrValue {
+        let mut v = leaf;
+        for _ in 0..levels {
+            v = if map {
+                AttrValue::Map(vec![("m".into(), v)])
+            } else {
+                AttrValue::List(vec![v])
+            };
+        }
+        v
+    }
+
+    /// Writes one record whose only attribute, `value` under `key`, folds into
+    /// `attrs_raw` (no dynamic columns), through the row path (`push`) or the
+    /// columnar path (`push_columnar`), and returns what `finish` returns.
+    /// The push itself must succeed: any refusal is the finish's.
+    fn write_overflow_attr(
+        key: &str,
+        value: AttrValue,
+        columnar: bool,
+    ) -> Result<Vec<u8>, LogSegError> {
         let cfg = RlogConfig {
             max_dynamic_columns: 0,
             ..RlogConfig::default()
         };
-        let nest = |levels: usize, map: bool| {
-            let mut v = AttrValue::I64(1);
-            for _ in 0..levels {
-                v = if map {
-                    AttrValue::Map(vec![("m".into(), v)])
-                } else {
-                    AttrValue::List(vec![v])
-                };
-            }
-            v
-        };
-        for columnar in [false, true] {
-            let write = |value: AttrValue| {
-                let mut r = base_record(0, 0);
-                r.stream_attrs = empty_stream_blob();
-                r.attrs = vec![("deep".into(), value)];
-                let mut w = RlogWriter::new(cfg, identity());
-                if columnar {
-                    w.push_columnar(ColumnarLogBatch::from_records(std::slice::from_ref(&r)))
-                        .expect("push_columnar");
-                } else {
-                    w.push(r).expect("push");
-                }
-                w.finish()
-            };
-            for (fits, map) in [(15usize, true), (31, false)] {
-                let value = nest(fits, map);
-                let obj = write(value.clone())
-                    .unwrap_or_else(|e| panic!("{fits} levels (map={map}) fit: {e}"));
-                let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open reader");
-                let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
-                assert_eq!(rows.len(), 1);
-                assert_eq!(rows[0].attrs, vec![("deep".to_string(), value)]);
+        let mut r = base_record(0, 0);
+        r.stream_attrs = empty_stream_blob();
+        r.attrs = vec![(key.to_string(), value)];
+        let mut w = RlogWriter::new(cfg, identity());
+        if columnar {
+            w.push_columnar(ColumnarLogBatch::from_records(std::slice::from_ref(&r)))
+                .expect("push_columnar");
+        } else {
+            w.push(r).expect("push");
+        }
+        w.finish()
+    }
 
-                let err = write(nest(fits + 1, map)).expect_err("one level past the fit");
-                match err {
-                    LogSegError::Corrupted(msg) => {
-                        assert_eq!(msg, "attrs_raw too deep", "columnar={columnar} map={map}")
+    /// Opens `obj`, scans it, and returns the one row's attributes.
+    fn only_row_attrs(obj: &[u8]) -> Vec<(String, AttrValue)> {
+        let reader = RlogReader::new(obj, &RlogConfig::default()).expect("open reader");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), 1);
+        rows[0].attrs.clone()
+    }
+
+    /// The writer holds `attrs_raw` to the `attrs_raw` reader's bounds, not to
+    /// the stricter admission rule, on the row path and the columnar path:
+    /// values past the admission rule that the reader decodes (16 and 32
+    /// nested maps, 100 and 128 nested lists, a map under 31 lists, a list of
+    /// `MAX_ATTR_ENTRIES` elements) are written and read back equal; values
+    /// the reader refuses (33 nested maps, 129 nested lists, a map under 32
+    /// lists, an empty list under 128, a list or map of one entry past
+    /// `MAX_ATTR_ENTRIES`) are refused at finish with the reader's own error,
+    /// so no object is produced.
+    #[test]
+    fn attrs_raw_writes_what_its_reader_decodes_and_refuses_the_rest_at_finish() {
+        let cap = crate::record::MAX_ATTR_ENTRIES as usize;
+        let empty_map = || AttrValue::Map(Vec::new());
+        for columnar in [false, true] {
+            let accepted = [
+                ("16 maps", nest_attr(16, true, AttrValue::I64(1))),
+                ("32 maps", nest_attr(32, true, AttrValue::I64(1))),
+                ("100 lists", nest_attr(100, false, AttrValue::I64(1))),
+                ("128 lists", nest_attr(128, false, AttrValue::I64(1))),
+                ("map under 31 lists", nest_attr(31, false, empty_map())),
+                (
+                    "list at the entry cap",
+                    AttrValue::List(vec![AttrValue::I64(0); cap]),
+                ),
+            ];
+            for (what, value) in accepted {
+                let obj = write_overflow_attr("deep", value.clone(), columnar)
+                    .unwrap_or_else(|e| panic!("{what} (columnar={columnar}) is written: {e}"));
+                assert_eq!(
+                    only_row_attrs(&obj),
+                    vec![("deep".to_string(), value)],
+                    "{what} (columnar={columnar})"
+                );
+            }
+
+            let refused = [
+                (
+                    "33 maps",
+                    nest_attr(33, true, AttrValue::I64(1)),
+                    "attrs_raw too deep",
+                ),
+                (
+                    "129 lists",
+                    nest_attr(129, false, AttrValue::I64(1)),
+                    "attrs_raw too deep",
+                ),
+                (
+                    "map under 32 lists",
+                    nest_attr(32, false, empty_map()),
+                    "attrs_raw too deep",
+                ),
+                (
+                    "empty list under 128 lists",
+                    nest_attr(128, false, AttrValue::List(Vec::new())),
+                    "attrs_raw too deep",
+                ),
+                (
+                    "list past the entry cap",
+                    AttrValue::List(vec![AttrValue::I64(0); cap + 1]),
+                    "attr list over cap",
+                ),
+                (
+                    "map past the entry cap",
+                    AttrValue::Map(vec![(String::new(), AttrValue::I64(0)); cap + 1]),
+                    "attrs_raw count over cap",
+                ),
+            ];
+            for (what, value, want) in refused {
+                match write_overflow_attr("deep", value, columnar) {
+                    Err(LogSegError::Corrupted(msg)) => {
+                        assert_eq!(msg, want, "{what} (columnar={columnar})")
                     }
-                    other => panic!("expected the attrs_raw decoder's error, got {other:?}"),
+                    Ok(_) => panic!("{what} (columnar={columnar}) must be refused at finish"),
+                    Err(other) => panic!("{what}: expected the reader's error, got {other:?}"),
                 }
+            }
+        }
+    }
+
+    /// The compaction shape: an `attrs_raw` value an older writer stored
+    /// (16, 24 and 32 nested maps, 99 nested lists), decoded by the
+    /// `attrs_raw` decoder and pushed into a fresh writer as an overflow
+    /// attribute, is written again on both paths and reads back equal.
+    #[test]
+    fn attrs_raw_values_decoded_from_storage_are_rewritten() {
+        for (levels, map) in [(16usize, true), (24, true), (32, true), (99, false)] {
+            let stored = canonical_attr_bytes(&[(
+                "legacy".to_string(),
+                nest_attr(levels, map, AttrValue::Str("leaf".into())),
+            )]);
+            let decoded =
+                crate::reader::decode_canonical_attrs(&stored).expect("the stored value decodes");
+            let [(key, value)] = <[_; 1]>::try_from(decoded.clone()).expect("one attribute");
+            for columnar in [false, true] {
+                let obj = write_overflow_attr(&key, value.clone(), columnar).unwrap_or_else(|e| {
+                    panic!("{levels} levels (map={map}, columnar={columnar}) rewrite: {e}")
+                });
+                assert_eq!(
+                    only_row_attrs(&obj),
+                    decoded,
+                    "{levels} levels (map={map}, columnar={columnar})"
+                );
             }
         }
     }

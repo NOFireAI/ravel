@@ -162,15 +162,19 @@ pub enum LogRejection {
     /// An array or kvlist attribute value nests deeper than log storage holds.
     /// A log attribute nested past what the segment format holds is rejected
     /// at admission: at most 15 kvlists may nest around a scalar, an array
-    /// level costing half a kvlist level (so 31 arrays fit). That is
-    /// [`ravel_logseg::attr_value_fits_depth`], the rule the segment writer
-    /// enforces and every segment decoder accepts, so an admitted attribute is
-    /// never refused when its segment is written or read.
+    /// level costing half a kvlist level (so 31 arrays fit). That is the depth
+    /// half of [`ravel_logseg::attr_value_fits_storage`], the rule the
+    /// `stream_attrs` decoder applies and the writer's `attrs_raw` check
+    /// accepts, so an admitted attribute is not refused when its segment is
+    /// written or read.
     ///
-    /// `max` is that limit in levels,
-    /// [`crate::logs_normalize::MAX_STORED_ATTRIBUTE_LEVELS`]: an array adds
-    /// one level for its elements, a kvlist one for its entries and one more
-    /// for their values. A value nested past the converter's own stack guard,
+    /// `max` is that limit in levels below the attribute,
+    /// [`crate::logs_normalize::MAX_STORED_ATTRIBUTE_LEVELS`]: an array's
+    /// elements sit one level below the array, a kvlist's entries one level
+    /// below the kvlist and their values one level below that. An empty array
+    /// adds no level; an empty kvlist still adds one, for its entries, so 30
+    /// arrays around an empty kvlist fit and 31 do not. A value nested past
+    /// the converter's own stack guard,
     /// [`crate::logs_normalize::MAX_ATTRIBUTE_NESTING_DEPTH`], is rejected
     /// through this variant with the same `max`, without being recursed
     /// through, so a hostile payload cannot drive the converter past a bounded
@@ -179,9 +183,20 @@ pub enum LogRejection {
     /// that trips it rejects that group instead, the same as any other
     /// conversion failure there.
     #[error(
-        "attribute {key} nests more than {max} levels deep (an array adds one level, a kvlist two)"
+        "attribute {key} nests more than {max} levels deep (counting one level for an array's elements, one for a kvlist's entries even when empty, and one more for their values)"
     )]
     AttributeTooDeeplyNested { key: String, max: usize },
+
+    /// An array or kvlist inside an attribute value holds more entries than
+    /// log storage holds: `max` is [`ravel_logseg::MAX_ATTR_ENTRIES`], the
+    /// entry cap of [`ravel_logseg::attr_value_fits_storage`] and of every
+    /// segment decoder. The value-length limit cannot catch this on its own,
+    /// since an empty array or kvlist entry adds nothing to the measured
+    /// length. Dropped as a single attribute when it sits on a record, like
+    /// [`LogRejection::AttributeTooDeeplyNested`]; a resource or scope
+    /// attribute that trips it rejects that group instead.
+    #[error("attribute {key} holds an array or kvlist of more than {max} entries")]
+    AttributeTooManyEntries { key: String, max: usize },
 
     /// `reason` applied identically to `count` log records that share one
     /// resource or scope (a resource or scope whose attribute set exceeded
@@ -202,14 +217,14 @@ impl LogRejection {
     /// exhaustive for the same reason: a new variant does not compile until it
     /// has been classified.
     ///
-    /// The five per-attribute variants class as `None`, not `structural`,
+    /// The six per-attribute variants class as `None`, not `structural`,
     /// when they stand on their own: they drop one attribute of a record that
     /// is still stored (their [`LogRejection::rejected_count`] is 0), so they
     /// cost the sender no record and must not move a rejected counter. This
     /// mirrors the traces path, where a stored span's dropped attributes are
     /// classed `None` for the same reason.
     ///
-    /// Those same five variants also appear inside a [`LogRejection::Grouped`]
+    /// Those same six variants also appear inside a [`LogRejection::Grouped`]
     /// when a resource- or scope-level attribute set cannot be converted,
     /// where they do cost whole records (the attributes carry stream identity,
     /// so nothing under the resource or scope can be admitted). That context
@@ -239,7 +254,8 @@ impl LogRejection {
             | LogRejection::AttributeValueTooLong { .. }
             | LogRejection::MissingAttributeValue { .. }
             | LogRejection::UnsupportedAttributeValue { .. }
-            | LogRejection::AttributeTooDeeplyNested { .. } => None,
+            | LogRejection::AttributeTooDeeplyNested { .. }
+            | LogRejection::AttributeTooManyEntries { .. } => None,
             // A grouped rejection is always a whole-group structural loss: its
             // reason is either a too-many-attributes breach or an attribute
             // that could not be converted at resource or scope scope, and skew
@@ -255,7 +271,7 @@ impl LogRejection {
     /// gives the count to report in an OTLP `rejected_log_records` field.
     /// Mirrors [`crate::limits::Rejection::rejected_count`].
     ///
-    /// The five per-attribute variants return 0: they drop one attribute of a
+    /// The six per-attribute variants return 0: they drop one attribute of a
     /// record that is still stored, so counting them as a rejected record
     /// over-reports how many records a sender's export lost. They remain
     /// visible to the sender through the partial-success `error_message`; only
@@ -275,7 +291,8 @@ impl LogRejection {
             | LogRejection::AttributeValueTooLong { .. }
             | LogRejection::MissingAttributeValue { .. }
             | LogRejection::UnsupportedAttributeValue { .. }
-            | LogRejection::AttributeTooDeeplyNested { .. } => 0,
+            | LogRejection::AttributeTooDeeplyNested { .. }
+            | LogRejection::AttributeTooManyEntries { .. } => 0,
             // Whole-record rejections: the record never reached storage.
             _ => 1,
         }
@@ -386,7 +403,7 @@ mod tests {
         );
     }
 
-    /// The five per-attribute variants drop one attribute of a record that is
+    /// The six per-attribute variants drop one attribute of a record that is
     /// still stored, so on their own they cost the sender no record: their
     /// `rejected_count` is 0 and they carry no admission class. Mirrors the
     /// traces path's attribute-level rejections.
@@ -403,6 +420,10 @@ mod tests {
             LogRejection::AttributeTooDeeplyNested {
                 key: "k".into(),
                 max: 31,
+            },
+            LogRejection::AttributeTooManyEntries {
+                key: "k".into(),
+                max: 1 << 20,
             },
         ];
         for v in &variants {

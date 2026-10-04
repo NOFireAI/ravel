@@ -30,16 +30,18 @@
 //! default this crate neither sets nor controls) still being in force.
 //!
 //! Attribute values that convert are then held to the stricter storage rule,
-//! [`ravel_logseg::attr_value_fits_depth`]: a resource, scope or record
+//! [`ravel_logseg::attr_value_fits_storage`]: a resource, scope or record
 //! attribute nested past what the log segment format holds is rejected here
-//! with [`LogRejection::AttributeTooDeeplyNested`], so it never reaches a
-//! flush that would refuse it.
+//! with [`LogRejection::AttributeTooDeeplyNested`], and one holding an array
+//! or kvlist of more than [`ravel_logseg::MAX_ATTR_ENTRIES`] entries with
+//! [`LogRejection::AttributeTooManyEntries`], so it does not reach a flush
+//! that would refuse it.
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-use ravel_logseg::{MAX_ATTR_DEPTH, attr_value_fits_depth, stream_attrs_bytes};
+use ravel_logseg::{MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
 use crate::logs_limits::{LogIngestLimits, LogRejection};
@@ -711,8 +713,15 @@ fn convert_attr(
         });
     }
     let value = convert_value(&kv.key, kv.value.as_ref(), 1)?;
-    if !attr_value_fits_depth(&value) {
-        return Err(too_deeply_nested(&kv.key));
+    if !attr_value_fits_storage(&value) {
+        return Err(if has_container_past_entry_cap(&value) {
+            LogRejection::AttributeTooManyEntries {
+                key: kv.key.clone(),
+                max: MAX_ATTR_ENTRIES as usize,
+            }
+        } else {
+            too_deeply_nested(&kv.key)
+        });
     }
     let len = attr_value_len(&value);
     if len > limits.max_attribute_value_len {
@@ -742,7 +751,7 @@ fn convert_attr(
 ///
 /// This is the converter's own stack guard, and it is the only depth bound a
 /// structured body meets. The storage rule an attribute must also satisfy is
-/// stricter and lives in ravel-logseg ([`ravel_logseg::attr_value_fits_depth`],
+/// stricter and lives in ravel-logseg ([`ravel_logseg::attr_value_fits_storage`],
 /// reported here as [`MAX_STORED_ATTRIBUTE_LEVELS`]).
 pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 100;
 
@@ -752,7 +761,7 @@ pub const MAX_ATTRIBUTE_NESTING_DEPTH: usize = 100;
 /// elements, a kvlist one for its entries and one more for their values. So
 /// 15 kvlists or 31 arrays nested around a scalar fit, and one more does not.
 /// Derived from [`ravel_logseg::MAX_ATTR_DEPTH`], whose accounting
-/// [`ravel_logseg::attr_value_fits_depth`] states, so it cannot drift from
+/// [`ravel_logseg::attr_value_fits_storage`] states, so it cannot drift from
 /// the rule admission enforces.
 pub const MAX_STORED_ATTRIBUTE_LEVELS: usize = MAX_ATTR_DEPTH as usize - 1;
 
@@ -764,6 +773,25 @@ fn too_deeply_nested(key: &str) -> LogRejection {
     LogRejection::AttributeTooDeeplyNested {
         key: key.to_string(),
         max: MAX_STORED_ATTRIBUTE_LEVELS,
+    }
+}
+
+/// Whether any array or kvlist in `value` holds more than
+/// [`MAX_ATTR_ENTRIES`] entries. It only names the reason for a value
+/// [`attr_value_fits_storage`] already refused: one that trips the entry cap
+/// is reported as [`LogRejection::AttributeTooManyEntries`], any other as too
+/// deeply nested. Recursion is bounded by [`MAX_ATTRIBUTE_NESTING_DEPTH`],
+/// since `value` came through `convert_value`.
+fn has_container_past_entry_cap(value: &AttrValue) -> bool {
+    match value {
+        AttrValue::List(items) => {
+            items.len() as u64 > MAX_ATTR_ENTRIES || items.iter().any(has_container_past_entry_cap)
+        }
+        AttrValue::Map(entries) => {
+            entries.len() as u64 > MAX_ATTR_ENTRIES
+                || entries.iter().any(|(_, v)| has_container_past_entry_cap(v))
+        }
+        _ => false,
     }
 }
 
@@ -1794,8 +1822,208 @@ mod tests {
             );
             assert_eq!(
                 out.rejected[0].to_string(),
-                "attribute deep nests more than 31 levels deep (an array adds one level, a kvlist two)"
+                "attribute deep nests more than 31 levels deep (counting one level for an array's elements, one for a kvlist's entries even when empty, and one more for their values)"
             );
+        }
+    }
+
+    /// The empty-kvlist case the rejection message names: 30 arrays around an
+    /// empty kvlist are admitted, 31 are dropped as too deeply nested.
+    #[test]
+    fn an_empty_kvlist_counts_one_level_for_its_entries() {
+        let empty_kvlist = AnyValueVariant::KvlistValue(KeyValueList { values: vec![] });
+        for (arrays, admitted) in [(30usize, true), (31, false)] {
+            let out = normalize(request(vec![resource_logs(
+                vec![],
+                vec![scope_logs(
+                    "lib",
+                    "1",
+                    vec![record(
+                        Some(any(AnyValueVariant::StringValue("body".into()))),
+                        vec![attr_kv("deep", nested_array(arrays, empty_kvlist.clone()))],
+                        1,
+                    )],
+                )],
+            )]));
+            assert_eq!(out.records.len(), 1);
+            assert_eq!(
+                out.records[0].attrs.len(),
+                usize::from(admitted),
+                "{arrays}"
+            );
+            assert_eq!(
+                out.rejected.is_empty(),
+                admitted,
+                "{arrays}: {:?}",
+                out.rejected
+            );
+        }
+    }
+
+    /// An array of `n` empty arrays: zero bytes under the value-length limit
+    /// however large `n` is. Built with one `vec!`, so linear in `n`.
+    fn wide_array(n: usize) -> AnyValue {
+        let empty = any(AnyValueVariant::ArrayValue(ArrayValue { values: vec![] }));
+        any(AnyValueVariant::ArrayValue(ArrayValue {
+            values: vec![empty; n],
+        }))
+    }
+
+    /// The entry cap as a count of `wide_array` elements.
+    const ENTRY_CAP: usize = MAX_ATTR_ENTRIES as usize;
+
+    fn too_many_entries(key: &str) -> LogRejection {
+        LogRejection::AttributeTooManyEntries {
+            key: key.to_string(),
+            max: ENTRY_CAP,
+        }
+    }
+
+    /// A resource attribute holding one entry past the segment decoders'
+    /// entry cap rejects every record under its resource and leaves a sibling
+    /// resource admitted; at the cap it is admitted and its `stream_attrs`
+    /// blob decodes under the segment format's own decoder.
+    #[test]
+    fn resource_attribute_past_the_entry_cap_rejects_its_group() {
+        let body = |s: &str| Some(any(AnyValueVariant::StringValue(s.into())));
+        let wide = resource_logs(
+            vec![attr_kv("wide", wide_array(ENTRY_CAP + 1))],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(body("a"), vec![], 1), record(body("b"), vec![], 2)],
+            )],
+        );
+        let sibling = resource_logs(
+            vec![string_kv("service.name", "ok")],
+            vec![scope_logs("lib", "1", vec![record(body("c"), vec![], 3)])],
+        );
+        let out = normalize(request(vec![wide, sibling]));
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].body, "c");
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::Grouped {
+                reason: Box::new(too_many_entries("wide")),
+                count: 2,
+            }]
+        );
+        assert_eq!(out.rejected[0].rejected_count(), 2);
+        assert_eq!(
+            out.rejected[0].to_string(),
+            "attribute wide holds an array or kvlist of more than 1048576 entries \
+             (rejecting 2 log records under it)"
+        );
+
+        let at = resource_logs(
+            vec![attr_kv("wide", wide_array(ENTRY_CAP))],
+            vec![scope_logs("lib", "1", vec![record(body("a"), vec![], 1)])],
+        );
+        let out = normalize(request(vec![at]));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records.len(), 1);
+        let decoded = ravel_logseg::record::decode_stream_attrs(&out.records[0].stream_attrs)
+            .expect("a resource attribute at the entry cap decodes");
+        match &decoded.resource[..] {
+            [(key, AttrValue::List(items))] => {
+                assert_eq!(key, "wide");
+                assert_eq!(items.len(), ENTRY_CAP);
+            }
+            other => panic!("expected the one wide list, got {} entries", other.len()),
+        }
+    }
+
+    /// A scope attribute one entry past the cap rejects every record under
+    /// that scope and leaves a sibling scope admitted.
+    #[test]
+    fn scope_attribute_past_the_entry_cap_rejects_its_group() {
+        let mut bad = scope_logs(
+            "bad",
+            "1",
+            vec![record(
+                Some(any(AnyValueVariant::StringValue("a".into()))),
+                vec![],
+                1,
+            )],
+        );
+        if let Some(scope) = bad.scope.as_mut() {
+            scope.attributes = vec![attr_kv("wide", wide_array(ENTRY_CAP + 1))];
+        }
+        let good = scope_logs(
+            "good",
+            "1",
+            vec![record(
+                Some(any(AnyValueVariant::StringValue("b".into()))),
+                vec![],
+                2,
+            )],
+        );
+        let out = normalize(request(vec![resource_logs(vec![], vec![bad, good])]));
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].body, "b");
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::Grouped {
+                reason: Box::new(too_many_entries("wide")),
+                count: 1,
+            }]
+        );
+    }
+
+    /// A record attribute one entry past the cap is dropped on its own: the
+    /// record and its sibling attribute are kept, and the drop costs no
+    /// record. At the cap the attribute is kept.
+    #[test]
+    fn record_attribute_past_the_entry_cap_is_dropped_and_its_record_kept() {
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![
+                        attr_kv("wide", wide_array(ENTRY_CAP + 1)),
+                        string_kv("ok", "1"),
+                    ],
+                    1,
+                )],
+            )],
+        )]));
+        assert_eq!(out.records.len(), 1);
+        // Keys first, so a failure does not print a million-entry value.
+        let keys: Vec<&str> = out.records[0]
+            .attrs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(keys, ["ok"]);
+        assert_eq!(
+            out.records[0].attrs,
+            vec![("ok".to_string(), AttrValue::Str("1".into()))]
+        );
+        assert_eq!(out.rejected, vec![too_many_entries("wide")]);
+        assert_eq!(out.rejected[0].rejected_count(), 0);
+
+        let out = normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![attr_kv("wide", wide_array(ENTRY_CAP))],
+                    1,
+                )],
+            )],
+        )]));
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        match &out.records[0].attrs[..] {
+            [(key, AttrValue::List(items))] => {
+                assert_eq!(key, "wide");
+                assert_eq!(items.len(), ENTRY_CAP);
+            }
+            other => panic!("expected the one wide list, got {} attributes", other.len()),
         }
     }
 
