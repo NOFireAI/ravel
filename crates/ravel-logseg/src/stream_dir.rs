@@ -339,7 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_encoder_allocates_its_buffer_once() {
+    fn borrowed_encoder_sizes_its_buffer_exactly() {
         for n in [0usize, 1, 50] {
             let raw: Vec<(u32, Vec<u8>, u32, u32)> = (0..n as u32)
                 .map(|i| (i, vec![b'x'; (i as usize) % 7], i, i + 1))

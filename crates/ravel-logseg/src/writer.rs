@@ -627,8 +627,10 @@ impl RlogWriter {
                 &mut stamp,
             )?);
         }
-        // Last read: every record resolved against its stream's seed above.
+        // Last read: every record resolved against its stream's seed above,
+        // through the one stamp scratch.
         drop(stream_seeds);
+        drop(stamp);
         match &cluster {
             None => rows.sort_by(|a, b| {
                 a.stream_ref
@@ -642,6 +644,8 @@ impl RlogWriter {
                 rows = permute(rows, &perm)?;
             }
         }
+        // Last read of the clustering key values.
+        drop(key_values);
 
         // Chunk into blocks by record target and an estimated byte cap.
         let block_spans = chunk_blocks(&rows, &self.cfg);
@@ -1392,6 +1396,8 @@ impl RlogWriter {
                 perm
             }
         };
+        // Last read of the clustering key values.
+        drop(key_values);
 
         // Chunk into blocks, reproducing chunk_blocks/row_estimate. The dynamic
         // part is precomputed in `g_est_dyn`; the rest is byte-identical.
