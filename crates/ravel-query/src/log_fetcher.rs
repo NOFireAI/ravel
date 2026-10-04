@@ -7411,16 +7411,16 @@ fn from_cache_error(
         // `BudgetRefused`. Handled explicitly rather than through a wildcard
         // so a future budget check added here cannot silently fall through
         // as a store error.
-        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::BudgetRefused {
-            key,
-            message,
-        }) => LogFetchError::Store {
-            key,
-            source: StoreError::Transient(format!(
-                "cache single-flight closure reported a budget refusal, which the RLOG funnel \
-                 never produces: {message}"
-            )),
-        },
+        SingleFlightError::Upstream(crate::fetcher::CacheFetchError::BudgetRefused) => {
+            LogFetchError::Store {
+                key: key.to_string(),
+                source: StoreError::Transient(
+                    "cache single-flight closure reported a budget refusal, which the RLOG \
+                     funnel never produces"
+                        .to_string(),
+                ),
+            }
+        }
         SingleFlightError::LeaderLost => LogFetchError::Store {
             key: key.to_string(),
             source: StoreError::Transient(

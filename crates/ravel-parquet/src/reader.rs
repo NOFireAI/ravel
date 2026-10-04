@@ -227,7 +227,7 @@ impl PinnedParquetReader {
             let followed_a_refusal = matches!(
                 fetched,
                 Err(SingleFlightError::Upstream(
-                    CacheFetchError::BudgetRefused { .. }
+                    CacheFetchError::BudgetRefused
                 ))
             ) && refused
                 .lock()
@@ -311,13 +311,8 @@ impl PinnedParquetReader {
                 let admission = match limits.admit(&phases, phase, end - start) {
                     Ok(admission) => admission,
                     Err(err) => {
-                        let message =
-                            "the query's request or byte budget refused this read".to_string();
                         *refused.lock().unwrap_or_else(PoisonError::into_inner) = Some(err);
-                        return Err(CacheFetchError::BudgetRefused {
-                            key: file.key_str(),
-                            message,
-                        });
+                        return Err(CacheFetchError::BudgetRefused);
                     }
                 };
                 let read = file
@@ -376,7 +371,7 @@ impl PinnedParquetReader {
             // a refused flight: the attempts are capped, so the last
             // unconsulted refusal is reported the same shape a store error
             // would be, rather than retried again.
-            SingleFlightError::Upstream(CacheFetchError::BudgetRefused { .. }) => {
+            SingleFlightError::Upstream(CacheFetchError::BudgetRefused) => {
                 ParquetReadError::Store {
                     key,
                     source: Arc::new(StoreError::Transient(
