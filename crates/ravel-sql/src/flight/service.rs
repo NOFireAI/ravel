@@ -442,13 +442,9 @@ impl FlightSqlService for RavelFlightSqlService {
         )?;
 
         // Step 2: resolve exactly once. For the signal tables this snapshot,
-        // and only this snapshot, is what DoGet will execute against. A
-        // Parquet table is pinned by the version of the manifest this resolve
-        // read, which the ticket carries: DoGet reads exactly that manifest
-        // object, so a table replaced between the RPCs streams the schema this
-        // FlightInfo advertised (#2054, #2240). The tenant's grants are not
-        // pinned: DoGet reads them again, and a grant removed between the two
-        // RPCs fails it with `LocationNotGranted` (ADR-2040 D3).
+        // and only this snapshot, is what DoGet will execute against. Parquet
+        // tables are pinned by manifest version: see the module doc of
+        // `flight` (mod.rs), "The two-RPC problem, and the pin".
         //
         // This accounting handle covers this RPC's resolve and logical plan.
         // DoGet (crate::flight::stream) builds its own handle for the execution
