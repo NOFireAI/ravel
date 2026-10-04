@@ -438,12 +438,14 @@ impl QueryBackend for ServiceBackend {
             .map_err(failure)?;
 
         let mut envelope = self.sql_base(request);
-        // A result the JSON encoding cannot hold is the class `/api/v1/sql`
-        // gives it, not an internal fault; anything else is one.
+        // A result the JSON encoding cannot hold is the caller's choice of
+        // column, not an internal fault; anything else is one.
         let output = outcome.output.to_json().map_err(|error| match error {
-            error @ ravel_sql::SqlError::UnencodableResult { .. } => {
-                failure(ServiceError::from_sql(error, tenant_hash))
-            }
+            ravel_sql::SqlError::UnencodableResult {
+                column,
+                data_type,
+                reason,
+            } => d4::unencodable_sql_result(&column, &data_type, reason),
             error => d4::internal(format!("sql result encoding: {error}")),
         })?;
         envelope.data = d4::sql_data(&output);

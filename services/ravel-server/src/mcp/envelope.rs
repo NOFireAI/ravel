@@ -237,6 +237,21 @@ pub(crate) fn internal(message: String) -> Failure {
     }
 }
 
+/// An SQL result cell the JSON encoding cannot hold. The message names the
+/// column, its Arrow type and the fixed reason, never the value. It names the
+/// remedies this caller has, since `/mcp` returns no Arrow IPC.
+pub(crate) fn unencodable_sql_result(column: &str, data_type: &str, reason: &str) -> Failure {
+    Failure {
+        class: FailureClass::Unsupported,
+        message: format!(
+            "column \"{column}\" of type {data_type} cannot be encoded as JSON: {reason}; \
+             cast the column in the query to a type JSON can hold, or read it over \
+             /api/v1/sql with the Arrow IPC format"
+        ),
+        counter: None,
+    }
+}
+
 /// The `budget` block of an operation that reports an estimate but no spend of
 /// its own.
 ///
