@@ -44,6 +44,13 @@ pub const SPAN_SEGMENT_FORMAT_VERSION: u16 = ravel_rspan::footer::VERSION;
 /// Nanoseconds per hour, the unit `ingest_hour_bucket` counts in.
 pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
+/// `d` in nanoseconds, saturating at `i64::MAX`. `as i64` would wrap a
+/// duration past about 292 years to a negative count, which every threshold
+/// comparison then reads as already elapsed.
+fn duration_nanos_saturating(d: Duration) -> i64 {
+    i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
+}
+
 /// Reserve `strict_visibility_budget_ns` must exceed `max_flush_delay` by
 /// (ADR-0076 decision 4): two PUT round trips (data object, then commit
 /// record) plus one retry's base backoff, with margin. `visibility_ceiling_ns`
@@ -442,15 +449,15 @@ pub(crate) fn idle_age_threshold(
     config: &IngestConfig,
 ) -> (i64, FlushTrigger) {
     if config.idle_flush_byte_floor > 0 && flush_est_bytes < config.idle_flush_byte_floor {
-        let lifetime_ns = config.max_flush_lifetime.as_nanos() as i64;
-        let tick_ns = config.flush_tick.as_nanos() as i64;
+        let lifetime_ns = duration_nanos_saturating(config.max_flush_lifetime);
+        let tick_ns = duration_nanos_saturating(config.flush_tick);
         (
             lifetime_ns.saturating_sub(tick_ns).max(0),
             FlushTrigger::AgeFloor,
         )
     } else {
         (
-            config.max_flush_delay_idle.as_nanos() as i64,
+            duration_nanos_saturating(config.max_flush_delay_idle),
             FlushTrigger::Age,
         )
     }
@@ -771,16 +778,16 @@ impl IngestConfig {
     /// `idle_flush_byte_floor`, and a buffer held under that floor is not
     /// bounded by the cap.
     pub fn flush_trigger_age_bound_ns(&self) -> i64 {
-        let fast_ns = self.max_flush_delay.as_nanos() as i64;
-        let idle_ns = self.max_flush_delay_idle.as_nanos() as i64;
+        let fast_ns = duration_nanos_saturating(self.max_flush_delay);
+        let idle_ns = duration_nanos_saturating(self.max_flush_delay_idle);
         let mut threshold_ns = fast_ns.max(idle_ns);
         if self.adaptive_flush_delay {
             let widest_ns = self
                 .strict_visibility_budget_ns
-                .saturating_sub(self.put_retry_base_delay.as_nanos() as i64);
+                .saturating_sub(duration_nanos_saturating(self.put_retry_base_delay));
             threshold_ns = threshold_ns.max(widest_ns);
         }
-        threshold_ns.saturating_add(self.flush_tick.as_nanos() as i64)
+        threshold_ns.saturating_add(duration_nanos_saturating(self.flush_tick))
     }
 
     /// How long a refused flush trigger may stay deferred before its shard
@@ -805,7 +812,7 @@ impl IngestConfig {
     pub fn flush_deferral_cap_ns(&self) -> i64 {
         let slack_ns = i64::from(ravel_catalog::FLUSH_BOUND_SLACK_HOURS) * NS_PER_HOUR;
         slack_ns
-            .saturating_sub(self.max_flush_lifetime.as_nanos() as i64)
+            .saturating_sub(duration_nanos_saturating(self.max_flush_lifetime))
             .saturating_sub(self.flush_trigger_age_bound_ns())
             .max(0)
     }
@@ -1083,6 +1090,51 @@ mod tests {
             ..shipped
         };
         assert_eq!(spent.flush_deferral_cap_ns(), 0);
+    }
+
+    /// A delay past `i64::MAX` nanoseconds (about 292 years) saturates the
+    /// trigger bound at `i64::MAX` and the deferral cap at 0. Truncated, a
+    /// 1000-year delay wraps negative, the bound falls back to the other
+    /// clock, and the cap comes out positive while every buffer's age is
+    /// compared against a negative threshold.
+    #[test]
+    fn a_delay_past_i64_nanos_saturates_the_bound_and_the_cap() {
+        let shipped = IngestConfig::default();
+        let millennium = Duration::from_secs(1000 * 365 * 86_400);
+        let just_past = Duration::from_nanos(i64::MAX as u64 + 1);
+        let at_max = Duration::from_nanos(i64::MAX as u64);
+        for delay in [millennium, just_past, at_max] {
+            let fast = IngestConfig {
+                max_flush_delay: delay,
+                ..shipped
+            };
+            assert_eq!(fast.flush_trigger_age_bound_ns(), i64::MAX, "{delay:?}");
+            assert_eq!(fast.flush_deferral_cap_ns(), 0, "{delay:?}");
+            let idle = IngestConfig {
+                max_flush_delay_idle: delay,
+                ..shipped
+            };
+            assert_eq!(idle.flush_trigger_age_bound_ns(), i64::MAX, "{delay:?}");
+            assert_eq!(idle.flush_deferral_cap_ns(), 0, "{delay:?}");
+            assert_eq!(idle_age_threshold(0, &idle), (i64::MAX, FlushTrigger::Age));
+        }
+        let lifetime = IngestConfig {
+            max_flush_lifetime: millennium,
+            ..shipped
+        };
+        assert_eq!(lifetime.flush_deferral_cap_ns(), 0);
+        let tick = IngestConfig {
+            flush_tick: millennium,
+            ..shipped
+        };
+        assert_eq!(tick.flush_trigger_age_bound_ns(), i64::MAX);
+        assert_eq!(tick.flush_deferral_cap_ns(), 0);
+        let wide_retry = IngestConfig {
+            adaptive_flush_delay: true,
+            put_retry_base_delay: millennium,
+            ..shipped
+        };
+        assert_eq!(wide_retry.flush_trigger_age_bound_ns(), 40_200_000_000);
     }
 
     #[test]
