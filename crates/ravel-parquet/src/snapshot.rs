@@ -223,9 +223,10 @@ async fn snapshot_with_limit(
 /// that is correct whatever the real size is, so `size` has no bearing on
 /// it. On a store without it, `size` shapes where that first explicit-range
 /// read lands; a stale `size` costs one retry rather than a misplaced read
-/// (see [`read_file`]). A `size` of 0, or one that over-reports by more than
-/// [`FOOTER_PREFETCH`] so the range starts past the object's end, leaves no
-/// range to issue; that read recovers through one HEAD instead (see
+/// (see [`read_file`]). A `size` of 0, or one that over-reports by
+/// [`FOOTER_PREFETCH`] or more so the range starts at or past the object's
+/// end, leaves no range to issue; that read recovers through one HEAD
+/// instead (see
 /// [`head_corrected_read`]).
 struct Candidate {
     key: String,
@@ -515,7 +516,7 @@ fn tail_range(size: u64) -> FooterRange {
 ///
 /// A `listed_size` of 0 is not evidence the object is empty: it issues no
 /// zero-length range at all. Nor is a `listed_size` that over-reports by
-/// more than `FOOTER_PREFETCH`, which would place the range past the
+/// `FOOTER_PREFETCH` or more, which would place the range at or past the
 /// object's real end; the store refuses that one client-side as
 /// `InvalidRange`, before any size can be compared. Both recover through
 /// [`head_corrected_read`].
@@ -1265,7 +1266,7 @@ mod tests {
 
     /// Without `suffix_range`, a listing that reports size 0 for a
     /// non-empty file leaves no range to request at all, and one that
-    /// over-reports by more than `FOOTER_PREFETCH` places the range past
+    /// over-reports by `FOOTER_PREFETCH` or more places the range at or past
     /// the object's real end, which the store refuses client-side as
     /// `InvalidRange` before any size can be compared. Neither is evidence
     /// the object is empty: both now snapshot the file correctly, recovered
