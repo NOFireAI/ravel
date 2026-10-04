@@ -230,7 +230,8 @@ same number, the store accepts one; the loser sees the conflict, re-reads
 the new version, and re-applies its own intent to it (D2). A table's
 history is therefore a total order with no lost update. There is no
 mutable HEAD: resolving a table is a LIST of `v/` and a GET of the newest
-manifest, both charged to the Resolve phase. `sweep` (see Lifecycle under
+manifest at or below the version bound (see the version bound amendment
+below), both charged to the Resolve phase. `sweep` (see Lifecycle under
 Consequences) deletes superseded versions, so the LIST stays short.
 
 ### D2. SQL defines tables over granted locations
@@ -1059,3 +1060,131 @@ Patterns that reach every table, such as `t/*/pq/t/*`, grant the tenant's
 whole table space on purpose and are skipped; segments that follow a
 wildcard but cannot reach a manifest (`prov`, `config`, `snap` under
 `catalog/*/`) are not reserved.
+
+## Amendment (2026-10-04): manifest versions are bounded, and a repair command removes forged ones
+
+<!-- amendment-applies: sections="D1. A table is a pinned snapshot of Parquet files where they already are" pointer="version bound amendment" -->
+
+D1 made a table's state its newest manifest version, whatever its number.
+Since DDL over HTTP, the Query role holds a create-only write on
+`t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm`, and nothing in that
+grant limits the version. A stolen Query credential could put a version at
+`u64::MAX`; every later DDL on the table then failed with a version
+overflow, so the table could be neither dropped nor created again. This is
+item 2 of issue #2430.
+
+**The bound.** `MAX_MANIFEST_VERSION` in `crates/ravel-pqtable/src/keys.rs`
+is 2^32 (4294967296). Versions are dense: each DDL statement writes exactly
+the next one, so a table reaches the bound only after 2^32 statements, more
+than a century at one statement per second. The `u64` version and the
+20-digit key are unchanged: the bound is a check on values, not a format
+change, so no key this build writes or reads is new.
+
+**Writers.** `writer::apply` refuses to write a version above the bound
+with `WriteError::VersionAboveBound`, which names the table, the version and
+the bound, before any put. An intent that writes nothing (`IF NOT EXISTS` on
+an existing table, `IF EXISTS` on a missing one) is still a no-op. HTTP DDL
+answers it 422 with that message, the class it uses for a well-formed
+statement it refuses (`DdlErrorClass::Unsupported`), not 500.
+
+**Keys that name no version.** The Query grant spells the version as 20
+single-character wildcards, but its `*` binds any run of segments before
+`/v/`, so it also admits a `.pqm` key under a table's `v/` prefix whose slot
+is not a version in `1..=u64::MAX`: the wrong length, an extra path segment
+(such as `t/<tenant_hash>/pq/t/hits/v/q/v/<20 digits>.pqm`, where the `*`
+binds `hits/v/q`), 20 digits above `u64::MAX`, twenty zeros, or characters
+that are not all digits. `keys::parse_listed_manifest_key` names such a key
+`ListedManifestKey::InvalidVersion` instead of refusing it, and every
+listing treats it exactly like a version above the bound: `resolve::versions`
+(and so `resolve::newest`), `resolve::tables` and the sweep's listing skip
+it, count it and warn about it as below, and never fail on it. Before this,
+one such key failed every query and DDL statement on its table and every
+`parquet ls` and `parquet sweep` of its tenant.
+
+**Readers.** `resolve::newest` resolves the highest version at or below the
+bound and never reads one above it or a key that names no version. Both SQL
+resolves (`first_live_table` and `resolve_tables` in
+`crates/ravel-sql/src/parquet.rs`) and the writer go through it, so a writer
+numbers from the newest version at or below the bound and a forged version
+above the bound no longer blocks DDL. A forged newest version does not win
+even where ignoring it serves an older definition: that is the intended
+behaviour, since letting it win hands the table to whoever put it. A table
+whose only versions are above the bound is no table. Each listing that finds
+a version above the bound or a key that names no version is counted per
+table (`resolve::above_bound_resolves`), and the first one in a process is
+logged at `warn` as a `resolve::AboveBoundVersions`, which names the tenant
+hash, the table, how many keys, the highest key's version characters (the
+text between `v/` and `.pqm`, escaped, since whoever put the key chose
+them), the bound and the repair command. The count is kept for at most
+`resolve::ABOVE_BOUND_TABLES_MAX` (4096) tables per process; past that a
+listing of a new table is not counted per table, so the map cannot grow with
+the number of tables someone forges keys under, and is warned about on one in
+every `resolve::ABOVE_BOUND_WARN_EVERY` (1024) such listings, so the log
+cannot grow with them either. A Flight ticket pin above the bound is refused as
+`PinnedManifestGone` before any read. `ravel-cli parquet ls` prints each
+table's newest version at or below the bound, with `--table` every version
+at or below it, reads neither kind of skipped key, and says when either
+exists.
+
+**Sweep.** `sweep::plan` leaves versions above the bound and keys that name
+no version out of the listing it pairs versions in, so none is a successor:
+neither can make the sweep delete the legitimate versions beneath it, and
+the sweep does not delete either.
+
+**Repair.** `ravel-cli parquet repair --tenant <t> --table <name>` lists
+every key under the table's `v/` prefix, escaped, with the time the store
+wrote it (its listing `last_modified`, which whoever put the key cannot
+choose), `created_by` and `statement`, and flags the versions above the bound
+and the keys that name no version (above `u64::MAX`, zero, not digits). With
+`--delete` it deletes exactly the flagged keys (`repair::delete_flagged`),
+checking every key before the first delete and refusing any other with
+`RepairError::NotFlagged`. With `--delete-version N` it deletes exactly the
+key of version N (`repair::delete_version`): N must be from 1 to the bound
+(zero and versions above it are the `--delete` path, refused with
+`RepairError::VersionOutOfRange` before any store call), the key must be in
+the listing (`RepairError::NotListed` otherwise), and nothing else is
+deleted. Without either flag it deletes nothing. It runs under the Maintain
+credential, whose `MaintainDelete` statement grants `s3:DeleteObject` on
+`t/*/pq/t/*` and whose `MaintainList` statement grants the `t/*/pq/t/*`
+listing. Maintain reads no manifest (`MaintainRead` has no grant under
+`t/*/pq/`), so which versions are flagged is decided from the listing alone,
+and the command reports `created_by` and `statement` as unreadable under it;
+running it without a delete flag under a credential that may read manifests,
+such as Query, shows them.
+
+**A forged version at or below the bound.** The bound removes the automatic
+wedge from versions above 2^32 and from keys that name no version. It does
+not stop a wedge: a forged version put exactly at the bound leaves the writer
+no next version, so every later DDL on the table is refused with
+`VersionAboveBound`, and whatever bound the writer used, a version forged at
+it would do the same. A forged version below the bound that is the table's
+highest is its newest, so it serves as the table. Neither is flagged, since
+nothing in the key tells it apart. Every such wedge is recoverable instead:
+an operator removes the version with `--delete-version`, after which the
+writer numbers from the newest version beneath it. What tells the operator
+the version is forged is the DDL audit log: every statement the server runs
+writes an `attempted` audit record before any store call (the DDL over HTTP
+amendment above), so a manifest version with no matching `attempted` record
+for that tenant and table, at or shortly before the store's write time, was
+not written by the server. That holds under `--audit-mode required`, the
+default; under `best-effort` a statement can run without its record.
+
+**What stays open.** The bound tells a forged version from a legitimate one
+only by its number, so a forged version at or below it still blocks DDL or
+serves as the table until an operator removes it with `--delete-version`
+after checking the audit log. Versions above the bound and keys that name no
+version cost every reader: the sweep never removes them, and every
+`resolve::newest` pages through all of them into memory, so one credential
+can make every resolve of a table arbitrarily expensive until
+`parquet repair --delete` removes them. A key whose segment between `pq/t/`
+and `/v/` is not a single valid table name (such as
+`t/<tenant_hash>/pq/t/a/b/v/<20 chars>.pqm`, which the Query grant's `*`
+admits) is still refused as foreign by the tenant-wide listings, so it fails
+`parquet ls` and `parquet sweep` for the whole tenant, though no table's
+resolve; validating that segment is issue #2510. A key whose extra segments
+sit under a valid table's own `v/` prefix, by contrast, is now a key that
+names no version, skipped and flagged like the rest. Narrowing the Query
+grant, item 1 of issue #2430, remains the root
+fix for all of these; until then the sweep also still deletes predecessors
+on the word of a manifest no one can attribute, when that manifest is at or
+below the bound.

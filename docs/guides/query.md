@@ -584,6 +584,14 @@ statement's object-store requests and bytes are not in the response and not
 in the per-query cost family; `/metrics` reports them per phase in the
 [`ravel_sql_ddl_*` families](observability.md#sql-ddl-statements-and-their-store-cost-ravel_sql_ddl_).
 
+Each statement that changes a table writes its next manifest version, and no
+statement writes one above 4294967296 (2^32): one that would is refused with
+a 422 naming the table, the version and that bound. A version above the bound
+can only have been put into the bucket directly; queries and DDL ignore it and
+keep using the table's newest version at or below the bound, and an operator
+removes it with `ravel-cli parquet repair` (see
+[repairing a forged Parquet table version](operations/maintenance.md#repairing-a-forged-parquet-table-version)).
+
 ```sh
 curl -X POST http://127.0.0.1:4318/api/v1/sql \
   -H "Authorization: Bearer devtoken" \

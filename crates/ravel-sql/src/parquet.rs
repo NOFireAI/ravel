@@ -40,6 +40,7 @@ use ravel_parquet::{
     ReadServices, TenantParquetStore,
 };
 use ravel_pqtable::grants::{self, GrantsError};
+use ravel_pqtable::keys::MAX_MANIFEST_VERSION;
 use ravel_pqtable::manifest::Manifest;
 use ravel_pqtable::names::validate_table;
 use ravel_pqtable::resolve::{self, ResolveError};
@@ -842,7 +843,9 @@ pub(crate) async fn resolve_tables(
 /// A pinned version that is gone is [`ParquetQueryError::PinnedManifestGone`]:
 /// the newest version never stands in for it. A pinned version that is a drop
 /// is refused the same way, as a defensive check only, since `GetFlightInfo`
-/// pins live versions. The caller has checked that `pins` is not empty.
+/// pins live versions. So is a pin above [`MAX_MANIFEST_VERSION`], before any
+/// read: `GetFlightInfo` resolves through `resolve::newest`, which never
+/// returns one. The caller has checked that `pins` is not empty.
 pub(crate) async fn resolve_pinned_tables(
     sources: &ParquetSources,
     tenant: &TenantHash,
@@ -856,6 +859,9 @@ pub(crate) async fn resolve_pinned_tables(
             table: pin.table.clone(),
             version: pin.version,
         };
+        if pin.version > MAX_MANIFEST_VERSION {
+            return Err(gone());
+        }
         let manifest = resolve::read_version(&store, tenant, &pin.table, pin.version)
             .await
             .map_err(|source| ParquetQueryError::Resolve {
@@ -1090,6 +1096,68 @@ mod tests {
         ravel_object_store::external::load_profiles(&json)
             .expect("profile")
             .remove(0)
+    }
+
+    /// A Flight pin above the manifest version bound is refused as gone
+    /// before Ravel's store is read at all; one at the bound is read.
+    #[tokio::test]
+    async fn a_pin_above_the_version_bound_is_gone_without_a_read() {
+        use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
+        use ravel_object_store::memory::MemoryStore;
+
+        let ravel = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let sources = ParquetSources::new(
+            ravel.clone(),
+            None,
+            Arc::new(GetLimiter::new(8).expect("limiter")),
+            None,
+            DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+        );
+        let pins = [ParquetPin {
+            table: "hits".to_string(),
+            version: MAX_MANIFEST_VERSION + 1,
+        }];
+        let got = resolve_pinned_tables(
+            &sources,
+            &TenantHash([7; 16]),
+            &pins,
+            &QueryAccounting::new(),
+        )
+        .await;
+        assert!(
+            matches!(
+                &got,
+                Err(ParquetQueryError::PinnedManifestGone { table, version })
+                    if table == "hits" && *version == MAX_MANIFEST_VERSION + 1
+            ),
+            "{:?}",
+            got.err()
+        );
+        assert_eq!(ravel.metrics().snapshot().op(StoreOp::Get).calls, 0);
+
+        // A pin exactly at the bound is inside it, so it is read; this store
+        // holds no such version, so the read finds it gone.
+        let pins = [ParquetPin {
+            table: "hits".to_string(),
+            version: MAX_MANIFEST_VERSION,
+        }];
+        let got = resolve_pinned_tables(
+            &sources,
+            &TenantHash([7; 16]),
+            &pins,
+            &QueryAccounting::new(),
+        )
+        .await;
+        assert!(
+            matches!(
+                &got,
+                Err(ParquetQueryError::PinnedManifestGone { version, .. })
+                    if *version == MAX_MANIFEST_VERSION
+            ),
+            "{:?}",
+            got.err()
+        );
+        assert_eq!(ravel.metrics().snapshot().op(StoreOp::Get).calls, 1);
     }
 
     /// `ProfileStores` opens one store per (profile, bucket), the first time
