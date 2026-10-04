@@ -1350,8 +1350,8 @@ struct BlockMetrics {
     prefetch_memory_reopens: Count,
     /// Unconsumed prefetches, of any partition of the statement, that this
     /// partition's refused opens dropped ([`PrefetchPool::revoke_all`]). Each
-    /// dropped prefetch's segment went back to its owner's work and was
-    /// opened again at its turn.
+    /// dropped prefetch's segment goes back to its owner's work, to be opened
+    /// again at its turn.
     prefetch_revocations: Count,
     /// Wall time in the synchronous decode and Arrow build sites inside
     /// `poll_next`: `next_block_columnar` plus `build_columnar_batches` on the
