@@ -52,8 +52,14 @@ const TOTAL_RECORDS: i64 = (SHARDS * OBJECTS_PER_SHARD) as i64 * RECORDS_PER_OBJ
 /// The statement window `[0 s, WINDOW_END_HOUR h]`. At [`SHARDS`] shards the
 /// resolve estimates at least `4 * 201 = 804` suffix buckets, at or above the
 /// default `prefix_list_crossover_requests` (720), so it takes the prefix path
-/// with no crossover override.
+/// with no crossover override. The assertion below fails the build if that
+/// default moves above this fixture; it does not detect a change to how the
+/// path is chosen.
 const WINDOW_END_HOUR: i64 = 200;
+const _: () = assert!(
+    SHARDS as u64 * (WINDOW_END_HOUR as u64 + 1)
+        >= ravel_catalog::DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS
+);
 const SQL: &str = "SELECT COUNT(*) FROM logs";
 
 fn tenant_hash() -> TenantHash {
@@ -532,11 +538,15 @@ async fn sql_missing_catalog_head_is_read_once_through_http() {
 /// statement that finds the audit pipeline idle returns well inside 5 s, after
 /// exactly one audit data-object PUT and one audit commit-record PUT.
 ///
-/// The second half is the control. On a fresh server, a second statement
-/// submitted while the first one's audit flush is in flight is not idle: the
-/// loop opens a full `max_age` window for it, so it is still pending 5 s after
-/// the first returned. A loop that always waited `max_age` would make the
-/// first statement look like the second.
+/// The second half is the control. On a fresh server, a second statement that
+/// follows the first within `max_age` is not idle: the loop opens a full
+/// `max_age` window for it, so it is still pending 5 s after the first
+/// returned. The test does not order the second statement's audit submission
+/// against the first one's held flush, so which idle condition refuses it is
+/// not pinned here: at least the previous-event gap does, since the first
+/// event was received less than `max_age` earlier. The in-flight-flush
+/// condition has its own test in `ravel-maintain`. A loop that always waited
+/// `max_age` would make the first statement look like the second.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_idle_audit_event_flushes_without_waiting_max_age() {
     let max_age = Duration::from_secs(10);
@@ -588,13 +598,15 @@ async fn sql_idle_audit_event_flushes_without_waiting_max_age() {
     assert_counts_every_record(status, &value);
 
     let mut second = second;
-    // hygiene-allow: wall-clock -- a lower bound the server's own max_age
-    // window guarantees: tokio timers never fire early.
+    // hygiene-allow: wall-clock -- a lower bound: the second event's max_age
+    // window opens when the loop receives it, after the held flush returns, and
+    // tokio timers never fire early. A stall of `bound` or more between the
+    // release above and this timeout would make it a false red.
     let pending = tokio::time::timeout(bound, &mut second).await;
     assert!(
         pending.is_err(),
-        "a statement submitted during an in-flight audit flush is not idle and \
-         must wait max_age ({max_age:?}), but it returned within {bound:?}"
+        "a statement that follows another within max_age ({max_age:?}) is not \
+         idle and must wait its window, but it returned within {bound:?}"
     );
     let (status, value) = second.await.expect("second statement task");
     assert_counts_every_record(status, &value);
