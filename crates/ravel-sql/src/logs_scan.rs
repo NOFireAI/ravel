@@ -4732,6 +4732,9 @@ impl LogScanStream {
                                         } else {
                                             LogScanState::Rows(Box::new(scan))
                                         };
+                                        if let Err(e) = this.top_up_prefetch(cx) {
+                                            return this.fail(e);
+                                        }
                                     }
                                     Ok(None) => this.finish_segment(),
                                     Err(e) => {
@@ -4741,9 +4744,6 @@ impl LogScanStream {
                                     }
                                 }
                             }
-                        }
-                        if let Err(e) = this.top_up_prefetch(cx) {
-                            return this.fail(e);
                         }
                         continue;
                     }
@@ -4816,15 +4816,16 @@ impl LogScanStream {
                                     open_dirs,
                                 ))
                             };
-                            if let Err(e) = this.top_up_prefetch(cx) {
-                                return this.fail(e);
-                            }
                         }
                         None => {
                             this.state = LogScanState::Done;
                         }
                     }
                 }
+                // The current open is polled before the opens behind it are
+                // topped up, so its reservations go first; the top-up then
+                // runs whether it resolved or is still in flight, which keeps
+                // the next segments' round trips overlapping this one's.
                 LogScanState::Opening(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(Some(scan))) => {
                         this.retrying = false;
@@ -4837,6 +4838,9 @@ impl LogScanStream {
                         } else {
                             LogScanState::Rows(Box::new(scan))
                         };
+                        if let Err(e) = this.top_up_prefetch(cx) {
+                            return this.fail(e);
+                        }
                     }
                     // The segment's ts span could not satisfy the query: no GET
                     // was issued and there is nothing to drain.
@@ -4854,6 +4858,9 @@ impl LogScanStream {
                     }
                     Poll::Pending => {
                         this.blocks.open_pending_polls.add(1);
+                        if let Err(e) = this.top_up_prefetch(cx) {
+                            return this.fail(e);
+                        }
                         return Poll::Pending;
                     }
                 },
