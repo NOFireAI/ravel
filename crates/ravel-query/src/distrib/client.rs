@@ -7,11 +7,15 @@
 //! the identical [`SliceResponse`] shape, so the merge cannot tell a remote slice
 //! from a local one.
 //!
-//! No transport in this crate decodes a remote's log or span slice. The
-//! log and span fetches are the [`SliceFetcher`] trait defaults, which report
-//! [`pb::status::Code::Unsupported`] and send the coordinator to whole-query
-//! local execution. [`SliceFetcher::fetch_logs`] states what wiring either
-//! signal across the slice boundary owes.
+//! No transport in this crate decodes a remote's log or span slice in
+//! production (the SQL lane in `ravel-sql` has its own fan-out). The
+//! production log and span fetches are the [`SliceFetcher`] trait defaults,
+//! which report [`pb::status::Code::Unsupported`] and send the coordinator to
+//! whole-query local execution; only test fetchers override them, and only
+//! the test module's loopback fetcher decodes frames, with test-only bounded
+//! decoders.
+//! [`SliceFetcher::fetch_logs`] states what wiring either signal across the
+//! slice boundary in production owes.
 
 use ravel_logseg::LogRecord;
 use ravel_proto::queryfrag::v1 as pb;
@@ -53,8 +57,8 @@ pub enum DistribError {
     /// `PartialAggregate` (ADR-0103 decision 2) on a log or span slice, where a
     /// worker-computed scalar aggregate is never expected (the metrics decoder
     /// does consume it).
-    /// Unreachable from a real query today: this crate only ever dispatches
-    /// `Signal::Metrics` across the slice boundary (see
+    /// Unreachable from a production query: this crate only ever dispatches
+    /// `Signal::Metrics` across the slice boundary in production (see
     /// [`SliceFetcher::fetch_logs`] for why). The `frame` oneof is
     /// exhaustive, so every decoder must still name the variants: this is a
     /// well-formed frame this build does not consume, not corruption.
@@ -288,10 +292,14 @@ pub trait SliceFetcher: Send + Sync {
     /// ADR's silent version-skew fallback: an unimplemented log fetch is a
     /// coverage gap the coordinator fills locally, never a hard failure.
     ///
-    /// Nothing overrides it today, [`RemoteSliceFetcher`] included, so no
-    /// transport in this crate decodes a remote's log or span slice: issue
-    /// #1912 deleted the whole-sequence decoders that did
-    /// (`decode_log_slice_frames` and `decode_span_slice_frames`). An override
+    /// No production fetcher overrides it, [`RemoteSliceFetcher`] included, and
+    /// no production caller dispatches `Distributed::fetch_logs`, so this crate
+    /// decodes no remote log slice in production: a log query in this lane runs
+    /// locally and never becomes a slice (the SQL lane in `ravel-sql` fans out
+    /// on its own). Only test fetchers override it; the test module's
+    /// `LoopbackSliceFetcher` is the one that decodes frames, driving the
+    /// fan-out end to end over a loopback worker with test-only bounded
+    /// decoders (ADR-0071, 2026-10-04 amendment). A production override
     /// has to decode the worker's [`pb::LogRecordFrame`]s incrementally under
     /// a per-slice frame and wire-byte cap, the way
     /// [`SliceStreamDecoder`](crate::distrib::SliceStreamDecoder) does for
@@ -310,9 +318,12 @@ pub trait SliceFetcher: Send + Sync {
     ///
     /// The default implementation reports [`pb::status::Code::Unsupported`], so
     /// a `SliceFetcher` that has not wired the span fetch path degrades to
-    /// whole-query local execution rather than erroring. Nothing overrides it
-    /// today, and an override carries the same bounded-decode obligation.
-    /// Mirrors [`fetch_logs`](Self::fetch_logs) exactly.
+    /// whole-query local execution rather than erroring. No production fetcher
+    /// overrides it and no production caller dispatches
+    /// `Distributed::fetch_spans`; only test fetchers override it, and only
+    /// the test module's loopback fetcher decodes frames, with a test-only
+    /// bounded decoder. A production override carries the same bounded-decode
+    /// obligation. Mirrors [`fetch_logs`](Self::fetch_logs) exactly.
     async fn fetch_spans(
         &self,
         _request: pb::FetchRequest,

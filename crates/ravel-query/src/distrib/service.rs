@@ -1403,7 +1403,11 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
         // coordinator sets it to the envelope of this slice's pinned segments, a
         // superset of every one of them, so the `TsRange` filter drops no record
         // a local read (over the whole-snapshot window) would keep. Erasure is
-        // threaded through the same funnel, applied per segment after decode.
+        // threaded through the same funnel, applied per segment after decode:
+        // the fetcher-level pre-filter `retain_log_records`, per-record
+        // attributes only. The authoritative merged-view exclusion
+        // (`retain_unerased_log_records`, ADR-0064 decision 2) is the reader's
+        // job, not this slice's.
         let query = LogQuery::new(window_start_ns, window_end_ns).with_erasure(erasure);
 
         let mut records: Vec<ravel_logseg::LogRecord> = Vec::new();
@@ -1450,10 +1454,10 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             });
         }
         // The record count rides the summary's `series_returned` field (reused
-        // per signal). No coordinator reads it back today: the client half of
-        // the log fan-out was deleted with the unbounded decoder it used
-        // (issue #1912), so this is the wire contract a bounded log decoder
-        // would have to honour, not something a live path consumes.
+        // per signal). No production coordinator reads it back: no production
+        // fetcher decodes a log slice (issue #1912), so in production this is
+        // the wire contract a bounded log decoder would have to honour. Only
+        // the test module's loopback fetcher consumes it today (issue #2508).
         frames.push(summary_frame(
             &accounting.snapshot(),
             records_returned,
@@ -1590,8 +1594,8 @@ impl<R: SegmentResolver + 'static> SeriesFetchService<R> {
             });
         }
         // The span count rides the summary's `series_returned` field (reused per
-        // signal). As on the log path above, no coordinator reads it back today
-        // (issue #1912).
+        // signal). As on the log path above, no production coordinator reads it
+        // back; only the test module's loopback fetcher does.
         frames.push(summary_frame(
             &accounting.snapshot(),
             spans_returned,
