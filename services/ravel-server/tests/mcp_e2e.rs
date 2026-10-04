@@ -809,4 +809,197 @@ mod with_mcp {
 
         running.shutdown().await.expect("server stops");
     }
+
+    /// Small, so the catalog's per-hour LIST fan-out over the SQL window stays
+    /// a handful of calls.
+    const SQL_NOW_NS: i64 = 4 * 3_600_000_000_000;
+
+    /// Publish one sample of metric `m` at `ts_ns` 1 for the test tenant, as a
+    /// real segment plus its commit record, so `samples` has a row to project.
+    async fn publish_one_sample(store: &dyn ObjectStoreBackend) {
+        use ravel_commit::publish::RetryPolicy;
+        use ravel_commit::record::NewCommitRecord;
+        use ravel_commit::{keys, publish, record};
+        use ravel_object_store::PutOptions;
+        use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
+        use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal};
+
+        let tenant = TenantId::new(TENANT);
+        let tenant_hash = tenant.hash();
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: "m".to_string(),
+        }])
+        .expect("valid labels");
+        let series = vec![SeriesInput {
+            series_id: SeriesId::compute(&tenant, "m", &labels).expect("series id"),
+            labels,
+            samples: vec![Sample {
+                ts_ns: 1,
+                value: 1.0,
+            }],
+        }];
+        let writer_id = uuid::Uuid::from_u128(2_000);
+        let written = SegmentWriter::write(
+            series,
+            SegmentIdentity {
+                tenant_hash: tenant_hash.0,
+                shard: 0,
+                writer_id: writer_id.to_string(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+            IngestBounds {
+                min_ingest_ts_ns: 0,
+                max_ingest_ts_ns: 0,
+            },
+        )
+        .expect("write segment");
+        let rec = record::build(NewCommitRecord {
+            tenant_hash,
+            signal: Signal::Metrics,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: written.bytes.len() as u64,
+            content_hash: written.summary.blake3,
+            sample_count: written.summary.sample_count,
+            series_count: written.summary.series_count,
+            min_event_ts_ns: written.summary.min_event_ts_ns,
+            max_event_ts_ns: written.summary.max_event_ts_ns,
+            min_ingest_ts_ns: written.summary.min_event_ts_ns,
+            max_ingest_ts_ns: written.summary.max_event_ts_ns,
+            segment_format_version: 1,
+            created_unix_ns: 10,
+            ingest_hour_bucket: 0,
+        })
+        .expect("valid commit record");
+        store
+            .put(
+                &keys::reconstruct_data_key(&rec).expect("data key"),
+                written.bytes,
+                PutOptions::default(),
+            )
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    /// A started server holding [`publish_one_sample`]'s row, and the
+    /// [`ServiceBackend`] the adapter hands `ravel_query_sql`'s body.
+    ///
+    /// Driven through the backend rather than the transport because
+    /// `ravel_query_sql` is in the catalog but not served by this build: a
+    /// `tools/call` for it answers `NotShipped` before any backend is reached.
+    /// The mapping under test is the backend's own `sql_execute`, which is the
+    /// call that tool body makes.
+    async fn sql_backend() -> (ravel_server::Running, ServiceBackend) {
+        let (store, metrics) = instrumented_memory();
+        publish_one_sample(store.as_ref()).await;
+        let running = start_server(store, metrics, mcp_on()).await;
+        let service = running
+            .query_service
+            .clone()
+            .expect("a query-serving mode builds one");
+        let budgets = McpRequestBudgets::default().clamp(
+            &ravel_query::EngineConfig::default(),
+            &McpBudgetConfig::default(),
+        );
+        (running, ServiceBackend::new(service, budgets))
+    }
+
+    fn sql_request(sql: &str) -> ravel_sql::SqlRequest {
+        ravel_sql::SqlRequest {
+            sql: sql.to_string(),
+            window: ravel_types::TimeRange {
+                start_ns: 0,
+                end_ns: SQL_NOW_NS,
+            },
+            min_tokens: Vec::new(),
+            now_ns: SQL_NOW_NS,
+            deadline: Duration::from_secs(30),
+            row_window: false,
+            max_rows: None,
+            budgets: None,
+        }
+    }
+
+    /// The MCP twin of `/api/v1/sql`'s
+    /// `a_result_json_cannot_encode_is_422_naming_the_column_and_arrow_ipc_reads_it`:
+    /// a `Date64` that is not a whole day has no JSON date, so the call fails
+    /// as `unsupported` naming the column, its type and the reason. The advice
+    /// is what an MCP caller can act on: `/mcp` has no Arrow IPC output, so
+    /// the HTTP message's "request the Arrow IPC format" must not appear, and
+    /// the value itself never does.
+    #[tokio::test]
+    async fn a_result_json_cannot_encode_is_unsupported_naming_the_column() {
+        const MILLIS: i64 = 1_700_000_000_123;
+        let (running, backend) = sql_backend().await;
+
+        let failure = backend
+            .sql_execute(
+                expected_tenant(),
+                &sql_request(&format!(
+                    "SELECT arrow_cast({MILLIS}, 'Date64') AS d FROM samples LIMIT 1"
+                )),
+            )
+            .await
+            .expect_err("a Date64 that is not a whole day has no JSON form");
+
+        assert_eq!(failure.class, FailureClass::Unsupported);
+        // The wire spelling a caller reads as `envelope["failure"]["class"]`.
+        let wire = serde_json::to_value(&failure).expect("a failure serializes");
+        assert_eq!(wire["class"], serde_json::json!("unsupported"));
+        assert_eq!(
+            failure.message,
+            "column \"d\" of type Date64 cannot be encoded as JSON: a JSON date must be a whole \
+             day from 0000-01-01 to 9999-12-31; cast the column in the query to a type JSON \
+             can hold, or read it over /api/v1/sql with the Arrow IPC format"
+        );
+        assert!(
+            !failure.message.contains(&MILLIS.to_string()),
+            "the message must not carry the value: {}",
+            failure.message
+        );
+        assert!(
+            !failure.message.contains("request the Arrow IPC format"),
+            "the HTTP advice has no MCP equivalent: {}",
+            failure.message
+        );
+
+        running.shutdown().await.expect("server stops");
+    }
+
+    /// The contrast: a `Date64` that is a whole day, through the same backend
+    /// call on the same fixture, encodes. So the failure above is the value's
+    /// JSON form, not the fixture, the type or the statement shape.
+    #[tokio::test]
+    async fn a_whole_day_date64_on_the_same_fixture_encodes() {
+        const WHOLE_DAY_MILLIS: i64 = 19_675 * 86_400_000;
+        let (running, backend) = sql_backend().await;
+
+        let envelope = backend
+            .sql_execute(
+                expected_tenant(),
+                &sql_request(&format!(
+                    "SELECT arrow_cast({WHOLE_DAY_MILLIS}, 'Date64') AS d FROM samples LIMIT 1"
+                )),
+            )
+            .await
+            .expect("a whole-day Date64 has a JSON date");
+
+        let envelope = serde_json::to_value(&envelope).expect("an envelope serializes");
+        assert_eq!(envelope["status"], serde_json::json!("ok"), "{envelope}");
+        assert_eq!(envelope["data"]["row_count"], serde_json::json!(1));
+        assert_eq!(
+            envelope["data"]["rows"],
+            serde_json::json!([["2023-11-14"]]),
+            "{envelope}"
+        );
+
+        running.shutdown().await.expect("server stops");
+    }
 }
