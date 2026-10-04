@@ -1,135 +1,145 @@
-# Ingest affinity: pinning a tenant to a subset of gateway replicas
+# Ingest affinity
 
-Ravel's object-storage bill is dominated by request charges, not stored bytes,
-and the number of requests scales with how many gateway replicas a tenant's
-writes land on. Ingest affinity pins each tenant to a small, stable subset of
-replicas so the same data is flushed once per subset instead of once per
-replica.
+Ingest affinity pins each tenant to a small, stable subset of gateway
+replicas. The same data is then flushed once per subset and not once per
+replica. Request charges, not stored bytes, dominate the object-storage bill
+of Ravel. The number of requests scales with the number of gateway replicas
+that the writes of a tenant land on.
 
-It changes no format, no contract, and no acknowledgement latency. It is
-configuration. The *routing mechanism* comes in layers: a deprecated
-ingress-nginx path, a Ravel-owned router, and a separate Gateway API exposure
-concept. The layers share the semantic contract this guide opens with.
+Affinity is configuration. It changes no format, no contract, and no
+acknowledgement latency. The *routing mechanism* comes in layers: a
+deprecated ingress-nginx path, a Ravel-owned router, and a separate Gateway
+API exposure concept. The layers share one semantic contract.
 
 ## Why it saves requests
 
-An ingest buffer is per `(tenant, signal, shard)` **per replica**. Every buffer
-flushes on its own age timer and every flush issues a data PUT plus a commit
-PUT. So a tenant whose exporters spray across all `R` gateway replicas keeps `R`
-independent flush streams alive for one logical stream of data, and pays `R`
-times the PUT pairs for it:
+An ingest buffer is per `(tenant, signal, shard)` **per replica**. Every
+buffer flushes on its own age timer, and every flush issues a data PUT plus a
+commit PUT. A tenant whose exporters reach all `R` gateway replicas keeps `R`
+independent flush streams alive for one logical stream of data. It pays `R`
+times the PUT pairs:
 
 ```
 PUTs/day = 2 x tenants x signals x shards x replicas x (86400 / age_threshold_s)
 ```
 
-Pinning a tenant to a subset of size `S` replaces `replicas` with `S` in that
-product for that tenant. At 10 replicas and the default subset of 2, that is a
-**5x reduction** in flush PUTs for every tenant, with no latency cost: each
-replica still acknowledges a strict write the moment its own commit PUT returns.
+A subset of size `S` replaces `replicas` with `S` in that product for that
+tenant. At 10 replicas and the default subset of 2, that is a
+**5x reduction** in flush PUTs for every tenant. There is no latency cost:
+each replica still acknowledges a strict write when its own commit PUT
+returns.
 
-The saving compounds with the other levers on the same bill (shard count,
+The saving multiplies with the other levers on the same bill (shard count,
 flush cadence), because they are different terms of the same product.
 
-Affinity narrows which *replicas* a tenant reaches, not which *shards*. Within
-a replica a tenant's series still hash across all of that replica's shards, so
-affinity does not isolate a tenant from a per-shard object-store stall: if one
-tenant's key prefix is being throttled (`503 SlowDown`, which the store applies
-per prefix), its stalled flush holds a permit on that shard and co-resident
-tenants' flushes queue behind it on every replica in the subset, and a smaller
-or different subset does not change that. The shard actor itself keeps running,
-so those tenants' writes are still accepted and their age triggers still fire;
-what they wait for is a permit to flush on. The control for
-cross-tenant flush isolation on a shard is `max_inflight_flushes`
-(docs/ingest.md "Shard actor"), not the subset size and not the shard count.
-Under the operator, set it with `spec.gateway.maxInflightFlushes` on the
-`RavelCluster` (see [kubernetes.md](kubernetes.md)), which renders
-`--max-inflight-flushes` onto the gateway Deployment; it defaults to 1.
+There is a read-side benefit too. Fewer, larger L0 objects mean fewer
+open-hour segments for a query to open, which lowers the per-query request
+budget.
 
-There is a read-side benefit too. Fewer, larger L0 objects mean fewer open-hour
-segments for a query to open, which lowers the per-query request budget.
+### Shards stay shared
+
+Affinity narrows which *replicas* a tenant reaches, not which *shards*.
+Within a replica, the series of a tenant still hash across all shards of
+that replica. Affinity therefore does not isolate a tenant from a per-shard
+object-store stall.
+
+The store applies `503 SlowDown` per key prefix. When the key prefix of one
+tenant is throttled, its stalled flush holds a permit on that shard. The
+flushes of co-resident tenants queue behind it on every replica in the
+subset. A smaller or different subset does not change that. The shard actor
+keeps running, so the writes of those tenants are still accepted and their
+age triggers still fire. They wait for a permit to flush on.
+
+The control for cross-tenant flush isolation on a shard is
+`max_inflight_flushes` (see [Shard actor](../ingest.md#shard-actor)). The
+subset size and the shard count do not control it. Under the operator, set
+`spec.gateway.maxInflightFlushes` on the `RavelCluster` (see
+[kubernetes.md](kubernetes.md)). It renders `--max-inflight-flushes` onto
+the gateway Deployment and defaults to 1.
 
 ## What it costs
 
-**A tenant's ingest throughput is bounded by its subset.** This is the real
-price and it is structural, not a tuning artifact. A tenant pinned to 2 replicas
-gets the CPU, memory, and network of 2 pods no matter how many the gateway
-Deployment runs. If that tenant's traffic outgrows 2 pods, the correct response
-is a larger subset, not a larger Deployment.
+**The subset bounds the ingest throughput of a tenant.** This cost is
+structural. A tenant pinned to 2 replicas gets the CPU, memory, and network
+of 2 pods, for any size of the gateway Deployment. If the traffic of that
+tenant outgrows 2 pods, use a larger subset. A larger Deployment does not
+help.
 
 Two smaller costs:
 
-- **Memory concentrates.** A subset holds the buffers for every tenant hashed
-  onto it, so a subset that draws several large tenants carries more buffered
-  bytes than an evenly sprayed replica would. The process-wide ingest buffer
-  budget still caps this; the effect is that the cap is reached sooner on a hot
-  subset.
-- **Load is only as even as the hash.** With a handful of tenants the
-  distribution across subsets is visibly lumpy. Affinity pays off with many
+- **Memory concentrates.** A subset holds the buffers for every tenant
+  hashed onto it. A subset that draws several large tenants carries more
+  buffered bytes than an evenly loaded replica. The process-wide ingest
+  buffer budget still caps this, and a hot subset reaches the cap sooner.
+- **Load is only as even as the hash.** With a handful of tenants, the
+  distribution across subsets is uneven. Affinity pays off with many
   tenants, not with three.
 
-Correctness is not on the list. Affinity is best-effort by design: `writer_id`
-and `epoch` already disambiguate concurrent writers in the object key, so a
-request that lands on a replica outside its usual subset writes a perfectly
-valid object. Rerouting is a cost event, never a correctness event.
+Affinity does not affect correctness. It is best-effort: `writer_id` and
+`epoch` already disambiguate concurrent writers in the object key. A request
+that lands on a replica outside its usual subset writes a valid object. A
+reroute costs requests and never costs correctness.
 
-## Five separate concepts, one at a time
+## Five separate concepts
 
-The word "affinity" gets stretched over five distinct things below. They are
-independent, they ship at different maturities, and confusing them is how a
-cluster ends up thinking it has subset pinning when it has `S=1`, or none at
-all. Name them separately:
+This guide uses the word "affinity" for five distinct things. They are
+independent, and they ship at different maturities. An operator who confuses
+them can expect subset pinning from a cluster that has `S=1`, or none at
+all.
 
-- **(a) The affinity semantic contract.** Subset-of-`S` pinning: a tenant's
-  writes reach a stable set of exactly `S` replicas, chosen by hashing tenant
-  identity. This is what `subsetSize` *means*. It is defined independently of
-  any implementation: everything below is a way to deliver it, or a weaker
-  thing that is not it.
-- **(b) The legacy `backend: ingressNginx` implementation.** The original
-  delivery: the operator renders `Ingress` objects carrying ingress-nginx's
-  `upstream-hash-by-subset` annotation family. It works and is unchanged, but
-  ingress-nginx is retiring upstream, so it is **deprecated**.
-- **(c) Gateway API exposure (`gateway.exposure.gatewayApi`).** A separate,
-  affinity-independent field that renders standard `HTTPRoute`/`GRPCRoute`
-  objects onto a `Gateway` you already run. It is *exposure*, not affinity: by
-  itself it pins nothing.
-- **(d) `backend: ravelNative`, Ravel's own subset router.** A horizontally
+- **(a) The affinity semantic contract.** Subset-of-`S` pinning: the writes
+  of a tenant reach a stable set of `S` replicas, chosen by a hash of tenant
+  identity. This is what `subsetSize` *means*. The contract is independent
+  of any implementation.
+- **(b) The legacy `backend: ingressNginx` implementation.** The operator
+  renders `Ingress` objects that carry the `upstream-hash-by-subset`
+  annotation family of ingress-nginx. It works and is unchanged. It is
+  **deprecated**, because ingress-nginx is retiring upstream.
+- **(c) Gateway API exposure (`gateway.exposure.gatewayApi`).** A separate
+  field, independent of affinity. It renders standard
+  `HTTPRoute`/`GRPCRoute` objects onto a `Gateway` that you already run. It
+  is *exposure*: by itself it pins nothing.
+- **(d) `backend: ravelNative`, the subset router of Ravel.** A horizontally
   scalable service, `ravel-ingest-router`, that watches EndpointSlices,
-  computes the subset itself with rendezvous hashing, and dials gateway pods
-  directly. It delivers the (a) contract with no dependency on any ingress or
-  Gateway implementation. Documented in full below.
+  computes the subset with rendezvous hashing, and dials gateway pods
+  directly. It delivers the (a) contract with no dependency on any ingress
+  or Gateway implementation.
 - **(e) Single-backend consistent hashing.** What most Gateway API and mesh
-  implementations offer natively (ring-hash, Maglev, `consistentHash`). It maps
-  one key onto **one** backend. That is `S=1`, a real and useful mode, but it
-  is *not* subset-of-`S`, and Ravel never presents it as a migration of one.
+  implementations offer natively (ring-hash, Maglev, `consistentHash`). It
+  maps one key onto **one** backend. That is `S=1`, a real and useful mode,
+  but it is *not* subset-of-`S`, and Ravel never presents it as a migration
+  of one.
 
-(a) is the contract. (b) and (d) implement it. (c) is orthogonal. (e) is the
-weaker cousin. The rest of this guide is organized around these five.
+(a) is the contract. (b) and (d) implement it. (c) is orthogonal. (e) is
+weaker than the contract.
 
-## What actually does the routing
+## What does the routing
 
-Kubernetes cannot express subset affinity on its own. A core `Service` offers
-only `sessionAffinity: ClientIP`, which keys on the client's source address:
-the address of the OpenTelemetry Collector or the gateway proxy in front of it,
-not of the tenant. Under a shared collector that maps every tenant onto one key.
-The operator therefore never sets it.
+Kubernetes cannot express subset affinity by itself. A core `Service` offers
+only `sessionAffinity: ClientIP`, which keys on the source address of the
+client. That is the address of the OpenTelemetry Collector or of the gateway
+proxy in front of it, not of the tenant. Under a shared collector, every
+tenant maps onto one key. The operator therefore never sets it.
 
-Tenant identity lives in the request's authentication material. Ravel resolves
-tenancy server-side from the bearer token, and OTLP connections are long-lived,
-so the URL path carries nothing routable either. The routing decision has to be
-made at layer 7 by something that can read a header or run tenant resolution.
-Two implementations do this: the legacy ingress-nginx backend (b) and the
-Ravel-native router (d). Alongside them sit the affinity-free exposure path
-(c) and the weaker `S=1` fallback (e).
+Tenant identity lives in the authentication material of the request. Ravel
+resolves tenancy server-side from the bearer token. OTLP connections are
+long-lived, and the URL path carries nothing routable. The routing decision
+must therefore be made at layer 7, by something that can read a header or
+run tenant resolution. Two implementations do this: the legacy ingress-nginx
+backend (b) and the Ravel-native router (d). The affinity-free exposure path
+(c) and the weaker `S=1` fallback (e) sit beside them.
 
-### (b) The legacy ingress-nginx backend (deprecated)
+### (b) Legacy ingress-nginx backend (deprecated)
 
-**Ravel does not ship an ingress controller, and the legacy backend does not add
-one.** What the operator ships under `backend: ingressNginx` is the `Ingress`
-object and the annotations that configure it. The cluster must already run an
-ingress controller that understands them. The supported and tested target is
+**`backend: ingressNginx` is the default and it keeps working unchanged.**
+Under it, the operator ships the `Ingress` object and the annotations that
+configure it.
+
+**Ravel does not ship an ingress controller, and the legacy backend does not
+add one.** The cluster must already run an ingress controller that
+understands the annotations. The supported and tested target is
 [ingress-nginx](https://kubernetes.github.io/ingress-nginx/), whose
-`upstream-hash-by` family expresses exactly the ADR's model:
+`upstream-hash-by` family expresses the subset-of-`S` model:
 
 | Annotation | Rendered value | What it does |
 |---|---|---|
@@ -139,75 +149,74 @@ ingress controller that understands them. The supported and tested target is
 | `nginx.ingress.kubernetes.io/service-upstream` | `false` | Balance over pod endpoints, not the ClusterIP. |
 | `nginx.ingress.kubernetes.io/backend-protocol` | `GRPC` (gRPC Ingress only) | Speak gRPC to the gateway. |
 
-Within a subset, ingress-nginx picks a member uniformly at random per request.
-That is the point of a subset larger than one: a tenant keeps using both of its
-replicas continuously, so losing one costs half its capacity rather than all of
-it, and nothing has to fail over.
+Within a subset, ingress-nginx picks a member uniformly at random per
+request. A tenant therefore keeps using both of its replicas continuously.
+The loss of one replica costs half of its capacity and not all of it, and
+nothing has to fail over.
 
-`service-upstream: false` is not decoration. With it set to `true` the upstream
-has exactly one server, the Service's ClusterIP, so kube-proxy picks the pod
-and the hash has nothing to distribute over. The affinity would silently do nothing.
-The controller's own default is `false`, but it is settable cluster-wide in the
-ingress-nginx ConfigMap, so the operator always renders it explicitly.
+The operator always renders `service-upstream: false` explicitly. With
+`true`, the upstream has one server, the ClusterIP of the Service. kube-proxy
+then picks the pod, the hash has nothing to distribute over, and the
+affinity silently does nothing. The default of the controller is `false`,
+but the ingress-nginx ConfigMap can set it cluster-wide.
 
-**`backend: ingressNginx` is the default and it keeps working unchanged**, but
-ingress-nginx is retiring upstream, so it is deprecated. A
-cluster on it gets an `IngestAffinityBackendDeprecated` condition on its
-`RavelCluster` status, with reason `IngressNginxRetired`; the condition
-disappears once the cluster moves off that backend. Nothing about an existing CR
-changes on upgrade: a CR that never set `backend` deserializes to `ingressNginx`,
-with the same `subsetSize` and the same key. The migration target is
-`backend: ravelNative` (see below).
+**Deprecation.** ingress-nginx is retiring upstream, so this backend is
+deprecated. A cluster on it gets an `IngestAffinityBackendDeprecated`
+condition on its `RavelCluster` status, with reason `IngressNginxRetired`.
+The condition disappears once the cluster moves off that backend. An
+existing CR does not change on upgrade: a CR that never set `backend`
+deserializes to `ingressNginx`, with the same `subsetSize` and the same key.
+The migration target is `backend: ravelNative` (see
+[Migrating from `ingressNginx` to `ravelNative`](#migrating-from-ingressnginx-to-ravelnative)).
 
-### (d) `backend: ravelNative`, Ravel's own subset router
+### (d) The `ravelNative` router
 
-`backend: ravelNative` delivers the (a) contract without any ingress controller
-at all. The operator renders `ravel-ingest-router`, a horizontally scalable
-service that:
+`backend: ravelNative` delivers the (a) contract without any ingress
+controller. The operator renders `ravel-ingest-router`, a horizontally
+scalable service. The router does three things:
 
-- **watches `EndpointSlice` objects** for this `RavelCluster`'s gateway Service,
-  so it always has the live set of Ready gateway pods and their addresses;
-- **computes the subset itself** with deterministic rendezvous (HRW) hashing
-  over that endpoint set, keyed on tenant identity: the same subset-of-`S`
-  semantics the nginx annotations express, but owned in Ravel's own
-  `ravel-affinity` crate;
-- **dials the chosen pod addresses directly**, from the EndpointSlice, never
-  through the gateway Service's ClusterIP. Going through the ClusterIP would
-  hand the connection back to kube-proxy's own load balancing and undo the
-  subset selection the router just made.
+- It **watches `EndpointSlice` objects** for the gateway Service of this
+  `RavelCluster`, so it always has the live set of Ready gateway pods and
+  their addresses.
+- It **computes the subset** with deterministic rendezvous (HRW) hashing
+  over that endpoint set, keyed on tenant identity. These are the same
+  subset-of-`S` semantics that the nginx annotations express, owned in the
+  `ravel-affinity` crate of Ravel.
+- It **dials the chosen pod addresses directly**, from the EndpointSlice,
+  never through the ClusterIP of the gateway Service. A connection through
+  the ClusterIP goes back to the load balancing of kube-proxy, which undoes
+  the subset selection.
 
-Within the `S`-member subset the router picks by local round-robin, skipping any
-member its own EndpointSlice view marks not-Ready. If fewer than `S` members are
-Ready it falls further down the same HRW-ranked order (position `S+1`, `S+2`, …)
-rather than narrowing to a smaller, unbalanced set.
+Within the `S`-member subset the router picks by local round-robin. It skips
+any member that its own EndpointSlice view marks not-Ready. If fewer than `S`
+members are Ready, it continues down the same HRW-ranked order (position
+`S+1`, `S+2`, …) and does not narrow to a smaller, unbalanced set.
 
-**Why it exists.** It removes the ingress-nginx dependency entirely. Subset
-selection lives in Ravel, so it does not matter which Gateway implementation,
-if any, terminates the connection. Combine it with Gateway API exposure (c)
-and you get subset pinning behind a conformant `Gateway`; run it with no
-exposure at all and it still pins, reachable however you route to the router's
-own Service.
+**No ingress dependency.** Subset selection lives in Ravel, so any Gateway
+implementation, or none, can terminate the connection. With Gateway API
+exposure (c), you get subset pinning behind a conformant `Gateway`. With no
+exposure, the router still pins, and you choose how to route to the Service
+of the router.
 
-**Rebalance identity.** A replica is identified by its pod UID as reported by
-the EndpointSlice, not its IP (an IP can be reused by a different pod after
-churn). The HRW guarantee, that adding or removing one endpoint moves only the
-tenants whose rank crosses position `S`, holds for scale events. It does *not*
-hold across a full rolling update of the gateway Deployment: every pod's UID
-changes at once, so the whole replica set is new and a rollout causes a
-one-time full reassignment. This is inherent to any identity-keyed subset
-scheme, not specific to this router, and it is a rebalance (a cost event), not
-a correctness event. See
+**Rebalance identity.** The pod UID that the EndpointSlice reports
+identifies a replica, not the IP. A different pod can reuse an IP after
+churn. For scale events the HRW guarantee holds: when one endpoint is added
+or removed, only the tenants whose rank crosses position `S` move. The
+guarantee does *not* hold across a full rolling update of the gateway
+Deployment. The UID of every pod changes, so the whole replica set is new,
+and a rollout causes a one-time full reassignment. Any identity-keyed subset
+scheme has this property. It is a rebalance (a cost event), not a
+correctness event. See
 [Rolling restarts and replica loss](#rolling-restarts-and-replica-loss).
 
-**Transient split view.** Multiple router replicas watch EndpointSlice
-independently. Between one replica observing a membership change and another
-catching up, two replicas can briefly compute different subsets for the same
-tenant. This is bounded by informer/watch latency (seconds), self-heals with no
-intervention, and has no durability or correctness impact: it is a routing
-decision, not data correctness. Named here only so it is not mistaken for a bug
-during a rollout.
+**Transient split view.** Router replicas watch EndpointSlice independently.
+After a membership change, two replicas can briefly compute different
+subsets for the same tenant, until both have observed the change. Informer
+and watch latency (seconds) bounds this. It heals with no intervention. It
+has no durability or correctness impact, because it is a routing decision.
+During a rollout this is expected behavior.
 
-#### The managed objects and their RBAC
+#### Router objects and RBAC
 
 Under `backend: ravelNative` the operator renders a set of objects that all
 share the base name `<cluster>-ingest-router`:
@@ -220,75 +229,82 @@ share the base name `<cluster>-ingest-router`:
 | `<cluster>-ingest-router` | Role | Namespaced. `get`/`list`/`watch` on `endpointslices` (`discovery.k8s.io`) and `services` (core), in this namespace only. |
 | `<cluster>-ingest-router` | RoleBinding | Binds the Role to the ServiceAccount. |
 
-The Role is deliberately least-privilege: no cluster-wide grant, no other
-resource, no write verbs. It is exactly what the EndpointSlice watcher needs to
-compute subsets and dial gateway pods, and nothing more, consistent with the
-storage credential role scoping Ravel uses elsewhere.
+The Role is least-privilege: no cluster-wide grant, no other resource, no
+write verbs. It grants what the EndpointSlice watcher needs to compute
+subsets and dial gateway pods, consistent with the storage credential role
+scoping that Ravel uses elsewhere.
 
-Switching `backend` away from `ravelNative`, or disabling affinity, deletes
-every one of these objects on the next reconcile; the delete-sweep covers all
-five kinds under the shared name, so a mode switch leaves nothing orphaned.
+When you switch `backend` away from `ravelNative`, or disable affinity, the
+operator deletes all of these objects on the next reconcile. The
+delete-sweep covers all five kinds under the shared name, so the switch
+leaves no orphan.
 
 #### The `canonicalTenant` key source
 
-`key.source: canonicalTenant` is a key source only `ravelNative` can offer. Instead
-of hashing a raw header value, the router runs Ravel's own tenant-resolution
-chain, the same code `ravel-server` uses, and hashes the
-resulting canonical `TenantId`. This is **immune to bearer-token rotation**:
-rotating a token does not move the tenant to a different subset, because the key
-is the resolved tenant, not the token. `authorizationHeader`, by contrast, moves
-a tenant on every rotation (see [Choosing the key](#choosing-the-key)).
+`key.source: canonicalTenant` is a key source that only `ravelNative` offers.
+The router runs the tenant-resolution chain of Ravel, the same code that
+`ravel-server` uses, and hashes the resulting canonical `TenantId`. It does
+not hash a raw header value.
 
-There is a real gap to know before choosing it: **the only resolver the CRD
-wires through is static tenant tokens**, via `spec.tenantTokensSecretRef`. OIDC
-is a resolver the chain can run, but no CRD field threads an issuer or JWKS URL
+This key is **immune to bearer-token rotation**. A token rotation does not
+move the tenant to a different subset, because the key is the resolved
+tenant and not the token. `authorizationHeader` moves a tenant on every
+rotation (see [Choosing the key](#choosing-the-key)).
+
+`canonicalTenant` works only for clusters that authenticate with static
+tenant tokens. **The only resolver the CRD wires through is static tenant
+tokens**, via `spec.tenantTokensSecretRef`. OIDC is a resolver that the
+chain can run, but no CRD field threads an issuer or JWKS URL
 into the router. mTLS resolution is not available at any layer: the router
-builds one resolver chain shared by every listener, and the mTLS resolver trusts
-a client-supplied identity header with no verification of its own, so
-`ravel-ingest-router` refuses `--mtls-enabled` outright rather than let any
-client set that header and pick its own tenant. A CRD field would not change
-that; isolating the resolver needs a dedicated mTLS listener the router does not
-have. So `canonicalTenant` works
-only for clusters authenticating with static tenant tokens. If you rely on OIDC
-or mTLS for tenancy, `canonicalTenant` is not usable for you; use
-`authorizationHeader`, which hashes the token bytes.
+builds one resolver chain that every listener shares. The mTLS resolver
+trusts a client-supplied identity header and does not verify it.
+`ravel-ingest-router` therefore refuses `--mtls-enabled`, so that no client
+can set that header and pick its own tenant. A CRD field cannot change that.
+To isolate the resolver, the router needs a dedicated mTLS listener, and it
+has none.
 
-Resolution is **fail-closed**: if the router cannot resolve a tenant for a
+If you rely on OIDC or mTLS for tenancy, use `authorizationHeader`, which
+hashes the token bytes.
+
+Resolution is **fail-closed**. If the router cannot resolve a tenant for a
 request under `canonicalTenant`, it rejects the request (HTTP 401 / gRPC
-`UNAUTHENTICATED`) rather than falling back to a weaker key. It never silently
-routes on something other than what you configured.
+`UNAUTHENTICATED`). It never routes on a key other than the one you
+configured.
 
-#### Current limitation: HTTP-only, no gRPC through the router
+#### HTTP-only router limitation
 
 **The operator-rendered router Deployment is HTTP-only.** It renders a single
-HTTP container port (8080) and no `--listen-grpc` flag, even though the router
-binary itself has a gRPC listener. When `backend: ravelNative` is combined
-with Gateway API exposure (c):
+HTTP container port (8080) and no `--listen-grpc` flag. The router binary
+has a gRPC listener, but the rendered Deployment does not use it. When
+`backend: ravelNative` is combined with Gateway API exposure (c):
 
-- the rendered **HTTPRoute** points at the router's Service (subset-pinned), but
-- the rendered **GRPCRoute** continues to target the **gateway Service
-  directly**, exactly as it does with affinity off.
+- The rendered **HTTPRoute** points at the Service of the router
+  (subset-pinned).
+- The rendered **GRPCRoute** still targets the **gateway Service directly**,
+  as it does with affinity off.
 
-So switching to `ravelNative` does not break gRPC ingest, which keeps working,
-but OTLP/gRPC is **not subset-pinned by the router**. It is load-balanced by the
-Gateway implementation across all gateway pods, which for gRPC is `S=1` or
-worse, not subset-of-`S`. The reason is structural: the router resolves one
-gateway port per process and cannot proxy the gateway's distinct HTTP and gRPC
-listener ports at once. Wiring gRPC through the router would need either a
-per-listener-port surface or a two-Deployment split, and neither exists.
+gRPC ingest keeps working after a switch to `ravelNative`, but the router
+does **not** subset-pin OTLP/gRPC. The Gateway implementation load-balances
+it across all gateway pods, which for gRPC is `S=1` or worse, not
+subset-of-`S`.
+
+The reason is structural. The router resolves one gateway port per process
+and cannot proxy the distinct HTTP and gRPC listener ports of the gateway at
+once. gRPC through the router needs either a per-listener-port surface or a
+two-Deployment split, and neither exists.
 
 If most of your ingest request bill comes from OTLP/gRPC, weigh this before
-migrating: `ravelNative` pins your OTLP/HTTP traffic but not your gRPC.
+you migrate: `ravelNative` pins your OTLP/HTTP traffic but not your gRPC.
 
 ### (c) Gateway API exposure
 
-`gateway.exposure.gatewayApi` is a separate, independent field from
-`ingestAffinity`: it renders standard
-`gateway.networking.k8s.io` `HTTPRoute` and `GRPCRoute` objects attached to an
-existing `Gateway`, instead of the ingress-nginx-specific `Ingress` objects. It
-carries no vendor extension, so it works with any conformant Gateway API
-implementation (Envoy Gateway, NGINX Gateway Fabric, Cilium, Istio, a managed
-cloud implementation); Ravel does not couple its CRD to one.
+`gateway.exposure.gatewayApi` is a separate field, independent of
+`ingestAffinity`. It renders standard `gateway.networking.k8s.io`
+`HTTPRoute` and `GRPCRoute` objects attached to an existing `Gateway`, in
+place of the ingress-nginx-specific `Ingress` objects. It carries no vendor
+extension, so it works with any conformant Gateway API implementation (Envoy
+Gateway, NGINX Gateway Fabric, Cilium, Istio, a managed cloud
+implementation). Ravel does not couple its CRD to one.
 
 ```yaml
 spec:
@@ -302,56 +318,66 @@ spec:
         grpc: true   # also render a GRPCRoute; default true
 ```
 
-By itself, exposure has **no tenant-affinity effect**: routing goes straight to
-the gateway Service, load-balanced however the Gateway implementation
-load-balances a Service backendRef (typically endpoint-aware round robin, not
-subset-of-`S`). Its relationship with the two affinity backends:
+By itself, exposure has **no tenant-affinity effect**. Routing goes straight
+to the gateway Service, load-balanced the way the Gateway implementation
+load-balances a Service backendRef (typically endpoint-aware round robin,
+not subset-of-`S`). With the two affinity backends:
 
-- **With `backend: ravelNative`** the operator points the rendered **HTTPRoute**
-  at the router's Service, so OTLP/HTTP is subset-pinned. The **GRPCRoute** still
-  targets the gateway Service directly (HTTP-only router limitation, above).
-- **With an *enabled* `backend: ingressNginx`** the combination is **rejected at
-  admission by a CEL rule**, because traffic on the Gateway API path would
-  bypass the nginx subset annotations entirely: pinned on the Ingress path,
-  unpinned on the Gateway API path, with no signal to the operator (see
-  [Admission rejections](#admission-rejections)). Use `ravelNative`, or disable
-  `ingestAffinity`.
+- **With `backend: ravelNative`**, the operator points the rendered
+  **HTTPRoute** at the Service of the router, so OTLP/HTTP is subset-pinned.
+  The **GRPCRoute** still targets the gateway Service directly (see the
+  [HTTP-only router limitation](#http-only-router-limitation)).
+- **With an *enabled* `backend: ingressNginx`**, the combination is
+  **rejected at admission by a CEL rule**. In that combination, traffic on
+  the Gateway API path bypasses the nginx subset annotations: pinned on the
+  Ingress path, unpinned on the Gateway API path, with no signal to the
+  operator (see
+  [Admission rejections](#admission-rejections)). Use `ravelNative`, or
+  disable `ingestAffinity`.
 
-TLS is not rendered by the operator here: Gateway API exposure terminates TLS at
-the referenced `Gateway`'s own listener, which you configure directly
+The operator does not render TLS here. Gateway API exposure terminates TLS
+at the listener of the referenced `Gateway`, which you configure directly
 (`tls.certificateRefs`). There is no `tlsSecretName` equivalent under
 `exposure.gatewayApi`, unlike the legacy `ingestAffinity.tlsSecretName`.
 
-Requires Gateway API **v1.1 or newer** in the cluster: `GRPCRoute` only reached
-the stable `v1` API version in Gateway API v1.1 (it was `v1alpha2` in v1.0), and
-the operator renders it at `v1`.
+Gateway API exposure requires Gateway API **v1.1 or newer** in the cluster.
+`GRPCRoute` reached the stable `v1` API version in Gateway API v1.1 (it was
+`v1alpha2` in v1.0), and the operator renders it at `v1`.
 
-### (e) Single-backend consistent hashing is `S=1`, not this
+### (e) Single-backend consistent hashing
 
-If you run HAProxy, Traefik, Istio, Envoy, or a cloud L7 load balancer and reach
-for its built-in hashing, **there is no subset-of-`S` configuration, and the
-closest thing is weaker.** What those layers offer is single-backend consistent
-hashing: HAProxy's `balance hdr(...)`, Istio's
+HAProxy, Traefik, Istio, Envoy and cloud L7 load balancers have built-in
+hashing. In those layers **there is no subset-of-`S` configuration, and the
+closest thing is weaker.** They offer single-backend consistent hashing.
+HAProxy's `balance hdr(...)`, Istio's
 `DestinationRule.trafficPolicy.loadBalancer.consistentHash.httpHeaderName`,
-Envoy's ring-hash and Maglev policies, and the session-persistence extensions in
-Gateway API implementations all map one key onto **one** backend. That is `S=1`.
-It is a real and useful mode, and it still divides the flush cost by
-`replicas`, but it is not what `subsetSize: 2` means: a tenant pinned to a single replica
-loses all of its capacity when that replica restarts and has to be rehashed
-somewhere else, which is exactly the failure the default subset of two exists to
-avoid. Ravel does not present those configurations as a migration of subset
-affinity, and neither should a runbook. The operator does not generate them
-either. You can use `spec.gateway.ingestAffinity.annotations` to carry your
-controller's own annotations onto the legacy Ingress objects, or configure that
-layer yourself and leave `ingestAffinity` unset, but read what you configure as
-`S=1` unless the layer genuinely implements subset-of-`S` selection. For real
-subset-of-`S` behind any Gateway implementation, use `backend: ravelNative`.
+Envoy's ring-hash and Maglev policies, and the session-persistence
+extensions in Gateway API implementations all map one key onto **one**
+backend. That is `S=1`.
+
+`S=1` is a real and useful mode, and it still divides the flush cost by
+`replicas`. It is not what `subsetSize: 2` means. A tenant pinned to a
+single replica loses all of its capacity when that replica restarts, and it
+must be rehashed to another replica. The default subset of two avoids that
+failure.
+
+Ravel does not present those configurations as a migration of subset
+affinity, and the operator does not generate them. Do not present them that
+way in a runbook. You have two options:
+
+- Use `spec.gateway.ingestAffinity.annotations` to carry the annotations of
+  your controller onto the legacy Ingress objects.
+- Configure that layer yourself and leave `ingestAffinity` unset.
+
+In both cases, read what you configure as `S=1` unless the layer implements
+subset-of-`S` selection. For subset-of-`S` behind any Gateway
+implementation, use `backend: ravelNative`.
 
 ## Admission rejections
 
-Two combinations are rejected by the API server at admission (CEL
-`x-kubernetes-validations` rules), so a bad manifest fails on `kubectl apply`
-with a clear message rather than degrading silently at runtime:
+The API server rejects two combinations at admission (CEL
+`x-kubernetes-validations` rules). A bad manifest fails on `kubectl apply`
+with a clear message and does not degrade silently at runtime.
 
 1. **Gateway API exposure with an enabled legacy backend.** Setting
    `gateway.exposure.gatewayApi` while `ingestAffinity` is enabled on
@@ -363,86 +389,91 @@ with a clear message rather than degrading silently at runtime:
    > ravelNative or disable ingestAffinity`
 
 2. **Canonical-tenant key on the legacy backend.** Setting
-   `key.source: canonicalTenant` while `backend` is `ingressNginx` is rejected,
-   because ingress-nginx has no way to run the tenant-resolution chain that
-   canonical-tenant hashing needs:
+   `key.source: canonicalTenant` while `backend` is `ingressNginx` is
+   rejected, because ingress-nginx cannot run the tenant-resolution chain
+   that canonical-tenant hashing needs:
 
    > `gateway.ingestAffinity.key.source canonicalTenant requires backend:
    > ravelNative -- ingress-nginx cannot run the ravel-tenant-resolve auth chain
    > that canonical-tenant hashing needs`
 
-   Because `backend` defaults to `ingressNginx`, a manifest that sets
-   `canonicalTenant` but omits `backend` is rejected too: the omitted default
-   *is* `ingressNginx`.
+   `backend` defaults to `ingressNginx`, so a manifest that sets
+   `canonicalTenant` and omits `backend` is rejected too.
 
-## Render-time degradation (not a crashloop)
+## Render-time degradation
 
-Two misconfigurations are caught by the operator at render time rather than at
-admission, because they depend on cluster state the API server does not see. In
-both cases the operator renders **no router objects** and writes a `Degraded`
-condition on the `RavelCluster` status. This is a deliberate operator-side
-validation, so the cluster fails visibly instead of scheduling a pod that would
-never run or would crashloop:
+The operator catches two misconfigurations at render time and not at
+admission, because they depend on cluster state that the API server does not
+see. In both cases the operator renders **no router objects** and writes a
+`Degraded` condition on the `RavelCluster` status. The cluster fails
+visibly, and the operator schedules no pod that cannot run or that
+crashloops.
 
 - **`routerImage` unset under `backend: ravelNative`.** The router is a
   different binary from `spec.image` (which is `ravel-server`), so there is
-  nothing to fall back to. The `Degraded` condition's reason is
+  no image to fall back to. The reason of the `Degraded` condition is
   **`RouterImageMissing`**.
-- **`key.source: canonicalTenant` with no resolver configured.** The router's
-  own CLI refuses to start under `canonical-tenant` unless at least one resolver
-  is present, and the only resolver the CRD wires through is
-  `tenantTokensSecretRef`. If that Secret is absent, or present but resolves to
-  zero tenant keys this reconcile, no `--tenant-token` flag would render and
-  the router would crashloop at startup. The operator renders nothing instead;
-  the `Degraded` condition's reason is **`CanonicalTenantResolverMissing`**.
+- **`key.source: canonicalTenant` with no resolver configured.** The CLI of
+  the router refuses to start under `canonical-tenant` unless at least one
+  resolver is present. The only resolver the CRD wires through is
+  `tenantTokensSecretRef`. If that Secret is absent, or present but resolves
+  to zero tenant keys this reconcile, no `--tenant-token` flag renders. A
+  router in that state crashloops at startup, so the operator renders
+  nothing. The reason of the `Degraded` condition is
+  **`CanonicalTenantResolverMissing`**.
 
-Only the router degrades: the gateway, query, and maintain Deployments still
-reconcile normally. Fix the field named in the condition message and the router
-renders on the next reconcile.
+Only the router degrades. The gateway, query, and maintain Deployments still
+reconcile normally. Fix the field that the condition message names, and the
+router renders on the next reconcile.
 
 If Gateway API exposure is also configured, a degraded router pass does not
-strand the HTTPRoute either: the operator computes the router's render outcome
-before rendering routes, so the HTTPRoute falls back to targeting the gateway
-Service directly whenever the router will not exist that pass, rather than
-pointing at a router Service the same reconcile just swept away.
+strand the HTTPRoute. The operator computes the render outcome of the router
+before it renders routes. When the router will not exist that pass, the
+HTTPRoute targets the gateway Service directly.
 
 ## Migrating from `ingressNginx` to `ravelNative`
 
-Moving from `backend: ingressNginx` to `backend: ravelNative` is the supported
-migration. The ingress-nginx rendering path is deprecated but not removed:
-`ingressNginx` remains the schema default and keeps working, and there is no
-removal timeline.
+The supported migration is from `backend: ingressNginx` to
+`backend: ravelNative`. The ingress-nginx rendering path is deprecated but
+not removed: `ingressNginx` remains the schema default and keeps working,
+and there is no removal timeline.
 
-Switching an existing production cluster is a **real migration, not a drop-in
-toggle.** It has behavior differences you must plan for:
+On an existing production cluster the switch is a **migration with behavior
+differences**. Plan for each of them:
 
 - **A new service to run.** `ravelNative` renders a `ravel-ingest-router`
-  Deployment (and Service/ServiceAccount/Role/RoleBinding). It needs an image:
-  set `ingestAffinity.routerImage` or the operator degrades with
+  Deployment (and Service/ServiceAccount/Role/RoleBinding). It needs an
+  image. Set `ingestAffinity.routerImage`, or the operator degrades with
   `RouterImageMissing`.
-- **RBAC to grant.** The operator must be able to create the router's
-  ServiceAccount, Role, and RoleBinding. This is part of the operator's shipped
-  ClusterRole (see [kubernetes.md](kubernetes.md)); confirm your deployment of
-  the operator carries it.
-- **HTTP-only.** OTLP/gRPC is not subset-pinned through the router (see
-  [the limitation above](#current-limitation-http-only-no-grpc-through-the-router)).
-  If your request bill is gRPC-dominated, the saving is smaller than the HTTP
-  math suggests.
-- **TLS moves.** If you were relying on `ingestAffinity.tlsSecretName`, that
-  field is legacy-backend-only. Under Gateway API exposure you configure
-  `tls.certificateRefs` on your `Gateway`'s listener yourself, pointing at the
-  same or an equivalent Secret; there is nothing the operator carries forward
-  automatically.
-- **A one-time rebalance.** Cutting over changes the routing layer, which every
-  tenant's key now hashes through differently. Expect a bounded PUT-rate bump as
-  buffers re-home, the same shape as any rebalance below.
+- **RBAC to grant.** The operator must be able to create the ServiceAccount,
+  Role, and RoleBinding of the router. The shipped ClusterRole of the
+  operator includes this (see [kubernetes.md](kubernetes.md)). Make sure
+  that your deployment of the operator carries it.
+- **HTTP-only.** The router does not subset-pin OTLP/gRPC (see the
+  [HTTP-only router limitation](#http-only-router-limitation)). If gRPC
+  dominates your request bill, the saving is smaller than the HTTP math
+  suggests.
+- **TLS moves.** `ingestAffinity.tlsSecretName` applies to the legacy
+  backend only. Under Gateway API exposure, configure `tls.certificateRefs`
+  on the listener of your `Gateway` yourself. Point it at the same or an
+  equivalent Secret. The operator carries nothing forward automatically.
+- **A one-time rebalance.** The cutover changes the routing layer, and the
+  key of every tenant now hashes through it differently. Expect a bounded
+  PUT-rate bump as buffers re-home, as for any rebalance (see
+  [Rolling restarts and replica loss](#rolling-restarts-and-replica-loss)).
 
-A workable sequence: set `routerImage` and (if using it) confirm the
-tenant-tokens Secret is populated; apply `backend: ravelNative`; if you also
-want Gateway API exposure, add `exposure.gatewayApi` in the same or a following
-apply and move your `Gateway` listener's TLS across; watch the flush/PUT rate
-settle (see [Verifying it works](#verifying-it-works)); then decommission the
-old ingress-nginx `Ingress` for this cluster once traffic has moved.
+A workable sequence:
+
+1. Set `routerImage`.
+2. If you use the tenant-tokens Secret, make sure that it is populated.
+3. Apply `backend: ravelNative`.
+4. If you also want Gateway API exposure, add `exposure.gatewayApi` in the
+   same or a following apply. Then move the TLS of your `Gateway` listener
+   across.
+5. Watch the flush/PUT rate settle (see
+   [Verifying it works](#verifying-it-works)).
+6. When traffic has moved, decommission the old ingress-nginx `Ingress` for
+   this cluster.
 
 ## Turning it on
 
@@ -463,8 +494,8 @@ spec:
       tlsSecretName: ingest-tls
 ```
 
-Everything else defaults: enabled, backend `ingressNginx`, subset size 2, key =
-the `Authorization` header, and a second Ingress for OTLP/gRPC.
+Everything else defaults: enabled, backend `ingressNginx`, subset size 2,
+key = the `Authorization` header, and a second Ingress for OTLP/gRPC.
 
 The Ravel-native backend, recommended for new deployments:
 
@@ -512,8 +543,8 @@ spec:
 
 ### Managed objects
 
-For a `RavelCluster` named `prod`, which objects render depends on the backend
-and on whether exposure is set.
+For a `RavelCluster` named `prod`, the rendered objects depend on the
+backend and on whether exposure is set.
 
 Under `backend: ingressNginx` (enabled):
 
@@ -524,8 +555,8 @@ Under `backend: ingressNginx` (enabled):
 
 Under `backend: ravelNative` (enabled, `routerImage` set): the five
 `prod-ingest-router` objects listed in
-[The managed objects and their RBAC](#the-managed-objects-and-their-rbac). No
-`Ingress` is rendered.
+[Router objects and RBAC](#router-objects-and-rbac). No `Ingress` is
+rendered.
 
 Under `gateway.exposure.gatewayApi` (independent of backend):
 
@@ -534,24 +565,29 @@ Under `gateway.exposure.gatewayApi` (independent of backend):
 | `prod-gateway-route` | HTTPRoute | Attached to `gatewayRef`. Backs onto the router's Service under `ravelNative`, otherwise the gateway Service. |
 | `prod-gateway-route-grpc` | GRPCRoute | Attached to `gatewayRef`. **Always** backs onto the gateway Service directly (see the HTTP-only limitation). Absent when `exposure.gatewayApi.grpc: false`. |
 
-Every object is owned by the `RavelCluster` and deleted with it. All are also
-deleted when `enabled` becomes `false` or the mode changes, so switching modes
-converges rather than leaving an orphan routing live traffic.
+The `RavelCluster` owns every object, and each is deleted with it. All are
+also deleted when `enabled` becomes `false` or the mode changes. A switch of
+modes therefore converges and leaves no orphan that routes live traffic.
 
-Two legacy Ingress objects are needed because `backend-protocol` is a per-Ingress
-annotation: one Ingress cannot speak HTTP to one port and gRPC to another.
+#### The two legacy Ingress objects
+
+The legacy backend needs two Ingress objects, because `backend-protocol` is
+a per-Ingress annotation. One Ingress cannot speak HTTP to one port and gRPC
+to another.
 
 **The two Ingress objects route on disjoint paths, never a shared `/`.**
-ingress-nginx builds one `location` per path in a server block, so if both
-Ingress objects claimed the same host and path `/` it would be a duplicate-path
-conflict: ingress-nginx keeps one location (ordered by CreationTimestamp,
-tie-broken by namespace and name) and drops the other's with a warning.
-`prod-gateway-ingest` sorts before `prod-gateway-ingest-grpc`, so the HTTP object
-would win and the gRPC object's `grpc_pass` and its affinity annotations would
-never take effect, so OTLP/gRPC, the primary ingest path, would be proxied as
-HTTP/1.1 and fail. OTLP/HTTP and OTLP/gRPC have disjoint path namespaces, so each
-Ingress serves only its own paths and the two never collide, with or without
-`hosts`.
+OTLP/HTTP and OTLP/gRPC have disjoint path namespaces. Each Ingress serves
+only its own paths, and the two never collide, with or without `hosts`.
+
+If both Ingress objects claimed the same host and path `/`, the result is a
+duplicate-path conflict. ingress-nginx builds one `location` per path in a
+server block. In a conflict it keeps one location (ordered by
+CreationTimestamp, tie-broken by namespace and name) and drops the other
+with a warning. `prod-gateway-ingest` sorts before
+`prod-gateway-ingest-grpc`, so the HTTP object wins the conflict. The
+`grpc_pass` of the gRPC object and its affinity annotations then never take
+effect, and OTLP/gRPC, the primary ingest path, is proxied as HTTP/1.1 and
+fails.
 
 The HTTP Ingress serves the three OTLP/HTTP routes:
 
@@ -559,35 +595,38 @@ The HTTP Ingress serves the three OTLP/HTTP routes:
 - `/v1/logs`
 - `/v1/traces`
 
-The gRPC Ingress serves the full service name of every gRPC service the gateway
-registers on the ingest surface. There are four, including OTAP's
-`ArrowMetricsService`:
+The gRPC Ingress serves the full service name of every gRPC service that the
+gateway registers on the ingest surface. There are four, including the
+`ArrowMetricsService` of OTAP:
 
 - `/opentelemetry.proto.collector.metrics.v1.MetricsService`
 - `/opentelemetry.proto.collector.logs.v1.LogsService`
 - `/opentelemetry.proto.collector.trace.v1.TraceService`
 - `/opentelemetry.proto.experimental.arrow.v1.ArrowMetricsService`
 
-Each path is a full gRPC service name, which is a complete path element under
-`PathType: Prefix` (Kubernetes matches Prefix element-wise, splitting on `/`).
-A full service name therefore prefixes `/<service>/<method>` correctly under
-both the strict spec semantics and ingress-nginx's rendering. A truncated
-common prefix such as `/opentelemetry.proto.collector.` is a single element that
-equals none of the service names and matches nothing under the spec, and it
-would also silently omit the OTAP service, so the full names are used.
+Each path is a full gRPC service name, which is a complete path element
+under `PathType: Prefix`. Kubernetes matches Prefix element-wise and splits
+on `/`. A full service name therefore prefixes `/<service>/<method>`
+correctly under both the strict spec semantics and the rendering of
+ingress-nginx. A truncated common prefix such as
+`/opentelemetry.proto.collector.` is a single element that equals none of
+the service names. It matches nothing under the spec, and it also omits the
+OTAP service.
 
-### Two things to set that the operator will not set for you
+### TLS and body size
 
-**TLS.** Under the legacy backend, ingress-nginx serves HTTP/2 to clients over
-TLS. OTLP/gRPC needs HTTP/2. Without `tlsSecretName` the gRPC Ingress will not
-work for most clients. Independently: tenant tokens are bearer tokens, so
-plaintext ingest exposes every tenant's credential on the wire. Under Gateway
-API exposure the equivalent is `tls.certificateRefs` on your `Gateway`'s
-listener, which you configure directly.
+The operator does not set these two for you.
+
+**TLS.** Under the legacy backend, ingress-nginx serves HTTP/2 to clients
+over TLS, and OTLP/gRPC needs HTTP/2. Without `tlsSecretName`, the gRPC
+Ingress does not work for most clients. Tenant tokens are also bearer
+tokens, so plaintext ingest exposes the credential of every tenant on the
+wire. Under Gateway API exposure the equivalent is `tls.certificateRefs` on
+the listener of your `Gateway`, which you configure directly.
 
 **Body size.** ingress-nginx defaults `proxy-body-size` to `1m` and rejects
 larger requests with a 413. A batched OTLP/HTTP export can exceed that. The
-operator does not silently raise it: pick a value and set it yourself (legacy
+operator does not raise it. Pick a value and set it yourself (legacy
 backend):
 
 ```yaml
@@ -597,134 +636,141 @@ backend):
 
 ## Sizing the subset
 
-Start at the default of 2 and raise it only for a measured reason.
+Start at the default of 2. Raise it only for a measured reason.
 
-- **The saving is `replicas / subsetSize`.** Going from 2 to 4 halves the saving.
-  There is no point raising it past the point where a tenant is actually
-  throughput-bound.
-- **The ceiling is a tenant's throughput.** If a tenant's exporters are being
-  throttled, or its subset's pods are pegged while the rest of the Deployment
-  idles, its subset is too small. That is the signal to raise `subsetSize`.
-- **`subsetSize` >= `replicas` disables the saving.** Every tenant then reaches
-  every replica, which is exactly the pre-affinity behaviour with extra moving
-  parts.
+- **The saving is `replicas / subsetSize`.** A move from 2 to 4 halves the
+  saving. Raise it only as far as the throughput of a tenant requires.
+- **The ceiling is the throughput of a tenant.** If the exporters of a
+  tenant are throttled, or the pods of its subset are saturated while the
+  rest of the Deployment idles, its subset is too small. That is the signal
+  to raise `subsetSize`.
+- **`subsetSize` >= `replicas` disables the saving.** Every tenant then
+  reaches every replica. That is the pre-affinity behaviour with extra
+  moving parts.
 - **Keep `replicas` a multiple of `subsetSize`** where you can. The legacy
-  ingress-nginx backend partitions the endpoint list into groups of `subsetSize`;
-  a remainder produces one undersized group whose tenants get less capacity than
-  their siblings. (`ravelNative`'s rendezvous hashing does not partition into
-  fixed groups, so this is less pronounced there, but a multiple still keeps the
-  distribution evenest.)
+  ingress-nginx backend partitions the endpoint list into groups of
+  `subsetSize`. A remainder produces one undersized group whose tenants get
+  less capacity than the others. The rendezvous hashing of `ravelNative`
+  does not partition into fixed groups, so the effect is less pronounced
+  there, but a multiple still keeps the distribution evenest.
 - **Do not size for the largest tenant.** `subsetSize` is one number for the
-  whole cluster: there is no per-tenant subset size, so raising it for one tenant
-  raises everyone's cost. A tenant that genuinely needs a much larger subset than
-  its siblings belongs in its own `RavelCluster`, which also gives it its own
-  gateway Deployment to be bounded by.
+  whole cluster. There is no per-tenant subset size, so a raise for one
+  tenant raises the cost of every tenant. A tenant that needs a much larger
+  subset than the others belongs in its own `RavelCluster`, which also gives
+  it its own gateway Deployment to be bounded by.
 
-A practical rule: `subsetSize = 2`, `replicas` sized so that a subset carries the
-largest tenant's peak with one replica to spare.
+A practical rule: `subsetSize = 2`, with `replicas` sized so that a subset
+carries the peak of the largest tenant with one replica to spare.
 
 ## Choosing the key
 
-**`authorizationHeader` (default).** Hashes the `Authorization` header, which is
-the credential Ravel itself resolves tenancy from. Nothing on the client needs
-to change. Two consequences to know:
+**`authorizationHeader` (default).** Hashes the `Authorization` header, which
+is the credential that Ravel resolves tenancy from. Nothing on the client
+needs to change. Two consequences:
 
-- A tenant using several distinct tokens (per-agent credentials, for example)
-  hashes to several subsets. Affinity still works, it just divides less. One
-  token per tenant gives the full saving.
-- **Rotating a token moves that tenant to a different subset**, which is a
-  rebalance (see below). This is usually invisible, but it means a token
-  rotation and a rolling restart at the same moment move a tenant twice.
-  `canonicalTenant` avoids this; see below.
+- A tenant that uses several distinct tokens (per-agent credentials, for
+  example) hashes to several subsets. Affinity still works, but it divides
+  less. One token per tenant gives the full saving.
+- **A token rotation moves that tenant to a different subset**, which is a
+  rebalance (see
+  [Rolling restarts and replica loss](#rolling-restarts-and-replica-loss)).
+  This is usually invisible. A token rotation and a rolling restart at the
+  same moment move a tenant twice. `canonicalTenant` avoids this.
 
-**`header` + `headerName`.** Hashes a named header, such as one a trusted
-upstream proxy stamps. Only use this if clients cannot set the header
-themselves. Otherwise a tenant can choose its own subset, and a misbehaving one
-can pin itself onto a busy subset.
+**`header` + `headerName`.** Hashes a named header, such as one that a
+trusted upstream proxy stamps. Use this only if clients cannot set the
+header themselves. Otherwise a tenant can choose its own subset, and a
+misbehaving tenant can pin itself onto a busy subset.
 
 **`mtlsSubject`.** Hashes the mTLS client certificate subject
-(`$ssl_client_s_dn` under ingress-nginx). Requires the terminating layer to do
-TLS with client-certificate authentication configured. If it is not, the subject
-is empty, every request hashes to the same key, and **every tenant lands on one
-subset**, a much worse outcome than no affinity. Verify client-cert
-authentication is actually on before selecting this. The router reads the
-subject from the identity header the terminating layer stamps and never
-verifies a certificate itself, so under `ravelNative` a client that can reach
-the router directly can set that header and choose its own subset, the same
-way it can under `header`. Only use this when clients cannot reach the router
-without passing through the terminating layer.
+(`$ssl_client_s_dn` under ingress-nginx). The terminating layer must do TLS
+with client-certificate authentication configured. If it does not, the
+subject is empty, every request hashes to the same key, and **every tenant
+lands on one subset**, a much worse outcome than no affinity. Make sure that
+client-certificate authentication is on before you select this.
 
-**`canonicalTenant` (`ravelNative` only).** Hashes the canonical `TenantId` that
-Ravel's own resolver produces, not any raw wire value. **Immune to token
-rotation**: rotating a tenant's token does not move it to a new subset. This is
-the one key source that survives a rotation cleanly. Caveats: it is rejected on
-`backend: ingressNginx` (nginx cannot run the resolver), and it only works for
-clusters authenticating with static tenant tokens (`tenantTokensSecretRef`):
-OIDC has no CRD surface, and mTLS resolution is not an option at all, because
-`ravel-ingest-router` refuses `--mtls-enabled` unconditionally (it builds one
-resolver chain shared by every listener, with no dedicated mTLS listener to
-isolate it behind). Selecting `canonicalTenant` without a resolver degrades
-the router with `CanonicalTenantResolverMissing`. See
-[The `canonicalTenant` key source](#the-canonicaltenant-key-source).
+The router reads the subject from the identity header that the terminating
+layer stamps, and never verifies a certificate itself. Under `ravelNative`,
+a client that can reach the router directly can set that header and choose
+its own subset, the same way it can under `header`. Use this only when
+clients cannot reach the router without passing through the terminating
+layer.
 
-Under the legacy backend, header names are lowercased with every character
-outside `[a-z0-9]` mapped to `_`, matching nginx's own `$http_<name>` variable
-naming: `X-Scope-OrgID` becomes `$http_x_scope_orgid`. The CRD additionally
-rejects header names outside HTTP token characters (`^[A-Za-z0-9][A-Za-z0-9-]{0,62}$`),
-so nothing user-supplied can reach the nginx configuration as syntax.
+**`canonicalTenant` (`ravelNative` only).** Hashes the canonical `TenantId`
+that the resolver of Ravel produces, not any raw wire value. It is **immune
+to token rotation**: a token rotation does not move the tenant to a new
+subset. No other key source has this property. Its limits:
+
+- It is rejected on `backend: ingressNginx`, because nginx cannot run the
+  resolver.
+- It works only for clusters that authenticate with static tenant tokens
+  (`tenantTokensSecretRef`). OIDC has no CRD surface. mTLS resolution is not
+  an option, because `ravel-ingest-router` refuses `--mtls-enabled`
+  unconditionally.
+- With no resolver, the router degrades with
+  `CanonicalTenantResolverMissing`.
+
+See [The `canonicalTenant` key source](#the-canonicaltenant-key-source).
+
+Under the legacy backend, header names are lowercased, and every character
+outside `[a-z0-9]` maps to `_`. This matches the `$http_<name>` variable
+naming of nginx: `X-Scope-OrgID` becomes `$http_x_scope_orgid`. The CRD also
+rejects header names outside HTTP token characters
+(`^[A-Za-z0-9][A-Za-z0-9-]{0,62}$`), so nothing user-supplied can reach the
+nginx configuration as syntax.
 
 ## Rolling restarts and replica loss
 
-Both are rebalance events. Neither is a correctness event. This applies to both
-backends; the mechanism differs slightly.
+Both are rebalance events, on both backends. Neither is a correctness event.
 
 **What happens on a rebalance.** The endpoint list changes, subsets are
-recomputed, and some tenants move to a different subset. A moved tenant's next
-write opens a fresh buffer on its new replica with a new `writer_id` and
-`epoch`, while its old replica still holds an unflushed buffer that its own age
-timer will flush shortly after. So a rebalance costs one extra flush per moved
-`(tenant, signal, shard)`, a brief bounded uptick in PUTs, not a step change.
-Nothing is lost: the old replica's flush completes and commits normally, and
-both objects are valid because writer identity is part of the key.
+recomputed, and some tenants move to a different subset. The next write of a
+moved tenant opens a fresh buffer on its new replica with a new `writer_id`
+and `epoch`. Its old replica still holds an unflushed buffer, which its own
+age timer flushes shortly after. A rebalance therefore costs one extra flush
+per moved `(tenant, signal, shard)`: a brief bounded uptick in PUTs, not a
+step change. Nothing is lost. The flush of the old replica completes and
+commits normally, and both objects are valid because writer identity is part
+of the key.
 
 **Replica loss.** The routing layer drops the endpoint as soon as the
-EndpointSlice updates (ingress-nginx watches it; `ravelNative` watches it
-directly). A tenant whose subset lost a member keeps writing to its surviving
-member at full correctness and roughly half its previous subset capacity, until
-the replacement pod is Ready and the subsets recompute. This is exactly why the
-default subset is two and not one: at one, a replica loss stalls that tenant
-until the reroute completes.
+EndpointSlice updates. ingress-nginx watches it, and `ravelNative` watches
+it directly. A tenant whose subset lost a member keeps writing to its
+surviving member, at full correctness and roughly half its previous subset
+capacity. That lasts until the replacement pod is Ready and the subsets
+recompute. With a subset of one, a replica loss stalls that tenant until the
+reroute completes. For that reason the default subset is two.
 
-**Rolling restart.** Every pod is replaced, so the endpoint set changes several
-times and most tenants move at least once. Under `ravelNative`, because a replica
-is identified by pod UID, a full gateway rollout replaces the entire set at once
-and causes a one-time full reassignment by construction, so expect the PUT-rate
-bump to cover the whole roll. Under either backend, keeping
-`maxSurge`/`maxUnavailable` conservative keeps the endpoint set changing in
-small steps, which moves fewer tenants per step.
+**Rolling restart.** Every pod is replaced, so the endpoint set changes
+several times and most tenants move at least once. Under `ravelNative`, the
+pod UID identifies a replica, so a full gateway rollout replaces the entire
+set and causes a one-time full reassignment. Expect the PUT-rate bump to
+cover the whole roll. Under either backend, conservative
+`maxSurge`/`maxUnavailable` values change the endpoint set in small steps,
+which moves fewer tenants per step.
 
-**One caveat for the legacy backend.** ketama hashing bounds how many *keys*
-remap when the endpoint set changes, but ingress-nginx builds subsets by
+**Scaling on the legacy backend.** ketama hashing bounds how many *keys*
+remap when the endpoint set changes. ingress-nginx builds subsets by
 partitioning the endpoint list, so a change in the number of endpoints can
 reshuffle subset *membership* more broadly than the key remapping alone
-suggests. A scale from 10 replicas to 11 is not a 1-in-11 disturbance; it
-regroups the partition. `ravelNative`'s rendezvous hashing has the tighter HRW
-guarantee here (only tenants whose rank crosses position `S` move on a single
-add/remove), but treat any scaling event as a rebalance whose cost you have
-chosen to pay, and scale in steps of `subsetSize` where you can.
+suggests. A scale from 10 replicas to 11 is not a 1-in-11 disturbance. It
+regroups the partition. The rendezvous hashing of `ravelNative` has the
+tighter HRW guarantee: on a single add or remove, only tenants whose rank
+crosses position `S` move. Treat any scaling event as a rebalance with a
+cost, and scale in steps of `subsetSize` where you can.
 
 **Long-lived OTLP connections do not pin anything.** A collector holds one
-HTTP/2 connection to the routing layer for hours, but the routing decision is
-re-evaluated per request (per gRPC call, per HTTP export), so a rebalance takes
-effect on the next request without the client reconnecting. The long-lived
-connection is between the client and the *router/ingress*, not between the client
-and a gateway pod. The one thing that does persist is the reverse: a client that
-keeps a connection open through a full gateway rollout never notices, because the
-routing layer absorbs it.
+HTTP/2 connection to the routing layer for hours. The routing decision is
+re-evaluated per request (per gRPC call, per HTTP export), so a rebalance
+takes effect on the next request and the client does not reconnect. The
+long-lived connection is between the client and the *router/ingress*, not
+between the client and a gateway pod. A client that keeps a connection open
+through a full gateway rollout sees no change, because the routing layer
+absorbs it.
 
 ## Verifying it works
 
-Affinity failing silently is the main risk, so check rather than assume.
+Affinity can fail silently, so check it.
 
 Under the legacy backend, check the rendered annotations:
 
@@ -735,8 +781,8 @@ kubectl get ingress prod-gateway-ingest -o jsonpath='{.metadata.annotations}'
 All four affinity annotations must be present, and `service-upstream` must be
 `false`.
 
-Under `ravelNative`, check that the router objects rendered and that its status
-is not degraded:
+Under `ravelNative`, check that the router objects rendered and that the
+status is not degraded:
 
 ```sh
 kubectl get deploy,svc,role,rolebinding,sa \
@@ -745,16 +791,19 @@ kubectl get ravelcluster prod -o jsonpath='{.status.conditions}'
 ```
 
 A `Degraded` condition with reason `RouterImageMissing` or
-`CanonicalTenantResolverMissing` means the router did not render; fix the field
-it names.
+`CanonicalTenantResolverMissing` means that the router did not render. Fix
+the field that it names.
 
-Then confirm the effect where it matters, for either backend: the flush and PUT
-rate. Watch the gateway Deployment's flush counters (see
-[observability.md](observability.md)) across enabling affinity. With `R`
-replicas and subset size 2 the flush rate should fall toward `2/R` of its
-previous value once every buffer has aged out. If it does not move, the traffic
-is not going through the routing layer, or (legacy) `service-upstream` is true
-somewhere, or every request is carrying the same key.
+Then, for either backend, check the effect on the flush and PUT rate. Watch
+the flush counters of the gateway Deployment (see
+[observability.md](observability.md)) while you enable affinity. With `R`
+replicas and subset size 2, the flush rate falls toward `2/R` of its
+previous value once every buffer has aged out. If the rate does not move,
+one of these is the cause:
+
+- The traffic does not go through the routing layer.
+- (Legacy) `service-upstream` is true somewhere.
+- Every request carries the same key.
 
 ## Turning it off
 
@@ -763,12 +812,14 @@ kubectl patch ravelcluster prod --type merge \
   -p '{"spec":{"gateway":{"ingestAffinity":{"enabled":false}}}}'
 ```
 
-The operator deletes the rendered objects (Ingress objects under the legacy
-backend, or the router objects under `ravelNative`) on the next reconcile and
-renders exactly what it rendered before affinity existed. Ingest keeps working
-through whatever else routes to the gateway Service. Removing the
-`ingestAffinity` block entirely does the same thing; `enabled: false` is there so
-you can do it without losing the rest of the configuration.
+On the next reconcile the operator deletes the rendered objects: the Ingress
+objects under the legacy backend, or the router objects under `ravelNative`.
+It then returns to the pre-affinity render. Ingest keeps working through
+whatever else routes to the gateway Service.
+
+Removal of the whole `ingestAffinity` block does the same thing. With
+`enabled: false` you turn affinity off and keep the rest of the
+configuration.
 
 ## See also
 
@@ -780,10 +831,11 @@ you can do it without losing the rest of the configuration.
 
 ## Background
 
-Why request cost dominates, and the other three levers on it, are
-[ADR-0076](../adrs/0076-reducing-s3-request-cost.md); subset affinity itself is
-its decision 1. The exposure and affinity split, the Ravel-native router, and
-the canonical-tenant key source are
-[ADR-0080](../adrs/0080-gateway-api-ingest-affinity.md), decisions 2, 3 and 1.
-The process-wide ingest buffer budget the memory note refers to is ADR-0069
-decision 1.
+- Why request cost dominates, and the other three levers on it, are
+  [ADR-0076](../adrs/0076-reducing-s3-request-cost.md). Subset affinity is
+  its decision 1.
+- The exposure and affinity split, the Ravel-native router, and the
+  canonical-tenant key source are
+  [ADR-0080](../adrs/0080-gateway-api-ingest-affinity.md), decisions 2, 3
+  and 1.
+- The process-wide ingest buffer budget is ADR-0069 decision 1.
