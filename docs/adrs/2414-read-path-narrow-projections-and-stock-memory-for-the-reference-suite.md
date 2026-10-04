@@ -117,7 +117,14 @@ larger of the configured routing threshold and five request costs as its
 break-even: a 35 MB object at a 3% projection saves 34 MB against a 31 MB
 break-even and reads ranged; a 3 MB L0 object saves under 3 MB and reads
 whole; an explicit `--logs-block-range-threshold` still bounds the
-block-range routing it was written for. `byte-minimal` and `latency-first`
+block-range routing it was written for. The break-even applies only when
+`cost-based` took the rate from the profile (its price term or its time
+term). An explicit `--logs-request-cost-bytes` replaces that rate and keeps
+the configured routing threshold as the break-even, because ADR-0996
+promises that a deployment setting the flag keeps exactly the routing it had
+under ADR-0904; the end-to-end test
+`an_explicit_request_cost_flag_keeps_its_deployment_on_the_ranged_route`
+pins it. `byte-minimal` and `latency-first`
 keep today's break-even (the configured threshold) and today's rate: they
 exist to read ranged wherever bytes are saved, and this decision does not
 touch them. The rate drives a third decision
