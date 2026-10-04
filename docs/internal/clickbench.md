@@ -779,15 +779,16 @@ Read the resolved values off the server's own startup log rather than
 assuming them, and record them with the entry (the lines below are this
 real box, `s3` store, at the `MemAvailable` reading above; a loopback store
 or a different `MemAvailable` reading changes the memory-derived lines as
-described above):
+described above; the server prefixes each line with a timestamp, left out
+here):
 
 ```
-INFO performance default resolved setting="fetch_concurrency" value=32 source="derived"
-INFO performance default resolved setting="cache_max_bytes" value=6943751168 source="budget-carve"
-INFO performance default resolved setting="catalog_cache_max_bytes" value=1388750233 source="budget-carve"
-INFO performance default resolved setting="memory_budget_bytes" value=27775004672 source="derived-available"
-INFO performance default resolved setting="sql_max_query_bytes" value=16451897344 source="derived" clamped=false remainder_capped=false
-INFO performance default resolved setting="sql_tenant_max_bytes" value=16451897344 source="derived" raised=false remainder_capped=false
+INFO ravel_server::config: performance default resolved setting="fetch_concurrency" value=32 source="derived"
+INFO ravel_server::config: performance default resolved setting="cache_max_bytes" value=6943751168 source="budget-carve"
+INFO ravel_server::config: performance default resolved setting="catalog_cache_max_bytes" value=1388750233 source="budget-carve"
+INFO ravel_server::config: performance default resolved setting="memory_budget_bytes" value=27775004672 source="derived-available"
+INFO ravel_server::config: performance default resolved setting="sql_max_query_bytes" value=16451897344 source="derived" clamped=false remainder_capped=false
+INFO ravel_server::config: performance default resolved setting="sql_tenant_max_bytes" value=16451897344 source="derived" raised=false remainder_capped=false
 ```
 
 Pass a flag only to measure a setting other than the derived one; a flag logs
