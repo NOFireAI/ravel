@@ -95,7 +95,7 @@ One process per (arm, shape); profiler starts before the corpus is built, so
 the input records are inside the peak. Bytes are dhat `gb` live at t-gmax,
 summed per site (innermost frame in a ravel crate or in these bins, skipping
 allocator shims). Raw dhat JSON stays under `.gate-logs/`, not committed
-(8 files, each several hundred KB to a few MB, and `.gate-logs/` is gitignored).
+(8 files, 3.2 MB total, and `.gate-logs/` is gitignored).
 
 | shape | row t-gmax | col_dropped t-gmax | col_dropped / row | col_dropped lower by |
 |---|---:|---:|---:|---:|
@@ -201,7 +201,7 @@ hash `c7b75470...0806`, the value stage0f-true-peak.md records).
   - control_1_stream: 122,896 bytes, `c7b75470317e3dcd898559d99a7eb71095807cc1af7dac453a2693869a360806` both arms
   - control_1000_streams: 34,256 bytes, `32056cbe5245ebf8b6f0da0ea781bf633f1d3e4b3a689a0e1c90dd718f025699` both arms
   - The dhat bins print the same `OBJECT_HASH` for both arms on every shape
-    (wide shapes confirmed equal to the timing bin's hash).
+    (all four shapes equal to the timing bin's hash).
 - Rows: 20,000 per arm on all four shapes (`RlogReader` scan, `rows_r=rows_c=20000`).
 - Dynamic columns in the finished object: 106 (wide), 5 (control); overflowed 0.
 - dhat per-site sum equals dhat's own t-gmax total, all 8 runs:
