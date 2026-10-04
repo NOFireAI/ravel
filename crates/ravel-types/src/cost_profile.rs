@@ -180,7 +180,7 @@ const S3_INTRA_REGION_2026_PRICES: StoreCostProfile = StoreCostProfile {
 
 /// Where the reference profile's two timings were measured.
 const S3_INTRA_REGION_2026_TIMINGS_MEASURED: &str =
-    "2026-10-03, the 32 GB reference box of the reference suite, intra-region against S3";
+    "measured on the reference box of the reference suite, intra-region against the object store";
 
 impl StoreCostProfile {
     /// Name of the reference profile, as it appears in a provenance stamp.
@@ -602,7 +602,7 @@ transfer_nanodollars_per_gib = 0
 retrieval_nanodollars_per_gib = 0
 request_latency_micros = 70000
 per_connection_throughput_bytes_per_s = 90000000
-timings_measured = "2026-10-03, the 32 GB reference box of the reference suite, intra-region against S3"
+timings_measured = "measured on the reference box of the reference suite, intra-region against the object store"
 "#;
         let parsed = StoreCostProfile::from_toml_str(doc).expect("parse");
         assert_eq!(parsed, StoreCostProfile::reference());
@@ -618,8 +618,8 @@ timings_measured = "2026-10-03, the 32 GB reference box of the reference suite, 
         assert_eq!(
             p.timings_measured.as_deref(),
             Some(
-                "2026-10-03, the 32 GB reference box of the reference suite, \
-                 intra-region against S3"
+                "measured on the reference box of the reference suite, \
+                 intra-region against the object store"
             )
         );
         assert_eq!(p.request_cost_bytes_from_timings(), Some(6_300_000));
