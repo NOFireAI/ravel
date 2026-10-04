@@ -260,7 +260,8 @@ dashboard is the hook; the kill script is the evidence.
 
 <!-- amendment-applies: sections="Decision" pointer="Amendments section below" -->
 
-Four things this ADR got wrong or left unsaid, found while implementing it.
+Four things this ADR got wrong or left unsaid, found while implementing it
+(A1 to A4), and one later change to a decision (A5).
 Recorded here rather than silently patched into the decisions above, so the
 gap between what was designed and what shipped stays visible.
 
@@ -311,6 +312,15 @@ files, trigger the job on every event as before, so a README or compose edit
 is still checked on the pull request that makes it. If the job is promoted to
 a required check, this amendment has to be revisited first: a required check
 that skips server changes before the merge would gate nothing for them.
+One consequence holds without any promotion. A server change that breaks the
+quickstart now first fails on the push to `main`, and that run's conclusion is
+`failure`. The release gate in `publish-images.yml` reads the conclusion of the
+whole `ci` run for the tagged commit and fails closed on it, so this advisory
+job can veto a publish for a commit it did not block from merging, the same
+inversion ADR-0086 records for `coverage`. The effect is a release blocked for
+that commit until a fix lands, never an image published from a red run. The
+push run also covers every landing in its merge-queue batch, so a red run
+names the batch, not the single commit.
 Tracked in issue #2520.
 
 One thing outside this ADR that A2 exposes: `scripts/demo.sh` passes no
