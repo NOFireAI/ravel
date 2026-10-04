@@ -45,9 +45,9 @@ pub enum CompactionOutcome {
     /// erased records through query-time dedup).
     RewritePresent,
     /// Fewer than `min_compaction_inputs` L0 records; not worth compacting.
-    /// Also returned with `count: 0` when every input is one compaction skips
-    /// as unrewritable ([`CompactionInputSkipReason`]), so nothing is left to
-    /// merge.
+    /// Also returned when compaction skips an input as unrewritable
+    /// ([`CompactionInputSkipReason`]) and fewer than the minimum remain;
+    /// `count` is then the number of writable inputs left, 0 when none is.
     BelowMinInputs { count: usize },
     /// Built and published (or converged / abandoned): `parts` parts written,
     /// `publish` records how the record PUT resolved.
@@ -115,9 +115,18 @@ pub fn compaction_inputs_skipped_total(signal: Signal, reason: CompactionInputSk
         .unwrap_or(0)
 }
 
-/// Whether this process already skipped the input object `key`.
-pub(crate) fn is_skipped_input(key: &str) -> bool {
-    skipped_inputs().keys.contains(key)
+/// `inputs` less every object this process already skipped, in order.
+fn drop_skipped_inputs(
+    inputs: Vec<crate::read::InputRecord>,
+) -> Result<Vec<crate::read::InputRecord>> {
+    let mut kept = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        let key = ravel_commit::keys::reconstruct_data_key(&input.record)?;
+        if !skipped_inputs().keys.contains(&key) {
+            kept.push(input);
+        }
+    }
+    Ok(kept)
 }
 
 /// Record that compaction of `bucket` skipped the input object `key` for
@@ -343,6 +352,21 @@ async fn compact_bucket_scoped(
     )
     .await?;
 
+    // An object an earlier run of this process skipped is left out before the
+    // claim and before its catalog is read again, and the minimum is applied
+    // to what remains.
+    let loaded = inputs.len();
+    let inputs = drop_skipped_inputs(inputs)?;
+    if inputs.len() != loaded && (inputs.is_empty() || inputs.len() < config.min_compaction_inputs)
+    {
+        return Ok((
+            ClaimedCompaction::Ran(CompactionOutcome::BelowMinInputs {
+                count: inputs.len(),
+            }),
+            None,
+        ));
+    }
+
     // Cancellation checkpoint 1 (ADR-1029 decision 3), which is also where the
     // claim is acquired. A participating run claims every bucket whatever its
     // size, because the claim fences this publish against an erasure rewrite of
@@ -500,8 +524,9 @@ fn listing_gate(listing: &BucketListing) -> Option<CompactionOutcome> {
 /// fails none.
 ///
 /// An input the codec cannot rewrite is left out of the merge and of the
-/// record ([`UnwritableInputs::Skip`]); when no input is left the bucket
-/// reports [`CompactionOutcome::BelowMinInputs`] with a count of 0.
+/// record ([`UnwritableInputs::Skip`]); when fewer than `min_compaction_inputs`
+/// inputs are left the bucket reports [`CompactionOutcome::BelowMinInputs`]
+/// with the count left.
 async fn run_pipeline<C: SegmentCodec>(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -529,7 +554,9 @@ async fn run_pipeline<C: SegmentCodec>(
             parts: outcome.parts,
             publish: outcome.publish,
         },
-        FencedRewrite::NoWritableInputs => CompactionOutcome::BelowMinInputs { count: 0 },
+        FencedRewrite::TooFewWritableInputs { remaining } => {
+            CompactionOutcome::BelowMinInputs { count: remaining }
+        }
         FencedRewrite::RecordSetChanged(now) => {
             listing_gate(&now).unwrap_or(CompactionOutcome::Compacted {
                 parts: 0,
