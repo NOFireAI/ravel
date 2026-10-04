@@ -20,7 +20,8 @@
 //! - [`sweep`] plans and executes deletion of manifest versions superseded for
 //!   longer than a grace period.
 //! - [`repair`] lists a table's manifest versions and deletes the ones above
-//!   [`keys::MAX_MANIFEST_VERSION`], which no writer creates.
+//!   [`keys::MAX_MANIFEST_VERSION`] and the keys naming no version, which no
+//!   writer creates, or one version an operator names.
 //! - [`clock`] is the injected time source the writer and grants use.
 
 pub mod clock;

@@ -578,10 +578,14 @@ against the Ravel bucket (ADR-0055, HTTP DDL amendment):
   `/`, so the grant also reaches keys such as
   `t/<tenant_hash>/pq/t/a/b/v/<20 chars>.pqm` or a 20-character version that
   is not 20 digits. Every such key is still inside that tenant's manifest
-  keyspace, which the role can already create versions in, and
-  `parse_manifest_key` refuses each one: any of them makes the tenant's
-  manifest sweep fail with a foreign-key error, and one under a real table's
-  `v/` prefix makes resolving that table fail too, until the Maintain
+  keyspace, which the role can already create versions in. A `.pqm` key
+  under a real table's `v/` prefix whose 20 characters name no version (too
+  large for a `u64`, zero, or not all digits) is skipped, counted and warned
+  about by every listing, as a version above the bound is, and
+  `ravel-cli parquet repair --delete` removes it. A key whose table segment
+  is not a valid table name, such as the `a/b` one, is still refused as
+  foreign: it makes the tenant's `parquet ls` and manifest sweep fail with a
+  foreign-key error, though no table's resolve, until the Maintain
   credential deletes it. That is the same class of harm as the
   maximal-version wedge below, confined to the manifest keyspace.
 
@@ -592,24 +596,33 @@ against the Ravel bucket (ADR-0055, HTTP DDL amendment):
   grants record `t/<tenant_hash>/pq/grants`, which Query cannot write, so a
   forged definition can only reach locations the tenant has granted. The
   server's own DDL authorization does not bind the IAM credential: anything
-  holding it can put a manifest directly. A version above the version bound
-  (`MAX_MANIFEST_VERSION`, 2^32, in `crates/ravel-pqtable/src/keys.rs`),
-  such as one numbered `u64::MAX`, no longer wedges the table: no DDL
-  statement writes one, readers and the writer ignore it when choosing the
-  newest version, the first resolve in each process logs it at `warn`
-  naming the table, and `ravel-cli parquet sweep` neither deletes it nor
-  treats it as a successor. Remove it with
+  holding it can put a manifest directly. The version bound
+  (`MAX_MANIFEST_VERSION`, 2^32, in `crates/ravel-pqtable/src/keys.rs`)
+  removes the automatic wedge from a version above it, such as one numbered
+  `u64::MAX`, and from a key that names no version: no DDL statement writes
+  either, readers and the writer skip both when choosing the newest
+  version, the first listing in each process logs one at `warn` naming the
+  table, and `ravel-cli parquet sweep` neither deletes one nor treats it as a
+  successor. Remove them with
   `ravel-cli parquet repair --tenant <tenant> --table <table> --delete`
   under the Maintain credential (`MaintainDelete` on `t/*/pq/t/*`); without
-  `--delete` the command lists the table's versions and flags the ones above
-  the bound, and it never deletes one at or below it. Maintain cannot read
+  a delete flag the command lists the table's versions and flags those, and
+  `--delete` never deletes a version at or below the bound. Until they are
+  removed, every resolve of the table lists all of them. The bound does not
+  stop a wedge by a forged version at or below it: one exactly at the bound
+  leaves the writer no next version, so DDL on the table is refused, and
+  one below it that is the highest is the table's definition, which the
+  sweep then treats as the successor of the legitimate versions beneath it.
+  Either stays in effect until an operator removes it with
+  `ravel-cli parquet repair --tenant <tenant> --table <table> --delete-version <N>`,
+  also under Maintain, after checking the DDL audit log: every statement the
+  server runs records `attempted` before any store call, so a version with
+  no matching record was not written by the server. Maintain cannot read
   manifests, so run the listing under Query first to see each version's
-  `created_by` and `statement`. A forged version at or below the bound is
-  still the newest version when it is the highest, and the sweep still
-  deletes the legitimate versions beneath it once it is past grace: delete
-  such a version by hand with the Maintain credential before that sweep
-  runs, or restore the noncurrent object versions if the bucket keeps them.
-  Issue #2430 tracks the rest of the hardening. The full procedure is in
+  `created_by` and `statement`; restore the noncurrent object versions if
+  the sweep already deleted legitimate ones and the bucket keeps them.
+  Narrowing this grant, item 1 of issue #2430, remains the root fix. The
+  full procedure is in
   [the maintenance guide](../../docs/guides/operations/maintenance.md#repairing-a-forged-parquet-table-version).
 - `QueryWrite` gains `sys/pq-probe/*`, and `QueryProbeDelete` grants
   `s3:DeleteObject` on `sys/pq-probe/*` only: before every `CREATE`,

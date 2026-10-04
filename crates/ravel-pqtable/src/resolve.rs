@@ -6,7 +6,11 @@
 //! A version above [`MAX_MANIFEST_VERSION`] is never a table's newest: no
 //! writer creates one, so it was put by something else, and letting it win
 //! would hand the table to whoever put it. [`newest`] resolves the highest
-//! version at or below the bound instead, and reports the table once per
+//! version at or below the bound instead. A `.pqm` key under a table's `v/`
+//! prefix whose 20 characters name no version at all
+//! ([`ListedManifestKey::InvalidVersion`]) is treated the same way: every
+//! listing here, and the sweep's, skips it rather than failing. Each listing
+//! that finds either kind is counted, and the table is reported once per
 //! process as an [`AboveBoundVersions`] warning.
 
 use std::collections::BTreeMap;
@@ -16,46 +20,109 @@ use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
 use ravel_types::TenantHash;
 
 use crate::keys::{
-    KeyError, MAX_MANIFEST_VERSION, manifest_key, manifest_prefix, parse_manifest_key,
-    tenant_manifest_prefix,
+    KeyError, ListedManifestKey, MAX_MANIFEST_VERSION, VERSION_WIDTH, manifest_key,
+    manifest_prefix, parse_listed_manifest_key, tenant_manifest_prefix,
 };
 use crate::manifest::{Manifest, ManifestError, decode_manifest};
 
-/// A table whose listing holds manifest versions above
-/// [`MAX_MANIFEST_VERSION`], which [`newest`] ignored. Logged once per table
-/// per process; [`above_bound_resolves`] counts every listing that saw one.
+/// A table whose listing holds manifest version keys no reader resolves:
+/// versions above [`MAX_MANIFEST_VERSION`], or `.pqm` keys whose 20 characters
+/// name no version. Logged once per table per process;
+/// [`above_bound_resolves`] counts every listing that saw one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
-    "Parquet table {table:?} of tenant {tenant_hash} has {count} manifest version(s) above the \
-     version bound {bound} (highest {highest}); they are ignored, and \
-     `ravel-cli parquet repair --tenant <tenant> --table {table} --delete` removes them"
+    "Parquet table {table:?} of tenant {tenant_hash} has {count} manifest version key(s) above \
+     the version bound {bound} or naming no version (highest {highest:?}); they are ignored, \
+     and `ravel-cli parquet repair --tenant <tenant> --table {table} --delete` removes them"
 )]
 pub struct AboveBoundVersions {
     /// The tenant hash, as 32 lowercase hex characters.
     pub tenant_hash: String,
     pub table: String,
     pub count: usize,
-    pub highest: u64,
+    /// The 20 version characters of the highest such key in key order, as
+    /// the key spells them. Chosen by whoever put the key, so print it
+    /// escaped.
+    pub highest: String,
     pub bound: u64,
 }
 
-/// Listings that saw a version above the bound, per (tenant hash, table).
+/// How many (tenant hash, table) pairs [`ABOVE_BOUND`] records. Past it, a
+/// listing of a table not yet recorded is warned about every time and not
+/// counted, so the map cannot grow with the number of tables someone forges
+/// keys under.
+pub const ABOVE_BOUND_TABLES_MAX: usize = 4096;
+
+/// Listings that saw a version key no reader resolves, per (tenant hash,
+/// table), for at most [`ABOVE_BOUND_TABLES_MAX`] pairs.
 static ABOVE_BOUND: Mutex<BTreeMap<(String, String), u64>> = Mutex::new(BTreeMap::new());
 
-/// Count one listing of `warning.table` that saw versions above the bound.
-/// Returns true the first time this process records that table, which is when
-/// the caller logs it.
-fn record_above_bound(warning: &AboveBoundVersions) -> bool {
-    let mut seen = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
-    let count = seen
-        .entry((warning.tenant_hash.clone(), warning.table.clone()))
-        .or_insert(0);
-    *count = count.saturating_add(1);
-    *count == 1
+/// Count one listing of `key` in `seen`, which holds at most `cap` entries.
+/// Returns true when the caller should log it: the first time `key` is
+/// recorded, and on every listing of a key the full map has no room for.
+fn record_in(
+    seen: &mut BTreeMap<(String, String), u64>,
+    key: (String, String),
+    cap: usize,
+) -> bool {
+    if let Some(count) = seen.get_mut(&key) {
+        *count = count.saturating_add(1);
+        return false;
+    }
+    if seen.len() < cap {
+        seen.insert(key, 1);
+    }
+    true
 }
 
-/// How many listings of `table` in this process found a manifest version
-/// above [`MAX_MANIFEST_VERSION`].
+/// Count and, the first time, log one listing of `table` that found
+/// `invalid` (the version characters of its
+/// [`ListedManifestKey::InvalidVersion`] keys) or a version in `versions`
+/// above [`MAX_MANIFEST_VERSION`]. Nothing when it found neither.
+pub(crate) fn note_unresolvable(
+    tenant: &TenantHash,
+    table: &str,
+    versions: &[u64],
+    invalid: &[String],
+) {
+    let mut slots: Vec<String> = versions
+        .iter()
+        .filter(|&&v| v > MAX_MANIFEST_VERSION)
+        .map(|v| format!("{v:0width$}", width = VERSION_WIDTH))
+        .collect();
+    slots.extend(invalid.iter().cloned());
+    let Some(highest) = slots.iter().max().cloned() else {
+        return;
+    };
+    let warning = AboveBoundVersions {
+        tenant_hash: tenant.to_hex(),
+        table: table.to_string(),
+        count: slots.len(),
+        highest,
+        bound: MAX_MANIFEST_VERSION,
+    };
+    let log = {
+        let mut seen = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        record_in(
+            &mut seen,
+            (warning.tenant_hash.clone(), warning.table.clone()),
+            ABOVE_BOUND_TABLES_MAX,
+        )
+    };
+    if log {
+        tracing::warn!(
+            tenant_hash = %warning.tenant_hash,
+            table = %warning.table,
+            highest = ?warning.highest,
+            "{warning}"
+        );
+    }
+}
+
+/// How many listings of `table` in this process found a manifest version key
+/// no reader resolves: a version above [`MAX_MANIFEST_VERSION`], or a key
+/// whose 20 characters name no version. Zero for a table first seen after
+/// [`ABOVE_BOUND_TABLES_MAX`] others were recorded.
 pub fn above_bound_resolves(tenant: &TenantHash, table: &str) -> u64 {
     let seen = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
     seen.get(&(tenant.to_hex(), table.to_string()))
@@ -126,74 +193,118 @@ fn store_error(key: &str, source: StoreError) -> ResolveError {
     }
 }
 
+/// What one listing found under a table's `v/` prefix.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TableListing {
+    /// Every manifest version, ascending, including any above
+    /// [`MAX_MANIFEST_VERSION`].
+    pub versions: Vec<u64>,
+    /// The `.pqm` keys whose 20 characters name no version
+    /// ([`ListedManifestKey::InvalidVersion`]), ascending. No reader resolves
+    /// them.
+    pub invalid_keys: Vec<String>,
+}
+
+/// Every key under `prefix`, grouped by table. `only_table` is the table a
+/// per-table prefix belongs to, which every key must name. Each table with a
+/// key no reader resolves is passed to [`note_unresolvable`].
+async fn list_grouped(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    prefix: &str,
+    only_table: Option<&str>,
+) -> Result<BTreeMap<String, TableListing>, ResolveError> {
+    let listed = list_all(store, prefix)
+        .await
+        .map_err(|e| store_error(prefix, e))?;
+    let foreign = |key: String, reason: String| ResolveError::ForeignKey {
+        key,
+        prefix: prefix.to_string(),
+        reason,
+    };
+    let mut out: BTreeMap<String, (TableListing, Vec<String>)> = BTreeMap::new();
+    for meta in listed {
+        let parsed = parse_listed_manifest_key(&meta.key)
+            .map_err(|e| foreign(meta.key.clone(), e.to_string()))?;
+        let (tenant_hash, table) = match &parsed {
+            ListedManifestKey::Version(p) => (p.tenant_hash, p.table.as_str()),
+            ListedManifestKey::InvalidVersion {
+                tenant_hash, table, ..
+            } => (*tenant_hash, table.as_str()),
+        };
+        if tenant_hash != *tenant || only_table.is_some_and(|t| t != table) {
+            return Err(foreign(
+                meta.key,
+                "belongs to another tenant or table".into(),
+            ));
+        }
+        let (listing, slots) = out.entry(table.to_string()).or_default();
+        match parsed {
+            ListedManifestKey::Version(p) => listing.versions.push(p.version),
+            ListedManifestKey::InvalidVersion { slot, .. } => {
+                listing.invalid_keys.push(meta.key);
+                slots.push(slot);
+            }
+        }
+    }
+    Ok(out
+        .into_iter()
+        .map(|(table, (mut listing, mut slots))| {
+            slots.sort_unstable();
+            slots.dedup();
+            listing.versions.sort_unstable();
+            listing.versions.dedup();
+            listing.invalid_keys.sort_unstable();
+            listing.invalid_keys.dedup();
+            note_unresolvable(tenant, &table, &listing.versions, &slots);
+            (table, listing)
+        })
+        .collect())
+}
+
 /// Every version number of `table`, ascending, from a paginated LIST of its
-/// `v/` prefix.
+/// `v/` prefix, including any above [`MAX_MANIFEST_VERSION`]. A key whose 20
+/// characters name no version is skipped and counted
+/// ([`above_bound_resolves`]); any other key that is not a version of this
+/// table is [`ResolveError::ForeignKey`].
 pub async fn versions(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     table: &str,
 ) -> Result<Vec<u64>, ResolveError> {
     let prefix = manifest_prefix(tenant, table)?;
-    let listed = list_all(store, &prefix)
-        .await
-        .map_err(|e| store_error(&prefix, e))?;
-    let mut out = Vec::with_capacity(listed.len());
-    for meta in listed {
-        let parsed = parse_manifest_key(&meta.key).map_err(|e| ResolveError::ForeignKey {
-            key: meta.key.clone(),
-            prefix: prefix.clone(),
-            reason: e.to_string(),
-        })?;
-        if parsed.tenant_hash != *tenant || parsed.table != table {
-            return Err(ResolveError::ForeignKey {
-                key: meta.key,
-                prefix,
-                reason: "belongs to another tenant or table".into(),
-            });
-        }
-        out.push(parsed.version);
-    }
-    out.sort_unstable();
-    out.dedup();
-    Ok(out)
+    let mut grouped = list_grouped(store, tenant, &prefix, Some(table)).await?;
+    Ok(grouped.remove(table).unwrap_or_default().versions)
 }
 
-/// Every table of `tenant` that has at least one manifest version, with that
-/// table's version numbers ascending.
+/// Every table of `tenant` with at least one key under its `v/` prefix, and
+/// what that prefix holds.
 ///
 /// One LIST of `t/<tenant_hash>/pq/t/` answers for every table, so an
 /// inspection of a whole tenant costs the same listing a sweep does rather
-/// than one per table. A key under that prefix that is not a manifest key is
-/// [`ResolveError::ForeignKey`], the same refusal [`versions`] makes.
+/// than one per table. Keys whose 20 characters name no version are skipped
+/// and counted as in [`versions`]; any other key under that prefix that is not
+/// a manifest key is [`ResolveError::ForeignKey`].
+pub async fn table_listings(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> Result<BTreeMap<String, TableListing>, ResolveError> {
+    list_grouped(store, tenant, &tenant_manifest_prefix(tenant), None).await
+}
+
+/// Every table of `tenant` that has at least one manifest version, with that
+/// table's version numbers ascending: [`table_listings`] without the keys that
+/// name no version.
 pub async fn tables(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
 ) -> Result<BTreeMap<String, Vec<u64>>, ResolveError> {
-    let prefix = tenant_manifest_prefix(tenant);
-    let listed = list_all(store, &prefix)
-        .await
-        .map_err(|e| store_error(&prefix, e))?;
-    let mut out: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-    for meta in listed {
-        let parsed = parse_manifest_key(&meta.key).map_err(|e| ResolveError::ForeignKey {
-            key: meta.key.clone(),
-            prefix: prefix.clone(),
-            reason: e.to_string(),
-        })?;
-        if parsed.tenant_hash != *tenant {
-            return Err(ResolveError::ForeignKey {
-                key: meta.key,
-                prefix,
-                reason: "belongs to another tenant".into(),
-            });
-        }
-        out.entry(parsed.table).or_default().push(parsed.version);
-    }
-    for versions in out.values_mut() {
-        versions.sort_unstable();
-        versions.dedup();
-    }
-    Ok(out)
+    Ok(table_listings(store, tenant)
+        .await?
+        .into_iter()
+        .filter(|(_, listing)| !listing.versions.is_empty())
+        .map(|(table, listing)| (table, listing.versions))
+        .collect())
 }
 
 /// Read and decode one manifest version. `Ok(None)` when it does not exist.
@@ -217,9 +328,10 @@ pub async fn read_version(
 /// a dropped table does not exist, and a writer needs the dropped version's
 /// number to write the next one.
 ///
-/// Versions above the bound are not read. Each listing that holds one is
-/// counted ([`above_bound_resolves`]), and the first in this process for the
-/// table is logged at `warn` as an [`AboveBoundVersions`].
+/// Versions above the bound, and keys whose 20 characters name no version,
+/// are not read. Each listing that holds one is counted
+/// ([`above_bound_resolves`]), and the first in this process for the table is
+/// logged at `warn` as an [`AboveBoundVersions`].
 pub async fn newest(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -227,24 +339,7 @@ pub async fn newest(
 ) -> Result<Option<Manifest>, ResolveError> {
     for _ in 0..MAX_RESOLVE_ATTEMPTS {
         let listed = versions(store, tenant, table).await?;
-        let (bounded, above) = split_at_bound(&listed);
-        if let Some(&highest) = above.last() {
-            let warning = AboveBoundVersions {
-                tenant_hash: tenant.to_hex(),
-                table: table.to_string(),
-                count: above.len(),
-                highest,
-                bound: MAX_MANIFEST_VERSION,
-            };
-            if record_above_bound(&warning) {
-                tracing::warn!(
-                    tenant_hash = %warning.tenant_hash,
-                    table = %warning.table,
-                    highest = warning.highest,
-                    "{warning}"
-                );
-            }
-        }
+        let (bounded, _above) = split_at_bound(&listed);
         let Some(&version) = bounded.last() else {
             return Ok(None);
         };
@@ -260,7 +355,7 @@ pub async fn newest(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use bytes::Bytes;
     use ravel_object_store::PutOptions;
     use ravel_object_store::memory::MemoryStore;
@@ -326,7 +421,7 @@ mod tests {
 
     /// Everything the `tracing` events of this thread format, from the moment
     /// the returned guard is set until it drops.
-    fn capture_logs() -> (
+    pub(crate) fn capture_logs() -> (
         std::sync::Arc<Mutex<Vec<u8>>>,
         tracing::subscriber::DefaultGuard,
     ) {
@@ -420,6 +515,112 @@ mod tests {
         );
     }
 
+    /// The 20 version characters of a `.pqm` key that names no version: more
+    /// than `u64::MAX`, zero, and not digits.
+    pub(crate) const INVALID_SLOTS: [&str; 3] = [
+        "99999999999999999999",
+        "00000000000000000000",
+        "abcdefghijklmnopqrst",
+    ];
+
+    /// Put `t/<tenant>/pq/t/hits/v/<slot>.pqm` with a body that is not a
+    /// manifest, so any attempt to read it as one fails.
+    pub(crate) async fn put_invalid(store: &MemoryStore, tenant: &TenantHash, slot: &str) {
+        let key = format!(
+            "{}{slot}.pqm",
+            manifest_prefix(tenant, "hits").expect("prefix")
+        );
+        store
+            .put(&key, Bytes::from_static(b"forged"), PutOptions::default())
+            .await
+            .expect("put");
+    }
+
+    /// How many times the above-bound warning names `slot` in `logs`.
+    pub(crate) fn warnings_naming(logs: &Mutex<Vec<u8>>, slot: &str) -> usize {
+        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
+        text.lines()
+            .filter(|l| {
+                l.contains("WARN")
+                    && l.contains("above the version bound")
+                    && l.contains(&format!("{slot:?}"))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_key_naming_no_version_is_skipped_by_versions_and_newest_and_counted() {
+        for (i, slot) in INVALID_SLOTS.iter().enumerate() {
+            let tenant = TenantHash([0x41 + i as u8; 16]);
+            let (logs, _guard) = capture_logs();
+            let store = MemoryStore::with_page_size(2);
+            for v in [1, 2] {
+                put_version(&store, &tenant, v).await;
+            }
+            put_invalid(&store, &tenant, slot).await;
+            assert_eq!(
+                versions(&store, &tenant, "hits").await.expect("versions"),
+                vec![1, 2],
+                "{slot}"
+            );
+            assert_eq!(
+                newest(&store, &tenant, "hits").await.expect("resolve"),
+                Some(live_manifest("hits", 2, &[2])),
+                "{slot}"
+            );
+            assert_eq!(above_bound_resolves(&tenant, "hits"), 2, "{slot}");
+            assert_eq!(warnings_naming(&logs, slot), 1, "{slot}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_naming_no_version_is_skipped_by_the_tenant_listing_and_counted() {
+        for (i, slot) in INVALID_SLOTS.iter().enumerate() {
+            let tenant = TenantHash([0x44 + i as u8; 16]);
+            let (logs, _guard) = capture_logs();
+            let store = MemoryStore::with_page_size(2);
+            for v in [1, 2] {
+                put_version(&store, &tenant, v).await;
+            }
+            put_invalid(&store, &tenant, slot).await;
+            for _ in 0..2 {
+                assert_eq!(
+                    tables(&store, &tenant).await.expect("tables"),
+                    BTreeMap::from([("hits".to_string(), vec![1, 2])]),
+                    "{slot}"
+                );
+            }
+            assert_eq!(above_bound_resolves(&tenant, "hits"), 2, "{slot}");
+            assert_eq!(warnings_naming(&logs, slot), 1, "{slot}");
+            let listings = table_listings(&store, &tenant).await.expect("listings");
+            assert_eq!(
+                listings.get("hits").map(|l| l.invalid_keys.clone()),
+                Some(vec![format!(
+                    "{}{slot}.pqm",
+                    manifest_prefix(&tenant, "hits").expect("prefix")
+                )])
+            );
+        }
+    }
+
+    #[test]
+    fn the_warning_map_stops_recording_at_its_cap_and_still_asks_for_a_warn() {
+        let mut seen = BTreeMap::new();
+        let key = |t: &str| ("tenant".to_string(), t.to_string());
+        assert!(record_in(&mut seen, key("a"), 2));
+        assert!(!record_in(&mut seen, key("a"), 2));
+        assert!(record_in(&mut seen, key("b"), 2));
+        // Full: a new table warns every time and is not recorded.
+        assert!(record_in(&mut seen, key("c"), 2));
+        assert!(record_in(&mut seen, key("c"), 2));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen.get(&key("a")), Some(&2));
+        assert_eq!(seen.get(&key("c")), None);
+        // A recorded table keeps counting.
+        assert!(!record_in(&mut seen, key("b"), 2));
+        assert_eq!(seen.get(&key("b")), Some(&2));
+    }
+
     #[tokio::test]
     async fn a_newest_version_deleted_before_every_read_is_reported_as_vanished() {
         // A sweep deleting the version this resolve just listed, on every
@@ -491,24 +692,48 @@ mod tests {
 
     #[tokio::test]
     async fn a_foreign_key_under_a_table_prefix_is_refused() {
+        // Only a key that is not `<20 characters>.pqm` directly under `v/`
+        // is foreign; one whose 20 characters name no version is skipped.
+        let prefix = manifest_prefix(&TENANT_A, "hits").expect("prefix");
+        for junk in [
+            format!("{prefix}notes.txt"),
+            format!("{prefix}00000000000000000001.parquet"),
+            format!("{prefix}0000000000000000001.pqm"),
+        ] {
+            let store = MemoryStore::new();
+            put_version(&store, &TENANT_A, 1).await;
+            store
+                .put(&junk, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("put");
+            assert!(matches!(
+                newest(&store, &TENANT_A, "hits").await,
+                Err(ResolveError::ForeignKey { ref key, .. }) if *key == junk
+            ));
+            // The tenant-wide listing makes the same refusal.
+            assert!(matches!(
+                tables(&store, &TENANT_A).await,
+                Err(ResolveError::ForeignKey { ref key, .. }) if *key == junk
+            ));
+        }
+        // A key outside `v/` reaches only the tenant-wide listing.
         let store = MemoryStore::new();
         put_version(&store, &TENANT_A, 1).await;
-        let junk = format!(
-            "{}notes.txt",
-            manifest_prefix(&TENANT_A, "hits").expect("prefix")
+        let outside = format!(
+            "{}hits/x/00000000000000000002.pqm",
+            tenant_manifest_prefix(&TENANT_A)
         );
         store
-            .put(&junk, Bytes::from_static(b"x"), PutOptions::default())
+            .put(&outside, Bytes::from_static(b"x"), PutOptions::default())
             .await
             .expect("put");
         assert!(matches!(
-            newest(&store, &TENANT_A, "hits").await,
-            Err(ResolveError::ForeignKey { key, .. }) if key == junk
-        ));
-        // The tenant-wide listing makes the same refusal.
-        assert!(matches!(
             tables(&store, &TENANT_A).await,
-            Err(ResolveError::ForeignKey { key, .. }) if key == junk
+            Err(ResolveError::ForeignKey { ref key, .. }) if *key == outside
         ));
+        assert_eq!(
+            versions(&store, &TENANT_A, "hits").await.expect("versions"),
+            vec![1]
+        );
     }
 }

@@ -618,11 +618,11 @@ _No flags._
 
 ### parquet ls
 
-Print every manifest field of each table's newest version. With `--table`, print every retained version of that one table instead
+Print every manifest field of each table's newest version. With `--table`, print every retained version of that one table at or below the version bound instead
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--table` |  |  | Restrict the output to one table, and print every version of it that has not been swept |
+| `--table` |  |  | Restrict the output to one table, and print every version of it at or below the version bound that has not been swept |
 | `--tenant` |  |  | The tenant whose Parquet tables to print |
 
 ### parquet sweep
@@ -636,11 +636,12 @@ Delete manifest versions superseded for longer than `--grace`
 
 ### parquet repair
 
-The repair for a forged manifest version: list one table's manifest versions and flag those above the version bound; with `--delete`, delete exactly the flagged ones
+The repair for a forged manifest version: list one table's manifest version keys and flag those above the version bound and those naming no version; with `--delete`, delete exactly the flagged ones; with `--delete-version N`, delete exactly version N
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--delete` |  |  | Delete every flagged version. Without it the command only lists |
+| `--delete` |  |  | Delete every flagged key. Without it or `--delete-version` the command only lists |
+| `--delete-version` |  |  | Delete exactly this version's key, from 1 to the version bound, and nothing else. For a version judged forged from the DDL audit log; zero and versions above the bound are refused |
 | `--table` |  |  | The table whose manifest versions to list |
 | `--tenant` |  |  | The tenant that owns the table |
 

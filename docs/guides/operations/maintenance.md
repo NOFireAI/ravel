@@ -1315,18 +1315,31 @@ as any fresh node. The local cache is disposable by construction.
 A Parquet table's definition is its newest manifest version under
 `t/<hash>/pq/t/<table>/v/`, and each `CREATE`, `CREATE OR REPLACE` or `DROP`
 writes the next number. No statement writes a version above 4294967296
-(2^32). One there was put straight into the bucket, for example with a
-stolen Query credential, which can create manifest versions.
+(2^32), or a `.pqm` key whose 20 characters are not a version number (20
+digits too large for a `u64`, twenty zeros, or not all digits). One
+there was put straight into the bucket, for example with a stolen Query
+credential, which can create manifest versions.
 
-Ravel ignores such a version: queries and DDL use the newest version at or
-below the bound, so the table keeps its last legitimate definition and DDL on
-it still works, and `parquet sweep` neither deletes it nor deletes the
-versions beneath it because of it. The first query or DDL in each server
-process that finds one logs a `warn` line naming the tenant hash, the table,
-the highest version and the repair command, and `parquet ls` prints a line
-for each table that has one.
+Ravel skips such a key: queries and DDL use the newest version at or below
+the bound, so the table keeps its last legitimate definition and DDL on it
+still works, and `parquet ls` and `parquet sweep` skip it too. The sweep
+neither deletes it nor deletes the versions beneath it because of it. The
+first listing in each process that finds one logs a `warn` line naming the
+tenant hash, the table, the highest such key's version characters and the
+repair command, and `parquet ls` prints a line for each table that has one.
 
-To remove it:
+The bound removes the automatic wedge from versions above 2^32 and from keys
+that name no version. A forged version at or below the bound still blocks DDL
+or serves as the table until you remove it with `--delete-version` after
+checking the audit log; see
+[a forged version at or below the bound](#a-forged-version-at-or-below-the-bound).
+Narrowing the Query role's manifest grant, so it cannot put such a version at
+all, remains the root fix and is not done yet.
+
+Until the flagged keys are removed, every resolve of the table lists all of
+them, so many of them make every query and DDL statement on it slower.
+
+To remove them:
 
 1. List the table's versions under a credential that can read manifests,
    such as the Query role, to see who wrote each one and with what
@@ -1336,9 +1349,10 @@ To remove it:
    ravel-cli parquet repair --tenant acme --table clicks
    ```
 
-   Each version prints its key, `created_by` and `statement`, and the ones
-   above the bound are marked `FLAGGED: above the version bound`. A key whose
-   twenty digits are too large to be a version number is flagged too.
+   Each key prints escaped, with `stored_unix_ms` (when the store wrote it,
+   by the store's clock), `created_by` and `statement`. Versions above the
+   bound are marked `FLAGGED: above the version bound`, and keys whose twenty
+   characters name no version are marked `FLAGGED: names no version`.
 2. Rotate the credential the version was written with. The repair removes
    the version, not the access that wrote it.
 3. Delete the flagged versions with the Maintain credential, the only role
@@ -1348,17 +1362,61 @@ To remove it:
    ravel-cli parquet repair --tenant acme --table clicks --delete
    ```
 
-   It deletes exactly the flagged versions and refuses to delete any version
+   It deletes exactly the flagged keys and refuses to delete any version
    at or below the bound. The Maintain role cannot read manifests, so this
    run reports `created_by` and `statement` as unreadable; that does not
-   change which versions it deletes.
+   change which keys it deletes.
+
+### A forged version at or below the bound
 
 A forged version at or below the bound looks like any other version and is
-not flagged. If `parquet repair` shows a newest version whose `created_by`
-and `statement` you do not recognise, delete that one key by hand with the
-Maintain credential before the next `parquet sweep`, which would otherwise
-delete the legitimate versions beneath it once it is past the grace, or
-restore the noncurrent object versions if the bucket keeps them.
+not flagged. As the table's highest version it is the table's definition, and
+one exactly at the bound leaves no next version, so every `CREATE OR REPLACE`
+or `DROP` on the table is refused with a 422 naming the version bound. The
+next `parquet sweep` also deletes the legitimate versions beneath it once it
+is past the grace, so act before that sweep runs, or restore the noncurrent
+object versions if the bucket keeps them.
+
+The audit log decides whether a version is forged. Every DDL statement the
+server runs writes an `attempted` audit record before it touches storage (see
+[the audit guide](../audit.md)), so a manifest version with no `attempted`
+record for its table at or shortly before its `stored_unix_ms` was not
+written by Ravel. This holds under `--audit-mode required`, the default:
+under `best-effort` a statement can run without its record, so also check
+`ravel_audit_write_failures_total` for that window. A matching record does
+not prove the version legitimate, since the record's text cannot name the
+version number it went on to write; compare its statement with the
+version's `statement` as well.
+
+1. List the table under the Query role, as in step 1 above, and note the
+   suspect version's number, `stored_unix_ms`, `created_by` and `statement`.
+2. As the tenant, read its DDL records around that time:
+
+   ```sql
+   SELECT ts_ns,
+          attrs['query.status'] AS status,
+          attrs['query.text'] AS statement
+   FROM audit
+   WHERE attrs['kind'] = 'query'
+     AND attrs['query.language'] = 'sql'
+     AND ts_ns >= TIMESTAMP '2026-10-04T09:00:00'
+     AND ts_ns <  TIMESTAMP '2026-10-04T10:00:00'
+   ORDER BY ts_ns;
+   ```
+
+   No `attempted` row naming the table before the version's
+   `stored_unix_ms` means no statement the server ran wrote it.
+3. Rotate the credential, as in step 2 above.
+4. Delete exactly that version with the Maintain credential:
+
+   ```sh
+   ravel-cli parquet repair --tenant acme --table clicks --delete-version 4294967296
+   ```
+
+   It deletes only that version's key and prints it. It refuses zero and
+   any version above the bound (those are what `--delete` removes) before
+   touching the store, and refuses a version that is not listed. The next
+   statement on the table numbers from the newest version left beneath it.
 
 ## The maintenance and inspection commands
 
@@ -1379,7 +1437,7 @@ list is in [the generated CLI reference](../../reference/ravel-cli-flags.md).
 | `catalog inspect --tenant <t> [--signal <s>]` | Decodes and prints that signal's HEAD and every referenced snapshot part: watermark, keys, hashes, entry counts. It names the signal both as a word and as the numeric value read off the object, so a HEAD stamped with a different signal than the one asked for is visible. It reports rather than errors when no HEAD exists yet. |
 | `catalog verify` | Diffs the sealed record history against the snapshot. See [routine verification](#routine-verification). |
 | `commit reconstruct` | Rebuilds record-less L0 data objects' commit records from their own footers. Stop maintenance first; see [troubleshooting](troubleshooting.md#commit-records-were-deleted-out-of-band). |
-| `parquet repair --tenant <t> --table <name> [--delete]` | Lists one Parquet table's manifest versions and flags those above the version bound; `--delete` removes exactly the flagged ones. See [repairing a forged Parquet table version](#repairing-a-forged-parquet-table-version). |
+| `parquet repair --tenant <t> --table <name> [--delete \| --delete-version N]` | Lists one Parquet table's manifest version keys and flags those above the version bound and those naming no version; `--delete` removes exactly the flagged ones, and `--delete-version N` removes exactly version N (1 to the bound). See [repairing a forged Parquet table version](#repairing-a-forged-parquet-table-version). |
 | `cache reclaim-legacy --cache-dir <dir> [--apply]` | Reclaims pre-namespacing local read-cache files. See [reclaiming a pre-namespacing cache directory](#reclaiming-a-pre-namespacing-cache-directory). Local filesystem only; dry run without `--apply`. |
 | `segment inspect <path-or-key>` | Parses one metric segment: trailer, footer fields, section list, decoded series count. |
 | `commit decode <key>` | Decodes one commit record: identity, referenced data object key, size and hash, sample and series counts, timestamps. |

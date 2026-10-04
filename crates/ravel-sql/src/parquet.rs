@@ -1099,7 +1099,7 @@ mod tests {
     }
 
     /// A Flight pin above the manifest version bound is refused as gone
-    /// before Ravel's store is read at all.
+    /// before Ravel's store is read at all; one at the bound is read.
     #[tokio::test]
     async fn a_pin_above_the_version_bound_is_gone_without_a_read() {
         use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
@@ -1134,6 +1134,30 @@ mod tests {
             got.err()
         );
         assert_eq!(ravel.metrics().snapshot().op(StoreOp::Get).calls, 0);
+
+        // A pin exactly at the bound is inside it, so it is read; this store
+        // holds no such version, so the read finds it gone.
+        let pins = [ParquetPin {
+            table: "hits".to_string(),
+            version: MAX_MANIFEST_VERSION,
+        }];
+        let got = resolve_pinned_tables(
+            &sources,
+            &TenantHash([7; 16]),
+            &pins,
+            &QueryAccounting::new(),
+        )
+        .await;
+        assert!(
+            matches!(
+                &got,
+                Err(ParquetQueryError::PinnedManifestGone { version, .. })
+                    if *version == MAX_MANIFEST_VERSION
+            ),
+            "{:?}",
+            got.err()
+        );
+        assert_eq!(ravel.metrics().snapshot().op(StoreOp::Get).calls, 1);
     }
 
     /// `ProfileStores` opens one store per (profile, bucket), the first time
