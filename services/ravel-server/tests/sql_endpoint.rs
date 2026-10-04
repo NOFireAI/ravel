@@ -614,6 +614,27 @@ fn build_router_principals(
     audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
     parquet: Option<ravel_sql::ParquetSources>,
 ) -> Router {
+    build_router_accounted(
+        store,
+        principals,
+        audit_sink,
+        parquet,
+        Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+            std::collections::HashSet::new(),
+        )),
+    )
+}
+
+/// [`build_router_principals`] recording into a caller-held
+/// `query_accounting`, so a `/metrics` router built over the same handle
+/// renders what this router records.
+fn build_router_accounted(
+    store: Arc<dyn ObjectStoreBackend>,
+    principals: HashMap<String, Principal>,
+    audit_sink: Arc<dyn ravel_maintain::QueryAuditSink>,
+    parquet: Option<ravel_sql::ParquetSources>,
+    query_accounting: Arc<ravel_server::metrics::QueryAccountingMetrics>,
+) -> Router {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
@@ -634,9 +655,7 @@ fn build_router_principals(
         store,
         clock: Arc::new(FixedClock),
         max_deadline: Duration::from_secs(30),
-        query_accounting: Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
-            std::collections::HashSet::new(),
-        )),
+        query_accounting,
         query_admission: ravel_query::QueryAdmissionController::shared(
             ravel_query::QueryConcurrencyLimit::Unlimited,
         ),
@@ -1394,6 +1413,313 @@ async fn a_ddl_statement_records_attempted_before_it_runs_and_its_outcome_after(
         "the outcome record is submitted after the statement's own store \
          calls: {stamps:?}"
     );
+}
+
+/// A `/metrics` router rendering `query_accounting`, the handle the SQL
+/// router under test records into.
+fn ddl_metrics_router(
+    store: Arc<dyn ObjectStoreBackend>,
+    query_accounting: Arc<ravel_server::metrics::QueryAccountingMetrics>,
+) -> Router {
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    ravel_server::metrics::router(ravel_server::metrics::MetricsState {
+        mode: ravel_server::Mode::All,
+        store_metrics: Arc::new(ravel_object_store::StoreMetrics::default()),
+        ingest_router: None,
+        log_ingest_router: None,
+        span_ingest_router: None,
+        catalog,
+        tenant_discovery: None,
+        maintenance_safety: None,
+        maintenance_ownership: None,
+        merge_memory: None,
+        scrub: None,
+        cache_metrics: None,
+        cache_disk_metrics: None,
+        catalog_cache_metrics: None,
+        catalog_cache_disk_metrics: None,
+        admission: Arc::new(ravel_ingest::AdmissionController::new(
+            Arc::new(ravel_ingest::SystemClock),
+            ravel_ingest::AdmissionLimits::default(),
+        )),
+        reconcile_cycle: Arc::new(
+            ravel_server::admission_reconcile::ReconcileCycleMetrics::default(),
+        ),
+        metrics_tenant_labels: false,
+        query_accounting,
+        metrics_tenant_allowlist: Arc::new(std::collections::HashSet::new()),
+        ingest_buffer_budget: ravel_ingest::IngestByteBudget::shared(
+            ravel_ingest::IngestByteBudgetLimit::Unlimited,
+        ),
+        ingest_concurrency: ravel_server::ingest_concurrency::IngestConcurrencyController::shared(
+            ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1024),
+        ),
+        distrib: None,
+        #[cfg(feature = "flight-sql")]
+        sql_slice_rejects: None,
+        durable_auth: None,
+        ingest_byte_metrics: Arc::new(ravel_server::ingest_byte_metrics::IngestByteMetrics::new()),
+        normalize_reject_metrics: Arc::new(
+            ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+        ),
+        metadata_cache: None,
+        cache: None,
+        cache_max_bytes: 0,
+        catalog_cache_max_bytes: 0,
+        audit_pipeline: None,
+        process_memory_budget: Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        process_memory_budget_is_fallback: false,
+        cpu_gates: ravel_server::cpu_gates::CpuGates::new(Default::default()),
+        can_fold: true,
+        fold_loop: Default::default(),
+        heartbeat: ravel_server::health_listener::Heartbeat::new(Arc::new(
+            ravel_ingest::SystemClock,
+        )),
+    })
+}
+
+async fn scrape_metrics(app: &Router) -> String {
+    let request = Request::builder()
+        .method("GET")
+        .uri("/metrics")
+        .body(Body::empty())
+        .expect("build request");
+    let response = app.clone().oneshot(request).await.expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    String::from_utf8(bytes.to_vec()).expect("utf8 metrics")
+}
+
+/// The value of the one sample line `series` names in `scrape`, or `None`
+/// when no line does; more than one matching line is a failure.
+fn series_value(scrape: &str, series: &str) -> Option<u64> {
+    let prefix = format!("{series} ");
+    let values: Vec<u64> = scrape
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix.as_str()))
+        .map(|value| value.parse().expect("integer sample"))
+        .collect();
+    assert!(
+        values.len() <= 1,
+        "{series} rendered {} times",
+        values.len()
+    );
+    values.first().copied()
+}
+
+/// How far one statement moved `series`: the after-scrape sample must be
+/// present exactly once; an absent before-sample is zero.
+fn series_delta(before: &str, after: &str, series: &str) -> u64 {
+    let after_value =
+        series_value(after, series).unwrap_or_else(|| panic!("{series} missing:\n{after}"));
+    after_value - series_value(before, series).unwrap_or(0)
+}
+
+/// Every `ravel_query_*` line of a scrape, headers included.
+fn query_family_lines(scrape: &str) -> Vec<&str> {
+    scrape
+        .lines()
+        .filter(|line| {
+            line.starts_with("ravel_query_")
+                || line.starts_with("# HELP ravel_query_")
+                || line.starts_with("# TYPE ravel_query_")
+        })
+        .collect()
+}
+
+const DDL_PHASES: [&str; 4] = ["grant", "probe", "snapshot", "write"];
+
+/// Each statement moves `ravel_sql_ddl_statements_total` by one under its
+/// kind and outcome, `ravel_sql_ddl_store_requests_total` per op by exactly
+/// the requests both stores served, and `ravel_sql_ddl_store_bytes_total` by
+/// exactly their GET bytes (issue #2374). A statement refused for the `ddl`
+/// capability counts as `error` and moves no request or byte. No
+/// `ravel_query_*` line changes.
+#[tokio::test]
+async fn ddl_statements_move_the_ddl_families_by_their_exact_cost_and_no_query_family() {
+    use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
+
+    let store = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    let tenant = TenantId::new("acme".to_string());
+    ravel_pqtable::grants::add(
+        store.as_ref(),
+        &tenant.hash(),
+        "lake",
+        "s3://lake/data",
+        "test",
+        &ravel_pqtable::clock::FixedClock::new(NOW_NS),
+    )
+    .await
+    .expect("grant");
+    let lake = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+    lake.put(
+        "data/clicks/part-0.parquet",
+        lake_parquet_file(&[1, 2, 3, 4]),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put the Parquet file");
+
+    let ravel_store: Arc<dyn ObjectStoreBackend> = store.clone();
+    let lake_store: Arc<dyn ObjectStoreBackend> = lake.clone();
+    let sources = ravel_sql::ParquetSources::new(
+        Arc::clone(&ravel_store),
+        Some(Arc::new(ravel_sql::ExternalStoreMap::new(HashMap::from([(
+            "lake".to_string(),
+            lake_store,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("limiter")),
+        None,
+        ravel_sql::DEFAULT_PARQUET_METADATA_CACHE_BYTES,
+    );
+    let query_accounting = Arc::new(ravel_server::metrics::QueryAccountingMetrics::new(
+        std::collections::HashSet::new(),
+    ));
+    let app = build_router_accounted(
+        Arc::clone(&ravel_store),
+        HashMap::from([
+            (
+                "ddl-token".to_string(),
+                Principal {
+                    tenant: tenant.clone(),
+                    ddl: true,
+                },
+            ),
+            ("read-token".to_string(), Principal { tenant, ddl: false }),
+        ]),
+        Arc::new(ravel_maintain::NoopQueryAuditSink),
+        Some(sources),
+        Arc::clone(&query_accounting),
+    );
+    let metrics = ddl_metrics_router(Arc::new(MemoryStore::new()), query_accounting);
+
+    // A query first, so the `ravel_query_*` comparison below compares
+    // populated rows rather than two empty families.
+    let (status, value) = post_json(&app, "read-token", "SELECT 1").await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+
+    // Per op, requests and GET bytes served by both stores so far.
+    let served = || {
+        let ravel = store.metrics().snapshot();
+        let lake = lake.metrics().snapshot();
+        let calls = StoreOp::ALL.map(|op| ravel.op(op).calls + lake.op(op).calls);
+        let get_bytes = ravel.op(StoreOp::Get).bytes + lake.op(StoreOp::Get).bytes;
+        (calls, get_bytes)
+    };
+    let requests = |phase: &str, op: StoreOp| {
+        format!(
+            "ravel_sql_ddl_store_requests_total{{mode=\"all\",tenant_hash=\"other\",\
+             phase=\"{phase}\",op=\"{}\"}}",
+            op.name()
+        )
+    };
+    let bytes = |phase: &str| {
+        format!(
+            "ravel_sql_ddl_store_bytes_total{{mode=\"all\",tenant_hash=\"other\",phase=\"{phase}\"}}"
+        )
+    };
+    let statements = |kind: &str, outcome: &str| {
+        format!(
+            "ravel_sql_ddl_statements_total{{mode=\"all\",tenant_hash=\"other\",\
+             kind=\"{kind}\",outcome=\"{outcome}\"}}"
+        )
+    };
+
+    let first = scrape_metrics(&metrics).await;
+    assert!(
+        query_family_lines(&first)
+            .iter()
+            .any(|line| line.starts_with("ravel_query_queries_total{")),
+        "the SELECT must have populated ravel_query_*:\n{first}"
+    );
+    let mut before = first.clone();
+    for (token, sql, kind, outcome, http) in [
+        (
+            "ddl-token",
+            CREATE_CLICKS,
+            "create",
+            "created",
+            StatusCode::OK,
+        ),
+        (
+            "ddl-token",
+            "DROP TABLE clicks",
+            "drop",
+            "dropped",
+            StatusCode::OK,
+        ),
+        (
+            "read-token",
+            "DROP TABLE clicks",
+            "drop",
+            "error",
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (calls_before, get_bytes_before) = served();
+        let (status, value) = post_json(&app, token, sql).await;
+        assert_eq!(status, http, "{sql}: {value}");
+        let (calls_after, get_bytes_after) = served();
+        let after = scrape_metrics(&metrics).await;
+
+        assert_eq!(
+            series_delta(&before, &after, &statements(kind, outcome)),
+            1,
+            "{sql}"
+        );
+        for op in StoreOp::ALL {
+            let moved: u64 = DDL_PHASES
+                .iter()
+                .map(|phase| series_delta(&before, &after, &requests(phase, op)))
+                .sum();
+            assert_eq!(
+                moved,
+                calls_after[op.index()] - calls_before[op.index()],
+                "{sql}: {} requests summed over phases against what the stores served",
+                op.name()
+            );
+        }
+        let moved_bytes: u64 = DDL_PHASES
+            .iter()
+            .map(|phase| series_delta(&before, &after, &bytes(phase)))
+            .sum();
+        assert_eq!(moved_bytes, get_bytes_after - get_bytes_before, "{sql}");
+
+        // Pinned per phase: the grants read is one GET, and the manifest write
+        // of a CREATE is one PUT after two LISTs (the existence check and the
+        // writer's resolve), each figure the ravel-sql cost tests measure.
+        if outcome == "created" {
+            assert_eq!(
+                series_delta(&before, &after, &requests("grant", StoreOp::Get)),
+                1
+            );
+            assert_eq!(
+                series_delta(&before, &after, &requests("write", StoreOp::Put)),
+                1
+            );
+            assert_eq!(
+                series_delta(&before, &after, &requests("write", StoreOp::List)),
+                2
+            );
+            assert!(series_delta(&before, &after, &bytes("snapshot")) > 0);
+        }
+        if outcome == "error" {
+            assert_eq!(
+                calls_after, calls_before,
+                "a refused statement reads nothing"
+            );
+        }
+
+        assert_eq!(
+            query_family_lines(&after),
+            query_family_lines(&first),
+            "{sql} must leave every ravel_query_* line unchanged"
+        );
+        before = after;
+    }
 }
 
 /// A submission failure on the `attempted` record (today's 503

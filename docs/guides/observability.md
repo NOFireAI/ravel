@@ -50,7 +50,11 @@ series colliding.
 The renderer can attach only these label keys: `tenant_hash`, `signal`,
 `mode`, `op`, `error_kind`, `workload_class`, `level`, `reason`, `cache`,
 `tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`,
-`carrier`, `gate`, `site`, `worker`, and `shard`, twenty-one in all.
+`carrier`, `gate`, `site`, `worker`, `shard`, and `phase`, twenty-two in
+all. `phase` exists only in a build with the `sql` feature and appears only
+on the [SQL DDL families](#sql-ddl-statements-and-their-store-cost-ravel_sql_ddl_),
+where `kind` and `outcome` also split DDL statements by leading keyword and
+by how they ended.
 `reason` is shared by several families: the admission-rejection counter, the
 scrub counters, the alert retention-skip counter, the superseded-inputs-held
 counter, the fragment capability reject counter, and the SQL slice capability
@@ -91,11 +95,11 @@ allowlist above, and no non-histogram sample renders it.
 
 ### The `tenant_hash="other"` fold
 
-Four families can carry a `tenant_hash` label: the admission family, the
-per-query cost family, the ingest PUT attribution family, and the fleet
-admission-reconciliation counter. By default every tenant folds into the
-single bucket `tenant_hash="other"`, and that bucket sums every folded
-tenant's counters. The scrape then holds one series per (signal or workload
+These families can carry a `tenant_hash` label: the admission family, the
+per-query cost family, the three SQL DDL families, the ingest PUT
+attribution family, and the fleet admission-reconciliation counter. By
+default every tenant folds into the single bucket `tenant_hash="other"`,
+and that bucket sums every folded tenant's counters. The scrape then holds one series per (signal or workload
 class), never one per tenant, regardless of how many tenants send traffic.
 
 The `--metrics-tenant-labels` flag opts out of the fold. With the flag on,
@@ -2281,6 +2285,40 @@ before then. A query that times out or is cancelled therefore reports every
 request it issued before it stopped, including any still outstanding at that
 moment, and the bytes of the fetches that had completed by then. Fetches the
 query would have issued later, had it run on, are not counted.
+
+### SQL DDL statements and their store cost (`ravel_sql_ddl_*`)
+
+Labels: `mode` and `tenant_hash` on every sample, folded exactly as the
+per-query cost family folds it; plus `kind` and `outcome` on the statement
+counter, `phase` and `op` on the request counter, and `phase` on the byte
+counter. A process built with the `sql` feature renders the three headers on
+every scrape; a build without it omits the families. A tenant bucket's
+samples appear once it has sent its first DDL statement, and from then on
+every (`phase`, `op`) pair and every `phase` renders, zeros included.
+
+A `CREATE EXTERNAL TABLE` or `DROP TABLE` over `POST /api/v1/sql` is not a
+query: its cost never enters the `ravel_query_*` family, the usage record, or
+any query budget. These three counters are where it is reported.
+
+| Metric | Meaning |
+|---|---|
+| `ravel_sql_ddl_statements_total{kind, outcome}` | DDL statements handled, by leading keyword (`kind="create"` or `"drop"`) and by how each ended (`outcome="created"`, `"dropped"`, `"noop"` or `"error"`). Every statement past the `timeout` check counts once. A statement refused for the `ddl` capability, by a failed `attempted` audit submission, or by admission counts as `error` with zero cost; an executed statement counts its own outcome, or `error` when it failed. A statement whose execution task panics is not counted. A request with a malformed `timeout` is not counted, the same as one whose body is not valid JSON. |
+| `ravel_sql_ddl_store_requests_total{phase, op}` | Object-store requests the statement issued, one per call at the object-store trait, counted when issued whether it succeeds, fails, or is still outstanding when the statement deadline trips. Retries below the trait are not counted. |
+| `ravel_sql_ddl_store_bytes_total{phase}` | Response-body bytes of completed GET requests as returned across the object-store trait, undecoded (a ranged read counts the range returned); request bodies, failed GETs, HEAD, LIST, PUT and DELETE count zero, and retries below the trait are not counted. |
+
+Every request a statement issues is counted in exactly one phase:
+
+- `grant`: the read of the tenant's location grants record.
+- `probe`: the listing or HEAD that finds an object under the `LOCATION`, and
+  the qualification probes on the external store and on Ravel's own store,
+  including the scratch object the bucket probe writes and deletes.
+- `snapshot`: the listing of the `LOCATION` and the Parquet footer reads.
+- `write`: the manifest resolve and write, including the existence check a
+  plain `CREATE` makes first. A `DROP` touches only this phase.
+
+A statement that fails reports the requests and bytes it accrued before it
+failed, including one cut off by its deadline; a statement refused by
+validation issued no request.
 
 ### Metric metadata cache (`query_metadata_cache_*`)
 

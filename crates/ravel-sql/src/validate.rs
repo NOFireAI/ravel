@@ -545,13 +545,42 @@ pub enum StatementKind {
 /// look at the top-level statement": a statement that routes to `Query` has
 /// paid no parse at all, which is every `SELECT`.
 pub fn statement_kind(sql: &str) -> StatementKind {
-    match complexity_guard::leading_keyword(sql) {
-        Some(keyword)
-            if keyword.eq_ignore_ascii_case("CREATE") || keyword.eq_ignore_ascii_case("DROP") =>
-        {
-            StatementKind::Ddl
+    match ddl_kind(sql) {
+        Some(_) => StatementKind::Ddl,
+        None => StatementKind::Query,
+    }
+}
+
+/// Which leading keyword routed a statement to [`StatementKind::Ddl`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DdlKind {
+    Create,
+    Drop,
+}
+
+impl DdlKind {
+    pub const ALL: [DdlKind; 2] = [DdlKind::Create, DdlKind::Drop];
+
+    /// The lowercase keyword, as a metrics label value.
+    pub fn name(self) -> &'static str {
+        match self {
+            DdlKind::Create => "create",
+            DdlKind::Drop => "drop",
         }
-        _ => StatementKind::Query,
+    }
+}
+
+/// The leading keyword [`statement_kind`] routes on: `Some` exactly when it
+/// returns [`StatementKind::Ddl`], whether or not the statement then
+/// validates.
+pub fn ddl_kind(sql: &str) -> Option<DdlKind> {
+    let keyword = complexity_guard::leading_keyword(sql)?;
+    if keyword.eq_ignore_ascii_case("CREATE") {
+        Some(DdlKind::Create)
+    } else if keyword.eq_ignore_ascii_case("DROP") {
+        Some(DdlKind::Drop)
+    } else {
+        None
     }
 }
 
@@ -1229,6 +1258,15 @@ mod tests {
         ] {
             assert_eq!(statement_kind(sql), StatementKind::Ddl, "{sql}");
         }
+        for (sql, kind) in [
+            ("create table t (a int)", DdlKind::Create),
+            ("CREATE (", DdlKind::Create),
+            ("-- note\nCREATE TABLE t (a INT)", DdlKind::Create),
+            ("DROP", DdlKind::Drop),
+            ("/* c */ drop TABLE t", DdlKind::Drop),
+        ] {
+            assert_eq!(ddl_kind(sql), Some(kind), "{sql}");
+        }
         for sql in [
             "CREATED",
             "DROPX",
@@ -1241,6 +1279,7 @@ mod tests {
             "",
         ] {
             assert_eq!(statement_kind(sql), StatementKind::Query, "{sql}");
+            assert_eq!(ddl_kind(sql), None, "{sql}");
         }
 
         let too_complex = format!(

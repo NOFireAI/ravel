@@ -107,12 +107,13 @@ use ravel_maintain::{QueryAuditSink, QueryStatus};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::QueryAdmissionController;
 use ravel_query::http::TenantResolver;
-use ravel_sql::{DdlOutcome, SqlExecutor, SqlRequest};
+use ravel_sql::{DdlCost, DdlOutcome, SqlExecutor, SqlRequest};
 use ravel_tenant_resolve::Principal;
 use ravel_types::{CommitToken, TenantHash, TimeRange};
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::metrics::DdlStatementOutcome;
 use crate::service::{ApiError, QueryService, ServiceError, ServiceErrorKind};
 
 /// The Arrow IPC stream media type, as registered by the Arrow project.
@@ -245,9 +246,9 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
     let body: SqlBody = serde_json::from_slice(&body)
         .map_err(|e| ApiError::bad_request(format!("invalid JSON request body: {e}")))?;
 
-    match ravel_sql::statement_kind(&body.query) {
-        ravel_sql::StatementKind::Query => {}
-        ravel_sql::StatementKind::Ddl => return run_ddl(state, &principal, &body).await,
+    // `ddl_kind` is `Some` exactly when `statement_kind` routes to DDL.
+    if let Some(kind) = ravel_sql::ddl_kind(&body.query) {
+        return run_ddl(state, &principal, &body, kind).await;
     }
 
     let now_ns = state.clock.now_ns();
@@ -326,18 +327,37 @@ fn request_deadline(body: &SqlBody, max_deadline: Duration) -> Result<Duration, 
 /// `attempted` record without an outcome: the task panics after the client
 /// has disconnected, so no handler is left to submit the `error` outcome its
 /// `JoinError` arm writes.
+///
+/// Every statement past the `timeout` check is counted once in the
+/// `ravel_sql_ddl_*` families under its leading keyword (`kind`), refused or
+/// executed alike: a refusal before [`SqlExecutor::execute_ddl`] runs (the
+/// `ddl` capability, the `attempted` submission, admission) counts as
+/// `error` with zero cost, and an executed statement counts its outcome and
+/// the [`ravel_sql::DdlCost`] it reports, failed or not. A task that panics
+/// inside `execute_ddl` is not counted. None of it reaches the
+/// `ravel_query_*` family or the usage record.
 async fn run_ddl(
     state: &SqlState,
     principal: &Principal,
     body: &SqlBody,
+    kind: ravel_sql::DdlKind,
 ) -> Result<Response, ServiceError> {
     let tenant_hash = principal.tenant.hash();
     let now_ns = state.clock.now_ns();
     let service = state.service();
     let controls = service.controls();
     let deadline = request_deadline(body, state.max_deadline)?;
+    let refused = || {
+        state.query_accounting.record_ddl(
+            tenant_hash,
+            kind,
+            DdlStatementOutcome::Error,
+            &DdlCost::default(),
+        );
+    };
 
     if !principal.ddl {
+        refused();
         controls
             .audit(
                 tenant_hash,
@@ -356,7 +376,7 @@ async fn run_ddl(
     // The `attempted` record: submitted and awaited before anything is read
     // or written, so a failed submission (today's 503 `unavailable`) refuses
     // the statement before it touches the store.
-    controls
+    if let Err(err) = controls
         .audit(
             tenant_hash,
             now_ns,
@@ -365,7 +385,11 @@ async fn run_ddl(
             (now_ns, now_ns),
             QueryStatus::Attempted,
         )
-        .await?;
+        .await
+    {
+        refused();
+        return Err(err.into());
+    }
 
     // From here the statement runs, and its outcome is recorded, in a task a
     // client disconnect cannot cancel: dropping this function's future (the
@@ -373,15 +397,33 @@ async fn run_ddl(
     let executor = Arc::clone(&state.executor);
     let clock = Arc::clone(&state.clock);
     let task_controls = controls.clone();
+    let accounting = Arc::clone(&state.query_accounting);
     let sql = body.query.clone();
     let tenant_str = principal.tenant.as_str().to_string();
 
     let handle = tokio::spawn(async move {
         let ddl_result: Result<DdlOutcome, ServiceError> = async {
-            let _permit = task_controls.admit()?;
-            executor
+            let _permit = match task_controls.admit() {
+                Ok(permit) => permit,
+                Err(err) => {
+                    accounting.record_ddl(
+                        tenant_hash,
+                        kind,
+                        DdlStatementOutcome::Error,
+                        &DdlCost::default(),
+                    );
+                    return Err(err.into());
+                }
+            };
+            let execution = executor
                 .execute_ddl(tenant_hash, &sql, &tenant_str, deadline)
-                .await
+                .await;
+            let outcome = match &execution.result {
+                Ok(outcome) => DdlStatementOutcome::of(outcome),
+                Err(_) => DdlStatementOutcome::Error,
+            };
+            accounting.record_ddl(tenant_hash, kind, outcome, &execution.cost);
+            execution
                 .result
                 .map_err(|err| ServiceError::from_ddl(err, tenant_hash))
         }
