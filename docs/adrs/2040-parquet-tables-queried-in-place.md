@@ -607,7 +607,8 @@ and the per-query memory cap:
   K4. Nothing outside the pre-registered set may fail.
 - **Concurrency.** Ten connections for 600 s, the ClickBench driver's
   phase, pre-registered against ADR-2023's 0.400 queries per second and
-  0.101 error ratio on the RLOG entry.
+  0.101 error ratio on the RLOG entry (see the concurrency bar amendment
+  below: the error ratio is reported, not judged).
 
 ## Rejected alternatives
 
@@ -1188,3 +1189,30 @@ grant, item 1 of issue #2430, remains the root
 fix for all of these; until then the sweep also still deletes predecessors
 on the word of a manifest no one can attribute, when that manifest is at or
 below the bound.
+
+## Amendment (2026-10-05): the concurrency bar judges no error ratio
+
+<!-- amendment-applies: sections="D7. Validation and the performance bar" pointer="concurrency bar amendment" -->
+<!-- amendment-supersedes: phrase="0.101 error ratio on the RLOG entry" pointer="concurrency bar amendment" -->
+
+D7 pre-registered the concurrency phase against ADR-2023's 0.400 queries
+per second and 0.101 error ratio on the RLOG entry. The concurrency bar is
+now exactly two rules (issue #2055):
+
+1. at least 0.400 queries per second;
+2. zero errors from any statement outside the pre-registered failure set.
+
+The 0.101 error ratio is no longer a bar. The phase's raw error ratio stays
+in the report, and the bench prints it beside the RLOG entry's 0.101 as a
+comparison only: the two are measured over different statement sets, so
+neither is a threshold for the other.
+
+The reason is arithmetic. The phase cycles all 43 statements, so the five
+pre-registered failures (q19, q29, q33, q34, q35) failing exactly as
+predicted put the raw ratio at 5/43, about 0.116, over 0.101 on every run.
+Judging the ceiling instead on the statements outside the registered set
+cannot fire either: rule 2 already fails the run on the first error from
+any of them, so whenever rule 2 passes that ratio is 0. The
+per-statement rule is strictly stronger than any ceiling over the same
+statements. `prereg.toml` drops its `concurrency_error_ratio_ceiling` key,
+and the bench refuses a file that still carries it.
