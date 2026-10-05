@@ -422,13 +422,9 @@ mod tests {
     #[tokio::test]
     async fn no_statement_starts_after_the_deadline() {
         let engine = stub(&[("s1", 4, false)]);
-        let figures = run(
-            vec![task(&engine)],
-            &statements(1),
-            Duration::from_secs(10),
-        )
-        .await
-        .expect("phase runs");
+        let figures = run(vec![task(&engine)], &statements(1), Duration::from_secs(10))
+            .await
+            .expect("phase runs");
         let starts: Vec<u64> = calls(&engine).into_iter().map(|(_, at)| at).collect();
         // The run started at 8 s finishes at 12 s and counts; none starts at 12 s.
         assert_eq!(starts, vec![0, 4, 8]);
@@ -469,13 +465,9 @@ mod tests {
     #[tokio::test]
     async fn an_erroring_statement_is_counted_and_named() {
         let engine = stub(&[("s1", 1, false), ("s2", 1, true)]);
-        let figures = run(
-            vec![task(&engine)],
-            &statements(2),
-            Duration::from_secs(4),
-        )
-        .await
-        .expect("phase runs");
+        let figures = run(vec![task(&engine)], &statements(2), Duration::from_secs(4))
+            .await
+            .expect("phase runs");
         assert_eq!(figures.queries_completed, 2);
         assert_eq!(figures.errors, 2);
         assert_eq!(figures.error_ratio, 0.5);
