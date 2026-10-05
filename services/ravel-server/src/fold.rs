@@ -32,13 +32,14 @@
 //! owned, and the behavior is byte-for-byte the unpartitioned fold
 //! (ADR-1693 decision 3).
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures::FutureExt;
-use ravel_catalog::Catalog;
+use ravel_catalog::{Catalog, RefoldRequest};
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_maintain::{Clock, MaintainError, RetentionConfig, WorkerSet};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
@@ -205,10 +206,117 @@ pub(crate) const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Sig
 /// The shard whose rendezvous owner owns a whole `(tenant, signal)` pair's
 /// fold (ADR-1693 decision 1). The fold is per pair, not per shard, so it
 /// needs one shard to key the unit on; shard 0 is the convention the
-/// per-signal maintenance sweeps already use
-/// ([`crate::maintain`]), which is what makes the sweeper and the
-/// folder for a pair the same process.
+/// per-signal maintenance sweeps already use ([`crate::maintain`]). That makes
+/// the process sweeping a pair's shard 0 and its per-pair catalog objects the
+/// process that folds it. Every other shard of the pair is swept by whichever
+/// process owns that shard, which under a live set of more than one need not
+/// be the folder.
 pub const FOLD_UNIT_SHARD: u32 = 0;
+
+/// Default [`RefoldQueue`] capacity, in entries.
+pub const DEFAULT_REFOLD_QUEUE_CAPACITY: usize = 256;
+
+/// One sweep's Named-blocked hours for one pair, waiting in a [`RefoldQueue`].
+#[derive(Debug)]
+struct RefoldEntry {
+    tenant: TenantHash,
+    signal: Signal,
+    hours: BTreeSet<u32>,
+}
+
+/// The in-process hand-off from the maintain loop's superseded-input sweep to
+/// the scheduled fold of the same `(tenant, signal)` pair (ADR-0063 section
+/// 4): the ingest hours a sweep held because the live catalog HEAD still names
+/// their superseded inputs ([`ravel_maintain::SweepReport::blocked_named_hours`]).
+/// The fold loop drains its signal's entries each tick and passes each
+/// tenant's hours to [`Catalog::fold_with_refold_request`].
+///
+/// A queued hour is a hint, never a durability dependency. The queue lives in
+/// memory and is bounded at `capacity` entries: a send that finds it full drops
+/// the oldest entry and counts it in [`Self::dropped_requests`]. A dropped
+/// entry, an entry lost with the process, and a request a no-op fold could not
+/// act on all cost the same thing: the sweep re-derives its blocked set on each
+/// pass, so a still-held hour is sent again by the next sweep that finds it.
+#[derive(Debug)]
+pub struct RefoldQueue {
+    capacity: usize,
+    pending: Mutex<VecDeque<RefoldEntry>>,
+    dropped: AtomicU64,
+}
+
+impl Default for RefoldQueue {
+    fn default() -> Self {
+        Self::new(DEFAULT_REFOLD_QUEUE_CAPACITY)
+    }
+}
+
+impl RefoldQueue {
+    /// A queue holding at most `capacity` entries; a zero capacity holds one.
+    pub fn new(capacity: usize) -> Self {
+        RefoldQueue {
+            capacity: capacity.max(1),
+            pending: Mutex::new(VecDeque::new()),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Queues `hours` for the next fold of `(tenant, signal)`. An empty set is
+    /// ignored. When the queue is full the oldest entry is dropped to make room
+    /// and counted in [`Self::dropped_requests`].
+    pub fn send(&self, tenant: TenantHash, signal: Signal, hours: BTreeSet<u32>) {
+        if hours.is_empty() {
+            return;
+        }
+        let mut pending = self.lock();
+        while pending.len() >= self.capacity {
+            pending.pop_front();
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        pending.push_back(RefoldEntry {
+            tenant,
+            signal,
+            hours,
+        });
+    }
+
+    /// Removes every entry queued for `signal` and merges them per tenant. Other
+    /// signals' entries stay queued, in order.
+    pub fn take_for_signal(&self, signal: Signal) -> BTreeMap<TenantHash, RefoldRequest> {
+        let taken: VecDeque<RefoldEntry> = {
+            let mut pending = self.lock();
+            let (taken, kept) = pending
+                .drain(..)
+                .partition(|entry: &RefoldEntry| entry.signal == signal);
+            *pending = kept;
+            taken
+        };
+        let mut merged: BTreeMap<TenantHash, RefoldRequest> = BTreeMap::new();
+        for entry in taken {
+            let request = merged.entry(entry.tenant).or_default();
+            for hour in entry.hours {
+                request.insert(hour);
+            }
+        }
+        merged
+    }
+
+    /// Entries dropped because the queue was full, since the process started.
+    pub fn dropped_requests(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Entries currently queued, across every signal.
+    pub fn pending_len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// A poisoned lock still guards a well-formed queue, at worst missing the
+    /// entries a panicking caller had taken out, and a lost entry is only a
+    /// lost hint, so the contents are used as they are.
+    fn lock(&self) -> MutexGuard<'_, VecDeque<RefoldEntry>> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// What one tick did, per tenant, for one signal. Returned by [`run_tick`] so
 /// the partition is assertable (ADR-1693's acceptance test) rather than only
@@ -1331,5 +1439,97 @@ mod tests {
                 panic!("a zero fold_interval must be refused at spawn");
             }
         }
+    }
+
+    fn refold_tenant(n: u8) -> TenantHash {
+        TenantHash([n; 16])
+    }
+
+    /// The hours each tenant's request names, ascending, for exact comparison.
+    fn request_hours(
+        drained: &BTreeMap<TenantHash, RefoldRequest>,
+    ) -> BTreeMap<TenantHash, Vec<u32>> {
+        drained
+            .iter()
+            .map(|(tenant, request)| (*tenant, request.hours().collect()))
+            .collect()
+    }
+
+    /// One send past capacity drops exactly the oldest entry: the count is 1,
+    /// the first tenant's hours are gone, and the newest send is the one that
+    /// stayed.
+    ///
+    /// Flip to watch it fail: in [`RefoldQueue::send`], when the queue is full
+    /// return before `push_back` instead of calling `pop_front` (drop the
+    /// newest). Tenant 0 then survives and the newest tenant is missing.
+    #[test]
+    fn a_full_refold_queue_drops_the_oldest_request_and_counts_it() {
+        let queue = RefoldQueue::new(DEFAULT_REFOLD_QUEUE_CAPACITY);
+        let sends = DEFAULT_REFOLD_QUEUE_CAPACITY + 1;
+        for n in 0..sends {
+            let tenant = refold_tenant(u8::try_from(n % 256).expect("fits"));
+            let hour = u32::try_from(n).expect("fits");
+            queue.send(tenant, Signal::Metrics, BTreeSet::from([hour]));
+        }
+        assert_eq!(queue.dropped_requests(), 1);
+        assert_eq!(queue.pending_len(), DEFAULT_REFOLD_QUEUE_CAPACITY);
+
+        // Capacity 256 wraps the tenant byte, so tenant 0 carries both the
+        // oldest send (hour 0) and the newest (hour 256).
+        let drained = request_hours(&queue.take_for_signal(Signal::Metrics));
+        assert_eq!(drained.len(), DEFAULT_REFOLD_QUEUE_CAPACITY);
+        assert_eq!(
+            drained.get(&refold_tenant(0)),
+            Some(&vec![
+                u32::try_from(DEFAULT_REFOLD_QUEUE_CAPACITY).expect("fits")
+            ]),
+            "the oldest send (hour 0) is gone and the newest (hour 256) is present"
+        );
+        assert_eq!(drained.get(&refold_tenant(1)), Some(&vec![1]));
+        assert_eq!(queue.pending_len(), 0);
+    }
+
+    /// An empty hour set is not an entry: it neither occupies a slot nor
+    /// pushes a real request out.
+    #[test]
+    fn an_empty_refold_send_queues_nothing() {
+        let queue = RefoldQueue::new(1);
+        queue.send(refold_tenant(1), Signal::Metrics, BTreeSet::from([7]));
+        queue.send(refold_tenant(2), Signal::Metrics, BTreeSet::new());
+        assert_eq!(queue.pending_len(), 1);
+        assert_eq!(queue.dropped_requests(), 0);
+    }
+
+    /// Two sends for one pair merge into one request carrying the union of
+    /// their hours, and a different signal's entry is left queued for that
+    /// signal's own fold loop.
+    ///
+    /// Flip to watch it fail: in [`RefoldQueue::take_for_signal`], replace the
+    /// partition with `pending.drain(..).collect()` (drain every signal). The
+    /// logs hour 11 is then merged into tenant 1's metrics request and the
+    /// first assertion fails.
+    #[test]
+    fn take_for_signal_leaves_other_signals_queued_and_merges_per_tenant() {
+        let queue = RefoldQueue::default();
+        queue.send(refold_tenant(1), Signal::Metrics, BTreeSet::from([5, 9]));
+        queue.send(refold_tenant(1), Signal::Logs, BTreeSet::from([11]));
+        queue.send(refold_tenant(1), Signal::Metrics, BTreeSet::from([9, 3]));
+        queue.send(refold_tenant(2), Signal::Metrics, BTreeSet::from([4]));
+
+        let drained = request_hours(&queue.take_for_signal(Signal::Metrics));
+        assert_eq!(
+            drained,
+            BTreeMap::from([
+                (refold_tenant(1), vec![3, 5, 9]),
+                (refold_tenant(2), vec![4]),
+            ])
+        );
+        assert_eq!(queue.pending_len(), 1, "the logs entry is still queued");
+        assert_eq!(
+            request_hours(&queue.take_for_signal(Signal::Logs)),
+            BTreeMap::from([(refold_tenant(1), vec![11])])
+        );
+        assert_eq!(queue.pending_len(), 0);
+        assert_eq!(queue.dropped_requests(), 0);
     }
 }
