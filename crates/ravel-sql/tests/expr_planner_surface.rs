@@ -88,63 +88,46 @@ fn single_cell(outcome: &SqlOutcome) -> String {
     array_value_to_string(batch.column(0), 0).expect("cell")
 }
 
-fn assert_refused_as_unsupported_plan(sql: &str, result: Result<SqlOutcome, SqlError>) {
-    match result {
-        Err(e @ SqlError::Plan(_)) => assert_eq!(
-            e.class(),
-            ErrorClass::Unsupported,
-            "{sql}: a planning refusal must report the Unsupported class"
-        ),
-        Err(e) => panic!("{sql}: refused, but not as SqlError::Plan: {e}"),
-        Ok(_) => panic!("{sql}: planned, but the syntax is refused (issue #2476)"),
+/// Run each statement and assert its one-cell answer.
+async fn assert_answers(fixture: &Fixture, cases: &[(&str, &str)]) {
+    for (sql, want) in cases {
+        let planned = run(fixture, sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must plan: {e}"));
+        assert_eq!(&single_cell(&planned), want, "{sql}");
     }
 }
 
-/// `POSITION(x IN y)` stays refused: no registered planner implements
-/// `plan_position`. `strpos(y, x)`, the admitted function-call form, plans
-/// through the same entry point and answers the 1-based index, so the refusal
-/// is the syntax and not the statement shape.
+/// `POSITION(x IN y)` plans through `UnicodeFunctionPlanner` (issue #2583)
+/// and answers the 1-based index of `x` in `y`.
 #[tokio::test]
-async fn position_in_syntax_is_refused_and_strpos_plans() {
+async fn position_in_syntax_answers_the_index() {
     let f = fixture().await;
-
-    let refused = "SELECT POSITION('a' IN 'ab')";
-    assert_refused_as_unsupported_plan(refused, run(&f, refused).await);
-
-    let call = "SELECT strpos('ab', 'a')";
-    let planned = run(&f, call)
-        .await
-        .unwrap_or_else(|e| panic!("{call} must plan: {e}"));
-    assert_eq!(single_cell(&planned), "1");
+    assert_answers(&f, &[("SELECT POSITION('a' IN 'ab')", "1")]).await;
 }
 
-/// `SUBSTRING(x FROM y FOR z)` stays refused: no registered planner
-/// implements `plan_substring`.
-///
-/// sqlparser reads an unquoted `substr(...)` or `substring(...)` call into the
-/// same AST node as the `FROM ... FOR` form, so those spellings are refused
-/// too (pinned in [`expr_planner_syntax_outcomes_are_pinned`]). The
-/// double-quoted name `"substr"(x, y, z)` is parsed as an ordinary function
-/// call and reaches the admitted `substr` scalar, which is what this control
-/// runs.
+/// `SUBSTRING(x FROM y [FOR z])` and the unquoted `substr(x, y, z)` and
+/// `substring(x, y, z)` calls plan through `UnicodeFunctionPlanner` (issue
+/// #2583) and answer the substring.
 #[tokio::test]
-async fn substring_from_for_syntax_is_refused_and_quoted_substr_plans() {
+async fn substring_syntax_and_unquoted_calls_answer_the_substring() {
     let f = fixture().await;
-
-    let refused = "SELECT SUBSTRING('abc' FROM 1 FOR 2)";
-    assert_refused_as_unsupported_plan(refused, run(&f, refused).await);
-
-    let call = "SELECT \"substr\"('abc', 1, 2)";
-    let planned = run(&f, call)
-        .await
-        .unwrap_or_else(|e| panic!("{call} must plan: {e}"));
-    assert_eq!(single_cell(&planned), "ab");
+    assert_answers(
+        &f,
+        &[
+            ("SELECT SUBSTRING('abcdef' FROM 2 FOR 3)", "bcd"),
+            ("SELECT SUBSTRING('abcdef' FROM 3)", "cdef"),
+            ("SELECT substr('abcdef', 2, 3)", "bcd"),
+            ("SELECT substring('abcdef', 2, 3)", "bcd"),
+        ],
+    )
+    .await;
 }
 
 /// One row per SQL syntax an `ExprPlanner` method can claim in DataFusion
 /// 54.1, with the outcome each has today. The registered planners and their
 /// targets are listed in `registered_expr_planners_are_pinned_for_every_table`.
-const CANARIES: [(&str, &str, Outcome); 18] = [
+const CANARIES: [(&str, &str, Outcome); 20] = [
     // plan_binary_op: TraceIdHexLiteralPlanner rewrites this comparison.
     (
         "plan_binary_op (trace_id hex literal)",
@@ -182,12 +165,11 @@ const CANARIES: [(&str, &str, Outcome); 18] = [
         "SELECT [1, 2]",
         Outcome::RefusedAtPlan,
     ),
-    // plan_position: no registered planner (UnicodeFunctionPlanner is not
-    // registered).
+    // plan_position: UnicodeFunctionPlanner, to `strpos`.
     (
         "plan_position",
         "SELECT POSITION('a' IN 'ab')",
-        Outcome::RefusedAtPlan,
+        Outcome::Plans,
     ),
     // plan_dictionary_literal: CoreFunctionPlanner, to `named_struct`.
     ("plan_dictionary_literal", "SELECT {'a': 1}", Outcome::Plans),
@@ -197,18 +179,29 @@ const CANARIES: [(&str, &str, Outcome); 18] = [
         "SELECT EXTRACT(minute FROM ts) FROM samples",
         Outcome::Plans,
     ),
-    // plan_substring: no registered planner.
+    // plan_substring: UnicodeFunctionPlanner, to `substr`. sqlparser reads
+    // `SUBSTRING(x FROM y [FOR z])` and the unquoted `substr(...)` and
+    // `substring(...)` calls into one AST node, which only `plan_substring`
+    // plans, so all four rows reach the same planner method.
     (
         "plan_substring (FROM ... FOR)",
         "SELECT SUBSTRING('abc' FROM 1 FOR 2)",
-        Outcome::RefusedAtPlan,
+        Outcome::Plans,
     ),
-    // plan_substring: sqlparser reads an unquoted `substr(...)` call into the
-    // same AST node, so it reaches the same missing planner.
+    (
+        "plan_substring (FROM)",
+        "SELECT SUBSTRING('abc' FROM 2)",
+        Outcome::Plans,
+    ),
     (
         "plan_substring (unquoted substr call)",
         "SELECT substr('abc', 1, 2)",
-        Outcome::RefusedAtPlan,
+        Outcome::Plans,
+    ),
+    (
+        "plan_substring (unquoted substring call)",
+        "SELECT substring('abc', 1, 2)",
+        Outcome::Plans,
     ),
     // plan_struct_literal: CoreFunctionPlanner, to `struct`.
     ("plan_struct_literal", "SELECT STRUCT(1, 2)", Outcome::Plans),

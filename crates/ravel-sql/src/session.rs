@@ -131,6 +131,7 @@ use datafusion::execution::object_store::ObjectStoreRegistry;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::functions::datetime::planner::DatetimeFunctionPlanner;
+use datafusion::functions::unicode::planner::UnicodeFunctionPlanner;
 use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::object_store::ObjectStore;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -746,12 +747,20 @@ pub fn build_session(
     let state = builder.build();
     let mut ctx = SessionContext::new_with_state(state);
 
-    // Register a hand-written `ExprPlanner` so `col['key']`
-    // (`logs.attrs`, `samples.labels`) plans instead of failing with
-    // `GetFieldAccess not supported`. See `crate::map_field_planner` for why
-    // this small planner is used instead of the `nested_expressions`
-    // feature. Registered for both tables, since `samples.labels` is a `Map`
-    // column too and this planner is table-agnostic.
+    // Expression planners (ADR-0097, amendment of issue #2583). A planner
+    // rewrites SQL syntax into a call it builds from the function value, not
+    // by name, so the scalar allowlist below never sees the rewrite target:
+    // an unadmitted target would execute without passing it.
+    // `registered_expr_planners_are_pinned_for_every_table` pins the planner
+    // set and `tests/expr_planner_surface.rs` pins, per syntax, whether it
+    // plans.
+
+    // `col['key']` on a map column such as `logs.attrs`, and a string key on
+    // a struct, to `get_field`, instead of failing with `GetFieldAccess not
+    // supported`. See `crate::map_field_planner` for why this small planner
+    // is used instead of the `nested_expressions` feature. `samples.labels`
+    // subscripts do not plan: that column is a dictionary-wrapped map, which
+    // `get_field` rejects.
     ctx.register_expr_planner(map_field_access_planner())?;
 
     // Register the `trace_id = '<32-hex>'` planner. See
@@ -759,17 +768,13 @@ pub fn build_session(
     // covers.
     ctx.register_expr_planner(trace_id_hex_literal_planner())?;
 
-    // `with_default_features()` only installs the `EXTRACT(field FROM expr)`
-    // planner under the facade's `datetime_expressions` feature, which this
-    // crate leaves off. The planner builds its `date_part` call from the UDF
-    // value, not by name, so the scalar allowlist below does not gate this
-    // path. The planner set is pinned by
-    // `registered_expr_planners_are_pinned_for_every_table`, and whether each
-    // syntax plans by `tests/expr_planner_surface.rs`. Neither sees which
-    // function a planner rewrites to: re-read every registered planner on
-    // every DataFusion upgrade, since a new rewrite target under an unchanged
-    // name and syntax would not fail closed.
+    // `with_default_features()` installs the `EXTRACT(field FROM expr)` and
+    // the `POSITION`/`SUBSTRING` planners only under the facade's
+    // `datetime_expressions` and `unicode_expressions` features, which this
+    // crate leaves off; the planner types themselves are compiled, because
+    // datafusion-functions is a mandatory dependency with those packs on.
     ctx.register_expr_planner(Arc::new(DatetimeFunctionPlanner))?;
+    ctx.register_expr_planner(Arc::new(UnicodeFunctionPlanner))?;
 
     // Allowlist enforcement (ADR-0022 decision 2), the hard registration
     // boundary behind the parse gate. Enumerate every aggregate UDAF the
@@ -1562,7 +1567,7 @@ mod tests {
     /// `Arc<dyn ExprPlanner>` and the concrete type is erased.
     #[test]
     fn registered_expr_planners_are_pinned_for_every_table() {
-        const EXPECTED: [&str; 6] = [
+        const EXPECTED: [&str; 7] = [
             // From `with_default_features()`. Struct literal `STRUCT(1, 2)` /
             // `STRUCT(1 AS a)` to `struct`/`named_struct`, dictionary literal
             // `{'a': 1}` to `named_struct`, `OVERLAY(x PLACING y FROM n)` to
@@ -1583,6 +1588,10 @@ mod tests {
             "TraceIdHexLiteralPlanner",
             // `build_session`: `EXTRACT(field FROM expr)` to `date_part`.
             "DatetimeFunctionPlanner",
+            // `build_session`: `POSITION(x IN y)` to `strpos`, and
+            // `SUBSTRING(x FROM y [FOR z])` plus unquoted `substr(...)` /
+            // `substring(...)` calls to `substr`.
+            "UnicodeFunctionPlanner",
         ];
 
         fn planner_name(
