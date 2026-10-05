@@ -482,9 +482,12 @@ pub struct FoldTickReport {
 /// after a bounded backoff.
 ///
 /// `refold` is the process's one [`RefoldQueue`], fed by the maintain loop's
-/// sweeps ([`crate::maintain::spawn`]). Each signal's tick folds each owned
-/// tenant with that pair's pending hours ([`run_tick`]). In `Mode::All` no
-/// maintain loop runs, nothing feeds the queue, and every request is empty.
+/// sweeps ([`crate::maintain::spawn`]). Each signal's tick folds each
+/// maintained tenant with at most the catalog's per-fold cap of that pair's
+/// oldest pending hours ([`run_tick`]). In `Mode::All` no maintain loop runs,
+/// nothing feeds the queue, and every request is empty; a maintain process
+/// whose fold is disabled spawns nothing here and hands its sweeps no queue
+/// ([`refold_queue_for_maintain`]).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     catalog: Arc<Catalog>,

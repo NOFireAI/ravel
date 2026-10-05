@@ -297,13 +297,17 @@ amendment), so a hold found by a process that does not fold the pair has no
 path to the process that does. A maintain tick therefore sends a pair's
 held hours only when its process owns shard 0 of the pair under the live set
 it is using for that tick; otherwise it sends nothing, so its queue does not
-fill with entries no fold takes. The fold tick likewise removes the entry of
-a pair whose shard 0 its process no longer owns. Holds found on shard 0, and
-every hold in a deployment with one maintain process, are queued for the
-fold and stay queued until a fold of the pair that is not a no-op takes
-them, unless the process restarts or the queue evicts them first. In
-`--mode all` no maintain loop runs, so nothing is swept into the queue and
-no hold reaches the fold this way. A hold on another shard swept by another
+fill with entries no fold takes. The fold tick likewise removes, uncounted,
+the entry of a pair whose shard 0 its process no longer owns, and of a
+tenant the tick does not maintain; an eviction from a full queue is the one
+removal counted. Holds found on shard 0, and every hold in a deployment with
+one maintain process, are queued for the fold and stay queued until folds of
+the pair that are not no-ops take them, at most
+`frontier_reconcile_max_hours` of the oldest per fold, unless the process
+restarts or the queue evicts them first. In `--mode all` no maintain loop
+runs, and a maintain process whose scheduled fold is disabled hands its
+sweeps no queue, so in neither is anything swept into the queue and no hold
+reaches the fold this way. A hold on another shard swept by another
 process reaches no fold and its inputs stay held until the fold's frontier
 band reaches the hour. Closing that gap needs a cross-process channel and is tracked as issue
 #2606. No ownership rule, key layout or mode gate changes.

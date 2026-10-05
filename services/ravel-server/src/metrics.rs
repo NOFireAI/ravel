@@ -2747,7 +2747,7 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
     write_header(
         out,
         "ravel_catalog_fold_refold_requests_dropped_total",
-        "Pending re-fold requests evicted from this process's in-memory queue because it already held its maximum of (tenant, signal) pairs, one per evicted pair. The maintain sweep sends a still-held hour again on its next pass that finds it.",
+        "Pending re-fold requests evicted from this process's in-memory queue because it already held its maximum of (tenant, signal) pairs, one per evicted pair. An evicted request is sent again by a later sweep pass that finds the hold.",
         "counter",
     );
     write_sample(
