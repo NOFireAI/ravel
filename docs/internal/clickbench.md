@@ -1028,9 +1028,10 @@ the filled file with the reports:
   cold sums. Every report, arm B's own included, fails if its sum exceeds
   1.25x the prediction.
 
-`failures`, `rlog_hot_ceiling_s`, `concurrency_qps_floor` and
-`concurrency_error_ratio_ceiling` already hold D7's figures; change them
-only with a reason recorded on #2055.
+`failures`, `rlog_hot_ceiling_s` and `concurrency_qps_floor` already hold
+D7's figures; change them only with a reason recorded on #2055. There is no
+error-ratio key: `concurrency_error_ratio_ceiling` was removed (issue
+#2055, step 7), and the bench refuses a `prereg.toml` that still carries it.
 
 ### 4. Build at one SHA
 
@@ -1140,9 +1141,8 @@ violation is any of:
   `suite.toml`'s declared verdicts not loading;
 - hot or cold sum above 1.25x the arm B prediction, or a hot sum not under
   `rlog_hot_ceiling_s`;
-- in the concurrency phase, queries per second under the floor,
-  `unregistered_error_ratio` over the ceiling, or an error from a statement
-  not in `failures`;
+- in the concurrency phase, queries per second under
+  `concurrency_qps_floor`, or any error from a statement not in `failures`;
 - a concurrency phase that failed after it started (`concurrency_error`).
 
 A pre-registered failure that answered is printed as a finding, not a
@@ -1157,17 +1157,22 @@ connections (`--concurrency-tasks`, default 10), each its own HTTP client,
 cycling the 43 statements, task `i` starting `4i` statements into the suite.
 The report's
 `concurrency` block holds the configured `duration_s` and the measured
-`elapsed_s`, queries per second, two error ratios, and per-statement counts,
+`elapsed_s`, queries per second, the error ratio, and per-statement counts,
 nearest-rank p50 and p95, and the first error. No task starts a statement
 after `duration_s`, but one already running finishes and counts, so
 `elapsed_s` runs from the phase's start to the last statement returning and
-is at least `duration_s`; `qps` is completed queries over `elapsed_s`. `error_ratio` is every error over
-completed plus errors, the figure comparable with the RLOG entry.
-`unregistered_error_ratio` is the same ratio over the statements not in
-`failures` only, and it is the one judged against
-`concurrency_error_ratio_ceiling` (issue #2055): the phase cycles all 43
+is at least `duration_s`; `qps` is completed queries over `elapsed_s`.
+`error_ratio` is every error over completed plus errors.
+
+D7's concurrency bar is two rules (issue #2055): `qps` at least
+`concurrency_qps_floor` (0.400), and no error from any statement outside
+`failures`. The error ratio is not judged. The phase cycles all 43
 statements, so the five registered failures erroring exactly as predicted
-put `error_ratio` at 5/43, about 0.116, over the 0.101 ceiling on every run.
+put `error_ratio` at 5/43, about 0.116, above the RLOG entry's 0.101 on
+every run, and a ratio over the statements outside `failures` could never
+fire on its own, since their first error already fails the run. The bench
+prints `error_ratio` beside the RLOG entry's 0.101 as a comparison, not a
+bar: the two are measured over different statement sets.
 Without the flag the phase does not run and none of D7's concurrency bar is
 checked.
 

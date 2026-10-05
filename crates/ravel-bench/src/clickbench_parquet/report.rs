@@ -404,15 +404,28 @@ pub const PLACEHOLDER: &str = "FILL-IN-ON-REFERENCE-MACHINE";
 /// subject run. Each ships as [`PLACEHOLDER`].
 pub const OPERATOR_KEYS: [&str; 3] = ["memory_cap_bytes", "arm_b_hot_s", "arm_b_cold_s"];
 
-const ALL_KEYS: [&str; 7] = [
+const ALL_KEYS: [&str; 6] = [
     "memory_cap_bytes",
     "arm_b_hot_s",
     "arm_b_cold_s",
     "failures",
     "rlog_hot_ceiling_s",
     "concurrency_qps_floor",
-    "concurrency_error_ratio_ceiling",
 ];
+
+/// Keys an earlier `prereg.toml` carried, each with why it went. A file that
+/// still holds one is refused, so a stale copy is never judged as if the bar
+/// it names were still checked.
+const REMOVED_KEYS: [(&str, &str); 1] = [(
+    "concurrency_error_ratio_ceiling",
+    "D7's concurrency bar is the queries-per-second floor and no error from a \
+     statement outside `failures`; the error ratio is reported, not judged",
+)];
+
+/// ADR-2023's concurrency error ratio on the RLOG entry. Printed beside the
+/// phase's `error_ratio` for comparison only: the two are measured over
+/// different statement sets, so neither is a bar for the other.
+pub const RLOG_ERROR_RATIO: f64 = 0.101;
 
 /// `prereg.toml`, loaded and validated.
 #[derive(Debug, Clone, PartialEq)]
@@ -426,7 +439,6 @@ pub struct Prereg {
     pub failures: BTreeSet<u32>,
     pub rlog_hot_ceiling_s: f64,
     pub concurrency_qps_floor: f64,
-    pub concurrency_error_ratio_ceiling: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -445,6 +457,8 @@ pub enum PreregError {
     Missing { key: String },
     #[error("prereg key {key} is not one this lane reads")]
     UnknownKey { key: String },
+    #[error("prereg key {key} was removed (issue #2055): {reason}; delete it from the file")]
+    RemovedKey { key: String, reason: String },
     #[error("prereg key {key}: {reason}")]
     Invalid { key: String, reason: String },
 }
@@ -494,6 +508,15 @@ fn statement_label(label: &str) -> Option<u32> {
 /// refused.
 pub fn parse_prereg(text: &str) -> Result<Prereg, PreregError> {
     let table: toml::Table = toml::from_str(text).map_err(|e| PreregError::Parse(e.to_string()))?;
+    if let Some((key, reason)) = REMOVED_KEYS
+        .iter()
+        .find(|(key, _)| table.contains_key(*key))
+    {
+        return Err(PreregError::RemovedKey {
+            key: (*key).to_string(),
+            reason: (*reason).to_string(),
+        });
+    }
     if let Some(key) = table.keys().find(|k| !ALL_KEYS.contains(&k.as_str())) {
         return Err(PreregError::UnknownKey { key: key.clone() });
     }
@@ -550,15 +573,6 @@ pub fn parse_prereg(text: &str) -> Result<Prereg, PreregError> {
         }
     };
 
-    let concurrency_error_ratio_ceiling =
-        positive_number(&table, "concurrency_error_ratio_ceiling")?;
-    if concurrency_error_ratio_ceiling > 1.0 {
-        return Err(invalid(
-            "concurrency_error_ratio_ceiling",
-            format!("a ratio is at most 1, found {concurrency_error_ratio_ceiling}"),
-        ));
-    }
-
     Ok(Prereg {
         memory_cap_bytes,
         arm_b_hot_s: positive_number(&table, "arm_b_hot_s")?,
@@ -566,7 +580,6 @@ pub fn parse_prereg(text: &str) -> Result<Prereg, PreregError> {
         failures,
         rlog_hot_ceiling_s: positive_number(&table, "rlog_hot_ceiling_s")?,
         concurrency_qps_floor: positive_number(&table, "concurrency_qps_floor")?,
-        concurrency_error_ratio_ceiling,
     })
 }
 
@@ -656,15 +669,6 @@ pub enum Violation {
     ColdOverArmB { cold_sum_s: f64, limit_s: f64 },
     #[error("concurrency phase ran {qps} queries per second, under the floor {floor}")]
     ConcurrencyQpsBelowFloor { qps: f64, floor: f64 },
-    #[error(
-        "concurrency phase error ratio outside the registered failures \
-         {unregistered_error_ratio} is over the ceiling {ceiling} (all errors: {error_ratio})"
-    )]
-    ConcurrencyErrorRatioOverCeiling {
-        unregistered_error_ratio: f64,
-        error_ratio: f64,
-        ceiling: f64,
-    },
     #[error("q{number} errored {errors} times in the concurrency phase and is not pre-registered")]
     ConcurrencyUnregisteredError { number: u32, errors: u64 },
     #[error("the concurrency phase failed after it started: {error}")]
@@ -832,18 +836,9 @@ fn check_against(
                 floor: prereg.concurrency_qps_floor,
             });
         }
-        // Judged on the per-statement counts, not the stored figure, and
-        // without the registered failures: the phase cycles every statement,
-        // so five registered failures failing as predicted alone make the raw
-        // ratio 5/43, over the ceiling (issue #2055).
-        let unregistered_error_ratio = concurrency.error_ratio_outside(&prereg.failures);
-        if unregistered_error_ratio > prereg.concurrency_error_ratio_ceiling {
-            violations.push(Violation::ConcurrencyErrorRatioOverCeiling {
-                unregistered_error_ratio,
-                error_ratio: concurrency.error_ratio,
-                ceiling: prereg.concurrency_error_ratio_ceiling,
-            });
-        }
+        // No error-ratio ceiling: one error outside `failures` already fails
+        // the phase here, which is stricter than any ceiling over those
+        // statements (issue #2055).
         for statement in &concurrency.statements {
             if statement.errors > 0 && !prereg.failures.contains(&statement.number) {
                 violations.push(Violation::ConcurrencyUnregisteredError {
@@ -1090,8 +1085,8 @@ mod tests {
 
     /// A report that meets every rule: the five pre-registered statements
     /// fail, every other statement reaches its declared verdict, hot and
-    /// cold sum to 43 s and 86 s, and the concurrency phase clears both
-    /// floors.
+    /// cold sum to 43 s and 86 s, and the concurrency phase clears the
+    /// queries-per-second floor with errors from registered q33 only.
     fn clean_report() -> ClickBenchParquetReport {
         let prereg = prereg();
         let declared = declared();
@@ -1131,7 +1126,6 @@ mod tests {
                 errors: 6,
                 qps: 1.0,
                 error_ratio: 0.01,
-                unregistered_error_ratio: 0.0,
                 statements: (1..=STATEMENT_COUNT as u32)
                     .map(|number| ConcurrencyStatement {
                         number,
@@ -1433,15 +1427,14 @@ mod tests {
             (5.0f64 / 43.0).to_bits(),
             "the raw ratio is 5/43"
         );
-        assert!(concurrency.error_ratio > prereg().concurrency_error_ratio_ceiling);
+        assert!(concurrency.error_ratio > RLOG_ERROR_RATIO);
         assert_eq!(check(&report, &prereg()), Ok(()));
     }
 
     #[test]
-    fn an_unregistered_error_ratio_over_the_ceiling_is_named() {
-        // On top of the registered failures, q8 errors on all 60 of its
-        // runs: 60 errors over 37 * 14 + 60 = 578 unregistered runs, about
-        // 0.104, while the raw ratio is 130 over 648.
+    fn a_single_unregistered_concurrency_error_fails_the_phase() {
+        // On top of the registered failures, q8 errors once in its 14 runs:
+        // one error among the 38 * 14 = 532 runs of unregistered statements.
         let mut report = clean_report();
         registered_failures_always_error(&mut report);
         let concurrency = report.concurrency.as_mut().expect("ran");
@@ -1450,32 +1443,19 @@ mod tests {
             .iter_mut()
             .find(|s| s.number == 8)
             .expect("q8");
-        q8.completed = 0;
-        q8.errors = 60;
-        concurrency.queries_completed = 37 * 14;
-        concurrency.errors = 130;
-        concurrency.error_ratio = 130.0 / 648.0;
-        concurrency.unregistered_error_ratio = 60.0 / 578.0;
+        q8.completed = 13;
+        q8.errors = 1;
+        q8.first_error = Some("budget".to_string());
+        concurrency.queries_completed = 38 * 14 - 1;
+        concurrency.errors = 5 * 14 + 1;
+        concurrency.error_ratio = 71.0 / 602.0;
         concurrency.errored_statements = vec![8, 19, 29, 33, 34, 35];
-        let violations = check(&report, &prereg()).expect_err("over the ceiling");
         assert_eq!(
-            violations,
-            vec![
-                Violation::ConcurrencyErrorRatioOverCeiling {
-                    unregistered_error_ratio: 60.0 / 578.0,
-                    error_ratio: 130.0 / 648.0,
-                    ceiling: 0.101
-                },
-                Violation::ConcurrencyUnregisteredError {
-                    number: 8,
-                    errors: 60
-                },
-            ]
-        );
-        let message = violations[0].to_string();
-        assert!(
-            message.contains(&(130.0f64 / 648.0).to_string()),
-            "the raw ratio is reported: {message}"
+            only_violation(&report),
+            Violation::ConcurrencyUnregisteredError {
+                number: 8,
+                errors: 1
+            }
         );
     }
 
@@ -1616,9 +1596,31 @@ mod tests {
                 failures: BTreeSet::from([19, 29, 33, 34, 35]),
                 rlog_hot_ceiling_s: 101.7,
                 concurrency_qps_floor: 0.400,
-                concurrency_error_ratio_ceiling: 0.101,
             }
         );
+    }
+
+    #[test]
+    fn a_prereg_still_carrying_the_error_ratio_ceiling_is_refused() {
+        let line = "concurrency_error_ratio_ceiling = 0.101\n";
+        for text in [
+            format!("{}\n{line}", filled_prereg_text()),
+            format!("{CHECKED_IN_PREREG}\n{line}"),
+        ] {
+            let error = parse_prereg(&text).expect_err("a removed key");
+            assert!(
+                matches!(
+                    &error,
+                    PreregError::RemovedKey { key, .. } if key == "concurrency_error_ratio_ceiling"
+                ),
+                "{error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.contains("concurrency_error_ratio_ceiling was removed (issue #2055)"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

@@ -1,9 +1,8 @@
 //! The ClickBench Parquet lane's concurrency phase (ADR-2040 D7): N tasks,
 //! each with its own engine, cycle the suite's statements until the phase's
-//! duration has passed, and the figures D7 judges (queries per second and
-//! error ratio) come out of what they completed.
+//! duration has passed, and the figures D7 reports (queries per second,
+//! error ratio, per-statement counts) come out of what they completed.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -95,33 +94,10 @@ pub struct ConcurrencyFigures {
     pub qps: f64,
     /// `errors / (queries_completed + errors)`, 0 when nothing ran.
     pub error_ratio: f64,
-    /// The same ratio over the statements outside the registered failures
-    /// the phase was given only; see
-    /// [`ConcurrencyFigures::error_ratio_outside`].
-    pub unregistered_error_ratio: f64,
     /// One entry per suite statement, in suite order.
     pub statements: Vec<ConcurrencyStatement>,
     /// Statements that errored at least once.
     pub errored_statements: Vec<u32>,
-}
-
-impl ConcurrencyFigures {
-    /// Errors from statements not in `registered` over the runs of those
-    /// statements, completed plus errored; 0 when none of them ran.
-    pub fn error_ratio_outside(&self, registered: &BTreeSet<u32>) -> f64 {
-        let (errors, attempted) = self
-            .statements
-            .iter()
-            .filter(|s| !registered.contains(&s.number))
-            .fold((0u64, 0u64), |(errors, attempted), s| {
-                (errors + s.errors, attempted + s.completed + s.errors)
-            });
-        if attempted == 0 {
-            0.0
-        } else {
-            errors as f64 / attempted as f64
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -216,14 +192,11 @@ pub fn check_shape(
 /// Runs the phase: task `i` cycles `statements` from position
 /// `i * TASK_OFFSET_STRIDE` (mod their count) and starts no statement once
 /// `duration` has passed on its clock since it began. A statement already
-/// running at that point runs to completion and counts. `registered` is the
-/// set of statement numbers whose errors
-/// [`ConcurrencyFigures::unregistered_error_ratio`] leaves out.
+/// running at that point runs to completion and counts.
 pub async fn run(
     tasks: Vec<PhaseTask>,
     statements: &[Statement],
     duration: Duration,
-    registered: &BTreeSet<u32>,
 ) -> Result<ConcurrencyFigures, ConcurrencyError> {
     check_shape(tasks.len(), statements.len(), duration)?;
     let task_count = tasks.len();
@@ -283,7 +256,7 @@ pub async fn run(
     let queries_completed: u64 = figures.iter().map(|s| s.completed).sum();
     let error_total: u64 = figures.iter().map(|s| s.errors).sum();
     let attempted = queries_completed + error_total;
-    let mut phase = ConcurrencyFigures {
+    Ok(ConcurrencyFigures {
         tasks: task_count,
         duration_s: duration.as_secs_f64(),
         elapsed_s: elapsed.as_secs_f64(),
@@ -295,16 +268,13 @@ pub async fn run(
         } else {
             error_total as f64 / attempted as f64
         },
-        unregistered_error_ratio: 0.0,
         errored_statements: figures
             .iter()
             .filter(|s| s.errors > 0)
             .map(|s| s.number)
             .collect(),
         statements: figures,
-    };
-    phase.unregistered_error_ratio = phase.error_ratio_outside(registered);
-    Ok(phase)
+    })
 }
 
 #[cfg(test)]
@@ -424,7 +394,6 @@ mod tests {
             vec![task(&engine0), task(&engine1)],
             &statements(5),
             Duration::from_secs(6),
-            &BTreeSet::new(),
         )
         .await
         .expect("phase runs");
@@ -436,10 +405,6 @@ mod tests {
         assert_eq!(figures.errors, 1);
         assert_eq!(figures.qps.to_bits(), (5.0f64 / 7.0).to_bits());
         assert_eq!(figures.error_ratio.to_bits(), (1.0f64 / 6.0).to_bits());
-        assert_eq!(
-            figures.unregistered_error_ratio.to_bits(),
-            (1.0f64 / 6.0).to_bits()
-        );
         let by_number: BTreeMap<u32, &ConcurrencyStatement> =
             figures.statements.iter().map(|s| (s.number, s)).collect();
         let row = |n: u32| {
@@ -457,14 +422,9 @@ mod tests {
     #[tokio::test]
     async fn no_statement_starts_after_the_deadline() {
         let engine = stub(&[("s1", 4, false)]);
-        let figures = run(
-            vec![task(&engine)],
-            &statements(1),
-            Duration::from_secs(10),
-            &BTreeSet::new(),
-        )
-        .await
-        .expect("phase runs");
+        let figures = run(vec![task(&engine)], &statements(1), Duration::from_secs(10))
+            .await
+            .expect("phase runs");
         let starts: Vec<u64> = calls(&engine).into_iter().map(|(_, at)| at).collect();
         // The run started at 8 s finishes at 12 s and counts; none starts at 12 s.
         assert_eq!(starts, vec![0, 4, 8]);
@@ -488,7 +448,6 @@ mod tests {
             engines.iter().map(task).collect(),
             &statements(43),
             Duration::from_secs(2),
-            &BTreeSet::new(),
         )
         .await
         .expect("phase runs");
@@ -506,18 +465,12 @@ mod tests {
     #[tokio::test]
     async fn an_erroring_statement_is_counted_and_named() {
         let engine = stub(&[("s1", 1, false), ("s2", 1, true)]);
-        let figures = run(
-            vec![task(&engine)],
-            &statements(2),
-            Duration::from_secs(4),
-            &BTreeSet::new(),
-        )
-        .await
-        .expect("phase runs");
+        let figures = run(vec![task(&engine)], &statements(2), Duration::from_secs(4))
+            .await
+            .expect("phase runs");
         assert_eq!(figures.queries_completed, 2);
         assert_eq!(figures.errors, 2);
         assert_eq!(figures.error_ratio, 0.5);
-        assert_eq!(figures.unregistered_error_ratio, 0.5);
         assert_eq!(figures.errored_statements, vec![2]);
         assert_eq!(
             figures.statements[1].first_error.as_deref(),
@@ -527,41 +480,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registered_errors_are_left_out_of_the_unregistered_ratio_only() {
+    async fn every_statement_counts_in_the_error_ratio() {
         // One task over 6 s runs s1, s2, s3 twice each: s1 completes twice,
-        // s2 and s3 error twice each. s2 is registered.
+        // s2 and s3 error twice each.
         let engine = stub(&[("s1", 1, false), ("s2", 1, true), ("s3", 1, true)]);
-        let figures = run(
-            vec![task(&engine)],
-            &statements(3),
-            Duration::from_secs(6),
-            &BTreeSet::from([2]),
-        )
-        .await
-        .expect("phase runs");
+        let figures = run(vec![task(&engine)], &statements(3), Duration::from_secs(6))
+            .await
+            .expect("phase runs");
         assert_eq!(figures.queries_completed, 2);
         assert_eq!(figures.errors, 4);
         assert_eq!(figures.error_ratio.to_bits(), (4.0f64 / 6.0).to_bits());
-        assert_eq!(figures.unregistered_error_ratio, 0.5);
         assert_eq!(figures.errored_statements, vec![2, 3]);
-        assert_eq!(figures.error_ratio_outside(&BTreeSet::from([2, 3])), 0.0);
-        assert_eq!(figures.error_ratio_outside(&BTreeSet::from([1, 2, 3])), 0.0);
+        let per_statement: Vec<(u32, u64, u64)> = figures
+            .statements
+            .iter()
+            .map(|s| (s.number, s.completed, s.errors))
+            .collect();
+        assert_eq!(per_statement, vec![(1, 2, 0), (2, 0, 2), (3, 0, 2)]);
     }
 
     #[tokio::test]
     async fn an_empty_phase_is_refused() {
         let engine = stub(&[("s1", 1, false)]);
-        let none = BTreeSet::new();
         assert_eq!(
-            run(Vec::new(), &statements(1), Duration::from_secs(1), &none).await,
+            run(Vec::new(), &statements(1), Duration::from_secs(1)).await,
             Err(ConcurrencyError::NoTasks)
         );
         assert_eq!(
-            run(vec![task(&engine)], &[], Duration::from_secs(1), &none).await,
+            run(vec![task(&engine)], &[], Duration::from_secs(1)).await,
             Err(ConcurrencyError::NoStatements)
         );
         assert_eq!(
-            run(vec![task(&engine)], &statements(1), Duration::ZERO, &none).await,
+            run(vec![task(&engine)], &statements(1), Duration::ZERO).await,
             Err(ConcurrencyError::ZeroDuration)
         );
     }
