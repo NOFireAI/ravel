@@ -330,14 +330,14 @@ async fn measure(
             tasks,
             &suite.statements,
             Duration::from_secs(args.concurrency_seconds),
-            &prereg.failures,
         )
         .await
         {
             Ok(figures) => {
                 eprintln!(
                     "concurrency: {} tasks, {} completed, {} errors in {} s (configured {} s), \
-                     qps={}, error_ratio={}, unregistered_error_ratio={}",
+                     qps={}, error_ratio={} (RLOG entry: {}, a comparison over a different \
+                     statement set, not a bar)",
                     figures.tasks,
                     figures.queries_completed,
                     figures.errors,
@@ -345,7 +345,7 @@ async fn measure(
                     figures.duration_s,
                     figures.qps,
                     figures.error_ratio,
-                    figures.unregistered_error_ratio
+                    report::RLOG_ERROR_RATIO
                 );
                 (Some(figures), None)
             }
@@ -554,8 +554,7 @@ mod tests {
             &prereg,
             "memory_cap_bytes = 1\narm_b_hot_s = 100.0\narm_b_cold_s = 100.0\n\
              failures = [\"q19\", \"q29\", \"q33\", \"q34\", \"q35\"]\n\
-             rlog_hot_ceiling_s = 101.7\nconcurrency_qps_floor = 0.400\n\
-             concurrency_error_ratio_ceiling = 0.101\n",
+             rlog_hot_ceiling_s = 101.7\nconcurrency_qps_floor = 0.400\n",
         )
         .expect("write");
         let server_log = dir.join("server.log");
