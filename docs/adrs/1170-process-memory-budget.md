@@ -1034,11 +1034,15 @@ budget at 0 whatever the 1 GiB floor says, and startup refused with the
    `crates/ravel-maintain/src/config.rs`; the 2 GiB constant stays and is now
    its ceiling. The resolved reserve is logged as
    `memory_overhead_reserve_bytes`, as before.
-2. A host or container with 8 GiB or more is unchanged byte for byte: a
-   quarter of 8 GiB is the 2 GiB constant. So are the merge-target
-   derivations at the default 20 GiB merge cursor budget, since below 8 GiB
-   the host less its reserve is under 20 GiB either way and the merge budget
-   is 0 in both.
+2. A host or container with a `MemTotal` (or cgroup memory limit) of 8 GiB
+   or more is unchanged byte for byte: a quarter of 8 GiB is the 2 GiB
+   constant. So are the merge-target derivations at the default 20 GiB merge
+   cursor budget, since below 8 GiB the host less its reserve is under 20 GiB
+   either way and the merge budget is 0 in both. A nominal 8 GiB instance
+   usually reports less: cloud providers commonly show a `MemTotal` of about
+   7.6-7.8 GiB after firmware and kernel reservations, which is below the
+   8 GiB line and falls on the scaled side, with its reserve about 50-100 MiB
+   lower than the fixed 2 GiB.
 3. A derived budget below 256 MiB (`MIN_DERIVED_MEMORY_BUDGET_BYTES`)
    refuses to start, before the hard-cap check, with its own message. It
    names `MemTotal` or the cgroup limit, the reserve taken from it, the

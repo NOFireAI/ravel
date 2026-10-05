@@ -557,8 +557,11 @@ pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// derivation and the value used when the budget is unknown. The floor binds
 /// only while the budget the derivation divides ([`merge_memory_budget_bytes`])
 /// satisfies `budget / 8 / concurrent_merges <= 256 MiB`. With the default
-/// 20 GiB merge cursor budget and the 2 GiB overhead reserve already deducted
-/// from that budget, that is a host of at most `22 GiB + 2 GiB *
+/// 20 GiB merge cursor budget and the overhead reserve already deducted
+/// from that budget (the fixed 2 GiB [`MEMORY_OVERHEAD_RESERVE_BYTES`]: every
+/// host in the ranges below is well above the 8 GiB threshold where
+/// [`effective_memory_overhead_reserve_bytes`] still scales it down), that is
+/// a host of at most `22 GiB + 2 GiB *
 /// concurrent_merges` for `ravel-cli maintain` (`compact-bucket` is one merge:
 /// 24 GiB or less) and, for `ravel-server` at `--maintain-unit-concurrency` 4,
 /// a host of 30 GiB or less.

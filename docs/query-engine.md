@@ -1250,10 +1250,16 @@ budget, not only strictly above it (see ADR-1170's 2026-09-07 amendment): a
 remainder of exactly `0` is exactly as unusable as a negative one, since it
 builds the same refuse-everything `MemoryBudget::new(0)`. A typed
 `MemoryBudgetExceeded` error names both figures so the fix is in the error
-message: lower `--cache-max-bytes` or `--catalog-cache-max-bytes`, or, when
-the budget itself derived to `0` (the host's effective memory is at or below
-the overhead reserve, and no value of either flag can satisfy the check), give
-the process more memory or raise its cgroup memory limit.
+message: lower `--cache-max-bytes` or `--catalog-cache-max-bytes`, or raise
+the host's available memory. A `0`-byte `memory_budget_bytes` reaching this
+check at all is only possible through an explicit `--memory-budget-bytes 0`
+today: a *derived* budget that small already refuses earlier, at startup,
+with the separate `MemoryBudgetBelowMinimum` error below the 256 MiB minimum
+(see above). Against an explicit `0`, the message says so instead: no
+`--cache-max-bytes` value can satisfy the check (both hard caps are
+non-negative byte counts, so their sum can never go below `0`), and the fix
+is `--memory-budget-bytes` above `0`, or leaving it unset to derive the
+budget from the host's memory.
 
 `--disable-cache` is outside that check entirely. It builds neither cache, so
 neither resolved ceiling holds any memory: the hard-caps figure is `0`
@@ -1261,10 +1267,12 @@ regardless of `--cache-max-bytes` and `--catalog-cache-max-bytes`, the
 remainder is the whole budget, and
 startup never refuses. That is what keeps the flag usable as the remedy the
 caching guide names it as, and it is the one path that can start with a
-remainder of `0`: a container whose effective memory is at or below the 2 GiB
-overhead reserve derives a `0` budget, which no flag can raise. Startup logs a
-WARN there rather than refusing, because such a process still ingests; every
-query that reserves memory is refused for as long as it runs that way.
+derived budget (and so a remainder) below the 256 MiB minimum, including
+exactly `0`: `--disable-cache` is also exempt from the `MemoryBudgetBelowMinimum`
+refusal described above, so a container too small to clear that minimum still
+starts under it. Startup logs a WARN there rather than refusing, because such
+a process still ingests; every query that reserves memory is refused for as
+long as it runs that way.
 
 This derivation runs once, at process startup, from the host profile
 observed at that moment. There is no runtime budget re-derivation: the

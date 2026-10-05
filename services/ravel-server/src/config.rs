@@ -3286,7 +3286,8 @@ pub use ravel_maintain::config::effective_memory_overhead_reserve_bytes;
 pub const MIN_DERIVED_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Share of `memory_budget_bytes` (cgroup-capped effective memory minus
-/// [`MEMORY_OVERHEAD_RESERVE_BYTES`]) the derived `--cache-max-bytes` takes.
+/// [`effective_memory_overhead_reserve_bytes`], [`MEMORY_OVERHEAD_RESERVE_BYTES`]
+/// scaled down below 8 GiB of memory) the derived `--cache-max-bytes` takes.
 ///
 /// 25% rather than a larger share because the cache does not have the machine
 /// to itself. Measured on the 30 GiB reference host with ten concurrent
@@ -17231,6 +17232,22 @@ mod tests {
     /// Prove-the-test: dropping the `check_memory_budget_minimum` call from
     /// `Cli::resolve_performance` makes the first `expect_err` panic, since
     /// the 225 MiB budget clears the cache-cap check.
+    ///
+    /// The explicit-`--memory-budget-bytes`-is-not-held-to-the-minimum
+    /// assertion near the end uses a 100 MiB flag value, below the 256 MiB
+    /// minimum: a value above the minimum (an earlier version of this test
+    /// used 1 GiB) would pass that assertion even if flags were wrongly held
+    /// to the minimum too. Prove-the-test: making
+    /// `check_memory_budget_minimum` apply to `PERF_SOURCE_FLAG` as well as
+    /// the three derived sources (adding `|| source == PERF_SOURCE_FLAG` to
+    /// its `PERF_SOURCE_DERIVED` arm instead of falling through to
+    /// `else { return Ok(()) }`) makes that `expect` panic: "an explicit
+    /// --memory-budget-bytes is not held to the minimum: this host has too
+    /// little memory for ravel-server's derived memory budget: MemTotal is
+    /// 314572800 bytes, the overhead reserve taken from it is 2147483648
+    /// bytes, and that leaves a derived memory budget of 104857600 bytes,
+    /// below the 268435456-byte minimum (256 MiB). Give the process more
+    /// memory, or set --memory-budget-bytes to size the budget explicitly".
     #[test]
     fn budget_below_minimum_refuses_with_a_plain_message() {
         let host = available_host(300 * MIB, 250 * MIB, 10 * MIB);
@@ -17287,12 +17304,12 @@ mod tests {
         );
         assert!(message.contains("251658240 bytes, below"), "{message}");
 
-        let flagged = Cli::try_parse_from(["ravel-server", "--memory-budget-bytes", "1073741824"])
+        let flagged = Cli::try_parse_from(["ravel-server", "--memory-budget-bytes", "104857600"])
             .expect("flag parses");
         let started = flagged
             .resolve_performance(host)
             .expect("an explicit --memory-budget-bytes is not held to the minimum");
-        assert_eq!(started.memory_budget_bytes, GIB);
+        assert_eq!(started.memory_budget_bytes, 100 * MIB);
 
         // The smallest MemTotal that clears the minimum is a little over
         // 341 MiB: three quarters of it must reach 256 MiB.
