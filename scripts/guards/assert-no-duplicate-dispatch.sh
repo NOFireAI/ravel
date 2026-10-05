@@ -25,8 +25,9 @@
 #   64  usage
 #   65  an existing pull request already addresses the issue; skip and log
 #   66  an OPEN pull request is already touching the predicted files
-#   69  the question could not be asked (gh failed); not the same as a clean
-#       answer, and never report it as one
+#   69  the question could not be asked (gh failed after its retries, or a
+#       pull request list came back as long as its limit and may be
+#       truncated); not the same as a clean answer, and never report it as one
 set -euo pipefail
 
 issue=""
@@ -56,21 +57,35 @@ fi
 [[ "${issue}" =~ ^[0-9]+$ ]] || { echo "assert-no-duplicate-dispatch.sh: --issue must be a number" >&2; exit 64; }
 [[ "${closed_days}" =~ ^[0-9]+$ ]] || { echo "assert-no-duplicate-dispatch.sh: --closed-days must be a number" >&2; exit 64; }
 
-if [[ -z "${repo}" ]]; then
-  repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
-  [[ -n "${repo}" ]] || { echo "assert-no-duplicate-dispatch.sh: could not resolve the repository" >&2; exit 69; }
-fi
-
 # A failed query must not read as "nothing found". Every gh call below
-# either produces data or exits 69.
+# either produces data or exits 69. A run issues one call per candidate pull
+# request, a few hundred in a busy fortnight, so a single transient failure
+# is retried before the run gives up.
+ask_attempts="${ASK_ATTEMPTS:-3}"
+ask_backoff_s="${ASK_BACKOFF_S:-5}"
 ask() {
-  local out
-  if ! out="$("$@" 2>/dev/null)"; then
-    echo "assert-no-duplicate-dispatch.sh: '$*' failed; refusing to report a clean answer" >&2
-    exit 69
-  fi
+  local out err attempt=1
+  err="$(mktemp)"
+  while ! out="$("$@" 2>"${err}")"; do
+    # A missing resource fails the same way every time; only a failure that
+    # can pass on a second try is worth one.
+    if ((attempt >= ask_attempts)) || grep -q 'HTTP 404\|Could not resolve to' "${err}"; then
+      echo "assert-no-duplicate-dispatch.sh: '$*' failed ${attempt} times; refusing to report a clean answer" >&2
+      sed -n '1,3p' "${err}" >&2
+      rm -f "${err}"
+      exit 69
+    fi
+    attempt=$((attempt + 1))
+    sleep "$((ask_backoff_s * (attempt - 1)))"
+  done
+  rm -f "${err}"
   printf '%s' "${out}"
 }
+
+if [[ -z "${repo}" ]]; then
+  repo="$(ask gh repo view --json nameWithOwner --jq .nameWithOwner)"
+  [[ -n "${repo}" ]] || { echo "assert-no-duplicate-dispatch.sh: could not resolve the repository" >&2; exit 69; }
+fi
 
 issue_json="$(ask gh issue view "${issue}" --repo "${repo}" --json number,state,title,stateReason)"
 issue_state="$(jq -r '.state' <<<"${issue_json}")"
@@ -83,8 +98,39 @@ fi
 
 cutoff_epoch=$(( $(date +%s) - closed_days * 86400 ))
 
-prs_json="$(ask gh pr list --repo "${repo}" --state all --limit 200 \
-  --json number,title,state,body,headRefName,updatedAt,mergedAt,closedAt)"
+# Narrow lists rather than one of every pull request: the open ones,
+# whatever their age, and those closed or merged on each day since the cutoff
+# day, one query per day so no single list comes near its limit (this
+# repository closes a few dozen a day, a few hundred a fortnight). A list
+# that comes back full may have cut off a candidate, and a candidate that was
+# never listed reads as no overlap, so a full list is refused.
+pr_list_limit="${PR_LIST_LIMIT:-500}"
+pr_fields="number,title,state,body,headRefName,updatedAt,mergedAt,closedAt"
+# Called inside a command substitution, where errexit does not apply, so each
+# failure exits explicitly; falling through here would read as an empty list.
+list_prs() {
+  local listed count
+  listed="$(ask gh pr list --repo "${repo}" --limit "${pr_list_limit}" --json "${pr_fields}" "$@")" || exit 69
+  count="$(jq 'length' <<<"${listed}")" || exit 69
+  [[ "${count}" =~ ^[0-9]+$ ]] || {
+    echo "assert-no-duplicate-dispatch.sh: a pull request list length did not parse: ${count}" >&2
+    exit 69
+  }
+  if ((count >= pr_list_limit)); then
+    echo "assert-no-duplicate-dispatch.sh: a pull request list returned its limit of ${pr_list_limit}; it may be truncated, refusing to report a clean answer" >&2
+    exit 69
+  fi
+  printf '%s' "${listed}"
+}
+open_json="$(list_prs --state open)" || exit 69
+closed_json=""
+for ((back = closed_days; back >= 0; back--)); do
+  day_epoch=$(( $(date +%s) - back * 86400 ))
+  day="$(date -u -r "${day_epoch}" +%Y-%m-%d 2>/dev/null \
+    || date -u -d "@${day_epoch}" +%Y-%m-%d)"
+  closed_json+="$(list_prs --state all --search "closed:${day}")" || exit 69
+done
+prs_json="$(jq -s 'add | unique_by(.number)' <<<"${open_json}${closed_json}")" || exit 69
 
 # Candidates: every open pull request, plus anything closed or merged inside
 # the window. A merged pull request from last week is exactly the thing that
