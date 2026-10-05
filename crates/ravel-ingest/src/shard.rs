@@ -51,7 +51,8 @@ use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, SEGMENT_FORMAT_VERSION, StoreClockLag, checked_ingest_hour_bucket,
-    idle_age_threshold, memory_backstop_crossed, size_trigger_fires, store_clock_lag,
+    duration_nanos_saturating, idle_age_threshold, memory_backstop_crossed, size_trigger_fires,
+    store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::error::WriteError;
@@ -1574,11 +1575,11 @@ impl ShardActor {
         if !has_priority {
             return idle_age_threshold(buf.flush_est_bytes, &self.config);
         }
-        let floor_ns = self.config.max_flush_delay.as_nanos() as i64;
+        let floor_ns = duration_nanos_saturating(self.config.max_flush_delay);
         if !self.config.adaptive_flush_delay {
             return (floor_ns, FlushTrigger::Age);
         }
-        let retry_headroom_ns = self.config.put_retry_base_delay.as_nanos() as i64;
+        let retry_headroom_ns = duration_nanos_saturating(self.config.put_retry_base_delay);
         let ceiling_ns = visibility_ceiling_ns(
             floor_ns,
             self.rtt.p99_ns(),
@@ -2366,7 +2367,8 @@ impl ShardActor {
         // ADR-1307 finding 4: it derives from the raw clock reading, not the
         // (possibly floor-raised) stamp, so absorbing a backwards step never
         // extends the budget.
-        let deadline_ns = raw_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
+        let deadline_ns =
+            raw_ns.saturating_add(duration_nanos_saturating(self.config.max_flush_lifetime));
 
         let identity = SegmentIdentity {
             tenant_hash: tenant_hash.0,
@@ -2474,7 +2476,7 @@ impl ShardActor {
             // store budget.
             pinned.deadline_ns = clock
                 .now_ns()
-                .saturating_add(ctx.config.max_flush_lifetime.as_nanos() as i64);
+                .saturating_add(duration_nanos_saturating(ctx.config.max_flush_lifetime));
             let started_ns = clock.now_ns();
             ctx.run_flush(pinned).await;
             let off_actor_ns = clock.now_ns().saturating_sub(started_ns).max(0) as u64;
@@ -2486,7 +2488,9 @@ impl ShardActor {
 
 #[cfg(test)]
 mod adaptive_delay_tests {
-    use super::{IngestConfig, adaptive_age_threshold_ns, visibility_ceiling_ns};
+    use super::{
+        IngestConfig, adaptive_age_threshold_ns, duration_nanos_saturating, visibility_ceiling_ns,
+    };
 
     const FLOOR_NS: i64 = 500_000_000;
     const RETRY_HEADROOM_NS: i64 = 100_000_000;
@@ -2602,8 +2606,8 @@ mod adaptive_delay_tests {
     #[test]
     fn default_config_visibility_ceiling_clears_the_floor() {
         let cfg = IngestConfig::default();
-        let floor_ns = cfg.max_flush_delay.as_nanos() as i64;
-        let retry_headroom_ns = cfg.put_retry_base_delay.as_nanos() as i64;
+        let floor_ns = duration_nanos_saturating(cfg.max_flush_delay);
+        let retry_headroom_ns = duration_nanos_saturating(cfg.put_retry_base_delay);
         for rtt_p99_ns in [0i64, 10_000_000, 50_000_000] {
             let ceiling_ns = visibility_ceiling_ns(
                 floor_ns,
@@ -3908,23 +3912,13 @@ mod tests {
             let metrics = Arc::new(IngestMetrics::new(4));
             let clock = TestClock::new(BASE_NS);
             let (tx, rx) = mpsc::channel(64);
-            let actor = ShardActor::new(
-                3,
-                Signal::Metrics,
-                Uuid::new_v4(),
-                1,
-                Arc::clone(&store),
-                clock.clone(),
-                Arc::new(ravel_commit::rng::SystemRng),
+            let actor = Self::actor(
                 config,
-                Arc::clone(&metrics),
-                rx,
-                Arc::new(AtomicI64::new(0)),
-                BufferBudgetCeiling::unlimited(),
-                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 scope.clone(),
-                #[cfg(feature = "stage-timing")]
-                Arc::new(MetricStageTimings::new()),
+                Arc::clone(&store),
+                Arc::clone(&metrics),
+                clock.clone(),
+                rx,
             );
             let (start, started) = oneshot::channel::<()>();
             let rig = HandBackRig {
@@ -3941,6 +3935,48 @@ mod tests {
                 }),
             };
             (rig, start)
+        }
+
+        /// The shard-3 actor a rig runs.
+        fn actor(
+            config: IngestConfig,
+            scope: Arc<crate::generation::ScriptedScope<ShardMsg>>,
+            store: Arc<dyn ObjectStoreBackend>,
+            metrics: Arc<IngestMetrics>,
+            clock: Arc<TestClock>,
+            rx: mpsc::Receiver<ShardMsg>,
+        ) -> ShardActor {
+            ShardActor::new(
+                3,
+                Signal::Metrics,
+                Uuid::new_v4(),
+                1,
+                store,
+                clock,
+                Arc::new(ravel_commit::rng::SystemRng),
+                config,
+                metrics,
+                rx,
+                Arc::new(AtomicI64::new(0)),
+                BufferBudgetCeiling::unlimited(),
+                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
+                scope,
+                #[cfg(feature = "stage-timing")]
+                Arc::new(MetricStageTimings::new()),
+            )
+        }
+
+        /// An actor over `config` that never runs, for a test that calls its
+        /// methods directly.
+        fn idle_actor(config: IngestConfig) -> ShardActor {
+            Self::actor(
+                config,
+                crate::generation::ScriptedScope::new(ScanCheck::InScanSet, None),
+                Arc::new(MemoryStore::new()),
+                Arc::new(IngestMetrics::new(4)),
+                TestClock::new(BASE_NS),
+                mpsc::channel(1).1,
+            )
         }
 
         /// Commit records written under this rig's shard index, 3.
@@ -4432,6 +4468,109 @@ mod tests {
         assert_eq!(rig.budget.in_flight_bytes(), 0, "the charge is released");
         assert_eq!(rig.own_commits().await, 1, "one teardown write");
         assert_eq!(rig.own_samples().await, 6, "every handed-back row, once");
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A `max_flush_delay` past `i64::MAX` nanoseconds gives a buffer with a
+    /// waiter an age threshold of `i64::MAX`, with the adaptive corridor off
+    /// and on, and such a buffer is never flushed by age. Cast with `as i64`
+    /// the delay wraps to -1, which every buffer age exceeds, so the buffer
+    /// is flushed on the first tick. A `put_retry_base_delay` past `i64::MAX`
+    /// nanoseconds leaves the adaptive ceiling at the floor; cast, it wraps to
+    /// -1 and widens the ceiling by a nanosecond instead of collapsing it.
+    ///
+    /// Guards: `duration_nanos_saturating(self.config.max_flush_delay)` in
+    /// `age_threshold_ns`: cast, the thresholds read -1 and the buffer is
+    /// flushed. And `duration_nanos_saturating(self.config.put_retry_base_delay)`
+    /// there: cast, the trickle tenant's threshold is the budget plus one
+    /// nanosecond, on the adaptive trigger.
+    #[tokio::test]
+    async fn a_max_flush_delay_past_i64_nanos_never_ages_a_waiting_buffer() {
+        let past = Duration::from_nanos(u64::MAX);
+        let config = IngestConfig {
+            max_flush_delay: past,
+            ..ticking_config()
+        };
+        let rig = HandBackRig::with(ScanCheck::InScanSet, None, config);
+        let (charge, mut answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        assert!(
+            settles(|| rig.tx.capacity() == rig.tx.max_capacity()).await,
+            "the actor takes the strict write"
+        );
+        assert!(
+            !tick_until(&rig.clock, || rig.metrics.snapshot().flushes_by_age > 0).await,
+            "a waiting buffer is not due by age"
+        );
+        assert!(matches!(
+            answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(rig.own_commits().await, 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+
+        let mut buf = TenantBuf::default();
+        buf.waiters.push(oneshot::channel().0);
+        let fixed = HandBackRig::idle_actor(config);
+        assert_eq!(fixed.age_threshold_ns(&buf), (i64::MAX, FlushTrigger::Age));
+        let adaptive = HandBackRig::idle_actor(IngestConfig {
+            adaptive_flush_delay: true,
+            ..config
+        });
+        adaptive.rtt.record(0);
+        assert_eq!(
+            adaptive.age_threshold_ns(&buf),
+            (i64::MAX, FlushTrigger::Age)
+        );
+
+        let wide_retry = HandBackRig::idle_actor(IngestConfig {
+            adaptive_flush_delay: true,
+            put_retry_base_delay: past,
+            ..ticking_config()
+        });
+        wide_retry.rtt.record(0);
+        buf.avg_gap_ns = i64::MAX;
+        assert_eq!(
+            wide_retry.age_threshold_ns(&buf),
+            (50_000_000, FlushTrigger::Age),
+            "no retry headroom is left under the budget, so the ceiling is the floor"
+        );
+    }
+
+    /// A `max_flush_lifetime` past `i64::MAX` nanoseconds is an unbounded
+    /// lifetime: the flush is written and its strict waiter answered `Ok`.
+    /// Cast with `as i64` the lifetime wraps to -1, so every deadline built
+    /// from it is already past and the flush is abandoned.
+    ///
+    /// Guards: `duration_nanos_saturating(self.config.max_flush_lifetime)` in
+    /// `flush_tenant`'s flush-open deadline: cast, the flush is abandoned in
+    /// the queue and `abandoned_queue_deadline` reads 1. And
+    /// `duration_nanos_saturating(ctx.config.max_flush_lifetime)` in the
+    /// deadline re-derived at the permit grant: cast, the data PUT is never
+    /// attempted and `abandoned_retry_exhausted` reads 1.
+    #[tokio::test]
+    async fn a_max_flush_lifetime_past_i64_nanos_never_abandons_a_flush() {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_nanos(u64::MAX),
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(ScanCheck::InScanSet, None, config);
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.abandoned_queue_deadline, 0);
+        assert_eq!(snap.abandoned_retry_exhausted, 0);
+        answer
+            .await
+            .expect("waiter answered")
+            .expect("the flush is written");
+        assert_eq!(rig.own_commits().await, 1);
+        assert_eq!(rig.own_samples().await, 6, "every row, once");
+        drop(rig.tx);
         rig.task.await.expect("actor ends");
     }
 

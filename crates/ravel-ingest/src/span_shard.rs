@@ -61,8 +61,8 @@ use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, SPAN_SEGMENT_FORMAT_VERSION, StoreClockLag,
-    checked_ingest_hour_bucket, idle_age_threshold, memory_backstop_crossed, size_trigger_fires,
-    store_clock_lag,
+    checked_ingest_hour_bucket, duration_nanos_saturating, idle_age_threshold,
+    memory_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::generation::{
@@ -1088,7 +1088,7 @@ impl SpanShardActor {
             !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if has_priority {
             (
-                self.config.max_flush_delay.as_nanos() as i64,
+                duration_nanos_saturating(self.config.max_flush_delay),
                 FlushTrigger::Age,
             )
         } else {
@@ -1748,7 +1748,8 @@ impl SpanShardActor {
         // in the queue and drop already-acked rows with no PUT.
         // ADR-1307 finding 4: it derives from the raw clock reading, not the
         // (possibly floor-raised) stamp.
-        let deadline_ns = raw_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
+        let deadline_ns =
+            raw_ns.saturating_add(duration_nanos_saturating(self.config.max_flush_lifetime));
 
         let identity = ObjectIdentity {
             tenant_hash: tenant_hash.0,
@@ -1846,7 +1847,7 @@ impl SpanShardActor {
             pinned.deadline_ns = ctx
                 .clock
                 .now_ns()
-                .saturating_add(ctx.config.max_flush_lifetime.as_nanos() as i64);
+                .saturating_add(duration_nanos_saturating(ctx.config.max_flush_lifetime));
             // Per-shard skew (issue #865, ADR-1692): time the whole flush,
             // matching `crate::shard`'s own off-actor span.
             let started_ns = ctx.clock.now_ns();
@@ -2864,19 +2865,13 @@ mod tests {
             let metrics = Arc::new(SpanIngestMetrics::new(4));
             let clock = TestClock::new(BASE_NS);
             let (tx, rx) = mpsc::channel(64);
-            let actor = SpanShardActor::new(
-                3,
-                Uuid::new_v4(),
-                1,
-                Arc::clone(&store),
-                clock.clone(),
-                Arc::new(ravel_commit::rng::SystemRng),
+            let actor = Self::actor(
                 config,
-                Arc::clone(&metrics),
-                rx,
-                BufferBudgetCeiling::unlimited(),
-                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 scope.clone(),
+                Arc::clone(&store),
+                Arc::clone(&metrics),
+                clock.clone(),
+                rx,
             );
             let (start, started) = oneshot::channel::<()>();
             let rig = HandBackRig {
@@ -2893,6 +2888,44 @@ mod tests {
                 }),
             };
             (rig, start)
+        }
+
+        /// The shard-3 actor a rig runs.
+        fn actor(
+            config: IngestConfig,
+            scope: Arc<crate::generation::ScriptedScope<SpanShardMsg>>,
+            store: Arc<dyn ObjectStoreBackend>,
+            metrics: Arc<SpanIngestMetrics>,
+            clock: Arc<TestClock>,
+            rx: mpsc::Receiver<SpanShardMsg>,
+        ) -> SpanShardActor {
+            SpanShardActor::new(
+                3,
+                Uuid::new_v4(),
+                1,
+                store,
+                clock,
+                Arc::new(ravel_commit::rng::SystemRng),
+                config,
+                metrics,
+                rx,
+                BufferBudgetCeiling::unlimited(),
+                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
+                scope,
+            )
+        }
+
+        /// An actor over `config` that never runs, for a test that calls its
+        /// methods directly.
+        fn idle_actor(config: IngestConfig) -> SpanShardActor {
+            Self::actor(
+                config,
+                crate::generation::ScriptedScope::new(ScanCheck::InScanSet, None),
+                Arc::new(MemoryStore::new()),
+                Arc::new(SpanIngestMetrics::new(4)),
+                TestClock::new(BASE_NS),
+                mpsc::channel(1).1,
+            )
         }
 
         /// Commit records written under this rig's shard index, 3.
@@ -3341,6 +3374,77 @@ mod tests {
         assert_eq!(rig.budget.in_flight_bytes(), 0, "the charge is released");
         assert_eq!(rig.own_commits().await, 1, "one teardown write");
         assert_eq!(rig.own_spans().await, 6, "every handed-back span, once");
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_max_flush_delay_past_i64_nanos_never_ages_a_waiting_buffer`.
+    ///
+    /// Guard: `duration_nanos_saturating(self.config.max_flush_delay)` in
+    /// `age_threshold_ns`: cast with `as i64`, the threshold reads -1 and the
+    /// buffer is flushed on the first tick.
+    #[tokio::test]
+    async fn a_max_flush_delay_past_i64_nanos_never_ages_a_waiting_buffer() {
+        let config = IngestConfig {
+            max_flush_delay: Duration::from_nanos(u64::MAX),
+            ..ticking_config()
+        };
+        let rig = HandBackRig::with(ScanCheck::InScanSet, None, config);
+        let (charge, mut answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        assert!(
+            yields_until(|| rig.tx.capacity() == rig.tx.max_capacity()).await,
+            "the actor takes the strict write"
+        );
+        assert!(
+            !tick_until(&rig.clock, || rig.metrics.snapshot().flushes_by_age > 0).await,
+            "a waiting buffer is not due by age"
+        );
+        assert!(matches!(
+            answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(rig.own_commits().await, 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+
+        let mut buf = SpanTenantBuf::default();
+        buf.waiters.push(oneshot::channel().0);
+        assert_eq!(
+            HandBackRig::idle_actor(config).age_threshold_ns(&buf),
+            (i64::MAX, FlushTrigger::Age)
+        );
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_max_flush_lifetime_past_i64_nanos_never_abandons_a_flush`.
+    ///
+    /// Guards: `duration_nanos_saturating(self.config.max_flush_lifetime)` in
+    /// `flush_tenant`'s flush-open deadline: cast, `abandoned_queue_deadline`
+    /// reads 1. And `duration_nanos_saturating(ctx.config.max_flush_lifetime)`
+    /// at the permit grant: cast, `abandoned_retry_exhausted` reads 1.
+    #[tokio::test]
+    async fn a_max_flush_lifetime_past_i64_nanos_never_abandons_a_flush() {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_nanos(u64::MAX),
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(ScanCheck::InScanSet, None, config);
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.abandoned_queue_deadline, 0);
+        assert_eq!(snap.abandoned_retry_exhausted, 0);
+        answer
+            .await
+            .expect("waiter answered")
+            .expect("the flush is written");
+        assert_eq!(rig.own_commits().await, 1);
+        assert_eq!(rig.own_spans().await, 6, "every span, once");
+        drop(rig.tx);
         rig.task.await.expect("actor ends");
     }
 }
