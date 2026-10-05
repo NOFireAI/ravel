@@ -649,12 +649,12 @@ fn split_tenant(live_ab: &[Uuid], shards: u32) -> (TenantId, u32) {
 /// An entry for a pair whose shard 0 another live process owns is removed at
 /// the start of this process's fold tick for the signal, and not counted as
 /// dropped, so a pair whose ownership moved away does not pin a queue slot.
-/// The same entry under this process alone stays queued, so the removal
-/// follows ownership.
+/// The same entry under this process alone, for a tenant it maintains and
+/// skips as fresh, stays queued, so the removal follows ownership.
 ///
 /// Flip to watch it fail: in `fold::run_tick`, delete the
-/// `refold.remove_unless(...)` loop at the top. `pending_len` after the tick
-/// under `{A, B}` is then 1, not 0.
+/// `refold.remove_unless(...)` loop. `pending_len` after the tick under
+/// `{A, B}` is then 1, not 0.
 #[tokio::test]
 async fn an_entry_for_a_pair_this_process_does_not_fold_is_removed_uncounted() {
     const SHARDS: u32 = 8;
@@ -665,13 +665,52 @@ async fn an_entry_for_a_pair_this_process_does_not_fold_is_removed_uncounted() {
     let solo_a = a.worker.solo_live_set();
     let now = past_horizon_ns();
 
+    // A first fold, so the tick below finds the tenant maintained and its
+    // HEAD fresh, and neither folds nor removes the entry.
+    publish_l0(&store, &tenant, 0, OLD_HOUR, 1).await;
     let queue = RefoldQueue::default();
-    queue.send(tenant.hash(), Signal::Metrics, BTreeSet::from([OLD_HOUR]));
     a.fold_tick(now, &solo_a, &queue).await;
+    queue.send(tenant.hash(), Signal::Metrics, BTreeSet::from([OLD_HOUR]));
+    let report = a.fold_tick(now, &solo_a, &queue).await;
+    assert_eq!(report.skipped_fresh, vec![tenant.hash()], "{report:?}");
     assert_eq!(queue.pending_len(), 1, "A alone owns the pair and keeps it");
 
     let report = a.fold_tick(now, &live_ab, &queue).await;
     assert_eq!(report.owned, Vec::new());
     assert_eq!(queue.pending_len(), 0, "B owns shard 0, so A removed it");
+    assert_eq!(queue.dropped_requests(), 0, "a removal is not a drop");
+}
+
+/// An entry for a tenant the tick does not maintain, here one deleted after
+/// the send so discovery no longer finds it, is removed at the fold tick for
+/// the signal and not counted as dropped, although this process alone owns
+/// shard 0 of the pair. Its slot is freed rather than pinned until eviction.
+///
+/// Flip to watch it fail: in `fold::run_tick`, pass
+/// `|tenant| worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD)` to
+/// `refold.remove_unless` instead of the `maintained_set` membership test.
+/// `pending_len` is then 1, not 0.
+#[tokio::test]
+async fn an_entry_for_a_tenant_the_tick_no_longer_maintains_is_removed_uncounted() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("refold-deleted-tenant");
+    let a = Process::new(&store, &tenant, PROCESS_A, 1);
+    let solo_a = a.worker.solo_live_set();
+    assert!(
+        a.worker
+            .owns_unit(&solo_a, &tenant.hash(), Signal::Metrics, FOLD_UNIT_SHARD),
+        "ownership alone would keep the entry"
+    );
+
+    let queue = RefoldQueue::default();
+    queue.send(tenant.hash(), Signal::Metrics, BTreeSet::from([OLD_HOUR]));
+    let report = a.fold_tick(past_horizon_ns(), &solo_a, &queue).await;
+    assert_eq!(report.discovered, 0, "{report:?}");
+    assert_eq!(report.maintained, 0);
+    assert_eq!(
+        queue.pending_len(),
+        0,
+        "the tick does not maintain the tenant"
+    );
     assert_eq!(queue.dropped_requests(), 0, "a removal is not a drop");
 }
