@@ -336,8 +336,7 @@ async fn measure(
             Ok(figures) => {
                 eprintln!(
                     "concurrency: {} tasks, {} completed, {} errors in {} s (configured {} s), \
-                     qps={}, error_ratio={} (RLOG entry: {}, a comparison over a different \
-                     statement set, not a bar)",
+                     qps={}, error_ratio={} (RLOG entry: {}; reported, not judged)",
                     figures.tasks,
                     figures.queries_completed,
                     figures.errors,

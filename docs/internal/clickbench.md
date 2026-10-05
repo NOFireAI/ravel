@@ -1166,13 +1166,11 @@ is at least `duration_s`; `qps` is completed queries over `elapsed_s`.
 
 D7's concurrency bar is two rules (issue #2055): `qps` at least
 `concurrency_qps_floor` (0.400), and no error from any statement outside
-`failures`. The error ratio is not judged. The phase cycles all 43
-statements, so the five registered failures erroring exactly as predicted
-put `error_ratio` at 5/43, about 0.116, above the RLOG entry's 0.101 on
-every run, and a ratio over the statements outside `failures` could never
-fire on its own, since their first error already fails the run. The bench
-prints `error_ratio` beside the RLOG entry's 0.101 as a comparison, not a
-bar: the two are measured over different statement sets.
+`failures`. The error ratio is not judged: the five registered failures
+alone put it at 5/43, about 0.116, above the RLOG entry's 0.101 on every
+run. ADR-2040's concurrency bar amendment gives the full reason. The bench
+prints `error_ratio` beside the RLOG entry's 0.101; explain any gap beyond
+what the registered failures account for on #2055.
 Without the flag the phase does not run and none of D7's concurrency bar is
 checked.
 
