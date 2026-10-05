@@ -10579,6 +10579,122 @@ mod tests {
         }
     }
 
+    /// The two column-statistics decode counters are read off the live
+    /// `Catalog` into their own fields. A folded HEAD points one part's
+    /// statistics at an object whose bytes match the HEAD's blake3 but carry
+    /// no column-statistics header, so every load refuses it: three loads move
+    /// `column_stats_decode_refusals` to 3 and leave
+    /// `column_stats_decode_panics` at 0, and the snapshot must read 3 and 0.
+    /// A real decode panic cannot be produced from this crate (the catalog's
+    /// panicking-job fault is `cfg(test)` inside `ravel-catalog`), so a
+    /// `from_catalog` that read the panic counter as a constant 0 would still
+    /// pass; one that swapped the two reads, or read the refusals as 0, fails.
+    ///
+    /// Prove-the-test: swap the two `catalog.column_stats_decode_*()` calls in
+    /// `from_catalog` and `refusals` reads 0 against the expected 3.
+    #[tokio::test]
+    async fn catalog_decode_counters_read_the_live_catalog() {
+        use bytes::Bytes;
+        use ravel_catalog::{Catalog, CatalogConfig};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_object_store::{ObjectStoreBackend, PutOptions};
+        use ravel_proto::catalog::v1::{SnapshotColumnStatsPartRef, SnapshotHead, SnapshotPartRef};
+        use ravel_types::accounting::QueryAccounting;
+        use ravel_types::{Signal, TenantId, TimeRange};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let store = std::sync::Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("decode-counter-snapshot").hash();
+        let signal = Signal::Logs;
+        let prefix = signal.key_prefix();
+        let stats_bytes = Bytes::from_static(b"not a column-statistics object");
+        let stats_key = format!("t/{}/catalog/{prefix}/cstat/refused.cstat", tenant.to_hex());
+        store
+            .put(&stats_key, stats_bytes.clone(), PutOptions::default())
+            .await
+            .expect("put stats object");
+        let part_hash = *blake3::hash(b"decode-counter-part").as_bytes();
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as u32,
+            shard_count: 1,
+            watermark_hour: 10,
+            parts: vec![SnapshotPartRef {
+                key: format!("t/{}/catalog/{prefix}/snap/empty.csnap", tenant.to_hex()),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+                column_stats: Some(SnapshotColumnStatsPartRef {
+                    key: stats_key,
+                    blake3: blake3::hash(&stats_bytes).as_bytes().to_vec(),
+                    size: stats_bytes.len() as u64,
+                    segment_count: 0,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
+            }],
+            folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
+            shard_generation_count: 1,
+            ..Default::default()
+        };
+        store
+            .put(
+                &format!("t/{}/catalog/{prefix}/HEAD", tenant.to_hex()),
+                Bytes::from(ravel_catalog::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store, CatalogConfig::default()).expect("catalog");
+        let before = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(
+            (
+                before.column_stats_decode_refusals,
+                before.column_stats_decode_panics
+            ),
+            (0, 0)
+        );
+
+        let range = TimeRange {
+            start_ns: 0,
+            end_ns: 50 * NS_PER_HOUR,
+        };
+        for _ in 0..3 {
+            let loaded = catalog
+                .load_column_stats(
+                    &tenant,
+                    signal,
+                    range,
+                    50 * NS_PER_HOUR,
+                    &QueryAccounting::new(),
+                )
+                .await
+                .expect("a refused decode degrades rather than failing the load");
+            assert!(loaded.is_none(), "the refused object covers nothing");
+        }
+        assert_eq!(
+            (
+                catalog.column_stats_decode_refusals(),
+                catalog.column_stats_decode_panics()
+            ),
+            (3, 0),
+            "the fixture refuses on every load and never panics"
+        );
+
+        let after = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(
+            after.column_stats_decode_refusals, 3,
+            "refusals read from the catalog's refusal counter"
+        );
+        assert_eq!(
+            after.column_stats_decode_panics, 0,
+            "panics read from the catalog's panic counter"
+        );
+    }
+
     /// A process that has never folded successfully still renders the gauge,
     /// at `0`, rather than omitting the series. An absent series cannot be
     /// alerted on with the `time() - gauge` expression the observability
