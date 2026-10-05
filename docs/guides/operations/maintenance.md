@@ -315,7 +315,8 @@ from the memory budget, and the span merge's target stays 256 MiB because span
 segments have no stored-size target to cap them:
 
 ```text
-budget = host memory - 2 GiB overhead reserve - merge cursor budget  (at least 0)
+budget = host memory - overhead reserve - merge cursor budget  (at least 0)
+reserve = min(2 GiB, host memory / 4)
 target = max( min( budget / 8 / concurrent_merges,
                    claim lease * 10 MiB/s / 2,
                    8 GiB ),
