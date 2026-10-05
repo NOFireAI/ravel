@@ -121,6 +121,12 @@ pub struct Transaction {
 /// or dropped hour degrades to today's behavior (the hour keeps naming its
 /// pre-rewrite inputs until retention drops it), and the sweep's gate remains
 /// the delete blocker either way.
+///
+/// Three kinds of fold ignore a request entirely, because the pass sits in the
+/// same reconcile branch as the other two: a first fold, a rebuild, and a
+/// no-op fold (the watermark did not advance, so the fold returns before any
+/// reconcile work). Nothing records the ignored hours; the requester re-derives
+/// its blocked set on each sweep and resubmits a still-held hour.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RefoldRequest {
     /// Ascending and deduplicated, so a fold spends its cap oldest-first (the
@@ -268,13 +274,14 @@ pub struct FoldReport {
     /// band uses; a request naming more hours than the cap allows carries the
     /// remainder to whichever later fold the requester asks again, and this
     /// field counts only the hours this call actually re-listed. `0` on a
-    /// [`Catalog::fold`] call (an empty [`RefoldRequest`]) and on a request
-    /// submitted to a fold call that turns out to be a no-op: the pass sits
-    /// inside the same reconcile branch as the fixed window and the frontier
-    /// band, which never runs when nothing new is sealed, so a request
-    /// against an unchanged watermark reconciles nothing regardless of what
-    /// it names (docs/adrs/0064-selective-subject-erasure.md, the no-op
-    /// carve-out).
+    /// [`Catalog::fold`] call (an empty [`RefoldRequest`]), and on a request
+    /// submitted to a first fold, a rebuild, or a fold call that turns out to
+    /// be a no-op: the pass sits inside the same reconcile branch as the fixed
+    /// window and the frontier band, which runs on none of the three (a no-op
+    /// fold has nothing newly sealed), so a request against an unchanged
+    /// watermark reconciles nothing regardless of what it names
+    /// (docs/adrs/0064-selective-subject-erasure.md, the no-op carve-out). The
+    /// requester resubmits a still-held hour on its next sweep.
     pub refold_hours_reconciled: usize,
     /// Stamped carriers this fold read: L0 commit records whose
     /// `declared_column_stats` (field 20) was non-empty, plus L1 compaction
@@ -1034,7 +1041,10 @@ impl Catalog {
     /// no part covers would be pure cost). It also inherits ADR-0063 section
     /// 4's carve-outs: a first fold and a rebuild do no reconcile work at all,
     /// so a request made against either is ignored rather than adding LISTs to
-    /// a fold that already derives every hour from the commit layout.
+    /// a fold that already derives every hour from the commit layout, and a
+    /// no-op fold (the watermark did not advance) returns before the reconcile
+    /// block, so a request made against one is ignored too. The requester
+    /// resubmits a still-held hour on its next sweep.
     #[allow(clippy::too_many_arguments)]
     pub async fn fold_with_refold_request(
         &self,

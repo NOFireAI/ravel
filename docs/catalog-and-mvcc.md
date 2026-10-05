@@ -1186,17 +1186,33 @@ those hours, after the fixed window and the frontier band:
   the same way, and land in the same single HEAD CAS. A re-fold can
   therefore only ever make the snapshot agree with the commit layout.
 - **Skipped when redundant.** The pass sits inside the same reconcile block
-  as the other two, so a first fold and a rebuilt fold ignore a request
-  entirely: a rebuild already re-derives every hour from the commit layout.
+  as the other two, so a first fold, a rebuilt fold and a no-op fold (the
+  watermark did not advance) ignore a request entirely: a rebuild already
+  re-derives every hour from the commit layout, and a no-op fold returns
+  before the reconcile block. The requester resubmits a still-held hour on
+  its next sweep.
 - **A hint, never a durability dependency.** An hour nobody requests
   degrades to the behaviour above (it keeps naming its pre-rewrite inputs
   until the frontier band reaches it), and the sweep's HEAD-reachability
   gate remains the delete blocker in every case.
 
-The maintain-tier wiring that turns the sweep's blocked hours into a
-`RefoldRequest` is a separate change; until it lands this entry point has no
-production caller and every fold behaves exactly as the two preceding
-sections describe.
+The requester is the maintain-role sweep of the process that folds the pair.
+Each maintain tick unions, per `(tenant, signal)`, the hours its zoned or
+full superseded-input sweeps held on `SnapshotBlock::Named`, and sends them
+to an in-process queue that the same process's fold loop drains on its next
+tick for that signal; each tenant's hours become its `RefoldRequest`. The
+queue holds at most 256 entries and drops the oldest when full. Nothing about
+it is durable: a dropped entry, a request discarded because its tenant was
+not folded that tick, or one lost with the process is sent again by the next
+sweep that still finds the hour held. In practice that is the full sweep
+(every `interior_reverify_ns`, 6 hours by default): a held hour is past its
+compaction's protection horizon, and the per-tick zoned sweep lists only
+hours still sealing or near their retention expiry. A process sends only for
+pairs whose shard 0 it owns, because only that process folds the pair. A
+hold found on another shard, swept by a process that does not own shard 0 of
+the pair, therefore reaches no fold, and those inputs stay held as described
+above until the frontier band reaches the hour. In `--mode all` no maintain
+loop runs, so every fold's request is empty.
 
 ## Commit sequence (strict mode)
 

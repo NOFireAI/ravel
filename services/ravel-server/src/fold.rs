@@ -1,6 +1,8 @@
 //! Per-signal background catalog fold task (ADR-0020; storage-derived tenant
-//! set is ADR-0048 decision 3). Periodically calls [`Catalog::fold`] so query resolve can
-//! serve sealed history from snapshots instead of full listing.
+//! set is ADR-0048 decision 3). Periodically calls
+//! [`Catalog::fold_with_refold_request`] so query resolve can serve sealed
+//! history from snapshots instead of full listing, passing each tenant the
+//! hours the maintain loop's sweeps queued on the [`RefoldQueue`].
 //!
 //! Never runs on the ingest or query path, and never affects correctness:
 //! every failure here is logged and retried on the next tick. Disabling this
