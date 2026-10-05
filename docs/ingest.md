@@ -328,13 +328,14 @@ the close fails as closed, which for a generation-mismatch hand-back makes the
 source write the rows in place on that flush and for a retired-index one keeps
 them with the source.
 
-Each pipeline counts hand-backs as `rerouted_flushes`, exported as
-`ravel_ingest_rerouted_flushes_total` by signal, once per flush attempt that
-delivered rows to at least one target. Its snapshot also carries two fields
-that are not exported yet: `rerouted_flushes_generation_mismatch`, the part
-handed back for an hour another generation owns, and
-`generation_mismatch_written_in_place`, one per buffer written in place while
-a mismatch was detected. The first hand-back of an episode on a shard logs
+Each pipeline counts hand-backs as `rerouted_flushes`, once per flush attempt
+that delivered rows to at least one target, and the part handed back for an
+hour another generation owns as `rerouted_flushes_generation_mismatch`. Both
+are exported as `ravel_ingest_rerouted_flushes_total` by signal and `reason`:
+the `generation_mismatch` series is that part and the `retired_index` series
+the rest. Its snapshot also carries `generation_mismatch_written_in_place`,
+one per buffer written in place while a mismatch was detected, exported as
+`ravel_ingest_generation_mismatch_in_place_writes_total` by signal. The first hand-back of an episode on a shard logs
 once at WARN with its reason (`retired_index` or `generation_mismatch`). A
 hand-back that keeps its rows, a retired-index one that finds a target not
 live or its mailbox closed, or a generation-mismatch one that finds a target's
