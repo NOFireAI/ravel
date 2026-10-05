@@ -201,6 +201,8 @@ pub struct LogIngestMetrics {
     /// they pinned (ADR-1642 scan-set amendment), the log-pipeline counterpart
     /// of `IngestMetrics::rerouted_flushes`.
     rerouted_flushes: AtomicU64,
+    /// The counterpart of `IngestMetrics::rerouted_flushes_retired_index`.
+    rerouted_flushes_retired_index: AtomicU64,
     /// The counterpart of `IngestMetrics::rerouted_flushes_generation_mismatch`.
     rerouted_flushes_generation_mismatch: AtomicU64,
     /// The counterpart of `IngestMetrics::hand_back_failures`.
@@ -376,8 +378,11 @@ pub struct LogIngestMetricsSnapshot {
     /// an hour another generation owns (ADR-1642 scan-set amendment), for
     /// every [`HandBackReason`].
     pub rerouted_flushes: u64,
-    /// The part of `rerouted_flushes` whose reason was
-    /// [`HandBackReason::GenerationMismatch`].
+    /// The hand-backs whose reason was [`HandBackReason::RetiredIndex`], read
+    /// from their own counter.
+    pub rerouted_flushes_retired_index: u64,
+    /// The hand-backs whose reason was [`HandBackReason::GenerationMismatch`],
+    /// read from their own counter.
     pub rerouted_flushes_generation_mismatch: u64,
     /// Hand-back episodes that kept rows in the source buffer: a
     /// retired-index target not live or closed, or a generation-mismatch
@@ -388,7 +393,8 @@ pub struct LogIngestMetricsSnapshot {
     /// `ravel_ingest_teardown_unscanned_writes_total`.
     pub teardown_unscanned_writes: u64,
     /// Buffers written in place into an hour another generation owns, after
-    /// a generation-mismatch hand-back could not deliver. Not exported.
+    /// a generation-mismatch hand-back could not deliver. Exported as
+    /// `ravel_ingest_generation_mismatch_in_place_writes_total`.
     pub generation_mismatch_written_in_place: u64,
     pub indexed_fields_stale_fallbacks: u64,
     pub postings_objects: u64,
@@ -762,13 +768,15 @@ impl LogIngestMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One flush handed back for `reason` (ADR-1642 scan-set amendment).
+    /// One flush handed back for `reason` (ADR-1642 scan-set amendment):
+    /// the total and exactly one per-reason counter.
     pub(crate) fn record_rerouted_flush(&self, reason: HandBackReason) {
-        if reason == HandBackReason::GenerationMismatch {
-            self.rerouted_flushes_generation_mismatch
-                .fetch_add(1, Ordering::Relaxed);
-        }
         self.rerouted_flushes.fetch_add(1, Ordering::Relaxed);
+        let by_reason = match reason {
+            HandBackReason::RetiredIndex => &self.rerouted_flushes_retired_index,
+            HandBackReason::GenerationMismatch => &self.rerouted_flushes_generation_mismatch,
+        };
+        by_reason.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Flushes handed back so far, read by the router's drain.
@@ -887,6 +895,9 @@ impl LogIngestMetrics {
             stale_provisioning_flushes: self.stale_provisioning_flushes.load(Ordering::Relaxed),
             grace_extended_stale_flushes: self.grace_extended_stale_flushes.load(Ordering::Relaxed),
             rerouted_flushes: self.rerouted_flushes.load(Ordering::Relaxed),
+            rerouted_flushes_retired_index: self
+                .rerouted_flushes_retired_index
+                .load(Ordering::Relaxed),
             rerouted_flushes_generation_mismatch: self
                 .rerouted_flushes_generation_mismatch
                 .load(Ordering::Relaxed),
@@ -1325,6 +1336,31 @@ mod tests {
         assert_eq!(
             snap.dynamic_columns_used_max, 8,
             "running maximum keeps the wider object's used count"
+        );
+    }
+
+    /// Each hand-back counts on the total and on exactly one per-reason
+    /// counter, so the snapshot reads (N + M, N, M) for N retired-index and M
+    /// generation-mismatch hand-backs. N and M differ, so a swapped field
+    /// fails too.
+    #[test]
+    fn rerouted_flushes_count_the_total_and_exactly_one_reason() {
+        let metrics = LogIngestMetrics::default();
+        for _ in 0..4 {
+            metrics.record_rerouted_flush(HandBackReason::RetiredIndex);
+        }
+        for _ in 0..7 {
+            metrics.record_rerouted_flush(HandBackReason::GenerationMismatch);
+        }
+
+        let snap = metrics.snapshot();
+        assert_eq!(
+            (
+                snap.rerouted_flushes,
+                snap.rerouted_flushes_retired_index,
+                snap.rerouted_flushes_generation_mismatch,
+            ),
+            (11, 4, 7)
         );
     }
 }

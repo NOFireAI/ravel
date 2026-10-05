@@ -2030,7 +2030,8 @@ impl Catalog {
     /// too large for the reuse cache's byte budget. Unlike a bare `Ok(None)`
     /// (no HEAD, no stats object), this never fires for legitimately absent
     /// statistics. Independent of the reuse cache, so it counts even when that
-    /// cache is disabled. Exporting it on `/metrics` is the server's follow-up.
+    /// cache is disabled. `ravel-server` exports it on `/metrics` as
+    /// `ravel_catalog_column_stats_decode_refusals_total`.
     pub fn column_stats_decode_refusals(&self) -> u64 {
         self.column_stats_decode_refusals.load(Ordering::Relaxed)
     }
@@ -2042,8 +2043,8 @@ impl Catalog {
     /// decode panics and the tenant runs with no column statistics for it.
     /// Not a refusal, so never counted in
     /// [`Catalog::column_stats_decode_refusals`]. A cancelled job is not
-    /// counted here or anywhere. Exporting it on `/metrics` is the server's
-    /// follow-up.
+    /// counted here or anywhere. `ravel-server` exports it on `/metrics` as
+    /// `ravel_catalog_column_stats_decode_panics_total`.
     pub fn column_stats_decode_panics(&self) -> u64 {
         self.column_stats_decode_panics.load(Ordering::Relaxed)
     }

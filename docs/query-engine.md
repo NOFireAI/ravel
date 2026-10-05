@@ -1103,20 +1103,18 @@ same RAII `reserve` API, so they read under `component="fetch"`.
   or format-floor history, or carries a format version below the lowest this
   build supports, a supersession chain of compaction or rewrite records that
   is cyclic, deeper than the resolver's fixed bound, or names a predecessor
-  with a different input set, 503
-  unavailable for transient store failures other than a checksum mismatch,
-  which answers 500 on a catalog read as on a segment fetch (the server puts
-  only the catalog on the read CPU gate, and a decode job for a
-  catalog snapshot part, postings or column-statistics object that panics
-  or that the gate cancels at shutdown answers no error: the resolve falls
-  back and the query still answers exactly), and for a catalog
+  with a different input set, 503 unavailable for transient store failures
+  other than a checksum mismatch, which answers 500 on a catalog read as on a
+  segment fetch (the server puts only the catalog on the read CPU gate, and a
+  decode job for a catalog snapshot part, postings or column-statistics object
+  that panics or that the gate cancels at shutdown answers no error: the
+  resolve falls back and the query still answers exactly), and for a catalog
   object (commit, compaction or rewrite record, erasure request, HEAD,
-  snapshot part or
-  postings) written in a format version above the highest this build reads
-  or carrying an enum value above the highest it reads (a snapshot part entry
-  level), or a provisioning record written in a format version above the
-  highest this build reads, which a peer on a newer build can read during a
-  rolling upgrade).
+  snapshot part or postings) written in a format version above the highest
+  this build reads or carrying an enum value above the highest it reads (a
+  snapshot part entry level), or a provisioning record written in a format
+  version above the highest this build reads, which a peer on a newer build
+  can read during a rolling upgrade).
 - Timestamps: Prometheus float seconds in, RFC3339 or float accepted like
   Prometheus; responses use float seconds with ms precision.
 - `resultType`: `vector`, `matrix`, `scalar`, `string`. A top-level scalar

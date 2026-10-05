@@ -175,9 +175,8 @@ pub enum HandBackReason {
 }
 
 impl HandBackReason {
-    /// The name of this reason in the hand-back WARN line. No exported metric
-    /// carries it: the snapshot counts the generation-mismatch part in its
-    /// own field.
+    /// The name of this reason in the hand-back WARN line, and the value of
+    /// the `reason` label on `ravel_ingest_rerouted_flushes_total`.
     pub fn label(self) -> &'static str {
         match self {
             HandBackReason::RetiredIndex => "retired_index",
