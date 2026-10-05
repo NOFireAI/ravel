@@ -1633,8 +1633,9 @@ enum MaintainCommand {
         /// division, floor). So each concurrent bucket may hold up to ~20 GiB / N
         /// of cursor budget plus its in-progress writer split target
         /// (--l1-part-memory-target-bytes, for a log merge by default the
-        /// host's memory less 2 GiB and less the 20 GiB cursor budget, / 8 / N,
-        /// within [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
+        /// host's memory less the overhead reserve (2 GiB from 8 GiB of memory
+        /// up, a quarter of that memory below it) and less the 20 GiB cursor
+        /// budget, / 8 / N, within [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
         /// ~20 GiB + 1 GiB; at N=4 each of the four holds up to ~5 GiB +
         /// 256 MiB, so the aggregate stays ~20 GiB of cursor budget plus
         /// ~1 GiB of writer targets. Dividing the budget is

@@ -612,7 +612,8 @@ now derived from the memory budget the process runs under. Three terms
 decide it, and the floor is applied last:
 
 ```text
-budget = memory - 2 GiB overhead reserve - merge cursor budget   (at least 0)
+budget = memory - overhead reserve - merge cursor budget   (at least 0)
+reserve = min(2 GiB, memory / 4)
 target = max( min( budget / 8 / concurrent_merges,
                    claim lease * 10 MiB/s / 2,
                    8 GiB ),
@@ -620,7 +621,9 @@ target = max( min( budget / 8 / concurrent_merges,
 ```
 
 `ravel-server` uses its resolved `memory_budget_bytes` (memory less its
-2 GiB overhead reserve) and its maintenance unit concurrency; `ravel-cli
+overhead reserve, 2 GiB from 8 GiB of memory up and a quarter of that
+memory below it -- ADR-1170, small-host reserve amendment, issue #2607)
+and its maintenance unit concurrency; `ravel-cli
 maintain` uses the host's total memory, capped by a cgroup memory limit on
 Linux, less the same reserve, and its bucket concurrency (1 for
 `compact-bucket`). Both then deduct the merge cursor budget (ADR-0979

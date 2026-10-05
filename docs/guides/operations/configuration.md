@@ -1483,8 +1483,9 @@ pool nests inside the per-tenant pool, so the tenant's total is unchanged by the
 per-query share: statements running together share the tenant ceiling, and a
 statement that arrives while another holds most of it gets what is left, not a
 reserved quarter. One tenant's SQL memory is therefore still at most 50% of
-`MemTotal`. The two caches carve the memory budget (`MemTotal` less the 2 GiB
-reserve) rather than `MemTotal`, so the three ceilings together come to about
+`MemTotal`. The two caches carve the memory budget (`MemTotal` less the
+overhead reserve, 2 GiB from 8 GiB of memory up and a quarter of that memory
+below it) rather than `MemTotal`, so the three ceilings together come to about
 78% of `MemTotal` on the reference host (25,125,558,681 of 32,212,254,720),
 and more on a loopback store, where the fetcher cache derives at 40%.
 
