@@ -46,8 +46,9 @@ pub(crate) const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 /// `d` in nanoseconds, saturating at `i64::MAX`. `as i64` would wrap a
 /// duration past about 292 years to a negative count, which every threshold
-/// comparison then reads as already elapsed.
-fn duration_nanos_saturating(d: Duration) -> i64 {
+/// comparison then reads as already elapsed, and every deadline built from it
+/// as already past.
+pub(crate) fn duration_nanos_saturating(d: Duration) -> i64 {
     i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
 }
 
@@ -1135,6 +1136,38 @@ mod tests {
             ..shipped
         };
         assert_eq!(wide_retry.flush_trigger_age_bound_ns(), 40_200_000_000);
+    }
+
+    /// Below a non-zero `idle_flush_byte_floor`, a lifetime past `i64::MAX`
+    /// nanoseconds holds a buffer for `i64::MAX` less one tick, and a tick
+    /// past it gives a hold of zero. Cast with `as i64`, either wraps to -1:
+    /// the lifetime's hold comes out as zero, and the tick's as one
+    /// nanosecond past the lifetime.
+    ///
+    /// Guards: `duration_nanos_saturating(config.max_flush_lifetime)` and
+    /// `duration_nanos_saturating(config.flush_tick)` in
+    /// `idle_age_threshold`'s floor branch, one assertion each.
+    #[test]
+    fn a_sub_floor_hold_saturates_a_lifetime_or_tick_past_i64_nanos() {
+        let past = Duration::from_nanos(u64::MAX);
+        let floored = IngestConfig {
+            idle_flush_byte_floor: 64 * 1024,
+            ..IngestConfig::default()
+        };
+        let lifetime = IngestConfig {
+            max_flush_lifetime: past,
+            flush_tick: Duration::from_secs(1),
+            ..floored
+        };
+        assert_eq!(
+            idle_age_threshold(0, &lifetime),
+            (i64::MAX - 1_000_000_000, FlushTrigger::AgeFloor)
+        );
+        let tick = IngestConfig {
+            flush_tick: past,
+            ..floored
+        };
+        assert_eq!(idle_age_threshold(0, &tick), (0, FlushTrigger::AgeFloor));
     }
 
     #[test]
