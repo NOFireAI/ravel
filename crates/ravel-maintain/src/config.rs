@@ -557,8 +557,11 @@ pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// derivation and the value used when the budget is unknown. The floor binds
 /// only while the budget the derivation divides ([`merge_memory_budget_bytes`])
 /// satisfies `budget / 8 / concurrent_merges <= 256 MiB`. With the default
-/// 20 GiB merge cursor budget and the 2 GiB overhead reserve already deducted
-/// from that budget, that is a host of at most `22 GiB + 2 GiB *
+/// 20 GiB merge cursor budget and the overhead reserve already deducted
+/// from that budget (the fixed 2 GiB [`MEMORY_OVERHEAD_RESERVE_BYTES`]: every
+/// host in the ranges below is well above the 8 GiB threshold where
+/// [`effective_memory_overhead_reserve_bytes`] still scales it down), that is
+/// a host of at most `22 GiB + 2 GiB *
 /// concurrent_merges` for `ravel-cli maintain` (`compact-bucket` is one merge:
 /// 24 GiB or less) and, for `ravel-server` at `--maintain-unit-concurrency` 4,
 /// a host of 30 GiB or less.
@@ -584,13 +587,33 @@ pub const L1_PART_MEMORY_TARGET_BUDGET_DIVISOR: u64 = 8;
 /// A provisional round figure, not a measurement: well above the few hundred MiB
 /// an idle process costs before its first query, so a flag combination is not
 /// falsely refused for lack of the real number.
+///
+/// This is the reserve's ceiling. Both binaries deduct
+/// [`effective_memory_overhead_reserve_bytes`], which is this constant on a
+/// host with 8 GiB or more and a quarter of the host's memory below that.
 pub const MEMORY_OVERHEAD_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// Host memory less [`MEMORY_OVERHEAD_RESERVE_BYTES`], floored at zero: the
-/// budget `ravel-cli maintain` starts its derivation from before
+/// Below `MEMORY_OVERHEAD_RESERVE_BYTES * MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR`
+/// (8 GiB) the overhead reserve is the host's memory divided by this (ADR-1170,
+/// small-host reserve amendment, issue #2607).
+pub const MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR: u64 = 4;
+
+/// The overhead reserve deducted from `total_bytes` (`MemTotal`, or the cgroup
+/// memory limit when one caps it): `min(MEMORY_OVERHEAD_RESERVE_BYTES,
+/// total_bytes / 4)`. The fixed 2 GiB alone leaves nothing on a host with
+/// 2 GiB or less; a quarter of the host leaves three quarters to derive from.
+/// From 8 GiB up it is [`MEMORY_OVERHEAD_RESERVE_BYTES`] exactly.
+pub fn effective_memory_overhead_reserve_bytes(total_bytes: u64) -> u64 {
+    MEMORY_OVERHEAD_RESERVE_BYTES.min(total_bytes / MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR)
+}
+
+/// Host memory less [`effective_memory_overhead_reserve_bytes`]: the budget
+/// `ravel-cli maintain` starts its derivation from before
 /// [`merge_memory_budget_bytes`] deducts the merge cursor budget.
 pub fn host_memory_budget_bytes(host_memory_total_bytes: u64) -> u64 {
-    host_memory_total_bytes.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES)
+    host_memory_total_bytes.saturating_sub(effective_memory_overhead_reserve_bytes(
+        host_memory_total_bytes,
+    ))
 }
 
 /// The memory the RLOG part-split derivation divides among concurrent merges:
@@ -603,7 +626,7 @@ pub fn host_memory_budget_bytes(host_memory_total_bytes: u64) -> u64 {
 /// 20 GiB ([`DEFAULT_MERGE_CURSOR_BUDGET_BYTES`]). A derivation that took one
 /// eighth of the whole budget would hand the writer buffer memory the cursors
 /// already claim. `process_budget_bytes` is host memory already net of
-/// [`MEMORY_OVERHEAD_RESERVE_BYTES`] (`ravel-server`'s `memory_budget_bytes`, or
+/// [`effective_memory_overhead_reserve_bytes`] (`ravel-server`'s `memory_budget_bytes`, or
 /// [`host_memory_budget_bytes`] for `ravel-cli maintain`).
 ///
 /// Worked figures at the default 20 GiB cursor budget: a 32 GiB host under
@@ -2271,11 +2294,50 @@ mod tests {
         assert_eq!(bytes, 256 * MIB);
 
         // A host smaller than the deductions floors at zero, then at 256 MiB.
+        // The reserve on a 1 GiB host is a quarter of it, so the host budget
+        // is 768 MiB, which the 20 GiB cursor budget then takes to zero.
         assert_eq!(merge_memory_budget_bytes(GIB, 20 * GIB), 0);
-        assert_eq!(host_memory_budget_bytes(GIB), 0);
+        assert_eq!(host_memory_budget_bytes(GIB), 768 * MIB);
+        assert_eq!(
+            merge_memory_budget_bytes(
+                host_memory_budget_bytes(GIB),
+                DEFAULT_MERGE_CURSOR_BUDGET_BYTES
+            ),
+            0
+        );
         let (bytes, bound) = derive_l1_part_memory_target(0, 1, DEFAULT_CLAIM_LEASE_DURATION);
         assert_eq!(bytes, 256 * MIB);
         assert_eq!(bound, L1PartMemoryTargetBound::Floor);
+    }
+
+    /// Issue #2607: the reserve is a quarter of the host below 8 GiB and the
+    /// fixed 2 GiB from 8 GiB up. A fixed 2 GiB fails the 2 GiB and 1,912 MiB
+    /// rows (it reads 2 GiB and leaves a 0 host budget there).
+    #[test]
+    fn the_reserve_is_a_quarter_of_the_host_below_eight_gib() {
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(1912 * MIB),
+            478 * MIB
+        );
+        assert_eq!(host_memory_budget_bytes(1912 * MIB), 1434 * MIB);
+        assert_eq!(effective_memory_overhead_reserve_bytes(2 * GIB), 512 * MIB);
+        assert_eq!(host_memory_budget_bytes(2 * GIB), 1536 * MIB);
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(8 * GIB - 4),
+            2 * GIB - 1
+        );
+        for total in [8 * GIB, 32 * GIB, 30 * GIB, u64::MAX] {
+            assert_eq!(
+                effective_memory_overhead_reserve_bytes(total),
+                MEMORY_OVERHEAD_RESERVE_BYTES
+            );
+            assert_eq!(
+                host_memory_budget_bytes(total),
+                total - MEMORY_OVERHEAD_RESERVE_BYTES
+            );
+        }
+        assert_eq!(effective_memory_overhead_reserve_bytes(0), 0);
+        assert_eq!(host_memory_budget_bytes(0), 0);
     }
 
     /// The ceiling term is named too: a 128 GiB budget with a lease long enough
