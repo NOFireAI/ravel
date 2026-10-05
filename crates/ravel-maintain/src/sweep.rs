@@ -232,6 +232,12 @@ pub struct SweepReport {
     /// ([`SupersededSweepOutcome::held_by_pinned_window`], ADR-1133); feeds
     /// `ravel_maintain_superseded_inputs_held_total{reason="pinned_window"}`.
     pub superseded_held_by_pinned_window: usize,
+    /// Rule 2: the ingest hours this pass held a chain group in because the
+    /// live catalog HEAD snapshot still names it
+    /// ([`SupersededSweepOutcome::blocked_named_hours`]). `ravel-server`'s
+    /// maintain loop hands these to the next scheduled fold of the pair as a
+    /// re-fold request.
+    pub blocked_named_hours: BTreeSet<u32>,
     /// Rule 2: the unnamed-since marker requests and transitions of this pass
     /// ([`SupersededSweepOutcome::unnamed_markers`]).
     pub unnamed_markers: MarkerStats,
@@ -411,6 +417,7 @@ pub async fn sweep_shard_with_holds(
             superseded_held_by_snapshot: superseded.held_by_snapshot,
             superseded_held_by_unreadable_head: superseded.held_by_unreadable_head,
             superseded_held_by_pinned_window: superseded.held_by_pinned_window,
+            blocked_named_hours: superseded.blocked_named_hours,
             unnamed_markers: reach.marker_stats().clone(),
             unnamed_marker_reap,
             superseded_groups_held_by_legal_hold: superseded.chain_groups_held_by_legal_hold,
@@ -616,6 +623,7 @@ pub async fn sweep_shard_zoned_with_holds(
             superseded_held_by_snapshot: superseded.held_by_snapshot,
             superseded_held_by_unreadable_head: superseded.held_by_unreadable_head,
             superseded_held_by_pinned_window: superseded.held_by_pinned_window,
+            blocked_named_hours: superseded.blocked_named_hours,
             unnamed_markers: superseded.unnamed_markers.clone(),
             unnamed_marker_reap: superseded.unnamed_marker_reap.clone(),
             superseded_groups_held_by_legal_hold: superseded.chain_groups_held_by_legal_hold,
@@ -1121,6 +1129,13 @@ pub struct SupersededSweepOutcome {
     /// copies it into [`SweepReport::superseded_held_by_pinned_window`], which
     /// feeds `ravel_maintain_superseded_inputs_held_total{reason="pinned_window"}`.
     pub held_by_pinned_window: usize,
+    /// The ingest hours of the chain groups counted in
+    /// [`Self::held_by_snapshot`]: hours whose snapshot entries still name
+    /// inputs a published compaction or rewrite record superseded, so a fold
+    /// that re-lists them releases the hold. Only that reason fills it; a group
+    /// held for an unreadable HEAD, the pinned-query window, a legal hold, or a
+    /// refused delete is not here, since no re-fold releases those.
+    pub blocked_named_hours: BTreeSet<u32>,
     /// The unnamed-since marker requests and transitions of this pass.
     pub unnamed_markers: MarkerStats,
     /// What this pass's orphan-marker reap did, when one ran.
@@ -1726,6 +1741,7 @@ async fn sweep_superseded_impl(
             }
             SnapshotGate::Blocked(SnapshotBlock::Named) => {
                 outcome.held_by_snapshot += group.object_count();
+                outcome.blocked_named_hours.insert(group.ingest_hour_bucket);
                 outcome.note_hold(group, shard);
             }
             SnapshotGate::Blocked(SnapshotBlock::Unreadable) => {

@@ -1,6 +1,8 @@
 //! Per-signal background catalog fold task (ADR-0020; storage-derived tenant
-//! set is ADR-0048 decision 3). Periodically calls [`Catalog::fold`] so query resolve can
-//! serve sealed history from snapshots instead of full listing.
+//! set is ADR-0048 decision 3). Periodically calls
+//! [`Catalog::fold_with_refold_request`] so query resolve can serve sealed
+//! history from snapshots instead of full listing, passing each tenant the
+//! hours the maintain loop's sweeps queued on the [`RefoldQueue`].
 //!
 //! Never runs on the ingest or query path, and never affects correctness:
 //! every failure here is logged and retried on the next tick. Disabling this
@@ -32,13 +34,14 @@
 //! owned, and the behavior is byte-for-byte the unpartitioned fold
 //! (ADR-1693 decision 3).
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures::FutureExt;
-use ravel_catalog::Catalog;
+use ravel_catalog::{Catalog, RefoldRequest};
 use ravel_commit::rng::{RngSource, SystemRng};
 use ravel_maintain::{Clock, MaintainError, RetentionConfig, WorkerSet};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
@@ -47,6 +50,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::config::Mode;
 use crate::tenant_discovery::restrict_by_lifecycle;
 
 /// Default `fold_interval`: 5 minutes.
@@ -205,10 +209,188 @@ pub(crate) const FOLD_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Sig
 /// The shard whose rendezvous owner owns a whole `(tenant, signal)` pair's
 /// fold (ADR-1693 decision 1). The fold is per pair, not per shard, so it
 /// needs one shard to key the unit on; shard 0 is the convention the
-/// per-signal maintenance sweeps already use
-/// ([`crate::maintain`]), which is what makes the sweeper and the
-/// folder for a pair the same process.
+/// per-signal maintenance sweeps already use ([`crate::maintain`]). That makes
+/// the process sweeping a pair's shard 0 and its per-pair catalog objects the
+/// process that folds it. Every other shard of the pair is swept by whichever
+/// process owns that shard, which under a live set of more than one need not
+/// be the folder.
 pub const FOLD_UNIT_SHARD: u32 = 0;
+
+/// Default [`RefoldQueue`] capacity, in `(tenant, signal)` pairs.
+pub const DEFAULT_REFOLD_QUEUE_CAPACITY: usize = 256;
+
+/// The most hours one [`RefoldQueue`] entry holds. A merge past it keeps the
+/// smallest hours, since the catalog reconciles a request oldest first.
+pub const REFOLD_ENTRY_HOURS_MAX: usize = 1024;
+
+/// One pair's pending hours. `seq` is the order the pair was inserted in; a
+/// merge into an existing entry keeps it.
+#[derive(Debug)]
+struct RefoldEntry {
+    seq: u64,
+    hours: BTreeSet<u32>,
+}
+
+#[derive(Debug, Default)]
+struct RefoldPending {
+    next_seq: u64,
+    entries: HashMap<(TenantHash, Signal), RefoldEntry>,
+}
+
+/// The in-process hand-off from the maintain loop's superseded-input sweep to
+/// the scheduled fold of the same `(tenant, signal)` pair (ADR-0063 section
+/// 4): the ingest hours a sweep held because the live catalog HEAD still names
+/// their superseded inputs ([`ravel_maintain::SweepReport::blocked_named_hours`]).
+///
+/// The queue holds one entry per pair, and a send for a pair already queued
+/// merges its hours into that entry. The fold tick reads at most the catalog's
+/// per-fold cap (`frontier_reconcile_max_hours`) of a pair's oldest hours with
+/// [`Self::peek`], passes them to [`Catalog::fold_with_refold_request`], and
+/// removes those hours with [`Self::remove_hours`] only after a fold that
+/// returned `Ok` and was not a no-op, so a request survives a no-op fold, a
+/// fresh skip, and a failed fold, and the hours past the cap stay queued for
+/// the pair's next fold that advances the watermark.
+///
+/// A queued hour is a hint, never a durability dependency. The queue lives in
+/// memory and is bounded at `capacity` pairs: a send for a new pair that finds
+/// it full evicts the pair inserted earliest (a merge does not make a pair
+/// younger) and counts it in [`Self::dropped_requests`]. One entry holds at
+/// most [`REFOLD_ENTRY_HOURS_MAX`] hours, the smallest ones, and the hours cut
+/// past that are not counted. An evicted pair, hours past the entry cap, and
+/// an entry lost with the process all cost the same thing: the sweep
+/// re-derives its blocked set on each pass, so a still-held hour is sent again
+/// by the next sweep that finds it.
+#[derive(Debug)]
+pub struct RefoldQueue {
+    capacity: usize,
+    pending: Mutex<RefoldPending>,
+    dropped: AtomicU64,
+}
+
+impl Default for RefoldQueue {
+    fn default() -> Self {
+        Self::new(DEFAULT_REFOLD_QUEUE_CAPACITY)
+    }
+}
+
+impl RefoldQueue {
+    /// A queue holding at most `capacity` pairs; a zero capacity holds one.
+    pub fn new(capacity: usize) -> Self {
+        RefoldQueue {
+            capacity: capacity.max(1),
+            pending: Mutex::new(RefoldPending::default()),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Queues `hours` for the next fold of `(tenant, signal)` that acts on
+    /// them. An empty set is ignored. Hours for a pair already queued are
+    /// merged into its entry. A new pair that finds the queue full evicts the
+    /// pair inserted earliest and counts it in [`Self::dropped_requests`].
+    pub fn send(&self, tenant: TenantHash, signal: Signal, hours: BTreeSet<u32>) {
+        if hours.is_empty() {
+            return;
+        }
+        let mut pending = self.lock();
+        let RefoldPending { next_seq, entries } = &mut *pending;
+        if let Some(entry) = entries.get_mut(&(tenant, signal)) {
+            entry.hours.extend(hours);
+            cap_entry_hours(&mut entry.hours);
+            return;
+        }
+        while entries.len() >= self.capacity {
+            let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.seq)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            entries.remove(&oldest);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut hours = hours;
+        cap_entry_hours(&mut hours);
+        entries.insert(
+            (tenant, signal),
+            RefoldEntry {
+                seq: *next_seq,
+                hours,
+            },
+        );
+        *next_seq += 1;
+    }
+
+    /// At most `limit` of the hours pending for `(tenant, signal)`, the
+    /// smallest ones, copied out and left queued. Empty when nothing is
+    /// pending.
+    pub fn peek(&self, tenant: &TenantHash, signal: Signal, limit: usize) -> RefoldRequest {
+        self.lock()
+            .entries
+            .get(&(*tenant, signal))
+            .map(|entry| RefoldRequest::from_hours(entry.hours.iter().copied().take(limit)))
+            .unwrap_or_default()
+    }
+
+    /// Removes `taken` from the pair's pending hours, and the entry once no
+    /// hour is left. An hour sent after the [`Self::peek`] that produced
+    /// `taken` stays queued.
+    pub fn remove_hours(&self, tenant: &TenantHash, signal: Signal, taken: &RefoldRequest) {
+        let mut pending = self.lock();
+        let key = (*tenant, signal);
+        let Some(entry) = pending.entries.get_mut(&key) else {
+            return;
+        };
+        for hour in taken.hours() {
+            entry.hours.remove(&hour);
+        }
+        if entry.hours.is_empty() {
+            pending.entries.remove(&key);
+        }
+    }
+
+    /// Removes every `signal` entry whose tenant fails `keep`, returning each
+    /// removed tenant and its hour count. Not counted as dropped.
+    pub fn remove_unless(
+        &self,
+        signal: Signal,
+        keep: impl Fn(&TenantHash) -> bool,
+    ) -> Vec<(TenantHash, usize)> {
+        let mut removed = Vec::new();
+        self.lock().entries.retain(|(tenant, entry_signal), entry| {
+            if *entry_signal != signal || keep(tenant) {
+                return true;
+            }
+            removed.push((*tenant, entry.hours.len()));
+            false
+        });
+        removed
+    }
+
+    /// Pairs evicted because the queue was full, since the process started.
+    pub fn dropped_requests(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Pairs currently queued, across every signal.
+    pub fn pending_len(&self) -> usize {
+        self.lock().entries.len()
+    }
+
+    /// A poisoned lock still guards a well-formed queue, at worst missing an
+    /// update a panicking caller was making, and a lost entry is only a lost
+    /// hint, so the contents are used as they are.
+    fn lock(&self) -> MutexGuard<'_, RefoldPending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Trims `hours` to its [`REFOLD_ENTRY_HOURS_MAX`] smallest.
+fn cap_entry_hours(hours: &mut BTreeSet<u32>) {
+    while hours.len() > REFOLD_ENTRY_HOURS_MAX {
+        hours.pop_last();
+    }
+}
 
 /// What one tick did, per tenant, for one signal. Returned by [`run_tick`] so
 /// the partition is assertable (ADR-1693's acceptance test) rather than only
@@ -233,12 +415,18 @@ pub struct FoldTickReport {
     pub excluded: usize,
     /// Maintained tenants whose fold ran and returned a report.
     pub folded: Vec<TenantHash>,
+    /// The `folded` tenants whose fold was a no-op (the watermark did not
+    /// advance), so their pending re-fold hours stayed queued.
+    pub no_op: Vec<TenantHash>,
     /// Maintained tenants whose fold returned an error. Logged and retried
     /// next tick; never fails a query.
     pub failed: Vec<TenantHash>,
     /// Maintained tenants skipped because their HEAD was younger than the fold
     /// interval, the cheap duplicate-work peek.
     pub skipped_fresh: Vec<TenantHash>,
+    /// Ingest hours the folds of this tick re-listed from a [`RefoldQueue`]
+    /// request, summed over `folded` ([`ravel_catalog::FoldReport::refold_hours_reconciled`]).
+    pub refold_hours_reconciled: usize,
 }
 
 /// Spawns one fold loop per signal in [`FOLD_SIGNALS`], not one per tenant:
@@ -292,6 +480,14 @@ pub struct FoldTickReport {
 /// `/metrics`. Each signal's loop runs under [`run_supervisor`], which catches
 /// a panic in the tick body, counts a restart there, and respawns the loop
 /// after a bounded backoff.
+///
+/// `refold` is the process's one [`RefoldQueue`], fed by the maintain loop's
+/// sweeps ([`crate::maintain::spawn`]). Each signal's tick folds each
+/// maintained tenant with at most the catalog's per-fold cap of that pair's
+/// oldest pending hours ([`run_tick`]). In `Mode::All` no maintain loop runs,
+/// nothing feeds the queue, and every request is empty; a maintain process
+/// whose fold is disabled spawns nothing here and hands its sweeps no queue
+/// ([`refold_queue_for_maintain`]).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     catalog: Arc<Catalog>,
@@ -303,6 +499,7 @@ pub fn spawn(
     live_set: watch::Receiver<Vec<Uuid>>,
     clock: Arc<dyn Clock>,
     loop_metrics: Arc<FoldLoopMetrics>,
+    refold: Arc<RefoldQueue>,
 ) -> Result<FoldTasks, SpawnError> {
     config.check_spawnable()?;
     if !config.enabled {
@@ -339,6 +536,7 @@ pub fn spawn(
             worker: Arc::clone(&worker),
             live_set: live_set.clone(),
             clock: Arc::clone(&clock),
+            refold: Arc::clone(&refold),
             // Production has no test seam, so the per-tick hook is a no-op.
             // Tests pass a closure that panics to exercise the supervisor.
             tick_hook: Arc::new(|| {}),
@@ -354,6 +552,19 @@ pub fn spawn(
         handles.push(handle);
     }
     Ok(FoldTasks { shutdown, handles })
+}
+
+/// The queue [`crate::maintain::spawn`] sends its sweeps' held hours to:
+/// `queue` when this process spawns the scheduled fold loops that take from
+/// it (`mode` runs the scheduled fold and `config` enables it, the same
+/// condition [`spawn`] starts them under), otherwise `None`, so a process
+/// with no fold to take a request queues nothing.
+pub fn refold_queue_for_maintain(
+    mode: Mode,
+    config: &FoldTaskConfig,
+    queue: &Arc<RefoldQueue>,
+) -> Option<Arc<RefoldQueue>> {
+    (mode.runs_scheduled_fold() && config.enabled).then(|| Arc::clone(queue))
 }
 
 /// Everything one fold-loop attempt needs, bundled so the supervisor can clone
@@ -374,6 +585,7 @@ struct LoopContext {
     worker: Arc<WorkerSet>,
     live_set: watch::Receiver<Vec<Uuid>>,
     clock: Arc<dyn Clock>,
+    refold: Arc<RefoldQueue>,
     /// Called once at the top of every tick body, inside the `catch_unwind`
     /// boundary. A no-op in production; a test seam for driving a panic
     /// through the supervisor.
@@ -536,6 +748,7 @@ async fn run_loop(
                 ctx.worker.as_ref(),
                 &live,
                 ctx.clock.as_ref(),
+                ctx.refold.as_ref(),
             )
             .await
             {
@@ -555,6 +768,7 @@ async fn run_loop(
                         folded = report.folded.len(),
                         failed = report.failed.len(),
                         skipped_fresh = report.skipped_fresh.len(),
+                        refold_hours_reconciled = report.refold_hours_reconciled,
                         "catalog fold cycle complete"
                     );
                 }
@@ -595,6 +809,23 @@ async fn run_loop(
 /// over the discovered set, so applying them in either order selects the same
 /// intersection.
 ///
+/// Before folding any tenant the tick removes from `refold` every entry of
+/// this signal whose tenant it does not maintain this tick: the process does
+/// not own shard 0 of the pair under `live_set`, or the tenant is not among
+/// the discovered, lifecycle-filtered tenants it is about to fold. Each
+/// removal is logged at debug and not counted as dropped, so a pair whose
+/// ownership moved away, or a tenant deleted after a send, does not pin a
+/// queue slot. Each maintained tenant is then folded with at most the
+/// catalog's `frontier_reconcile_max_hours` of its oldest pending hours, read
+/// with [`RefoldQueue::peek`] and left queued (empty when none is pending),
+/// since the catalog reconciles no more than that per fold. Those hours are
+/// removed with [`RefoldQueue::remove_hours`] only after a fold that returned
+/// `Ok` and was not a no-op; a no-op fold, a fresh skip, or a failed fold
+/// leaves them for the next tick, and the hours past the cap stay queued for
+/// the pair's next fold that is not a no-op. A first fold and a rebuild are
+/// not no-ops and reconcile none of the request's hours, yet the hours passed
+/// to them are removed too: both derive every hour from the commit layout.
+///
 /// Public for the same reason [`crate::maintain::run_tick`] is: a test drives
 /// one deterministic cycle with an injected clock and an explicit live set,
 /// instead of racing the background loop's timer.
@@ -610,6 +841,7 @@ pub async fn run_tick(
     worker: &WorkerSet,
     live_set: &[Uuid],
     clock: &dyn Clock,
+    refold: &RefoldQueue,
 ) -> Result<FoldTickReport, MaintainError> {
     let discovered = ravel_maintain::discover_tenants(store).await?;
     let mut owned = Vec::new();
@@ -625,6 +857,24 @@ pub async fn run_tick(
         }
     }
     let (maintained, excluded) = restrict_by_lifecycle(store, &owned, fallback_allow).await;
+    let maintained_set: HashSet<TenantHash> = maintained.iter().copied().collect();
+    for (tenant, hours) in refold.remove_unless(signal, |tenant| maintained_set.contains(tenant)) {
+        if worker.owns_unit(live_set, &tenant, signal, FOLD_UNIT_SHARD) {
+            tracing::debug!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                hours,
+                "catalog fold: removing a re-fold request for a tenant this tick does not maintain"
+            );
+        } else {
+            tracing::debug!(
+                tenant = %tenant.to_hex(),
+                signal = ?signal,
+                hours,
+                "catalog fold: removing a re-fold request for a pair this process no longer folds"
+            );
+        }
+    }
     let mut report = FoldTickReport {
         discovered: discovered.len(),
         owned,
@@ -633,11 +883,16 @@ pub async fn run_tick(
         ..FoldTickReport::default()
     };
 
+    // The catalog reconciles at most this many requested hours per fold, oldest
+    // first, so the tick takes no more than that and the rest stay queued.
+    let refold_take =
+        usize::try_from(catalog.config().frontier_reconcile_max_hours).unwrap_or(usize::MAX);
     for tenant in maintained {
         // The deployment-default retention window for this tenant, resolved
         // per tick from the CLI-derived RetentionConfig (ADR-0078). The fold
         // overlays the durable TenantConfig.retention_ns on top of it.
         let default_retention_ns = retention.window_for(&tenant);
+        let refold_request = refold.peek(&tenant, signal, refold_take);
         match run_tenant_tick(
             catalog,
             store,
@@ -647,10 +902,22 @@ pub async fn run_tick(
             interval,
             default_retention_ns,
             clock,
+            &refold_request,
         )
         .await
         {
-            TenantTickOutcome::Folded => report.folded.push(tenant),
+            TenantTickOutcome::Folded {
+                no_op,
+                refold_hours_reconciled,
+            } => {
+                if no_op {
+                    report.no_op.push(tenant);
+                } else if !refold_request.is_empty() {
+                    refold.remove_hours(&tenant, signal, &refold_request);
+                }
+                report.folded.push(tenant);
+                report.refold_hours_reconciled += refold_hours_reconciled;
+            }
             TenantTickOutcome::Failed => report.failed.push(tenant),
             TenantTickOutcome::SkippedFresh => report.skipped_fresh.push(tenant),
         }
@@ -662,15 +929,18 @@ pub async fn run_tick(
 /// What one tenant's fold attempt did, so [`run_tick`] can report the exact
 /// partition instead of a bare count.
 enum TenantTickOutcome {
-    Folded,
+    Folded {
+        no_op: bool,
+        refold_hours_reconciled: usize,
+    },
     Failed,
     SkippedFresh,
 }
 
 /// One fold attempt for one tenant this process already owns: the HEAD
-/// freshness peek, then [`Catalog::fold`] if it's stale. Split out from
-/// [`run_tick`] so discovery, ownership and the per-tenant fold logic stay
-/// independently readable.
+/// freshness peek, then [`Catalog::fold_with_refold_request`] if it's stale.
+/// Split out from [`run_tick`] so discovery, ownership and the per-tenant fold
+/// logic stay independently readable.
 #[allow(clippy::too_many_arguments)]
 async fn run_tenant_tick(
     catalog: &Catalog,
@@ -681,19 +951,29 @@ async fn run_tenant_tick(
     interval: Duration,
     default_retention_ns: Option<i64>,
     clock: &dyn Clock,
+    refold_request: &RefoldRequest,
 ) -> TenantTickOutcome {
     let now_ns = clock.now_ns();
     if head_fresh_enough(store, tenant, signal, interval, now_ns).await {
         tracing::debug!(
             tenant = %tenant.to_hex(),
             signal = ?signal,
+            refold_hours_pending = refold_request.len(),
             "catalog fold: HEAD already fresh, skipping this tick"
         );
         return TenantTickOutcome::SkippedFresh;
     }
 
     match catalog
-        .fold(tenant, signal, folder_id, now_ns, &[], default_retention_ns)
+        .fold_with_refold_request(
+            tenant,
+            signal,
+            folder_id,
+            now_ns,
+            &[],
+            default_retention_ns,
+            refold_request,
+        )
         .await
     {
         Ok(report) => {
@@ -710,9 +990,14 @@ async fn run_tenant_tick(
                 list_requests = report.list_requests,
                 get_requests = report.get_requests,
                 put_requests = report.put_requests,
+                refold_hours_requested = refold_request.len(),
+                refold_hours_reconciled = report.refold_hours_reconciled,
                 "catalog fold complete"
             );
-            TenantTickOutcome::Folded
+            TenantTickOutcome::Folded {
+                no_op: report.no_op,
+                refold_hours_reconciled: report.refold_hours_reconciled,
+            }
         }
         Err(err) => {
             tracing::warn!(
@@ -889,6 +1174,7 @@ mod tests {
             worker,
             live_set,
             clock: Arc::new(FixedClock::new(NOW_NS)),
+            refold: Arc::new(RefoldQueue::default()),
             tick_hook,
         }
     }
@@ -1324,6 +1610,7 @@ mod tests {
             live_set,
             Arc::new(FixedClock::new(NOW_NS)),
             Arc::new(FoldLoopMetrics::default()),
+            Arc::new(RefoldQueue::default()),
         ) {
             Err(SpawnError::ZeroFoldInterval) => {}
             Ok(tasks) => {
@@ -1331,5 +1618,206 @@ mod tests {
                 panic!("a zero fold_interval must be refused at spawn");
             }
         }
+    }
+
+    fn refold_tenant(n: u8) -> TenantHash {
+        TenantHash([n; 16])
+    }
+
+    /// The hours pending for one pair, ascending, for exact comparison.
+    fn pending_hours(queue: &RefoldQueue, tenant: TenantHash, signal: Signal) -> Vec<u32> {
+        queue.peek(&tenant, signal, usize::MAX).hours().collect()
+    }
+
+    /// An empty hour set is not an entry: it neither occupies a slot nor
+    /// pushes a real request out.
+    #[test]
+    fn an_empty_refold_send_queues_nothing() {
+        let queue = RefoldQueue::new(1);
+        queue.send(refold_tenant(1), Signal::Metrics, BTreeSet::from([7]));
+        queue.send(refold_tenant(2), Signal::Metrics, BTreeSet::new());
+        assert_eq!(queue.pending_len(), 1);
+        assert_eq!(queue.dropped_requests(), 0);
+    }
+
+    /// Two sends for one pair merge into one entry carrying the union of their
+    /// hours, and the same tenant under another signal is a separate pair.
+    /// Past capacity the pair inserted earliest is evicted, exactly once, even
+    /// when a merge into it is the send just before: age is insertion age, and
+    /// a merge does not make a pair younger.
+    ///
+    /// Flip either line to watch it fail:
+    /// - in [`RefoldQueue::send`], replace the merge branch's `entry.hours.extend(hours)`
+    ///   with `entry.hours = hours` (overwrite): tenant 1's hours are `[3, 9]`;
+    /// - in the same merge branch, add `entry.seq = *next_seq; *next_seq += 1;`
+    ///   (a merge refreshes age): tenant 1 is evicted instead of tenant 0, so
+    ///   tenant 0's metrics hours are `[0, 1000]`, not empty.
+    #[test]
+    fn sends_for_one_pair_merge_and_do_not_use_a_second_slot() {
+        let queue = RefoldQueue::default();
+        queue.send(refold_tenant(1), Signal::Metrics, BTreeSet::from([5, 9]));
+        queue.send(refold_tenant(1), Signal::Logs, BTreeSet::from([11]));
+        queue.send(refold_tenant(1), Signal::Metrics, BTreeSet::from([9, 3]));
+        assert_eq!(queue.pending_len(), 2, "one entry per pair");
+        assert_eq!(
+            pending_hours(&queue, refold_tenant(1), Signal::Metrics),
+            vec![3, 5, 9]
+        );
+        assert_eq!(
+            pending_hours(&queue, refold_tenant(1), Signal::Logs),
+            vec![11]
+        );
+        assert_eq!(queue.dropped_requests(), 0);
+
+        let queue = RefoldQueue::new(DEFAULT_REFOLD_QUEUE_CAPACITY);
+        for n in 0..DEFAULT_REFOLD_QUEUE_CAPACITY {
+            let tenant = refold_tenant(u8::try_from(n).expect("fits"));
+            let hour = u32::try_from(n).expect("fits");
+            queue.send(tenant, Signal::Metrics, BTreeSet::from([hour]));
+        }
+        assert_eq!(queue.pending_len(), DEFAULT_REFOLD_QUEUE_CAPACITY);
+        assert_eq!(queue.dropped_requests(), 0);
+
+        // A merge into the oldest pair, then one new pair past capacity.
+        queue.send(refold_tenant(0), Signal::Metrics, BTreeSet::from([1000]));
+        assert_eq!(queue.dropped_requests(), 0, "a merge evicts nothing");
+        queue.send(refold_tenant(0), Signal::Logs, BTreeSet::from([2000]));
+
+        assert_eq!(queue.dropped_requests(), 1);
+        assert_eq!(queue.pending_len(), DEFAULT_REFOLD_QUEUE_CAPACITY);
+        assert_eq!(
+            pending_hours(&queue, refold_tenant(0), Signal::Metrics),
+            Vec::<u32>::new(),
+            "the earliest-inserted pair is evicted although it was merged into last"
+        );
+        assert_eq!(
+            pending_hours(&queue, refold_tenant(1), Signal::Metrics),
+            vec![1]
+        );
+        assert_eq!(
+            pending_hours(&queue, refold_tenant(255), Signal::Metrics),
+            vec![255]
+        );
+        assert_eq!(
+            pending_hours(&queue, refold_tenant(0), Signal::Logs),
+            vec![2000]
+        );
+    }
+
+    /// An entry holds at most [`REFOLD_ENTRY_HOURS_MAX`] hours and keeps the
+    /// smallest, on the insert path and on the merge path alike, and the cut
+    /// counts nothing as dropped.
+    ///
+    /// Flip to watch it fail: in `cap_entry_hours`, call `hours.pop_first()`
+    /// instead of `hours.pop_last()` (keep the largest). The first entry then
+    /// starts at hour 10, not 0.
+    #[test]
+    fn an_entry_keeps_only_its_oldest_hours_past_the_cap() {
+        let max = u32::try_from(REFOLD_ENTRY_HOURS_MAX).expect("fits");
+        let queue = RefoldQueue::default();
+
+        queue.send(refold_tenant(1), Signal::Metrics, (0..max + 10).collect());
+        assert_eq!(
+            pending_hours(&queue, refold_tenant(1), Signal::Metrics),
+            (0..max).collect::<Vec<u32>>()
+        );
+
+        queue.send(refold_tenant(2), Signal::Metrics, (10..max + 10).collect());
+        queue.send(refold_tenant(2), Signal::Metrics, (0..10).collect());
+        assert_eq!(
+            pending_hours(&queue, refold_tenant(2), Signal::Metrics),
+            (0..max).collect::<Vec<u32>>()
+        );
+        assert_eq!(queue.dropped_requests(), 0);
+        assert_eq!(queue.pending_len(), 2);
+    }
+
+    /// Removing the hours a fold was given leaves an hour sent while that fold
+    /// ran, and the entry goes only once its last hour does.
+    ///
+    /// Flip to watch it fail: in [`RefoldQueue::remove_hours`], replace the
+    /// per-hour loop and the emptiness check with
+    /// `pending.entries.remove(&key);` (remove the whole entry). Hour 12 is
+    /// then gone and `pending_len` is 0.
+    #[test]
+    fn hours_sent_during_a_fold_survive_its_removal() {
+        let queue = RefoldQueue::default();
+        let tenant = refold_tenant(1);
+        queue.send(tenant, Signal::Metrics, BTreeSet::from([5, 9]));
+
+        let taken = queue.peek(&tenant, Signal::Metrics, usize::MAX);
+        assert_eq!(taken.hours().collect::<Vec<u32>>(), vec![5, 9]);
+        assert_eq!(queue.pending_len(), 1, "a peek removes nothing");
+
+        queue.send(tenant, Signal::Metrics, BTreeSet::from([12]));
+        queue.remove_hours(&tenant, Signal::Metrics, &taken);
+        assert_eq!(queue.pending_len(), 1);
+        assert_eq!(pending_hours(&queue, tenant, Signal::Metrics), vec![12]);
+
+        queue.remove_hours(&tenant, Signal::Metrics, &RefoldRequest::from_hours([12]));
+        assert_eq!(queue.pending_len(), 0);
+        assert_eq!(queue.dropped_requests(), 0);
+    }
+
+    /// The maintain loop gets the queue only in a process whose scheduled fold
+    /// loops are spawned: a mode that runs the scheduled fold, with the fold
+    /// enabled. A maintain process with the fold disabled, and a mode with no
+    /// scheduled fold, get `None`.
+    ///
+    /// Flip to watch it fail: in [`refold_queue_for_maintain`], return
+    /// `Some(Arc::clone(queue))` unconditionally. The disabled maintain case
+    /// is then `Some`, not `None`.
+    #[test]
+    fn the_maintain_loop_gets_the_queue_only_where_the_fold_runs() {
+        let queue = Arc::new(RefoldQueue::default());
+        let fold = |enabled| FoldTaskConfig {
+            enabled,
+            fold_interval: DEFAULT_FOLD_INTERVAL,
+        };
+        let given = |mode, enabled| {
+            refold_queue_for_maintain(mode, &fold(enabled), &queue)
+                .map(|given| Arc::ptr_eq(&given, &queue))
+        };
+        assert_eq!(given(Mode::Maintain, true), Some(true));
+        assert_eq!(given(Mode::Maintain, false), None);
+        assert_eq!(given(Mode::Query, true), None);
+        assert_eq!(given(Mode::Query, false), None);
+    }
+
+    /// A limited peek returns the `limit` smallest hours and removes nothing;
+    /// removing them leaves exactly the larger ones.
+    ///
+    /// Flip to watch it fail: in [`RefoldQueue::peek`], drop the `.take(limit)`.
+    /// The peek then returns all five hours, not `[3, 5, 9]`.
+    #[test]
+    fn a_limited_peek_returns_the_smallest_hours() {
+        let queue = RefoldQueue::default();
+        let tenant = refold_tenant(1);
+        queue.send(tenant, Signal::Metrics, BTreeSet::from([20, 9, 3, 14, 5]));
+
+        let taken = queue.peek(&tenant, Signal::Metrics, 3);
+        assert_eq!(taken.hours().collect::<Vec<u32>>(), vec![3, 5, 9]);
+        assert_eq!(
+            pending_hours(&queue, tenant, Signal::Metrics),
+            vec![3, 5, 9, 14, 20],
+            "a peek removes nothing"
+        );
+        assert_eq!(
+            queue
+                .peek(&tenant, Signal::Metrics, 0)
+                .hours()
+                .collect::<Vec<u32>>(),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            queue
+                .peek(&tenant, Signal::Metrics, 6)
+                .hours()
+                .collect::<Vec<u32>>(),
+            vec![3, 5, 9, 14, 20]
+        );
+
+        queue.remove_hours(&tenant, Signal::Metrics, &taken);
+        assert_eq!(pending_hours(&queue, tenant, Signal::Metrics), vec![14, 20]);
     }
 }

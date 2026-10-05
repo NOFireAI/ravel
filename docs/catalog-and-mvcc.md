@@ -1180,23 +1180,65 @@ those hours, after the fixed window and the frontier band:
   `frontier_reconcile_max_hours`, the same runtime value the frontier band
   reads (default 168), so lowering that bound lowers both. The remainder needs
   no deferral bookkeeping in the snapshot: the requester re-derives its
-  blocked set on each pass, so a still-blocked hour is requested again.
+  blocked set on each pass, so a still-blocked hour is requested again. The
+  requester below passes a fold no more than that many hours and keeps the
+  rest queued.
 - **Same diff-and-apply, same CAS.** Requested buckets go through the
   identical `Catalog::classify_bucket` diff, mark their covering parts dirty
   the same way, and land in the same single HEAD CAS. A re-fold can
   therefore only ever make the snapshot agree with the commit layout.
 - **Skipped when redundant.** The pass sits inside the same reconcile block
-  as the other two, so a first fold and a rebuilt fold ignore a request
-  entirely: a rebuild already re-derives every hour from the commit layout.
+  as the other two, so a first fold, a rebuilt fold and a no-op fold (the
+  watermark did not advance) ignore a request entirely: a rebuild already
+  re-derives every hour from the commit layout, and a no-op fold returns
+  before the reconcile block. A request passed to a no-op fold reconciles
+  nothing; the requester below keeps it queued for the next fold of the pair
+  that is not a no-op. A first fold and a rebuild are not no-ops, so the
+  requester removes the hours it passed to one, which reconciles none of
+  them from the request because it derives every hour from the commit
+  layout.
 - **A hint, never a durability dependency.** An hour nobody requests
   degrades to the behaviour above (it keeps naming its pre-rewrite inputs
   until the frontier band reaches it), and the sweep's HEAD-reachability
   gate remains the delete blocker in every case.
 
-The maintain-tier wiring that turns the sweep's blocked hours into a
-`RefoldRequest` is a separate change; until it lands this entry point has no
-production caller and every fold behaves exactly as the two preceding
-sections describe.
+The requester is the maintain-role sweep of the process that folds the pair.
+Each maintain tick unions, per `(tenant, signal)`, the hours its zoned or
+full superseded-input sweeps held on `SnapshotBlock::Named`, and sends them
+to an in-process queue shared with the same process's fold loop. The queue
+keeps one entry per pair and merges a later send's hours into it. Each fold
+tick passes a tenant at most `frontier_reconcile_max_hours` of its oldest
+pending hours as its `RefoldRequest`, the most the fold reconciles, and
+removes those hours only after a fold that returned successfully and was not
+a no-op, so they survive a no-op fold, a tick that skips the tenant because
+its HEAD is fresh, and a failed fold, and reach the first successful fold of
+the pair that advances the watermark without waiting for another sweep. The
+hours past that cap stay queued for the pair's next fold that advances the
+watermark, so a request larger than the cap takes more than one such fold.
+Hours a sweep sends while a fold runs stay queued after it. The queue holds
+at most 256 pairs. An entry leaves it without a fold in three cases: the
+fold tick removes it, uncounted, when its process does not own shard 0 of
+the pair under the live set, or when the tick does not maintain the tenant
+(discovery no longer finds it, or the lifecycle restriction excludes it);
+and a new pair that finds the queue full evicts the pair inserted earliest,
+the one case counted, on `ravel_catalog_fold_refold_requests_dropped_total`.
+One entry keeps at most its 1024 smallest hours. Nothing about the queue is
+durable: an entry lost with the process on restart, an evicted pair, and
+hours cut past the per-entry cap are sent again by the next sweep pass that
+still finds the hold. The per-tick zoned sweep finds a hold only in its head
+and tail hours, the hours still sealing and those within a protection horizon
+after their retention expiry. Any other hold below the fold's reconcile
+window is found by the full sweep, which runs every `interior_reverify_ns`
+(`--maintain-interior-reverify`, 6 hours by default), so it can wait that
+long before it is queued. A process sends only for pairs whose
+shard 0 it owns, because only that process folds the pair. A hold found on
+another shard, swept by a process that does not own shard 0 of the pair,
+therefore reaches no fold, and those inputs stay held as described above
+until the frontier band reaches the hour. Only a process that runs the
+scheduled fold feeds the queue: in `--mode all` no maintain loop runs, and a
+maintain process whose scheduled fold is disabled (`--disable-fold`) hands
+its sweeps no queue, so neither queues anything and every fold request in
+`--mode all` is empty.
 
 ## Commit sequence (strict mode)
 

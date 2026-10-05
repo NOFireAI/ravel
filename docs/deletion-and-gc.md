@@ -276,11 +276,24 @@ frontier band is not left to wait indefinitely for one of those two passes to
 eventually cover its hour: `Catalog::fold_with_refold_request` (the
 ADR-0063 amendment) takes a caller-supplied set of ingest hours and re-lists
 them in the same fold call, closing the gap on demand instead of on a
-schedule. A request submitted to a fold call that turns out to be a
-**no-op** (nothing newly sealed beyond the previous watermark) reconciles
-**zero hours**, whatever hours it named: the targeted pass sits inside the
-same reconcile branch as the fixed window and the frontier band, and a
-no-op fold returns before that branch ever runs. `FoldReport`'s
+schedule. The maintain-role sweep supplies those hours: each tick hands the
+hours it held because the live HEAD still names their superseded inputs to
+the scheduled fold of the pair, through an in-process queue, when the
+process runs the scheduled fold and owns shard 0 of the pair, and therefore
+folds it
+(docs/catalog-and-mvcc.md, "Targeted re-fold requests", including the limit
+for a hold found on another shard). A request submitted to a fold call that
+turns out to be a **no-op** (nothing newly sealed beyond the previous
+watermark) reconciles **zero hours**, whatever hours it named: the targeted
+pass sits inside the same reconcile branch as the fixed window and the
+frontier band, and a no-op fold returns before that branch ever runs. The
+queue keeps such a request for the next fold of the pair that is not a
+no-op, so the hand-off does not wait for another sweep. Each fold takes at
+most `frontier_reconcile_max_hours` of the pair's oldest queued hours, the
+most it reconciles, and the rest stay queued for the pair's next fold that
+advances the watermark. A request lost with the process on restart, evicted
+from the full queue, or cut past an entry's 1024-hour cap is sent again by
+the next sweep pass that finds the hold. `FoldReport`'s
 `refold_hours_reconciled` field reports the count, and is `0` on that path,
 on a plain `Catalog::fold` call, and on any request naming hours the pass
 did not reach (docs/adrs/0064-selective-subject-erasure.md, the no-op

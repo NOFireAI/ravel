@@ -1599,6 +1599,7 @@ async fn a_held_group_over_an_absent_compaction_record_holds_no_unrelated_reques
         outcome,
         SupersededSweepOutcome {
             held_by_snapshot: 2,
+            blocked_named_hours: BTreeSet::from([b.ingest_hour_bucket]),
             held_request_ids: BTreeSet::from([request.to_string()]),
             ..SupersededSweepOutcome::default()
         }
