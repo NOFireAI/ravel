@@ -3586,6 +3586,10 @@ pub async fn start_with_heartbeat(
     // instance the maintenance context injects rather than a second clock of
     // its own (ADR-1693 decision 6).
     let maintain_clock: Arc<dyn ravel_maintain::Clock> = Arc::new(maintain::WallClock);
+    // The hours the maintain loop's sweeps find held by a named snapshot, handed
+    // to the next fold of the same pair (ADR-0063 section 4). Only the
+    // maintain loop feeds it, so in `Mode::All` it stays empty.
+    let refold_queue = Arc::new(fold::RefoldQueue::default());
 
     let fold_tasks = if config.mode.runs_scheduled_fold() {
         // Background class (ADR-0070): fold is deferred maintenance traffic.
@@ -3604,6 +3608,7 @@ pub async fn start_with_heartbeat(
             live_set_rx,
             maintain_clock.clone(),
             fold_loop_metrics.clone(),
+            refold_queue.clone(),
         )?
     } else {
         fold::FoldTasks::none()
@@ -3640,6 +3645,7 @@ pub async fn start_with_heartbeat(
             maintain_worker.clone(),
             live_set_tx.clone(),
             maintain_clock.clone(),
+            refold_queue.clone(),
         )
         .map_err(|e| match e {
             maintain::SpawnError::GcConfig(e) => {

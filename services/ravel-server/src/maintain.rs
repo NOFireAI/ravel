@@ -76,6 +76,7 @@
 //! ([`crate::maintain::seed_memo_from_snapshots`],
 //! [`crate::maintain::persist_memo_snapshot`]).
 
+use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -110,6 +111,7 @@ use uuid::Uuid;
 
 use crate::alert_state_memo::{MemoError, read_alert_state_memo};
 use crate::alerting::ALERT_SHARD;
+use crate::fold::{FOLD_UNIT_SHARD, RefoldQueue};
 use crate::tenant_discovery::{TenantDiscoveryMetrics, discover_and_restrict_by_lifecycle};
 
 /// Default `maintain_interval`: 5 minutes.
@@ -1359,6 +1361,10 @@ fn compactor_config_from_gc(
 /// A zero `heartbeat_interval` (on `config` or on `worker`) is refused the same
 /// way, with [`SpawnError::ZeroHeartbeatInterval`], and a zero `interval` with
 /// [`SpawnError::ZeroMaintainInterval`].
+///
+/// `refold` is the process's one [`RefoldQueue`], shared with
+/// [`crate::fold::spawn`]: each tenant tick sends the hours its sweeps found
+/// held by a named snapshot ([`run_tick_with_refold`]).
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1371,6 +1377,7 @@ pub fn spawn(
     worker: Arc<WorkerSet>,
     live_tx: Arc<watch::Sender<Vec<Uuid>>>,
     clock: Arc<dyn Clock>,
+    refold: Arc<RefoldQueue>,
 ) -> Result<MaintenanceTasks, SpawnError> {
     if !config.enabled {
         return Ok(MaintenanceTasks::none());
@@ -1431,6 +1438,7 @@ pub fn spawn(
         // tests inject a `FixedClock` here instead.
         clock,
         live_tx,
+        refold,
         // Production has no test seam, so the per-cycle hook is a no-op. Tests
         // pass a closure that panics to exercise the supervisor's restart path.
         cycle_hook: Arc::new(|| {}),
@@ -1472,6 +1480,9 @@ struct LoopContext {
     /// subscribes to the same channel so both loops partition against one
     /// membership view (ADR-1693 decision 1).
     live_tx: Arc<watch::Sender<Vec<Uuid>>>,
+    /// Where each tenant tick sends its sweeps' Named-blocked hours for the
+    /// scheduled fold.
+    refold: Arc<RefoldQueue>,
     /// Called once at the top of every cycle body, inside the `catch_unwind`
     /// boundary. A no-op in production; a test seam for driving a panic through
     /// the supervisor.
@@ -1607,6 +1618,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
         rng,
         clock,
         live_tx,
+        refold,
         cycle_hook,
     } = ctx;
     // One memo for the whole process, held across every tick and every
@@ -1835,6 +1847,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                         &worker,
                         &live_set,
                         &SharedClock(Arc::clone(&clock)),
+                        Some(refold.as_ref()),
                     )
                     .await;
 
@@ -1955,6 +1968,9 @@ pub async fn reap_query_worker_heartbeats(
 /// clock ([`run_tick_with_clock`]), so the running service passes the real
 /// [`WallClock`] and a test's clock governs every time-gated decision in the
 /// cycle.
+///
+/// `refold`, when given, is passed to every tenant tick
+/// ([`run_tick_with_refold`]); the running service always gives one.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
     store: &dyn ObjectStoreBackend,
@@ -1969,6 +1985,7 @@ pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
     worker: &WorkerSet,
     live_set: &[Uuid],
     clock: &C,
+    refold: Option<&RefoldQueue>,
 ) -> MaintainReport {
     // Before discovery, so a failed tenant listing does not also stall the
     // query-worker prefix.
@@ -2009,7 +2026,7 @@ pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
 
     let mut total = MaintainReport::default();
     for tenant in &outcome.maintained {
-        let report = run_tick_with_clock(
+        let report = run_tick_with_refold(
             clock,
             store,
             tenant,
@@ -2021,6 +2038,7 @@ pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
             ownership,
             worker,
             live_set,
+            refold,
         )
         .await;
         total.retired += report.retired;
@@ -2205,6 +2223,34 @@ fn orphans_present_total(report: &ravel_maintain::SweepReport) -> usize {
     report.orphans_deleted + report.orphans_withheld + report.orphans_quarantine_refused
 }
 
+/// Sends one `(tenant, signal)` pair's Named-blocked hours to `queue` when this
+/// process folds the pair, that is when it owns [`FOLD_UNIT_SHARD`] of it under
+/// `live_set` (see [`run_tick_with_refold`]). Otherwise sends nothing and
+/// counts nothing as dropped.
+fn send_refold_hours(
+    queue: &RefoldQueue,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    tenant: &TenantHash,
+    signal: Signal,
+    hours: BTreeSet<u32>,
+) {
+    if hours.is_empty() {
+        return;
+    }
+    if !worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD) {
+        tracing::debug!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            hours = hours.len(),
+            "maintenance: hours held by a named snapshot on a shard this process sweeps but \
+             whose pair it does not fold; no re-fold request sent"
+        );
+        return;
+    }
+    queue.send(*tenant, signal, hours);
+}
+
 /// [`run_tick`] with the clock injected instead of hardwired to [`WallClock`].
 /// The running service passes the loop's injected clock, which is
 /// [`WallClock`] there; tests pass a
@@ -2239,6 +2285,52 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
     ownership: &MaintenanceOwnershipMetrics,
     worker: &WorkerSet,
     live_set: &[Uuid],
+) -> MaintainReport {
+    run_tick_with_refold(
+        clock,
+        store,
+        tenant,
+        compactor,
+        retention,
+        shard_count,
+        memo,
+        safety,
+        ownership,
+        worker,
+        live_set,
+        None,
+    )
+    .await
+}
+
+/// [`run_tick_with_clock`], also handing the scheduled fold the hours this
+/// tick's superseded-input sweeps held because the live catalog HEAD still
+/// names their superseded inputs
+/// ([`ravel_maintain::SweepReport::blocked_named_hours`], ADR-0063 section 4).
+/// Both sweep paths feed it, the zoned per-tick pass and the full pass.
+///
+/// Per `(tenant, signal)`, the hours of every owned shard's sweep are unioned
+/// and sent to `refold` once, and only when this process owns
+/// [`FOLD_UNIT_SHARD`] of the pair under `live_set`, which is when its own fold
+/// loop folds the pair and drains the entry. A process that sweeps a shard of
+/// the pair but does not fold it sends nothing, since its queue is never
+/// drained for that pair: the hours it found held reach no fold from here, and
+/// their inputs stay held as they did before re-fold requests existed (issue
+/// #2606). `None` sends nothing at all.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
+    clock: &C,
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    compactor: &CompactorConfig,
+    retention: &RetentionConfig,
+    shard_count: u32,
+    memo: &mut MaintainMemo,
+    safety: &MaintenanceSafetyMetrics,
+    ownership: &MaintenanceOwnershipMetrics,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+    refold: Option<&RefoldQueue>,
 ) -> MaintainReport {
     // Advisory-claim participation (ADR-1029 decision 5). The supervisor is one
     // of the two actors the ADR names, so every per-unit tick below claims the
@@ -2482,6 +2574,7 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
         )
         .await;
 
+        let mut blocked_named_hours: BTreeSet<u32> = BTreeSet::new();
         for (shard, unit_memo, scan_result, sweep_result) in unit_results {
             memo.merge_unit(unit_memo);
             ownership.observe_unit_tick(
@@ -2597,6 +2690,7 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                         log_orphan_breaker_trip(tenant, signal, shard, &report);
                     }
                     safety.record_sweep(signal, &report);
+                    blocked_named_hours.extend(&report.blocked_named_hours);
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -2608,6 +2702,9 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
                     );
                 }
             }
+        }
+        if let Some(queue) = refold {
+            send_refold_hours(queue, worker, live_set, tenant, signal, blocked_named_hours);
         }
 
         // Idempotency markers exist only for logs and spans (ADR-0051 SS5);
@@ -5187,6 +5284,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             &WallClock,
+            None,
         )
         .await;
         assert!(
@@ -5508,6 +5606,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             &clock,
+            None,
         )
         .await;
 
@@ -7369,6 +7468,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             &WallClock,
+            None,
         )
         .await;
 
@@ -7416,6 +7516,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             &WallClock,
+            None,
         )
         .await;
 
@@ -7478,6 +7579,7 @@ mod tests {
             &worker,
             &worker.solo_live_set(),
             &WallClock,
+            None,
         )
         .await;
 
@@ -7549,6 +7651,7 @@ mod tests {
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
+                refold: Arc::new(RefoldQueue::default()),
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
@@ -9205,6 +9308,7 @@ mod tests {
                 &worker,
                 &live_solo,
                 &WallClock,
+                None,
             )
             .await;
         }
@@ -9230,6 +9334,7 @@ mod tests {
             &worker,
             &live_ab,
             &WallClock,
+            None,
         )
         .await;
 
@@ -9332,6 +9437,7 @@ mod tests {
                 &worker,
                 &live_solo,
                 &WallClock,
+                None,
             )
             .await;
         }
@@ -9368,6 +9474,7 @@ mod tests {
             &worker,
             &live_solo,
             &WallClock,
+            None,
         )
         .await;
         assert_eq!(
@@ -9410,6 +9517,7 @@ mod tests {
             &worker,
             &live_solo,
             &WallClock,
+            None,
         )
         .await;
         assert!(
@@ -9451,6 +9559,7 @@ mod tests {
             &worker,
             &live_ab,
             &WallClock,
+            None,
         )
         .await;
         assert_eq!(
@@ -9603,6 +9712,7 @@ mod tests {
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
+                refold: Arc::new(RefoldQueue::default()),
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
@@ -9693,6 +9803,7 @@ mod tests {
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
+                refold: Arc::new(RefoldQueue::default()),
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
@@ -9777,6 +9888,7 @@ mod tests {
                 clock: Arc::new(clock.clone()),
                 live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
                 worker,
+                refold: Arc::new(RefoldQueue::default()),
                 cycle_hook: Arc::new(|| {}),
             }
         };
@@ -9881,6 +9993,7 @@ mod tests {
             clock: Arc::new(clock),
             live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
             worker,
+            refold: Arc::new(RefoldQueue::default()),
             cycle_hook,
         };
         (ctx, ownership, metrics)
@@ -10181,6 +10294,7 @@ mod tests {
             Arc::clone(&worker),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
+            Arc::new(RefoldQueue::default()),
         ) {
             Err(SpawnError::GcConfig(ravel_maintain::GcConfigError::MaintainSkewUncovered {
                 clock_skew_allowance_ns,
@@ -10216,6 +10330,7 @@ mod tests {
             Arc::clone(&worker),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
+            Arc::new(RefoldQueue::default()),
         )
         .expect("a horizon that covers the running sweeper's skew spawns normally");
         tasks.shutdown().await;
@@ -10259,6 +10374,7 @@ mod tests {
                 Arc::clone(&worker),
                 Arc::new(watch::channel(worker.solo_live_set()).0),
                 Arc::new(WallClock),
+                Arc::new(RefoldQueue::default()),
             )
         };
 
@@ -10338,6 +10454,7 @@ mod tests {
                 Arc::clone(&worker),
                 Arc::new(watch::channel(worker.solo_live_set()).0),
                 Arc::new(WallClock),
+                Arc::new(RefoldQueue::default()),
             ) {
                 Err(SpawnError::ZeroHeartbeatInterval) => {}
                 Err(other) => panic!("{case}: expected ZeroHeartbeatInterval, got: {other}"),
@@ -10382,6 +10499,7 @@ mod tests {
             Arc::clone(&worker),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
+            Arc::new(RefoldQueue::default()),
         ) {
             Err(SpawnError::ZeroMaintainInterval) => {}
             Err(other) => panic!("expected ZeroMaintainInterval, got: {other}"),
@@ -12141,6 +12259,7 @@ mod query_worker_reap_tests {
             &worker,
             &worker.solo_live_set(),
             &ravel_maintain::FixedClock::new(NOW_NS),
+            None,
         )
         .await;
 

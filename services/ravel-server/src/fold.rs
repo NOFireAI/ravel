@@ -347,6 +347,9 @@ pub struct FoldTickReport {
     /// Maintained tenants skipped because their HEAD was younger than the fold
     /// interval, the cheap duplicate-work peek.
     pub skipped_fresh: Vec<TenantHash>,
+    /// Ingest hours the folds of this tick re-listed from a [`RefoldQueue`]
+    /// request, summed over `folded` ([`ravel_catalog::FoldReport::refold_hours_reconciled`]).
+    pub refold_hours_reconciled: usize,
 }
 
 /// Spawns one fold loop per signal in [`FOLD_SIGNALS`], not one per tenant:
@@ -400,6 +403,11 @@ pub struct FoldTickReport {
 /// `/metrics`. Each signal's loop runs under [`run_supervisor`], which catches
 /// a panic in the tick body, counts a restart there, and respawns the loop
 /// after a bounded backoff.
+///
+/// `refold` is the process's one [`RefoldQueue`], fed by the maintain loop's
+/// sweeps ([`crate::maintain::spawn`]). Each signal's tick drains that signal's
+/// entries and folds each owned tenant with its request. In `Mode::All` no
+/// maintain loop runs, nothing feeds the queue, and every request is empty.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     catalog: Arc<Catalog>,
@@ -411,6 +419,7 @@ pub fn spawn(
     live_set: watch::Receiver<Vec<Uuid>>,
     clock: Arc<dyn Clock>,
     loop_metrics: Arc<FoldLoopMetrics>,
+    refold: Arc<RefoldQueue>,
 ) -> Result<FoldTasks, SpawnError> {
     config.check_spawnable()?;
     if !config.enabled {
@@ -447,6 +456,7 @@ pub fn spawn(
             worker: Arc::clone(&worker),
             live_set: live_set.clone(),
             clock: Arc::clone(&clock),
+            refold: Arc::clone(&refold),
             // Production has no test seam, so the per-tick hook is a no-op.
             // Tests pass a closure that panics to exercise the supervisor.
             tick_hook: Arc::new(|| {}),
@@ -482,6 +492,7 @@ struct LoopContext {
     worker: Arc<WorkerSet>,
     live_set: watch::Receiver<Vec<Uuid>>,
     clock: Arc<dyn Clock>,
+    refold: Arc<RefoldQueue>,
     /// Called once at the top of every tick body, inside the `catch_unwind`
     /// boundary. A no-op in production; a test seam for driving a panic
     /// through the supervisor.
@@ -644,6 +655,7 @@ async fn run_loop(
                 ctx.worker.as_ref(),
                 &live,
                 ctx.clock.as_ref(),
+                ctx.refold.as_ref(),
             )
             .await
             {
@@ -663,6 +675,7 @@ async fn run_loop(
                         folded = report.folded.len(),
                         failed = report.failed.len(),
                         skipped_fresh = report.skipped_fresh.len(),
+                        refold_hours_reconciled = report.refold_hours_reconciled,
                         "catalog fold cycle complete"
                     );
                 }
@@ -703,6 +716,12 @@ async fn run_loop(
 /// over the discovered set, so applying them in either order selects the same
 /// intersection.
 ///
+/// After discovery succeeds the tick drains `refold` of this signal's entries
+/// once and folds each maintained tenant with its own request (empty when none
+/// was queued). A drained request for a tenant this tick does not fold (not
+/// owned here, excluded, or skipped as fresh) is discarded and logged at debug:
+/// the sweep that found the hour held sends it again on its next pass.
+///
 /// Public for the same reason [`crate::maintain::run_tick`] is: a test drives
 /// one deterministic cycle with an injected clock and an explicit live set,
 /// instead of racing the background loop's timer.
@@ -718,8 +737,10 @@ pub async fn run_tick(
     worker: &WorkerSet,
     live_set: &[Uuid],
     clock: &dyn Clock,
+    refold: &RefoldQueue,
 ) -> Result<FoldTickReport, MaintainError> {
     let discovered = ravel_maintain::discover_tenants(store).await?;
+    let mut refold_requests = refold.take_for_signal(signal);
     let mut owned = Vec::new();
     for tenant in &discovered {
         if worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD) {
@@ -746,6 +767,7 @@ pub async fn run_tick(
         // per tick from the CLI-derived RetentionConfig (ADR-0078). The fold
         // overlays the durable TenantConfig.retention_ns on top of it.
         let default_retention_ns = retention.window_for(&tenant);
+        let refold_request = refold_requests.remove(&tenant).unwrap_or_default();
         match run_tenant_tick(
             catalog,
             store,
@@ -755,13 +777,29 @@ pub async fn run_tick(
             interval,
             default_retention_ns,
             clock,
+            &refold_request,
         )
         .await
         {
-            TenantTickOutcome::Folded => report.folded.push(tenant),
+            TenantTickOutcome::Folded {
+                refold_hours_reconciled,
+            } => {
+                report.folded.push(tenant);
+                report.refold_hours_reconciled += refold_hours_reconciled;
+            }
             TenantTickOutcome::Failed => report.failed.push(tenant),
             TenantTickOutcome::SkippedFresh => report.skipped_fresh.push(tenant),
         }
+    }
+
+    for (tenant, request) in refold_requests {
+        tracing::debug!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            hours = request.len(),
+            "catalog fold: dropping a re-fold request for a tenant this tick does not fold; \
+             the sweep resubmits it"
+        );
     }
 
     Ok(report)
@@ -770,15 +808,15 @@ pub async fn run_tick(
 /// What one tenant's fold attempt did, so [`run_tick`] can report the exact
 /// partition instead of a bare count.
 enum TenantTickOutcome {
-    Folded,
+    Folded { refold_hours_reconciled: usize },
     Failed,
     SkippedFresh,
 }
 
 /// One fold attempt for one tenant this process already owns: the HEAD
-/// freshness peek, then [`Catalog::fold`] if it's stale. Split out from
-/// [`run_tick`] so discovery, ownership and the per-tenant fold logic stay
-/// independently readable.
+/// freshness peek, then [`Catalog::fold_with_refold_request`] if it's stale.
+/// Split out from [`run_tick`] so discovery, ownership and the per-tenant fold
+/// logic stay independently readable.
 #[allow(clippy::too_many_arguments)]
 async fn run_tenant_tick(
     catalog: &Catalog,
@@ -789,19 +827,29 @@ async fn run_tenant_tick(
     interval: Duration,
     default_retention_ns: Option<i64>,
     clock: &dyn Clock,
+    refold_request: &RefoldRequest,
 ) -> TenantTickOutcome {
     let now_ns = clock.now_ns();
     if head_fresh_enough(store, tenant, signal, interval, now_ns).await {
         tracing::debug!(
             tenant = %tenant.to_hex(),
             signal = ?signal,
+            refold_hours_dropped = refold_request.len(),
             "catalog fold: HEAD already fresh, skipping this tick"
         );
         return TenantTickOutcome::SkippedFresh;
     }
 
     match catalog
-        .fold(tenant, signal, folder_id, now_ns, &[], default_retention_ns)
+        .fold_with_refold_request(
+            tenant,
+            signal,
+            folder_id,
+            now_ns,
+            &[],
+            default_retention_ns,
+            refold_request,
+        )
         .await
     {
         Ok(report) => {
@@ -818,9 +866,13 @@ async fn run_tenant_tick(
                 list_requests = report.list_requests,
                 get_requests = report.get_requests,
                 put_requests = report.put_requests,
+                refold_hours_requested = refold_request.len(),
+                refold_hours_reconciled = report.refold_hours_reconciled,
                 "catalog fold complete"
             );
-            TenantTickOutcome::Folded
+            TenantTickOutcome::Folded {
+                refold_hours_reconciled: report.refold_hours_reconciled,
+            }
         }
         Err(err) => {
             tracing::warn!(
@@ -997,6 +1049,7 @@ mod tests {
             worker,
             live_set,
             clock: Arc::new(FixedClock::new(NOW_NS)),
+            refold: Arc::new(RefoldQueue::default()),
             tick_hook,
         }
     }
@@ -1432,6 +1485,7 @@ mod tests {
             live_set,
             Arc::new(FixedClock::new(NOW_NS)),
             Arc::new(FoldLoopMetrics::default()),
+            Arc::new(RefoldQueue::default()),
         ) {
             Err(SpawnError::ZeroFoldInterval) => {}
             Ok(tasks) => {
