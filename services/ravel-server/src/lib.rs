@@ -852,6 +852,19 @@ impl ServerConfig {
     }
 }
 
+/// The [`fold::RefoldQueue`] the maintain loop sends its held hours to: the
+/// process's queue when [`start`] spawns the scheduled fold that takes from
+/// it (the condition [`fold::spawn`] applies: a mode that
+/// [`Mode::runs_scheduled_fold`] and an enabled fold), and `None` otherwise,
+/// so a process whose fold is disabled queues nothing that no fold would take.
+fn refold_queue_for_maintain(
+    mode: Mode,
+    fold_config: &FoldTaskConfig,
+    queue: &Arc<fold::RefoldQueue>,
+) -> Option<Arc<fold::RefoldQueue>> {
+    (mode.runs_scheduled_fold() && fold_config.enabled).then(|| Arc::clone(queue))
+}
+
 /// Default `--shutdown-timeout`: the ceiling on the graceful-shutdown drain.
 /// Kept below [`K8S_DEFAULT_GRACE_PERIOD`] so the process finishes draining and
 /// exits on its own before Kubernetes escalates SIGTERM to SIGKILL, leaving
@@ -2954,7 +2967,8 @@ pub async fn start_with_heartbeat(
     // The hours the maintain loop's sweeps find held by a named snapshot, handed
     // to the next fold of the same pair (ADR-0063 section 4). Built in every
     // mode so `/metrics` can read its eviction count. Only the maintain loop
-    // feeds it, so outside `Mode::Maintain` it stays empty.
+    // feeds it, and only when this process also runs the scheduled fold, so
+    // outside `Mode::Maintain` and under `--disable-fold` it stays empty.
     let refold_queue = Arc::new(fold::RefoldQueue::default());
 
     // Mounted unconditionally: the store and catalog above are built in every
@@ -3647,7 +3661,7 @@ pub async fn start_with_heartbeat(
             maintain_worker.clone(),
             live_set_tx.clone(),
             maintain_clock.clone(),
-            refold_queue.clone(),
+            refold_queue_for_maintain(config.mode, &config.fold, &refold_queue),
         )
         .map_err(|e| match e {
             maintain::SpawnError::GcConfig(e) => {
@@ -6024,6 +6038,53 @@ mod loop_interval_startup_tests {
                 is_zero_interval_refusal(which, &err),
                 "{which:?}: expected the typed zero-interval refusal, got: {err:#}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod refold_queue_for_maintain_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// The maintain loop gets the process's queue exactly when the scheduled
+    /// fold that takes from it runs in this process: a mode that runs the
+    /// scheduled fold, with the fold enabled. Under `--disable-fold`, and in a
+    /// mode with no scheduled fold, it gets none.
+    ///
+    /// Flip to watch it fail: make `refold_queue_for_maintain` return
+    /// `Some(Arc::clone(queue))` unconditionally. The `Maintain` case with the
+    /// fold disabled then gets the queue.
+    #[test]
+    fn the_maintain_loop_gets_the_queue_only_when_the_fold_runs() {
+        let queue = Arc::new(fold::RefoldQueue::default());
+        let enabled = FoldTaskConfig::default();
+        let disabled = FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        };
+        let cases = [
+            (Mode::Maintain, enabled, true),
+            (Mode::Maintain, disabled, false),
+            (Mode::Query, enabled, false),
+            (Mode::Query, disabled, false),
+            (Mode::All, enabled, true),
+            (Mode::All, disabled, false),
+            (Mode::Gateway, enabled, false),
+            (Mode::Gateway, disabled, false),
+        ];
+        for (mode, fold_config, expect_queue) in cases {
+            let got = refold_queue_for_maintain(mode, &fold_config, &queue);
+            assert_eq!(
+                got.is_some(),
+                expect_queue,
+                "{mode:?}, fold enabled {}",
+                fold_config.enabled
+            );
+            if let Some(got) = got {
+                assert!(Arc::ptr_eq(&got, &queue), "the process's one queue");
+            }
         }
     }
 }
