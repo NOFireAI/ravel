@@ -3011,3 +3011,110 @@ async fn the_combined_pass_reports_every_superseded_hold() {
         );
     }
 }
+
+// --- The Named hours rule 2 hands to the fold ---------------------------------
+
+/// An hour inside the fold's default 26-hour reconcile window, so the second
+/// fold re-lists it and names its rewrite output, unlike [`OLD_HOUR`].
+const RECONCILED_HOUR: u32 = HOUR - 5;
+
+/// [`SweepReport::blocked_named_hours`] carries exactly the hours held because
+/// the HEAD snapshot still names their superseded inputs, on both combined
+/// passes. One fixture holds two hours for two reasons in the same pass:
+/// [`OLD_HOUR`] is outside the fold's reconcile window, so HEAD still names its
+/// pre-rewrite inputs (Named); [`RECONCILED_HOUR`] is inside it, so HEAD names
+/// its rewrite output and its inputs wait out the pinned-query window
+/// (PinnedWindow, under the default window this test keeps). Only the Named
+/// hour is reported.
+///
+/// Flip-line proof: in `sweep_superseded_impl`, add
+/// `outcome.blocked_named_hours.insert(group.ingest_hour_bucket);` to the
+/// `SnapshotBlock::PinnedWindow` arm: the set becomes
+/// `{OLD_HOUR, RECONCILED_HOUR}` and the first assertion fails.
+#[tokio::test]
+async fn sweep_reports_only_the_hours_a_named_snapshot_blocked() {
+    for zoned in [false, true] {
+        let mem = Arc::new(MemoryStore::new());
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        seed_two_hours(mem.as_ref()).await;
+        let reconciled_ns = i64::from(RECONCILED_HOUR) * NS_PER_HOUR;
+        seed_input(
+            mem.as_ref(),
+            &InputSpec::new_at(
+                RECONCILED_HOUR,
+                Uuid::from_u128(0xC1),
+                1,
+                1,
+                vec![
+                    raw_series("keep", &[("k", "d")], &[(reconciled_ns + 1_000, 4.0)]),
+                    raw_series("victim", &[("k", "e")], &[(reconciled_ns + 2_000, 6.0)]),
+                ],
+            ),
+        )
+        .await;
+        fold_head(&mem, created, 1, None).await;
+        run_rewrite(mem.as_ref(), &clock).await;
+        run_rewrite_in(
+            mem.as_ref(),
+            &clock,
+            &bucket_at(RECONCILED_HOUR),
+            &[pending_request()],
+        )
+        .await;
+        fold_head(&mem, created + 3 * NS_PER_HOUR, 2, None).await;
+        assert_eq!(
+            head_named_data_keys(mem.as_ref(), RECONCILED_HOUR)
+                .await
+                .len(),
+            1,
+            "the second fold reconciled the in-window hour to its rewrite output"
+        );
+
+        clock.set(past_horizon(created));
+        // The default pinned-query window, unlike `cfg()`: the reconciled
+        // hour's inputs are unnamed, and their marker is written this pass.
+        let config = CompactorConfig::default();
+        let b = old_bucket();
+        let report = if zoned {
+            sweep_shard_zoned(
+                mem.as_ref(),
+                &clock,
+                &config,
+                &NoLeases,
+                &b.tenant_hash,
+                b.signal,
+                b.shard,
+                &[RECONCILED_HOUR, OLD_HOUR],
+            )
+            .await
+        } else {
+            sweep_shard(
+                mem.as_ref(),
+                &clock,
+                &config,
+                &NoLeases,
+                &b.tenant_hash,
+                b.signal,
+                b.shard,
+            )
+            .await
+        }
+        .expect("a held pass does not fail");
+
+        assert_eq!(
+            report.blocked_named_hours,
+            BTreeSet::from([OLD_HOUR]),
+            "only the hour HEAD still names is reported (zoned: {zoned}): {report:?}"
+        );
+        assert_eq!(
+            (
+                report.superseded_held_by_snapshot,
+                report.superseded_held_by_pinned_window,
+                report.superseded_held_by_unreadable_head,
+            ),
+            (4, 2, 0),
+            "both hours are held this pass, for different reasons (zoned: {zoned})"
+        );
+    }
+}
