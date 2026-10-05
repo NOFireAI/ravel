@@ -2312,9 +2312,9 @@ pub async fn run_tick_with_clock<C: Clock + Clone + 'static>(
 /// Per `(tenant, signal)`, the hours of every owned shard's sweep are unioned
 /// and sent to `refold` once, and only when this process owns
 /// [`FOLD_UNIT_SHARD`] of the pair under `live_set`, which is when its own fold
-/// loop folds the pair and drains the entry. A process that sweeps a shard of
-/// the pair but does not fold it sends nothing, since its queue is never
-/// drained for that pair: the hours it found held reach no fold from here, and
+/// loop folds the pair and takes the entry. A process that sweeps a shard of
+/// the pair but does not fold it sends nothing, since no fold in this process
+/// takes an entry for that pair: the hours it found held reach no fold from here, and
 /// their inputs stay held as they did before re-fold requests existed (issue
 /// #2606). `None` sends nothing at all.
 #[allow(clippy::too_many_arguments)]

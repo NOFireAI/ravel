@@ -411,6 +411,9 @@ pub struct FoldTickReport {
     pub excluded: usize,
     /// Maintained tenants whose fold ran and returned a report.
     pub folded: Vec<TenantHash>,
+    /// The `folded` tenants whose fold was a no-op (the watermark did not
+    /// advance), so their pending re-fold hours stayed queued.
+    pub no_op: Vec<TenantHash>,
     /// Maintained tenants whose fold returned an error. Logged and retried
     /// next tick; never fails a query.
     pub failed: Vec<TenantHash>,
@@ -475,8 +478,8 @@ pub struct FoldTickReport {
 /// after a bounded backoff.
 ///
 /// `refold` is the process's one [`RefoldQueue`], fed by the maintain loop's
-/// sweeps ([`crate::maintain::spawn`]). Each signal's tick drains that signal's
-/// entries and folds each owned tenant with its request. In `Mode::All` no
+/// sweeps ([`crate::maintain::spawn`]). Each signal's tick folds each owned
+/// tenant with that pair's pending hours ([`run_tick`]). In `Mode::All` no
 /// maintain loop runs, nothing feeds the queue, and every request is empty.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
@@ -786,11 +789,14 @@ async fn run_loop(
 /// over the discovered set, so applying them in either order selects the same
 /// intersection.
 ///
-/// After discovery succeeds the tick drains `refold` of this signal's entries
-/// once and folds each maintained tenant with its own request (empty when none
-/// was queued). A drained request for a tenant this tick does not fold (not
-/// owned here, excluded, or skipped as fresh) is discarded and logged at debug:
-/// the sweep that found the hour held sends it again on its next pass.
+/// Before discovery the tick removes from `refold` every entry of this signal
+/// whose pair this process does not own under `live_set`, logged at debug and
+/// not counted as dropped, so a pair whose ownership moved away does not pin a
+/// queue slot. Each maintained tenant is then folded with its pending hours,
+/// read with [`RefoldQueue::peek`] and left queued (empty when none is
+/// pending). They are removed with [`RefoldQueue::remove_hours`] only after a
+/// fold that returned `Ok` and was not a no-op; a no-op fold, a fresh skip, or
+/// a failed fold leaves them for the next tick.
 ///
 /// Public for the same reason [`crate::maintain::run_tick`] is: a test drives
 /// one deterministic cycle with an injected clock and an explicit live set,
@@ -809,6 +815,16 @@ pub async fn run_tick(
     clock: &dyn Clock,
     refold: &RefoldQueue,
 ) -> Result<FoldTickReport, MaintainError> {
+    for (tenant, hours) in refold.remove_unless(signal, |tenant| {
+        worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD)
+    }) {
+        tracing::debug!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            hours,
+            "catalog fold: removing a re-fold request for a pair this process no longer folds"
+        );
+    }
     let discovered = ravel_maintain::discover_tenants(store).await?;
     let mut owned = Vec::new();
     for tenant in &discovered {
@@ -837,7 +853,6 @@ pub async fn run_tick(
         // overlays the durable TenantConfig.retention_ns on top of it.
         let default_retention_ns = retention.window_for(&tenant);
         let refold_request = refold.peek(&tenant, signal);
-        refold.remove_hours(&tenant, signal, &refold_request);
         match run_tenant_tick(
             catalog,
             store,
@@ -852,8 +867,14 @@ pub async fn run_tick(
         .await
         {
             TenantTickOutcome::Folded {
+                no_op,
                 refold_hours_reconciled,
             } => {
+                if no_op {
+                    report.no_op.push(tenant);
+                } else if !refold_request.is_empty() {
+                    refold.remove_hours(&tenant, signal, &refold_request);
+                }
                 report.folded.push(tenant);
                 report.refold_hours_reconciled += refold_hours_reconciled;
             }
@@ -868,7 +889,10 @@ pub async fn run_tick(
 /// What one tenant's fold attempt did, so [`run_tick`] can report the exact
 /// partition instead of a bare count.
 enum TenantTickOutcome {
-    Folded { refold_hours_reconciled: usize },
+    Folded {
+        no_op: bool,
+        refold_hours_reconciled: usize,
+    },
     Failed,
     SkippedFresh,
 }
@@ -894,7 +918,7 @@ async fn run_tenant_tick(
         tracing::debug!(
             tenant = %tenant.to_hex(),
             signal = ?signal,
-            refold_hours_dropped = refold_request.len(),
+            refold_hours_pending = refold_request.len(),
             "catalog fold: HEAD already fresh, skipping this tick"
         );
         return TenantTickOutcome::SkippedFresh;
@@ -931,6 +955,7 @@ async fn run_tenant_tick(
                 "catalog fold complete"
             );
             TenantTickOutcome::Folded {
+                no_op: report.no_op,
                 refold_hours_reconciled: report.refold_hours_reconciled,
             }
         }

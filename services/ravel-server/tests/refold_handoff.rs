@@ -12,6 +12,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +30,9 @@ use ravel_maintain::worker_set::{DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURREN
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, RetentionConfig, WorkerSet,
     compact_bucket,
+};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutOptions};
@@ -67,13 +71,9 @@ fn seal_now(hour: u32) -> i64 {
     (i64::from(hour) + 1) * NS_PER_HOUR + MARGIN_NS
 }
 
-/// The default compactor, with the full-sweep cadence at one hour so a tick an
-/// hour after the previous full sweep is itself a full sweep.
+/// The default compactor, full-sweep cadence included.
 fn compactor_config() -> CompactorConfig {
-    CompactorConfig {
-        interior_reverify_ns: NS_PER_HOUR,
-        ..CompactorConfig::default()
-    }
+    CompactorConfig::default()
 }
 
 /// Publish one real L0 metrics segment and its commit record into
@@ -138,9 +138,12 @@ async fn publish_l0(store: &MemoryStore, tenant: &TenantId, shard: u32, hour: u3
 }
 
 /// One maintain-role process over the shared store: its catalog, its worker
-/// identity, and the memo its maintain loop keeps across ticks.
+/// identity, and the memo its maintain loop keeps across ticks. `fold_store`
+/// is what the catalog and the fold tick read and write; `store` is the
+/// memory store underneath it, for seeding and inspection.
 struct Process {
     store: Arc<MemoryStore>,
+    fold_store: Arc<dyn ObjectStoreBackend>,
     catalog: Catalog,
     worker: WorkerSet,
     memo: MaintainMemo,
@@ -155,9 +158,18 @@ impl Process {
         process_id: Uuid,
         shard_count: u32,
     ) -> Self {
-        let store_dyn: Arc<dyn ObjectStoreBackend> = store.clone();
+        Self::with_fold_store(store, store.clone(), tenant, process_id, shard_count)
+    }
+
+    fn with_fold_store(
+        store: &Arc<MemoryStore>,
+        fold_store: Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantId,
+        process_id: Uuid,
+        shard_count: u32,
+    ) -> Self {
         let catalog = Catalog::new(
-            store_dyn,
+            fold_store.clone(),
             CatalogConfig {
                 shard_count,
                 ..CatalogConfig::default()
@@ -173,6 +185,7 @@ impl Process {
         .with_process_id(process_id);
         Process {
             store: store.clone(),
+            fold_store,
             catalog,
             worker,
             memo: MaintainMemo::new(compactor_config().interior_reverify_ns),
@@ -209,7 +222,7 @@ impl Process {
         report
     }
 
-    /// One scheduled metrics fold tick at `now_ns`, draining `refold`.
+    /// One scheduled metrics fold tick at `now_ns`, taking from `refold`.
     async fn fold_tick(
         &self,
         now_ns: i64,
@@ -218,7 +231,7 @@ impl Process {
     ) -> FoldTickReport {
         fold::run_tick(
             &self.catalog,
-            self.store.as_ref(),
+            self.fold_store.as_ref(),
             Signal::Metrics,
             None,
             self.worker.process_id(),
@@ -341,7 +354,7 @@ async fn late_compaction_record_is_refolded_after_one_sweep_and_one_fold() {
     let report = process.fold_tick(now, &solo, &queue).await;
     assert_eq!(report.folded, vec![tenant.hash()]);
     assert_eq!(report.refold_hours_reconciled, 1, "{report:?}");
-    assert_eq!(queue.pending_len(), 0, "the fold drained the entry");
+    assert_eq!(queue.pending_len(), 0, "the fold took the entry");
     assert_eq!(
         head_levels(&store, &tenant, OLD_HOUR).await,
         (0, parts),
@@ -349,17 +362,44 @@ async fn late_compaction_record_is_refolded_after_one_sweep_and_one_fold() {
     );
 }
 
-/// A tenant that stopped ingesting is not stranded by the no-op carve-out. Its
-/// hourly fold publishes a HEAD; ten minutes later the HEAD is stale enough to
-/// fold again but no hour has newly sealed, so the request a maintain tick
-/// queued in between reaches a no-op fold and reconciles nothing, and the
-/// fold tick drains it all the same. An hour later the next full sweep sends
-/// the still-held hour again, and the fold that follows, now past a seal,
-/// reconciles it.
+const NS_PER_MINUTE: i64 = 60_000_000_000;
+
+/// The hours `queue` holds for the tenant's metrics pair, ascending.
+fn pending_hours(queue: &RefoldQueue, tenant: &TenantId) -> Vec<u32> {
+    queue
+        .peek(&tenant.hash(), Signal::Metrics)
+        .hours()
+        .collect()
+}
+
+/// The first instant at which the seeded record is past its protection horizon
+/// and a fold publishes a HEAD that advances the watermark: a quiet tenant's
+/// hourly fold, with the queue still empty.
+async fn hourly_fold(process: &Process, live_set: &[Uuid], queue: &RefoldQueue) -> i64 {
+    let hourly = seal_now(FIRST_WATERMARK_HOUR + 30);
+    assert!(
+        hourly >= past_horizon_ns(),
+        "the record is past its horizon"
+    );
+    let report = process.fold_tick(hourly, live_set, queue).await;
+    assert_eq!(report.folded, vec![process.tenant.hash()]);
+    assert_eq!(report.no_op, Vec::new(), "the hourly fold advanced");
+    assert_eq!(report.refold_hours_reconciled, 0);
+    hourly
+}
+
+/// A tenant that stopped ingesting is not stranded by the no-op carve-out, and
+/// the hand-off needs no second sweep. One maintain tick, under the default
+/// full-sweep cadence, queues the held hour. The fold ticks that follow inside
+/// the same watermark hour find HEAD stale but nothing newly sealed, so each is
+/// a no-op, reconciles nothing, and leaves the request queued. The first fold
+/// tick past the next seal reconciles exactly that hour.
 ///
-/// The resubmission comes from a full sweep: the per-tick zoned sweep lists
-/// only the head and tail hours, and an hour this old is interior. This test
-/// runs the full-sweep cadence at one hour.
+/// Flip to watch it fail: in `fold::run_tick`, call
+/// `refold.remove_hours(&tenant, signal, &refold_request);` right after
+/// `refold.peek` (remove before the fold, as the old drain did). The first
+/// no-op tick then leaves `pending_len` 0, not 1, and without that assertion
+/// the last fold's `refold_hours_reconciled` is 0, not 1.
 #[tokio::test]
 async fn a_quiet_tenants_blocked_hour_is_refolded_on_the_next_hourly_fold() {
     let store = Arc::new(MemoryStore::new());
@@ -367,51 +407,130 @@ async fn a_quiet_tenants_blocked_hour_is_refolded_on_the_next_hourly_fold() {
     let mut process = Process::new(&store, &tenant, PROCESS_A, 1);
     let solo = process.worker.solo_live_set();
     let parts = seed_late_compaction(&process, 0, &solo).await;
-
-    // The hourly fold of a quiet tenant: it advances the watermark and finds
-    // nothing to re-fold.
     let queue = RefoldQueue::default();
-    let quiet_hour = FIRST_WATERMARK_HOUR + 30;
-    let hourly = seal_now(quiet_hour);
-    assert!(
-        hourly >= past_horizon_ns(),
-        "the record is past its horizon"
-    );
-    let report = process.fold_tick(hourly, &solo, &queue).await;
-    assert_eq!(report.folded, vec![tenant.hash()]);
-    assert_eq!(report.refold_hours_reconciled, 0);
+    let hourly = hourly_fold(&process, &solo, &queue).await;
 
-    // The maintain tick queues the held hour; the next fold is no-op.
-    let later = hourly + 10 * 60 * 1_000_000_000;
-    process.maintain_tick(later, &solo, &queue).await;
-    assert_eq!(queue.pending_len(), 1, "the sweep queued one entry");
-    let report = process.fold_tick(later, &solo, &queue).await;
-    assert_eq!(report.folded, vec![tenant.hash()], "HEAD was not fresh");
-    assert_eq!(
-        report.refold_hours_reconciled, 0,
-        "a no-op fold reconciles nothing"
-    );
-    assert_eq!(queue.pending_len(), 0, "the no-op fold still drained it");
+    // The one maintain tick of this test.
+    let sweep_at = hourly + 10 * NS_PER_MINUTE;
+    process.maintain_tick(sweep_at, &solo, &queue).await;
+    assert_eq!(queue.pending_len(), 1, "the sweep queued one pair");
+    assert_eq!(pending_hours(&queue, &tenant), vec![OLD_HOUR]);
+
+    for minutes in [10, 30] {
+        let report = process
+            .fold_tick(hourly + minutes * NS_PER_MINUTE, &solo, &queue)
+            .await;
+        assert_eq!(report.folded, vec![tenant.hash()], "HEAD was not fresh");
+        assert_eq!(report.no_op, vec![tenant.hash()], "nothing newly sealed");
+        assert_eq!(
+            report.refold_hours_reconciled, 0,
+            "a no-op fold reconciles nothing"
+        );
+        assert_eq!(queue.pending_len(), 1, "a no-op fold leaves the request");
+        assert_eq!(pending_hours(&queue, &tenant), vec![OLD_HOUR]);
+    }
     assert_eq!(head_levels(&store, &tenant, OLD_HOUR).await, (2, 0));
 
-    // One hour on: the next full sweep resubmits, and the fold seals a new
-    // hour and reconciles the requested one.
-    let next = later + NS_PER_HOUR;
-    process.maintain_tick(next, &solo, &queue).await;
-    assert_eq!(
-        queue.pending_len(),
-        1,
-        "the full sweep resubmitted the hour"
-    );
-    let report = process.fold_tick(next, &solo, &queue).await;
+    // Past the next seal, with no sweep in between.
+    let next_seal = seal_now(FIRST_WATERMARK_HOUR + 31);
+    let report = process.fold_tick(next_seal, &solo, &queue).await;
+    assert_eq!(report.no_op, Vec::new());
     assert_eq!(report.refold_hours_reconciled, 1, "{report:?}");
+    assert_eq!(queue.pending_len(), 0);
+    assert_eq!(queue.dropped_requests(), 0);
     assert_eq!(head_levels(&store, &tenant, OLD_HOUR).await, (0, parts));
+}
+
+/// A fold tick that skips the tenant because its HEAD is fresh does not fold
+/// it, so it leaves the request for a later tick, which reconciles it.
+///
+/// Flip to watch it fail: in `fold::run_tick`, in the
+/// `TenantTickOutcome::SkippedFresh` arm, call
+/// `refold.remove_hours(&tenant, signal, &refold_request);`. `pending_len`
+/// after the skipped tick is then 0, not 1.
+#[tokio::test]
+async fn a_fresh_skipped_tenant_keeps_its_request() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("refold-fresh-skip");
+    let mut process = Process::new(&store, &tenant, PROCESS_A, 1);
+    let solo = process.worker.solo_live_set();
+    seed_late_compaction(&process, 0, &solo).await;
+    let queue = RefoldQueue::default();
+    let hourly = hourly_fold(&process, &solo, &queue).await;
+
+    process.maintain_tick(hourly, &solo, &queue).await;
+    assert_eq!(queue.pending_len(), 1);
+
+    let report = process
+        .fold_tick(hourly + NS_PER_MINUTE, &solo, &queue)
+        .await;
+    assert_eq!(report.skipped_fresh, vec![tenant.hash()], "{report:?}");
+    assert_eq!(report.folded, Vec::new());
+    assert_eq!(queue.pending_len(), 1, "a fresh skip leaves the request");
+    assert_eq!(pending_hours(&queue, &tenant), vec![OLD_HOUR]);
+
+    let report = process
+        .fold_tick(seal_now(FIRST_WATERMARK_HOUR + 31), &solo, &queue)
+        .await;
+    assert_eq!(report.refold_hours_reconciled, 1, "{report:?}");
+    assert_eq!(queue.pending_len(), 0);
+}
+
+/// A fold that fails leaves the request, and the next fold that is not a no-op
+/// reconciles it. The failure is one refused PUT under the catalog prefix,
+/// counted by the fault store so the test proves it fired.
+///
+/// Flip to watch it fail: in `fold::run_tick`, in the
+/// `TenantTickOutcome::Failed` arm, call
+/// `refold.remove_hours(&tenant, signal, &refold_request);`. `pending_len`
+/// after the failed tick is then 0, not 1.
+#[tokio::test]
+async fn a_failed_fold_keeps_its_request() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("refold-failed-fold");
+    let mut seeder = Process::new(&store, &tenant, PROCESS_A, 1);
+    let solo = seeder.worker.solo_live_set();
+    seed_late_compaction(&seeder, 0, &solo).await;
+    let queue = RefoldQueue::default();
+    let hourly = hourly_fold(&seeder, &solo, &queue).await;
+    seeder.maintain_tick(hourly, &solo, &queue).await;
+    assert_eq!(queue.pending_len(), 1);
+
+    let faults = Arc::new(FaultStore::new(
+        store.clone(),
+        FaultPlan::empty().with_rule(
+            Rule::new(Op::Put, ScriptedFault::Permanent("refused".to_string()))
+                .with_key_contains("/catalog/")
+                .with_occurrence(Occurrence::Nth(1)),
+        ),
+    ));
+    let folder = Process::with_fold_store(&store, faults.clone(), &tenant, PROCESS_A, 1);
+    let next_seal = seal_now(FIRST_WATERMARK_HOUR + 31);
+
+    let report = folder.fold_tick(next_seal, &solo, &queue).await;
+    assert_eq!(
+        faults.fault_count(Op::Put, FaultKind::Permanent),
+        1,
+        "the fault fired"
+    );
+    assert_eq!(report.failed, vec![tenant.hash()], "{report:?}");
+    assert_eq!(report.folded, Vec::new());
+    assert_eq!(report.refold_hours_reconciled, 0);
+    assert_eq!(queue.pending_len(), 1, "a failed fold leaves the request");
+    assert_eq!(pending_hours(&queue, &tenant), vec![OLD_HOUR]);
+
+    let report = folder.fold_tick(next_seal, &solo, &queue).await;
+    assert_eq!(report.folded, vec![tenant.hash()], "{report:?}");
+    assert_eq!(report.no_op, Vec::new());
+    assert_eq!(report.refold_hours_reconciled, 1, "{report:?}");
+    assert_eq!(queue.pending_len(), 0);
+    assert_eq!(faults.fault_count(Op::Put, FaultKind::Permanent), 1);
 }
 
 /// With more than one maintain process, a process that sweeps a shard of a
 /// pair but does not own shard 0 of it does not fold the pair, so it queues
-/// nothing for it: the entry would never be drained and would only ever be
-/// dropped. It counts nothing as dropped either. The same tick with this
+/// nothing for it: no fold in that process would take the entry, and its fold
+/// tick would only remove it. It counts nothing as dropped either. The same tick with this
 /// process alone in the live set does queue the hour, so the hold is real.
 ///
 /// Flip to watch it fail: in `maintain::send_refold_hours`, delete the
@@ -424,19 +543,7 @@ async fn a_process_that_does_not_fold_the_pair_sends_nothing() {
     let store = Arc::new(MemoryStore::new());
     // The first tenant (in a fixed list) for which, under {A, B}, B owns shard
     // 0 and A owns some other shard. Asserted rather than assumed.
-    let probe = WorkerSet::with_defaults(0).with_process_id(PROCESS_A);
-    let (tenant, shard) = (0..64)
-        .map(|n| TenantId::new(format!("refold-split-{n}")))
-        .find_map(|tenant| {
-            let hash = tenant.hash();
-            if probe.owns_unit(&live_ab, &hash, Signal::Metrics, FOLD_UNIT_SHARD) {
-                return None;
-            }
-            (1..SHARDS)
-                .find(|s| probe.owns_unit(&live_ab, &hash, Signal::Metrics, *s))
-                .map(|s| (tenant, s))
-        })
-        .expect("some tenant splits shard 0 and another shard across A and B");
+    let (tenant, shard) = split_tenant(&live_ab, SHARDS);
 
     let mut a = Process::new(&store, &tenant, PROCESS_A, SHARDS);
     let solo_a = a.worker.solo_live_set();
@@ -454,4 +561,53 @@ async fn a_process_that_does_not_fold_the_pair_sends_nothing() {
         .maintain_tick(past_horizon_ns(), &solo_a, &control)
         .await;
     assert_eq!(control.pending_len(), 1, "the hold exists and is queued");
+}
+
+/// The first tenant (in a fixed list) for which, under `live_ab`, B owns shard
+/// 0 of the metrics pair and A owns some other shard, with that shard.
+/// Asserted rather than assumed.
+fn split_tenant(live_ab: &[Uuid], shards: u32) -> (TenantId, u32) {
+    let probe = WorkerSet::with_defaults(0).with_process_id(PROCESS_A);
+    (0..64)
+        .map(|n| TenantId::new(format!("refold-split-{n}")))
+        .find_map(|tenant| {
+            let hash = tenant.hash();
+            if probe.owns_unit(live_ab, &hash, Signal::Metrics, FOLD_UNIT_SHARD) {
+                return None;
+            }
+            (1..shards)
+                .find(|s| probe.owns_unit(live_ab, &hash, Signal::Metrics, *s))
+                .map(|s| (tenant, s))
+        })
+        .expect("some tenant splits shard 0 and another shard across A and B")
+}
+
+/// An entry for a pair whose shard 0 another live process owns is removed at
+/// the start of this process's fold tick for the signal, and not counted as
+/// dropped, so a pair whose ownership moved away does not pin a queue slot.
+/// The same entry under this process alone stays queued, so the removal
+/// follows ownership.
+///
+/// Flip to watch it fail: in `fold::run_tick`, delete the
+/// `refold.remove_unless(...)` loop at the top. `pending_len` after the tick
+/// under `{A, B}` is then 1, not 0.
+#[tokio::test]
+async fn an_entry_for_a_pair_this_process_does_not_fold_is_removed_uncounted() {
+    const SHARDS: u32 = 8;
+    let live_ab = vec![PROCESS_A, PROCESS_B];
+    let (tenant, _) = split_tenant(&live_ab, SHARDS);
+    let store = Arc::new(MemoryStore::new());
+    let a = Process::new(&store, &tenant, PROCESS_A, SHARDS);
+    let solo_a = a.worker.solo_live_set();
+    let now = past_horizon_ns();
+
+    let queue = RefoldQueue::default();
+    queue.send(tenant.hash(), Signal::Metrics, BTreeSet::from([OLD_HOUR]));
+    a.fold_tick(now, &solo_a, &queue).await;
+    assert_eq!(queue.pending_len(), 1, "A alone owns the pair and keeps it");
+
+    let report = a.fold_tick(now, &live_ab, &queue).await;
+    assert_eq!(report.owned, Vec::new());
+    assert_eq!(queue.pending_len(), 0, "B owns shard 0, so A removed it");
+    assert_eq!(queue.dropped_requests(), 0, "a removal is not a drop");
 }
