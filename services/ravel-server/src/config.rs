@@ -1948,8 +1948,9 @@ pub struct Cli {
     /// ([`resolve_performance_defaults`], ADR-0088 as amended by issue #1141,
     /// rebased onto `memory_budget_bytes` by ADR-1170 decision 3): normally
     /// [`CACHE_MEMORY_PERCENT`] of `memory_budget_bytes` (cgroup-capped
-    /// effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`], not raw
-    /// `MemTotal`); reference host (16 cores, 30 GiB, at today's provisional
+    /// effective memory minus the overhead reserve, which is
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] or a quarter of that memory below
+    /// 8 GiB, not raw `MemTotal`); reference host (16 cores, 30 GiB, at today's provisional
     /// reserve): 7,516,192,768. On a `--store s3` deployment whose
     /// `--s3-endpoint` is a loopback address, the fetcher cache instead takes
     /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`: a miss
@@ -1972,8 +1973,9 @@ pub struct Cli {
     /// is unknown.
     ///
     /// Omitted, the value derives at [`CATALOG_CACHE_MEMORY_PERCENT`] of
-    /// `memory_budget_bytes` (cgroup-capped effective memory minus
-    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]), unaffected by whether the store is
+    /// `memory_budget_bytes` (cgroup-capped effective memory minus the
+    /// overhead reserve, [`MEMORY_OVERHEAD_RESERVE_BYTES`] or a quarter of
+    /// that memory below 8 GiB), unaffected by whether the store is
     /// loopback; reference host: 1,503,238,553. Fallback when MemTotal is
     /// unknown: [`DEFAULT_CACHE_MAX_BYTES`] (256 MiB). Startup refuses (does
     /// not clamp) a value that, together with the resolved
@@ -3381,13 +3383,14 @@ pub const SQL_TENANT_MEMORY_PERCENT: u64 = 50;
 
 /// Floor under the available-memory `memory_budget_bytes` derivation (ADR-1170,
 /// amended 2026-10-03 by issue #2367): `max(FLOOR, MemAvailable + own_rss -
-/// MEMORY_OVERHEAD_RESERVE_BYTES)`, 1 GiB. A co-resident process can leave
-/// `MemAvailable` arbitrarily small; the floor keeps the derivation from
-/// collapsing the budget toward `0` on that host, while
+/// reserve)`, 1 GiB, where the reserve is
+/// [`effective_memory_overhead_reserve_bytes`] of `MemTotal`. A co-resident
+/// process can leave `MemAvailable` arbitrarily small; the floor keeps the
+/// derivation from collapsing the budget toward `0` on that host, while
 /// [`ResolvedPerformanceDefaults::memory_budget_bytes`]'s own `min` against
-/// `MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES` still lets a genuinely tiny
-/// host (less memory than the floor plus the reserve) derive a budget below
-/// it, which `check_memory_budget` can still refuse.
+/// `MemTotal - reserve` still lets a genuinely tiny host (less memory than
+/// the floor plus the reserve) derive a budget below it, which startup
+/// refuses under [`MIN_DERIVED_MEMORY_BUDGET_BYTES`].
 pub const MEMORY_BUDGET_FLOOR_BYTES: u64 = 1 << 30;
 
 /// Cap on the derived (non-explicit-flag) `sql_tenant_max_bytes` and
@@ -3588,7 +3591,7 @@ pub struct ResolvedPerformanceDefaults {
     /// The process-wide ceiling (ADR-1170 decision 3, amended by issue
     /// #1255) that [`Self::cache_max_bytes`] and
     /// [`Self::catalog_cache_max_bytes`] are now carved from: cgroup-capped
-    /// effective memory minus [`MEMORY_OVERHEAD_RESERVE_BYTES`], or
+    /// effective memory minus [`Self::memory_overhead_reserve_bytes`], or
     /// `u64::MAX` when memory is unknown (the two caches then fall back to
     /// [`DEFAULT_CACHE_MAX_BYTES`] instead of carving a meaningless budget;
     /// `u64::MAX` rather than `0` because an unmeasured host has no
@@ -3624,8 +3627,9 @@ pub struct ResolvedPerformanceDefaults {
     /// occur with today's flat cache constants.
     ///
     /// Under [`Self::cache_disabled`] this is the whole budget, and startup
-    /// does not refuse it, so a `0` here is also reachable on a host whose
-    /// effective memory is at or below the overhead reserve. `emit` WARNs on
+    /// does not refuse it, so a derived budget below
+    /// [`MIN_DERIVED_MEMORY_BUDGET_BYTES`], or a `0` from an explicit
+    /// `--memory-budget-bytes 0`, is also reachable here. `emit` WARNs on
     /// that combination rather than refusing: no flag can raise a budget the
     /// host's memory did not produce, and the process still ingests.
     pub memory_remainder_bytes: u64,
@@ -3661,9 +3665,9 @@ pub struct ResolvedPerformanceDefaults {
     /// Whether the available-memory `memory_budget_bytes` derivation
     /// (`source == PERF_SOURCE_DERIVED_AVAILABLE`) was held at
     /// [`MEMORY_BUDGET_FLOOR_BYTES`]: `MemAvailable + own_rss -
-    /// MEMORY_OVERHEAD_RESERVE_BYTES`, before the subsequent `min` against
-    /// `MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES`, fell below the
-    /// floor. Set independent of whether that `min` then clips the budget
+    /// reserve`, before the subsequent `min` against `MemTotal - reserve`,
+    /// fell below the floor (the reserve is
+    /// [`Self::memory_overhead_reserve_bytes`]). Set independent of whether that `min` then clips the budget
     /// even lower on a genuinely tiny host: the floor is what the WARN names,
     /// not the final figure. Always `false` on every other source.
     pub memory_budget_floor_bound: bool,
@@ -3760,17 +3764,21 @@ fn resolve_knob(
 ///   amended again 2026-10-03 by issue #2367): `--memory-budget-bytes` wins
 ///   unconditionally (source [`PERF_SOURCE_FLAG`]). Absent that flag, a
 ///   finite cgroup memory limit keeps the pre-#2367 rule unchanged -- the
-///   limit minus [`MEMORY_OVERHEAD_RESERVE_BYTES`] (source
-///   [`PERF_SOURCE_DERIVED_CGROUP`]), `MemAvailable` ignored, since the limit
-///   is already this process's share of the host. With no cgroup limit and
-///   `MemAvailable` known: `min(MemTotal - RESERVE, max(FLOOR, MemAvailable +
-///   own_rss - RESERVE))`, every subtraction saturating, `FLOOR` being
+///   limit minus `RESERVE` (source [`PERF_SOURCE_DERIVED_CGROUP`]),
+///   `MemAvailable` ignored, since the limit is already this process's share
+///   of the host. With no cgroup limit and `MemAvailable` known:
+///   `min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own_rss -
+///   RESERVE))`, every subtraction saturating, `FLOOR` being
 ///   [`MEMORY_BUDGET_FLOOR_BYTES`] (source
 ///   [`PERF_SOURCE_DERIVED_AVAILABLE`]). Otherwise (`MemAvailable` unknown,
 ///   including every non-Linux target): the pre-#2367 rule, `MemTotal -
 ///   RESERVE` (source [`PERF_SOURCE_DERIVED`]), or `u64::MAX` when `MemTotal`
 ///   itself is unknown (source [`PERF_SOURCE_FALLBACK`]; no trustworthy
-///   ceiling can be derived, which is unlimited, not `0`).
+///   ceiling can be derived, which is unlimited, not `0`). In every derived
+///   branch `RESERVE` is [`effective_memory_overhead_reserve_bytes`] of the
+///   limit or `MemTotal` the branch starts from: `min(2 GiB, memory / 4)`
+///   (issue #2607). `Cli::resolve_performance` refuses a derived budget
+///   below [`MIN_DERIVED_MEMORY_BUDGET_BYTES`].
 /// - `cache_max_bytes` (fetcher cache): [`CACHE_MEMORY_PERCENT`] of
 ///   `memory_budget_bytes`, or [`LOOPBACK_CACHE_MEMORY_PERCENT`] instead when
 ///   `flags.store_is_loopback` (a `--store s3` deployment against a loopback
@@ -4271,11 +4279,10 @@ impl ResolvedPerformanceDefaults {
     /// of either kind is built, so the process holds no read-cache memory,
     /// `memory_hard_caps_bytes` is `0`, and the remainder is the whole budget.
     /// Refusing there would refuse a process that has already given back
-    /// every byte the refusal asks it to give back, and a container whose
-    /// effective memory is at or below the overhead reserve derives a `0`
-    /// budget against `0` caps, which the `>=` comparison below would refuse
-    /// with no flag left that could satisfy it. `emit` WARNs about a `0`
-    /// remainder instead.
+    /// every byte the refusal asks it to give back, and an explicit
+    /// `--memory-budget-bytes 0` against `0` caps would be refused by the
+    /// `>=` comparison below with no cache flag left that could satisfy it.
+    /// `emit` WARNs about a `0` remainder instead.
     ///
     /// Also a no-op in a mode that uses no part of the budget
     /// ([`Self::memory_budget_not_applicable`], `--mode gateway`): it builds
@@ -7372,11 +7379,12 @@ impl Cli {
     ///
     /// Mode-aware for the memory budget only. In every mode that uses it
     /// ([`Mode::uses_memory_budget`]: `all`, `query`, `maintain`) the budget
-    /// is carved and [`ResolvedPerformanceDefaults::check_memory_budget`]
-    /// refuses startup as before. `--mode gateway` builds no query surface and
-    /// runs no fold, so it derives no budget, subtracts no overhead reserve,
-    /// and skips that check: a gateway starts under a cgroup memory limit of
-    /// 2 GiB or less. The other settings resolve the same way in every mode.
+    /// is carved, [`ResolvedPerformanceDefaults::check_memory_budget_minimum`]
+    /// refuses a derived budget below [`MIN_DERIVED_MEMORY_BUDGET_BYTES`],
+    /// and [`ResolvedPerformanceDefaults::check_memory_budget`] refuses
+    /// startup as before. `--mode gateway` builds no query surface and runs
+    /// no fold, so it derives no budget, subtracts no overhead reserve, and
+    /// skips both checks: a gateway starts under any cgroup memory limit. The other settings resolve the same way in every mode.
     ///
     /// `--logs-fetch-policy` carries no concurrency default (ADR-1196):
     /// `latency-first` resolves `store_get_concurrency` exactly as every
@@ -17285,5 +17293,15 @@ mod tests {
             .resolve_performance(host)
             .expect("an explicit --memory-budget-bytes is not held to the minimum");
         assert_eq!(started.memory_budget_bytes, GIB);
+
+        // The smallest MemTotal that clears the minimum is a little over
+        // 341 MiB: three quarters of it must reach 256 MiB.
+        let threshold = available_host(357_913_941, 357_913_941, 0);
+        let at = cli
+            .resolve_performance(threshold)
+            .expect("357,913,941 bytes derives exactly the minimum");
+        assert_eq!(at.memory_budget_bytes, MIN_DERIVED_MEMORY_BUDGET_BYTES);
+        cli.resolve_performance(available_host(357_913_940, 357_913_940, 0))
+            .expect_err("one byte less derives one byte under the minimum");
     }
 }
