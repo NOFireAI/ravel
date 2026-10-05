@@ -61,8 +61,8 @@ use crate::clock::Clock;
 use crate::config::{
     DrainIntent, FlushClockError, IngestConfig, LagCheck, MAX_FLUSH_ALL_PASSES,
     MAX_FLUSH_CLOCK_HOLD_NS, SPAN_SEGMENT_FORMAT_VERSION, StoreClockLag,
-    checked_ingest_hour_bucket, idle_age_threshold, memory_backstop_crossed, size_trigger_fires,
-    store_clock_lag,
+    checked_ingest_hour_bucket, duration_nanos_saturating, idle_age_threshold,
+    memory_backstop_crossed, size_trigger_fires, store_clock_lag,
 };
 use crate::deferral::{DEFERRAL_CAP_ABANDONED, DeferralCapFlag, deferral_cap_reached};
 use crate::generation::{
@@ -70,6 +70,7 @@ use crate::generation::{
     reread_and_check, send_hand_back,
 };
 use crate::metrics::FlushTrigger;
+use crate::shard::{InPlaceCause, InPlaceWarnings};
 use crate::span_error::SpanWriteError;
 use crate::span_metrics::SpanIngestMetrics;
 use crate::span_router::shard_for_span;
@@ -676,9 +677,10 @@ pub(crate) struct SpanShardActor {
     /// The router's generation state, for the scan-set check at flush open
     /// and the hand-back it may lead to (ADR-1642 scan-set amendment).
     scope: Arc<dyn FlushScope<SpanShardMsg>>,
-    /// Set by a hand-back and cleared by the next flush that opens in place,
-    /// so a run of hand-backs on this shard logs one WARN.
+    /// See [`crate::shard`]'s `ShardActor::handing_back`.
     handing_back: bool,
+    /// See [`crate::shard`]'s `ShardActor::in_place_warnings`.
+    in_place_warnings: InPlaceWarnings,
     /// See [`crate::shard`]'s `ShardActor::mismatch_in_place`.
     mismatch_in_place: bool,
     /// See [`crate::shard`]'s `ShardActor::drain_rereads`.
@@ -732,6 +734,7 @@ impl SpanShardActor {
             cap_flag,
             scope,
             handing_back: false,
+            in_place_warnings: InPlaceWarnings::default(),
             mismatch_in_place: false,
             drain_rereads: None,
         }
@@ -1088,7 +1091,7 @@ impl SpanShardActor {
             !buf.waiters.is_empty() || buf.flush_est_bytes >= self.config.min_flush_bytes;
         if has_priority {
             (
-                self.config.max_flush_delay.as_nanos() as i64,
+                duration_nanos_saturating(self.config.max_flush_delay),
                 FlushTrigger::Age,
             )
         } else {
@@ -1598,6 +1601,7 @@ impl SpanShardActor {
         {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
+                self.in_place_warnings.rearm(tenant_hash);
                 buf
             }
             ScanCheck::HandBack {
@@ -1619,17 +1623,25 @@ impl SpanShardActor {
                     Err(SpanWriteError::Abandoned(DEFERRAL_CAP_ABANDONED.into())),
                 );
                 self.metrics.record_generation_mismatch_written_in_place();
-                tracing::warn!(
-                    signal = ?Signal::Spans,
-                    shard = self.shard,
-                    tenant_hash = %tenant_hash.to_hex(),
+                self.handing_back = false;
+                if self.in_place_warnings.should_warn(
+                    tenant_hash,
+                    InPlaceCause::RetrySpent,
                     ingest_hour_bucket,
-                    target_count,
-                    "ravel-ingest: a generation-mismatch hand-back kept failing for the flush \
-                     deferral cap; writing the flush in place in an ingest hour another shard \
-                     generation owns; readers find the spans, but a pushdown split over this \
-                     hour may see their traces at two shard indices"
-                );
+                ) {
+                    tracing::warn!(
+                        signal = ?Signal::Spans,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        target_count,
+                        "ravel-ingest: a generation-mismatch hand-back kept failing for the \
+                         flush deferral cap; writing the flush in place in an ingest hour \
+                         another shard generation owns; readers find the spans, but a \
+                         pushdown split over this hour may see their traces at two shard \
+                         indices"
+                    );
+                }
                 buf
             }
             ScanCheck::HandBack {
@@ -1656,6 +1668,7 @@ impl SpanShardActor {
                 }
                 let target_dead = handed.target_dead;
                 let Some(mut buf) = handed.kept else {
+                    self.in_place_warnings.rearm(tenant_hash);
                     return;
                 };
                 buf.stale_view_counted = false;
@@ -1666,19 +1679,28 @@ impl SpanShardActor {
                     && (target_dead || !enforced || self.mismatch_in_place)
                 {
                     self.metrics.record_generation_mismatch_written_in_place();
-                    tracing::warn!(
-                        signal = ?Signal::Spans,
-                        shard = self.shard,
-                        tenant_hash = %tenant_hash.to_hex(),
+                    if !handed.delivered {
+                        self.handing_back = false;
+                    }
+                    if self.in_place_warnings.should_warn(
+                        tenant_hash,
+                        InPlaceCause::DeadTarget,
                         ingest_hour_bucket,
-                        target_count,
-                        target_dead,
-                        "ravel-ingest: writing a flush in place in an ingest hour another \
-                         shard generation owns, because a hand-back target shard is dead, \
-                         condemned or closed, or a drain found its mailbox still full; \
-                         readers find the spans, but a pushdown split over this hour may see \
-                         their traces at two shard indices"
-                    );
+                    ) {
+                        tracing::warn!(
+                            signal = ?Signal::Spans,
+                            shard = self.shard,
+                            tenant_hash = %tenant_hash.to_hex(),
+                            ingest_hour_bucket,
+                            target_count,
+                            target_dead,
+                            "ravel-ingest: writing a flush in place in an ingest hour another \
+                             shard generation owns, because a hand-back target shard is dead, \
+                             condemned or closed, or a drain found its mailbox still full; \
+                             readers find the spans, but a pushdown split over this hour may \
+                             see their traces at two shard indices"
+                        );
+                    }
                     buf
                 } else if enforced {
                     if reason == HandBackReason::GenerationMismatch {
@@ -1748,7 +1770,8 @@ impl SpanShardActor {
         // in the queue and drop already-acked rows with no PUT.
         // ADR-1307 finding 4: it derives from the raw clock reading, not the
         // (possibly floor-raised) stamp.
-        let deadline_ns = raw_ns.saturating_add(self.config.max_flush_lifetime.as_nanos() as i64);
+        let deadline_ns =
+            raw_ns.saturating_add(duration_nanos_saturating(self.config.max_flush_lifetime));
 
         let identity = ObjectIdentity {
             tenant_hash: tenant_hash.0,
@@ -1846,7 +1869,7 @@ impl SpanShardActor {
             pinned.deadline_ns = ctx
                 .clock
                 .now_ns()
-                .saturating_add(ctx.config.max_flush_lifetime.as_nanos() as i64);
+                .saturating_add(duration_nanos_saturating(ctx.config.max_flush_lifetime));
             // Per-shard skew (issue #865, ADR-1692): time the whole flush,
             // matching `crate::shard`'s own off-actor span.
             let started_ns = ctx.clock.now_ns();
@@ -2864,19 +2887,13 @@ mod tests {
             let metrics = Arc::new(SpanIngestMetrics::new(4));
             let clock = TestClock::new(BASE_NS);
             let (tx, rx) = mpsc::channel(64);
-            let actor = SpanShardActor::new(
-                3,
-                Uuid::new_v4(),
-                1,
-                Arc::clone(&store),
-                clock.clone(),
-                Arc::new(ravel_commit::rng::SystemRng),
+            let actor = Self::actor(
                 config,
-                Arc::clone(&metrics),
-                rx,
-                BufferBudgetCeiling::unlimited(),
-                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
                 scope.clone(),
+                Arc::clone(&store),
+                Arc::clone(&metrics),
+                clock.clone(),
+                rx,
             );
             let (start, started) = oneshot::channel::<()>();
             let rig = HandBackRig {
@@ -2893,6 +2910,44 @@ mod tests {
                 }),
             };
             (rig, start)
+        }
+
+        /// The shard-3 actor a rig runs.
+        fn actor(
+            config: IngestConfig,
+            scope: Arc<crate::generation::ScriptedScope<SpanShardMsg>>,
+            store: Arc<dyn ObjectStoreBackend>,
+            metrics: Arc<SpanIngestMetrics>,
+            clock: Arc<TestClock>,
+            rx: mpsc::Receiver<SpanShardMsg>,
+        ) -> SpanShardActor {
+            SpanShardActor::new(
+                3,
+                Uuid::new_v4(),
+                1,
+                store,
+                clock,
+                Arc::new(ravel_commit::rng::SystemRng),
+                config,
+                metrics,
+                rx,
+                BufferBudgetCeiling::unlimited(),
+                DeferralCapFlag::new(config.flush_deferral_cap_ns()),
+                scope,
+            )
+        }
+
+        /// An actor over `config` that never runs, for a test that calls its
+        /// methods directly.
+        fn idle_actor(config: IngestConfig) -> SpanShardActor {
+            Self::actor(
+                config,
+                crate::generation::ScriptedScope::new(ScanCheck::InScanSet, None),
+                Arc::new(MemoryStore::new()),
+                Arc::new(SpanIngestMetrics::new(4)),
+                TestClock::new(BASE_NS),
+                mpsc::channel(1).1,
+            )
         }
 
         /// Commit records written under this rig's shard index, 3.
@@ -2954,10 +3009,24 @@ mod tests {
         }
 
         async fn write_acked(&self, bytes: u64, ack: Option<SpanAck>) -> Arc<IngestByteCharge> {
+            self.write_as("acme", bytes, ack).await
+        }
+
+        /// Buffers the six spans for `tenant`, under one charge of `bytes`.
+        async fn write_tenant(&self, tenant: &str, bytes: u64) -> Arc<IngestByteCharge> {
+            self.write_as(tenant, bytes, None).await
+        }
+
+        async fn write_as(
+            &self,
+            tenant: &str,
+            bytes: u64,
+            ack: Option<SpanAck>,
+        ) -> Arc<IngestByteCharge> {
             let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
             self.tx
                 .send(SpanShardMsg::Write {
-                    tenant: TenantId::new("acme"),
+                    tenant: TenantId::new(tenant),
                     spans: Self::six_spans(),
                     ack,
                     charge: Some(Arc::clone(&charge)),
@@ -3341,6 +3410,393 @@ mod tests {
         assert_eq!(rig.budget.in_flight_bytes(), 0, "the charge is released");
         assert_eq!(rig.own_commits().await, 1, "one teardown write");
         assert_eq!(rig.own_spans().await, 6, "every handed-back span, once");
+        rig.task.await.expect("actor ends");
+    }
+
+    /// See `crate::shard`'s `HAND_BACK_WARN` and its two neighbours.
+    const HAND_BACK_WARN: &str = "handing its rows to that hour's shard generation";
+    const DEAD_TARGET_WARN: &str = "because a hand-back target shard is dead";
+    const RETRY_SPENT_WARN: &str = "kept failing for the flush deferral cap";
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_run_of_in_place_mismatch_writes_warns_once`.
+    ///
+    /// Guards: `self.in_place_warnings.should_warn(..)` gating the WARN in
+    /// the in-place branch of `flush_tenant`'s hand-back arm, and
+    /// `self.in_place_warnings.rearm(tenant_hash)` in the `InScanSet` arm.
+    #[tokio::test]
+    async fn a_run_of_in_place_mismatch_writes_warns_once() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        for _ in 0..3 {
+            drop(rig.write(4_096).await);
+            rig.flush_now().await;
+        }
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            3
+        );
+        assert_eq!(rig.own_commits().await, 3);
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1, "one WARN for the run");
+
+        rig.scope.set(ScanCheck::InScanSet, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        rig.scope.set(MISMATCH, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            4
+        );
+        assert_eq!(rig.own_commits().await, 5);
+        assert_eq!(
+            warns.count(DEAD_TARGET_WARN),
+            2,
+            "the in-scan flush ended the run"
+        );
+        assert_eq!(warns.count(HAND_BACK_WARN), 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_run_of_retry_spent_in_place_writes_warns_once`.
+    ///
+    /// Guard: `self.in_place_warnings.should_warn(..)` gating the WARN in
+    /// `flush_tenant`'s `mismatch_retry_spent(..)` arm.
+    #[tokio::test]
+    async fn a_run_of_retry_spent_in_place_writes_warns_once() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(7200),
+            ..IngestConfig::default()
+        };
+        assert_eq!(config.flush_deferral_cap_ns(), 0);
+        let (target, _inbox) = full_target();
+        let rig = HandBackRig::with(MISMATCH, Some(target), config);
+        rig.scope.set_wait(false);
+        for _ in 0..2 {
+            drop(rig.write(4_096).await);
+            rig.flush_now().await;
+        }
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.hand_back_failures, 2, "each buffer was retried once");
+        assert_eq!(snap.generation_mismatch_written_in_place, 2);
+        assert_eq!(warns.count(RETRY_SPENT_WARN), 1, "one WARN for the run");
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `an_in_place_write_ends_a_hand_back_run`.
+    ///
+    /// Guard: `self.handing_back = false` under `!handed.delivered` in the
+    /// in-place branch of `flush_tenant`'s hand-back arm.
+    #[tokio::test]
+    async fn an_in_place_write_ends_a_hand_back_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let (target, _inbox) = mpsc::channel(64);
+        let rig = HandBackRig::with(HAND_BACK, Some(target.clone()), config);
+        for _ in 0..2 {
+            drop(rig.write(4_096).await);
+            rig.flush_now().await;
+        }
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 2);
+        assert_eq!(warns.count(HAND_BACK_WARN), 1, "one WARN for the run");
+
+        rig.scope.set(MISMATCH, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            1
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        rig.scope.set(HAND_BACK, Some(target));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 3);
+        assert_eq!(
+            warns.count(HAND_BACK_WARN),
+            2,
+            "the in-place write ended the run"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// See `crate::shard`'s `spent_at_once_config`.
+    fn spent_at_once_config() -> IngestConfig {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(7200),
+            ..IngestConfig::default()
+        };
+        assert_eq!(config.flush_deferral_cap_ns(), 0);
+        config
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `in_place_mismatch_warnings_are_kept_per_tenant`.
+    ///
+    /// Guard: the tenant in `InPlaceWarnings::should_warn`'s key.
+    #[tokio::test]
+    async fn in_place_mismatch_warnings_are_kept_per_tenant() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let rig = HandBackRig::with(MISMATCH, None, spent_at_once_config());
+        drop(rig.write_tenant("acme", 4_096).await);
+        rig.flush_now().await;
+        drop(rig.write_tenant("beta", 4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            2
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 2, "one WARN per tenant");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_second_in_place_cause_in_the_same_hour_warns_again`.
+    ///
+    /// Guard: the cause in `InPlaceWarnings::should_warn`'s key.
+    #[tokio::test]
+    async fn a_second_in_place_cause_in_the_same_hour_warns_again() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let rig = HandBackRig::with(MISMATCH, None, spent_at_once_config());
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        let (target, _inbox) = full_target();
+        rig.scope.set(MISMATCH, Some(target));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.hand_back_failures, 1, "retried once");
+        assert_eq!(snap.generation_mismatch_written_in_place, 2);
+        assert_eq!(warns.count(RETRY_SPENT_WARN), 1, "the second cause warns");
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `an_in_place_write_in_the_next_hour_warns_again`.
+    ///
+    /// Guard: the hour in `InPlaceWarnings::should_warn`'s comparison.
+    #[tokio::test]
+    async fn an_in_place_write_in_the_next_hour_warns_again() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let rig = HandBackRig::with(MISMATCH, None, spent_at_once_config());
+        for _ in 0..2 {
+            drop(rig.write(4_096).await);
+            rig.flush_now().await;
+        }
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1, "one WARN for the hour");
+
+        rig.clock.advance_ns(3_600_000_000_000);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            3
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 2, "the next hour warns");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_full_hand_over_ends_an_in_place_episode`.
+    ///
+    /// Guard: `self.in_place_warnings.rearm(tenant_hash)` where `handed.kept`
+    /// is `None` in `flush_tenant`'s hand-back arm.
+    #[tokio::test]
+    async fn a_full_hand_over_ends_an_in_place_episode() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let rig = HandBackRig::with(MISMATCH, None, spent_at_once_config());
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        let (target, _inbox) = mpsc::channel(64);
+        rig.scope.set(MISMATCH, Some(target));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 1);
+
+        rig.scope.set(MISMATCH, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            2
+        );
+        assert_eq!(
+            warns.count(DEAD_TARGET_WARN),
+            2,
+            "the full hand-over ended the episode"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_partial_hand_over_written_in_place_stays_in_the_hand_back_run`.
+    ///
+    /// Guard: `if !handed.delivered` around `self.handing_back = false` in
+    /// the in-place branch of `flush_tenant`'s hand-back arm.
+    #[tokio::test]
+    async fn a_partial_hand_over_written_in_place_stays_in_the_hand_back_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let rig = HandBackRig::with(MISMATCH, None, spent_at_once_config());
+        let (live, _inbox) = mpsc::channel(64);
+        let (closed, gone) = mpsc::channel(64);
+        drop(gone);
+        rig.scope.set_split(MISMATCH, vec![live.clone(), closed]);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.rerouted_flushes, 1, "one target took its spans");
+        assert_eq!(snap.generation_mismatch_written_in_place, 1);
+        assert_eq!(warns.count(HAND_BACK_WARN), 1);
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        rig.scope.set(HAND_BACK, Some(live));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 2);
+        assert_eq!(warns.count(HAND_BACK_WARN), 1, "still one run");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_retry_spent_write_ends_a_hand_back_run`.
+    ///
+    /// Guard: `self.handing_back = false` in `flush_tenant`'s
+    /// `mismatch_retry_spent(..)` arm.
+    #[tokio::test]
+    async fn a_retry_spent_write_ends_a_hand_back_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let (live, _inbox) = mpsc::channel(64);
+        let rig = HandBackRig::with(HAND_BACK, Some(live.clone()), spent_at_once_config());
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(HAND_BACK_WARN), 1);
+
+        let (full, _full_inbox) = full_target();
+        rig.scope.set(MISMATCH, Some(full));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(RETRY_SPENT_WARN), 1);
+
+        rig.scope.set(HAND_BACK, Some(live));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 2);
+        assert_eq!(
+            warns.count(HAND_BACK_WARN),
+            2,
+            "the retry-spent write ended the run"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_max_flush_delay_past_i64_nanos_never_ages_a_waiting_buffer`.
+    ///
+    /// Guard: `duration_nanos_saturating(self.config.max_flush_delay)` in
+    /// `age_threshold_ns`: cast with `as i64`, the threshold reads -1 and the
+    /// buffer is flushed on the first tick.
+    #[tokio::test]
+    async fn a_max_flush_delay_past_i64_nanos_never_ages_a_waiting_buffer() {
+        let config = IngestConfig {
+            max_flush_delay: Duration::from_nanos(u64::MAX),
+            ..ticking_config()
+        };
+        let rig = HandBackRig::with(ScanCheck::InScanSet, None, config);
+        let (charge, mut answer) = rig.write_strict(4_096).await;
+        drop(charge);
+        assert!(
+            yields_until(|| rig.tx.capacity() == rig.tx.max_capacity()).await,
+            "the actor takes the strict write"
+        );
+        assert!(
+            !tick_until(&rig.clock, || rig.metrics.snapshot().flushes_by_age > 0).await,
+            "a waiting buffer is not due by age"
+        );
+        assert!(matches!(
+            answer.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(rig.own_commits().await, 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+
+        let mut buf = SpanTenantBuf::default();
+        buf.waiters.push(oneshot::channel().0);
+        assert_eq!(
+            HandBackRig::idle_actor(config).age_threshold_ns(&buf),
+            (i64::MAX, FlushTrigger::Age)
+        );
+    }
+
+    /// The span counterpart of `crate::shard`'s
+    /// `a_max_flush_lifetime_past_i64_nanos_never_abandons_a_flush`.
+    ///
+    /// Guards: `duration_nanos_saturating(self.config.max_flush_lifetime)` in
+    /// `flush_tenant`'s flush-open deadline: cast, `abandoned_queue_deadline`
+    /// reads 1. And `duration_nanos_saturating(ctx.config.max_flush_lifetime)`
+    /// at the permit grant: cast, `abandoned_retry_exhausted` reads 1.
+    #[tokio::test]
+    async fn a_max_flush_lifetime_past_i64_nanos_never_abandons_a_flush() {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_nanos(u64::MAX),
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(ScanCheck::InScanSet, None, config);
+        let (charge, answer) = rig.write_strict(4_096).await;
+        drop(charge);
+
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.abandoned_queue_deadline, 0);
+        assert_eq!(snap.abandoned_retry_exhausted, 0);
+        answer
+            .await
+            .expect("waiter answered")
+            .expect("the flush is written");
+        assert_eq!(rig.own_commits().await, 1);
+        assert_eq!(rig.own_spans().await, 6, "every span, once");
+        drop(rig.tx);
         rig.task.await.expect("actor ends");
     }
 }

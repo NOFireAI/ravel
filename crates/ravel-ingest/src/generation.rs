@@ -444,12 +444,129 @@ impl<M> FlushScope<M> for AlwaysInScope {
     }
 }
 
+/// Collects the message of every WARN event on the thread that installed it,
+/// until the guard [`WarnCapture::install`] returns is dropped. A shard actor
+/// a `#[tokio::test]` spawns runs on the test's own thread, so its WARNs land
+/// in that test's capture.
+///
+/// The layer behind it is the process-wide default, installed once, and not
+/// a thread-scoped `set_default`: a callsite another test thread registers
+/// while a scoped default is being registered can cache an interest that
+/// leaves the scoped subscriber out, and the capture then sees nothing.
+/// Because that layer marks every non-WARN callsite never, it is safe only
+/// while no other unit test in this crate's `src` installs a subscriber.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct WarnCapture {
+    messages: Arc<Mutex<Vec<String>>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static THREAD_CAPTURE: std::cell::RefCell<Option<WarnCapture>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Hands each WARN event to the capture installed on its thread, if any.
+#[cfg(test)]
+struct ThreadWarnLayer;
+
+#[cfg(test)]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ThreadWarnLayer {
+    fn register_callsite(
+        &self,
+        metadata: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        if *metadata.level() == tracing::Level::WARN {
+            tracing::subscriber::Interest::always()
+        } else {
+            tracing::subscriber::Interest::never()
+        }
+    }
+
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() != tracing::Level::WARN {
+            return;
+        }
+        THREAD_CAPTURE.with(|slot| {
+            if let Some(capture) = slot.borrow().as_ref() {
+                let mut visitor = MessageVisitor::default();
+                event.record(&mut visitor);
+                capture
+                    .messages
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(visitor.0);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct MessageVisitor(String);
+
+#[cfg(test)]
+impl tracing::field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+/// Removes this thread's capture when dropped.
+#[cfg(test)]
+pub(crate) struct WarnCaptureGuard;
+
+#[cfg(test)]
+impl Drop for WarnCaptureGuard {
+    fn drop(&mut self) {
+        THREAD_CAPTURE.with(|slot| slot.borrow_mut().take());
+    }
+}
+
+#[cfg(test)]
+impl WarnCapture {
+    /// Captures this thread's WARN events until the guard drops.
+    pub(crate) fn install(&self) -> WarnCaptureGuard {
+        use tracing_subscriber::layer::SubscriberExt;
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            // Err only when another global subscriber is already set, which
+            // this test binary never does; the capture would then see nothing
+            // and the caller's count assertion fails.
+            let _ = tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(ThreadWarnLayer),
+            );
+        });
+        THREAD_CAPTURE.with(|slot| *slot.borrow_mut() = Some(self.clone()));
+        WarnCaptureGuard
+    }
+
+    /// Captured messages containing `needle`.
+    pub(crate) fn count(&self, needle: &str) -> usize {
+        self.messages
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count()
+    }
+}
+
 /// A [`FlushScope`] whose verdict and hand-back target a unit test sets, so a
 /// test can hand an actor a closed or absent target and read what it sends.
 #[cfg(test)]
 pub(crate) struct ScriptedScope<M> {
     verdict: Mutex<ScanCheck>,
     target: Mutex<Option<mpsc::Sender<M>>>,
+    /// One target per shard index, used in place of `target` when non-empty.
+    split: Mutex<Vec<mpsc::Sender<M>>>,
     wait: Mutex<bool>,
 }
 
@@ -459,6 +576,7 @@ impl<M> ScriptedScope<M> {
         Arc::new(ScriptedScope {
             verdict: Mutex::new(verdict),
             target: Mutex::new(target),
+            split: Mutex::new(Vec::new()),
             wait: Mutex::new(true),
         })
     }
@@ -466,6 +584,14 @@ impl<M> ScriptedScope<M> {
     pub(crate) fn set(&self, verdict: ScanCheck, target: Option<mpsc::Sender<M>>) {
         *self.verdict.lock().unwrap_or_else(|p| p.into_inner()) = verdict;
         *self.target.lock().unwrap_or_else(|p| p.into_inner()) = target;
+        self.split.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    /// [`Self::set`] with target shard `i` of every set handed `targets[i]`,
+    /// so one hand-back can deliver to one target and fail on another.
+    pub(crate) fn set_split(&self, verdict: ScanCheck, targets: Vec<mpsc::Sender<M>>) {
+        self.set(verdict, None);
+        *self.split.lock().unwrap_or_else(|p| p.into_inner()) = targets;
     }
 
     /// Whether a hand-back may wait for room in the target's mailbox, as
@@ -481,9 +607,14 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
         *self.verdict.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Every shard of every set is this one target, returned even when its
-    /// mailbox is closed: a target that closes after the liveness check.
-    fn live_sender(&self, _count: u32, _shard: u32) -> Option<mpsc::Sender<M>> {
+    /// Every shard of every set is this one target, or its split target,
+    /// returned even when its mailbox is closed: a target that closes after
+    /// the liveness check.
+    fn live_sender(&self, _count: u32, shard: u32) -> Option<mpsc::Sender<M>> {
+        let split = self.split.lock().unwrap_or_else(|p| p.into_inner());
+        if !split.is_empty() {
+            return split.get(shard as usize).cloned();
+        }
         self.target
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -848,23 +979,24 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
                 {
                     let scan = scan_count(&view.generations, hour, DEFAULT_SCAN_SLACK_HOURS);
                     let active = active_shard_count(&view.generations, hour_of(now_ns));
-                    // `Err` for an owner the view does not list. The owner is
-                    // read from this same list, so that cannot happen; it
-                    // fails closed like an untrusted view rather than write.
-                    let owner = match stable_generation_for_hour(
-                        &view.generations,
-                        hour,
-                        DEFAULT_SCAN_SLACK_HOURS,
-                    ) {
-                        None => Ok(None),
-                        Some(owner) => view
-                            .generations
-                            .iter()
-                            .find(|g| g.generation == owner)
-                            .map(|owner| Some(owner.shard_count))
-                            .ok_or(()),
-                    };
                     if shard < scan {
+                        // `Err` for an owner the view does not list. The owner
+                        // is read from this same list, so that cannot happen;
+                        // it fails closed like an untrusted view rather than
+                        // write.
+                        let owner = match stable_generation_for_hour(
+                            &view.generations,
+                            hour,
+                            DEFAULT_SCAN_SLACK_HOURS,
+                        ) {
+                            None => Ok(None),
+                            Some(owner) => view
+                                .generations
+                                .iter()
+                                .find(|g| g.generation == owner)
+                                .map(|owner| Some(owner.shard_count))
+                                .ok_or(()),
+                        };
                         match owner {
                             Ok(Some(owner)) if owner != count => ScanCheck::HandBack {
                                 scan_count: scan,
