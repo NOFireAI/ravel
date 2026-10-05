@@ -1497,8 +1497,9 @@ enum MaintainCommand {
         /// L1 segment (a split target, not a peak-memory bound: a span merge
         /// can overshoot it by a whole trace). Applies to log and span merges.
         /// Refused at 0. Default for log merges: derived from the host's
-        /// memory (MemTotal capped by a cgroup memory limit) less a 2 GiB
-        /// overhead reserve and the 20 GiB merge cursor budget, divided by 8,
+        /// memory (MemTotal capped by a cgroup memory limit) less an overhead
+        /// reserve (2 GiB from 8 GiB of memory up, a quarter of that memory
+        /// below it) and the 20 GiB merge cursor budget, divided by 8,
         /// capped at the part size the claim lease supports (1500 MiB at the
         /// default 300 s lease) and at 8 GiB, with a 256 MiB floor applied
         /// last; 256 MiB when the host memory cannot be read. A derived value
@@ -1586,8 +1587,9 @@ enum MaintainCommand {
         /// host for path-specific overshoot). Lower it for smaller segments on a
         /// small host; raise it for fewer, larger segments. Applies to log and
         /// span merges. Refused at 0. Default for log merges: derived from the
-        /// host's memory (MemTotal capped by a cgroup memory limit) less a
-        /// 2 GiB overhead reserve and the 20 GiB merge cursor budget (shared
+        /// host's memory (MemTotal capped by a cgroup memory limit) less an
+        /// overhead reserve (2 GiB from 8 GiB of memory up, a quarter of that
+        /// memory below it) and the 20 GiB merge cursor budget (shared
         /// by the concurrent buckets), divided by 8 and by --bucket-concurrency,
         /// capped at the part size the claim lease supports (1500 MiB at the
         /// default 300 s lease) and at 8 GiB, with a 256 MiB floor applied
@@ -1631,8 +1633,9 @@ enum MaintainCommand {
         /// division, floor). So each concurrent bucket may hold up to ~20 GiB / N
         /// of cursor budget plus its in-progress writer split target
         /// (--l1-part-memory-target-bytes, for a log merge by default the
-        /// host's memory less 2 GiB and less the 20 GiB cursor budget, / 8 / N,
-        /// within [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
+        /// host's memory less the overhead reserve (2 GiB from 8 GiB of memory
+        /// up, a quarter of that memory below it) and less the 20 GiB cursor
+        /// budget, / 8 / N, within [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
         /// ~20 GiB + 1 GiB; at N=4 each of the four holds up to ~5 GiB +
         /// 256 MiB, so the aggregate stays ~20 GiB of cursor budget plus
         /// ~1 GiB of writer targets. Dividing the budget is
@@ -4605,7 +4608,8 @@ mod tests {
     }
 
     /// Without `--l1-part-memory-target-bytes` the memory split target is
-    /// derived from the host memory less the 2 GiB overhead reserve and the
+    /// derived from the host memory less the overhead reserve (2 GiB from
+    /// 8 GiB of memory up, the band the 32 GiB host below is in) and the
     /// 20 GiB merge cursor budget, over `--bucket-concurrency`, capped by the
     /// claim lease (issue #2351). The worked figure is a 32 GiB host at one
     /// merge: `32 - 2 - 20 = 10 GiB`, `/ 8 = 1.25 GiB` (1342177280), where the

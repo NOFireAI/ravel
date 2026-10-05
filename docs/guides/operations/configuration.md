@@ -1483,8 +1483,9 @@ pool nests inside the per-tenant pool, so the tenant's total is unchanged by the
 per-query share: statements running together share the tenant ceiling, and a
 statement that arrives while another holds most of it gets what is left, not a
 reserved quarter. One tenant's SQL memory is therefore still at most 50% of
-`MemTotal`. The two caches carve the memory budget (`MemTotal` less the 2 GiB
-reserve) rather than `MemTotal`, so the three ceilings together come to about
+`MemTotal`. The two caches carve the memory budget (`MemTotal` less the
+overhead reserve, 2 GiB from 8 GiB of memory up and a quarter of that memory
+below it) rather than `MemTotal`, so the three ceilings together come to about
 78% of `MemTotal` on the reference host (25,125,558,681 of 32,212,254,720),
 and more on a loopback store, where the fetcher cache derives at 40%.
 
@@ -1534,14 +1535,19 @@ no cgroup memory limit
 and a readable `MemAvailable` (Linux's own `/proc/meminfo` estimate of memory
 a new allocation could claim without swapping), the budget is
 `min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`,
-every subtraction saturating at zero. `RESERVE` is the same fixed 2 GiB
-overhead reserve as before; `FLOOR` is a 1 GiB floor under the
-`MemAvailable + own RSS - RESERVE` term only, not under the final budget:
-binding it logs at `WARN` with the `MemAvailable` reading that hit it and
-`--memory-budget-bytes` named as the remedy, but the outer `min` against
-`MemTotal - RESERVE` keeps the final budget at or below the pre-amendment
-figure, so a host whose `MemTotal` is at or below the reserve still derives
-0 and is refused at startup, as before.
+every subtraction saturating at zero. `RESERVE` is the overhead reserve,
+`min(2 GiB, memory / 4)` of the memory the budget starts from (`MemTotal`,
+or the cgroup memory limit when one applies): a fixed 2 GiB from 8 GiB up,
+and a quarter of the memory below that, so a t3a.small (`MemTotal`
+1,912 MiB) reserves 478 MiB rather than more than it has. `FLOOR` is a 1 GiB
+floor under the `MemAvailable + own RSS - RESERVE` term only, not under the
+final budget: binding it logs at `WARN` with the `MemAvailable` reading that
+hit it and `--memory-budget-bytes` named as the remedy, but the outer `min`
+against `MemTotal - RESERVE` keeps the final budget at or below that figure.
+A derived budget below 256 MiB refuses to start, with a message naming
+`MemTotal` (or the cgroup limit), the reserve, the budget and
+`--memory-budget-bytes`; a host or container needs a little over 341 MiB of
+memory to clear it.
 The process's own resident set counts as available because the kernel does
 not call a process's own resident pages "available" even though this
 process may reuse them rather than compete with them. A cgroup memory
@@ -1602,8 +1608,8 @@ so its `/metrics` carries no `cache="fetch"` series for any of those
 families. With neither flag set, no `ravel_cache_*` family renders at all.
 In any mode, a `--cache-max-bytes` of `0` builds no fetcher cache.
 Every other mode (`all`, `query`, `maintain`) still needs
-effective memory above the 2 GiB reserve plus whatever its two cache
-ceilings claim. The current state is visible
+a derived budget of at least 256 MiB after the overhead reserve, plus room
+for whatever its two cache ceilings claim. The current state is visible
 live at `/metrics`: `ravel_memory_budget_bytes` (the ceiling of that shared
 accountant, which is the startup log's `memory_remainder_bytes`, the budget
 MINUS the two cache ceilings, not the pre-carve `memory_budget_bytes` figure
@@ -1685,7 +1691,7 @@ below the 1 GiB floor, one extra line appears inside the block above, after
 the `memory_remainder_bytes` line and before the two SQL pool lines:
 
 ```
-WARN memory_budget_bytes was held at MEMORY_BUDGET_FLOOR_BYTES: MemAvailable plus this process's own resident set left little or no room after the overhead reserve, most likely a co-resident process claiming most of the host; the subsequent min against MemTotal - MEMORY_OVERHEAD_RESERVE_BYTES can still clip memory_budget_bytes below this floor, down to 0 on a genuinely tiny host; set --memory-budget-bytes to size the budget explicitly memory_budget_bytes=1073741824 mem_available_bytes=2147483648 own_rss_bytes=0
+WARN memory_budget_bytes was held at MEMORY_BUDGET_FLOOR_BYTES: MemAvailable plus this process's own resident set left little or no room after the overhead reserve, most likely a co-resident process claiming most of the host; the subsequent min against MemTotal less the overhead reserve can still clip memory_budget_bytes below this floor on a small host; set --memory-budget-bytes to size the budget explicitly memory_budget_bytes=1073741824 mem_available_bytes=2147483648 own_rss_bytes=0
 ```
 
 The last two flags are meaningful only in a build with the `sql` feature. See

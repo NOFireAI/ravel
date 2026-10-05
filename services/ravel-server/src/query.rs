@@ -1439,8 +1439,10 @@ mod catalog_cache_tests {
     /// `ResolvedPerformanceDefaults::catalog_cache_max_bytes`). The catalog
     /// cache is a SEPARATE ceiling from the fetcher cache: both carve from
     /// `memory_budget_bytes` (`MemTotal` minus
-    /// [`crate::config::MEMORY_OVERHEAD_RESERVE_BYTES`], ADR-1170 decision 3),
-    /// not from raw `MemTotal`. On the reference profile the 30,064,771,072
+    /// [`crate::config::effective_memory_overhead_reserve_bytes`], ADR-1170
+    /// decision 3, scaled below 8 GiB of memory rather than the fixed
+    /// [`crate::config::MEMORY_OVERHEAD_RESERVE_BYTES`] -- ADR-1170's small-host
+    /// reserve amendment), not from raw `MemTotal`. On the reference profile the 30,064,771,072
     /// budget resolves to 5% for the catalog cache (1,503,238,553) while the
     /// fetcher cache `store::build_cache` bounds stays at 25%
     /// (7,516,192,768), so the two independent LRU caches do not each claim
