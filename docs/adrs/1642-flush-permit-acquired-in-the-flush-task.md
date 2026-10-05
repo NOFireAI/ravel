@@ -700,7 +700,8 @@ delivers), and teardown writes outside the scan set as
 `teardown_unscanned_writes`. `ravel-server` exports them on `/metrics` by
 signal as `ravel_ingest_rerouted_flushes_total`,
 `ravel_ingest_hand_back_failures_total` and
-`ravel_ingest_teardown_unscanned_writes_total`. The first hand-back of an
+`ravel_ingest_teardown_unscanned_writes_total` (the first family also by
+`reason` since the metrics export amendment below). The first hand-back of an
 episode on a shard logs once at WARN with the signal, shard, pinned hour and
 scan count; the episode ends when that shard next opens a flush in place. The
 first failed hand-back of a buffer logs once, at WARN for metrics and at ERROR
@@ -1036,24 +1037,32 @@ at the overflow boundary.
 
 ## Amendment (2026-10-05): the hand-back counts are exported (issue #2600)
 
-<!-- amendment-applies: sections="Amendment (2026-10-04): the hand-back also fires on a generation mismatch (issue #2429)" pointer="metrics export amendment" -->
+<!-- amendment-applies: sections="Amendment (2026-10-03): the scan-set check at flush open (issue #2410)|Amendment (2026-10-04): the hand-back also fires on a generation mismatch (issue #2429)" pointer="metrics export amendment" -->
 
 The generation-mismatch amendment left its two counts as in-process snapshot
 fields. `ravel-server` now renders both, in the modes that build ingest
 routers.
 
 `ravel_ingest_rerouted_flushes_total` carries a `reason` label with the two
-values `HandBackReason::label()` gives. The `generation_mismatch` series
-reads `rerouted_flushes_generation_mismatch` and the `retired_index` series
-reads `rerouted_flushes` less that, saturating at zero, so a sum over the
-family is what it was before the label.
+values `HandBackReason::label()` gives. Each reason series is its own
+counter: each pipeline's snapshot gains `rerouted_flushes_retired_index`
+beside `rerouted_flushes_generation_mismatch`, a hand-back increments
+`rerouted_flushes` and exactly one of the two, and each series renders from
+its own field. A series derived as the total less the other reason could
+read lower than the scrape before, when a hand-back landed between the loads
+of the two counters, and Prometheus reads a decrease as a counter reset.
+Every hand-back is counted under exactly one reason, so a sum over the family
+equals the series before the label, except in a scrape that lands between
+the increment of the total and that of the reason.
 
 `ravel_ingest_generation_mismatch_in_place_writes_total` reads
-`generation_mismatch_written_in_place`. It is the durable trace of the
-residual that amendment states: a buffer written under its own shard index
-in an hour another generation owns alone, which leaves that hour eligible for
-distributed pushdown with a series at two shard indices. An alert should fire
-on any increase.
+`generation_mismatch_written_in_place`. It counts the residual that amendment
+states: a buffer written under its own shard index in an hour another
+generation owns alone, which leaves that hour eligible for distributed
+pushdown with a series at two shard indices. It is a process counter and
+resets when the process restarts; the WARN line naming the tenant, shard,
+hour and target count is the durable trace. An alert should fire on any
+increase.
 
 Nothing about when a hand-back fires, what it waits on, or when it writes in
 place changes here.

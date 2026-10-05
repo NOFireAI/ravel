@@ -1035,14 +1035,18 @@ pub struct IngestPipelineSnapshot {
     /// plus buffers whose flush stayed closed at flush open because the view
     /// was past its trust horizon, counted once per buffer per episode.
     pub stale_provisioning_flushes: u64,
-    /// Flushes handed back to the tenant's current shard generation instead of
-    /// written, for either [`HandBackReason`]: a shard index outside the
-    /// read-side scan set of their ingest hour, or an index inside it in an
-    /// hour another generation owns alone.
+    /// Flushes handed back instead of written, for either [`HandBackReason`]:
+    /// a shard index outside the read-side scan set of their ingest hour,
+    /// handed to the tenant's current shard generation, or an index inside it
+    /// in an hour another generation owns alone, handed to the owning
+    /// generation's shards. Not rendered on its own: each reason series reads
+    /// its own field below.
     pub rerouted_flushes: u64,
-    /// The part of `rerouted_flushes` handed back for
-    /// [`HandBackReason::GenerationMismatch`]; the rest are
-    /// [`HandBackReason::RetiredIndex`].
+    /// Hand-backs for [`HandBackReason::RetiredIndex`], from their own
+    /// counter.
+    pub rerouted_flushes_retired_index: u64,
+    /// Hand-backs for [`HandBackReason::GenerationMismatch`], from their own
+    /// counter.
     pub rerouted_flushes_generation_mismatch: u64,
     /// Hand-back episodes that kept rows in the source buffer for a later
     /// flush to retry: a retired-index target dead, condemned or closed, or a
@@ -1225,6 +1229,7 @@ impl IngestPipelineSnapshot {
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             rerouted_flushes: snapshot.rerouted_flushes,
+            rerouted_flushes_retired_index: snapshot.rerouted_flushes_retired_index,
             rerouted_flushes_generation_mismatch: snapshot.rerouted_flushes_generation_mismatch,
             hand_back_failures: snapshot.hand_back_failures,
             generation_mismatch_written_in_place: snapshot.generation_mismatch_written_in_place,
@@ -1279,6 +1284,7 @@ impl IngestPipelineSnapshot {
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             rerouted_flushes: snapshot.rerouted_flushes,
+            rerouted_flushes_retired_index: snapshot.rerouted_flushes_retired_index,
             rerouted_flushes_generation_mismatch: snapshot.rerouted_flushes_generation_mismatch,
             hand_back_failures: snapshot.hand_back_failures,
             generation_mismatch_written_in_place: snapshot.generation_mismatch_written_in_place,
@@ -1332,6 +1338,7 @@ impl IngestPipelineSnapshot {
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             rerouted_flushes: snapshot.rerouted_flushes,
+            rerouted_flushes_retired_index: snapshot.rerouted_flushes_retired_index,
             rerouted_flushes_generation_mismatch: snapshot.rerouted_flushes_generation_mismatch,
             hand_back_failures: snapshot.hand_back_failures,
             generation_mismatch_written_in_place: snapshot.generation_mismatch_written_in_place,
@@ -1356,19 +1363,22 @@ impl IngestPipelineSnapshot {
     }
 }
 
-/// One `ravel_ingest_rerouted_flushes_total` value per [`HandBackReason`]. The
-/// snapshot counts every hand-back and, separately, the generation-mismatch
-/// part, so the retired-index series is the difference; the two always sum to
-/// `rerouted_flushes`.
-fn rerouted_flushes_by_reason(pipeline: &IngestPipelineSnapshot) -> [(HandBackReason, u64); 2] {
-    let mismatch = pipeline.rerouted_flushes_generation_mismatch;
-    [
-        (
-            HandBackReason::RetiredIndex,
-            pipeline.rerouted_flushes.saturating_sub(mismatch),
-        ),
-        (HandBackReason::GenerationMismatch, mismatch),
-    ]
+/// Every [`HandBackReason`], in render order. [`rerouted_flushes_for`] has no
+/// wildcard arm, so a new variant fails to compile there until it gets a
+/// series; list it here in the same change.
+const HAND_BACK_REASONS: [HandBackReason; 2] = [
+    HandBackReason::RetiredIndex,
+    HandBackReason::GenerationMismatch,
+];
+
+/// The `ravel_ingest_rerouted_flushes_total` value for one reason, read from
+/// that reason's own counter. Each is a counter on its own, never a
+/// difference of two, so no series can read lower than the scrape before.
+fn rerouted_flushes_for(pipeline: &IngestPipelineSnapshot, reason: HandBackReason) -> u64 {
+    match reason {
+        HandBackReason::RetiredIndex => pipeline.rerouted_flushes_retired_index,
+        HandBackReason::GenerationMismatch => pipeline.rerouted_flushes_generation_mismatch,
+    }
 }
 
 fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelineSnapshot]) {
@@ -1685,16 +1695,18 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     write_header(
         out,
         "ravel_ingest_rerouted_flushes_total",
-        "Flushes that handed their rows to the tenant's current shard generation instead of \
-         writing them, by signal and reason, counted once per flush attempt that delivered rows \
-         to at least one target. reason=\"retired_index\": the flush would have written under a \
-         shard index outside the read-side scan set of the ingest hour it pinned. \
-         reason=\"generation_mismatch\": the index is inside the scan set, but another shard \
-         generation, routing at another shard count, owns that hour alone.",
+        "Flushes that handed their rows to other shards instead of writing them, by signal and \
+         reason, counted once per flush attempt that delivered rows to at least one target, \
+         under exactly one reason. reason=\"retired_index\": the flush would have written under \
+         a shard index outside the read-side scan set of the ingest hour it pinned, and the \
+         rows went to the tenant's current shard generation. reason=\"generation_mismatch\": \
+         the index is inside the scan set, but another shard generation, routing at another \
+         shard count, owns that hour alone, and the rows went to the owning generation's \
+         shards.",
         "counter",
     );
     for pipeline in pipelines {
-        for (reason, value) in rerouted_flushes_by_reason(pipeline) {
+        for reason in HAND_BACK_REASONS {
             write_sample(
                 out,
                 "ravel_ingest_rerouted_flushes_total",
@@ -1703,7 +1715,7 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
                     Label::Signal(pipeline.signal),
                     Label::HandBackReason(reason),
                 ],
-                value,
+                rerouted_flushes_for(pipeline, reason),
             );
         }
     }
@@ -1715,9 +1727,10 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
          retry, by signal, counted once per buffer until a hand-back from it delivers: a \
          retired-index hand-back whose target shard was dead, condemned or closed, and a \
          generation-mismatch hand-back whose target's mailbox was full. A generation-mismatch \
-         buffer is retried only until the flush deferral cap and is then written in place; a \
-         generation-mismatch hand-back whose target is dead, condemned or closed is not counted \
-         here and is written in place at once. Both in-place writes count on \
+         buffer is retried only until the flush deferral cap, or until a drain or a teardown \
+         flushes it, and is then written in place; a generation-mismatch hand-back whose \
+         target is dead, condemned or closed is not counted here and is written in place at \
+         once. Both in-place writes count on \
          ravel_ingest_generation_mismatch_in_place_writes_total. A log or span target stays \
          condemned until restart, so a retired-index rise there means rows waiting for the \
          shutdown drain.",
@@ -9159,23 +9172,27 @@ mod tests {
     }
 
     /// Issue #2600: each pipeline's hand-back count renders split by reason,
-    /// with `generation_mismatch` reading the snapshot's mismatch part and
-    /// `retired_index` the total less that part, and the in-place mismatch
-    /// writes render as their own family. Every figure is distinct, so a
-    /// series reading another field, another signal's snapshot, or the
+    /// each series read from its own snapshot field, and the in-place
+    /// mismatch writes render as their own family. Every figure is distinct,
+    /// so a series reading another field, another signal's snapshot, or the
     /// unsplit total fails here.
     ///
-    /// Prove-the-test: in `rerouted_flushes_by_reason`, render
-    /// `pipeline.rerouted_flushes` for `RetiredIndex` (drop the
-    /// `saturating_sub`) and the metrics `retired_index` sample reads 7
-    /// against the expected 4; delete the
+    /// Prove-the-test: in `rerouted_flushes_for`, render
+    /// `pipeline.rerouted_flushes.saturating_sub(pipeline.rerouted_flushes_generation_mismatch)`
+    /// for `RetiredIndex` and the metrics `retired_index` sample reads 4
+    /// against the expected 1; delete the
     /// `ravel_ingest_generation_mismatch_in_place_writes_total` `write_sample`
     /// and its sample list is empty against the expected three lines.
     #[test]
     fn hand_back_reason_and_in_place_writes_render_exact_samples() {
+        // The retired-index figures are deliberately NOT the total less the
+        // mismatch figure (1 vs 7 - 3, 10 vs 16 - 5, 12 vs 29 - 9): the
+        // snapshot fields are independent counters, and a renderer that
+        // derives one series by subtraction fails on every signal.
         let ingest = vec![
             IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
                 rerouted_flushes: 7,
+                rerouted_flushes_retired_index: 1,
                 rerouted_flushes_generation_mismatch: 3,
                 hand_back_failures: 13,
                 generation_mismatch_written_in_place: 2,
@@ -9183,6 +9200,7 @@ mod tests {
             }),
             IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
                 rerouted_flushes: 16,
+                rerouted_flushes_retired_index: 10,
                 rerouted_flushes_generation_mismatch: 5,
                 hand_back_failures: 17,
                 generation_mismatch_written_in_place: 6,
@@ -9190,6 +9208,7 @@ mod tests {
             }),
             IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
                 rerouted_flushes: 29,
+                rerouted_flushes_retired_index: 12,
                 rerouted_flushes_generation_mismatch: 9,
                 hand_back_failures: 19,
                 generation_mismatch_written_in_place: 8,
@@ -9202,11 +9221,11 @@ mod tests {
         assert_eq!(
             family_samples(&body, "ravel_ingest_rerouted_flushes_total"),
             vec![
-                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"metrics\",reason=\"retired_index\"} 4",
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"metrics\",reason=\"retired_index\"} 1",
                 "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"metrics\",reason=\"generation_mismatch\"} 3",
-                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"logs\",reason=\"retired_index\"} 11",
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"logs\",reason=\"retired_index\"} 10",
                 "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"logs\",reason=\"generation_mismatch\"} 5",
-                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"spans\",reason=\"retired_index\"} 20",
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"spans\",reason=\"retired_index\"} 12",
                 "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"spans\",reason=\"generation_mismatch\"} 9",
             ],
             "{body}"
@@ -9242,25 +9261,6 @@ mod tests {
                 "{family} is declared once, as a counter"
             );
         }
-    }
-
-    /// A mismatch part above the total, which the ingest snapshot's two
-    /// relaxed loads can read when a hand-back lands between them, renders the
-    /// retired-index series at zero rather than wrapping.
-    #[test]
-    fn retired_index_hand_backs_saturate_at_zero() {
-        let pipeline = IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
-            rerouted_flushes: 2,
-            rerouted_flushes_generation_mismatch: 3,
-            ..Default::default()
-        });
-        assert_eq!(
-            rerouted_flushes_by_reason(&pipeline),
-            [
-                (HandBackReason::RetiredIndex, 0),
-                (HandBackReason::GenerationMismatch, 3),
-            ]
-        );
     }
 
     /// Every series issue #2600 adds renders, at `0`, before anything was
