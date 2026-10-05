@@ -426,7 +426,7 @@ async fn a_process_that_does_not_fold_the_pair_sends_nothing() {
     // 0 and A owns some other shard. Asserted rather than assumed.
     let probe = WorkerSet::with_defaults(0).with_process_id(PROCESS_A);
     let (tenant, shard) = (0..64)
-        .map(|n| TenantId::new(&format!("refold-split-{n}")))
+        .map(|n| TenantId::new(format!("refold-split-{n}")))
         .find_map(|tenant| {
             let hash = tenant.hash();
             if probe.owns_unit(&live_ab, &hash, Signal::Metrics, FOLD_UNIT_SHARD) {
