@@ -49,14 +49,11 @@
 //!   [`ADMITTED_TABLE_FUNCTIONS`]). This backstops the subset check in
 //!   crate::validate and fails closed under DataFusion upgrades -- a newly added
 //!   default function in any registry is excluded by default rather than
-//!   silently reachable by name. The allowlist governs name resolution only:
-//!   syntax that a registered `ExprPlanner` rewrites reaches its target
-//!   function without passing it, because the planner builds the call from
-//!   the function value. That path is guarded by the planner-set pin
-//!   (`registered_expr_planners_are_pinned_for_every_table`) and by
-//!   `tests/expr_planner_surface.rs`, and by re-reading each registered
-//!   planner on upgrade. `avg`/`mean` are admitted (ADR-0022 decisions 3, 4):
-//!   they stay in the admitted set so the deregistration loop keeps them, and
+//!   silently reachable by name. The allowlist governs name resolution only;
+//!   syntax an `ExprPlanner` rewrites is governed as described beside the
+//!   planner registrations in [`build_session`]. `avg`/`mean` are admitted
+//!   (ADR-0022 decisions 3, 4): they stay in the admitted set so the
+//!   deregistration loop keeps them, and
 //!   their built-in accumulator is then replaced by the sequential-fold UDAF
 //!   (crate::avg), the same registry-replacement pattern min/max use.
 //! - The table-function admitted set is empty, so `range`/`generate_series`
@@ -750,10 +747,12 @@ pub fn build_session(
     // Expression planners (ADR-0097, amendment of issue #2583). A planner
     // rewrites SQL syntax into a call it builds from the function value, not
     // by name, so the scalar allowlist below never sees the rewrite target:
-    // an unadmitted target would execute without passing it.
-    // `registered_expr_planners_are_pinned_for_every_table` pins the planner
-    // set and `tests/expr_planner_surface.rs` pins, per syntax, whether it
-    // plans.
+    // an unadmitted target would execute without passing it. Planner-rewritten
+    // syntax is governed instead by the planner pin
+    // (`registered_expr_planners_are_pinned_for_every_table`) and by
+    // `tests/expr_planner_surface.rs`, which pins per syntax whether it plans
+    // and which function the planned expression calls, and asserts every
+    // scalar it calls is in `ADMITTED_SCALARS`.
 
     // `col['key']` on a map column such as `logs.attrs`, and a string key on
     // a struct, to `get_field`, instead of failing with `GetFieldAccess not
@@ -1551,13 +1550,10 @@ mod tests {
     }
 
     /// The expression planners every session carries, in registration order
-    /// (issue #2476). A planner builds its rewrite target from the function
-    /// value, not by name, so the scalar allowlist above never sees what it
-    /// rewrites to: this pin is the drift guard for the planner set. A planner
-    /// appearing, disappearing, or moving fails here; whether each syntax
-    /// plans is pinned by `tests/expr_planner_surface.rs`. Neither guard sees
-    /// which function a planner rewrites to, so a changed rewrite target
-    /// under an unchanged planner name and syntax passes both.
+    /// (issues #2476 and #2583); why this pin exists is stated beside the
+    /// planner registrations in [`build_session`]. A planner appearing,
+    /// disappearing, or moving fails here; each syntax's outcome and rewrite
+    /// target are pinned by `tests/expr_planner_surface.rs`.
     ///
     /// Each name is the planner's `Debug` output cut at the first character
     /// that cannot be part of a Rust identifier. Every planner below derives
@@ -1568,18 +1564,21 @@ mod tests {
     #[test]
     fn registered_expr_planners_are_pinned_for_every_table() {
         const EXPECTED: [&str; 7] = [
-            // From `with_default_features()`. Struct literal `STRUCT(1, 2)` /
+            // From `with_default_features()`, admitted deliberately (ADR-0097,
+            // amendment of issue #2583). Struct literal `STRUCT(1, 2)` /
             // `STRUCT(1 AS a)` to `struct`/`named_struct`, dictionary literal
             // `{'a': 1}` to `named_struct`, `OVERLAY(x PLACING y FROM n)` to
             // `overlay`, and struct field access `s.a` to `get_field`. All four
             // targets are in ADMITTED_SCALARS.
             "CoreFunctionPlanner",
-            // From `with_default_features()`. Normalizes the arguments of an
-            // aggregate call such as `count()` / `count(*)`; it plans no new
-            // syntax and targets whichever admitted aggregate was named.
+            // From `with_default_features()`, admitted deliberately. Normalizes
+            // the arguments of an aggregate call such as `count()` /
+            // `count(*)`; it plans no new syntax and targets whichever admitted
+            // aggregate was named.
             "AggregateFunctionPlanner",
-            // From `with_default_features()`. The same normalization for a
-            // function used with `OVER`, such as `count(*) OVER ()`.
+            // From `with_default_features()`, admitted deliberately. The same
+            // normalization for a function used with `OVER`, such as
+            // `count(*) OVER ()`.
             "WindowFunctionPlanner",
             // `build_session`: `map_col['key']` subscript to `get_field`.
             "MapFieldAccessPlanner",
