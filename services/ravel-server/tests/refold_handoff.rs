@@ -168,14 +168,27 @@ impl Process {
         process_id: Uuid,
         shard_count: u32,
     ) -> Self {
-        let catalog = Catalog::new(
-            fold_store.clone(),
+        Self::with_catalog_config(
+            store,
+            fold_store,
+            tenant,
+            process_id,
             CatalogConfig {
                 shard_count,
                 ..CatalogConfig::default()
             },
         )
-        .expect("catalog builds");
+    }
+
+    fn with_catalog_config(
+        store: &Arc<MemoryStore>,
+        fold_store: Arc<dyn ObjectStoreBackend>,
+        tenant: &TenantId,
+        process_id: Uuid,
+        config: CatalogConfig,
+    ) -> Self {
+        let shard_count = config.shard_count;
+        let catalog = Catalog::new(fold_store.clone(), config).expect("catalog builds");
         let worker = WorkerSet::new(
             seal_now(FIRST_WATERMARK_HOUR),
             HEARTBEAT,
@@ -367,7 +380,11 @@ const NS_PER_MINUTE: i64 = 60_000_000_000;
 /// The hours `queue` holds for the tenant's metrics pair, ascending.
 fn pending_hours(queue: &RefoldQueue, tenant: &TenantId) -> Vec<u32> {
     queue
-        .peek(&tenant.hash(), Signal::Metrics)
+        .peek(
+            &tenant.hash(),
+            Signal::Metrics,
+            fold::REFOLD_ENTRY_HOURS_MAX,
+        )
         .hours()
         .collect()
 }
@@ -525,6 +542,58 @@ async fn a_failed_fold_keeps_its_request() {
     assert_eq!(report.refold_hours_reconciled, 1, "{report:?}");
     assert_eq!(queue.pending_len(), 0);
     assert_eq!(faults.fault_count(Op::Put, FaultKind::Permanent), 1);
+}
+
+/// The catalog reconciles at most `frontier_reconcile_max_hours` of a
+/// request's hours per fold, oldest first, so a fold tick passes only that
+/// many of the pair's oldest pending hours and removes only those. A request
+/// five hours past the cap keeps exactly its five largest hours queued after a
+/// fold that advanced the watermark. The oldest passed hour is the held one,
+/// and the fold reconciles it.
+///
+/// Flip to watch it fail: in `fold::run_tick`, pass `usize::MAX` to
+/// `refold.peek` instead of `refold_limit` (peek everything). The remainder is
+/// then empty, not the five largest hours.
+#[tokio::test]
+async fn a_request_past_the_per_fold_cap_keeps_its_remainder() {
+    const CAP: u32 = 4;
+    let store = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("refold-past-the-cap");
+    let process = Process::with_catalog_config(
+        &store,
+        store.clone(),
+        &tenant,
+        PROCESS_A,
+        CatalogConfig {
+            shard_count: 1,
+            frontier_reconcile_max_hours: CAP,
+            ..CatalogConfig::default()
+        },
+    );
+    let solo = process.worker.solo_live_set();
+    let parts = seed_late_compaction(&process, 0, &solo).await;
+
+    let queue = RefoldQueue::default();
+    queue.send(
+        tenant.hash(),
+        Signal::Metrics,
+        (OLD_HOUR..OLD_HOUR + CAP + 5).collect(),
+    );
+
+    let report = process
+        .fold_tick(seal_now(FIRST_WATERMARK_HOUR + 30), &solo, &queue)
+        .await;
+    assert_eq!(report.folded, vec![tenant.hash()], "{report:?}");
+    assert_eq!(report.no_op, Vec::new(), "the fold advanced the watermark");
+    assert_eq!(report.refold_hours_reconciled, 1, "{report:?}");
+    assert_eq!(
+        pending_hours(&queue, &tenant),
+        (OLD_HOUR + CAP..OLD_HOUR + CAP + 5).collect::<Vec<u32>>(),
+        "the hours past the cap stay queued"
+    );
+    assert_eq!(queue.pending_len(), 1);
+    assert_eq!(queue.dropped_requests(), 0);
+    assert_eq!(head_levels(&store, &tenant, OLD_HOUR).await, (0, parts));
 }
 
 /// With more than one maintain process, a process that sweeps a shard of a
