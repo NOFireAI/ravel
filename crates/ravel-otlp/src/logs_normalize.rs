@@ -780,16 +780,31 @@ fn too_deeply_nested(key: &str) -> LogRejection {
 /// [`MAX_ATTR_ENTRIES`] entries. It only names the reason for a value
 /// [`attr_value_fits_storage`] already refused: one that trips the entry cap
 /// is reported as [`LogRejection::AttributeTooManyEntries`], any other as too
-/// deeply nested. Recursion is bounded by [`MAX_ATTRIBUTE_NESTING_DEPTH`],
-/// since `value` came through `convert_value`.
+/// deeply nested. It counts depth as `convert_value` does and does not look
+/// past [`MAX_ATTRIBUTE_NESTING_DEPTH`], answering false for anything nested
+/// deeper: such a value is too deeply nested whatever it holds, and the bound
+/// keeps this recursion bounded for any value, not only one `convert_value`
+/// produced.
 fn has_container_past_entry_cap(value: &AttrValue) -> bool {
+    has_container_past_entry_cap_at(value, 1)
+}
+
+fn has_container_past_entry_cap_at(value: &AttrValue, depth: usize) -> bool {
+    if depth > MAX_ATTRIBUTE_NESTING_DEPTH {
+        return false;
+    }
     match value {
         AttrValue::List(items) => {
-            items.len() as u64 > MAX_ATTR_ENTRIES || items.iter().any(has_container_past_entry_cap)
+            items.len() as u64 > MAX_ATTR_ENTRIES
+                || items
+                    .iter()
+                    .any(|v| has_container_past_entry_cap_at(v, depth + 1))
         }
         AttrValue::Map(entries) => {
             entries.len() as u64 > MAX_ATTR_ENTRIES
-                || entries.iter().any(|(_, v)| has_container_past_entry_cap(v))
+                || entries
+                    .iter()
+                    .any(|(_, v)| has_container_past_entry_cap_at(v, depth + 1))
         }
         _ => false,
     }
@@ -853,22 +868,28 @@ fn convert_value(
     }
 }
 
-/// Payload bytes in an attribute value: its own string or bytes payload, plus
-/// nested entries (and their keys) for lists and maps. Scalars count as their
-/// stored width. This is what `max_attribute_value_len` bounds; it is a size
-/// measure over the value, not the exact length of the canonical encoding,
-/// which additionally carries type tags and length prefixes.
+/// The size `max_attribute_value_len` bounds. A string or bytes value counts
+/// its payload length, an integer or float 8, a bool 1. A list counts 1 for
+/// itself plus its items; a map counts 1 for itself plus, per entry, 1 for
+/// the entry, its key length and its value. So no value, however it is built,
+/// measures less than the number of containers and map entries it holds. The
+/// measure is a lower bound on the length of the canonical encoding, not that
+/// length: the encoding carries a type tag and a count or length prefix for
+/// every value as well.
 fn attr_value_len(value: &AttrValue) -> usize {
     match value {
         AttrValue::Str(s) => s.len(),
         AttrValue::Bytes(b) => b.len(),
         AttrValue::I64(_) | AttrValue::F64(_) => 8,
         AttrValue::Bool(_) => 1,
-        AttrValue::List(items) => items.iter().map(attr_value_len).sum(),
-        AttrValue::Map(entries) => entries
+        AttrValue::List(items) => items
             .iter()
-            .map(|(k, v)| k.len() + attr_value_len(v))
-            .sum(),
+            .fold(1usize, |acc, v| acc.saturating_add(attr_value_len(v))),
+        AttrValue::Map(entries) => entries.iter().fold(1usize, |acc, (k, v)| {
+            acc.saturating_add(1)
+                .saturating_add(k.len())
+                .saturating_add(attr_value_len(v))
+        }),
     }
 }
 
@@ -1458,6 +1479,63 @@ mod tests {
             proptest::prop_assert_eq!(&whole_set[..2], &[1u8, 0u8][..]);
             proptest::prop_assert_eq!(node.encoded, whole_set[2..].to_vec());
         }
+
+        /// No value measures less than its containers, its map entries and
+        /// its scalar payload bytes together, so a value built from empty
+        /// containers cannot pass the size limit at any size.
+        #[test]
+        fn attr_value_len_is_at_least_containers_entries_and_scalars(
+            value in arbitrary_attr_value()
+        ) {
+            let parts = SizeParts::of(&value);
+            let len = attr_value_len(&value);
+            proptest::prop_assert!(
+                len >= parts.containers + parts.entries + parts.scalar_bytes,
+                "{len} for {parts:?}"
+            );
+            proptest::prop_assert_eq!(
+                len,
+                parts.containers + parts.entries + parts.scalar_bytes + parts.key_bytes
+            );
+        }
+    }
+
+    /// The pieces of a value counted independently of [`attr_value_len`].
+    #[derive(Debug, Default)]
+    struct SizeParts {
+        containers: usize,
+        entries: usize,
+        scalar_bytes: usize,
+        key_bytes: usize,
+    }
+
+    impl SizeParts {
+        fn of(value: &AttrValue) -> Self {
+            let mut parts = Self::default();
+            parts.add(value);
+            parts
+        }
+
+        fn add(&mut self, value: &AttrValue) {
+            match value {
+                AttrValue::Str(s) => self.scalar_bytes += s.len(),
+                AttrValue::Bytes(b) => self.scalar_bytes += b.len(),
+                AttrValue::I64(_) | AttrValue::F64(_) => self.scalar_bytes += 8,
+                AttrValue::Bool(_) => self.scalar_bytes += 1,
+                AttrValue::List(items) => {
+                    self.containers += 1;
+                    items.iter().for_each(|v| self.add(v));
+                }
+                AttrValue::Map(entries) => {
+                    self.containers += 1;
+                    self.entries += entries.len();
+                    for (k, v) in entries {
+                        self.key_bytes += k.len();
+                        self.add(v);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1601,6 +1679,169 @@ mod tests {
                 max: limits.max_attribute_value_len,
             }]
         );
+    }
+
+    /// Normalize one record carrying a small string attribute and `value`
+    /// under the key "big".
+    fn normalize_with_big_attribute(value: AnyValueVariant) -> LogNormalizeOutput {
+        normalize(request(vec![resource_logs(
+            vec![],
+            vec![scope_logs(
+                "lib",
+                "1",
+                vec![record(
+                    Some(any(AnyValueVariant::StringValue("body".into()))),
+                    vec![string_kv("small", "v"), kv("big", value)],
+                    1,
+                )],
+            )],
+        )]))
+    }
+
+    /// A list of `n` empty lists measures 1 + n.
+    fn list_of_empty_lists(n: usize) -> AnyValueVariant {
+        AnyValueVariant::ArrayValue(ArrayValue {
+            values: vec![any(AnyValueVariant::ArrayValue(ArrayValue { values: vec![] })); n],
+        })
+    }
+
+    /// A map of `n` entries, each with an empty key and an empty map value,
+    /// measures 1 + 2n: the map, then per entry 1 for the entry and 1 for the
+    /// empty map.
+    fn map_of_empty_maps(n: usize) -> AnyValueVariant {
+        AnyValueVariant::KvlistValue(KeyValueList {
+            values: vec![
+                kv(
+                    "",
+                    AnyValueVariant::KvlistValue(KeyValueList { values: vec![] })
+                );
+                n
+            ],
+        })
+    }
+
+    fn assert_big_attribute_dropped(out: &LogNormalizeOutput, len: usize, max: usize) {
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(
+            out.records[0].attrs,
+            vec![("small".to_string(), AttrValue::Str("v".into()))]
+        );
+        assert_eq!(
+            out.rejected,
+            vec![LogRejection::AttributeValueTooLong { len, max }]
+        );
+    }
+
+    fn assert_big_attribute_kept(out: &LogNormalizeOutput) {
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.records.len(), 1);
+        let keys: Vec<&str> = out.records[0]
+            .attrs
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert!(keys.contains(&"big"), "{keys:?}");
+    }
+
+    #[test]
+    fn list_of_empty_lists_past_the_value_limit_drops_the_attribute() {
+        let max = LogIngestLimits::default().max_attribute_value_len;
+        let out = normalize_with_big_attribute(list_of_empty_lists(max));
+        assert_big_attribute_dropped(&out, max + 1, max);
+    }
+
+    #[test]
+    fn list_of_empty_lists_at_the_value_limit_is_kept() {
+        let max = LogIngestLimits::default().max_attribute_value_len;
+        assert_eq!(
+            attr_value_len(&AttrValue::List(vec![AttrValue::List(vec![]); max - 1])),
+            max
+        );
+        let out = normalize_with_big_attribute(list_of_empty_lists(max - 1));
+        assert_big_attribute_kept(&out);
+    }
+
+    /// With the default limit of 8192 a map of empty maps cannot land on the
+    /// limit exactly (1 + 2n is odd): 4096 entries measure 8193, one past it.
+    #[test]
+    fn map_of_empty_maps_past_the_value_limit_drops_the_attribute() {
+        let max = LogIngestLimits::default().max_attribute_value_len;
+        assert_eq!(max, 8192);
+        let out = normalize_with_big_attribute(map_of_empty_maps(4096));
+        assert_big_attribute_dropped(&out, max + 1, max);
+    }
+
+    /// 4095 entries measure 8191, the largest such map within the limit.
+    #[test]
+    fn map_of_empty_maps_under_the_value_limit_is_kept() {
+        let max = LogIngestLimits::default().max_attribute_value_len;
+        let value = AttrValue::Map(vec![(String::new(), AttrValue::Map(vec![])); 4095]);
+        assert_eq!(attr_value_len(&value), max - 1);
+        let out = normalize_with_big_attribute(map_of_empty_maps(4095));
+        assert_big_attribute_kept(&out);
+    }
+
+    #[test]
+    fn attr_value_len_counts_every_container_and_map_entry() {
+        let cases = [
+            (AttrValue::List(vec![]), 1),
+            (AttrValue::Map(vec![]), 1),
+            (AttrValue::List(vec![AttrValue::List(vec![]); 3]), 4),
+            (
+                AttrValue::Map(vec![("ab".to_string(), AttrValue::Bool(true))]),
+                5,
+            ),
+            (
+                AttrValue::List(vec![AttrValue::List(vec![AttrValue::Str("xyz".into())])]),
+                5,
+            ),
+            (AttrValue::Str("abcdefg".into()), 7),
+        ];
+        for (value, want) in cases {
+            assert_eq!(attr_value_len(&value), want, "{value:?}");
+        }
+    }
+
+    /// One list past the entry cap, built from bools so it stays cheap.
+    fn list_past_entry_cap() -> AttrValue {
+        let n = usize::try_from(MAX_ATTR_ENTRIES).expect("entry cap fits usize") + 1;
+        AttrValue::List(vec![AttrValue::Bool(true); n])
+    }
+
+    fn wrap_in_lists(mut value: AttrValue, levels: usize) -> AttrValue {
+        for _ in 0..levels {
+            value = AttrValue::List(vec![value]);
+        }
+        value
+    }
+
+    #[test]
+    fn entry_cap_check_stops_at_the_nesting_bound() {
+        let value = wrap_in_lists(AttrValue::Bool(true), MAX_ATTRIBUTE_NESTING_DEPTH + 50);
+        assert!(!has_container_past_entry_cap(&value));
+    }
+
+    #[test]
+    fn entry_cap_check_finds_an_over_cap_container_at_depth_1() {
+        assert!(has_container_past_entry_cap(&list_past_entry_cap()));
+    }
+
+    #[test]
+    fn entry_cap_check_finds_an_over_cap_container_at_depth_3() {
+        let value = wrap_in_lists(list_past_entry_cap(), 2);
+        assert!(has_container_past_entry_cap(&value));
+    }
+
+    /// The deepest level `convert_value` admits is still searched; one level
+    /// past it is not.
+    #[test]
+    fn entry_cap_check_ignores_an_over_cap_container_past_the_bound() {
+        let at_bound = wrap_in_lists(list_past_entry_cap(), MAX_ATTRIBUTE_NESTING_DEPTH - 1);
+        assert!(has_container_past_entry_cap(&at_bound));
+        let past_bound = wrap_in_lists(at_bound, 1);
+        assert!(!has_container_past_entry_cap(&past_bound));
+        let far_past = wrap_in_lists(past_bound, 49);
+        assert!(!has_container_past_entry_cap(&far_past));
     }
 
     #[test]
@@ -1860,8 +2101,8 @@ mod tests {
         }
     }
 
-    /// An array of `n` empty arrays: zero bytes under the value-length limit
-    /// however large `n` is. Built with one `vec!`, so linear in `n`.
+    /// An array of `n` empty arrays: 1 + n bytes under the value-length limit.
+    /// Built with one `vec!`, so linear in `n`.
     fn wide_array(n: usize) -> AnyValue {
         let empty = any(AnyValueVariant::ArrayValue(ArrayValue { values: vec![] }));
         any(AnyValueVariant::ArrayValue(ArrayValue {
@@ -1871,6 +2112,15 @@ mod tests {
 
     /// The entry cap as a count of `wide_array` elements.
     const ENTRY_CAP: usize = MAX_ATTR_ENTRIES as usize;
+
+    /// Limits under which `wide_array(ENTRY_CAP)` exactly fits the
+    /// value-length limit, so only the entry cap decides it.
+    fn entry_cap_limits() -> LogIngestLimits {
+        LogIngestLimits {
+            max_attribute_value_len: ENTRY_CAP + 1,
+            ..LogIngestLimits::default()
+        }
+    }
 
     fn too_many_entries(key: &str) -> LogRejection {
         LogRejection::AttributeTooManyEntries {
@@ -1919,7 +2169,7 @@ mod tests {
             vec![attr_kv("wide", wide_array(ENTRY_CAP))],
             vec![scope_logs("lib", "1", vec![record(body("a"), vec![], 1)])],
         );
-        let out = normalize(request(vec![at]));
+        let out = normalize_logs(request(vec![at]), &entry_cap_limits(), 5_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), 1);
         let decoded = ravel_logseg::record::decode_stream_attrs(&out.records[0].stream_attrs)
@@ -2005,18 +2255,22 @@ mod tests {
         assert_eq!(out.rejected, vec![too_many_entries("wide")]);
         assert_eq!(out.rejected[0].rejected_count(), 0);
 
-        let out = normalize(request(vec![resource_logs(
-            vec![],
-            vec![scope_logs(
-                "lib",
-                "1",
-                vec![record(
-                    Some(any(AnyValueVariant::StringValue("body".into()))),
-                    vec![attr_kv("wide", wide_array(ENTRY_CAP))],
-                    1,
+        let out = normalize_logs(
+            request(vec![resource_logs(
+                vec![],
+                vec![scope_logs(
+                    "lib",
+                    "1",
+                    vec![record(
+                        Some(any(AnyValueVariant::StringValue("body".into()))),
+                        vec![attr_kv("wide", wide_array(ENTRY_CAP))],
+                        1,
+                    )],
                 )],
-            )],
-        )]));
+            )]),
+            &entry_cap_limits(),
+            5_000,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         match &out.records[0].attrs[..] {
             [(key, AttrValue::List(items))] => {
