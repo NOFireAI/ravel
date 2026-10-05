@@ -473,6 +473,7 @@ maximum fresh.
 | `ravel_catalog_fold_failures_total` | Catalog folds of this signal that failed. The fold retries on the next tick and never fails a query directly. |
 | `ravel_catalog_fold_last_success_timestamp_seconds` | Gauge. Unix time of the last successful fold of this signal in this process, `0` if none has succeeded since it started. |
 | `ravel_catalog_fold_loop_restarts_total` | This signal's fold loop caught panicking and restarted by its supervisor in this process. Rendered under the same rule as the gauge above: only where the fold runs on a schedule. |
+| `ravel_catalog_fold_refold_requests_dropped_total` | Pending re-fold requests evicted from this process's in-memory queue because it already held 256 `(tenant, signal)` pairs, one per evicted pair. Labelled by `mode` only: one queue serves every signal. A maintain sweep that finds an hour held by a named snapshot queues it for the next fold of that pair; an evicted hour is queued again by the next sweep pass that finds the hold. Rendered under the same rule as the gauge above, and moves only in a `maintain` process, the one mode whose sweep feeds the queue. |
 
 A no-op fold counts as a cycle and advances the gauge. That is deliberate: a
 fold seals an ingest hour only once `max_flush_lifetime +

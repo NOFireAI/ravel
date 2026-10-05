@@ -2510,6 +2510,11 @@ pub struct CatalogCountersSnapshot {
     /// leaves it zeroed and the scrape handler fills it in through
     /// [`CatalogCountersSnapshot::with_fold_loop_restarts`].
     pub fold_loop_restarts: [u64; crate::fold::FOLD_SIGNALS.len()],
+    /// Pairs the process's [`crate::fold::RefoldQueue`] evicted because it was
+    /// full. Like `fold_loop_restarts`, left zeroed by
+    /// [`CatalogCountersSnapshot::from_catalog`] and filled in by the scrape
+    /// handler through [`CatalogCountersSnapshot::with_refold_requests_dropped`].
+    pub fold_refold_requests_dropped: u64,
 }
 
 impl Default for CatalogCountersSnapshot {
@@ -2522,6 +2527,7 @@ impl Default for CatalogCountersSnapshot {
             column_stats_decode_panics: 0,
             fold: CatalogFoldCounters::zeroed_per_signal(),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
+            fold_refold_requests_dropped: 0,
         }
     }
 }
@@ -2546,6 +2552,7 @@ impl CatalogCountersSnapshot {
                 last_success_unix_ns: catalog.fold_last_success_unix_ns(signal),
             }),
             fold_loop_restarts: [0; crate::fold::FOLD_SIGNALS.len()],
+            fold_refold_requests_dropped: 0,
         }
     }
 
@@ -2557,6 +2564,12 @@ impl CatalogCountersSnapshot {
         restarts: [u64; crate::fold::FOLD_SIGNALS.len()],
     ) -> Self {
         self.fold_loop_restarts = restarts;
+        self
+    }
+
+    /// Attaches [`crate::fold::RefoldQueue::dropped_requests`].
+    pub fn with_refold_requests_dropped(mut self, dropped: u64) -> Self {
+        self.fold_refold_requests_dropped = dropped;
         self
     }
 }
@@ -2728,6 +2741,21 @@ fn render_catalog_family(out: &mut String, mode: Mode, snapshot: &CatalogCounter
             restarts,
         );
     }
+
+    // One queue per process serves every signal, so this counter has no
+    // signal label.
+    write_header(
+        out,
+        "ravel_catalog_fold_refold_requests_dropped_total",
+        "Pending re-fold requests evicted from this process's in-memory queue because it already held its maximum of (tenant, signal) pairs, one per evicted pair. The maintain sweep sends a still-held hour again on its next pass that finds it.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_catalog_fold_refold_requests_dropped_total",
+        &[Label::Mode(mode)],
+        snapshot.fold_refold_requests_dropped,
+    );
 }
 
 /// ADR-0873 declared-statistics observability: decision 2's per-carrier drop
@@ -7678,6 +7706,10 @@ pub struct MetricsState {
     /// `ravel_catalog_fold_loop_restarts_total`, which renders under the same
     /// `Mode::runs_scheduled_fold` gate as the liveness gauge.
     pub fold_loop: Arc<crate::fold::FoldLoopMetrics>,
+    /// The process's one [`crate::fold::RefoldQueue`], the same handle the
+    /// fold and maintain loops share. Always present, like `fold_loop`. Read at
+    /// scrape time for `ravel_catalog_fold_refold_requests_dropped_total`.
+    pub refold: Arc<crate::fold::RefoldQueue>,
     /// The ADR-1702 runtime heartbeat, the same one the `--listen-health`
     /// listener reads when it is bound. Always present: `crate::start` builds
     /// and beats one in every mode. Read at scrape time for
@@ -7713,7 +7745,8 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     }
 
     let catalog_snapshot = CatalogCountersSnapshot::from_catalog(state.catalog.as_ref())
-        .with_fold_loop_restarts(state.fold_loop.restarts());
+        .with_fold_loop_restarts(state.fold_loop.restarts())
+        .with_refold_requests_dropped(state.refold.dropped_requests());
 
     let maintain_snapshot =
         state
@@ -13825,6 +13858,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
             can_fold: true,
             fold_loop: Default::default(),
+            refold: refold_queue_with_one_eviction(),
             heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
         };
 
@@ -13834,6 +13868,16 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             .await
             .expect("read body");
         let body = String::from_utf8(bytes.to_vec()).expect("metrics body is utf8");
+
+        // The same real handler reads the queue's eviction count: replace
+        // `state.refold.dropped_requests()` in [`metrics_handler`] with `0`
+        // and this fails.
+        assert_eq!(
+            body.matches("ravel_catalog_fold_refold_requests_dropped_total{mode=\"all\"} 1\n")
+                .count(),
+            1,
+            "the handler must render the queue's one eviction:\n{body}"
+        );
 
         assert!(
             body.contains("ravel_cache_resident_entries{mode=\"all\",cache=\"catalog\"} 0"),
@@ -13849,6 +13893,67 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             !body.contains("cache=\"catalog\",tier="),
             "a RAM-only catalog cache must render with no tier label:\n{body}"
         );
+    }
+
+    /// A one-pair queue that has evicted exactly one pair.
+    fn refold_queue_with_one_eviction() -> Arc<crate::fold::RefoldQueue> {
+        let queue = crate::fold::RefoldQueue::new(1);
+        for n in 1..=2 {
+            queue.send(
+                ravel_types::TenantHash([n; 16]),
+                Signal::Metrics,
+                std::collections::BTreeSet::from([u32::from(n)]),
+            );
+        }
+        assert_eq!(queue.dropped_requests(), 1);
+        Arc::new(queue)
+    }
+
+    /// The re-fold eviction counter renders from zero, and at the snapshot's
+    /// value with the mode as its only label, in exactly the modes that
+    /// schedule a fold, under the same gate as the loop-restart counter.
+    ///
+    /// Flip either line to watch it fail: in `render_catalog_family`, write
+    /// `0` instead of `snapshot.fold_refold_requests_dropped` (the `7` sample
+    /// is missing), or move the family above the `runs_scheduled_fold` gate
+    /// (it renders in query mode).
+    #[test]
+    fn refold_dropped_counter_renders_where_the_fold_is_scheduled() {
+        for (mode, label, renders) in [
+            (Mode::All, "all", true),
+            (Mode::Maintain, "maintain", true),
+            (Mode::Query, "query", false),
+            (Mode::Gateway, "gateway", false),
+        ] {
+            for dropped in [0, 7] {
+                let mut out = String::new();
+                let snapshot =
+                    CatalogCountersSnapshot::default().with_refold_requests_dropped(dropped);
+                render_catalog_family(&mut out, mode, &snapshot);
+                let sample = format!(
+                    "ravel_catalog_fold_refold_requests_dropped_total{{mode=\"{label}\"}} {dropped}\n"
+                );
+                assert_eq!(
+                    out.matches(&sample).count(),
+                    usize::from(renders),
+                    "{mode:?} at {dropped}:\n{out}"
+                );
+                assert_eq!(
+                    out.matches("ravel_catalog_fold_refold_requests_dropped_total{")
+                        .count(),
+                    usize::from(renders),
+                    "one series, no signal label, in {mode:?}:\n{out}"
+                );
+                assert_eq!(
+                    out.matches(
+                        "# TYPE ravel_catalog_fold_refold_requests_dropped_total counter\n"
+                    )
+                    .count(),
+                    usize::from(renders),
+                    "{mode:?}:\n{out}"
+                );
+            }
+        }
     }
 
     fn tenant_usage(tenant: &str, signal: Signal) -> TenantUsage {

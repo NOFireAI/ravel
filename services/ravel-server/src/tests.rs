@@ -231,6 +231,7 @@ fn harness(
         cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
+        refold: Default::default(),
         heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
     });
 
@@ -451,6 +452,7 @@ fn promql_harness(
         cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
+        refold: Default::default(),
         heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
     });
 
@@ -1253,6 +1255,7 @@ fn sql_budget_harness(
         cpu_gates: crate::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
+        refold: Default::default(),
         heartbeat: crate::health_listener::Heartbeat::new(Arc::new(SystemClock)),
     });
 

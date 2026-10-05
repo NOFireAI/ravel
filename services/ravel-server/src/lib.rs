@@ -2951,6 +2951,11 @@ pub async fn start_with_heartbeat(
     // loop that was never spawned, so it stays at the zero every counter starts
     // from, and the render gate omits it anyway.
     let fold_loop_metrics = Arc::new(fold::FoldLoopMetrics::default());
+    // The hours the maintain loop's sweeps find held by a named snapshot, handed
+    // to the next fold of the same pair (ADR-0063 section 4). Built in every
+    // mode so `/metrics` can read its eviction count. Only the maintain loop
+    // feeds it, so outside `Mode::Maintain` it stays empty.
+    let refold_queue = Arc::new(fold::RefoldQueue::default());
 
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
@@ -3006,6 +3011,7 @@ pub async fn start_with_heartbeat(
         // `Mode::mounts_on_demand_fold` for the route's mount gate.
         can_fold: config.folds_in_process(),
         fold_loop: fold_loop_metrics.clone(),
+        refold: refold_queue.clone(),
         heartbeat,
     };
 
@@ -3586,10 +3592,6 @@ pub async fn start_with_heartbeat(
     // instance the maintenance context injects rather than a second clock of
     // its own (ADR-1693 decision 6).
     let maintain_clock: Arc<dyn ravel_maintain::Clock> = Arc::new(maintain::WallClock);
-    // The hours the maintain loop's sweeps find held by a named snapshot, handed
-    // to the next fold of the same pair (ADR-0063 section 4). Only the
-    // maintain loop feeds it, so in `Mode::All` it stays empty.
-    let refold_queue = Arc::new(fold::RefoldQueue::default());
 
     let fold_tasks = if config.mode.runs_scheduled_fold() {
         // Background class (ADR-0070): fold is deferred maintenance traffic.
