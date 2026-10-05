@@ -1203,9 +1203,10 @@ now exactly two rules (issue #2055):
 2. zero errors from any statement outside the pre-registered failure set.
 
 The 0.101 error ratio is no longer a bar. The phase's raw error ratio stays
-in the report, and the bench prints it beside the RLOG entry's 0.101 as a
-comparison only: the two are measured over different statement sets, so
-neither is a threshold for the other.
+in the report, and the bench prints it beside the RLOG entry's 0.101. Both
+are every error over completed plus errored runs of the same ten-connection
+phase, so a gap between them is a real difference in which statements fail,
+to be explained, not a bar to pass.
 
 The reason is arithmetic. The phase cycles all 43 statements, so the five
 pre-registered failures (q19, q29, q33, q34, q35) failing exactly as

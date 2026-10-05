@@ -423,8 +423,8 @@ const REMOVED_KEYS: [(&str, &str); 1] = [(
 )];
 
 /// ADR-2023's concurrency error ratio on the RLOG entry. Printed beside the
-/// phase's `error_ratio` for comparison only: the two are measured over
-/// different statement sets, so neither is a bar for the other.
+/// phase's `error_ratio` and not judged: the registered failures alone put
+/// that ratio above it (ADR-2040's concurrency bar amendment).
 pub const RLOG_ERROR_RATIO: f64 = 0.101;
 
 /// `prereg.toml`, loaded and validated.
