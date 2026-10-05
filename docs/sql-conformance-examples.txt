@@ -67,14 +67,26 @@ Clause / operator	LIKE	SELECT count(*) FROM logs WHERE body LIKE '%record 1%'
 Clause / operator	LIMIT	SELECT ts, value FROM samples ORDER BY series_id, ts LIMIT 1
 Clause / operator	OFFSET	SELECT value FROM samples ORDER BY value OFFSET 1
 Clause / operator	ORDER BY	SELECT ts, value FROM samples ORDER BY ts
+Clause / operator	OVERLAY(x PLACING y FROM n)	SELECT OVERLAY('abc' PLACING 'x' FROM 2)
 Clause / operator	POSITION(x IN y)	SELECT POSITION('a' IN 'ab')
 Clause / operator	Projection	SELECT ts, value FROM samples ORDER BY series_id, ts
 Clause / operator	REGEXP_REPLACE backreference	SELECT regexp_replace('ab', '(a)(b)', '\2\1') FROM samples LIMIT 1
-Clause / operator	SUBSTRING(x FROM y FOR z)	SELECT SUBSTRING('abc' FROM 1 FOR 2)
+Clause / operator	STRUCT(...) literal	SELECT STRUCT(1, 2)['c1']
+Clause / operator	SUBSTRING(x FROM y FOR z)	SELECT SUBSTRING('abcdef' FROM 2 FOR 3)
+Clause / operator	SUBSTRING(x FROM y)	SELECT SUBSTRING('abcdef' FROM 3)
+Clause / operator	attrs['k'] map subscript	SELECT count(*) FROM logs WHERE attrs['dur'] = '10'
+Clause / operator	count()	SELECT count() FROM samples
+Clause / operator	count(*) OVER ()	SELECT max(c) FROM (SELECT count(*) OVER () AS c FROM samples)
 Clause / operator	count(DISTINCT)	SELECT count(DISTINCT series_id) FROM samples
 Clause / operator	date_part(minute)	SELECT date_part('minute', ts) FROM samples
 Clause / operator	declared i64 typed aggregate	SELECT sum(dur) FROM logs
 Clause / operator	declared i64 typed comparison	SELECT ts FROM logs WHERE dur >= 20
+Clause / operator	named_struct(...)['k'] subscript	SELECT named_struct('a', 1, 'b', 2)['b']
+Clause / operator	struct field s.a	SELECT s.b FROM (SELECT named_struct('a', 1, 'b', 2) AS s)
+Clause / operator	trace_id = '<32-hex>'	SELECT count(*) FROM spans WHERE trace_id = '01234567890123456789012345678901'
+Clause / operator	unquoted substr(x, y, z)	SELECT substr('abcdef', 2, 3)
+Clause / operator	unquoted substring(x, y, z)	SELECT substring('abcdef', 2, 3)
+Clause / operator	{'k': v} literal	SELECT {'a': 1, 'b': 2}['b']
 Scalar function	abs	SELECT abs(-3.5) FROM samples LIMIT 1
 Scalar function	current_date	SELECT current_date FROM samples
 Scalar function	current_time	SELECT current_time FROM samples

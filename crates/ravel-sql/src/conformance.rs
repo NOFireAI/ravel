@@ -22,11 +22,9 @@
 //!    nondeterministic scalars ([`crate::session::EXCLUDED_SCALARS`]) and the
 //!    excluded window functions ([`crate::session::EXCLUDED_WINDOWS`], ADR-0097
 //!    decisions 4 and 6), every write/DDL statement (the read-only
-//!    single-statement gate, [`crate::validate`]), a query spanning both
+//!    single-statement gate, [`crate::validate`]), and a query spanning both
 //!    signal tables ([`crate::error::SqlError::CrossSignalQuery`], ADR-0033
-//!    decision C), and the `POSITION(x IN y)` and `SUBSTRING(x FROM y FOR z)`
-//!    special forms, which no registered expression planner handles
-//!    ([`crate::error::SqlError::Plan`], issue #2476).
+//!    decision C).
 //! 3. [`Classification::Unclassified`]: implemented but untested, or
 //!    claimed-supported but actually wrong. This module declares no construct
 //!    into this state; it is the state a construct *falls into* when its
@@ -217,12 +215,6 @@ const E_CROSS_SIGNAL: &str = "SqlError::CrossSignalQuery";
 /// a registry gate; it fails closed inside DataFusion's sliding-window planner,
 /// so the conformance suite verifies it by executing the query.
 const E_SLIDING_AVG: &str = "SqlError::Execution";
-/// The typed error special-form syntax surfaces when no registered expression
-/// planner handles it (issue #2476): DataFusion's SQL-to-plan step refuses it,
-/// mapped to [`crate::error::SqlError::Plan`]. Like [`E_SLIDING_AVG`], it is not
-/// refused by [`crate::validate`], so the conformance suite verifies it by
-/// executing the query.
-const E_NO_EXPR_PLANNER: &str = "SqlError::Plan";
 
 /// One admitted upstream scalar *family* (ADR-0097 decision 8), attested by a
 /// single representative row rather than one row per member. The family row is
@@ -595,33 +587,66 @@ pub fn registry() -> Vec<Construct> {
         rationale: "substring pattern match via the Ravel like UDF",
     });
 
-    // Special-form string syntax with no registered expression planner (issue
-    // #2476). DataFusion plans these only through `UnicodeFunctionPlanner`,
-    // which `crate::session::build_session` does not register, so they are
-    // refused while planning. The function-call forms reach the admitted
-    // scalars instead. sqlparser reads an unquoted `substr(...)` or
-    // `substring(...)` call into the same refused node as the `FROM ... FOR`
-    // form, so only the double-quoted name is a working call.
-    // tests/expr_planner_surface.rs pins both refusals and both call forms.
-    out.push(Construct {
-        category: Category::Clause,
-        name: "POSITION(x IN y)".to_string(),
-        example: "SELECT POSITION('a' IN 'ab')".to_string(),
-        classification: Classification::IntentionallyRejected {
-            typed_error: E_NO_EXPR_PLANNER,
-        },
-        rationale: "no registered expression planner; call strpos(y, x) instead",
-    });
-    out.push(Construct {
-        category: Category::Clause,
-        name: "SUBSTRING(x FROM y FOR z)".to_string(),
-        example: "SELECT SUBSTRING('abc' FROM 1 FOR 2)".to_string(),
-        classification: Classification::IntentionallyRejected {
-            typed_error: E_NO_EXPR_PLANNER,
-        },
-        rationale: "no registered expression planner; call \"substr\"(x, y, z), name \
-                    double-quoted, instead",
-    });
+    // Syntax a registered expression planner rewrites into a function call
+    // (ADR-0097, amendment of issue #2583). Why the scalar allowlist does not
+    // see these rewrites is stated beside the planner registrations in
+    // `crate::session::build_session`.
+    let planner_syntax = [
+        // UnicodeFunctionPlanner, to `strpos` and `substr`.
+        ("POSITION(x IN y)", "SELECT POSITION('a' IN 'ab')"),
+        (
+            "SUBSTRING(x FROM y FOR z)",
+            "SELECT SUBSTRING('abcdef' FROM 2 FOR 3)",
+        ),
+        ("SUBSTRING(x FROM y)", "SELECT SUBSTRING('abcdef' FROM 3)"),
+        ("unquoted substr(x, y, z)", "SELECT substr('abcdef', 2, 3)"),
+        (
+            "unquoted substring(x, y, z)",
+            "SELECT substring('abcdef', 2, 3)",
+        ),
+        // CoreFunctionPlanner, to `overlay`, `struct`, `named_struct` and
+        // `get_field`.
+        (
+            "OVERLAY(x PLACING y FROM n)",
+            "SELECT OVERLAY('abc' PLACING 'x' FROM 2)",
+        ),
+        ("STRUCT(...) literal", "SELECT STRUCT(1, 2)['c1']"),
+        ("{'k': v} literal", "SELECT {'a': 1, 'b': 2}['b']"),
+        (
+            "struct field s.a",
+            "SELECT s.b FROM (SELECT named_struct('a', 1, 'b', 2) AS s)",
+        ),
+        // MapFieldAccessPlanner, to `get_field`.
+        (
+            "named_struct(...)['k'] subscript",
+            "SELECT named_struct('a', 1, 'b', 2)['b']",
+        ),
+        (
+            "attrs['k'] map subscript",
+            "SELECT count(*) FROM logs WHERE attrs['dur'] = '10'",
+        ),
+        // TraceIdHexLiteralPlanner, to a `FixedSizeBinary(16)` literal. The id
+        // is all digits so the generated doc carries no hash-shaped token.
+        (
+            "trace_id = '<32-hex>'",
+            "SELECT count(*) FROM spans WHERE trace_id = '01234567890123456789012345678901'",
+        ),
+        // AggregateFunctionPlanner and WindowFunctionPlanner.
+        ("count()", "SELECT count() FROM samples"),
+        (
+            "count(*) OVER ()",
+            "SELECT max(c) FROM (SELECT count(*) OVER () AS c FROM samples)",
+        ),
+    ];
+    for (name, example) in planner_syntax {
+        out.push(Construct {
+            category: Category::Clause,
+            name: name.to_string(),
+            example: example.to_string(),
+            classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
+            rationale: "syntax a registered expression planner rewrites (ADR-0097)",
+        });
+    }
 
     // --- Scalar functions (ADR-0097 decisions 4, 8) ----------------------
     // One representative row per admitted upstream family. The other members
