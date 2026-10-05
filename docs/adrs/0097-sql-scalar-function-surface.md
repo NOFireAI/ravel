@@ -40,7 +40,9 @@ last_value lead nth_value ntile percent_rank rank row_number`.
 The 134 scalars include the full string, unicode, datetime, math, regex, and
 encoding packs: `lower`, `upper`, `substr`, `substring`, `concat`,
 `starts_with`, `regexp_like`, `regexp_replace`, `date_trunc`, `date_part`,
-`to_char`, `floor`, `round`, `abs`, `coalesce`, all present and all executing.
+`to_char`, `floor`, `round`, `abs`, `coalesce`, all present and all executing
+(see the expression-planner amendment below: `substr` and `substring`
+executed only when called by a quoted name before it).
 They also include `uuid`, `random`, `rand`, `now`, `current_timestamp`, and
 `version`, which are nondeterministic or environment-reading.
 
@@ -302,7 +304,9 @@ surface from a false model, which is how this gap survived.
    sequential-accumulation concern does not apply to them, and removing
    working, differentially-tested capability serves nothing. The allowlist's
    purpose is to stop the surface growing without a decision, not to shrink
-   it.
+   it. The allowlist governs name resolution only; syntax an expression
+   planner rewrites is governed as the expression-planner amendment below
+   records.
 
    Two carve-outs are decided here rather than deferred. The
    nondeterministic and environment-reading scalars (`uuid`, `random`,
@@ -578,3 +582,63 @@ which answers exactly `ravel-pq://<tenant_hash>/` with that query's
 text above that treats the empty object-store registry as holding for every
 session holds for every session that reads no Parquet table; the code is
 `crates/ravel-sql/src/session.rs` and `crates/ravel-parquet/src/store.rs`.
+
+## Amendment (2026-10-05): expression-planner syntax is admitted deliberately (issue #2583)
+
+<!-- amendment-applies: sections="The live surface: 134 scalars, 11 window functions, 6 aggregates|Decision" pointer="expression-planner amendment" -->
+<!-- amendment-supersedes: phrase="all present and all executing" pointer="expression-planner amendment" -->
+
+Decision 2 governs functions reached by name. A DataFusion `ExprPlanner`
+reaches functions another way: it rewrites a piece of SQL syntax into a call
+it builds from the function value, so the call never passes the scalar
+allowlist. The allowlist governs name resolution only. Syntax a planner
+rewrites is governed by two things instead: the pinned planner set
+(`registered_expr_planners_are_pinned_for_every_table` in
+`crates/ravel-sql/src/session.rs`), and `crates/ravel-sql/tests/expr_planner_surface.rs`,
+which pins for each syntax whether it plans and which function the planned
+logical expression calls, asserts every scalar so called is in
+`ADMITTED_SCALARS`, and asserts its table covers all 13 `ExprPlanner`
+methods of DataFusion 54.1.
+
+Every session carries seven planners. Three come from DataFusion's
+`with_default_features()` and are admitted deliberately:
+
+- `CoreFunctionPlanner`: `STRUCT(1, 2)` to `struct`, `STRUCT(1 AS a)` and
+  the dictionary literal `{'a': 1}` to `named_struct`,
+  `OVERLAY(x PLACING y FROM n)` to `overlay`, and struct field access `s.a`
+  to `get_field`.
+- `AggregateFunctionPlanner`: normalizes the arguments of an aggregate call
+  such as `count()` or `count(*)`. It admits no new function; the call
+  targets whichever admitted aggregate was named.
+- `WindowFunctionPlanner`: the same normalization for a function used with
+  `OVER`, such as `count(*) OVER ()`.
+
+Four are registered by `build_session`:
+
+- `MapFieldAccessPlanner` (Ravel's): `col['key']` on a map or struct to
+  `get_field`. A subscript on `samples.labels` is refused while planning,
+  because that column is a dictionary-wrapped map `get_field` does not
+  accept; label values are read with `label(labels, 'name')`. Subscripting
+  `samples.labels` remains a gap.
+- `TraceIdHexLiteralPlanner` (Ravel's): `trace_id = '<32 hex digits>'` and
+  `<>` to a comparison against a `FixedSizeBinary(16)` literal, with no
+  function call.
+- `DatetimeFunctionPlanner` (DataFusion's): `EXTRACT(field FROM ts)` to
+  `date_part`.
+- `UnicodeFunctionPlanner` (DataFusion's, new with this amendment):
+  `POSITION(x IN y)` to `strpos`, and `SUBSTRING(x FROM n [FOR m])` to
+  `substr`. It is reachable through `datafusion-functions`, whose
+  `unicode_expressions` feature is already on, so no Cargo feature and no
+  `Cargo.lock` entry was added.
+
+Every target named above is in `ADMITTED_SCALARS` or is an admitted
+aggregate. The syntax that stays refused is the list index `'abc'[1]`, the
+array literal `[1, 2]`, `MAP {...}`, and the `@>` operator.
+
+**Correction.** The live-surface section listed `substr` and `substring` as
+callable. That was true only for a quoted name such as `"substr"(...)`.
+sqlparser reads an unquoted `substr(...)` or `substring(...)` call into the
+same node as `SUBSTRING(x FROM n)`, which only `plan_substring` plans, and
+until this amendment no registered planner implemented it, so every unquoted
+call failed to plan. With `UnicodeFunctionPlanner` registered, both unquoted
+spellings plan to `substr` and answer.
