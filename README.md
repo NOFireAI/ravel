@@ -156,10 +156,11 @@ GCS or Azure location an operator granted the tenant with
 `ravel-cli tenant parquet-grant add`, through a credential profile from the
 file `ravel-server --parquet-profiles` names. A statement reads only Parquet
 tables or one of the five tables above, never both, and a table reads exactly
-the file versions it was defined over. Tables will be created with
-`CREATE EXTERNAL TABLE ... STORED AS PARQUET`, which SQL does not accept yet;
-until it does, a Parquet table exists only where an operator wrote its
-manifest. Such a table is queried by name:
+the file versions it was defined over. A caller with the `ddl` capability,
+which is absent by default, creates a table with
+`CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION '...'` and removes it
+with `DROP TABLE` (see the [query guide](docs/guides/query.md)). Such a table
+is queried by name:
 
 ```text
 SELECT URL, count(*) AS c FROM hits WHERE CounterID = 62 GROUP BY URL ORDER BY c DESC LIMIT 10
