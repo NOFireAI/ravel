@@ -242,11 +242,13 @@ struct RefoldPending {
 /// their superseded inputs ([`ravel_maintain::SweepReport::blocked_named_hours`]).
 ///
 /// The queue holds one entry per pair, and a send for a pair already queued
-/// merges its hours into that entry. The fold tick reads a pair's hours with
+/// merges its hours into that entry. The fold tick reads at most the catalog's
+/// per-fold cap (`frontier_reconcile_max_hours`) of a pair's oldest hours with
 /// [`Self::peek`], passes them to [`Catalog::fold_with_refold_request`], and
-/// removes them with [`Self::remove_hours`] only after a fold that returned
-/// `Ok` and was not a no-op, so a request survives a no-op fold, a fresh skip,
-/// and a failed fold.
+/// removes those hours with [`Self::remove_hours`] only after a fold that
+/// returned `Ok` and was not a no-op, so a request survives a no-op fold, a
+/// fresh skip, and a failed fold, and the hours past the cap stay queued for
+/// the pair's next fold that advances the watermark.
 ///
 /// A queued hour is a hint, never a durability dependency. The queue lives in
 /// memory and is bounded at `capacity` pairs: a send for a new pair that finds
@@ -318,13 +320,14 @@ impl RefoldQueue {
         *next_seq += 1;
     }
 
-    /// The hours pending for `(tenant, signal)`, copied out and left queued.
-    /// Empty when nothing is pending.
-    pub fn peek(&self, tenant: &TenantHash, signal: Signal) -> RefoldRequest {
+    /// At most `limit` of the hours pending for `(tenant, signal)`, the
+    /// smallest ones, copied out and left queued. Empty when nothing is
+    /// pending.
+    pub fn peek(&self, tenant: &TenantHash, signal: Signal, limit: usize) -> RefoldRequest {
         self.lock()
             .entries
             .get(&(*tenant, signal))
-            .map(|entry| RefoldRequest::from_hours(entry.hours.iter().copied()))
+            .map(|entry| RefoldRequest::from_hours(entry.hours.iter().copied().take(limit)))
             .unwrap_or_default()
     }
 
@@ -792,11 +795,16 @@ async fn run_loop(
 /// Before discovery the tick removes from `refold` every entry of this signal
 /// whose pair this process does not own under `live_set`, logged at debug and
 /// not counted as dropped, so a pair whose ownership moved away does not pin a
-/// queue slot. Each maintained tenant is then folded with its pending hours,
-/// read with [`RefoldQueue::peek`] and left queued (empty when none is
-/// pending). They are removed with [`RefoldQueue::remove_hours`] only after a
-/// fold that returned `Ok` and was not a no-op; a no-op fold, a fresh skip, or
-/// a failed fold leaves them for the next tick.
+/// queue slot. Each maintained tenant is then folded with at most the
+/// catalog's `frontier_reconcile_max_hours` of its oldest pending hours, read
+/// with [`RefoldQueue::peek`] and left queued (empty when none is pending),
+/// since the catalog reconciles no more than that per fold. Those hours are
+/// removed with [`RefoldQueue::remove_hours`] only after a fold that returned
+/// `Ok` and was not a no-op; a no-op fold, a fresh skip, or a failed fold
+/// leaves them for the next tick, and the hours past the cap stay queued for
+/// the pair's next fold that is not a no-op. A first fold and a rebuild are
+/// not no-ops and reconcile none of the request's hours, yet the hours passed
+/// to them are removed too: both derive every hour from the commit layout.
 ///
 /// Public for the same reason [`crate::maintain::run_tick`] is: a test drives
 /// one deterministic cycle with an injected clock and an explicit live set,
@@ -847,12 +855,16 @@ pub async fn run_tick(
         ..FoldTickReport::default()
     };
 
+    // The catalog reconciles at most this many requested hours per fold, oldest
+    // first, so the tick takes no more than that and the rest stay queued.
+    let refold_take =
+        usize::try_from(catalog.config().frontier_reconcile_max_hours).unwrap_or(usize::MAX);
     for tenant in maintained {
         // The deployment-default retention window for this tenant, resolved
         // per tick from the CLI-derived RetentionConfig (ADR-0078). The fold
         // overlays the durable TenantConfig.retention_ns on top of it.
         let default_retention_ns = retention.window_for(&tenant);
-        let refold_request = refold.peek(&tenant, signal);
+        let refold_request = refold.peek(&tenant, signal, refold_take);
         match run_tenant_tick(
             catalog,
             store,
@@ -1586,7 +1598,7 @@ mod tests {
 
     /// The hours pending for one pair, ascending, for exact comparison.
     fn pending_hours(queue: &RefoldQueue, tenant: TenantHash, signal: Signal) -> Vec<u32> {
-        queue.peek(&tenant, signal).hours().collect()
+        queue.peek(&tenant, signal, usize::MAX).hours().collect()
     }
 
     /// An empty hour set is not an entry: it neither occupies a slot nor
@@ -1705,7 +1717,7 @@ mod tests {
         let tenant = refold_tenant(1);
         queue.send(tenant, Signal::Metrics, BTreeSet::from([5, 9]));
 
-        let taken = queue.peek(&tenant, Signal::Metrics);
+        let taken = queue.peek(&tenant, Signal::Metrics, usize::MAX);
         assert_eq!(taken.hours().collect::<Vec<u32>>(), vec![5, 9]);
         assert_eq!(queue.pending_len(), 1, "a peek removes nothing");
 
@@ -1717,5 +1729,42 @@ mod tests {
         queue.remove_hours(&tenant, Signal::Metrics, &RefoldRequest::from_hours([12]));
         assert_eq!(queue.pending_len(), 0);
         assert_eq!(queue.dropped_requests(), 0);
+    }
+
+    /// A limited peek returns the `limit` smallest hours and removes nothing;
+    /// removing them leaves exactly the larger ones.
+    ///
+    /// Flip to watch it fail: in [`RefoldQueue::peek`], drop the `.take(limit)`.
+    /// The peek then returns all five hours, not `[3, 5, 9]`.
+    #[test]
+    fn a_limited_peek_returns_the_smallest_hours() {
+        let queue = RefoldQueue::default();
+        let tenant = refold_tenant(1);
+        queue.send(tenant, Signal::Metrics, BTreeSet::from([20, 9, 3, 14, 5]));
+
+        let taken = queue.peek(&tenant, Signal::Metrics, 3);
+        assert_eq!(taken.hours().collect::<Vec<u32>>(), vec![3, 5, 9]);
+        assert_eq!(
+            pending_hours(&queue, tenant, Signal::Metrics),
+            vec![3, 5, 9, 14, 20],
+            "a peek removes nothing"
+        );
+        assert_eq!(
+            queue
+                .peek(&tenant, Signal::Metrics, 0)
+                .hours()
+                .collect::<Vec<u32>>(),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            queue
+                .peek(&tenant, Signal::Metrics, 6)
+                .hours()
+                .collect::<Vec<u32>>(),
+            vec![3, 5, 9, 14, 20]
+        );
+
+        queue.remove_hours(&tenant, Signal::Metrics, &taken);
+        assert_eq!(pending_hours(&queue, tenant, Signal::Metrics), vec![14, 20]);
     }
 }
