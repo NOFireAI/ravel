@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use ravel_catalog::{
     Catalog, CatalogConfig, DEFAULT_CLOCK_SKEW_ALLOWANCE_NS, DEFAULT_FOLD_SAFETY_MARGIN_NS,
     DEFAULT_MAX_FLUSH_LIFETIME_NS, DEFAULT_MAX_SNAPSHOT_PART_BYTES, PartLimits, decode_head,
@@ -651,15 +652,34 @@ fn split_tenant(live_ab: &[Uuid], shards: u32) -> (TenantId, u32) {
         .expect("some tenant splits shard 0 and another shard across A and B")
 }
 
-/// An entry for a pair whose shard 0 another live process owns is removed at
-/// the start of this process's fold tick for the signal, and not counted as
-/// dropped, so a pair whose ownership moved away does not pin a queue slot.
-/// The same entry under this process alone stays queued, so the removal
-/// follows ownership.
+/// Puts one object under the tenant's prefix, so discovery finds the tenant,
+/// and runs its first fold at `now_ns` with an empty queue. A fold tick at the
+/// same instant then skips the tenant as fresh, which leaves a request queued
+/// without folding it.
+async fn seed_folded_tenant(process: &Process, now_ns: i64, live_set: &[Uuid]) {
+    process
+        .store
+        .put(
+            &format!("t/{}/marker", process.tenant.hash().to_hex()),
+            Bytes::from_static(b"x"),
+            PutOptions::default(),
+        )
+        .await
+        .expect("seed the tenant prefix discovery lists");
+    let report = process
+        .fold_tick(now_ns, live_set, &RefoldQueue::default())
+        .await;
+    assert_eq!(report.folded, vec![process.tenant.hash()], "{report:?}");
+}
+
+/// An entry for a pair whose shard 0 another live process owns is removed by
+/// this process's fold tick for the signal, and not counted as dropped, so a
+/// pair whose ownership moved away does not pin a queue slot. The same entry
+/// under this process alone stays queued, so the removal follows ownership.
 ///
 /// Flip to watch it fail: in `fold::run_tick`, delete the
-/// `refold.remove_unless(...)` loop at the top. `pending_len` after the tick
-/// under `{A, B}` is then 1, not 0.
+/// `refold.remove_unless(...)` loop. `pending_len` after the tick under
+/// `{A, B}` is then 1, not 0.
 #[tokio::test]
 async fn an_entry_for_a_pair_this_process_does_not_fold_is_removed_uncounted() {
     const SHARDS: u32 = 8;
@@ -669,14 +689,55 @@ async fn an_entry_for_a_pair_this_process_does_not_fold_is_removed_uncounted() {
     let a = Process::new(&store, &tenant, PROCESS_A, SHARDS);
     let solo_a = a.worker.solo_live_set();
     let now = past_horizon_ns();
+    seed_folded_tenant(&a, now, &solo_a).await;
 
     let queue = RefoldQueue::default();
     queue.send(tenant.hash(), Signal::Metrics, BTreeSet::from([OLD_HOUR]));
-    a.fold_tick(now, &solo_a, &queue).await;
+    let report = a.fold_tick(now, &solo_a, &queue).await;
+    assert_eq!(report.skipped_fresh, vec![tenant.hash()], "{report:?}");
     assert_eq!(queue.pending_len(), 1, "A alone owns the pair and keeps it");
 
     let report = a.fold_tick(now, &live_ab, &queue).await;
     assert_eq!(report.owned, Vec::new());
     assert_eq!(queue.pending_len(), 0, "B owns shard 0, so A removed it");
     assert_eq!(queue.dropped_requests(), 0, "a removal is not a drop");
+}
+
+/// An entry for a tenant the tick does not maintain, here one deleted after
+/// the sweep sent its hours so discovery no longer finds it, is removed by the
+/// fold tick for the signal and not counted as dropped, although this process
+/// alone owns every pair. The same tick with the tenant's prefix back keeps
+/// the entry, so the removal follows the maintained set.
+///
+/// Flip to watch it fail: in `fold::run_tick`, drop
+/// `&& maintained_set.contains(tenant)` from the `remove_unless` predicate.
+/// `pending_len` after the first tick is then 1, not 0.
+#[tokio::test]
+async fn an_entry_for_a_tenant_the_tick_no_longer_maintains_is_removed_uncounted() {
+    let store = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("refold-deleted-tenant");
+    let process = Process::new(&store, &tenant, PROCESS_A, 1);
+    let solo = process.worker.solo_live_set();
+    let now = past_horizon_ns();
+
+    let queue = RefoldQueue::default();
+    queue.send(tenant.hash(), Signal::Metrics, BTreeSet::from([OLD_HOUR]));
+    let report = process.fold_tick(now, &solo, &queue).await;
+    assert_eq!(report.discovered, 0, "{report:?}");
+    assert_eq!(report.maintained, 0);
+    assert_eq!(
+        queue.pending_len(),
+        0,
+        "the tenant is gone, so its entry is"
+    );
+    assert_eq!(queue.dropped_requests(), 0, "a removal is not a drop");
+
+    // Control: the same entry for a tenant discovery finds stays queued.
+    seed_folded_tenant(&process, now, &solo).await;
+    queue.send(tenant.hash(), Signal::Metrics, BTreeSet::from([OLD_HOUR]));
+    let report = process.fold_tick(now, &solo, &queue).await;
+    assert_eq!(report.maintained, 1, "{report:?}");
+    assert_eq!(report.skipped_fresh, vec![tenant.hash()]);
+    assert_eq!(pending_hours(&queue, &tenant), vec![OLD_HOUR]);
+    assert_eq!(queue.dropped_requests(), 0);
 }

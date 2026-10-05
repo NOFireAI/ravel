@@ -34,7 +34,7 @@
 //! owned, and the behavior is byte-for-byte the unpartitioned fold
 //! (ADR-1693 decision 3).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -789,10 +789,13 @@ async fn run_loop(
 /// over the discovered set, so applying them in either order selects the same
 /// intersection.
 ///
-/// Before discovery the tick removes from `refold` every entry of this signal
-/// whose pair this process does not own under `live_set`, logged at debug and
-/// not counted as dropped, so a pair whose ownership moved away does not pin a
-/// queue slot. Each maintained tenant is then folded with at most
+/// After discovery and the lifecycle narrowing, before any fold, the tick
+/// removes from `refold` every entry of this signal whose pair this process
+/// does not own under `live_set` or whose tenant is not in the set this tick
+/// maintains, logged at debug and not counted as dropped. So neither a pair
+/// whose ownership moved away nor a tenant deleted after a send pins a queue
+/// slot. A discovery failure returns before that removal. Each maintained
+/// tenant is then folded with at most
 /// [`ravel_catalog::CatalogConfig::frontier_reconcile_max_hours`] of its
 /// oldest pending hours, the most the catalog reconciles from a request in one
 /// fold, read with [`RefoldQueue::peek`] and left queued (empty when none is
@@ -821,16 +824,6 @@ pub async fn run_tick(
     clock: &dyn Clock,
     refold: &RefoldQueue,
 ) -> Result<FoldTickReport, MaintainError> {
-    for (tenant, hours) in refold.remove_unless(signal, |tenant| {
-        worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD)
-    }) {
-        tracing::debug!(
-            tenant = %tenant.to_hex(),
-            signal = ?signal,
-            hours,
-            "catalog fold: removing a re-fold request for a pair this process no longer folds"
-        );
-    }
     let discovered = ravel_maintain::discover_tenants(store).await?;
     let mut owned = Vec::new();
     for tenant in &discovered {
@@ -845,6 +838,18 @@ pub async fn run_tick(
         }
     }
     let (maintained, excluded) = restrict_by_lifecycle(store, &owned, fallback_allow).await;
+    let maintained_set: HashSet<TenantHash> = maintained.iter().copied().collect();
+    for (tenant, hours) in refold.remove_unless(signal, |tenant| {
+        worker.owns_unit(live_set, tenant, signal, FOLD_UNIT_SHARD)
+            && maintained_set.contains(tenant)
+    }) {
+        tracing::debug!(
+            tenant = %tenant.to_hex(),
+            signal = ?signal,
+            hours,
+            "catalog fold: removing a re-fold request for a pair this tick does not fold"
+        );
+    }
     let mut report = FoldTickReport {
         discovered: discovered.len(),
         owned,
