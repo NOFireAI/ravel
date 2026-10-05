@@ -258,9 +258,12 @@ async fn metrics_render_queued_flush_families_named_by_the_flag_help() {
             ("ravel_ingest_queued_flushes", "gauge"),
             ("ravel_ingest_flush_trigger_deferred_total", "counter"),
             ("ravel_ingest_deferral_cap_refused_total", "counter"),
-            ("ravel_ingest_rerouted_flushes_total", "counter"),
             ("ravel_ingest_hand_back_failures_total", "counter"),
             ("ravel_ingest_teardown_unscanned_writes_total", "counter"),
+            (
+                "ravel_ingest_generation_mismatch_in_place_writes_total",
+                "counter",
+            ),
         ] {
             assert_eq!(
                 body.matches(&format!("# TYPE {family} {metric_type}"))
@@ -281,6 +284,72 @@ async fn metrics_render_queued_flush_families_named_by_the_flag_help() {
                     usize::from(expect_ingest)
                 );
             }
+        }
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// Issue #2600: the hand-back count split by reason and the in-place mismatch
+/// writes reach a real scrape, each series at exactly `0` on an idle process,
+/// wherever an ingest router exists, and nowhere else. The reason split
+/// replaces the family's one series per signal: no sample without a `reason`
+/// label remains.
+#[tokio::test]
+async fn metrics_render_hand_back_reason_and_in_place_writes_from_zero() {
+    for (mode, mode_label, expect_ingest) in [
+        (Mode::All, "all", true),
+        (Mode::Gateway, "gateway", true),
+        (Mode::Query, "query", false),
+        (Mode::Maintain, "maintain", false),
+    ] {
+        let running = start_test_server(mode, u64::MAX, false).await;
+        let base = format!("http://{}", running.http_addr);
+        let body = reqwest::Client::new()
+            .get(format!("{base}/metrics"))
+            .send()
+            .await
+            .expect("metrics request completes")
+            .text()
+            .await
+            .expect("metrics body is text");
+
+        let mut expected_rerouted = Vec::new();
+        let mut expected_in_place = Vec::new();
+        if expect_ingest {
+            for signal in ["metrics", "logs", "spans"] {
+                for reason in ["retired_index", "generation_mismatch"] {
+                    expected_rerouted.push(format!(
+                        "ravel_ingest_rerouted_flushes_total{{mode=\"{mode_label}\",signal=\"{signal}\",reason=\"{reason}\"}} 0"
+                    ));
+                }
+                expected_in_place.push(format!(
+                    "ravel_ingest_generation_mismatch_in_place_writes_total{{mode=\"{mode_label}\",signal=\"{signal}\"}} 0"
+                ));
+            }
+        }
+        assert_eq!(
+            mode_only_samples(&body, "ravel_ingest_rerouted_flushes_total"),
+            expected_rerouted,
+            "mode {mode:?}:\n{body}"
+        );
+        assert_eq!(
+            mode_only_samples(
+                &body,
+                "ravel_ingest_generation_mismatch_in_place_writes_total"
+            ),
+            expected_in_place,
+            "mode {mode:?}:\n{body}"
+        );
+        for family in [
+            "ravel_ingest_rerouted_flushes_total",
+            "ravel_ingest_generation_mismatch_in_place_writes_total",
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {family} counter\n")).count(),
+                usize::from(expect_ingest),
+                "mode {mode:?} declares {family}:\n{body}"
+            );
         }
 
         running.shutdown().await.expect("graceful shutdown");
