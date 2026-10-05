@@ -3118,3 +3118,66 @@ async fn sweep_reports_only_the_hours_a_named_snapshot_blocked() {
         );
     }
 }
+
+/// A group held because the HEAD snapshot could not be read is not a Named
+/// hold, so its hour is not in [`SweepReport::blocked_named_hours`]: no re-fold
+/// releases a HEAD nobody can decode. The same fixture with HEAD readable
+/// reports the hour, so the hold is real and only its reason differs.
+///
+/// Flip-line proof: in `sweep_superseded_impl`, add
+/// `outcome.blocked_named_hours.insert(group.ingest_hour_bucket);` to the
+/// `SnapshotBlock::Unreadable` arm: the unreadable pass then reports
+/// `{OLD_HOUR}` and the first `blocked_named_hours` assertion fails.
+#[tokio::test]
+async fn an_unreadable_snapshot_hold_is_not_a_named_hour() {
+    for zoned in [false, true] {
+        let mem = Arc::new(MemoryStore::new());
+        let created = sealed_now_ns();
+        let clock = FixedClock::new(created);
+        seed_two_hours(mem.as_ref()).await;
+        fold_head(&mem, created, 1, None).await;
+        run_rewrite(mem.as_ref(), &clock).await;
+        clock.set(past_horizon(created));
+
+        let plan = FaultPlan::empty()
+            .with_rule(
+                Rule::new(Op::Get, ScriptedFault::CorruptRange).with_key_contains(head_key()),
+            )
+            .with_rule(Rule::new(Op::Delete, ScriptedFault::Timeout));
+        let store = FaultStore::new(mem.clone(), plan);
+        let report = combined_pass(&store, &clock, &NoLeases, zoned).await;
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::CorruptRange),
+            1,
+            "exactly one HEAD GET this pass, and it was corrupted (zoned: {zoned})"
+        );
+        assert_eq!(
+            report.blocked_named_hours,
+            BTreeSet::new(),
+            "an unreadable hold is not a Named hour (zoned: {zoned}): {report:?}"
+        );
+        assert_eq!(
+            (
+                report.superseded_held_by_snapshot,
+                report.superseded_held_by_unreadable_head,
+            ),
+            (0, 4),
+            "the group is held for the Unreadable reason (zoned: {zoned})"
+        );
+        assert_eq!(store.fault_count(Op::Delete, FaultKind::Timeout), 0);
+
+        let report = combined_pass(mem.as_ref(), &clock, &NoLeases, zoned).await;
+        assert_eq!(
+            report.blocked_named_hours,
+            BTreeSet::from([OLD_HOUR]),
+            "readable, the same hold is Named (zoned: {zoned}): {report:?}"
+        );
+        assert_eq!(
+            (
+                report.superseded_held_by_snapshot,
+                report.superseded_held_by_unreadable_head,
+            ),
+            (4, 0)
+        );
+    }
+}
