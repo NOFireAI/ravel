@@ -2951,6 +2951,11 @@ pub async fn start_with_heartbeat(
     // loop that was never spawned, so it stays at the zero every counter starts
     // from, and the render gate omits it anyway.
     let fold_loop_metrics = Arc::new(fold::FoldLoopMetrics::default());
+    // The hours the maintain loop's sweeps find held by a named snapshot, handed
+    // to the next fold of the same pair (ADR-0063 section 4). Built in every
+    // mode so `/metrics` can read its eviction count. Only the maintain loop
+    // feeds it, so outside `Mode::Maintain` it stays empty.
+    let refold_queue = Arc::new(fold::RefoldQueue::default());
 
     // Mounted unconditionally: the store and catalog above are built in every
     // mode, so `/metrics` is too (ADR-0044 section 4), including maintain,
@@ -3006,6 +3011,7 @@ pub async fn start_with_heartbeat(
         // `Mode::mounts_on_demand_fold` for the route's mount gate.
         can_fold: config.folds_in_process(),
         fold_loop: fold_loop_metrics.clone(),
+        refold: refold_queue.clone(),
         heartbeat,
     };
 
@@ -3604,6 +3610,7 @@ pub async fn start_with_heartbeat(
             live_set_rx,
             maintain_clock.clone(),
             fold_loop_metrics.clone(),
+            refold_queue.clone(),
         )?
     } else {
         fold::FoldTasks::none()
@@ -3640,6 +3647,7 @@ pub async fn start_with_heartbeat(
             maintain_worker.clone(),
             live_set_tx.clone(),
             maintain_clock.clone(),
+            refold_queue.clone(),
         )
         .map_err(|e| match e {
             maintain::SpawnError::GcConfig(e) => {

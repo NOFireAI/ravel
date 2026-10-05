@@ -268,6 +268,7 @@ impl Process {
             &self.worker,
             live_set,
             &clock,
+            &fold::RefoldQueue::default(),
         )
         .await
         .expect("tenant discovery succeeds")

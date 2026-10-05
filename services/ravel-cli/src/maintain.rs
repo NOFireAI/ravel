@@ -1522,6 +1522,9 @@ pub async fn sweep_at(
         superseded_held_by_snapshot,
         superseded_held_by_unreadable_head,
         superseded_held_by_pinned_window,
+        // Consumed by the server's maintain loop as a re-fold request; this
+        // CLI runs no fold, and the Named hold count above covers them.
+        blocked_named_hours: _,
         unnamed_markers,
         unnamed_marker_reap,
         superseded_groups_held_by_legal_hold,

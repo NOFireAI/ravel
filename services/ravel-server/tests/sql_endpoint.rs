@@ -1490,6 +1490,7 @@ fn ddl_metrics_router(
         cpu_gates: ravel_server::cpu_gates::CpuGates::new(Default::default()),
         can_fold: true,
         fold_loop: Default::default(),
+        refold: Default::default(),
         heartbeat: ravel_server::health_listener::Heartbeat::new(Arc::new(
             ravel_ingest::SystemClock,
         )),
