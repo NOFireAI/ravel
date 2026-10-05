@@ -1048,9 +1048,15 @@ pub(crate) struct ShardActor {
     /// The router's generation state, for the scan-set check at flush open
     /// and the hand-back it may lead to (ADR-1642 scan-set amendment).
     scope: Arc<dyn FlushScope<ShardMsg>>,
-    /// Set by a hand-back and cleared by the next flush that opens in place,
-    /// so a run of hand-backs on this shard logs one WARN.
+    /// Set by a hand-back and cleared by the next flush that opens in place
+    /// with nothing handed back, inside the scan set or written in place over
+    /// a generation mismatch, so a run of hand-backs on this shard logs one
+    /// WARN.
     handing_back: bool,
+    /// Tenants whose last generation-mismatch flush was written in place, so
+    /// a run of such writes logs one WARN per tenant. A flush of the tenant
+    /// that opens inside the scan set, or hands every row over, removes it.
+    writing_in_place: HashSet<TenantHash>,
     /// Set for a drain's last pass over buffers a generation-mismatch
     /// hand-back left undelivered: a hand-back that fails again there writes
     /// the rows in place, so the drain does not answer with them buffered.
@@ -1120,6 +1126,7 @@ impl ShardActor {
             cap_flag,
             scope,
             handing_back: false,
+            writing_in_place: HashSet::new(),
             mismatch_in_place: false,
             drain_rereads: None,
         }
@@ -2214,6 +2221,7 @@ impl ShardActor {
         {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
+                self.writing_in_place.remove(&tenant_hash);
                 buf
             }
             ScanCheck::HandBack {
@@ -2235,17 +2243,20 @@ impl ShardActor {
                     Err(WriteError::Abandoned(DEFERRAL_CAP_ABANDONED.into())),
                 );
                 self.metrics.record_generation_mismatch_written_in_place();
-                tracing::warn!(
-                    signal = ?self.ctx.signal,
-                    shard = self.shard,
-                    tenant_hash = %tenant_hash.to_hex(),
-                    ingest_hour_bucket,
-                    target_count,
-                    "ravel-ingest: a generation-mismatch hand-back kept failing for the flush \
-                     deferral cap; writing the flush in place in an ingest hour another shard \
-                     generation owns; readers find the rows, but a pushdown split over this \
-                     hour may see their series at two shard indices"
-                );
+                self.handing_back = false;
+                if self.writing_in_place.insert(tenant_hash) {
+                    tracing::warn!(
+                        signal = ?self.ctx.signal,
+                        shard = self.shard,
+                        tenant_hash = %tenant_hash.to_hex(),
+                        ingest_hour_bucket,
+                        target_count,
+                        "ravel-ingest: a generation-mismatch hand-back kept failing for the \
+                         flush deferral cap; writing the flush in place in an ingest hour \
+                         another shard generation owns; readers find the rows, but a pushdown \
+                         split over this hour may see their series at two shard indices"
+                    );
+                }
                 buf
             }
             ScanCheck::HandBack {
@@ -2272,6 +2283,7 @@ impl ShardActor {
                 }
                 let target_dead = handed.target_dead;
                 let Some(mut buf) = handed.kept else {
+                    self.writing_in_place.remove(&tenant_hash);
                     return;
                 };
                 buf.stale_view_counted = false;
@@ -2282,19 +2294,24 @@ impl ShardActor {
                     && (target_dead || !enforced || self.mismatch_in_place)
                 {
                     self.metrics.record_generation_mismatch_written_in_place();
-                    tracing::warn!(
-                        signal = ?self.ctx.signal,
-                        shard = self.shard,
-                        tenant_hash = %tenant_hash.to_hex(),
-                        ingest_hour_bucket,
-                        target_count,
-                        target_dead,
-                        "ravel-ingest: writing a flush in place in an ingest hour another \
-                         shard generation owns, because a hand-back target shard is dead, \
-                         condemned or closed, or a drain found its mailbox still full; \
-                         readers find the rows, but a pushdown split over this hour may see \
-                         their series at two shard indices"
-                    );
+                    if !handed.delivered {
+                        self.handing_back = false;
+                    }
+                    if self.writing_in_place.insert(tenant_hash) {
+                        tracing::warn!(
+                            signal = ?self.ctx.signal,
+                            shard = self.shard,
+                            tenant_hash = %tenant_hash.to_hex(),
+                            ingest_hour_bucket,
+                            target_count,
+                            target_dead,
+                            "ravel-ingest: writing a flush in place in an ingest hour another \
+                             shard generation owns, because a hand-back target shard is dead, \
+                             condemned or closed, or a drain found its mailbox still full; \
+                             readers find the rows, but a pushdown split over this hour may \
+                             see their series at two shard indices"
+                        );
+                    }
                     buf
                 } else if enforced {
                     if reason == HandBackReason::GenerationMismatch {
@@ -4468,6 +4485,143 @@ mod tests {
         assert_eq!(rig.budget.in_flight_bytes(), 0, "the charge is released");
         assert_eq!(rig.own_commits().await, 1, "one teardown write");
         assert_eq!(rig.own_samples().await, 6, "every handed-back row, once");
+        rig.task.await.expect("actor ends");
+    }
+
+    /// Text of the hand-back WARN, and of the two in-place WARNs of
+    /// `flush_tenant`'s generation-mismatch arms.
+    const HAND_BACK_WARN: &str = "handing its rows to that hour's shard generation";
+    const DEAD_TARGET_WARN: &str = "because a hand-back target shard is dead";
+    const RETRY_SPENT_WARN: &str = "kept failing for the flush deferral cap";
+
+    /// Three flushes in a row that each write a generation mismatch in place,
+    /// for a hand-back target that is not live, log one WARN and move the
+    /// in-place counter by exactly 3. A flush that opens inside the scan set
+    /// ends the run, so the next in-place write warns again.
+    ///
+    /// Guards: `self.writing_in_place.insert(tenant_hash)` gating the WARN in
+    /// the in-place branch of `flush_tenant`'s hand-back arm: without it the
+    /// run logs three WARNs. And `self.writing_in_place.remove(&tenant_hash)`
+    /// in the `InScanSet` arm: without it the write after the in-scan flush
+    /// logs nothing.
+    #[tokio::test]
+    async fn a_run_of_in_place_mismatch_writes_warns_once() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        for _ in 0..3 {
+            drop(rig.write(4_096).await);
+            rig.flush_now().await;
+        }
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            3
+        );
+        assert_eq!(rig.own_commits().await, 3);
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1, "one WARN for the run");
+
+        rig.scope.set(ScanCheck::InScanSet, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        rig.scope.set(MISMATCH, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            4
+        );
+        assert_eq!(rig.own_commits().await, 5);
+        assert_eq!(
+            warns.count(DEAD_TARGET_WARN),
+            2,
+            "the in-scan flush ended the run"
+        );
+        assert_eq!(warns.count(HAND_BACK_WARN), 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The same for the arm that writes in place once a generation-mismatch
+    /// hand-back has kept failing for the deferral cap, here zero: each drain
+    /// retries the hand-back once, then writes in place, and two such drains
+    /// log one WARN.
+    ///
+    /// Guard: `self.writing_in_place.insert(tenant_hash)` gating the WARN in
+    /// `flush_tenant`'s `mismatch_retry_spent(..)` arm: without it the two
+    /// writes log two WARNs.
+    #[tokio::test]
+    async fn a_run_of_retry_spent_in_place_writes_warns_once() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(7200),
+            ..IngestConfig::default()
+        };
+        assert_eq!(config.flush_deferral_cap_ns(), 0);
+        let (target, _inbox) = full_target();
+        let rig = HandBackRig::with(MISMATCH, Some(target), config);
+        rig.scope.set_wait(false);
+        for _ in 0..2 {
+            drop(rig.write(4_096).await);
+            rig.flush_now().await;
+        }
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.hand_back_failures, 2, "each buffer was retried once");
+        assert_eq!(snap.generation_mismatch_written_in_place, 2);
+        assert_eq!(warns.count(RETRY_SPENT_WARN), 1, "one WARN for the run");
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 0);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A run of hand-backs logs one WARN, and a flush written in place over
+    /// a generation mismatch, with nothing handed back, ends the run: the
+    /// next hand-back warns again.
+    ///
+    /// Guard: `self.handing_back = false` under `!handed.delivered` in the
+    /// in-place branch of `flush_tenant`'s hand-back arm: without it the
+    /// last hand-back logs nothing.
+    #[tokio::test]
+    async fn an_in_place_write_ends_a_hand_back_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let (target, _inbox) = mpsc::channel(64);
+        let rig = HandBackRig::with(HAND_BACK, Some(target.clone()), config);
+        for _ in 0..2 {
+            drop(rig.write(4_096).await);
+            rig.flush_now().await;
+        }
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 2);
+        assert_eq!(warns.count(HAND_BACK_WARN), 1, "one WARN for the run");
+
+        rig.scope.set(MISMATCH, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            1
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        rig.scope.set(HAND_BACK, Some(target));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 3);
+        assert_eq!(
+            warns.count(HAND_BACK_WARN),
+            2,
+            "the in-place write ended the run"
+        );
+        drop(rig.tx);
         rig.task.await.expect("actor ends");
     }
 
