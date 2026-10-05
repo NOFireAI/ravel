@@ -50,6 +50,7 @@ use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use crate::config::Mode;
 use crate::tenant_discovery::restrict_by_lifecycle;
 
 /// Default `fold_interval`: 5 minutes.
@@ -548,6 +549,19 @@ pub fn spawn(
         handles.push(handle);
     }
     Ok(FoldTasks { shutdown, handles })
+}
+
+/// The queue [`crate::maintain::spawn`] sends its sweeps' held hours to:
+/// `queue` when this process spawns the scheduled fold loops that take from
+/// it (`mode` runs the scheduled fold and `config` enables it, the same
+/// condition [`spawn`] starts them under), otherwise `None`, so a process
+/// with no fold to take a request queues nothing.
+pub fn refold_queue_for_maintain(
+    mode: Mode,
+    config: &FoldTaskConfig,
+    queue: &Arc<RefoldQueue>,
+) -> Option<Arc<RefoldQueue>> {
+    (mode.runs_scheduled_fold() && config.enabled).then(|| Arc::clone(queue))
 }
 
 /// Everything one fold-loop attempt needs, bundled so the supervisor can clone
@@ -1729,6 +1743,31 @@ mod tests {
         queue.remove_hours(&tenant, Signal::Metrics, &RefoldRequest::from_hours([12]));
         assert_eq!(queue.pending_len(), 0);
         assert_eq!(queue.dropped_requests(), 0);
+    }
+
+    /// The maintain loop gets the queue only in a process whose scheduled fold
+    /// loops are spawned: a mode that runs the scheduled fold, with the fold
+    /// enabled. A maintain process with the fold disabled, and a mode with no
+    /// scheduled fold, get `None`.
+    ///
+    /// Flip to watch it fail: in [`refold_queue_for_maintain`], return
+    /// `Some(Arc::clone(queue))` unconditionally. The disabled maintain case
+    /// is then `Some`, not `None`.
+    #[test]
+    fn the_maintain_loop_gets_the_queue_only_where_the_fold_runs() {
+        let queue = Arc::new(RefoldQueue::default());
+        let fold = |enabled| FoldTaskConfig {
+            enabled,
+            fold_interval: DEFAULT_FOLD_INTERVAL,
+        };
+        let given = |mode, enabled| {
+            refold_queue_for_maintain(mode, &fold(enabled), &queue)
+                .map(|given| Arc::ptr_eq(&given, &queue))
+        };
+        assert_eq!(given(Mode::Maintain, true), Some(true));
+        assert_eq!(given(Mode::Maintain, false), None);
+        assert_eq!(given(Mode::Query, true), None);
+        assert_eq!(given(Mode::Query, false), None);
     }
 
     /// A limited peek returns the `limit` smallest hours and removes nothing;

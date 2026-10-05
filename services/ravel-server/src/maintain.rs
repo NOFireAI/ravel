@@ -1364,7 +1364,9 @@ fn compactor_config_from_gc(
 ///
 /// `refold` is the process's one [`RefoldQueue`], shared with
 /// [`crate::fold::spawn`]: each tenant tick sends the hours its sweeps found
-/// held by a named snapshot ([`run_tick_with_refold`]).
+/// held by a named snapshot ([`run_tick_with_refold`]). `None` when this
+/// process runs no scheduled fold to take them
+/// ([`crate::fold::refold_queue_for_maintain`]); the sweeps then send nothing.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
@@ -1377,7 +1379,7 @@ pub fn spawn(
     worker: Arc<WorkerSet>,
     live_tx: Arc<watch::Sender<Vec<Uuid>>>,
     clock: Arc<dyn Clock>,
-    refold: Arc<RefoldQueue>,
+    refold: Option<Arc<RefoldQueue>>,
 ) -> Result<MaintenanceTasks, SpawnError> {
     if !config.enabled {
         return Ok(MaintenanceTasks::none());
@@ -1481,8 +1483,8 @@ struct LoopContext {
     /// membership view (ADR-1693 decision 1).
     live_tx: Arc<watch::Sender<Vec<Uuid>>>,
     /// Where each tenant tick sends its sweeps' Named-blocked hours for the
-    /// scheduled fold.
-    refold: Arc<RefoldQueue>,
+    /// scheduled fold; `None` when this process runs no scheduled fold.
+    refold: Option<Arc<RefoldQueue>>,
     /// Called once at the top of every cycle body, inside the `catch_unwind`
     /// boundary. A no-op in production; a test seam for driving a panic through
     /// the supervisor.
@@ -1847,7 +1849,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                         &worker,
                         &live_set,
                         &SharedClock(Arc::clone(&clock)),
-                        Some(refold.as_ref()),
+                        refold.as_deref(),
                     )
                     .await;
 
@@ -1970,7 +1972,8 @@ pub async fn reap_query_worker_heartbeats(
 /// cycle.
 ///
 /// `refold`, when given, is passed to every tenant tick
-/// ([`run_tick_with_refold`]); the running service always gives one.
+/// ([`run_tick_with_refold`]); the running service gives one only when its
+/// scheduled fold runs ([`crate::fold::refold_queue_for_maintain`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_discovery_cycle<C: Clock + Clone + 'static>(
     store: &dyn ObjectStoreBackend,
@@ -7651,7 +7654,7 @@ mod tests {
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
-                refold: Arc::new(RefoldQueue::default()),
+                refold: Some(Arc::new(RefoldQueue::default())),
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
@@ -9712,7 +9715,7 @@ mod tests {
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
-                refold: Arc::new(RefoldQueue::default()),
+                refold: Some(Arc::new(RefoldQueue::default())),
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
@@ -9803,7 +9806,7 @@ mod tests {
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
-                refold: Arc::new(RefoldQueue::default()),
+                refold: Some(Arc::new(RefoldQueue::default())),
                 cycle_hook: Arc::new(|| {}),
             },
             shutdown_rx,
@@ -9888,7 +9891,7 @@ mod tests {
                 clock: Arc::new(clock.clone()),
                 live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
                 worker,
-                refold: Arc::new(RefoldQueue::default()),
+                refold: Some(Arc::new(RefoldQueue::default())),
                 cycle_hook: Arc::new(|| {}),
             }
         };
@@ -9993,7 +9996,7 @@ mod tests {
             clock: Arc::new(clock),
             live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
             worker,
-            refold: Arc::new(RefoldQueue::default()),
+            refold: Some(Arc::new(RefoldQueue::default())),
             cycle_hook,
         };
         (ctx, ownership, metrics)
@@ -10294,7 +10297,7 @@ mod tests {
             Arc::clone(&worker),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
-            Arc::new(RefoldQueue::default()),
+            Some(Arc::new(RefoldQueue::default())),
         ) {
             Err(SpawnError::GcConfig(ravel_maintain::GcConfigError::MaintainSkewUncovered {
                 clock_skew_allowance_ns,
@@ -10330,7 +10333,7 @@ mod tests {
             Arc::clone(&worker),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
-            Arc::new(RefoldQueue::default()),
+            Some(Arc::new(RefoldQueue::default())),
         )
         .expect("a horizon that covers the running sweeper's skew spawns normally");
         tasks.shutdown().await;
@@ -10374,7 +10377,7 @@ mod tests {
                 Arc::clone(&worker),
                 Arc::new(watch::channel(worker.solo_live_set()).0),
                 Arc::new(WallClock),
-                Arc::new(RefoldQueue::default()),
+                Some(Arc::new(RefoldQueue::default())),
             )
         };
 
@@ -10454,7 +10457,7 @@ mod tests {
                 Arc::clone(&worker),
                 Arc::new(watch::channel(worker.solo_live_set()).0),
                 Arc::new(WallClock),
-                Arc::new(RefoldQueue::default()),
+                Some(Arc::new(RefoldQueue::default())),
             ) {
                 Err(SpawnError::ZeroHeartbeatInterval) => {}
                 Err(other) => panic!("{case}: expected ZeroHeartbeatInterval, got: {other}"),
@@ -10499,7 +10502,7 @@ mod tests {
             Arc::clone(&worker),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
-            Arc::new(RefoldQueue::default()),
+            Some(Arc::new(RefoldQueue::default())),
         ) {
             Err(SpawnError::ZeroMaintainInterval) => {}
             Err(other) => panic!("expected ZeroMaintainInterval, got: {other}"),

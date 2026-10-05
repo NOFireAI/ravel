@@ -2954,7 +2954,9 @@ pub async fn start_with_heartbeat(
     // The hours the maintain loop's sweeps find held by a named snapshot, handed
     // to the next fold of the same pair (ADR-0063 section 4). Built in every
     // mode so `/metrics` can read its eviction count. Only the maintain loop
-    // feeds it, so outside `Mode::Maintain` it stays empty.
+    // feeds it, and only when this process also runs the scheduled fold that
+    // takes from it, so outside `Mode::Maintain`, and in a maintain process
+    // whose fold is disabled, it stays empty.
     let refold_queue = Arc::new(fold::RefoldQueue::default());
 
     // Mounted unconditionally: the store and catalog above are built in every
@@ -3647,7 +3649,7 @@ pub async fn start_with_heartbeat(
             maintain_worker.clone(),
             live_set_tx.clone(),
             maintain_clock.clone(),
-            refold_queue.clone(),
+            fold::refold_queue_for_maintain(config.mode, &config.fold, &refold_queue),
         )
         .map_err(|e| match e {
             maintain::SpawnError::GcConfig(e) => {
