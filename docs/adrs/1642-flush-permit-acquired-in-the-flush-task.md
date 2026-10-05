@@ -7,10 +7,11 @@ Status: Accepted (2026-09-12). Amended 2026-09-20 (issue #1740, see
 2026-10-03 (issue #2438, see "Amendment (2026-10-03): the zero deferral cap
 refusal binds the library entry" below), 2026-10-04 (issue #2429, see
 "Amendment (2026-10-04): the hand-back also fires on a generation mismatch"
-below), and 2026-10-04 (issue #2465, see "Amendment (2026-10-04): every
-startup cadence check binds the library entry" below). Supersedes ADR-0067
-decision 2. Issues #1292, #1641, #1740, #1916, #2410, #2438, #2429, and
-#2465.
+below), 2026-10-04 (issue #2465, see "Amendment (2026-10-04): every
+startup cadence check binds the library entry" below), and 2026-10-05 (issue
+#2600, see "Amendment (2026-10-05): the hand-back counts are exported"
+below). Supersedes ADR-0067 decision 2. Issues #1292, #1641, #1740, #1916,
+#2410, #2438, #2429, #2465, and #2600.
 
 ## Context
 
@@ -955,7 +956,7 @@ once per attempt. Each pipeline's snapshot adds
 and `generation_mismatch_written_in_place`. These are in-process snapshot
 fields: `ravel-server` exports `ravel_ingest_rerouted_flushes_total` by signal
 only, with no reason label, and renders neither new field. Exporting them is a
-change to that crate.
+change to that crate (made since: see the metrics export amendment below).
 
 **Tests.** `crates/ravel-ingest/tests/scan_set_handback.rs` runs on the
 metrics, log and span routers: a generation-0 buffer on index 1 deferred to
@@ -1032,3 +1033,27 @@ fast delay one nanosecond under 2.5 s, and a `min_flush_bytes` one byte under
 `target_bytes`. `ravel-ingest`'s
 `a_delay_past_i64_nanos_saturates_the_bound_and_the_cap` pins the saturation
 at the overflow boundary.
+
+## Amendment (2026-10-05): the hand-back counts are exported (issue #2600)
+
+<!-- amendment-applies: sections="Amendment (2026-10-04): the hand-back also fires on a generation mismatch (issue #2429)" pointer="metrics export amendment" -->
+
+The generation-mismatch amendment left its two counts as in-process snapshot
+fields. `ravel-server` now renders both, in the modes that build ingest
+routers.
+
+`ravel_ingest_rerouted_flushes_total` carries a `reason` label with the two
+values `HandBackReason::label()` gives. The `generation_mismatch` series
+reads `rerouted_flushes_generation_mismatch` and the `retired_index` series
+reads `rerouted_flushes` less that, saturating at zero, so a sum over the
+family is what it was before the label.
+
+`ravel_ingest_generation_mismatch_in_place_writes_total` reads
+`generation_mismatch_written_in_place`. It is the durable trace of the
+residual that amendment states: a buffer written under its own shard index
+in an hour another generation owns alone, which leaves that hour eligible for
+distributed pushdown with a series at two shard indices. An alert should fire
+on any increase.
+
+Nothing about when a hand-back fires, what it waits on, or when it writes in
+place changes here.

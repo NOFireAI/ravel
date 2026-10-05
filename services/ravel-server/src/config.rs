@@ -1683,22 +1683,21 @@ pub struct Cli {
     /// not a shed. A deferral is backed by the flush deferral cap, the 2 h
     /// flush slack (the flush-timing part of the 3 h read-side scan slack,
     /// which adds one hour of clock skew) less `max_flush_lifetime`, the
-    /// slowest flush
-    /// trigger (the largest of `--max-flush-delay`, `--max-flush-delay-idle`
-    /// and, under `--adaptive-flush-delay`, the adaptive corridor's widest
-    /// ceiling) and one flush tick (3559.8 s at the defaults): once a shard's
-    /// oldest deferred flush reaches it, the shard refuses every new write, in
-    /// both write modes, until the deferred flushes open, with a retryable
-    /// 429 / `RESOURCE_EXHAUSTED` counted on
+    /// slowest flush trigger (the largest of `--max-flush-delay`,
+    /// `--max-flush-delay-idle` and, under `--adaptive-flush-delay`, the
+    /// adaptive corridor's widest ceiling) and one flush tick (3559.8 s at the
+    /// defaults): once a shard's oldest deferred flush reaches it, the shard
+    /// refuses every new write, in both write modes, until the deferred flushes
+    /// open, with a retryable 429 / `RESOURCE_EXHAUSTED` counted on
     /// `ravel_ingest_deferral_cap_refused_total`. A strict write already
-    /// waiting on that flush is answered 503, and its rows are still written
-    /// by the flush that opens past the cap. The deferred flush itself still
-    /// waits for a slot as long as the stall lasts. Drains (`FlushNow`, shutdown) are never refused, and
-    /// neither is a tenant buffer that has crossed its per-(shard, tenant)
-    /// memory backstop, so THE QUEUE CAN EXCEED THIS CAP under memory
-    /// pressure: the backstop is the only bound on one buffer's resident
-    /// memory, and refusing there would trade a bounded queue of flush tasks
-    /// for an unbounded buffer, the worse of the two failures. Size the
+    /// waiting on that flush is answered 503, and its rows are still written by
+    /// the flush that opens past the cap. The deferred flush itself still waits
+    /// for a slot as long as the stall lasts. Drains (`FlushNow`, shutdown) are
+    /// never refused, and neither is a tenant buffer that has crossed its
+    /// per-(shard, tenant) memory backstop, so THE QUEUE CAN EXCEED THIS CAP
+    /// under memory pressure: the backstop is the only bound on one buffer's
+    /// resident memory, and refusing there would trade a bounded queue of flush
+    /// tasks for an unbounded buffer, the worse of the two failures. Size the
     /// steady state from this cap; what bounds the overshoot is the paragraph
     /// below. `0` is rejected. A `--max-inflight-flushes` above this value is
     /// accepted and raises the effective cap to match, since effective
@@ -2031,9 +2030,10 @@ pub struct Cli {
     #[arg(long = "catalog-resolve-concurrency", value_name = "COUNT")]
     pub catalog_resolve_concurrency: Option<usize>,
 
-    /// Jobs the read CPU gate runs at once (ADR-1702 decision 3): query,
-    /// catalog and maintenance decode above the gate's inline floor, each on
-    /// a blocking-pool thread holding one permit. Unset, it is
+    /// Jobs the read CPU gate runs at once (ADR-1702 decision 3): the
+    /// catalog's snapshot part, postings and column-statistics decodes above
+    /// the gate's inline floor, each on a blocking-pool thread holding one
+    /// permit. Query segment decode does not run on it. Unset, it is
     /// `max(1, cores - 1)`. Lower it on a node shared with other CPU-heavy
     /// work. `0` is rejected at startup, because a zero-permit gate would
     /// never run a job.

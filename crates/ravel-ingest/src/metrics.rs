@@ -814,7 +814,8 @@ pub struct IngestMetricsSnapshot {
     /// `ravel_ingest_teardown_unscanned_writes_total`.
     pub teardown_unscanned_writes: u64,
     /// Buffers written in place into an hour another generation owns, after
-    /// a generation-mismatch hand-back could not deliver. Not exported.
+    /// a generation-mismatch hand-back could not deliver. Exported as
+    /// `ravel_ingest_generation_mismatch_in_place_writes_total`.
     pub generation_mismatch_written_in_place: u64,
     /// `ingest_metadata_flush_gets_total` (ADR-0085 decision 1).
     pub metadata_flush_gets_total: u64,

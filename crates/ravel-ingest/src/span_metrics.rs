@@ -295,7 +295,8 @@ pub struct SpanIngestMetricsSnapshot {
     /// `ravel_ingest_teardown_unscanned_writes_total`.
     pub teardown_unscanned_writes: u64,
     /// Buffers written in place into an hour another generation owns, after
-    /// a generation-mismatch hand-back could not deliver. Not exported.
+    /// a generation-mismatch hand-back could not deliver. Exported as
+    /// `ravel_ingest_generation_mismatch_in_place_writes_total`.
     pub generation_mismatch_written_in_place: u64,
     /// Sum across shards of [`SpanIngestMetrics::in_flight_flushes_by_shard`]
     /// at snapshot time. The per-shard breakdown does not fit this struct's

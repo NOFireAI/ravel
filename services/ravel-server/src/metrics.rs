@@ -88,9 +88,9 @@ use axum::routing::get;
 use ravel_cache::CacheMetricsSnapshot;
 use ravel_catalog::Catalog;
 use ravel_ingest::{
-    AdmissionController, IngestMetricsSnapshot, IngestRouter, LogIngestMetricsSnapshot,
-    LogIngestRouter, SpanIngestMetricsSnapshot, SpanIngestRouter, TenantPutAttribution,
-    TenantUsage,
+    AdmissionController, HandBackReason, IngestMetricsSnapshot, IngestRouter,
+    LogIngestMetricsSnapshot, LogIngestRouter, SpanIngestMetricsSnapshot, SpanIngestRouter,
+    TenantPutAttribution, TenantUsage,
 };
 use ravel_maintain::ScrubLevel;
 use ravel_maintain::UnreadableReason;
@@ -310,6 +310,11 @@ pub enum Label {
     /// `unwritable_stream_attrs`. Shares the `reason` key with the other
     /// reason variants.
     CompactionInputSkipReason(ravel_maintain::CompactionInputSkipReason),
+    /// Why a flush handed its rows back instead of writing them:
+    /// `retired_index` or `generation_mismatch`. A closed enum owned by
+    /// `ravel_ingest`, which also owns the label spelling. Shares the `reason`
+    /// key with the other reason variants.
+    HandBackReason(HandBackReason),
     Cache(CacheFamily),
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
@@ -560,6 +565,7 @@ impl Label {
             Label::AlertRetentionSkipReason(_) => "reason",
             Label::SupersededHeldReason(_) => "reason",
             Label::CompactionInputSkipReason(_) => "reason",
+            Label::HandBackReason(_) => "reason",
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
@@ -603,6 +609,7 @@ impl Label {
             Label::AlertRetentionSkipReason(reason) => reason.name().to_string(),
             Label::SupersededHeldReason(reason) => reason.name().to_string(),
             Label::CompactionInputSkipReason(reason) => reason.name().to_string(),
+            Label::HandBackReason(reason) => reason.label().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
@@ -1029,11 +1036,22 @@ pub struct IngestPipelineSnapshot {
     /// was past its trust horizon, counted once per buffer per episode.
     pub stale_provisioning_flushes: u64,
     /// Flushes handed back to the tenant's current shard generation instead of
-    /// written outside the read-side scan set of their ingest hour.
+    /// written, for either [`HandBackReason`]: a shard index outside the
+    /// read-side scan set of their ingest hour, or an index inside it in an
+    /// hour another generation owns alone.
     pub rerouted_flushes: u64,
-    /// Hand-back episodes that kept rows in the source buffer because a target
-    /// shard was dead, condemned or closed.
+    /// The part of `rerouted_flushes` handed back for
+    /// [`HandBackReason::GenerationMismatch`]; the rest are
+    /// [`HandBackReason::RetiredIndex`].
+    pub rerouted_flushes_generation_mismatch: u64,
+    /// Hand-back episodes that kept rows in the source buffer for a later
+    /// flush to retry: a retired-index target dead, condemned or closed, or a
+    /// generation-mismatch target's mailbox full.
     pub hand_back_failures: u64,
+    /// Buffers written in place under their own shard index in an hour another
+    /// shard generation owns alone, after a generation-mismatch hand-back
+    /// could not deliver.
+    pub generation_mismatch_written_in_place: u64,
     /// Teardown flushes written in place under a shard index readers do not
     /// scan for their ingest hour.
     pub teardown_unscanned_writes: u64,
@@ -1207,7 +1225,9 @@ impl IngestPipelineSnapshot {
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             rerouted_flushes: snapshot.rerouted_flushes,
+            rerouted_flushes_generation_mismatch: snapshot.rerouted_flushes_generation_mismatch,
             hand_back_failures: snapshot.hand_back_failures,
+            generation_mismatch_written_in_place: snapshot.generation_mismatch_written_in_place,
             teardown_unscanned_writes: snapshot.teardown_unscanned_writes,
             postings: None,
             metadata_sink: Some(MetadataSinkCounters {
@@ -1259,7 +1279,9 @@ impl IngestPipelineSnapshot {
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             rerouted_flushes: snapshot.rerouted_flushes,
+            rerouted_flushes_generation_mismatch: snapshot.rerouted_flushes_generation_mismatch,
             hand_back_failures: snapshot.hand_back_failures,
+            generation_mismatch_written_in_place: snapshot.generation_mismatch_written_in_place,
             teardown_unscanned_writes: snapshot.teardown_unscanned_writes,
             postings: Some(PostingsCounters {
                 objects: snapshot.postings_objects,
@@ -1310,7 +1332,9 @@ impl IngestPipelineSnapshot {
             partial_writes: snapshot.partial_writes,
             stale_provisioning_flushes: snapshot.stale_provisioning_flushes,
             rerouted_flushes: snapshot.rerouted_flushes,
+            rerouted_flushes_generation_mismatch: snapshot.rerouted_flushes_generation_mismatch,
             hand_back_failures: snapshot.hand_back_failures,
+            generation_mismatch_written_in_place: snapshot.generation_mismatch_written_in_place,
             teardown_unscanned_writes: snapshot.teardown_unscanned_writes,
             postings: None,
             metadata_sink: None,
@@ -1330,6 +1354,21 @@ impl IngestPipelineSnapshot {
             active_shard_count: 0,
         }
     }
+}
+
+/// One `ravel_ingest_rerouted_flushes_total` value per [`HandBackReason`]. The
+/// snapshot counts every hand-back and, separately, the generation-mismatch
+/// part, so the retired-index series is the difference; the two always sum to
+/// `rerouted_flushes`.
+fn rerouted_flushes_by_reason(pipeline: &IngestPipelineSnapshot) -> [(HandBackReason, u64); 2] {
+    let mismatch = pipeline.rerouted_flushes_generation_mismatch;
+    [
+        (
+            HandBackReason::RetiredIndex,
+            pipeline.rerouted_flushes.saturating_sub(mismatch),
+        ),
+        (HandBackReason::GenerationMismatch, mismatch),
+    ]
 }
 
 fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelineSnapshot]) {
@@ -1646,28 +1685,42 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
     write_header(
         out,
         "ravel_ingest_rerouted_flushes_total",
-        "Flushes that would have written under a shard index outside the read-side scan set of \
-         the ingest hour they pinned and handed their rows to the tenant's current shard \
-         generation instead, by signal.",
+        "Flushes that handed their rows to the tenant's current shard generation instead of \
+         writing them, by signal and reason, counted once per flush attempt that delivered rows \
+         to at least one target. reason=\"retired_index\": the flush would have written under a \
+         shard index outside the read-side scan set of the ingest hour it pinned. \
+         reason=\"generation_mismatch\": the index is inside the scan set, but another shard \
+         generation, routing at another shard count, owns that hour alone.",
         "counter",
     );
     for pipeline in pipelines {
-        write_sample(
-            out,
-            "ravel_ingest_rerouted_flushes_total",
-            &labels(mode, pipeline.signal),
-            pipeline.rerouted_flushes,
-        );
+        for (reason, value) in rerouted_flushes_by_reason(pipeline) {
+            write_sample(
+                out,
+                "ravel_ingest_rerouted_flushes_total",
+                &[
+                    Label::Mode(mode),
+                    Label::Signal(pipeline.signal),
+                    Label::HandBackReason(reason),
+                ],
+                value,
+            );
+        }
     }
 
     write_header(
         out,
         "ravel_ingest_hand_back_failures_total",
-        "Hand-backs that could not deliver rows because a target shard of the tenant's current \
-         generation was dead, condemned or closed, by signal, counted once per buffer until a \
-         hand-back from it delivers. The rows stay in the source shard's buffer and are retried; \
-         a log or span target stays condemned until restart, so a rise there means rows waiting \
-         for the shutdown drain.",
+        "Hand-backs that kept their rows in the source shard's buffer for a later flush to \
+         retry, by signal, counted once per buffer until a hand-back from it delivers: a \
+         retired-index hand-back whose target shard was dead, condemned or closed, and a \
+         generation-mismatch hand-back whose target's mailbox was full. A generation-mismatch \
+         buffer is retried only until the flush deferral cap and is then written in place; a \
+         generation-mismatch hand-back whose target is dead, condemned or closed is not counted \
+         here and is written in place at once. Both in-place writes count on \
+         ravel_ingest_generation_mismatch_in_place_writes_total. A log or span target stays \
+         condemned until restart, so a retired-index rise there means rows waiting for the \
+         shutdown drain.",
         "counter",
     );
     for pipeline in pipelines {
@@ -1676,6 +1729,26 @@ fn render_ingest_family(out: &mut String, mode: Mode, pipelines: &[IngestPipelin
             "ravel_ingest_hand_back_failures_total",
             &labels(mode, pipeline.signal),
             pipeline.hand_back_failures,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_ingest_generation_mismatch_in_place_writes_total",
+        "Buffers written under their own shard index in an ingest hour another shard generation \
+         owns alone, because a generation-mismatch hand-back could not deliver, by signal. \
+         Readers find the rows, but that hour stays eligible for distributed pushdown with a \
+         series at two shard indices, so a distributed aggregate over it can differ from the \
+         single-node answer, and objects are immutable, so it stays that way. Alert on any \
+         increase.",
+        "counter",
+    );
+    for pipeline in pipelines {
+        write_sample(
+            out,
+            "ravel_ingest_generation_mismatch_in_place_writes_total",
+            &labels(mode, pipeline.signal),
+            pipeline.generation_mismatch_written_in_place,
         );
     }
 
@@ -8201,6 +8274,7 @@ mod tests {
             Label::CompactionInputSkipReason(
                 ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
             ),
+            Label::HandBackReason(HandBackReason::RetiredIndex),
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
@@ -8235,6 +8309,7 @@ mod tests {
                 Label::AlertRetentionSkipReason(_) => "reason",
                 Label::SupersededHeldReason(_) => "reason",
                 Label::CompactionInputSkipReason(_) => "reason",
+                Label::HandBackReason(_) => "reason",
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
@@ -8298,6 +8373,8 @@ mod tests {
                 // CompactionInputSkipReason (issue #2554) reuses the `reason`
                 // key.
                 "reason",
+                // HandBackReason (issue #2600) reuses the `reason` key.
+                "reason",
                 "cache",
                 "tier",
                 "kind",
@@ -8331,8 +8408,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            30,
-            "exactly 30 label variants every build has, 21 distinct keys (sql adds DdlKind, \
+            31,
+            "exactly 31 label variants every build has, 21 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
@@ -9079,6 +9156,159 @@ mod tests {
             ),
             "the spans pipeline must render its driven condemned count"
         );
+    }
+
+    /// Issue #2600: each pipeline's hand-back count renders split by reason,
+    /// with `generation_mismatch` reading the snapshot's mismatch part and
+    /// `retired_index` the total less that part, and the in-place mismatch
+    /// writes render as their own family. Every figure is distinct, so a
+    /// series reading another field, another signal's snapshot, or the
+    /// unsplit total fails here.
+    ///
+    /// Prove-the-test: in `rerouted_flushes_by_reason`, render
+    /// `pipeline.rerouted_flushes` for `RetiredIndex` (drop the
+    /// `saturating_sub`) and the metrics `retired_index` sample reads 7
+    /// against the expected 4; delete the
+    /// `ravel_ingest_generation_mismatch_in_place_writes_total` `write_sample`
+    /// and its sample list is empty against the expected three lines.
+    #[test]
+    fn hand_back_reason_and_in_place_writes_render_exact_samples() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+                rerouted_flushes: 7,
+                rerouted_flushes_generation_mismatch: 3,
+                hand_back_failures: 13,
+                generation_mismatch_written_in_place: 2,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot {
+                rerouted_flushes: 16,
+                rerouted_flushes_generation_mismatch: 5,
+                hand_back_failures: 17,
+                generation_mismatch_written_in_place: 6,
+                ..Default::default()
+            }),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot {
+                rerouted_flushes: 29,
+                rerouted_flushes_generation_mismatch: 9,
+                hand_back_failures: 19,
+                generation_mismatch_written_in_place: 8,
+                ..Default::default()
+            }),
+        ];
+        let mut body = String::new();
+        render_ingest_family(&mut body, Mode::Gateway, &ingest);
+
+        assert_eq!(
+            family_samples(&body, "ravel_ingest_rerouted_flushes_total"),
+            vec![
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"metrics\",reason=\"retired_index\"} 4",
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"metrics\",reason=\"generation_mismatch\"} 3",
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"logs\",reason=\"retired_index\"} 11",
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"logs\",reason=\"generation_mismatch\"} 5",
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"spans\",reason=\"retired_index\"} 20",
+                "ravel_ingest_rerouted_flushes_total{mode=\"gateway\",signal=\"spans\",reason=\"generation_mismatch\"} 9",
+            ],
+            "{body}"
+        );
+        assert_eq!(
+            family_samples(
+                &body,
+                "ravel_ingest_generation_mismatch_in_place_writes_total"
+            ),
+            vec![
+                "ravel_ingest_generation_mismatch_in_place_writes_total{mode=\"gateway\",signal=\"metrics\"} 2",
+                "ravel_ingest_generation_mismatch_in_place_writes_total{mode=\"gateway\",signal=\"logs\"} 6",
+                "ravel_ingest_generation_mismatch_in_place_writes_total{mode=\"gateway\",signal=\"spans\"} 8",
+            ],
+            "{body}"
+        );
+        assert_eq!(
+            family_samples(&body, "ravel_ingest_hand_back_failures_total"),
+            vec![
+                "ravel_ingest_hand_back_failures_total{mode=\"gateway\",signal=\"metrics\"} 13",
+                "ravel_ingest_hand_back_failures_total{mode=\"gateway\",signal=\"logs\"} 17",
+                "ravel_ingest_hand_back_failures_total{mode=\"gateway\",signal=\"spans\"} 19",
+            ],
+            "the hand-back failures family keeps its labels and values"
+        );
+        for family in [
+            "ravel_ingest_rerouted_flushes_total",
+            "ravel_ingest_generation_mismatch_in_place_writes_total",
+        ] {
+            assert_eq!(
+                body.matches(&format!("# TYPE {family} counter\n")).count(),
+                1,
+                "{family} is declared once, as a counter"
+            );
+        }
+    }
+
+    /// A mismatch part above the total, which the ingest snapshot's two
+    /// relaxed loads can read when a hand-back lands between them, renders the
+    /// retired-index series at zero rather than wrapping.
+    #[test]
+    fn retired_index_hand_backs_saturate_at_zero() {
+        let pipeline = IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot {
+            rerouted_flushes: 2,
+            rerouted_flushes_generation_mismatch: 3,
+            ..Default::default()
+        });
+        assert_eq!(
+            rerouted_flushes_by_reason(&pipeline),
+            [
+                (HandBackReason::RetiredIndex, 0),
+                (HandBackReason::GenerationMismatch, 3),
+            ]
+        );
+    }
+
+    /// Every series issue #2600 adds renders, at `0`, before anything was
+    /// handed back, in each mode the renderer is handed pipelines for, so an
+    /// `increase()` alert on either has a series to evaluate from the first
+    /// scrape. Which modes build ingest pipelines at all is pinned by
+    /// `tests/metrics_endpoint.rs`.
+    #[test]
+    fn hand_back_reason_and_in_place_series_render_from_zero() {
+        let ingest = vec![
+            IngestPipelineSnapshot::from_metrics(IngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_log_metrics(LogIngestMetricsSnapshot::default()),
+            IngestPipelineSnapshot::from_span_metrics(SpanIngestMetricsSnapshot::default()),
+        ];
+        for (mode, mode_label) in [
+            (Mode::All, "all"),
+            (Mode::Gateway, "gateway"),
+            (Mode::Query, "query"),
+            (Mode::Maintain, "maintain"),
+        ] {
+            let mut body = String::new();
+            render_ingest_family(&mut body, mode, &ingest);
+            let mut expected_rerouted = Vec::new();
+            let mut expected_in_place = Vec::new();
+            for signal in ["metrics", "logs", "spans"] {
+                for reason in ["retired_index", "generation_mismatch"] {
+                    expected_rerouted.push(format!(
+                        "ravel_ingest_rerouted_flushes_total{{mode=\"{mode_label}\",signal=\"{signal}\",reason=\"{reason}\"}} 0"
+                    ));
+                }
+                expected_in_place.push(format!(
+                    "ravel_ingest_generation_mismatch_in_place_writes_total{{mode=\"{mode_label}\",signal=\"{signal}\"}} 0"
+                ));
+            }
+            assert_eq!(
+                family_samples(&body, "ravel_ingest_rerouted_flushes_total"),
+                expected_rerouted,
+                "{mode:?}"
+            );
+            assert_eq!(
+                family_samples(
+                    &body,
+                    "ravel_ingest_generation_mismatch_in_place_writes_total"
+                ),
+                expected_in_place,
+                "{mode:?}"
+            );
+        }
     }
 
     /// The idempotency lookup-failure and probe-GET counters each render one
@@ -10347,6 +10577,122 @@ mod tests {
                 "{untouched:?} was not folded"
             );
         }
+    }
+
+    /// The two column-statistics decode counters are read off the live
+    /// `Catalog` into their own fields. A folded HEAD points one part's
+    /// statistics at an object whose bytes match the HEAD's blake3 but carry
+    /// no column-statistics header, so every load refuses it: three loads move
+    /// `column_stats_decode_refusals` to 3 and leave
+    /// `column_stats_decode_panics` at 0, and the snapshot must read 3 and 0.
+    /// A real decode panic cannot be produced from this crate (the catalog's
+    /// panicking-job fault is `cfg(test)` inside `ravel-catalog`), so a
+    /// `from_catalog` that read the panic counter as a constant 0 would still
+    /// pass; one that swapped the two reads, or read the refusals as 0, fails.
+    ///
+    /// Prove-the-test: swap the two `catalog.column_stats_decode_*()` calls in
+    /// `from_catalog` and `refusals` reads 0 against the expected 3.
+    #[tokio::test]
+    async fn catalog_decode_counters_read_the_live_catalog() {
+        use bytes::Bytes;
+        use ravel_catalog::{Catalog, CatalogConfig};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_object_store::{ObjectStoreBackend, PutOptions};
+        use ravel_proto::catalog::v1::{SnapshotColumnStatsPartRef, SnapshotHead, SnapshotPartRef};
+        use ravel_types::accounting::QueryAccounting;
+        use ravel_types::{Signal, TenantId, TimeRange};
+
+        const NS_PER_HOUR: i64 = 3_600_000_000_000;
+        let store = std::sync::Arc::new(MemoryStore::new());
+        let tenant = TenantId::new("decode-counter-snapshot").hash();
+        let signal = Signal::Logs;
+        let prefix = signal.key_prefix();
+        let stats_bytes = Bytes::from_static(b"not a column-statistics object");
+        let stats_key = format!("t/{}/catalog/{prefix}/cstat/refused.cstat", tenant.to_hex());
+        store
+            .put(&stats_key, stats_bytes.clone(), PutOptions::default())
+            .await
+            .expect("put stats object");
+        let part_hash = *blake3::hash(b"decode-counter-part").as_bytes();
+        let head = SnapshotHead {
+            format_version: ravel_catalog::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(signal) as u32,
+            shard_count: 1,
+            watermark_hour: 10,
+            parts: vec![SnapshotPartRef {
+                key: format!("t/{}/catalog/{prefix}/snap/empty.csnap", tenant.to_hex()),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour: 10,
+                min_hour: 0,
+                column_stats: Some(SnapshotColumnStatsPartRef {
+                    key: stats_key,
+                    blake3: blake3::hash(&stats_bytes).as_bytes().to_vec(),
+                    size: stats_bytes.len() as u64,
+                    segment_count: 0,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
+            }],
+            folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
+            shard_generation_count: 1,
+            ..Default::default()
+        };
+        store
+            .put(
+                &format!("t/{}/catalog/{prefix}/HEAD", tenant.to_hex()),
+                Bytes::from(ravel_catalog::encode_head(&head).expect("encode head")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+
+        let catalog = Catalog::new(store, CatalogConfig::default()).expect("catalog");
+        let before = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(
+            (
+                before.column_stats_decode_refusals,
+                before.column_stats_decode_panics
+            ),
+            (0, 0)
+        );
+
+        let range = TimeRange {
+            start_ns: 0,
+            end_ns: 50 * NS_PER_HOUR,
+        };
+        for _ in 0..3 {
+            let loaded = catalog
+                .load_column_stats(
+                    &tenant,
+                    signal,
+                    range,
+                    50 * NS_PER_HOUR,
+                    &QueryAccounting::new(),
+                )
+                .await
+                .expect("a refused decode degrades rather than failing the load");
+            assert!(loaded.is_none(), "the refused object covers nothing");
+        }
+        assert_eq!(
+            (
+                catalog.column_stats_decode_refusals(),
+                catalog.column_stats_decode_panics()
+            ),
+            (3, 0),
+            "the fixture refuses on every load and never panics"
+        );
+
+        let after = CatalogCountersSnapshot::from_catalog(&catalog);
+        assert_eq!(
+            after.column_stats_decode_refusals, 3,
+            "refusals read from the catalog's refusal counter"
+        );
+        assert_eq!(
+            after.column_stats_decode_panics, 0,
+            "panics read from the catalog's panic counter"
+        );
     }
 
     /// A process that has never folded successfully still renders the gauge,

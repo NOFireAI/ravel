@@ -601,11 +601,11 @@ onward routes with the new count. Guarantees:
     scan set, but objects are immutable, so the hour stays pushdown-eligible
     with a series at two shard indices for good, and a distributed aggregate
     over that hour can differ from the single-node answer. The trace is a
-    WARN line with the tenant, shard, hour and target count, and the
-    in-process snapshot counter `generation_mismatch_written_in_place`, not
-    yet exported on `/metrics`. Rows a binary without this rule wrote in place
-    stay split the same way, and a rolling deploy keeps writing them until the
-    last process running such a binary exits.
+    WARN line with the tenant, shard, hour and target count, and the counter
+    `ravel_ingest_generation_mismatch_in_place_writes_total` on `/metrics`.
+    Rows a binary without this rule wrote in place stay split the same way,
+    and a rolling deploy keeps writing them until the last process running
+    such a binary exits.
   - A writer or reshard-append clock skewed beyond the tolerated clock skew
     (one hour) can make the view's scan set wider than the true one.
 - Commit tokens are unaffected: a token minted under any generation resolves
