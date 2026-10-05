@@ -314,8 +314,18 @@ counted on `flush_all_residue_tenants` like any other residue. Rows written
 in place this way are found by
 readers, since they are inside the scan set, but the hour stays
 pushdown-eligible with their series at two shard indices, so a distributed
-pushdown over it can split those series across two slices. Each such buffer
-logs a WARN with the tenant, shard, hour and target count.
+pushdown over it can split those series across two slices. The WARN for such
+a write, with the tenant, shard, hour and target count, logs once per tenant,
+per cause and per pinned ingest hour. The two causes are a target that is not
+live or a drain that found its mailbox still full, and a hand-back that kept
+failing for the deferral cap. Later in-place writes of that tenant for that
+cause in that hour log nothing, until a flush of the tenant opens in the scan
+set or hands all its rows over, after which the next one warns again. The
+per-shard state behind this is bounded at 4096 entries; past it, entries for
+older hours are dropped, and if that is not enough it is cleared, which can
+repeat one WARN per tenant and cause. `generation_mismatch_written_in_place`
+(below) moves on every such write, so the counter, not the WARN, is the
+signal to alert on.
 
 A hand-back a target accepted is written unless the target's actor panics
 before writing it, which loses its buffer as any shard death does, or the rows

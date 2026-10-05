@@ -454,6 +454,10 @@ impl<M> FlushScope<M> for AlwaysInScope {
 /// a thread-scoped `set_default`: a callsite another test thread registers
 /// while a scoped default is being registered can cache an interest that
 /// leaves the scoped subscriber out, and the capture then sees nothing.
+///
+/// It is safe only while no other unit test under `crates/ravel-ingest/src`
+/// installs a tracing subscriber, since this one is process-wide in the lib
+/// test binary and marks every non-WARN callsite `never`.
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct WarnCapture {
@@ -564,6 +568,8 @@ impl WarnCapture {
 pub(crate) struct ScriptedScope<M> {
     verdict: Mutex<ScanCheck>,
     target: Mutex<Option<mpsc::Sender<M>>>,
+    /// Targets that replace `target` for one target shard index.
+    shard_targets: Mutex<HashMap<u32, mpsc::Sender<M>>>,
     wait: Mutex<bool>,
 }
 
@@ -573,8 +579,20 @@ impl<M> ScriptedScope<M> {
         Arc::new(ScriptedScope {
             verdict: Mutex::new(verdict),
             target: Mutex::new(target),
+            shard_targets: Mutex::new(HashMap::new()),
             wait: Mutex::new(true),
         })
+    }
+
+    /// Returns `target` for target shard index `shard` in place of the
+    /// shared target, or the shared target again for `None`, so one flush can
+    /// hand some rows over and have the rest refused.
+    pub(crate) fn set_shard_target(&self, shard: u32, target: Option<mpsc::Sender<M>>) {
+        let mut targets = self.shard_targets.lock().unwrap_or_else(|p| p.into_inner());
+        match target {
+            Some(tx) => targets.insert(shard, tx),
+            None => targets.remove(&shard),
+        };
     }
 
     pub(crate) fn set(&self, verdict: ScanCheck, target: Option<mpsc::Sender<M>>) {
@@ -595,9 +613,18 @@ impl<M: Send + 'static> FlushScope<M> for ScriptedScope<M> {
         *self.verdict.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Every shard of every set is this one target, returned even when its
-    /// mailbox is closed: a target that closes after the liveness check.
-    fn live_sender(&self, _count: u32, _shard: u32) -> Option<mpsc::Sender<M>> {
+    /// Every shard of every set is this one target, unless
+    /// [`Self::set_shard_target`] replaced it, returned even when its mailbox
+    /// is closed: a target that closes after the liveness check.
+    fn live_sender(&self, _count: u32, shard: u32) -> Option<mpsc::Sender<M>> {
+        if let Some(tx) = self
+            .shard_targets
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&shard)
+        {
+            return Some(tx.clone());
+        }
         self.target
             .lock()
             .unwrap_or_else(|p| p.into_inner())

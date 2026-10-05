@@ -78,6 +78,7 @@ use crate::log_error::LogWriteError;
 use crate::log_metrics::LogIngestMetrics;
 use crate::log_router::partition_columnar;
 use crate::metrics::FlushTrigger;
+use crate::shard::{InPlaceCause, InPlaceWarnings};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{LogStage, LogStageTimings};
 use crate::storage_layout::{WriterLayout, writer_layout};
@@ -1167,8 +1168,8 @@ pub(crate) struct LogShardActor {
     scope: Arc<dyn FlushScope<LogShardMsg>>,
     /// See [`crate::shard`]'s `ShardActor::handing_back`.
     handing_back: bool,
-    /// See [`crate::shard`]'s `ShardActor::writing_in_place`.
-    writing_in_place: HashSet<TenantHash>,
+    /// See [`crate::shard`]'s `ShardActor::in_place_warnings`.
+    in_place_warnings: InPlaceWarnings,
     /// See [`crate::shard`]'s `ShardActor::mismatch_in_place`.
     mismatch_in_place: bool,
     /// See [`crate::shard`]'s `ShardActor::drain_rereads`.
@@ -1227,7 +1228,7 @@ impl LogShardActor {
             cap_flag,
             scope,
             handing_back: false,
-            writing_in_place: HashSet::new(),
+            in_place_warnings: InPlaceWarnings::default(),
             mismatch_in_place: false,
             drain_rereads: None,
         }
@@ -2265,7 +2266,7 @@ impl LogShardActor {
         {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
-                self.writing_in_place.remove(&tenant_hash);
+                self.in_place_warnings.rearm(tenant_hash);
                 buf
             }
             ScanCheck::HandBack {
@@ -2288,7 +2289,11 @@ impl LogShardActor {
                 );
                 self.metrics.record_generation_mismatch_written_in_place();
                 self.handing_back = false;
-                if self.writing_in_place.insert(tenant_hash) {
+                if self.in_place_warnings.should_warn(
+                    tenant_hash,
+                    InPlaceCause::RetrySpent,
+                    ingest_hour_bucket,
+                ) {
                     tracing::warn!(
                         signal = ?Signal::Logs,
                         shard = self.shard,
@@ -2328,7 +2333,7 @@ impl LogShardActor {
                 }
                 let target_dead = handed.target_dead;
                 let Some(mut buf) = handed.kept else {
-                    self.writing_in_place.remove(&tenant_hash);
+                    self.in_place_warnings.rearm(tenant_hash);
                     return;
                 };
                 buf.stale_view_counted = false;
@@ -2342,7 +2347,11 @@ impl LogShardActor {
                     if !handed.delivered {
                         self.handing_back = false;
                     }
-                    if self.writing_in_place.insert(tenant_hash) {
+                    if self.in_place_warnings.should_warn(
+                        tenant_hash,
+                        InPlaceCause::DeadTarget,
+                        ingest_hour_bucket,
+                    ) {
                         tracing::warn!(
                             signal = ?Signal::Logs,
                             shard = self.shard,
@@ -4424,6 +4433,21 @@ mod tests {
             charge
         }
 
+        /// [`Self::write`] for `tenant`.
+        async fn write_for(&self, tenant: &str, bytes: u64) -> Arc<IngestByteCharge> {
+            let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
+            self.tx
+                .send(LogShardMsg::Write {
+                    tenant: TenantId::new(tenant),
+                    records: Self::six_records(),
+                    ack: None,
+                    charge: Some(Arc::clone(&charge)),
+                })
+                .await
+                .expect("send write");
+            charge
+        }
+
         /// Six records on six streams, which split across a two-shard set.
         fn six_records() -> Vec<NormalizedLogRecord> {
             let records: Vec<NormalizedLogRecord> = (0..6)
@@ -4835,9 +4859,9 @@ mod tests {
     /// The log counterpart of `crate::shard`'s
     /// `a_run_of_in_place_mismatch_writes_warns_once`.
     ///
-    /// Guards: `self.writing_in_place.insert(tenant_hash)` gating the WARN in
+    /// Guards: `self.in_place_warnings.should_warn(..)` gating the WARN in
     /// the in-place branch of `flush_tenant`'s hand-back arm, and
-    /// `self.writing_in_place.remove(&tenant_hash)` in the `InScanSet` arm.
+    /// `self.in_place_warnings.rearm(tenant_hash)` in the `InScanSet` arm.
     #[tokio::test]
     async fn a_run_of_in_place_mismatch_writes_warns_once() {
         let warns = crate::generation::WarnCapture::default();
@@ -4882,7 +4906,7 @@ mod tests {
     /// The log counterpart of `crate::shard`'s
     /// `a_run_of_retry_spent_in_place_writes_warns_once`.
     ///
-    /// Guard: `self.writing_in_place.insert(tenant_hash)` gating the WARN in
+    /// Guard: `self.in_place_warnings.should_warn(..)` gating the WARN in
     /// `flush_tenant`'s `mismatch_retry_spent(..)` arm.
     #[tokio::test]
     async fn a_run_of_retry_spent_in_place_writes_warns_once() {
@@ -4949,6 +4973,225 @@ mod tests {
             warns.count(HAND_BACK_WARN),
             2,
             "the in-place write ended the run"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// See `crate::shard`'s `zero_cap_config`.
+    fn zero_cap_config() -> IngestConfig {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(7200),
+            ..IngestConfig::default()
+        };
+        assert_eq!(config.flush_deferral_cap_ns(), 0);
+        config
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `in_place_writes_of_two_tenants_each_warn`.
+    ///
+    /// Guard: the tenant in `InPlaceWarnings::should_warn`'s key.
+    #[tokio::test]
+    async fn in_place_writes_of_two_tenants_each_warn() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        drop(rig.write_for("globex", 4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            2
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 2, "one WARN per tenant");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_second_in_place_cause_in_the_same_hour_warns_again`.
+    ///
+    /// Guard: the cause in `InPlaceWarnings::should_warn`'s key.
+    #[tokio::test]
+    async fn a_second_in_place_cause_in_the_same_hour_warns_again() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let rig = HandBackRig::with(MISMATCH, None, zero_cap_config());
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        let (target, _inbox) = full_target();
+        rig.scope.set(MISMATCH, Some(target));
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.hand_back_failures, 1);
+        assert_eq!(snap.generation_mismatch_written_in_place, 2);
+        assert_eq!(warns.count(RETRY_SPENT_WARN), 1, "the new cause warns");
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `an_in_place_write_in_the_next_hour_warns_again`.
+    ///
+    /// Guard: the hour comparison in `InPlaceWarnings::should_warn`.
+    #[tokio::test]
+    async fn an_in_place_write_in_the_next_hour_warns_again() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1, "one WARN in the hour");
+
+        rig.clock.advance_ns(crate::config::NS_PER_HOUR);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            3
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 2, "the next hour warns");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_full_hand_over_ends_an_in_place_run`.
+    ///
+    /// Guard: `self.in_place_warnings.rearm(tenant_hash)` where `hand_back`
+    /// kept nothing in `flush_tenant`'s hand-back arm.
+    #[tokio::test]
+    async fn a_full_hand_over_ends_an_in_place_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        let (target, _inbox) = mpsc::channel(64);
+        rig.scope.set(MISMATCH, Some(target));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 1);
+
+        rig.scope.set(MISMATCH, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            2
+        );
+        assert_eq!(
+            warns.count(DEAD_TARGET_WARN),
+            2,
+            "the full hand-over ended the run"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_partial_hand_over_written_in_place_keeps_the_hand_back_run`.
+    ///
+    /// Guard: `if !handed.delivered` around `self.handing_back = false` in the
+    /// in-place branch of `flush_tenant`'s hand-back arm.
+    #[tokio::test]
+    async fn a_partial_hand_over_written_in_place_keeps_the_hand_back_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let (target, _inbox) = mpsc::channel(64);
+        let rig = HandBackRig::with(MISMATCH, Some(target), config);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(HAND_BACK_WARN), 1);
+
+        let (closed, inbox) = mpsc::channel(16);
+        drop(inbox);
+        rig.scope.set_shard_target(1, Some(closed));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(
+            snap.rerouted_flushes, 2,
+            "shard 0's records were handed over"
+        );
+        assert_eq!(
+            snap.generation_mismatch_written_in_place, 1,
+            "shard 1's records were written in place"
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        rig.scope.set_shard_target(1, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 3);
+        assert_eq!(warns.count(HAND_BACK_WARN), 1, "one WARN for the run");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The log counterpart of `crate::shard`'s
+    /// `a_retry_spent_in_place_write_ends_a_hand_back_run`.
+    ///
+    /// Guard: `self.handing_back = false` in `flush_tenant`'s
+    /// `mismatch_retry_spent(..)` arm.
+    #[tokio::test]
+    async fn a_retry_spent_in_place_write_ends_a_hand_back_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let (live, _inbox) = mpsc::channel(64);
+        let rig = HandBackRig::with(MISMATCH, Some(live.clone()), zero_cap_config());
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(HAND_BACK_WARN), 1);
+
+        let (full, _full_inbox) = full_target();
+        rig.scope.set(MISMATCH, Some(full));
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            1
+        );
+        assert_eq!(warns.count(RETRY_SPENT_WARN), 1);
+
+        rig.scope.set(MISMATCH, Some(live));
+        rig.scope.set_wait(true);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 2);
+        assert_eq!(
+            warns.count(HAND_BACK_WARN),
+            2,
+            "the retry-spent write ended the run"
         );
         drop(rig.tx);
         rig.task.await.expect("actor ends");

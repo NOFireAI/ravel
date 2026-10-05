@@ -984,6 +984,68 @@ impl Drop for InFlightFlushGuard {
     }
 }
 
+/// Entries [`InPlaceWarnings`] holds before it prunes. Past it, entries for
+/// hours older than the one being recorded are dropped, and if that is not
+/// enough the map is cleared; clearing costs at most one repeated WARN per
+/// tenant and cause.
+pub(crate) const IN_PLACE_WARN_STATE_BOUND: usize = 4096;
+
+/// Why a generation-mismatch flush was written in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum InPlaceCause {
+    /// A hand-back target was dead, condemned or closed, or a drain found its
+    /// mailbox still full.
+    DeadTarget,
+    /// The hand-back kept failing for the flush deferral cap.
+    RetrySpent,
+}
+
+/// The ingest hour each tenant and cause last logged a generation-mismatch
+/// in-place WARN for, so such writes log one WARN per tenant, per cause, per
+/// pinned ingest hour. Logging-only: nothing but the decision to emit that
+/// WARN reads it.
+#[derive(Debug, Default)]
+pub(crate) struct InPlaceWarnings {
+    last_hour: HashMap<(TenantHash, InPlaceCause), u32>,
+}
+
+impl InPlaceWarnings {
+    /// Whether an in-place write of `tenant` for `cause`, pinned to `hour`,
+    /// logs its WARN; records `hour` when it does.
+    pub(crate) fn should_warn(
+        &mut self,
+        tenant: TenantHash,
+        cause: InPlaceCause,
+        hour: u32,
+    ) -> bool {
+        let key = (tenant, cause);
+        if self.last_hour.get(&key) == Some(&hour) {
+            return false;
+        }
+        self.last_hour.insert(key, hour);
+        if self.last_hour.len() > IN_PLACE_WARN_STATE_BOUND {
+            self.last_hour.retain(|_, h| *h >= hour);
+            if self.last_hour.len() > IN_PLACE_WARN_STATE_BOUND {
+                self.last_hour.clear();
+                self.last_hour.insert(key, hour);
+            }
+        }
+        true
+    }
+
+    /// Ends `tenant`'s episode for both causes, so its next in-place write
+    /// warns again.
+    pub(crate) fn rearm(&mut self, tenant: TenantHash) {
+        self.last_hour.remove(&(tenant, InPlaceCause::DeadTarget));
+        self.last_hour.remove(&(tenant, InPlaceCause::RetrySpent));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.last_hour.len()
+    }
+}
+
 pub(crate) struct ShardActor {
     shard: u32,
     writer_id: Uuid,
@@ -1053,10 +1115,10 @@ pub(crate) struct ShardActor {
     /// a generation mismatch, so a run of hand-backs on this shard logs one
     /// WARN.
     handing_back: bool,
-    /// Tenants whose last generation-mismatch flush was written in place, so
-    /// a run of such writes logs one WARN per tenant. A flush of the tenant
-    /// that opens inside the scan set, or hands every row over, removes it.
-    writing_in_place: HashSet<TenantHash>,
+    /// Gates the two generation-mismatch in-place WARNs to one per tenant,
+    /// cause and pinned ingest hour. A flush of the tenant that opens inside
+    /// the scan set, or hands every row over, re-arms the tenant. Logging-only.
+    in_place_warnings: InPlaceWarnings,
     /// Set for a drain's last pass over buffers a generation-mismatch
     /// hand-back left undelivered: a hand-back that fails again there writes
     /// the rows in place, so the drain does not answer with them buffered.
@@ -1126,7 +1188,7 @@ impl ShardActor {
             cap_flag,
             scope,
             handing_back: false,
-            writing_in_place: HashSet::new(),
+            in_place_warnings: InPlaceWarnings::default(),
             mismatch_in_place: false,
             drain_rereads: None,
         }
@@ -2221,7 +2283,7 @@ impl ShardActor {
         {
             ScanCheck::InScanSet => {
                 self.handing_back = false;
-                self.writing_in_place.remove(&tenant_hash);
+                self.in_place_warnings.rearm(tenant_hash);
                 buf
             }
             ScanCheck::HandBack {
@@ -2244,7 +2306,11 @@ impl ShardActor {
                 );
                 self.metrics.record_generation_mismatch_written_in_place();
                 self.handing_back = false;
-                if self.writing_in_place.insert(tenant_hash) {
+                if self.in_place_warnings.should_warn(
+                    tenant_hash,
+                    InPlaceCause::RetrySpent,
+                    ingest_hour_bucket,
+                ) {
                     tracing::warn!(
                         signal = ?self.ctx.signal,
                         shard = self.shard,
@@ -2283,7 +2349,7 @@ impl ShardActor {
                 }
                 let target_dead = handed.target_dead;
                 let Some(mut buf) = handed.kept else {
-                    self.writing_in_place.remove(&tenant_hash);
+                    self.in_place_warnings.rearm(tenant_hash);
                     return;
                 };
                 buf.stale_view_counted = false;
@@ -2297,7 +2363,11 @@ impl ShardActor {
                     if !handed.delivered {
                         self.handing_back = false;
                     }
-                    if self.writing_in_place.insert(tenant_hash) {
+                    if self.in_place_warnings.should_warn(
+                        tenant_hash,
+                        InPlaceCause::DeadTarget,
+                        ingest_hour_bucket,
+                    ) {
                         tracing::warn!(
                             signal = ?self.ctx.signal,
                             shard = self.shard,
@@ -4025,8 +4095,16 @@ mod tests {
 
         /// Six points of tenant `acme`, which split across a two-shard set.
         fn six_points() -> Vec<IngestPoint> {
-            let tenant = TenantId::new("acme");
-            let points: Vec<IngestPoint> = (0..6)
+            let points = Self::points_of("acme");
+            let targets: HashSet<u32> = points.iter().map(|p| shard_for(&p.series_id, 2)).collect();
+            assert_eq!(targets.len(), 2, "the rows split across both targets");
+            points
+        }
+
+        /// Six points of `tenant`.
+        fn points_of(tenant: &str) -> Vec<IngestPoint> {
+            let tenant = TenantId::new(tenant);
+            (0..6)
                 .map(|i| {
                     let p = point(&tenant, &format!("host-{i}"));
                     IngestPoint {
@@ -4035,15 +4113,28 @@ mod tests {
                         value: IngestValue::Scalar(p.sample),
                     }
                 })
-                .collect();
-            let targets: HashSet<u32> = points.iter().map(|p| shard_for(&p.series_id, 2)).collect();
-            assert_eq!(targets.len(), 2, "the rows split across both targets");
-            points
+                .collect()
         }
 
         /// Buffers six points of tenant `acme`, under one charge of `bytes`.
         async fn write(&self, bytes: u64) -> Arc<IngestByteCharge> {
             self.write_acked(bytes, None).await
+        }
+
+        /// Buffers six points of `tenant`, under one charge of `bytes`.
+        async fn write_for(&self, tenant: &str, bytes: u64) -> Arc<IngestByteCharge> {
+            let charge = Arc::new(self.budget.try_charge(bytes).expect("charge"));
+            self.tx
+                .send(ShardMsg::Write {
+                    tenant: TenantId::new(tenant),
+                    points: Self::points_of(tenant),
+                    exemplars: Vec::new(),
+                    ack: None,
+                    charge: Some(Arc::clone(&charge)),
+                })
+                .await
+                .expect("send write");
+            charge
         }
 
         /// [`Self::write`] with a strict waiter, answered on the returned
@@ -4499,9 +4590,9 @@ mod tests {
     /// in-place counter by exactly 3. A flush that opens inside the scan set
     /// ends the run, so the next in-place write warns again.
     ///
-    /// Guards: `self.writing_in_place.insert(tenant_hash)` gating the WARN in
+    /// Guards: `self.in_place_warnings.should_warn(..)` gating the WARN in
     /// the in-place branch of `flush_tenant`'s hand-back arm: without it the
-    /// run logs three WARNs. And `self.writing_in_place.remove(&tenant_hash)`
+    /// run logs three WARNs. And `self.in_place_warnings.rearm(tenant_hash)`
     /// in the `InScanSet` arm: without it the write after the in-scan flush
     /// logs nothing.
     #[tokio::test]
@@ -4550,7 +4641,7 @@ mod tests {
     /// retries the hand-back once, then writes in place, and two such drains
     /// log one WARN.
     ///
-    /// Guard: `self.writing_in_place.insert(tenant_hash)` gating the WARN in
+    /// Guard: `self.in_place_warnings.should_warn(..)` gating the WARN in
     /// `flush_tenant`'s `mismatch_retry_spent(..)` arm: without it the two
     /// writes log two WARNs.
     #[tokio::test]
@@ -4623,6 +4714,271 @@ mod tests {
         );
         drop(rig.tx);
         rig.task.await.expect("actor ends");
+    }
+
+    /// Four shards, and a deferral cap of zero, so a drain writes a
+    /// generation mismatch it could not hand back in place on its next pass.
+    fn zero_cap_config() -> IngestConfig {
+        let config = IngestConfig {
+            shard_count: 4,
+            max_flush_lifetime: Duration::from_secs(7200),
+            ..IngestConfig::default()
+        };
+        assert_eq!(config.flush_deferral_cap_ns(), 0);
+        config
+    }
+
+    /// Two tenants writing in place in the same hour each log the WARN.
+    ///
+    /// Guard: the tenant in `InPlaceWarnings::should_warn`'s key: keyed by
+    /// the shard alone, the second tenant's write logs nothing.
+    #[tokio::test]
+    async fn in_place_writes_of_two_tenants_each_warn() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        drop(rig.write_for("globex", 4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            2
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 2, "one WARN per tenant");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A tenant that warned for a dead target and then writes in place
+    /// because its retry is spent, in the same hour, warns again with the
+    /// retry-spent text.
+    ///
+    /// Guard: the cause in `InPlaceWarnings::should_warn`'s key: with one key
+    /// for both causes, the retry-spent write logs nothing.
+    #[tokio::test]
+    async fn a_second_in_place_cause_in_the_same_hour_warns_again() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let rig = HandBackRig::with(MISMATCH, None, zero_cap_config());
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        let (target, _inbox) = full_target();
+        rig.scope.set(MISMATCH, Some(target));
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.hand_back_failures, 1);
+        assert_eq!(snap.generation_mismatch_written_in_place, 2);
+        assert_eq!(warns.count(RETRY_SPENT_WARN), 1, "the new cause warns");
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A tenant that warned in one ingest hour warns again for the same cause
+    /// in the next, with no in-scan flush between.
+    ///
+    /// Guard: the hour comparison in `InPlaceWarnings::should_warn`: matching
+    /// on the key alone, the write in the next hour logs nothing.
+    #[tokio::test]
+    async fn an_in_place_write_in_the_next_hour_warns_again() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1, "one WARN in the hour");
+
+        rig.clock.advance_ns(NS_PER_HOUR);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            3
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 2, "the next hour warns");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A flush that hands all of a tenant's rows over ends its in-place
+    /// episode: the next in-place write in the same hour warns again.
+    ///
+    /// Guard: `self.in_place_warnings.rearm(tenant_hash)` where `hand_back`
+    /// kept nothing in `flush_tenant`'s hand-back arm: without it the last
+    /// write logs nothing.
+    #[tokio::test]
+    async fn a_full_hand_over_ends_an_in_place_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let rig = HandBackRig::with(MISMATCH, None, config);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        let (target, _inbox) = mpsc::channel(64);
+        rig.scope.set(MISMATCH, Some(target));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 1);
+
+        rig.scope.set(MISMATCH, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            2
+        );
+        assert_eq!(
+            warns.count(DEAD_TARGET_WARN),
+            2,
+            "the full hand-over ended the run"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A flush that hands some rows over and writes the rest in place keeps
+    /// the hand-back run going: the next hand-back logs nothing.
+    ///
+    /// Guard: `if !handed.delivered` around `self.handing_back = false` in the
+    /// in-place branch of `flush_tenant`'s hand-back arm: clearing it
+    /// unconditionally, the last hand-back warns again.
+    #[tokio::test]
+    async fn a_partial_hand_over_written_in_place_keeps_the_hand_back_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let config = IngestConfig {
+            shard_count: 4,
+            ..IngestConfig::default()
+        };
+        let (target, _inbox) = mpsc::channel(64);
+        let rig = HandBackRig::with(MISMATCH, Some(target), config);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(HAND_BACK_WARN), 1);
+
+        let (closed, inbox) = mpsc::channel(16);
+        drop(inbox);
+        rig.scope.set_shard_target(1, Some(closed));
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        let snap = rig.metrics.snapshot();
+        assert_eq!(snap.rerouted_flushes, 2, "shard 0's rows were handed over");
+        assert_eq!(
+            snap.generation_mismatch_written_in_place, 1,
+            "shard 1's rows were written in place"
+        );
+        assert_eq!(warns.count(DEAD_TARGET_WARN), 1);
+
+        rig.scope.set_shard_target(1, None);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 3);
+        assert_eq!(warns.count(HAND_BACK_WARN), 1, "one WARN for the run");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// A retry-spent in-place write ends a hand-back run: the next hand-back
+    /// warns again.
+    ///
+    /// Guard: `self.handing_back = false` in `flush_tenant`'s
+    /// `mismatch_retry_spent(..)` arm: without it the last hand-back logs
+    /// nothing.
+    #[tokio::test]
+    async fn a_retry_spent_in_place_write_ends_a_hand_back_run() {
+        let warns = crate::generation::WarnCapture::default();
+        let _capture = warns.install();
+        let (live, _inbox) = mpsc::channel(64);
+        let rig = HandBackRig::with(MISMATCH, Some(live.clone()), zero_cap_config());
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(warns.count(HAND_BACK_WARN), 1);
+
+        let (full, _full_inbox) = full_target();
+        rig.scope.set(MISMATCH, Some(full));
+        rig.scope.set_wait(false);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(
+            rig.metrics.snapshot().generation_mismatch_written_in_place,
+            1
+        );
+        assert_eq!(warns.count(RETRY_SPENT_WARN), 1);
+
+        rig.scope.set(MISMATCH, Some(live));
+        rig.scope.set_wait(true);
+        drop(rig.write(4_096).await);
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 2);
+        assert_eq!(
+            warns.count(HAND_BACK_WARN),
+            2,
+            "the retry-spent write ended the run"
+        );
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// The in-place WARN state never holds more than its bound: past it,
+    /// entries for older hours are dropped first, and the map is cleared only
+    /// when that is not enough, keeping the entry just recorded.
+    ///
+    /// Guard: the `IN_PLACE_WARN_STATE_BOUND` check in
+    /// `InPlaceWarnings::should_warn`: without it the map holds one entry per
+    /// tenant ever recorded.
+    #[test]
+    fn in_place_warning_state_stays_within_its_bound() {
+        let tenant = |i: usize| TenantId::new(format!("t{i}")).hash();
+        let mut same_hour = InPlaceWarnings::default();
+        for i in 0..=IN_PLACE_WARN_STATE_BOUND {
+            assert!(same_hour.should_warn(tenant(i), InPlaceCause::DeadTarget, 7));
+            assert!(same_hour.len() <= IN_PLACE_WARN_STATE_BOUND);
+        }
+        assert_eq!(same_hour.len(), 1, "cleared, keeping the new entry");
+        assert!(!same_hour.should_warn(
+            tenant(IN_PLACE_WARN_STATE_BOUND),
+            InPlaceCause::DeadTarget,
+            7
+        ));
+
+        let half = IN_PLACE_WARN_STATE_BOUND / 2;
+        let mut two_hours = InPlaceWarnings::default();
+        for i in 0..IN_PLACE_WARN_STATE_BOUND {
+            let hour = if i < half { 7 } else { 8 };
+            assert!(two_hours.should_warn(tenant(i), InPlaceCause::RetrySpent, hour));
+        }
+        assert_eq!(two_hours.len(), IN_PLACE_WARN_STATE_BOUND);
+        assert!(two_hours.should_warn(
+            tenant(IN_PLACE_WARN_STATE_BOUND),
+            InPlaceCause::RetrySpent,
+            8
+        ));
+        assert_eq!(
+            two_hours.len(),
+            IN_PLACE_WARN_STATE_BOUND - half + 1,
+            "only the older hour's entries were dropped"
+        );
+        assert!(!two_hours.should_warn(tenant(half), InPlaceCause::RetrySpent, 8));
     }
 
     /// A `max_flush_delay` past `i64::MAX` nanoseconds gives a buffer with a
