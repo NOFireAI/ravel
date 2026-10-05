@@ -173,7 +173,7 @@ flowchart TB
   maintain process and no `all` process does not fold, and queries pay
   listing cost for the whole unsealed span.
 - T11e's refold channel holds by construction only for holds the pair's
-  folder finds itself (see the 2026-10-06 refold channel amendment below):
+  folder finds itself (see the 2026-10-05 refold channel amendment below):
   the sweep that finds a named-snapshot block on shard 0 and the fold that
   reconciles it run in the same maintain process for the same unit key, but
   another shard of the pair may be swept by another process.
@@ -280,9 +280,9 @@ Scope: the supervisor is in `ravel-server`'s fold task and the alert is in
 `deploy/prometheus/ravel.rules.yaml`. No ownership rule, no key layout, no
 mode gate and no metric already in the family changes.
 
-## Amendment (2026-10-06): the refold channel holds for shard 0 only
+## Amendment (2026-10-05): the refold channel holds for shard 0 only
 
-<!-- amendment-supersedes: phrase="refold channel holds by construction" pointer="2026-10-06 refold channel amendment" -->
+<!-- amendment-supersedes: phrase="refold channel holds by construction" pointer="2026-10-05 refold channel amendment" -->
 
 The Consequences section said the refold channel (ADR-0063 section 4, the
 re-fold requests the superseded-input sweep hands to the fold) holds by
@@ -292,14 +292,18 @@ owner of shard 0, while every other shard of the pair is swept by its own
 owner under the same rendezvous hash, which with more than one maintain
 process is often a different process.
 
-The channel is an in-process queue (ADR-0063, the 2026-10-06 requester
+The channel is an in-process queue (ADR-0063, the 2026-10-05 requester
 amendment), so a hold found by a process that does not fold the pair has no
 path to the process that does. A maintain tick therefore sends a pair's
 held hours only when its process owns shard 0 of the pair under the live set
 it is using for that tick; otherwise it sends nothing, so its queue does not
-fill with entries no fold drains. Holds found on shard 0, and every hold in a
-deployment with one maintain process or with `--mode all`'s solo live set,
-reach the fold. A hold on another shard swept by another process reaches no
-fold and its inputs stay held until the fold's frontier band reaches the
-hour. Closing that gap needs a cross-process channel and is tracked as issue
+fill with entries no fold takes. The fold tick likewise removes the entry of
+a pair whose shard 0 its process no longer owns. Holds found on shard 0, and
+every hold in a deployment with one maintain process, are queued for the
+fold and stay queued until a fold of the pair that is not a no-op takes
+them, unless the process restarts or the queue evicts them first. In
+`--mode all` no maintain loop runs, so nothing is swept into the queue and
+no hold reaches the fold this way. A hold on another shard swept by another
+process reaches no fold and its inputs stay held until the fold's frontier
+band reaches the hour. Closing that gap needs a cross-process channel and is tracked as issue
 #2606. No ownership rule, key layout or mode gate changes.
