@@ -3269,7 +3269,19 @@ impl Default for CpuGatePermits {
 /// above the few hundred MiB an idle process (binary text/data, thread
 /// stacks, the tokio runtime, tracing buffers) costs before its first query,
 /// so a flag combination is not falsely refused for lack of the real number.
+///
+/// This is the reserve's ceiling: the derivation deducts
+/// [`effective_memory_overhead_reserve_bytes`] of the memory it starts from,
+/// which is this constant from 8 GiB up and a quarter of that memory below
+/// (ADR-1170, small-host reserve amendment, issue #2607).
 pub use ravel_maintain::config::MEMORY_OVERHEAD_RESERVE_BYTES;
+pub use ravel_maintain::config::effective_memory_overhead_reserve_bytes;
+
+/// The smallest derived `memory_budget_bytes` startup accepts: 256 MiB
+/// (ADR-1170, small-host reserve amendment, issue #2607). A host whose
+/// derivation lands below it refuses with [`MemoryBudgetBelowMinimum`]; an
+/// explicit `--memory-budget-bytes` is not held to it.
+pub const MIN_DERIVED_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Share of `memory_budget_bytes` (cgroup-capped effective memory minus
 /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]) the derived `--cache-max-bytes` takes.
@@ -3587,9 +3599,12 @@ pub struct ResolvedPerformanceDefaults {
     /// separate budget.
     pub memory_budget_bytes: u64,
     /// The overhead reserve subtracted from effective memory to produce
-    /// [`Self::memory_budget_bytes`]. Always [`MEMORY_OVERHEAD_RESERVE_BYTES`]
-    /// today; logged so an operator can see the constant that was live for a
-    /// given run, independent of `main.rs`'s compiled-in value at read time.
+    /// [`Self::memory_budget_bytes`]: [`effective_memory_overhead_reserve_bytes`]
+    /// of the memory the derivation started from, which is
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] from 8 GiB up. On a source that
+    /// subtracts nothing (flag, fallback, not-applicable) it is
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]. Logged so an operator can see the
+    /// reserve that was live for a given run.
     pub memory_overhead_reserve_bytes: u64,
     /// `cache_max_bytes + catalog_cache_max_bytes`: the two hard, non-shedding
     /// eviction caps carved from [`Self::memory_budget_bytes`]. Startup
@@ -3896,40 +3911,67 @@ pub fn resolve_performance_defaults(
     // RSS counts as available because the kernel's own accounting does not
     // call a process's resident pages "available", yet they are memory this
     // process may reuse rather than a competing claim against it.
-    let (memory_budget_bytes, memory_budget_source, memory_budget_floor_bound) =
+    //
+    // Every derived arm deducts the reserve scaled to the memory it starts
+    // from (issue #2607), so the cgroup and available-memory branches agree on
+    // a host of the same size.
+    let (memory_budget_bytes, memory_budget_source, memory_budget_floor_bound, memory_reserve) =
         if flags.memory_budget_not_applicable {
-            (u64::MAX, PERF_SOURCE_NOT_APPLICABLE, false)
+            (
+                u64::MAX,
+                PERF_SOURCE_NOT_APPLICABLE,
+                false,
+                MEMORY_OVERHEAD_RESERVE_BYTES,
+            )
         } else if let Some(explicit) = flags.memory_budget_bytes {
-            (explicit, PERF_SOURCE_FLAG, false)
+            (
+                explicit,
+                PERF_SOURCE_FLAG,
+                false,
+                MEMORY_OVERHEAD_RESERVE_BYTES,
+            )
         } else {
             match host.mem_total_bytes {
-                None => (u64::MAX, PERF_SOURCE_FALLBACK, false),
-                Some(total) if host.cgroup_memory_limit_bytes.is_some() => (
-                    total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES),
-                    PERF_SOURCE_DERIVED_CGROUP,
+                None => (
+                    u64::MAX,
+                    PERF_SOURCE_FALLBACK,
                     false,
+                    MEMORY_OVERHEAD_RESERVE_BYTES,
                 ),
+                Some(total) if host.cgroup_memory_limit_bytes.is_some() => {
+                    let reserve = effective_memory_overhead_reserve_bytes(total);
+                    (
+                        total.saturating_sub(reserve),
+                        PERF_SOURCE_DERIVED_CGROUP,
+                        false,
+                        reserve,
+                    )
+                }
                 Some(total) => match (host.mem_total_raw_bytes, host.mem_available_bytes) {
                     (Some(raw_total), Some(available)) => {
+                        let reserve = effective_memory_overhead_reserve_bytes(raw_total);
                         let own_rss = host.own_rss_bytes.unwrap_or(0);
-                        let mem_total_minus_reserve =
-                            raw_total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES);
-                        let raw_available_term = available
-                            .saturating_add(own_rss)
-                            .saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES);
+                        let mem_total_minus_reserve = raw_total.saturating_sub(reserve);
+                        let raw_available_term =
+                            available.saturating_add(own_rss).saturating_sub(reserve);
                         let floor_bound = raw_available_term < MEMORY_BUDGET_FLOOR_BYTES;
                         let available_term = raw_available_term.max(MEMORY_BUDGET_FLOOR_BYTES);
                         (
                             mem_total_minus_reserve.min(available_term),
                             PERF_SOURCE_DERIVED_AVAILABLE,
                             floor_bound,
+                            reserve,
                         )
                     }
-                    _ => (
-                        total.saturating_sub(MEMORY_OVERHEAD_RESERVE_BYTES),
-                        PERF_SOURCE_DERIVED,
-                        false,
-                    ),
+                    _ => {
+                        let reserve = effective_memory_overhead_reserve_bytes(total);
+                        (
+                            total.saturating_sub(reserve),
+                            PERF_SOURCE_DERIVED,
+                            false,
+                            reserve,
+                        )
+                    }
                 },
             }
         };
@@ -4078,7 +4120,7 @@ pub fn resolve_performance_defaults(
         sql_tenant_max_bytes,
         query_deadline,
         memory_budget_bytes,
-        memory_overhead_reserve_bytes: MEMORY_OVERHEAD_RESERVE_BYTES,
+        memory_overhead_reserve_bytes: memory_reserve,
         memory_hard_caps_bytes,
         memory_remainder_bytes,
         cache_disabled: flags.disable_cache,
@@ -4177,6 +4219,40 @@ impl std::fmt::Display for MemoryBudgetExceeded {
 
 impl std::error::Error for MemoryBudgetExceeded {}
 
+/// Startup refuses a derived `memory_budget_bytes` below
+/// [`MIN_DERIVED_MEMORY_BUDGET_BYTES`] (ADR-1170, small-host reserve
+/// amendment, issue #2607): the host is too small for the derivation to leave
+/// a workable budget once the overhead reserve is taken. Checked before
+/// [`MemoryBudgetExceeded`], whose cache-cap wording does not describe this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBudgetBelowMinimum {
+    /// What [`Self::memory_bytes`] is: `"MemTotal"`, or `"the cgroup memory
+    /// limit"` when one capped the memory the budget was derived from.
+    pub memory_basis: &'static str,
+    /// The memory the reserve was deducted from.
+    pub memory_bytes: u64,
+    /// The overhead reserve deducted from it.
+    pub reserve_bytes: u64,
+    /// The derived budget.
+    pub memory_budget_bytes: u64,
+}
+
+impl std::fmt::Display for MemoryBudgetBelowMinimum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this host has too little memory for ravel-server's derived memory budget: {} is {} \
+             bytes, the overhead reserve taken from it is {} bytes, and that leaves a derived \
+             memory budget of {} bytes, below the {MIN_DERIVED_MEMORY_BUDGET_BYTES}-byte minimum \
+             (256 MiB). Give the process more memory, or set --memory-budget-bytes to size the \
+             budget explicitly",
+            self.memory_basis, self.memory_bytes, self.reserve_bytes, self.memory_budget_bytes
+        )
+    }
+}
+
+impl std::error::Error for MemoryBudgetBelowMinimum {}
+
 impl ResolvedPerformanceDefaults {
     /// Refuse a flag combination whose two hard cache caps together leave no
     /// strictly positive remainder of [`Self::memory_budget_bytes`]
@@ -4225,6 +4301,42 @@ impl ResolvedPerformanceDefaults {
             });
         }
         Ok(())
+    }
+
+    /// Refuse a derived budget below [`MIN_DERIVED_MEMORY_BUDGET_BYTES`]
+    /// (issue #2607). Applies to the three derived sources only: an explicit
+    /// `--memory-budget-bytes` is the operator's figure, and the fallback and
+    /// not-applicable budgets are `u64::MAX`. `host` is the profile the budget
+    /// was resolved from, read for the memory figure the message names.
+    pub fn check_memory_budget_minimum(
+        &self,
+        host: HostProfile,
+    ) -> Result<(), MemoryBudgetBelowMinimum> {
+        let source = self.sources.memory_budget_bytes;
+        let (memory_basis, memory_bytes) = if source == PERF_SOURCE_DERIVED_AVAILABLE {
+            ("MemTotal", host.mem_total_raw_bytes)
+        } else if source == PERF_SOURCE_DERIVED_CGROUP {
+            let capped_by_limit = host.cgroup_memory_limit_bytes == host.mem_total_bytes;
+            let basis = if capped_by_limit {
+                "the cgroup memory limit"
+            } else {
+                "MemTotal"
+            };
+            (basis, host.mem_total_bytes)
+        } else if source == PERF_SOURCE_DERIVED {
+            ("MemTotal", host.mem_total_bytes)
+        } else {
+            return Ok(());
+        };
+        if self.memory_budget_bytes >= MIN_DERIVED_MEMORY_BUDGET_BYTES {
+            return Ok(());
+        }
+        Err(MemoryBudgetBelowMinimum {
+            memory_basis,
+            memory_bytes: memory_bytes.unwrap_or(0),
+            reserve_bytes: self.memory_overhead_reserve_bytes,
+            memory_budget_bytes: self.memory_budget_bytes,
+        })
     }
 }
 
@@ -7265,6 +7377,7 @@ impl Cli {
         host: HostProfile,
     ) -> anyhow::Result<ResolvedPerformanceDefaults> {
         let resolved = resolve_performance_defaults(host, self.performance_flags()?);
+        resolved.check_memory_budget_minimum(host)?;
         resolved.check_memory_budget()?;
         Ok(resolved)
     }
