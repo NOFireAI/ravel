@@ -328,23 +328,27 @@ the close fails as closed, which for a generation-mismatch hand-back makes the
 source write the rows in place on that flush and for a retired-index one keeps
 them with the source.
 
-Each pipeline counts hand-backs as `rerouted_flushes`, exported as
-`ravel_ingest_rerouted_flushes_total` by signal, once per flush attempt that
-delivered rows to at least one target. Its snapshot also carries two fields
-that are not exported yet: `rerouted_flushes_generation_mismatch`, the part
-handed back for an hour another generation owns, and
+Each pipeline counts hand-backs as `rerouted_flushes`, once per flush attempt
+that delivered rows to at least one target, and each one also on exactly one
+per-reason counter: `rerouted_flushes_retired_index`, or
+`rerouted_flushes_generation_mismatch` for an hour another generation owns.
+The two per-reason counters are exported as
+`ravel_ingest_rerouted_flushes_total` by signal and `reason`, each series
+read from its own counter. Each pipeline's snapshot also carries
 `generation_mismatch_written_in_place`, one per buffer written in place while
-a mismatch was detected. The first hand-back of an episode on a shard logs
-once at WARN with its reason (`retired_index` or `generation_mismatch`). A
-hand-back that keeps its rows, a retired-index one that finds a target not
-live or its mailbox closed, or a generation-mismatch one that finds a target's
-mailbox full on a send that may not wait, counts once per buffer on
-`ravel_ingest_hand_back_failures_total` and logs once (WARN for metrics, whose
-dead shard the next write routed to it respawns; ERROR for logs and spans,
-whose dead shard is condemned, so retired-index rows wait for the teardown
-drain). A generation-mismatch hand-back whose target is not live keeps
-nothing, so it is not counted there; its in-place write counts on
-`generation_mismatch_written_in_place`. `flush_all` repeats while a pass handed rows back, and `shutdown` drains
+a mismatch was detected, exported as
+`ravel_ingest_generation_mismatch_in_place_writes_total` by signal. The first
+hand-back of an episode on a shard logs once at WARN with its reason
+(`retired_index` or `generation_mismatch`). A hand-back that keeps its rows,
+a retired-index one that finds a target not live or its mailbox closed, or a
+generation-mismatch one that finds a target's mailbox full on a send that may
+not wait, counts once per buffer on `ravel_ingest_hand_back_failures_total`
+and logs once (WARN for metrics, whose dead shard the next write routed to it
+respawns; ERROR for logs and spans, whose dead shard is condemned, so
+retired-index rows wait for the teardown drain). A generation-mismatch
+hand-back whose target is not live keeps nothing, so it is not counted there;
+its in-place write counts on `generation_mismatch_written_in_place`.
+`flush_all` repeats while a pass handed rows back, and `shutdown` drains
 shard sets largest first, listing them again after each one because a
 hand-back can construct the current generation's set during the drain, so
 rows handed back to a smaller set reach a set that has not drained yet. A
