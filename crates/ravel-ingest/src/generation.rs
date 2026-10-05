@@ -962,23 +962,24 @@ impl<H: Send + Sync + 'static> GenerationSwitch<H> {
                 {
                     let scan = scan_count(&view.generations, hour, DEFAULT_SCAN_SLACK_HOURS);
                     let active = active_shard_count(&view.generations, hour_of(now_ns));
-                    // `Err` for an owner the view does not list. The owner is
-                    // read from this same list, so that cannot happen; it
-                    // fails closed like an untrusted view rather than write.
-                    let owner = match stable_generation_for_hour(
-                        &view.generations,
-                        hour,
-                        DEFAULT_SCAN_SLACK_HOURS,
-                    ) {
-                        None => Ok(None),
-                        Some(owner) => view
-                            .generations
-                            .iter()
-                            .find(|g| g.generation == owner)
-                            .map(|owner| Some(owner.shard_count))
-                            .ok_or(()),
-                    };
                     if shard < scan {
+                        // `Err` for an owner the view does not list. The owner
+                        // is read from this same list, so that cannot happen;
+                        // it fails closed like an untrusted view rather than
+                        // write.
+                        let owner = match stable_generation_for_hour(
+                            &view.generations,
+                            hour,
+                            DEFAULT_SCAN_SLACK_HOURS,
+                        ) {
+                            None => Ok(None),
+                            Some(owner) => view
+                                .generations
+                                .iter()
+                                .find(|g| g.generation == owner)
+                                .map(|owner| Some(owner.shard_count))
+                                .ok_or(()),
+                        };
                         match owner {
                             Ok(Some(owner)) if owner != count => ScanCheck::HandBack {
                                 scan_count: scan,
