@@ -31,10 +31,12 @@
 //! zero-new-feature `ExprPlanner` that only implements `plan_field_access`
 //! for the `NamedStructField` case and delegates to that always-available
 //! function. `ListIndex`/`ListRange` (non-string-literal subscripts, slices)
-//! are left unplanned (`PlannerResult::Original`): the `logs.attrs` and
-//! `samples.labels` columns are string-keyed maps reached only through the
-//! quoted-string subscript form, so those variants have no caller in this
-//! crate's supported SQL surface today.
+//! are left unplanned (`PlannerResult::Original`): `logs.attrs` is a
+//! string-keyed map reached only through the quoted-string subscript form, so
+//! those variants have no caller in this crate's supported SQL surface today.
+//! `samples.labels` is a dictionary-wrapped map, which `get_field` rejects, so
+//! a subscript on it is rewritten here and then refused while planning;
+//! label values are read with the `label(labels, 'name')` UDF instead.
 //!
 //! Precedence: this planner only rewrites `col['key']` into
 //! `get_field(col, 'key')` over whatever `Expr` the column reference already

@@ -36,7 +36,7 @@ use ravel_sql::conformance::{
     Category, Classification, Construct, Verdict, Verified, registry, render_document,
     render_example_manifest, score,
 };
-use ravel_sql::{ErrorClass, QueryOutput, SqlError, ValidationError, validate_query};
+use ravel_sql::{QueryOutput, SqlError, ValidationError, validate_query};
 use ravel_types::{Signal, TenantId, logstream};
 use util::{Fixture, SegSpec, SeriesSpec, request, tenant_id};
 use uuid::Uuid;
@@ -142,6 +142,34 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         // Of the three log bodies ("conformance record 0/1/2"), only the second
         // contains the substring "record 1".
         (Category::Clause, "LIKE") => Some(Expect::Scalar(1.0)),
+        // Syntax an expression planner rewrites (ADR-0097, issue #2583), each
+        // result re-derived from its literal inputs. 'a' is the first
+        // character of 'ab'; characters 2..4 of 'abcdef' are 'bcd'.
+        (Category::Clause, "POSITION(x IN y)") => Some(Expect::Scalar(1.0)),
+        (
+            Category::Clause,
+            "SUBSTRING(x FROM y FOR z)"
+            | "unquoted substr(x, y, z)"
+            | "unquoted substring(x, y, z)",
+        ) => Some(Expect::Str("bcd")),
+        (Category::Clause, "SUBSTRING(x FROM y)") => Some(Expect::Str("cdef")),
+        // 'x' replaces the second character of 'abc'.
+        (Category::Clause, "OVERLAY(x PLACING y FROM n)") => Some(Expect::Str("axc")),
+        // The second field of each struct holds 2.
+        (
+            Category::Clause,
+            "STRUCT(...) literal"
+            | "{'k': v} literal"
+            | "struct field s.a"
+            | "named_struct(...)['k'] subscript",
+        ) => Some(Expect::Scalar(2.0)),
+        // One of the three log records has `dur` = 10 (see `publish_logs`).
+        (Category::Clause, "attrs['k'] map subscript") => Some(Expect::Scalar(1.0)),
+        // The fixture holds no spans: this row proves the comparison plans and
+        // runs, not that it matches.
+        (Category::Clause, "trace_id = '<32-hex>'") => Some(Expect::Scalar(0.0)),
+        // Four samples, counted by `count()` and by the window count on every row.
+        (Category::Clause, "count()" | "count(*) OVER ()") => Some(Expect::Scalar(count as f64)),
 
         // ADR-0097 decision 8: one representative scalar per admitted family,
         // each result re-derived from its literal inputs.
@@ -246,9 +274,10 @@ fn check_output(expect: Expect, output: &QueryOutput) -> Result<(), String> {
     }
 }
 
-/// The single string cell of a one-row, one-column result.
+/// The single string cell of a one-row, one-column result, `Utf8` or
+/// `Utf8View` (`substr` answers the latter).
 fn single_str(output: &QueryOutput) -> Result<String, String> {
-    use datafusion::arrow::array::StringArray;
+    use datafusion::arrow::array::{StringArray, StringViewArray};
 
     let batch = output
         .batches()
@@ -259,11 +288,16 @@ fn single_str(output: &QueryOutput) -> Result<String, String> {
         return Err(format!("expected 1 column, got {}", batch.num_columns()));
     }
     let column = batch.column(0);
-    let strings = column
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| format!("result column has type {}, not Utf8", column.data_type()))?;
-    Ok(strings.value(0).to_string())
+    if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
+        return Ok(strings.value(0).to_string());
+    }
+    if let Some(strings) = column.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(strings.value(0).to_string());
+    }
+    Err(format!(
+        "result column has type {}, not Utf8 or Utf8View",
+        column.data_type()
+    ))
 }
 
 /// The single numeric cell of a one-row, one-column result, as an `f64`.
@@ -503,24 +537,6 @@ async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
                     },
                     Ok(_) => Verdict::Broken {
                         observed: "moving-frame avg was accepted".to_string(),
-                    },
-                }
-            } else if typed_error == "SqlError::Plan" {
-                // Special-form syntax no registered expression planner handles
-                // (issue #2476) passes the gate and is refused while planning.
-                match fixture
-                    .executor
-                    .execute(tenant.hash(), &request(&construct.example))
-                    .await
-                {
-                    Err(e @ SqlError::Plan(_)) if e.class() == ErrorClass::Unsupported => {
-                        Verdict::Confirmed
-                    }
-                    Err(e) => Verdict::Broken {
-                        observed: format!("wrong error ({:?}): {e}", e.class()),
-                    },
-                    Ok(_) => Verdict::Broken {
-                        observed: "special-form syntax was accepted".to_string(),
                     },
                 }
             } else {
