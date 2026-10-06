@@ -88,6 +88,7 @@ use ravel_types::{Signal, TenantHash};
 use crate::bucket::Bucket;
 use crate::claim_guard::{Checkpoint, ClaimSkipReason};
 use crate::clock::Clock;
+use crate::compact::CompactionInputSkipReason;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
@@ -110,7 +111,9 @@ const MIGRATE_CURSOR_LEN: usize = 9;
 /// The per-invocation work budget for [`migrate_family`], counted in L0 records:
 /// those an L0 migration rewrote, and the inputs a re-encoded compaction record
 /// names, for every rewrite that built its parts and then published, converged,
-/// abandoned at its deadline, or stopped at a changed record set. A budget bounds how much one invocation does before
+/// abandoned at its deadline, or stopped at a changed record set, plus the L0
+/// records of a bucket skipped because an input in it is an object the writer
+/// refuses ([`FamilyMigrateReport::unwritable_skipped`]). A budget bounds how much one invocation does before
 /// persisting its cursor and returning control, so a large migration runs
 /// across many invocations without a lock or a long-lived process. It does not
 /// bound request cost: the walk reads the compaction and rewrite records of
@@ -307,6 +310,16 @@ pub struct NotMigratedBucket {
     pub reason: NotMigratedReason,
 }
 
+/// One bucket the walk skipped because `object_key`, a live L0 input in it, is
+/// an object the writer refuses to rewrite for `reason` (issue #2580).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwritableBucket {
+    pub shard: u32,
+    pub ingest_hour: u32,
+    pub object_key: String,
+    pub reason: CompactionInputSkipReason,
+}
+
 /// What one [`count_below_target`] pass found below the target, with the three
 /// sources kept apart (ADR-1331 decision 1).
 ///
@@ -480,6 +493,17 @@ pub struct FamilyMigrateReport {
     /// run resumes past them, and they are retried by the first run after the
     /// walk drains.
     pub not_migrated: Vec<NotMigratedBucket>,
+    /// Every bucket the walk skipped because a live L0 input in it is an
+    /// object the writer refuses to rewrite ([`MaintainError::UnwritableInput`],
+    /// issue #2580), in walk order, one entry per bucket naming the first such
+    /// object. Bounded like the lists above, by the buckets this invocation
+    /// examined. Nothing in the bucket was written, the walk went on to the
+    /// next bucket, and the fresh re-audit still counts the bucket's
+    /// below-target records, so the floor stays unraised while the object
+    /// remains. No re-run clears it: it stays until the object is removed or
+    /// repaired, or retention ages the bucket out. Its below-target L0 records
+    /// count against the [`MigrateBudget`] as a rewritten bucket's would.
+    pub unwritable_skipped: Vec<UnwritableBucket>,
     /// The `(shard, ingest_hour)` the cursor was persisted at, when this
     /// invocation stopped on its budget. `None` once the walk completes: a
     /// drained walk clears the cursor rather than leaving a position behind.
@@ -1583,7 +1607,10 @@ fn record_reencode(
 ///    [`reencode_compaction_parts`] (a no-op reported as blocked while
 ///    [`CompactorConfig::reencode_writer_enabled`] is off), and otherwise it is
 ///    named in [`FamilyMigrateReport::reencode_blocked`]. A dispatched rewrite
-///    that published nothing is named in [`FamilyMigrateReport::not_migrated`];
+///    that published nothing is named in [`FamilyMigrateReport::not_migrated`],
+///    and one refused because a live L0 input is an object the writer cannot
+///    rewrite in [`FamilyMigrateReport::unwritable_skipped`], the walk going
+///    on to the next bucket either way;
 /// 3. stops early once `budget` is spent (persisting the cursor and returning
 ///    with `walk_complete == false` so the caller re-invokes), or runs the
 ///    verify-and-raise step once the walk reaches its end within budget;
@@ -1673,78 +1700,116 @@ pub async fn migrate_family(
                     });
                 };
                 if l0_below > 0 {
-                    match migrate_bucket_format(store, clock, config, &bucket, target_version)
-                        .await?
-                    {
-                        // The run built its parts and published nothing: the
-                        // pre-publish re-list found the record set changed, or
-                        // the deadline passed. The re-audit still counts the
-                        // bucket's records and a later run retries it.
-                        MigrateOutcome::Rewritten {
-                            publish: PublishOutcome::Abandoned,
-                            ..
-                        } => {
-                            not_migrated(&mut report, NotMigratedReason::PublishAbandoned);
-                            spent += l0_below;
-                        }
-                        MigrateOutcome::RecordSetChanged => {
-                            not_migrated(&mut report, NotMigratedReason::RecordSetChanged);
-                            spent += l0_below;
-                        }
-                        MigrateOutcome::Rewritten { .. } => {
-                            report.buckets_migrated += 1;
-                            report.records_migrated += l0_below;
-                            spent += l0_below;
-                        }
-                        // The rewrite primitive serves one record set per
-                        // bucket, so it refuses a bucket that already carries
-                        // compaction or rewrite records. Two different things
-                        // reach this arm and only one of them is permanent:
-                        // a concurrent compaction or erasure rewrite published
-                        // between our listing and the call's own listing or its
-                        // pre-publish re-list, and the migration published
-                        // nothing (the bucket claim and that re-list are what
-                        // stop a compaction record built from unerased inputs
-                        // landing beside an erasure rewrite record, which would
-                        // serve the erased rows again); or the bucket holds overlapping
-                        // compaction records whose loser-only inputs are still
-                        // served raw and below the target, which no rewrite can
-                        // migrate, because a new record over those inputs joins
-                        // the same overlap component and loses to the existing
-                        // winner.
-                        //
-                        // The outcome alone cannot tell them apart: both are
-                        // returned on nothing more than the bucket carrying a
-                        // record at re-list time. So ask the question again
-                        // against current state rather than counting the
-                        // refusal. `blocked_buckets` claims the permanent case
-                        // on both the CLI and in the guide, and a list that also
-                        // named a raced-past bucket would send an operator
-                        // looking for an overlap that is not there.
-                        MigrateOutcome::AlreadyCompacted | MigrateOutcome::RewritePresent => {
-                            if refusal_is_permanent(store, &bucket, config, target_version).await? {
-                                report.blocked_buckets.push(BlockedBucket {
+                    let migrated =
+                        match migrate_bucket_format(store, clock, config, &bucket, target_version)
+                            .await
+                        {
+                            // One object no build can rewrite must not end the
+                            // walk: record the bucket and go on. Its records stay
+                            // live below the target, so the re-audit refuses the
+                            // floor while it remains.
+                            Err(MaintainError::UnwritableInput {
+                                object_key, reason, ..
+                            }) => {
+                                tracing::warn!(
+                                    tenant = %tenant_hash.to_hex(),
+                                    signal = ?signal,
+                                    shard,
+                                    ingest_hour = hour,
+                                    object_key = ?object_key,
+                                    reason = reason.name(),
+                                    "migrate skipped a bucket holding an input object it cannot \
+                                     rewrite; the walk goes on and the floor stays unraised while \
+                                     the object remains (issue #2580)"
+                                );
+                                report.unwritable_skipped.push(UnwritableBucket {
                                     shard,
                                     ingest_hour: hour,
-                                    reason: BlockedReason::LoserOnlyInputs,
+                                    object_key,
+                                    reason,
                                 });
+                                spent += l0_below;
+                                None
                             }
-                        }
-                        // A concurrent tombstone or a bucket already at the
-                        // target: nothing to migrate and nothing to report.
-                        MigrateOutcome::NotSealed
-                        | MigrateOutcome::Tombstoned
-                        | MigrateOutcome::UpToDate => {}
-                        // Another pass held the bucket's claim, or this one lost
-                        // it: nothing was published and the bucket is not
-                        // migrated. The fresh re-audit still counts its
-                        // below-target records, so the floor stays unraised
-                        // until a later invocation migrates it.
-                        MigrateOutcome::SkippedClaimed { reason } => {
-                            not_migrated(&mut report, NotMigratedReason::ClaimSkipped { reason });
-                        }
-                        MigrateOutcome::Cancelled { at } => {
-                            not_migrated(&mut report, NotMigratedReason::Cancelled { at });
+                            other => Some(other?),
+                        };
+                    if let Some(migrated) = migrated {
+                        match migrated {
+                            // The run built its parts and published nothing: the
+                            // pre-publish re-list found the record set changed, or
+                            // the deadline passed. The re-audit still counts the
+                            // bucket's records and a later run retries it.
+                            MigrateOutcome::Rewritten {
+                                publish: PublishOutcome::Abandoned,
+                                ..
+                            } => {
+                                not_migrated(&mut report, NotMigratedReason::PublishAbandoned);
+                                spent += l0_below;
+                            }
+                            MigrateOutcome::RecordSetChanged => {
+                                not_migrated(&mut report, NotMigratedReason::RecordSetChanged);
+                                spent += l0_below;
+                            }
+                            MigrateOutcome::Rewritten { .. } => {
+                                report.buckets_migrated += 1;
+                                report.records_migrated += l0_below;
+                                spent += l0_below;
+                            }
+                            // The rewrite primitive serves one record set per
+                            // bucket, so it refuses a bucket that already carries
+                            // compaction or rewrite records. Two different things
+                            // reach this arm and only one of them is permanent:
+                            // a concurrent compaction or erasure rewrite published
+                            // between our listing and the call's own listing or its
+                            // pre-publish re-list, and the migration published
+                            // nothing (the bucket claim and that re-list are what
+                            // stop a compaction record built from unerased inputs
+                            // landing beside an erasure rewrite record, which would
+                            // serve the erased rows again); or the bucket holds overlapping
+                            // compaction records whose loser-only inputs are still
+                            // served raw and below the target, which no rewrite can
+                            // migrate, because a new record over those inputs joins
+                            // the same overlap component and loses to the existing
+                            // winner.
+                            //
+                            // The outcome alone cannot tell them apart: both are
+                            // returned on nothing more than the bucket carrying a
+                            // record at re-list time. So ask the question again
+                            // against current state rather than counting the
+                            // refusal. `blocked_buckets` claims the permanent case
+                            // on both the CLI and in the guide, and a list that also
+                            // named a raced-past bucket would send an operator
+                            // looking for an overlap that is not there.
+                            MigrateOutcome::AlreadyCompacted | MigrateOutcome::RewritePresent => {
+                                if refusal_is_permanent(store, &bucket, config, target_version)
+                                    .await?
+                                {
+                                    report.blocked_buckets.push(BlockedBucket {
+                                        shard,
+                                        ingest_hour: hour,
+                                        reason: BlockedReason::LoserOnlyInputs,
+                                    });
+                                }
+                            }
+                            // A concurrent tombstone or a bucket already at the
+                            // target: nothing to migrate and nothing to report.
+                            MigrateOutcome::NotSealed
+                            | MigrateOutcome::Tombstoned
+                            | MigrateOutcome::UpToDate => {}
+                            // Another pass held the bucket's claim, or this one lost
+                            // it: nothing was published and the bucket is not
+                            // migrated. The fresh re-audit still counts its
+                            // below-target records, so the floor stays unraised
+                            // until a later invocation migrates it.
+                            MigrateOutcome::SkippedClaimed { reason } => {
+                                not_migrated(
+                                    &mut report,
+                                    NotMigratedReason::ClaimSkipped { reason },
+                                );
+                            }
+                            MigrateOutcome::Cancelled { at } => {
+                                not_migrated(&mut report, NotMigratedReason::Cancelled { at });
+                            }
                         }
                     }
                 } else if listing.rewrite_record_keys.is_empty() {
@@ -4463,5 +4528,160 @@ mod tests {
             "the winner's one and the loser's two below-target parts all count \
              in l1; the loser names the bucket and the rewrite parts count nowhere"
         );
+    }
+
+    /// Seed one single-record L0 `.rlog` input at `(0, hour)`, recorded at
+    /// `segment_format_version`. With `refused` the record's scope name is not
+    /// UTF-8, written past the writer's check, so the RLOG writer refuses to
+    /// rewrite the object (issue #2580); its stream is one no healthy input
+    /// carries.
+    async fn seed_rlog_at(
+        store: &dyn ObjectStoreBackend,
+        hour: u32,
+        seq: u64,
+        refused: bool,
+        segment_format_version: u32,
+    ) {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let th = tenant_hash();
+        let shard = 0;
+        let writer_id = Uuid::from_u128(u128::from(seq));
+        let created = i64::from(hour) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+        let service = if refused { "svc9" } else { "svc0" };
+        let res = vec![(
+            "service.name".to_string(),
+            AttrValue::Str(service.to_string()),
+        )];
+        let mut stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]);
+        if refused {
+            let at = stream_attrs
+                .windows(5)
+                .position(|w| w == b"scope")
+                .expect("scope name in blob");
+            stream_attrs[at] = 0xFF;
+        }
+        let record = LogRecord {
+            stream_id: log_stream_id(&res, "scope", "1", &[]),
+            stream_attrs,
+            ts_ns: created,
+            observed_ts_ns: created,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "alpha".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        };
+        let mut writer = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: th.0,
+                shard,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: EPOCH,
+                writer_seq: seq,
+            },
+        );
+        if refused {
+            writer = writer.with_unchecked_stream_attrs();
+        }
+        writer.push(record).expect("push log record");
+        let bytes = Bytes::from(writer.finish().expect("finish rlog L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(
+            &th,
+            Signal::Logs,
+            shard,
+            writer_id,
+            EPOCH,
+            seq,
+            &content_hash,
+        )
+        .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put rlog data");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Logs,
+            shard,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created,
+            max_event_ts_ns: created,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version,
+            created_unix_ns: created,
+            ingest_hour_bucket: hour,
+        })
+        .expect("build logs commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    /// A bucket skipped for an unwritable input spends its L0 records against
+    /// the budget, as a rewritten one does. Three logs buckets of two
+    /// below-target records each, the first two holding one refused object
+    /// apiece, walked with a two-record budget: the first invocation skips
+    /// hour 100 and stops there, and the next resumes past it, skips hour 101
+    /// and stops there. With `spent += l0_below` removed from the walk's
+    /// `UnwritableInput` arm the first invocation walks the whole family,
+    /// skipping both and migrating hour 102 before the budget stops it.
+    #[tokio::test]
+    async fn a_bucket_skipped_for_an_unwritable_input_spends_the_budget() {
+        let store = MemoryStore::new();
+        let target = crate::rlog::OUTPUT_FORMAT_VERSION;
+        let mut seq = 0;
+        for hour in [100, 101, 102] {
+            for refused in [false, hour != 102] {
+                seq += 1;
+                seed_rlog_at(&store, hour, seq, refused, target - 1).await;
+            }
+        }
+        let clock = FixedClock::new(sealed_now_ns_for(102));
+        let config = CompactorConfig::default();
+        let run = || {
+            migrate_family(
+                &store,
+                &clock,
+                &config,
+                tenant_hash(),
+                Signal::Logs,
+                "rlog",
+                target,
+                1,
+                MigrateBudget::records(2),
+                "migrate test",
+            )
+        };
+
+        for hour in [100, 101] {
+            let report = run().await.expect("the walk stops on its budget");
+            let skipped: Vec<(u32, u32)> = report
+                .unwritable_skipped
+                .iter()
+                .map(|b| (b.shard, b.ingest_hour))
+                .collect();
+            assert_eq!(skipped, vec![(0, hour)], "{report:?}");
+            assert_eq!(report.buckets_migrated, 0, "{report:?}");
+            assert!(report.budget_exhausted, "{report:?}");
+            assert!(!report.walk_complete, "{report:?}");
+            assert_eq!(report.cursor_advanced_to, Some((0, hour)), "{report:?}");
+        }
     }
 }

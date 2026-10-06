@@ -308,6 +308,10 @@ ravel-test-support = { workspace = true }
 # pairs with, already in the lockfile through ravel-cli.
 ravel-pqtable = { workspace = true }
 parquet = { version = "59", default-features = false, features = ["arrow"] }
+# Already a normal dependency; the dev edge only adds `test-support`, so the
+# erasure tests in src/maintain.rs can store a `stream_attrs` blob the writer
+# refuses (`RlogWriter::with_unchecked_stream_attrs`, issue #2580).
+ravel-logseg = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

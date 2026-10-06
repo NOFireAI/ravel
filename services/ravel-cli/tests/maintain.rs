@@ -1428,6 +1428,7 @@ async fn migrate_without_the_reencode_flag_reports_the_bucket_blocked_and_writes
              the target. A run with --reencode-compaction-parts re-encodes it, once every reader \
              and maintainer runs a build that reads version 2 compaction records.\n\
              buckets_not_migrated: 0\n\
+             buckets_unwritable_skipped: 0\n\
              walk_complete: true\n\
              verification: FOUND STRAGGLERS l0_commit_records=0 l1_compaction_parts=1 \
              rewrite_record_parts=0\n",
@@ -1483,6 +1484,7 @@ async fn migrate_with_the_reencode_flag_reencodes_the_bucket_and_reports_it_migr
              records_migrated: 2\n\
              buckets_reencode_blocked: 0\n\
              buckets_not_migrated: 0\n\
+             buckets_unwritable_skipped: 0\n\
              walk_complete: true\n\
              verification: FOUND STRAGGLERS l0_commit_records=0 l1_compaction_parts=1 \
              rewrite_record_parts=0\n",
@@ -1573,6 +1575,7 @@ async fn migrate_prints_a_bucket_whose_claim_another_process_holds() {
              # Each not_migrated bucket published nothing this run. This run drained the walk \
              and cleared its cursor, so the next migrate run starts over and retries every one \
              of them.\n\
+             buckets_unwritable_skipped: 0\n\
              walk_complete: true\n\
              verification: FOUND STRAGGLERS l0_commit_records=0 l1_compaction_parts=1 \
              rewrite_record_parts=0\n",
@@ -1788,6 +1791,7 @@ async fn migrate_exits_zero_when_another_writer_resolved_a_not_migrated_bucket()
              # Each not_migrated bucket published nothing this run, and the fresh re-audit \
              found nothing below the target: another writer carried it to the target after \
              this run passed it. Nothing is left to retry.\n\
+             buckets_unwritable_skipped: 0\n\
              walk_complete: true\n\
              verification: clean (no records below target)\n\
              floor_raised_to: {version}\n"

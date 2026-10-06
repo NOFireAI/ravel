@@ -118,6 +118,21 @@ pub enum MaintainError {
         a_len: usize,
         b_len: usize,
     },
+    /// An input object the codec's writer would refuse to rewrite
+    /// ([`crate::codec::SegmentCodec::unwritable_input`]), found before the
+    /// merge by a run that must carry every input: format migration and the
+    /// erasure rewrite. Compaction leaves such an input out instead (issue
+    /// #2554). Nothing was written.
+    #[error(
+        "input object {object_key:?} cannot be rewritten ({}): {detail}; nothing written (issue #2580)",
+        reason.name()
+    )]
+    UnwritableInput {
+        object_key: String,
+        reason: crate::compact::CompactionInputSkipReason,
+        /// The decoder's refusal.
+        detail: String,
+    },
     #[error("unknown object shape in bucket listing: {0:?}")]
     UnknownBucketEntry(String),
     #[error("decoded record signal {actual} does not match the queried signal {expected}")]
