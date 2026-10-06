@@ -58,7 +58,9 @@ pub enum CompactionOutcome {
 }
 
 /// Why compaction left one input object of a bucket out of its merge (issue
-/// #2554): the `reason` label of `ravel_maintain_compaction_inputs_skipped_total`.
+/// #2554): the `reason` label of `ravel_maintain_compaction_inputs_skipped_total`,
+/// and of `ravel_maintain_erasure_unwritable_objects_total` for an object that
+/// blocks an erasure rewrite instead (issue #2580).
 ///
 /// A skipped input is left in storage as it is. The published compaction
 /// record does not name it, so the catalog keeps serving it as an L0 object and

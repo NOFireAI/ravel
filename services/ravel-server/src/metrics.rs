@@ -4036,6 +4036,18 @@ pub struct MaintenanceSafetySnapshot {
     /// [`ravel_maintain::CompactionInputSkipReason::ALL`] member, signals
     /// outermost, in those orders.
     pub compaction_inputs_skipped: Vec<(Signal, ravel_maintain::CompactionInputSkipReason, u64)>,
+    /// Input objects that blocked an erasure rewrite of their bucket since
+    /// process start, each counted once (issue #2580): one entry per
+    /// [`ravel_maintain::ERASURE_UNWRITABLE_SIGNALS`] member and
+    /// [`ravel_maintain::CompactionInputSkipReason::ALL`] member, signals
+    /// outermost, in those orders.
+    pub erasure_unwritable_objects: Vec<(Signal, ravel_maintain::CompactionInputSkipReason, u64)>,
+    /// [`ravel_maintain::retention::held_out_of_window_objects_total`], read at
+    /// scrape time. Not signal-scoped: ravel-maintain keeps one total.
+    pub retention_held_out_of_window_objects: u64,
+    /// [`ravel_maintain::retention::held_by_lease_buckets_total`], read at
+    /// scrape time. Not signal-scoped: ravel-maintain keeps one total.
+    pub retention_held_by_lease_buckets: u64,
     pub signals: Vec<MaintenanceSafetySignalSnapshot>,
 }
 
@@ -4069,6 +4081,11 @@ impl MaintenanceSafetySnapshot {
                 .map(|&signal| (signal, metrics.unmaintained_superseded(signal)))
                 .collect(),
             compaction_inputs_skipped: compaction_inputs_skipped(),
+            erasure_unwritable_objects: erasure_unwritable_objects(),
+            retention_held_out_of_window_objects:
+                ravel_maintain::retention::held_out_of_window_objects_total(),
+            retention_held_by_lease_buckets: ravel_maintain::retention::held_by_lease_buckets_total(
+            ),
             signals: crate::maintain::MAINTAINED_SIGNALS
                 .iter()
                 .map(|&signal| MaintenanceSafetySignalSnapshot {
@@ -4130,6 +4147,25 @@ fn compaction_inputs_skipped() -> Vec<(Signal, ravel_maintain::CompactionInputSk
         .collect()
 }
 
+/// [`MaintenanceSafetySnapshot::erasure_unwritable_objects`], read from the
+/// process-wide counter ravel-maintain's erasure rewrite keeps.
+fn erasure_unwritable_objects() -> Vec<(Signal, ravel_maintain::CompactionInputSkipReason, u64)> {
+    ravel_maintain::ERASURE_UNWRITABLE_SIGNALS
+        .iter()
+        .flat_map(|&signal| {
+            ravel_maintain::CompactionInputSkipReason::ALL
+                .iter()
+                .map(move |&reason| {
+                    (
+                        signal,
+                        reason,
+                        ravel_maintain::erasure_unwritable_objects_total(signal, reason),
+                    )
+                })
+        })
+        .collect()
+}
+
 /// No `tenant_hash` label on any series here. ADR-0048 decision 4 names
 /// `tenant_hash` for the breaker-trip counter, but ADR-0044 section 4 blocks
 /// any per-tenant series on this unauthenticated route pending an
@@ -4154,6 +4190,38 @@ fn render_maintain_safety_family(
         "ravel_maintain_legal_hold_refresh_failures_total",
         &[Label::Mode(mode)],
         snapshot.legal_hold_refresh_failures,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_retention_held_out_of_window_objects_total",
+        "Data objects the retention sweep declined to delete because their format version is \
+         outside this build's reader window, counted once per object per pass, summed over \
+         every signal since process start (ADR-0066). The whole bucket keeps its tombstone and \
+         nothing in it is deleted that pass. A rising total means retention is holding data \
+         past its window: finish the upgrade, complete maintain migrate, or roll back.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_retention_held_out_of_window_objects_total",
+        &[Label::Mode(mode)],
+        snapshot.retention_held_out_of_window_objects,
+    );
+
+    write_header(
+        out,
+        "ravel_maintain_retention_held_by_lease_buckets_total",
+        "Tombstoned buckets the retention sweep declined to touch because a lease or legal hold \
+         protects a key it would delete, counted once per bucket per pass, summed over every \
+         signal since process start (ADR-0042). Rises for as long as a hold stands.",
+        "counter",
+    );
+    write_sample(
+        out,
+        "ravel_maintain_retention_held_by_lease_buckets_total",
+        &[Label::Mode(mode)],
+        snapshot.retention_held_by_lease_buckets,
     );
 
     write_header(
@@ -4193,6 +4261,30 @@ fn render_maintain_safety_family(
         write_sample(
             out,
             "ravel_maintain_compaction_inputs_skipped_total",
+            &[
+                Label::Mode(mode),
+                Label::Signal(signal),
+                Label::CompactionInputSkipReason(reason),
+            ],
+            value,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_erasure_unwritable_objects_total",
+        "Input objects that blocked the selective-erasure rewrite of their bucket, by signal and \
+         reason, each object counted once per process since process start (issue #2580). \
+         reason=\"unwritable_stream_attrs\": a log object carrying a stream_attrs blob the RLOG \
+         writer refuses. The bucket is not rewritten and the object stays in storage, so every \
+         erasure request whose window covers it stays pending; requests it does not cover \
+         complete. A warn log line names its key. Resets on restart: alert on an increase.",
+        "counter",
+    );
+    for &(signal, reason, value) in &snapshot.erasure_unwritable_objects {
+        write_sample(
+            out,
+            "ravel_maintain_erasure_unwritable_objects_total",
             &[
                 Label::Mode(mode),
                 Label::Signal(signal),
@@ -11408,6 +11500,9 @@ mod tests {
             unmaintained_orphan_breaker_trips: vec![(Signal::Alerts, 14), (Signal::Audit, 0)],
             unmaintained_superseded: Vec::new(),
             compaction_inputs_skipped: Vec::new(),
+            erasure_unwritable_objects: Vec::new(),
+            retention_held_out_of_window_objects: 15,
+            retention_held_by_lease_buckets: 16,
             signals: vec![
                 MaintenanceSafetySignalSnapshot {
                     signal: Signal::Metrics,
@@ -11498,6 +11593,18 @@ mod tests {
         assert!(
             body.contains("ravel_maintain_legal_hold_refresh_failures_total{mode=\"maintain\"} 3"),
             "missing legal_hold_refresh_failures sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_held_out_of_window_objects_total{mode=\"maintain\"} 15\n"
+            ),
+            "missing retention_held_out_of_window_objects sample:\n{body}"
+        );
+        assert!(
+            body.contains(
+                "ravel_maintain_retention_held_by_lease_buckets_total{mode=\"maintain\"} 16\n"
+            ),
+            "missing retention_held_by_lease_buckets sample:\n{body}"
         );
         assert!(
             body.contains(
@@ -12807,6 +12914,13 @@ mod tests {
                     1,
                 ),
             ],
+            erasure_unwritable_objects: vec![(
+                Signal::Logs,
+                ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
+                1,
+            )],
+            retention_held_out_of_window_objects: 1,
+            retention_held_by_lease_buckets: 1,
             signals: vec![MaintenanceSafetySignalSnapshot {
                 signal: Signal::Metrics,
                 conservation_aborts: 1,
@@ -12868,34 +12982,37 @@ mod tests {
         );
 
         for line in body.lines() {
-            let expected_keys =
-                if line.starts_with("ravel_maintain_legal_hold_refresh_failures_total") {
-                    vec!["mode"]
-                } else if line.starts_with("ravel_maintain_conservation_aborts_total")
-                    || line.starts_with("ravel_maintain_orphan_breaker_tripped_total")
-                    || line.starts_with("ravel_maintain_orphans_withheld")
-                    || line.starts_with("ravel_maintain_orphans_present")
-                    || line.starts_with("ravel_maintain_orphans_quarantined_total")
-                    || line.starts_with("ravel_maintain_orphans_quarantine_refused_total")
-                    || line.starts_with("ravel_maintain_superseded_deletes_refused_total")
-                    || line.starts_with("ravel_maintain_superseded_groups_held_by_legal_hold_total")
-                    || line.starts_with("ravel_maintain_dreq_held_by_superseded_inputs_total")
-                    || line.starts_with("ravel_maintain_quarantine_reaped_total")
-                    || line.starts_with("ravel_maintain_l0_records_pending")
-                    || line.starts_with("ravel_maintain_bytes_reclaimed_total")
-                    || line.starts_with("ravel_maintain_retention_lag_seconds")
-                    || line.starts_with("ravel_maintain_units_scan_failed")
-                {
-                    vec!["mode", "signal"]
-                } else if line.starts_with("ravel_maintain_superseded_inputs_held_total")
-                    || line.starts_with("ravel_maintain_compaction_inputs_skipped_total")
-                {
-                    vec!["mode", "signal", "reason"]
-                } else if line.starts_with("ravel_maintain_objects_deleted_total") {
-                    vec!["mode", "kind"]
-                } else {
-                    continue;
-                };
+            let expected_keys = if line
+                .starts_with("ravel_maintain_legal_hold_refresh_failures_total")
+                || line.starts_with("ravel_maintain_retention_held_")
+            {
+                vec!["mode"]
+            } else if line.starts_with("ravel_maintain_conservation_aborts_total")
+                || line.starts_with("ravel_maintain_orphan_breaker_tripped_total")
+                || line.starts_with("ravel_maintain_orphans_withheld")
+                || line.starts_with("ravel_maintain_orphans_present")
+                || line.starts_with("ravel_maintain_orphans_quarantined_total")
+                || line.starts_with("ravel_maintain_orphans_quarantine_refused_total")
+                || line.starts_with("ravel_maintain_superseded_deletes_refused_total")
+                || line.starts_with("ravel_maintain_superseded_groups_held_by_legal_hold_total")
+                || line.starts_with("ravel_maintain_dreq_held_by_superseded_inputs_total")
+                || line.starts_with("ravel_maintain_quarantine_reaped_total")
+                || line.starts_with("ravel_maintain_l0_records_pending")
+                || line.starts_with("ravel_maintain_bytes_reclaimed_total")
+                || line.starts_with("ravel_maintain_retention_lag_seconds")
+                || line.starts_with("ravel_maintain_units_scan_failed")
+            {
+                vec!["mode", "signal"]
+            } else if line.starts_with("ravel_maintain_superseded_inputs_held_total")
+                || line.starts_with("ravel_maintain_compaction_inputs_skipped_total")
+                || line.starts_with("ravel_maintain_erasure_unwritable_objects_total")
+            {
+                vec!["mode", "signal", "reason"]
+            } else if line.starts_with("ravel_maintain_objects_deleted_total") {
+                vec!["mode", "kind"]
+            } else {
+                continue;
+            };
             let brace = line.find('{').expect("sample line carries labels");
             let labels = &line[brace + 1..line.find('}').expect("closed label block")];
             let keys: Vec<&str> = labels
@@ -13021,6 +13138,61 @@ mod tests {
                 "ravel_maintain_compaction_inputs_skipped_total{mode=\"maintain\",signal=\"audit\",reason=\"unwritable_stream_attrs\"} 0",
             ]
         );
+    }
+
+    /// `ravel_maintain_erasure_unwritable_objects_total` renders one sample per
+    /// signal whose erasure rewrite can be blocked by an unwritable object and
+    /// per reason, carrying exactly `mode`, `signal` and `reason` (issue
+    /// #2580). The snapshot constructor lists the logs signal and every reason
+    /// whatever the counter holds, so the series exists from zero. The value
+    /// read from the process is not pinned here: the erasure tests in
+    /// `maintain` move the same process-wide counter.
+    #[test]
+    fn erasure_unwritable_objects_renders_each_signal_and_reason() {
+        use ravel_maintain::CompactionInputSkipReason as Reason;
+        let from_process = MaintenanceSafetySnapshot::from_metrics(
+            &crate::maintain::MaintenanceSafetyMetrics::default(),
+        );
+        let shape: Vec<(Signal, Reason)> = from_process
+            .erasure_unwritable_objects
+            .iter()
+            .map(|&(signal, reason, _)| (signal, reason))
+            .collect();
+        assert_eq!(shape, vec![(Signal::Logs, Reason::UnwritableStreamAttrs)]);
+
+        let family = "ravel_maintain_erasure_unwritable_objects_total";
+        for value in [0, 2] {
+            let snapshot = MaintenanceSafetySnapshot {
+                erasure_unwritable_objects: vec![(
+                    Signal::Logs,
+                    Reason::UnwritableStreamAttrs,
+                    value,
+                )],
+                ..from_process.clone()
+            };
+            let mut body = String::new();
+            render_maintain_safety_family(&mut body, Mode::Maintain, &snapshot);
+            assert_eq!(
+                body.matches(&format!("# TYPE {family} counter\n")).count(),
+                1,
+                "{body}"
+            );
+            assert_eq!(
+                body.matches(&format!("# HELP {family} ")).count(),
+                1,
+                "{body}"
+            );
+            let samples: Vec<&str> = body
+                .lines()
+                .filter(|line| line.starts_with(&format!("{family}{{")))
+                .collect();
+            assert_eq!(
+                samples,
+                vec![format!(
+                    "{family}{{mode=\"maintain\",signal=\"logs\",reason=\"unwritable_stream_attrs\"}} {value}"
+                )]
+            );
+        }
     }
 
     /// A maintain-safety snapshot with `set` applied to every signal's entry,
