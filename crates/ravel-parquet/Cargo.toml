@@ -24,6 +24,11 @@ object_store = { version = "0.13", default-features = false }
 # The parquet major datafusion-datasource-parquet 54 is built on, with the
 # features it already enables, for footer decoding and `AsyncFileReader`.
 parquet = { version = "58", default-features = false, features = ["arrow", "async"] }
+# The base64 major parquet 58 decodes an embedded `ARROW:schema` with, and
+# the flatbuffers major its arrow-ipc verifies it with, so the footer check
+# reads that value byte for byte as the decoder does.
+base64 = { version = "0.22", default-features = false, features = ["std"] }
+flatbuffers = { version = "25", default-features = false, features = ["std"] }
 # `url::Url` appears in the `ObjectStoreRegistry` trait signature and
 # datafusion does not re-export it; ravel-sql names it the same way.
 url = "2"
