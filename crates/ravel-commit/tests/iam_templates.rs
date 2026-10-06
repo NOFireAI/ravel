@@ -2331,12 +2331,17 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // (query_template_covers_every_parquet_table_read). HTTP Parquet DDL
     // creates manifests under a create-only grant and runs the bucket probe,
     // which puts and deletes sys/pq-probe/<random>
-    // (query_template_covers_every_parquet_ddl_call).
+    // (query_template_covers_every_parquet_ddl_call). The l0/ and l1/ list
+    // prefixes make S3 answer a GET of a segment a compaction or retention
+    // delete removed with 404 rather than 403, so the engine's re-resolve
+    // retry runs (query_lists_the_data_prefixes_so_a_deleted_segment_reads_as_missing).
     ExpectedRolePatterns {
         role: "query",
         list_prefixes: &[
             "t/",
             "t/*/*/c/*",
+            "t/*/*/l0/*",
+            "t/*/*/l1/*",
             "t/*/catalog/*/*",
             "admission/query/*",
             "sys/query/workers/*",
@@ -6218,14 +6223,19 @@ fn an_idempotency_list_grant_widened_to_any_idem_prefix_reaches_the_lookalikes()
 /// record (`AbsentPolicy::RefuseIfCommittedDataHidden` in `validate_or_adopt`,
 /// `crates/ravel-catalog/src/provisioning.rs`) issues one delimited listing of
 /// `t/<hash>/<sig>/c/` per provisioned signal (`commit_prefix` there) and never
-/// lists `t/<hash>/<sig>/l0/`. `query.json`'s ListBucket grant admits the
-/// first and does not admit the second. The ravel-server test
-/// `query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing`
-/// fails any `l0/` listing the way this template would, so a change to the
-/// check that lists `l0/` fails there unless this grant, and this test, change
-/// with it.
+/// lists `t/<hash>/<sig>/l0/`. `QueryList` admits the first.
+///
+/// `QueryList` also names `t/*/*/l0/*` and `t/*/*/l1/*`, for no listing the
+/// code issues: S3 answers a GET of an absent key with 404 only when one of the
+/// caller's ListBucket grants has an `s3:prefix` value matching that key, and
+/// with 403 otherwise. A query read of a segment that a compaction or retention
+/// delete removed must see `NotFound`, the one error the engine's re-resolve
+/// retry fires on. The template therefore admits an `l0/` listing as well, and
+/// what keeps the startup check from issuing one is the ravel-server test
+/// `query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing`,
+/// not this grant.
 #[test]
-fn query_template_admits_the_startup_commit_listing_and_not_l0() {
+fn query_template_admits_the_startup_commit_listing_and_lists_the_data_prefixes() {
     let query = load_policy("query");
     let allowed = list_prefix_patterns(&query, Some("Allow"));
     let denied = list_prefix_patterns(&query, Some("Deny"));
@@ -6239,11 +6249,6 @@ fn query_template_admits_the_startup_commit_listing_and_not_l0() {
             .expect("commit shard prefix ends in the shard directory")
             .to_string();
         assert_eq!(commit, format!("t/{hash}/{sig}/c/"));
-        let l0_data =
-            data_key(&tenant, signal, 0, Uuid::from_u128(1), 1, 1, &[0u8; 32]).expect("data_key");
-        let l0_end = l0_data.find("/l0/").expect("data key has an l0 segment") + "/l0/".len();
-        let l0 = l0_data[..l0_end].to_string();
-        assert_eq!(l0, format!("t/{hash}/{sig}/l0/"));
 
         assert!(
             allowed.iter().any(|p| glob_matches(p, &commit)),
@@ -6254,11 +6259,236 @@ fn query_template_admits_the_startup_commit_listing_and_not_l0() {
             !denied.iter().any(|p| glob_matches(p, &commit)),
             "query: a ListBucket Deny withdraws {commit:?}"
         );
+    }
+
+    let stmt = policy_statements(&query)
+        .iter()
+        .find(|s| statement_sid(s) == "QueryList")
+        .expect("query.json carries a QueryList statement");
+    assert_eq!(
+        stmt,
+        &serde_json::json!({
+            "Sid": "QueryList",
+            "Effect": "Allow",
+            "Action": "s3:ListBucket",
+            "Resource": BUCKET_ARN,
+            "Condition": {"StringLike": {"s3:prefix": [
+                "t/",
+                "t/*/*/c/*",
+                "t/*/*/l0/*",
+                "t/*/*/l1/*",
+                "t/*/catalog/*/*",
+                "admission/query/*",
+                "sys/query/workers/*",
+                "t/*/pq/t/*",
+            ]}},
+        }),
+        "query/QueryList: the statement is not exactly the expected list grant"
+    );
+}
+
+/// Each key in `key_domain()` that `reader` may GET and that one of `deleters`
+/// can delete: its delete Allow reaches the key and its own delete Deny does
+/// not. A GET of such a key can race the delete.
+fn deletable_reads(reader: &Policy, deleters: &[&Policy]) -> Vec<String> {
+    let gets = key_patterns_for(reader, &["s3:GetObject"], Some("Allow"));
+    let deletes: Vec<(Vec<String>, Vec<String>)> = deleters
+        .iter()
+        .map(|d| {
+            (
+                delete_key_patterns(d, "Allow"),
+                delete_key_patterns(d, "Deny"),
+            )
+        })
+        .collect();
+    key_domain()
+        .iter()
+        .filter(|key| gets.iter().any(|p| glob_matches(p, key)))
+        .filter(|key| {
+            deletes.iter().any(|(allow, deny)| {
+                allow.iter().any(|p| glob_matches(p, key))
+                    && !deny.iter().any(|p| glob_matches(p, key))
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// The keys of `deletable_reads` that no `reader` ListBucket Allow `s3:prefix`
+/// value matches: S3 answers a GET of one that was deleted with 403, not 404.
+fn deletable_reads_without_a_list_grant(reader: &Policy, deleters: &[&Policy]) -> Vec<String> {
+    let prefixes = list_prefix_patterns(reader, Some("Allow"));
+    deletable_reads(reader, deleters)
+        .into_iter()
+        .filter(|key| !prefixes.iter().any(|p| glob_matches(p, key)))
+        .collect()
+}
+
+/// Every L0 data key and L1 part key in `representative_keys` except the two
+/// on the audit legal-hold shard, which Maintain's `DenyDeleteProtected`
+/// keeps it from deleting; those two are returned second, built the way
+/// `representative_keys` builds them.
+fn deletable_segment_keys() -> (Vec<String>, Vec<String>) {
+    let tenant = test_tenant();
+    let hold = vec![
+        data_key(
+            &tenant,
+            Signal::Audit,
+            AUDIT_HOLD_SHARD,
+            Uuid::from_u128(1),
+            1,
+            1,
+            &[0u8; 32],
+        )
+        .expect("data_key"),
+        l1_part_key(
+            &tenant,
+            Signal::Audit,
+            AUDIT_HOLD_SHARD,
+            0,
+            hash16(),
+            0,
+            hash16(),
+        )
+        .expect("l1_part_key"),
+    ];
+    let mut segments = l0_data_keys();
+    segments.extend(
+        representative_keys()
+            .into_iter()
+            .filter(|k| k.contains("/l1/")),
+    );
+    for key in &hold {
+        assert!(segments.contains(key), "{key:?} is a representative key");
+    }
+    segments.retain(|k| !hold.contains(k));
+    segments.sort();
+    (segments, hold)
+}
+
+/// Every key the Query role may GET and the Maintain role can delete has a
+/// Query ListBucket `s3:prefix` value matching it, so a query read that races a
+/// compaction or retention delete sees `NotFound` and the engine's re-resolve
+/// retry runs, rather than `AccessDenied`. The set is derived from the two
+/// templates; every L0 data key and L1 part key Maintain can delete is in it,
+/// and the legal-hold shard's two are not.
+#[test]
+fn query_lists_the_data_prefixes_so_a_deleted_segment_reads_as_missing() {
+    let query = load_policy("query");
+    let maintain = load_policy("maintain");
+    let racing = deletable_reads(&query, &[&maintain]);
+    let (segments, hold) = deletable_segment_keys();
+    for key in &segments {
         assert!(
-            !allowed.iter().any(|p| glob_matches(p, &l0)),
-            "query: a ListBucket s3:prefix admits {l0:?}; the Query startup check \
-             is documented and tested as never listing l0/. s3:prefix values: \
-             {allowed:?}"
+            racing.contains(key),
+            "query: {key:?} is not in the set Query reads and Maintain deletes: \
+             {racing:?}"
+        );
+    }
+    for key in &hold {
+        assert!(
+            !racing.contains(key),
+            "query: the legal-hold key {key:?} reads as deletable by Maintain"
+        );
+    }
+    assert_eq!(
+        deletable_reads_without_a_list_grant(&query, &[&maintain]),
+        Vec::<String>::new(),
+        "query: keys Query reads and Maintain deletes that no Query list grant \
+         covers; S3 answers a read of one that was deleted with 403"
+    );
+}
+
+/// The coverage check is live: `query.json` with the `l0/` and `l1/` list
+/// prefixes removed leaves exactly the L0 data keys and L1 part keys Maintain
+/// can delete uncovered.
+#[test]
+fn query_list_without_the_data_prefixes_leaves_every_segment_uncovered() {
+    let path = policy_json_path("query");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read template"))
+            .expect("parse template");
+    let stmt = json["Statement"]
+        .as_array_mut()
+        .expect("Statement array")
+        .iter_mut()
+        .find(|s| s["Sid"] == serde_json::json!("QueryList"))
+        .expect("QueryList statement");
+    let prefixes = stmt["Condition"]["StringLike"]["s3:prefix"]
+        .as_array_mut()
+        .expect("QueryList s3:prefix array");
+    let before = prefixes.len();
+    prefixes.retain(|p| p != "t/*/*/l0/*" && p != "t/*/*/l1/*");
+    assert_eq!(
+        prefixes.len(),
+        before - 2,
+        "the fixture removed both prefixes"
+    );
+    let narrowed = build_policy("query", "narrowed fixture", &json);
+
+    let (want, _) = deletable_segment_keys();
+    let mut got = deletable_reads_without_a_list_grant(&narrowed, &[&load_policy("maintain")]);
+    got.sort();
+    assert_eq!(got, want);
+}
+
+/// The same check for every server role against every other role's delete
+/// grants. Recorded, not fixed: the keys pinned here are read by the role,
+/// deletable by another, and matched by none of the role's list grants.
+///
+/// Gateway's six are the literal `t/<hash16>/<sig>/idem/<hash16>` witnesses of
+/// `constructor_free_tenant_witness_keys`, which `GatewayRead` and
+/// `MaintainDelete` reach through `t/*/*/idem/*`. No marker has that shape: a
+/// real marker key, `t/<hash>/<sig>/idem/<keyhash32>.<hour>.idm`, is matched by
+/// `GatewayListTenantBootstrapKeys`, which this test also asserts.
+///
+/// Maintain's one is the audit signal's admission snapshot: `MaintainRead`'s
+/// `t/*/u/*`, granted for the query-audit records, also reaches
+/// `t/<hash>/u/admission/<process_id>.snapshot`, which `GatewayAdmissionDelete`
+/// reaps. No Maintain path reads an admission snapshot.
+#[test]
+fn deletable_reads_without_a_list_grant_per_server_role() {
+    let policies: Vec<(&str, Policy)> = ALL_ROLES.iter().map(|r| (*r, load_policy(r))).collect();
+    let hash = hash16();
+    let idem_witnesses: Vec<String> = ALL_SIGNALS
+        .iter()
+        .map(|s| format!("t/{hash}/{}/idem/{hash}", s.key_prefix()))
+        .collect();
+    for (reader, expected) in [
+        ("gateway", idem_witnesses),
+        ("query", Vec::new()),
+        ("maintain", vec![admission_snapshot_key(Signal::Audit)]),
+    ] {
+        let (_, policy) = policies
+            .iter()
+            .find(|(r, _)| *r == reader)
+            .expect("reader policy");
+        let others: Vec<&Policy> = policies
+            .iter()
+            .filter(|(r, _)| *r != reader)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(
+            deletable_reads_without_a_list_grant(policy, &others),
+            expected,
+            "{reader}: keys this role reads, another role deletes, and none of \
+             its list grants matches"
+        );
+    }
+
+    let gateway = load_policy("gateway");
+    let prefixes = list_prefix_patterns(&gateway, Some("Allow"));
+    let hex = test_tenant().to_hex();
+    for signal in IDEM_SIGNALS {
+        let marker = idem_marker_key_under(
+            &hex,
+            signal,
+            &idem_keyhash32("acme", b"client-key-1"),
+            495_972,
+        );
+        assert!(
+            prefixes.iter().any(|p| glob_matches(p, &marker)),
+            "gateway: no list grant matches the marker key {marker:?}"
         );
     }
 }

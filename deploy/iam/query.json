@@ -8,7 +8,7 @@
       "Resource": "arn:aws:s3:::my-ravel-bucket",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["t/", "t/*/*/c/*", "t/*/catalog/*/*", "admission/query/*", "sys/query/workers/*", "t/*/pq/t/*"]
+          "s3:prefix": ["t/", "t/*/*/c/*", "t/*/*/l0/*", "t/*/*/l1/*", "t/*/catalog/*/*", "admission/query/*", "sys/query/workers/*", "t/*/pq/t/*"]
         }
       }
     },

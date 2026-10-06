@@ -715,10 +715,13 @@ data sits on a shard index at or above its `--shards`, because it reads such
 a tenant through that shard count and would leave those shards out (ADR-0050
 section 5). Otherwise it passes without writing anything. It never lists
 `l0/`, since Query serves committed data only. Adoption belongs to ingest,
-maintenance and the CLI. The read role therefore holds no provisioning write
-and no `l0/` listing: `QueryList` does not admit `t/*/*/l0/*`, so an
-adopting Query startup would be refused at that listing before it reached the
-write.
+maintenance and the CLI. The read role therefore holds no provisioning write,
+so an adopting Query startup would be refused at the write. `QueryList` does
+admit `t/*/*/l0/*`, for the reason "Data objects a query reads" below gives,
+so the template would not refuse an `l0/` listing: what keeps the startup
+check from issuing one is `static_absent_policy`, and the ravel-server test
+`query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing`
+fails any `l0/` listing.
 
 Each create-only statement is `s3:PutObject` conditioned on `StringEquals`
 `s3:if-none-match` `*`, the form `QueryManifestCreate` uses. Each CAS-only
@@ -838,8 +841,43 @@ nor a deeper key, a listing prefix, a 31- or 33-character tenant segment, or
 Some keys are deliberately left out. `sys/t/<tenant_hash>`, the alert lease
 and the compaction claims are written with a create-if-absent PUT first and
 read only once that PUT reports the object exists. A data object that a
-concurrent compaction deleted is a race, not a bootstrap state, and naming
-those keys would need a `*`.
+concurrent compaction deleted is a race, not a bootstrap state, so it is not
+named here: `QueryList` names the `l0/` and `l1/` prefixes with a `*` for it
+(see the next section).
+
+## Data objects a query reads: a list grant so a deleted one reads as missing
+
+On AWS S3, a GET of an absent key answers 404 only when one of the caller's
+`s3:ListBucket` grants has an `s3:prefix` value that matches the key itself,
+and 403 otherwise. Measured on a real S3 bucket on 2026-10-05: under a
+`StringLike` grant on `t/*/*/l0/*`, a GET of an absent L0 key answered 404;
+under a grant on `t/` alone, a GET of an absent L1 key answered 403.
+
+A query pins its segment set when it resolves and then GETs each segment. A
+compaction or retention delete can remove one in between. Both query engines
+re-resolve and retry once, and only on `NotFound`:
+
+| Call | Mode | S3 operation | Grant |
+|---|---|---|---|
+| The PromQL engine's segment fetch (`crates/ravel-query/src/engine.rs`) and the SQL executor's (`crates/ravel-sql/src/executor.rs`, `SqlError::is_segment_not_found`) GET each pinned L0 and L1 segment, and re-resolve once when a GET reports `NotFound` | `query`, `all` | `s3:GetObject`; the 404 needs `s3:ListBucket` | `QueryRead` `t/*/*/l0/*` and `t/*/*/l1/*`; `QueryList` `s3:prefix` `t/*/*/l0/*` and `t/*/*/l1/*` |
+
+Until issue #2462 `QueryList` named neither prefix, so on AWS S3 a query
+whose read raced such a delete was refused with `AccessDenied` and failed
+instead of retrying. The list grant lets Query list the data prefixes; it
+could already read every object under them, and list the commit records and
+the catalog that name them.
+
+`query_lists_the_data_prefixes_so_a_deleted_segment_reads_as_missing` in
+`crates/ravel-commit/tests/iam_templates.rs` derives the keys Query may GET
+and Maintain can delete from the two templates and checks that a `QueryList`
+value matches each one. The same check over every server role against every
+other role's deletes finds two kinds of key no list grant of the reader
+matches, both pinned by `deletable_reads_without_a_list_grant_per_server_role`:
+Gateway's `t/*/*/idem/*` read and Maintain's `t/*/*/idem/*` delete meet on the
+test's literal `idem/` witnesses, a shape no marker has (a real marker key is
+matched by `GatewayListTenantBootstrapKeys`), and Maintain's `t/*/u/*` read
+reaches the audit signal's admission snapshot, which Gateway's reap deletes and
+no Maintain path reads.
 
 ## Idempotency markers: the keyed-ingest lookup
 

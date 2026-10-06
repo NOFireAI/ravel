@@ -205,6 +205,11 @@ The Gateway row's `idem/<key>` (dedup lookup) is a read of one marker key per
 hour of the dedup window, most of them absent, and the marker lookup amendment
 below grants the list of exactly that key an absent key needs on AWS S3.
 
+The Query row's `l0/**` and `l1/**` reads race the compaction and retention
+deletes, and a read of a segment deleted after the query resolved must be
+answered 404, not 403, for the query's one re-resolve retry to run; the
+data-prefix list amendment below adds the list grant that makes it so.
+
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
 runs inside the same `Mode::Maintain` process as compaction and retention
@@ -1535,9 +1540,11 @@ or above its configured shard count, since it would read that tenant through
 the implicit generation 0 of that count and leave those shards out. Otherwise
 it passes with no write. It never lists `l0/`: Query serves committed data
 only. ADR-0050 section 5 therefore holds in every mode, and the read role
-holds no provisioning write and no `l0/` listing. Before this, Query ran the
-adopt path, whose first call lists `t/<hash>/<sig>/l0/`, a prefix
-`QueryList` does not admit, so a Query process with a statically known
+holds no provisioning write and no `l0/` listing (the template grants one
+since the data-prefix list amendment below; the code still issues none).
+Before this, Query ran the adopt path, whose first call lists
+`t/<hash>/<sig>/l0/`, a prefix `QueryList` did not admit until the
+data-prefix list amendment below, so a Query process with a statically known
 tenant that had data and no record was refused at startup with
 `AccessDenied` before it reached any write. ADR-0050 section 5 already
 assigns adoption to ingest, maintenance and the CLI and keeps the read path
@@ -1594,8 +1601,8 @@ refuses an unconditioned `PutObject` reaching the record, refuses a `prov`
 grant reaching a nested `/prov` key, an unprovisioned signal's key, or a key
 whose tenant segment is 31 or 33 characters wide, asserts `query.json`
 reaches no record and admits the commit-prefix listing of the Query startup
-check but not an `l0/` one, and matches each caller above to a grant of its
-own kind.
+check but not an `l0/` one (an assertion the data-prefix list amendment below
+replaces), and matches each caller above to a grant of its own kind.
 
 Net effect on §1: the Maintain write column gains the `prov` writes above,
 the Gateway and Admin entries are conditioned and narrowed to the three
@@ -1664,7 +1671,8 @@ under `t/*/*/maint/*` by `MaintainList`, so they gain nothing. Left out:
 exists; the idempotency markers are found by a prefix listing, not a
 single-key read (no longer so, see the marker lookup amendment below); and a
 data object a concurrent compaction deleted is a race,
-not a bootstrap state, whose key cannot be named without a `*`.
+not a bootstrap state, whose key cannot be named without a `*` (the
+data-prefix list amendment below names it with one).
 
 A list request whose prefix is one of these keys can return only that key,
 since no key the system writes begins with one and continues, so the grants
@@ -1811,3 +1819,55 @@ reads where absence is a normal state.
 
 Recorded as an appended amendment, with an inline pointer added to §1 and to
 the bootstrap-key list amendment.
+
+## Amendment (2026-10-05): Query lists the data prefixes it reads
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|Amendment (2026-10-03): prov write conditions per role|Amendment (2026-10-03): bootstrap-key list grants per role" pointer="data-prefix list amendment" -->
+<!-- amendment-supersedes: phrase="whose key cannot be named without a `*`" pointer="data-prefix list amendment" -->
+<!-- amendment-supersedes: phrase="no `l0/` listing" pointer="data-prefix list amendment" -->
+
+Issue #2462. A query pins its segment set when it resolves and then GETs each
+L0 and L1 segment. A compaction or retention delete can remove one in
+between. The PromQL engine (`crates/ravel-query/src/engine.rs`) and the SQL
+executor (`crates/ravel-sql/src/executor.rs`) then re-resolve and retry once,
+and only when the GET fails with `NotFound`.
+
+Measured on a real S3 bucket on 2026-10-05: a GET of a key that does not exist
+answers 404 only when one of the caller's `ListBucket` grants has an
+`s3:prefix` condition that matches the key itself, and 403 otherwise. Under a
+`StringLike` grant on `t/*/*/l0/*`, an absent L0 key answered 404; under a
+grant on `t/` alone, an absent L1 key answered 403. `QueryRead` granted
+`t/*/*/l0/*` and `t/*/*/l1/*` and `QueryList` named neither, so on AWS S3 a
+query whose read raced such a delete was refused with `AccessDenied`, the retry
+did not run, and the query failed.
+
+Decision: `QueryList` gains the `s3:prefix` values `t/*/*/l0/*` and
+`t/*/*/l1/*`. The bootstrap-key list amendment left this race out because its
+key cannot be named without a `*`; this grant names it with one. What it costs:
+Query can now list the data prefixes. It could already read every object under
+them, and list the commit records and the catalog that name each one, so the
+listing discloses no key the role could not already find. The Query startup
+provisioning check still lists only `t/<hash>/<sig>/c/` and never `l0/`; the
+ravel-server test that fails an `l0/` listing, not the template, is what holds
+that now. Gateway and Maintain are unchanged.
+
+`crates/ravel-commit/tests/iam_templates.rs` derives the keys Query may GET and
+Maintain can delete (its delete grants less its `DenyDeleteProtected`) from the
+two templates, asserts every L0 data key and L1 part key Maintain can delete is
+among them, and asserts a `QueryList` value matches each one; with the two
+values removed, exactly those keys are left unmatched. The same check for each
+server role against every other role's deletes finds, and pins, two kinds of
+key the reader's list grants do not match: the test's literal `idem/` witness
+keys under Gateway's `t/*/*/idem/*` read and Maintain's delete, a shape no
+marker has (a real marker key is matched by the marker list grant of the marker
+lookup amendment), and the audit signal's admission snapshot under Maintain's
+`t/*/u/*` read, which Gateway's reap deletes and no Maintain path reads.
+Nothing here was run against AWS beyond the measurement above.
+
+Net effect on §1: the Query role's `l0/**` and `l1/**` reads gain a list grant.
+The prov write conditions amendment's "no `l0/` listing" for the read role and
+the bootstrap-key list amendment's note on the race no longer hold of the
+template.
+
+Recorded as an appended amendment, with an inline pointer added to §1, the prov
+write conditions amendment and the bootstrap-key list amendment.
