@@ -2352,7 +2352,7 @@ pub async fn start_with_heartbeat(
     let ingest_buffer_budget =
         ravel_ingest::IngestByteBudget::shared(config.ingest_buffer_budget_limit);
 
-    let ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
+    let ingest_router = if config.mode.holds_ingest_buffer() {
         let ingest_config = validated_ingest_config(
             IngestConfig {
                 shard_count: config.shard_count,
@@ -2435,7 +2435,7 @@ pub async fn start_with_heartbeat(
     // same shard count, same store, same clock, but RLOG objects under the
     // `l` keyspace (docs/ingest.md "Log pipeline"). It exists in exactly the
     // modes that serve ingest, so the two options are always Some together.
-    let log_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
+    let log_ingest_router = if config.mode.holds_ingest_buffer() {
         // The per-tenant POSTINGS indexed-field resolver reaches the writer here:
         // the router hands it to every shard, which resolves the list at flush
         // time. The CLI-derived `IndexedFieldConfig` is the base; wrapping it in
@@ -2476,7 +2476,7 @@ pub async fn start_with_heartbeat(
     // keyspace and routing by trace_id rather than by a derived identity
     // (ADR-0041). It exists in exactly the modes that serve ingest, so all
     // three options are always Some together.
-    let span_ingest_router = if matches!(config.mode, Mode::All | Mode::Gateway) {
+    let span_ingest_router = if config.mode.holds_ingest_buffer() {
         let span_ingest_config = validated_ingest_config(
             IngestConfig {
                 shard_count: config.shard_count,
