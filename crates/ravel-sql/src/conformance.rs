@@ -614,7 +614,7 @@ pub fn registry() -> Vec<Construct> {
         ("{'k': v} literal", "SELECT {'a': 1, 'b': 2}['b']"),
         (
             "struct field s.a",
-            "SELECT s.b FROM (SELECT named_struct('a', 1, 'b', 2) AS s)",
+            "SELECT s.a FROM (SELECT named_struct('a', 2, 'b', 1) AS s)",
         ),
         // MapFieldAccessPlanner, to `get_field`.
         (

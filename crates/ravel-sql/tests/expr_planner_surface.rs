@@ -175,7 +175,7 @@ async fn substring_syntax_and_unquoted_calls_answer_the_substring() {
 /// One row per SQL syntax an `ExprPlanner` method can claim in DataFusion
 /// 54.1, with the outcome each has today and, for a row that plans, the call
 /// its syntax is rewritten to. Each label starts with the method's name.
-const CANARIES: [(&str, &str, Expect); 21] = [
+const CANARIES: [(&str, &str, Expect); 22] = [
     // plan_binary_op: TraceIdHexLiteralPlanner rewrites this comparison to a
     // `FixedSizeBinary(16)` literal, so the plan calls nothing.
     (
@@ -201,6 +201,13 @@ const CANARIES: [(&str, &str, Expect); 21] = [
         "plan_field_access (struct subscript)",
         "SELECT named_struct('a', 1)['a']",
         Expect::Plans(Some((Kind::Scalar, "get_field"))),
+    ),
+    // plan_field_access: MapFieldAccessPlanner rewrites the subscript to
+    // `get_field`, which refuses the dictionary-encoded `samples.labels` map.
+    (
+        "plan_field_access (samples labels subscript)",
+        "SELECT labels['__name__'] FROM samples",
+        Expect::RefusedAtPlan,
     ),
     // plan_field_access: list index; no registered planner handles it.
     (
@@ -347,9 +354,9 @@ fn canaries_cover_every_expr_planner_method() {
     assert_eq!(
         methods.len(),
         EXPR_PLANNER_METHODS,
-        "CANARIES covers {methods:?}. An `ExprPlanner` method has lost its row, \
-         or a DataFusion upgrade grew the trait: each new method that \
-         corresponds to SQL syntax needs a row here and a raised count"
+        "CANARIES covers {methods:?}, not {EXPR_PLANNER_METHODS} methods: a \
+         method's last row was removed, or a row was added for a new method \
+         without raising EXPR_PLANNER_METHODS"
     );
 }
 
