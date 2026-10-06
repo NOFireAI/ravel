@@ -430,6 +430,27 @@ async fn a_parquet_table_answers_a_filtered_select_with_its_reads_split_by_phase
     );
 }
 
+/// `LIMIT n` caps a plain projection over a three-file Parquet table of six
+/// rows, the shape that over-returned on `logs` (issue #2616).
+#[tokio::test]
+async fn limit_caps_rows_of_a_plain_projection() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    for (sql, want) in [
+        ("SELECT name FROM hits LIMIT 1", 1),
+        ("SELECT name FROM hits LIMIT 3", 3),
+        ("SELECT * FROM hits LIMIT 2", 2),
+        ("SELECT name FROM hits LIMIT 9", 6),
+    ] {
+        let outcome = lake
+            .execute(&acme, sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must execute: {e}"));
+        assert_eq!(outcome.output.num_rows(), want, "{sql}");
+    }
+}
+
 /// Issue #2458: `EXTRACT(field FROM expr)` plans (via `DatetimeFunctionPlanner`,
 /// registered in `crate::session::build_session`) into the already-admitted
 /// `date_part('field', expr)` call it rewrites to, and returns identical

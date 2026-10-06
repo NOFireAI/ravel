@@ -945,3 +945,35 @@ fn example_sql_matches_committed_manifest() {
          REGEN_SQL_CONFORMANCE_EXAMPLES=1 cargo test -p ravel-sql --test conformance"
     );
 }
+
+/// `LIMIT n` caps the rows a plain projection returns, on `logs` as on
+/// `samples` (issue #2616). Every statement is checked and every miscount is
+/// collected, so one run names each shape that over-returns.
+#[tokio::test]
+async fn limit_caps_rows_of_a_plain_projection() {
+    let fixture = conformance_fixture().await;
+    let tenant = tenant_id("conformance");
+    let cases: [(&str, usize); 8] = [
+        ("SELECT body FROM logs LIMIT 1", 1),
+        ("SELECT body FROM logs LIMIT 2", 2),
+        ("SELECT * FROM logs LIMIT 1", 1),
+        ("SELECT ts, body FROM logs LIMIT 2", 2),
+        ("SELECT body FROM logs LIMIT 1 OFFSET 1", 1),
+        ("SELECT body FROM logs LIMIT 5", LOG_RECORD_COUNT),
+        ("SELECT value FROM samples LIMIT 1", 1),
+        ("SELECT value FROM samples LIMIT 2", 2),
+    ];
+    let mut misses = Vec::new();
+    for (sql, want) in cases {
+        let outcome = fixture
+            .executor
+            .execute(tenant.hash(), &request(sql))
+            .await
+            .unwrap_or_else(|e| panic!("{sql} must execute: {e}"));
+        let got = outcome.output.num_rows();
+        if got != want {
+            misses.push(format!("`{sql}`: expected {want} rows, got {got}"));
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+}
