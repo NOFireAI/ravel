@@ -148,13 +148,28 @@ pub enum ListedManifestKey {
     /// extra path segment, more than `u64::MAX`, all zeros, or not all decimal
     /// digits. The Query grant spells the version as 20 single-character
     /// wildcards, but its `*` binds any run of segments before `/v/`, so it
-    /// admits these keys; readers skip them as they skip a version above
-    /// [`MAX_MANIFEST_VERSION`].
+    /// admits these keys; readers skip one the store lists as they skip a
+    /// version above [`MAX_MANIFEST_VERSION`]. The S3 adapter cannot list one
+    /// holding a control character, an empty segment or a `.` or `..`
+    /// segment: its listing fails instead.
     InvalidVersion {
         tenant_hash: TenantHash,
         table: String,
         slot: String,
         reason: &'static str,
+    },
+    /// `t/<tenant_hash>/pq/t/<segment>/v/<20 characters>.pqm` whose
+    /// `segment` is not a valid table name: an upper-case or reserved name,
+    /// or a path such as `a/b`. The Query grant's `*` binds any such segment,
+    /// so it admits these keys, but no table owns them. The tenant-wide
+    /// listings skip one the store lists, and `ravel-cli parquet repair
+    /// --stray` removes one whose key is its own [`store_path`]. The S3
+    /// adapter cannot list a key holding a control character, an empty
+    /// segment or a `.` or `..` segment: its listing fails instead. `rest`
+    /// is the key text after [`tenant_manifest_prefix`].
+    InvalidTable {
+        tenant_hash: TenantHash,
+        rest: String,
     },
 }
 
@@ -197,14 +212,40 @@ pub fn parse_manifest_key(key: &str) -> Result<ParsedManifestKey, KeyError> {
     })
 }
 
+/// The tenant and the text after `pq/t/` of a key the Query grant's pattern
+/// `t/<32 characters>/pq/t/*/v/<20 characters>.pqm` admits, whatever `*`
+/// binds; `None` for any other key.
+fn query_grant_shaped(key: &str) -> Option<(TenantHash, &str)> {
+    let (tenant_hash, after_pq) = split_tenant_pq(key).ok()?;
+    let rest = after_pq.strip_prefix("t/")?;
+    let stem = rest.strip_suffix(MANIFEST_SUFFIX)?;
+    let (slot_start, _) = stem.char_indices().rev().nth(VERSION_WIDTH - 1)?;
+    stem[..slot_start]
+        .ends_with("/v/")
+        .then_some((tenant_hash, rest))
+}
+
 /// Parse a key a manifest listing returned. A key [`parse_manifest_key`]
 /// accepts is [`ListedManifestKey::Version`]; one under a valid table's `v/`
 /// prefix ending in `.pqm` whose `slot` names no version is
-/// [`ListedManifestKey::InvalidVersion`]. Every other key is an error, as it
-/// is for [`parse_manifest_key`]: a suffix other than `.pqm`, a key outside a
-/// valid table's `v/` prefix, or a table segment [`validate_table`] refuses.
+/// [`ListedManifestKey::InvalidVersion`]; one the Query grant admits whose
+/// segment between `pq/t/` and `/v/` is not a valid table name is
+/// [`ListedManifestKey::InvalidTable`]. Every other key is an error, as it is
+/// for [`parse_manifest_key`]: a suffix other than `.pqm`, or a key with no
+/// `/v/<20 characters>.pqm` ending outside a valid table's `v/` prefix.
 pub fn parse_listed_manifest_key(key: &str) -> Result<ListedManifestKey, KeyError> {
-    let (tenant_hash, table, slot) = split_manifest_key(key)?;
+    let (tenant_hash, table, slot) = match split_manifest_key(key) {
+        Ok(parts) => parts,
+        Err(err) => {
+            return match query_grant_shaped(key) {
+                Some((tenant_hash, rest)) => Ok(ListedManifestKey::InvalidTable {
+                    tenant_hash,
+                    rest: rest.to_string(),
+                }),
+                None => Err(err),
+            };
+        }
+    };
     let reason = if slot.len() != VERSION_WIDTH || !slot.bytes().all(|b| b.is_ascii_digit()) {
         "version is not 20 decimal digits"
     } else {
@@ -220,6 +261,22 @@ pub fn parse_listed_manifest_key(key: &str) -> Result<ListedManifestKey, KeyErro
         slot: slot.to_string(),
         reason,
     })
+}
+
+/// The key the S3 adapter sends a request for `key` to: `object_store`'s
+/// `Path::from`, which drops empty segments, percent-encodes a `.` or `..`
+/// segment, and percent-encodes control characters, every non-ASCII byte and
+/// ``\ { ^ } % ` ] " > [ ~ < # | * ?`` within a segment. Every key a builder
+/// here produces is its own store path.
+pub fn store_path(key: &str) -> String {
+    object_store::path::Path::from(key).to_string()
+}
+
+/// Whether a request for `key` through the S3 adapter reaches `key` itself
+/// ([`store_path`] leaves it unchanged). A delete of any other key goes to a
+/// different key, so it reports success and leaves `key` in place.
+pub fn is_store_path(key: &str) -> bool {
+    object_store::path::Path::from(key).as_ref() == key
 }
 
 #[cfg(test)]
@@ -381,15 +438,78 @@ mod tests {
                 "{key:?}"
             );
         }
-        // Only a key with a non-`.pqm` suffix, outside a valid table's `v/`
-        // prefix, or under an invalid table segment stays foreign.
+        // Only a key with a non-`.pqm` suffix, or with no `/v/<20>.pqm`
+        // ending outside a valid table's `v/` prefix, stays foreign.
         for key in [
             format!("t/{th}/pq/t/hits/v/00000000000000000001.parquet"),
             format!("t/{th}/pq/t/hits/x/00000000000000000001.pqm"),
-            format!("t/{th}/pq/t/Hits/v/00000000000000000001.pqm"),
+            format!("t/{th}/pq/t/Hits/v/00000000000000000001.parquet"),
+            format!("t/{th}/pq/t/Hits/v/0000000000000001.txt"),
+            format!("t/{th}/pq/t/Hits/v/00000000000000000001"),
+            format!("t/{th}/pq/t/Hits/v/0000000000000000001.pqm"),
+            format!("t/{th}/pq/t/Hits/v/000000000000000000001.pqm"),
+            format!("t/{th}/pq/t/a/b/00000000000000000001.pqm"),
             format!("t/{th}/pq/t/hits/notes.txt"),
+            format!("t/{th}/pq/x/Hits/v/00000000000000000001.pqm"),
         ] {
             assert!(parse_listed_manifest_key(&key).is_err(), "{key:?} parsed");
+        }
+    }
+
+    #[test]
+    fn store_path_is_the_key_the_s3_adapter_sends_a_request_to() {
+        let longest = format!("t{}", "x".repeat(62));
+        for key in [
+            manifest_key(&TENANT_A, "hits", 1).expect("key"),
+            manifest_key(&TENANT_A, &longest, u64::MAX).expect("key"),
+            manifest_key(&TENANT_A, "_a0", MAX_MANIFEST_VERSION).expect("key"),
+            grants_key(&TENANT_A),
+        ] {
+            assert!(is_store_path(&key), "{key:?}");
+            assert_eq!(store_path(&key), key);
+        }
+        let th = "a1".repeat(16);
+        for (rest, sent) in [
+            ("Hits~/v/1.pqm", "Hits%7E/v/1.pqm"),
+            ("a%2Fb/v/1.pqm", "a%252Fb/v/1.pqm"),
+            ("hits//v/3.pqm", "hits/v/3.pqm"),
+            ("./v/1.pqm", "%2E/v/1.pqm"),
+            ("../v/1.pqm", "%2E%2E/v/1.pqm"),
+            ("Hits/v/\"\\x.pqm", "Hits/v/%22%5Cx.pqm"),
+            ("Hits/v/\u{e9}.pqm", "Hits/v/%C3%A9.pqm"),
+            ("Hits/v/\u{1b}.pqm", "Hits/v/%1B.pqm"),
+        ] {
+            let key = format!("t/{th}/pq/t/{rest}");
+            assert!(!is_store_path(&key), "{key:?}");
+            assert_eq!(store_path(&key), format!("t/{th}/pq/t/{sent}"), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_listed_key_the_query_grant_admits_under_an_invalid_table_is_named() {
+        let th = "a1".repeat(16);
+        for rest in [
+            "Hits/v/00000000000000000001.pqm",
+            "logs/v/00000000000000000001.pqm",
+            "l0/v/00000000000000000001.pqm",
+            "a/b/v/00000000000000000001.pqm",
+            "hits/x/v/00000000000000000001.pqm",
+            "/v/00000000000000000001.pqm",
+            // The 20 characters are any characters, as the grant's `?` is.
+            "Hits/v/\u{1b}[2Jxxxxxxxxxxxxxxxx.pqm",
+            "Hits/v/0000000000000000000\u{e9}.pqm",
+        ] {
+            let key = format!("t/{th}/pq/t/{rest}");
+            assert_eq!(
+                parse_listed_manifest_key(&key).expect("parse"),
+                ListedManifestKey::InvalidTable {
+                    tenant_hash: TENANT_A,
+                    rest: rest.into(),
+                },
+                "{key:?}"
+            );
+            // Never a manifest key a writer or resolver accepts.
+            assert!(parse_manifest_key(&key).is_err(), "{key:?}");
         }
     }
 }

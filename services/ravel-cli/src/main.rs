@@ -281,8 +281,9 @@ fn command_is_write(command: &Command) -> bool {
             // Deletes superseded manifest versions under
             // `t/<tenant_hash>/pq/t/`.
             ParquetCommand::Sweep { .. } => true,
-            // Deletes flagged manifest version keys with `--delete`, or one
-            // named version with `--delete-version`; otherwise only lists.
+            // Deletes flagged manifest version keys, or with `--stray` the
+            // keys under no valid table name, with `--delete`, or one named
+            // version with `--delete-version`; otherwise only lists.
             ParquetCommand::Repair {
                 delete,
                 delete_version,
@@ -915,14 +916,25 @@ enum ParquetCommand {
     },
     /// The repair for a forged manifest version: list one table's manifest
     /// version keys and flag those above the version bound and those naming
-    /// no version; with `--delete`, delete exactly the flagged ones; with
-    /// `--delete-version N`, delete exactly version N.
+    /// no version; with `--delete`, delete the flagged ones, skipping and
+    /// naming any Ravel cannot delete; with `--delete-version N`, delete
+    /// exactly version N.
     ///
     /// No DDL statement writes a version above the bound (2^32) or a `.pqm`
     /// key under a table's `v/` prefix whose slot is not a version number, so
     /// one there was put directly in the bucket, for example with a stolen
     /// Query credential. Readers and
-    /// the sweep already skip it; `--delete` removes it. A forged version at
+    /// the sweep already skip it when the store lists it; `--delete` removes
+    /// it. A flagged key the S3 adapter would send a delete of to a different
+    /// key (one holding a character its path encoding escapes, such as `~`)
+    /// is marked undeletable. `--delete` deletes every other flagged key,
+    /// sends no delete for an undeletable one, prints it as skipped, and then
+    /// fails naming the keys left in place. A delete that fails part way
+    /// prints the keys deleted before it, then the store error, and fails.
+    /// On S3 a key holding a control character, an empty
+    /// segment or a `.` or `..` segment fails this listing and every read of
+    /// the table; delete those with the Maintain credential through an S3
+    /// tool. A forged version at
     /// or below the bound is not flagged: as the newest it serves as the
     /// table, and exactly at the bound it blocks every later DDL. Remove one
     /// with `--delete-version` once the DDL audit log shows no statement wrote
@@ -931,22 +943,56 @@ enum ParquetCommand {
     /// manifests), and marks the flagged ones. Without `--delete` or
     /// `--delete-version` nothing is deleted. Run it under the Maintain
     /// credential, the only role that may delete manifest versions.
+    ///
+    /// With `--stray` instead of `--table`, list every `.pqm` key under the
+    /// tenant's `t/<tenant_hash>/pq/t/` whose segment before `/v/` is not a
+    /// valid table name (upper case, reserved, or a path such as `a/b`), which
+    /// the Query grant also admits and the tenant-wide listings skip; with
+    /// `--delete`, delete those, print them, then list again and fail naming
+    /// any still there. A key the S3 adapter would send a delete of to a
+    /// different key (one holding a character its path encoding escapes, such
+    /// as `~` or `%`) is marked undeletable and skipped. It is listed, and the
+    /// listing after `--delete` names every key still there, only when no
+    /// such key sits at a list page boundary: the adapter encodes the page's
+    /// continuation too, so the next page repeats keys, failing the listing,
+    /// or skips the keys after it. A key under a name reserved
+    /// after tables could be created (such as `l0`) is marked as possibly a
+    /// table created before the reservation and skipped unless
+    /// `--include-reserved-names` is passed. On S3 a key holding a control
+    /// character, an empty segment or a `.` or `..` segment fails this listing
+    /// and the tenant-wide ones; delete that exact key with the Maintain
+    /// credential through an S3 tool.
     Repair {
         /// The tenant that owns the table.
         #[arg(long)]
         tenant: String,
         /// The table whose manifest versions to list.
+        #[arg(long, required_unless_present = "stray", conflicts_with = "stray")]
+        table: Option<String>,
+        /// List the tenant's keys under no valid table name instead of one
+        /// table's versions.
         #[arg(long)]
-        table: String,
-        /// Delete every flagged key. Without it or `--delete-version` the
-        /// command only lists.
+        stray: bool,
+        /// Delete every flagged key, or with `--stray` every listed key not
+        /// marked as skipped. Without it or `--delete-version` the command
+        /// only lists.
         #[arg(long, conflicts_with = "delete_version")]
         delete: bool,
         /// Delete exactly this version's key, from 1 to the version bound,
         /// and nothing else. For a version judged forged from the DDL audit
         /// log; zero and versions above the bound are refused.
-        #[arg(long, value_name = "N")]
+        #[arg(long, value_name = "N", conflicts_with = "stray")]
         delete_version: Option<u64>,
+        /// With `--stray --delete`, also delete keys under a name reserved
+        /// after tables could be created, which may be manifests of a table
+        /// created before the reservation.
+        #[arg(
+            long,
+            requires = "stray",
+            requires = "delete",
+            conflicts_with = "table"
+        )]
+        include_reserved_names: bool,
     },
 }
 
@@ -2680,18 +2726,29 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 ParquetCommand::Repair {
                     tenant,
                     table,
+                    stray,
                     delete,
                     delete_version,
+                    include_reserved_names,
                 },
         } => {
             use ravel_cli::parquet::RepairAction;
-            let action = match (delete, delete_version) {
-                (_, Some(version)) => RepairAction::DeleteVersion(version),
-                (true, None) => RepairAction::DeleteFlagged,
-                (false, None) => RepairAction::List,
-            };
-            ravel_cli::parquet::repair(store::build_store(&cli.store)?, &tenant, &table, action)
-                .await
+            let store = store::build_store(&cli.store)?;
+            // clap makes `--stray` and `--table` exclusive and requires one.
+            match table.filter(|_| !stray) {
+                None => {
+                    ravel_cli::parquet::repair_stray(store, &tenant, delete, include_reserved_names)
+                        .await
+                }
+                Some(table) => {
+                    let action = match (delete, delete_version) {
+                        (_, Some(version)) => RepairAction::DeleteVersion(version),
+                        (true, None) => RepairAction::DeleteFlagged,
+                        (false, None) => RepairAction::List,
+                    };
+                    ravel_cli::parquet::repair(store, &tenant, &table, action).await
+                }
+            }
         }
         Command::Cache {
             command: CacheCommand::ReclaimLegacy { cache_dir, apply },
@@ -4296,6 +4353,29 @@ mod tests {
                 true,
             ),
             (
+                &["ravel", "parquet", "repair", "--tenant", "t", "--stray"],
+                false,
+            ),
+            (
+                &[
+                    "ravel", "parquet", "repair", "--tenant", "t", "--stray", "--delete",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "parquet",
+                    "repair",
+                    "--tenant",
+                    "t",
+                    "--stray",
+                    "--delete",
+                    "--include-reserved-names",
+                ],
+                true,
+            ),
+            (
                 &[
                     "ravel",
                     "parquet",
@@ -4351,6 +4431,50 @@ mod tests {
                 "{args:?} classified as write={}, expected {}",
                 super::command_is_write(&cli.command),
                 expect_write
+            );
+        }
+    }
+
+    /// `parquet repair` takes exactly one of `--table` and `--stray`, and
+    /// `--delete-version` only with `--table`.
+    #[test]
+    fn parquet_repair_takes_a_table_or_stray_and_never_both() {
+        let base = ["ravel", "parquet", "repair", "--tenant", "t"];
+        for tail in [
+            &[][..],
+            &["--delete"][..],
+            &["--stray", "--table", "hits"][..],
+            &["--stray", "--delete-version", "5"][..],
+            &["--stray", "--include-reserved-names"][..],
+            &["--table", "hits", "--delete", "--include-reserved-names"][..],
+        ] {
+            let args: Vec<&str> = base.iter().chain(tail).copied().collect();
+            assert!(Cli::try_parse_from(&args).is_err(), "{args:?} parsed");
+        }
+        for (tail, include) in [
+            (&["--stray", "--delete"][..], false),
+            (
+                &["--stray", "--delete", "--include-reserved-names"][..],
+                true,
+            ),
+        ] {
+            let args: Vec<&str> = base.iter().chain(tail).copied().collect();
+            let cli = Cli::try_parse_from(&args).expect("parse");
+            assert!(
+                matches!(
+                    cli.command,
+                    Command::Parquet {
+                        command: super::ParquetCommand::Repair {
+                            table: None,
+                            stray: true,
+                            delete: true,
+                            delete_version: None,
+                            include_reserved_names,
+                            ..
+                        }
+                    } if include_reserved_names == include
+                ),
+                "{args:?}"
             );
         }
     }
@@ -5834,5 +5958,98 @@ mod tenant_kms_dispatch_tests {
             )
         );
         assert_nothing_written(&fake, start);
+    }
+}
+
+/// `parquet repair --stray` driven through [`run`], the function `main`
+/// calls, so the dispatch's handling of `--include-reserved-names` is what
+/// is pinned, not only the parsed flag.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod parquet_repair_dispatch_tests {
+    use bytes::Bytes;
+    use clap::Parser;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_types::TenantId;
+
+    use super::fake_s3::{Echo, spawn};
+    use super::{Cli, run_logged, store};
+
+    const TENANT: &str = "acme";
+
+    fn argv(endpoint: &str, command: &[&str]) -> Vec<String> {
+        [
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+            "--tenant-hash-unkeyed",
+        ]
+        .iter()
+        .chain(command)
+        .map(|arg| arg.to_string())
+        .collect()
+    }
+
+    /// A well-formed manifest key of `acme` under `l0`, a name reserved
+    /// after tables could be created, written straight to the bucket.
+    async fn reserved_key(endpoint: &str) -> String {
+        let key = format!(
+            "t/{}/pq/t/l0/v/00000000000000000001.pqm",
+            TenantId::new(TENANT).hash().to_hex()
+        );
+        let args = store::StoreArgs::try_parse_from(&argv(endpoint, &[])[..11])
+            .expect("store flags parse");
+        store::build_store(&args)
+            .expect("store")
+            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+        key
+    }
+
+    async fn run_repair(endpoint: &str, tail: &[&str]) -> anyhow::Result<()> {
+        let mut command = vec![
+            "parquet", "repair", "--tenant", TENANT, "--stray", "--delete",
+        ];
+        command.extend(tail);
+        let cli = Cli::try_parse_from(argv(endpoint, &command)).expect("command parses");
+        run_logged(cli, &mut Vec::new()).await
+    }
+
+    /// Without `--include-reserved-names` the reserved-name key is skipped
+    /// and the run fails naming it; with it, the dispatch hands `true` to the
+    /// repair and the key is deleted.
+    ///
+    /// Non-vacuity: pass `false` for `include_reserved_names` at the
+    /// `repair_stray` call in `run_logged` and the second run sends no
+    /// delete and fails naming the key.
+    #[tokio::test]
+    async fn include_reserved_names_reaches_the_stray_repair() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        let key = reserved_key(&endpoint).await;
+
+        let err = run_repair(&endpoint, &[])
+            .await
+            .expect_err("the reserved-name key is skipped");
+        assert_eq!(
+            err.to_string(),
+            format!("1 key(s) under no valid table name still listed after --delete: {key:?}")
+        );
+        assert_eq!(fake.deletes(), Vec::<String>::new());
+        assert!(fake.has_object(&key));
+
+        run_repair(&endpoint, &["--include-reserved-names"])
+            .await
+            .expect("the reserved-name key is deleted");
+        assert_eq!(fake.deletes(), vec![key.clone()]);
+        assert!(!fake.has_object(&key));
     }
 }
