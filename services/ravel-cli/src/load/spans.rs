@@ -1044,7 +1044,14 @@ pub(super) async fn load_spans_into(
     // One sequential cursor, as on the metrics path: a failed load's landed
     // rows stay a file prefix, which is what makes the printed resume offset
     // mean anything.
-    let mut cursors = open_stride_cursors(&input, &metadata, &row_group_lens, 1, batch_rows)?;
+    let mut cursors = open_stride_cursors(
+        &input,
+        &metadata,
+        &row_group_lens,
+        1,
+        batch_rows,
+        batch_rows,
+    )?;
     let Some(cursor) = cursors.pop() else {
         return Err(LoadError::Setup(
             "internal error: no read cursor was opened for the input file".to_string(),

@@ -256,6 +256,17 @@ pub fn reader_schema_for_path(path: &Path) -> Result<Option<SchemaRef>, LoadErro
     Ok(load_reader_schema(&metadata))
 }
 
+/// The Arrow batch size each of `k` stride cursors decodes at (issue #2613).
+/// A round deals about `batch_rows / k` rows from each live cursor, so this
+/// is the most a cursor needs decoded ahead of a round; decoding `batch_rows`
+/// per cursor instead keeps `k` whole batches of every column alive at once.
+/// Batch composition does not depend on this value: [`cursor_take_spans`](super::logs::cursor_take_spans)
+/// deals each round the rows a `batch_rows`-row reader would have given it,
+/// whatever the reader's batch size is.
+pub(super) fn reader_batch_rows(batch_rows: usize, k: usize) -> usize {
+    batch_rows.div_ceil(k.max(1)).max(1)
+}
+
 /// Open one [`BatchReader`](super::logs::BatchReader) per stride cursor (issue #560), each restricted to
 /// its own contiguous partition of `parquet_path`'s row groups, with
 /// `partition_base` set to that partition's first row's file-absolute index.
@@ -263,12 +274,18 @@ pub fn reader_schema_for_path(path: &Path) -> Result<Option<SchemaRef>, LoadErro
 /// degenerate zero-row-group case, which forces `k == 1`) yields an
 /// already-exhausted cursor with no reader opened, rather than asking Parquet
 /// to build a reader over zero row groups.
+///
+/// Each reader decodes Arrow batches of `reader_batch_rows` rows, and each
+/// cursor deals rows in `batch_rows`-row blocks (the boundary
+/// [`cursor_take_spans`](super::logs::cursor_take_spans) never crosses). Passing `batch_rows` for both
+/// reproduces one Arrow batch per block exactly.
 pub(super) fn open_stride_cursors<S: InputReaders>(
     source: &S,
     metadata: &ArrowReaderMetadata,
     row_group_lens: &[u64],
     k: usize,
     batch_rows: usize,
+    reader_batch_rows: usize,
 ) -> Result<Vec<CursorState>, LoadError> {
     let mut group_file_base = Vec::with_capacity(row_group_lens.len());
     let mut running = 0u64;
@@ -303,16 +320,19 @@ pub(super) fn open_stride_cursors<S: InputReaders>(
                 buffered: None,
                 partition_base: running,
                 consumed: 0,
+                block_rows: batch_rows,
+                partition_rows: 0,
             });
             continue;
         }
         let partition_base = group_file_base[range.start];
+        let partition_rows = row_group_lens[range.clone()].iter().sum();
         let file = source.open()?;
         let builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(file, cursor_metadata.clone());
         let reader = builder
             .with_row_groups(range.collect())
-            .with_batch_size(batch_rows)
+            .with_batch_size(reader_batch_rows)
             .build()
             .map_err(|e| LoadError::Setup(format!("failed to build Parquet reader: {e}")))?;
         cursors.push(CursorState {
@@ -320,6 +340,8 @@ pub(super) fn open_stride_cursors<S: InputReaders>(
             buffered: None,
             partition_base,
             consumed: 0,
+            block_rows: batch_rows,
+            partition_rows,
         });
     }
     Ok(cursors)

@@ -196,6 +196,9 @@ else, and indexed here so nothing is reachable from nowhere.
 - [internal/diagrams.md](internal/diagrams.md): what each diagram under
   `diagrams/` shows, which page it illustrates, and the visual language
   they share.
+- [internal/loader-memory-2613.md](internal/loader-memory-2613.md): where
+  `ravel-cli load` puts its memory at large `--batch-rows` on ClickBench,
+  by allocation site, and the ranked reductions.
 - [guides/formal-verification.md](guides/formal-verification.md): what the
   TLA+ suite under `formal/tla/` checks, what it does not establish, and
   how to run it, read its results, and add a model.

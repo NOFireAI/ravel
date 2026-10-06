@@ -527,7 +527,10 @@ enum Command {
         /// regions of the file instead of one. Omit for automatic sizing
         /// (`min(--shards, row-group count)`, floored at 1); an explicit value
         /// is clamped to `[1, row-group count]`. `1` is exactly today's
-        /// sequential read. `0` is rejected.
+        /// sequential read. `0` is rejected. Each cursor decodes Arrow
+        /// batches of `ceil(--batch-rows / K)` rows, so the decoded Arrow
+        /// rows held by cursors no longer scale with K (issue #2613); each
+        /// cursor still keeps its own reader and page-decode state.
         #[arg(long, value_name = "K")]
         read_cursors: Option<usize>,
         /// Number of Strict writes allowed in flight at once. Each batch's
@@ -540,9 +543,13 @@ enum Command {
         /// which is where the measured 2.94x on the 100M-row ClickBench corpus
         /// comes from (ADR-0807); `1` restores the old one-batch-at-a-time
         /// behavior. The cost is memory: each in-flight write keeps its built
-        /// batch resident until its ack, so the live working set scales by
-        /// roughly the depth (see docs/guides/clickbench.md for how this stacks
-        /// with the `--batch-rows` x `--shards` product). The reported
+        /// batch resident until its ack, so the window adds up to this many
+        /// built batches to the working set. That is an upper bound, not the
+        /// typical cost: the single decode task is usually the bottleneck and
+        /// the window seldom fills, and on the 100M-row ClickBench corpus
+        /// depth 4 against depth 1 was 11-17% of peak RSS at 500,000- and
+        /// 1,000,000-row batches (issue #2613; docs/internal/loader-memory-2613.md
+        /// attributes the peak by allocation site). The reported
         /// durable-token list is unaffected by the depth. It is always exactly
         /// the batches strictly before the failing one, in submission order,
         /// followed by whatever a batch submitted after the failing one had

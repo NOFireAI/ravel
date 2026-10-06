@@ -131,8 +131,15 @@ fn load_setup_parses_the_footer_once() {
         cursor_count, GROUPS,
         "8 requested cursors over 8 row groups gives 8 cursors"
     );
-    let cursors = open_stride_cursors(&source, &metadata, &row_group_lens, cursor_count, 1024)
-        .expect("cursors");
+    let cursors = open_stride_cursors(
+        &source,
+        &metadata,
+        &row_group_lens,
+        cursor_count,
+        1024,
+        1024,
+    )
+    .expect("cursors");
     assert_eq!(cursors.len(), GROUPS, "one cursor per row group");
 
     assert_eq!(

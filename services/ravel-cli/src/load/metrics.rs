@@ -1126,7 +1126,14 @@ pub async fn load_metrics(
     // One sequential cursor, not the logs path's K stride cursors: a classic
     // histogram's data point is a CONTIGUOUS run of rows, and interleaving
     // far-apart file regions inside one batch would split every such run.
-    let mut cursors = open_stride_cursors(&input, &metadata, &row_group_lens, 1, batch_rows)?;
+    let mut cursors = open_stride_cursors(
+        &input,
+        &metadata,
+        &row_group_lens,
+        1,
+        batch_rows,
+        batch_rows,
+    )?;
     let Some(cursor) = cursors.pop() else {
         return Err(LoadError::Setup(
             "internal error: no read cursor was opened for the input file".to_string(),
