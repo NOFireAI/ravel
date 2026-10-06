@@ -1484,8 +1484,8 @@ per-query share: statements running together share the tenant ceiling, and a
 statement that arrives while another holds most of it gets what is left, not a
 reserved quarter. One tenant's SQL memory is therefore still at most 50% of
 `MemTotal`. The two caches carve the memory budget (`MemTotal` less the
-overhead reserve, 2 GiB from 8 GiB of memory up and a quarter of that memory
-below it) rather than `MemTotal`, so the three ceilings together come to about
+overhead reserve, 2 GiB from 8 GiB of memory up and scaled down below it, as
+described below) rather than `MemTotal`, so the three ceilings together come to about
 78% of `MemTotal` on the reference host (25,125,558,681 of 32,212,254,720),
 and more on a loopback store, where the fetcher cache derives at 40%.
 
@@ -1536,18 +1536,25 @@ and a readable `MemAvailable` (Linux's own `/proc/meminfo` estimate of memory
 a new allocation could claim without swapping), the budget is
 `min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`,
 every subtraction saturating at zero. `RESERVE` is the overhead reserve,
-`min(2 GiB, memory / 4)` of the memory the budget starts from (`MemTotal`,
-or the cgroup memory limit when one applies): a fixed 2 GiB from 8 GiB up,
-and a quarter of the memory below that, so a t3a.small (`MemTotal`
-1,912 MiB) reserves 478 MiB rather than more than it has. `FLOOR` is a 1 GiB
+`min(2 GiB, max(memory / 4, held))` of the memory the budget starts from
+(`MemTotal`, or the cgroup memory limit when one applies), where `held` is
+what the process holds outside the budget: a provisional, uncalibrated
+256 MiB baseline, plus the `--max-ingest-buffer-bytes` ceiling in
+`--mode all`, or the whole 2 GiB when that flag is `0` (unbounded). The
+reserve is a fixed 2 GiB from 8 GiB up. Below that, a t3a.small (`MemTotal`
+1,912 MiB) reserves 768 MiB in `--mode all` at the default 512 MiB ingest
+ceiling, for a budget of at most 1,144 MiB, and 478 MiB, a quarter, in
+`--mode query` and `--mode maintain`, for at most 1,434 MiB. `FLOOR` is a 1 GiB
 floor under the `MemAvailable + own RSS - RESERVE` term only, not under the
 final budget: binding it logs at `WARN` with the `MemAvailable` reading that
 hit it and `--memory-budget-bytes` named as the remedy, but the outer `min`
 against `MemTotal - RESERVE` keeps the final budget at or below that figure.
 A derived budget below 256 MiB refuses to start, with a message naming
 `MemTotal` (or the cgroup limit), the reserve, the budget and
-`--memory-budget-bytes`; a host or container needs a little over 341 MiB of
-memory to clear it.
+`--memory-budget-bytes`, and `--max-ingest-buffer-bytes` when the ingest
+ceiling set the reserve; a host or container needs 512 MiB of memory to
+clear it in `--mode query` or `--mode maintain`, and 1 GiB in `--mode all` at
+the default ingest ceiling.
 The process's own resident set counts as available because the kernel does
 not call a process's own resident pages "available" even though this
 process may reuse them rather than compete with them. A cgroup memory
@@ -1592,10 +1599,14 @@ cache claims nothing against the budget and the remainder is all of it.
 `--mode gateway` derives no budget at all: it builds no query surface and
 runs no fold, so nothing in it reads through either cache or reserves
 against the accountant. No overhead reserve is subtracted for it, so it
-starts under any cgroup memory limit, including one of 2 GiB or less. It
-still needs memory for its ingest buffers (bounded by
-`--max-ingest-buffer-bytes`, 512 MiB by default) plus allocator and runtime
-overhead, so size its limit above that bound; its startup log prints one
+starts under any cgroup memory limit, including one of 2 GiB or less. Every
+mode that buffers ingest (`all` and `gateway`) holds its ingest buffers
+outside the memory budget, bounded by `--max-ingest-buffer-bytes` (512 MiB by
+default), plus allocator and runtime overhead. In `--mode all` the overhead
+reserve covers that bound; a gateway reserves nothing, so size its limit
+above it. On a small host, lowering `--max-ingest-buffer-bytes` is the lever
+in both: it lowers what a gateway's limit must hold, and in `--mode all` it
+lowers the reserve and leaves a larger budget. A gateway's startup log prints one
 line saying the memory budget is
 not applicable in gateway mode, and its `ravel_memory_budget_bytes` reads
 `u64::MAX`. Unless `--catalog-cache-max-bytes` is set, a gateway builds no

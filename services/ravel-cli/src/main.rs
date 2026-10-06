@@ -1498,8 +1498,8 @@ enum MaintainCommand {
         /// can overshoot it by a whole trace). Applies to log and span merges.
         /// Refused at 0. Default for log merges: derived from the host's
         /// memory (MemTotal capped by a cgroup memory limit) less an overhead
-        /// reserve (2 GiB from 8 GiB of memory up, a quarter of that memory
-        /// below it) and the 20 GiB merge cursor budget, divided by 8,
+        /// reserve (2 GiB from 8 GiB of memory up, below it a quarter of that memory
+        /// but at least 256 MiB) and the 20 GiB merge cursor budget, divided by 8,
         /// capped at the part size the claim lease supports (1500 MiB at the
         /// default 300 s lease) and at 8 GiB, with a 256 MiB floor applied
         /// last; 256 MiB when the host memory cannot be read. A derived value
@@ -1588,8 +1588,8 @@ enum MaintainCommand {
         /// small host; raise it for fewer, larger segments. Applies to log and
         /// span merges. Refused at 0. Default for log merges: derived from the
         /// host's memory (MemTotal capped by a cgroup memory limit) less an
-        /// overhead reserve (2 GiB from 8 GiB of memory up, a quarter of that
-        /// memory below it) and the 20 GiB merge cursor budget (shared
+        /// overhead reserve (2 GiB from 8 GiB of memory up, below it a quarter
+        /// of that memory but at least 256 MiB) and the 20 GiB merge cursor budget (shared
         /// by the concurrent buckets), divided by 8 and by --bucket-concurrency,
         /// capped at the part size the claim lease supports (1500 MiB at the
         /// default 300 s lease) and at 8 GiB, with a 256 MiB floor applied
@@ -1634,7 +1634,7 @@ enum MaintainCommand {
         /// of cursor budget plus its in-progress writer split target
         /// (--l1-part-memory-target-bytes, for a log merge by default the
         /// host's memory less the overhead reserve (2 GiB from 8 GiB of memory
-        /// up, a quarter of that memory below it) and less the 20 GiB cursor
+        /// up, below it a quarter of that memory but at least 256 MiB) and less the 20 GiB cursor
         /// budget, / 8 / N, within [256 MiB, 8 GiB]): on a 30 GiB host at N=1 one bucket may hold
         /// ~20 GiB + 1 GiB; at N=4 each of the four holds up to ~5 GiB +
         /// 256 MiB, so the aggregate stays ~20 GiB of cursor budget plus

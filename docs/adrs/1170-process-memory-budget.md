@@ -660,9 +660,9 @@ memory is at or below the overhead reserve (budget `0`, caps `0`, refused by
 the `>=` comparison with no flag able to satisfy it) starting as it did
 before this decision landed. That is the one path allowed to run with a `0`
 remainder, and `emit` WARNs on it. (Since the small-host reserve amendment
-below, the reserve is at most a quarter of effective memory, so no container
-with memory sits at or below it, and a derived budget under 256 MiB refuses
-with its own message unless `--disable-cache` is set.)
+below, a derived budget under 256 MiB, including the `0` of a container at
+or below its reserve, refuses with its own message unless `--disable-cache`
+is set.)
 
 Decision 1's accountant adapter is also already in place in `ravel-sql`
 (`TenantMemoryAccountant::with_process_budget`, `crates/ravel-sql/src/
@@ -719,8 +719,9 @@ analyzes: an infallible-`grow` overshoot is still bounded only by a
 provisional constant, and fetch-layer memory is still uncharged until
 decision 2 lands and a calibration run freezes the reserve against it. The
 small-host reserve amendment below makes the 2 GiB a ceiling, taking a
-quarter of effective memory instead below 8 GiB; the 2 GiB value itself is
-still this uncalibrated placeholder.
+quarter of effective memory instead below 8 GiB, or the memory the mode holds
+outside the budget when that is more; the 2 GiB value itself is still this
+uncalibrated placeholder.
 
 ## Amendment 2026-09-26 (issue #1255): decision 2 reaches the server
 
@@ -937,8 +938,8 @@ server were alone on the host, and on that host it was not.
    the `min`, so it never lifts the budget above `MemTotal - RESERVE`. A
    host too small to fit the reserve still derives 0 and is still refused,
    as before this amendment. (The small-host reserve amendment below scales
-   the reserve under 8 GiB, so no such host remains; a derived budget under
-   256 MiB now refuses with its own message instead.) When the floor binds, the derivation logs a
+   the reserve under 8 GiB; a derived budget under 256 MiB, 0 included, now
+   refuses with its own message instead.) When the floor binds, the derivation logs a
    warning naming the `MemAvailable` reading and `--memory-budget-bytes` as
    the remedy.
 2. `--memory-budget-bytes` sets the budget explicitly and wins over both
@@ -1023,17 +1024,29 @@ budget at 0 whatever the 1 GiB floor says, and startup refused with the
 
 **Decision.**
 
-1. The reserve is `min(MEMORY_OVERHEAD_RESERVE_BYTES, memory / 4)`, where
-   `memory` is what the derivation starts from: the cgroup limit under a
-   cgroup memory limit, otherwise `MemTotal`. Every site that subtracts the
-   reserve uses this rule: the three derived branches of
-   `resolve_performance_defaults` (`derived-cgroup`, `derived-available` in
-   both of its terms, and `derived`), and `ravel_maintain::
-   host_memory_budget_bytes`, which `ravel-cli maintain` derives its merge
-   budget from. The rule is `effective_memory_overhead_reserve_bytes` in
-   `crates/ravel-maintain/src/config.rs`; the 2 GiB constant stays and is now
-   its ceiling. The resolved reserve is logged as
-   `memory_overhead_reserve_bytes`, as before.
+1. The reserve is `min(MEMORY_OVERHEAD_RESERVE_BYTES, max(memory / 4,
+   floor))`, where `memory` is what the derivation starts from: the cgroup
+   limit under a cgroup memory limit, otherwise `MemTotal`. `floor` is the
+   memory the process holds outside the budget, which the reserve must cover
+   however small the host: `NON_BUDGET_BASELINE_BYTES` (256 MiB), plus the
+   resolved `--max-ingest-buffer-bytes` ceiling in a mode that holds the
+   ingest buffer (`all`; a gateway holds it too but derives no budget). The
+   ingest buffer is bounded by that flag and sits outside the budget, so
+   without this term a quarter of a small host (478 MiB on a t3a.small) is
+   less than the 512 MiB default ceiling alone. Under `0`, which leaves the
+   buffer unbounded, `floor` is the 2 GiB ceiling. The 256 MiB baseline is
+   uncalibrated, like the 2 GiB ceiling: it is a provisional allowance for
+   the allocator, thread stacks and the runtime, not a measured figure.
+   Every site that subtracts the reserve uses this rule: the three derived
+   branches of `resolve_performance_defaults` (`derived-cgroup`,
+   `derived-available` in both of its terms, and `derived`), and
+   `ravel_maintain::host_memory_budget_bytes`, which `ravel-cli maintain`
+   derives its merge budget from at the baseline floor alone, since it holds
+   no ingest buffer. The rule is `effective_memory_overhead_reserve_bytes` in
+   `crates/ravel-maintain/src/config.rs`, and the floor is
+   `non_budget_floor_bytes` in `services/ravel-server/src/config.rs`; the
+   2 GiB constant stays and is now its ceiling. The resolved reserve is
+   logged as `memory_overhead_reserve_bytes`, as before.
 2. A host or container with a `MemTotal` (or cgroup memory limit) of 8 GiB
    or more is unchanged byte for byte: a quarter of 8 GiB is the 2 GiB
    constant. So are the merge-target derivations at the default 20 GiB merge
@@ -1047,8 +1060,12 @@ budget at 0 whatever the 1 GiB floor says, and startup refused with the
    refuses to start, before the hard-cap check, with its own message. It
    names `MemTotal` or the cgroup limit, the reserve taken from it, the
    resulting budget, and `--memory-budget-bytes` as the remedy, and not the
-   cache caps. Three quarters of the memory must reach 256 MiB, so the
-   smallest memory that starts is a little over 341 MiB. An explicit
+   cache caps. When the ingest term set the reserve, it also names
+   `--max-ingest-buffer-bytes`, since lowering it is what leaves a larger
+   budget. The smallest memory that starts is 512 MiB in `query` and
+   `maintain` (the 256 MiB baseline reserve plus the 256 MiB minimum) and
+   1 GiB in `all` at the default ingest ceiling (a 768 MiB reserve plus the
+   minimum). An explicit
    `--memory-budget-bytes` is not held to this minimum, and neither is
    `--disable-cache`, which keeps the 2026-09-07 amendment's path for a
    container too small to cache: such a process starts and `emit` WARNs that
@@ -1056,20 +1073,34 @@ budget at 0 whatever the 1 GiB floor says, and startup refused with the
    not checked.
 4. The 1 GiB floor stays under the `min`, as the available-memory amendment
    states, so it still never lifts the budget above `MemTotal - RESERVE`; a
-   600 MiB host derives 450 MiB, not 1 GiB.
+   600 MiB host in `query` derives 344 MiB (a 256 MiB reserve), not 1 GiB.
 
-On the t3a.small the reserve is 478 MiB (501,219,328 bytes) and `MemTotal -
-RESERVE` is 1,434 MiB. With no cgroup limit the budget is
-`min(1,434 MiB, max(1 GiB, MemAvailable + own_rss - 478 MiB))`, between 1 GiB
-and 1,434 MiB depending on what is free at startup. At the 1 GiB floor the
-fetcher cache is 256 MiB, the catalog cache 53,687,091 bytes, and the shared
-remainder 751,619,277 bytes.
+On the t3a.small (`MemTotal` 1,912 MiB), per mode, with default flags:
+
+- `all`: the floor is 256 MiB plus the 512 MiB ingest ceiling, 768 MiB
+  (805,306,368 bytes), above a quarter, so the reserve is 768 MiB and
+  `MemTotal - RESERVE` is 1,144 MiB. With no cgroup limit the budget is
+  `min(1,144 MiB, max(1 GiB, MemAvailable + own_rss - 768 MiB))`, between
+  1 GiB and 1,144 MiB depending on what is free at startup; under a cgroup
+  limit of the same size it is 1,144 MiB. At `--max-ingest-buffer-bytes
+  134217728` the floor is 384 MiB and a quarter sets the reserve, as in
+  `query`; at `0` the reserve is 2 GiB and the server refuses.
+- `query` and `maintain`: no ingest buffer, so a quarter, 478 MiB
+  (501,219,328 bytes), is above the 256 MiB baseline and sets the reserve.
+  `MemTotal - RESERVE` is 1,434 MiB, and with no cgroup limit the budget is
+  between 1 GiB and 1,434 MiB.
+- `gateway`: no budget is derived and nothing is reserved.
+
+At the 1 GiB floor the fetcher cache is 256 MiB, the catalog cache
+53,687,091 bytes, and the shared remainder 751,619,277 bytes, in every mode
+that derives a budget.
 
 The zero-budget arm of the `cache_max_bytes` refusal is now reached only by
 an explicit `--memory-budget-bytes 0`, and its message says so.
 
 The 2 GiB ceiling is still the uncalibrated placeholder the 2026-09-07
-amendment describes, and a quarter of memory is no more measured than it is.
-Decision 3's calibration run replaces both; until then, a small host's
-reserve is a proportion chosen so the budget is positive, not a figure shown
-to cover the allocator and stacks on that host.
+amendment describes, and neither a quarter of memory nor the 256 MiB baseline
+is more measured than it is. Decision 3's calibration run replaces all three;
+until then, a small host's reserve is a proportion chosen so the budget is
+positive, held at or above the ingest ceiling it must cover, not a figure
+shown to cover the allocator and stacks on that host.

@@ -1971,8 +1971,8 @@ pub struct Cli {
     /// rebased onto `memory_budget_bytes` by ADR-1170 decision 3): normally
     /// [`CACHE_MEMORY_PERCENT`] of `memory_budget_bytes` (cgroup-capped
     /// effective memory minus the overhead reserve, which is
-    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] or a quarter of that memory below
-    /// 8 GiB, not raw `MemTotal`); reference host (16 cores, 30 GiB, at today's provisional
+    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] from 8 GiB up and scales down below
+    /// it (ADR-1170, small-host reserve amendment), not raw `MemTotal`); reference host (16 cores, 30 GiB, at today's provisional
     /// reserve): 7,516,192,768. On a `--store s3` deployment whose
     /// `--s3-endpoint` is a loopback address, the fetcher cache instead takes
     /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`: a miss
@@ -1996,8 +1996,8 @@ pub struct Cli {
     ///
     /// Omitted, the value derives at [`CATALOG_CACHE_MEMORY_PERCENT`] of
     /// `memory_budget_bytes` (cgroup-capped effective memory minus the
-    /// overhead reserve, [`MEMORY_OVERHEAD_RESERVE_BYTES`] or a quarter of
-    /// that memory below 8 GiB), unaffected by whether the store is
+    /// overhead reserve, [`MEMORY_OVERHEAD_RESERVE_BYTES`] from 8 GiB up and
+    /// scaled down below it), unaffected by whether the store is
     /// loopback; reference host: 1,503,238,553. Fallback when MemTotal is
     /// unknown: [`DEFAULT_CACHE_MAX_BYTES`] (256 MiB). Startup refuses (does
     /// not clamp) a value that, together with the resolved
@@ -3656,8 +3656,9 @@ pub struct ResolvedPerformanceDefaults {
     pub memory_budget_bytes: u64,
     /// The overhead reserve subtracted from effective memory to produce
     /// [`Self::memory_budget_bytes`]: [`effective_memory_overhead_reserve_bytes`]
-    /// of the memory the derivation started from, which is
-    /// [`MEMORY_OVERHEAD_RESERVE_BYTES`] from 8 GiB up. On a source that
+    /// of the memory the derivation started from, at this mode's
+    /// [`non_budget_floor_bytes`], which is [`MEMORY_OVERHEAD_RESERVE_BYTES`]
+    /// from 8 GiB up. On a source that
     /// subtracts nothing (flag, fallback, not-applicable) it is
     /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]. Logged so an operator can see the
     /// reserve that was live for a given run.
@@ -3835,8 +3836,10 @@ fn resolve_knob(
 ///   itself is unknown (source [`PERF_SOURCE_FALLBACK`]; no trustworthy
 ///   ceiling can be derived, which is unlimited, not `0`). In every derived
 ///   branch `RESERVE` is [`effective_memory_overhead_reserve_bytes`] of the
-///   limit or `MemTotal` the branch starts from: `min(2 GiB, memory / 4)`
-///   (issue #2607). `Cli::resolve_performance` refuses a derived budget
+///   limit or `MemTotal` the branch starts from, at the floor
+///   [`non_budget_floor_bytes`] gives `flags.ingest_buffer_limit`:
+///   `min(2 GiB, max(memory / 4, floor))` (issue #2607).
+///   `Cli::resolve_performance` refuses a derived budget
 ///   below [`MIN_DERIVED_MEMORY_BUDGET_BYTES`].
 /// - `cache_max_bytes` (fetcher cache): [`CACHE_MEMORY_PERCENT`] of
 ///   `memory_budget_bytes`, or [`LOOPBACK_CACHE_MEMORY_PERCENT`] instead when
