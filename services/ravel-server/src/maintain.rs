@@ -3351,9 +3351,11 @@ struct ErasureRewritePass {
     not_sealed: usize,
     /// Buckets whose rewrite is blocked by an input object the writer refuses
     /// ([`ErasureRewriteOutcome::BlockedByUnwritableObject`], issue #2580).
-    /// They do not set `deferred`: the object stays live, so the completion
-    /// gate below puts every request whose window covers it in
-    /// `catalog_blocked`, and the other requests complete.
+    /// They do not set `deferred`: nothing in such a bucket is rewritten, so
+    /// every live object in it stays live, and the completion gate below puts
+    /// every request whose window reaches any of them in `catalog_blocked`.
+    /// A blocked bucket holds back no request whose window reaches none of its
+    /// live objects.
     blocked_by_unwritable_object: usize,
     /// A bucket in scope was NOT brought up to date this tick: a legal hold,
     /// an abandoned publish, a listing failure, or a rewrite error. Any of
@@ -3483,9 +3485,11 @@ async fn erasure_rewrite_pass(
                     // fails the same way on every tick, so deferring here would
                     // hold back every request of the tenant and signal for as
                     // long as it exists. The completion gate below still counts
-                    // the object as live, so a request it blocks stays pending.
+                    // every live object of the bucket, so a request whose
+                    // window reaches any of them stays pending.
                     // ravel-maintain warns once per object with its key.
-                    Ok(ErasureRewriteOutcome::BlockedByUnwritableObject { .. }) => {
+                    Ok(ErasureRewriteOutcome::BlockedByUnwritableObject { claim, .. }) => {
+                        tally_claim(&mut pass, claim);
                         pass.blocked_by_unwritable_object += 1;
                     }
                     Ok(ErasureRewriteOutcome::Held) => {
@@ -3578,12 +3582,7 @@ fn tally_erasure_rewrite(
     abandoned: Option<ErasureAbandon>,
     claim: Option<ravel_maintain::ClaimAcquisition>,
 ) {
-    if let Some(claim) = claim {
-        pass.claims_acquired += 1;
-        if claim.stolen {
-            pass.claims_stolen += 1;
-        }
-    }
+    tally_claim(pass, claim);
     if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
         pass.deferred = true;
     }
@@ -3592,6 +3591,16 @@ fn tally_erasure_rewrite(
         Some(ErasureAbandon::ClaimHeld { .. }) => pass.claim_backoffs += 1,
         Some(ErasureAbandon::ClaimLost { .. }) => pass.claims_lost += 1,
         Some(ErasureAbandon::RecordSetChanged | ErasureAbandon::Deadline) => {}
+    }
+}
+
+/// Count a bucket claim an erasure rewrite took, fresh or stolen, into `pass`.
+fn tally_claim(pass: &mut ErasureRewritePass, claim: Option<ravel_maintain::ClaimAcquisition>) {
+    if let Some(claim) = claim {
+        pass.claims_acquired += 1;
+        if claim.stolen {
+            pass.claims_stolen += 1;
+        }
     }
 }
 
@@ -6570,6 +6579,161 @@ mod tests {
         assert!(store.get(&covering, GetRange::Full).await.is_err());
         assert_eq!(unwritable_total(), before, "nothing counted as unwritable");
         assert!(log.blocked_warnings_naming(&second_key).is_empty());
+    }
+
+    /// Seed one bucket at [`UNWRITABLE_LOG_HOUR`] holding a healthy object with
+    /// the subject in the hour's first second and an object the writer refuses
+    /// in its tenth, with no compaction record. Writer ids derive from `base`.
+    /// Returns the refused object's data key.
+    async fn seed_blocked_bucket_with_a_healthy_object(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        base: u128,
+    ) -> String {
+        let hour_ns = i64::from(UNWRITABLE_LOG_HOUR) * TEST_NS_PER_HOUR;
+        publish_log_l0(
+            store,
+            tenant,
+            Uuid::from_u128(base),
+            UNWRITABLE_LOG_HOUR,
+            &[subject_log_record(0, hour_ns + 1_000, TEST_ERASED_SUBJECT)],
+            false,
+        )
+        .await;
+        let mut refused = subject_log_record(1, hour_ns + 10_000_000_000, TEST_ERASED_SUBJECT);
+        let at = refused
+            .stream_attrs
+            .windows(5)
+            .position(|w| w == b"scope")
+            .expect("scope name in blob");
+        refused.stream_attrs[at] = 0xFF;
+        publish_log_l0(
+            store,
+            tenant,
+            Uuid::from_u128(base + 1),
+            UNWRITABLE_LOG_HOUR,
+            &[refused],
+            true,
+        )
+        .await
+    }
+
+    /// A blocked bucket writes nothing, so its healthy objects stay live too:
+    /// a request whose window covers only the healthy object, and not the
+    /// refused one, stays pending after a tick that reports the bucket blocked.
+    /// A request whose window reaches no live object of the bucket completes on
+    /// the same tick.
+    ///
+    /// With `erasure_rewrite_pass`'s `BlockedByUnwritableObject` arm ending in
+    /// `continue`, which skips the completion gate for a blocked bucket, the
+    /// healthy-object request is written a `.done` and the first assertion
+    /// fails.
+    #[tokio::test]
+    async fn a_blocked_bucket_holds_a_request_that_reaches_only_its_healthy_object() {
+        let _serial = UNWRITABLE_SERIAL.lock().await;
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let refused_key =
+            seed_blocked_bucket_with_a_healthy_object(&store, &tenant, 0x2580_0300).await;
+        let hour_ns = i64::from(UNWRITABLE_LOG_HOUR) * TEST_NS_PER_HOUR;
+        let healthy_window = submit_log_request(
+            &store,
+            &tenant,
+            Uuid::from_u128(0x2580_0310),
+            hour_ns,
+            hour_ns + 1_000_000_000,
+        )
+        .await;
+        let elsewhere = submit_log_request(
+            &store,
+            &tenant,
+            Uuid::from_u128(0x2580_0311),
+            i64::from(HEALTHY_LOG_HOUR) * TEST_NS_PER_HOUR,
+            hour_ns,
+        )
+        .await;
+        let before = unwritable_total();
+
+        logs_erasure_tick(&store, &tenant).await;
+
+        assert_eq!(
+            unwritable_total() - before,
+            1,
+            "the tick reported the bucket blocked by the refused object"
+        );
+        assert!(
+            store.get(&healthy_window, GetRange::Full).await.is_err(),
+            "a request whose window reaches only the blocked bucket's healthy object \
+             stays pending"
+        );
+        assert!(
+            store.get(&elsewhere, GetRange::Full).await.is_ok(),
+            "a request whose window reaches no live object of the blocked bucket completes"
+        );
+        assert!(store.get(&refused_key, GetRange::Full).await.is_ok());
+    }
+
+    /// The bucket claim a blocked erasure rewrite took counts on
+    /// `ravel_maintain_claims_acquired_total` like any other: one blocked
+    /// bucket under coordination is exactly one fresh acquisition.
+    ///
+    /// With `tally_claim(&mut pass, claim)` dropped from
+    /// `erasure_rewrite_pass`'s `BlockedByUnwritableObject` arm, or with
+    /// `erasure_rewrite_bucket` reporting `claim: None` there, the count reads
+    /// 0.
+    #[tokio::test]
+    async fn a_blocked_erasure_rewrite_counts_its_claim() {
+        let _serial = UNWRITABLE_SERIAL.lock().await;
+        let store = MemoryStore::new();
+        store.set_clock_ms((TEST_ERASURE_NOW_NS / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        seed_blocked_bucket_with_a_healthy_object(&store, &tenant, 0x2580_0400).await;
+        let hour_ns = i64::from(UNWRITABLE_LOG_HOUR) * TEST_NS_PER_HOUR;
+        let pending = submit_log_request(
+            &store,
+            &tenant,
+            Uuid::from_u128(0x2580_0410),
+            hour_ns,
+            hour_ns + 1_000_000_000,
+        )
+        .await;
+        let clock = FixedClock::new(TEST_ERASURE_NOW_NS);
+        let compactor = CompactorConfig {
+            coordination: Coordination::On,
+            claim_participant: Some(ClaimParticipant::new(
+                Uuid::from_u128(0x2580_04C1),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let before = unwritable_total();
+
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &ravel_maintain::NoLeases,
+            &tenant,
+            Signal::Logs,
+            1,
+            &mut MaintainMemo::with_default_interval(),
+            &safety,
+        )
+        .await;
+
+        assert_eq!(unwritable_total() - before, 1, "the bucket was blocked");
+        assert_eq!(
+            (
+                safety.claims_acquired(Signal::Logs),
+                safety.claims_stolen(Signal::Logs),
+                safety.claims_skipped(Signal::Logs),
+                safety.claims_lost(Signal::Logs),
+            ),
+            (1, 0, 0, 0),
+            "one fresh acquisition, for the blocked bucket"
+        );
+        assert!(store.get(&pending, GetRange::Full).await.is_err());
     }
 
     /// Submit one erasure request exactly as `ravel-cli erase submit` does: a

@@ -768,6 +768,7 @@ async fn migrate_bucket_format_scoped(
         // now rather than hold the bucket's compaction off for the lease.
         Err(err @ MaintainError::UnwritableInput { .. }) => {
             if let Some(guard) = guard
+                && guard.cancelled_at().await.is_none()
                 && let Err(claim_err) = guard.complete(store).await
             {
                 tracing::warn!(

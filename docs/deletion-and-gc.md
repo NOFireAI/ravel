@@ -818,26 +818,30 @@ every bound is measured.
 
 - **An object the rewrite cannot write blocks its own bucket, not every
   request of its tenant and signal.** A log object written before the RLOG
-  writer checked `stream_attrs` blobs can carry one the writer refuses. Compaction leaves such an object out of its merge,
-  so it stays live as raw L0. When a bucket holding one has no compaction
-  record, its erasure rewrite would have to carry the object: the pass checks
-  every input before the merge, builds and publishes nothing for that bucket,
-  and reports it blocked by the object. Every other bucket of the tenant and
-  signal is rewritten and verified as usual on the same tick, so a request
-  whose event-time window does not reach the object completes. A request whose
-  window covers the object never completes while the object exists: the
-  completion gate counts it as live raw L0 like any other, so the request's
-  `.dreq` and its query-time filter stay. In a bucket that does have a
-  compaction record the rewrite rewrites only that record's parts and never
-  reaches the object; the completion gate keeps the covering request pending
-  there too, and nothing is counted or warned. The operator sees the blocked
-  case as `ravel_maintain_erasure_unwritable_objects_total{signal="logs",reason="unwritable_stream_attrs"}`
+  writer checked `stream_attrs` blobs can carry one the writer refuses.
+  Compaction leaves such an object out of its merge, so it stays live as raw
+  L0. When a bucket holding one has no compaction record, its erasure rewrite
+  would have to carry the object: the pass checks every input before the
+  merge, builds and publishes nothing for that bucket, and reports it blocked
+  by the object. A blocked bucket writes nothing, so every live object in it,
+  healthy ones included, stays live, and the completion gate counts each as
+  live raw L0 like any other: a request whose event-time window reaches any
+  of them never completes while the object exists, and the request's `.dreq`
+  and its query-time filter stay. Every other bucket of the tenant and signal
+  is rewritten and verified as usual on the same tick, so a request whose
+  window reaches no live object of a blocked bucket completes. In a bucket
+  that does have a compaction record the rewrite rewrites only that record's
+  parts and never reaches the object; the completion gate keeps a request
+  whose window covers the object pending there too, and nothing is counted or
+  warned. The operator sees the blocked case as
+  `ravel_maintain_erasure_unwritable_objects_total{signal="logs",reason="unwritable_stream_attrs"}`
   rising by one per object (objects, not passes, each counted once per process;
   the counter resets on restart), one `WARN` line per object per process,
   `erasure rewrite of a bucket is blocked by an input object it cannot
-  rewrite`, carrying the bucket and the escaped `object_key`, and the covering
-  request still pending with no `.done`. No supported procedure removes or
-  repairs such an object yet; retention removes it with its bucket.
+  rewrite`, carrying the bucket and the escaped `object_key`, and every request
+  whose window reaches a live object of the bucket still pending with no
+  `.done`. No supported procedure removes or repairs such an object yet;
+  retention removes it with its bucket.
 
 - **Physical removal reuses the existing sweep.** A rewrite's superseded
   inputs become inputs to the superseded-input sweep, deleted after
