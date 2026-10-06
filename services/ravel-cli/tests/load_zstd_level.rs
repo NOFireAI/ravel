@@ -143,20 +143,37 @@ fn records(data: &[u8]) -> Vec<LogRecord> {
     reader.scan(&Predicate::And(Vec::new())).expect("scan").0
 }
 
+/// One page's compression and where its stored bytes sit in the object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageInfo {
+    comp: u8,
+    len: u64,
+    uncomp_len: u64,
+    /// Absolute offset of the page's stored bytes into the object.
+    offset: u64,
+}
+
 /// Every page of an object, keyed by (group, column id, block), with its
-/// compression and stored length.
-fn pages(data: &[u8]) -> BTreeMap<(usize, u32, u64), (u8, u64)> {
+/// compression, stored length, and absolute location.
+fn pages(data: &[u8]) -> BTreeMap<(usize, u32, u64), PageInfo> {
     let f = footer::open(data).expect("footer");
+    let blocks = f.section(kind::BLOCKS).expect("BLOCKS");
     let desc = f.section(kind::PAGE_DIR).expect("PAGE_DIR");
     let raw = read_section(data, desc, &RlogConfig::default()).expect("read PAGE_DIR");
     let dir = PageDir::decode(&raw).expect("decode PAGE_DIR");
     let mut out = BTreeMap::new();
     for (g, group) in dir.groups.iter().enumerate() {
         for chunk in &group.chunks {
-            for page in &chunk.pages {
+            let offsets = chunk.page_offsets().expect("page offsets");
+            for (page, rel_offset) in chunk.pages.iter().zip(offsets) {
                 out.insert(
                     (g, chunk.column_id, u64::from(page.block)),
-                    (page.comp, page.len),
+                    PageInfo {
+                        comp: page.comp,
+                        len: page.len,
+                        uncomp_len: page.uncomp_len,
+                        offset: blocks.offset + rel_offset,
+                    },
                 );
             }
         }
@@ -164,15 +181,37 @@ fn pages(data: &[u8]) -> BTreeMap<(usize, u32, u64), (u8, u64)> {
     out
 }
 
-/// Stored bytes of every zstd-compressed whole-read section, by kind.
-fn zstd_sections(data: &[u8]) -> BTreeMap<u32, u64> {
+/// Every zstd-compressed whole-read section's descriptor, by kind.
+fn zstd_sections(data: &[u8]) -> BTreeMap<u32, footer::SectionDesc> {
     footer::open(data)
         .expect("footer")
         .sections
         .iter()
         .filter(|s| s.comp == COMP_ZSTD && s.kind != kind::BLOCKS)
-        .map(|s| (s.kind, s.len))
+        .map(|s| (s.kind, *s))
         .collect()
+}
+
+/// Proves `stored` is exactly what compressing its own content at `level`
+/// produces: decompresses `stored` to its recorded uncompressed length, then
+/// recompresses at `level` with `zstd::bulk::compress`, which is deterministic
+/// for the same input and level, and requires an exact match. This is the
+/// claim a stored-size inequality cannot pin, because zstd does not guarantee
+/// a higher level stores fewer bytes on small inputs.
+fn assert_level_applied(unit: &str, level: i32, stored: &[u8], uncomp_len: u64) {
+    let raw = zstd::bulk::decompress(stored, uncomp_len as usize)
+        .unwrap_or_else(|e| panic!("{unit}: decompress at level {level}: {e}"));
+    assert_eq!(
+        raw.len() as u64,
+        uncomp_len,
+        "{unit}: decompressed length at level {level}"
+    );
+    let recompressed = zstd::bulk::compress(&raw, level)
+        .unwrap_or_else(|e| panic!("{unit}: recompress at level {level}: {e}"));
+    assert_eq!(
+        recompressed, stored,
+        "{unit}: recompressing its content at level {level} does not reproduce the stored bytes"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -187,13 +226,10 @@ async fn load_zstd_level_reaches_every_written_page() {
     let parquet = dir.path().join("logs.parquet");
     let mapping = dir.path().join("mapping.toml");
     std::fs::write(&mapping, MAPPING).expect("write mapping");
-    let now_ns = i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos(),
-    )
-    .expect("fits i64");
+    // Pinned, not read from the wall clock: time is injected (load::run takes
+    // now_ns as a parameter), so pinning it makes the written corpus bytes
+    // identical on every run instead of varying with SystemTime::now().
+    let now_ns: i64 = 1_790_000_000_000_000_000;
     // Starts a minute back so every row sits in the past of the load's clock.
     write_fixture(&parquet, now_ns - 60_000_000_000);
 
@@ -209,7 +245,9 @@ async fn load_zstd_level_reaches_every_written_page() {
 
     let mut rows3 = 0usize;
     let (mut total3, mut total19) = (0u64, 0u64);
-    let (mut zpages3, mut zpages19, mut zpage_count) = (0u64, 0u64, 0usize);
+    let (mut zpages3, mut zpages19) = (0u64, 0u64);
+    let (mut zpage_count3, mut zpage_count19) = (0usize, 0usize);
+    let (mut section_count3, mut section_count19) = (0usize, 0usize);
     for (min_ts, obj3) in &at3.objects {
         let obj19 = &at19.objects[min_ts];
         total3 += obj3.len() as u64;
@@ -226,18 +264,20 @@ async fn load_zstd_level_reaches_every_written_page() {
             pages19.keys().collect::<Vec<_>>(),
             "both loads write the same pages"
         );
-        for (at, &(comp19, len19)) in &pages19 {
-            if comp19 != COMP_ZSTD {
-                continue;
+        for (at, p19) in &pages19 {
+            let p3 = &pages3[at];
+            if p19.comp == COMP_ZSTD {
+                let stored19 = &obj19[p19.offset as usize..(p19.offset + p19.len) as usize];
+                assert_level_applied(&format!("page {at:?} (level 19 load)"), 19, stored19, p19.uncomp_len);
+                zpages19 += p19.len;
+                zpage_count19 += 1;
             }
-            let (_, len3) = pages3[at];
-            assert!(
-                len19 <= len3,
-                "page {at:?}: level 19 stored {len19} bytes, level 3 stored {len3}"
-            );
-            zpages3 += len3;
-            zpages19 += len19;
-            zpage_count += 1;
+            if p3.comp == COMP_ZSTD {
+                let stored3 = &obj3[p3.offset as usize..(p3.offset + p3.len) as usize];
+                assert_level_applied(&format!("page {at:?} (level 3 load)"), 3, stored3, p3.uncomp_len);
+                zpages3 += p3.len;
+                zpage_count3 += 1;
+            }
         }
 
         let sections3 = zstd_sections(obj3);
@@ -256,15 +296,20 @@ async fn load_zstd_level_reaches_every_written_page() {
                 kind::PAGE_DIR
             ],
         );
-        for (k, len19) in &sections19 {
-            assert!(
-                *len19 <= sections3[k],
-                "section kind {k}: level 19 stored {len19} bytes, level 3 stored {}",
-                sections3[k]
-            );
+        for (k, desc19) in &sections19 {
+            let desc3 = &sections3[k];
+            let stored19 = &obj19[desc19.offset as usize..(desc19.offset + desc19.len) as usize];
+            assert_level_applied(&format!("section kind {k} (level 19 load)"), 19, stored19, desc19.uncomp_len);
+            section_count19 += 1;
+            let stored3 = &obj3[desc3.offset as usize..(desc3.offset + desc3.len) as usize];
+            assert_level_applied(&format!("section kind {k} (level 3 load)"), 3, stored3, desc3.uncomp_len);
+            section_count3 += 1;
         }
-        // Measured 8306 against 9072 bytes (91.6%).
-        let (s3, s19): (u64, u64) = (sections3.values().sum(), sections19.values().sum());
+        // Measured 8309 against 9083 bytes (91.5%).
+        let (s3, s19): (u64, u64) = (
+            sections3.values().map(|d| d.len).sum(),
+            sections19.values().map(|d| d.len).sum(),
+        );
         assert!(
             s19 * 100 <= s3 * 95,
             "level 19 sections are at least 5% smaller: {s19} vs {s3}"
@@ -274,14 +319,17 @@ async fn load_zstd_level_reaches_every_written_page() {
     assert_eq!(rows3, ROWS, "every row landed");
     // 15 before row-group dictionaries (#2144) replaced some per-block string
     // pages on this corpus with a dictionary page and id pages.
-    assert_eq!(zpage_count, 13, "zstd pages compared");
+    assert_eq!(zpage_count19, 13, "zstd pages checked, level 19 load");
+    assert_eq!(zpage_count3, 13, "zstd pages checked, level 3 load");
+    assert_eq!(section_count19, 4, "zstd sections checked, level 19 load");
+    assert_eq!(section_count3, 4, "zstd sections checked, level 3 load");
     // A level that reached only the sections leaves every page the same size.
-    // Measured 343647 against 420260 bytes (81.8%).
+    // Measured 319657 against 396157 bytes (80.7%).
     assert!(
         zpages19 * 100 <= zpages3 * 90,
         "level 19 pages are at least 10% smaller: {zpages19} vs {zpages3}"
     );
-    // Measured 394248 against 471627 bytes (83.6%).
+    // Measured 392761 against 470035 bytes (83.6%).
     assert!(
         total19 * 100 <= total3 * 90,
         "level 19 objects are at least 10% smaller: {total19} vs {total3}"
