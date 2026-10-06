@@ -589,15 +589,15 @@ pub const L1_PART_MEMORY_TARGET_BUDGET_DIVISOR: u64 = 8;
 /// bound, so a flag combination is not falsely refused for lack of the real
 /// number.
 ///
-/// This is the reserve's ceiling. Both binaries deduct
+/// This caps the quarter-of-memory term of the reserve. Both binaries deduct
 /// [`effective_memory_overhead_reserve_bytes`], which is this constant on a
-/// host with 8 GiB or more.
+/// host with 8 GiB or more unless the non-budget floor is larger.
 pub const MEMORY_OVERHEAD_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Below `MEMORY_OVERHEAD_RESERVE_BYTES * MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR`
 /// (8 GiB) the overhead reserve scales with the host's memory divided by this,
-/// down to the non-budget floor (ADR-1170, small-host reserve amendment, issue
-/// #2607).
+/// lifted to the non-budget floor (ADR-1170, small-host reserve amendment,
+/// issue #2607).
 pub const MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR: u64 = 4;
 
 /// What a process costs outside the memory budget before it holds any ingest
@@ -609,21 +609,23 @@ pub const MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR: u64 = 4;
 pub const NON_BUDGET_BASELINE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The overhead reserve deducted from `total_bytes` (`MemTotal`, or the cgroup
-/// memory limit when one caps it): `min(MEMORY_OVERHEAD_RESERVE_BYTES,
-/// max(total_bytes / 4, non_budget_floor_bytes))`.
+/// memory limit when one caps it): `max(min(MEMORY_OVERHEAD_RESERVE_BYTES,
+/// total_bytes / 4), non_budget_floor_bytes)`.
 ///
 /// `non_budget_floor_bytes` is the memory the process holds outside the budget
-/// that the reserve must cover however small the host:
+/// that the reserve must cover whatever the host's size:
 /// [`NON_BUDGET_BASELINE_BYTES`], plus the ingest buffer bound in a
-/// `ravel-server` mode that buffers ingest. From 8 GiB up the quarter reaches
-/// the cap, so the reserve is [`MEMORY_OVERHEAD_RESERVE_BYTES`] exactly
-/// whatever the floor.
+/// `ravel-server` mode that buffers ingest. The floor wins over the cap, so a
+/// floor above [`MEMORY_OVERHEAD_RESERVE_BYTES`] is the reserve at every host
+/// size. With a floor at or below the cap, the reserve is
+/// [`MEMORY_OVERHEAD_RESERVE_BYTES`] exactly from 8 GiB up.
 pub fn effective_memory_overhead_reserve_bytes(
     total_bytes: u64,
     non_budget_floor_bytes: u64,
 ) -> u64 {
     MEMORY_OVERHEAD_RESERVE_BYTES
-        .min((total_bytes / MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR).max(non_budget_floor_bytes))
+        .min(total_bytes / MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR)
+        .max(non_budget_floor_bytes)
 }
 
 /// Host memory less [`effective_memory_overhead_reserve_bytes`] at the
@@ -2331,13 +2333,16 @@ mod tests {
         assert_eq!(bound, L1PartMemoryTargetBound::Floor);
     }
 
-    /// Issue #2607: the reserve is `min(2 GiB, max(host / 4, floor))`. A
+    /// Issue #2607: the reserve is `max(min(2 GiB, host / 4), floor)`. A
     /// fixed 2 GiB fails the 2 GiB and 1,912 MiB rows (it reads 2 GiB and
     /// leaves a 0 host budget there); dropping the floor fails the 512 MiB,
     /// 600 MiB and 0 rows (128 MiB, 150 MiB and 0 instead of 256 MiB) and the
-    /// 768 MiB floor rows; dropping the outer `min` fails the 3 GiB floor rows.
+    /// 768 MiB floor rows; applying the cap after the floor,
+    /// `min(2 GiB, max(host / 4, floor))`, fails the floor-above-the-cap rows
+    /// (2 GiB instead of 3 GiB at 1 GiB); dropping the cap, `max(host / 4,
+    /// floor)`, fails the 32 GiB rows (8 GiB instead of 2 GiB).
     #[test]
-    fn the_reserve_is_a_quarter_of_the_host_between_its_floor_and_cap() {
+    fn the_reserve_is_a_capped_quarter_of_the_host_lifted_to_its_floor() {
         assert_eq!(NON_BUDGET_BASELINE_BYTES, 256 * MIB);
         let baseline = NON_BUDGET_BASELINE_BYTES;
         assert_eq!(
@@ -2379,10 +2384,18 @@ mod tests {
             GIB
         );
         for total in [8 * GIB, 32 * GIB, 30 * GIB, u64::MAX] {
-            for floor in [0, baseline, 768 * MIB, 3 * GIB] {
+            for floor in [0, baseline, 768 * MIB, 2 * GIB] {
                 assert_eq!(
                     effective_memory_overhead_reserve_bytes(total, floor),
                     MEMORY_OVERHEAD_RESERVE_BYTES,
+                    "total {total}, floor {floor}"
+                );
+            }
+            // A floor above the cap wins over it at every host size.
+            for floor in [2304 * MIB, 3328 * MIB, 3 * GIB] {
+                assert_eq!(
+                    effective_memory_overhead_reserve_bytes(total, floor),
+                    floor,
                     "total {total}, floor {floor}"
                 );
             }
@@ -2391,11 +2404,16 @@ mod tests {
                 total - MEMORY_OVERHEAD_RESERVE_BYTES
             );
         }
-        // A floor above the cap is held at the cap on a small host too.
+        // And on a host smaller than the floor.
         assert_eq!(
             effective_memory_overhead_reserve_bytes(GIB, 3 * GIB),
-            MEMORY_OVERHEAD_RESERVE_BYTES
+            3 * GIB
         );
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(4 * GIB, 3328 * MIB),
+            3328 * MIB
+        );
+        assert_eq!(effective_memory_overhead_reserve_bytes(0, 3 * GIB), 3 * GIB);
         assert_eq!(effective_memory_overhead_reserve_bytes(0, 0), 0);
         assert_eq!(
             effective_memory_overhead_reserve_bytes(0, baseline),
