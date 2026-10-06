@@ -187,6 +187,8 @@ key-epoch record `t/<hash>/enc`, the metric metadata record `t/<hash>/m/meta`,
 and the alert evaluator's lease and state memo under `t/<hash>/a/`, along with
 the alert transition writes the Query role makes; the control-plane key
 amendment below adds them and lists every control-plane key each role uses.
+The key-epoch write conditions amendment below makes every server role's
+`t/<hash>/enc` write a create-only or a CAS-only grant.
 
 The table's `prov` entries are incomplete too: Maintain creates the record
 on the startup and maintain-tick adopt paths and raises format floors under
@@ -718,7 +720,8 @@ The needed grant, once provisioned:
 - **Gateway, Query, Maintain**: `GetObject` + `PutObject` on `t/*/enc`
   (`CreateIfAbsent` for the bootstrap epoch 0, `CasVersion` for every
   later rotation — both are plain `s3:PutObject` at the IAM layer per §1's
-  existing note on `CreateIfAbsent`/`CasVersion`/`Put`). Add `t/*/enc` to
+  existing note on `CreateIfAbsent`/`CasVersion`/`Put`; the key-epoch write
+  conditions amendment below grants each under its own Condition). Add `t/*/enc` to
   each role's `ListBucket` `s3:prefix` condition alongside the existing
   per-key wildcards, the same way the bare `t/` discovery entry is added
   (ADR-0072 decision 5).
@@ -1118,7 +1121,8 @@ below are the narrowest that cover each call:
   and `CasVersion` for each appended epoch. Only `NotFound` reads as absence,
   so a refused GET or PUT stops the process from starting. `GatewayRead`,
   `QueryRead`, `MaintainRead`, `GatewayWrite`, `QueryWrite` and
-  `MaintainWrite` gain `t/*/enc`. Admin reads it for `ravel-cli
+  `MaintainWrite` gain `t/*/enc` (the writes move to conditioned statements
+  in the key-epoch write conditions amendment below). Admin reads it for `ravel-cli
   verify-custody` through its blanket `t/*` and writes it nowhere. Nothing
   lists it, so no `ListBucket` prefix is added, unlike the follow-up the
   `t/<hash>/enc` amendment above proposed (the bootstrap-key list amendment
@@ -1738,7 +1742,8 @@ default, as the servers write it. Routing is opt-in through the flag: without
 it these commands write under the bucket default as before. Maintain already
 holds `kms:Encrypt` and `kms:GenerateDataKey*` on the
 tenant keys and the `t/*/enc` write, so §1's Maintain row and the templates
-are unchanged.
+are unchanged. (The key-epoch write conditions amendment below splits that
+write into create-only and CAS-only grants; these commands need the CAS one.)
 
 Admin is unchanged as well: decrypt-only on the tenant keys, as §1 and the
 `t/<hash>/enc` amendment have it. No Admin command takes the flag, so its
@@ -1871,3 +1876,62 @@ template.
 
 Recorded as an appended amendment, with an inline pointer added to §1, the prov
 write conditions amendment and the bootstrap-key list amendment.
+
+## Amendment (2026-10-05): the key-epoch record's writes are conditional
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant|Amendment (2026-10-01): the control-plane keys each role reads and writes|Amendment (2026-10-03): `ravel-cli` routes Maintain data writes through the tenant key" pointer="key-epoch write conditions amendment" -->
+
+Issue #2462. `GatewayWrite`, `QueryWrite` and `MaintainWrite` granted an
+unconditioned `PutObject` on `t/*/enc`, the append-only key-epoch record
+(ADR-0062 decision 1b). Every production write of it goes through
+`record_key_epoch` (`crates/ravel-catalog/src/key_epoch.rs`), with
+`PutMode::CreateIfAbsent` when its GET finds no record and
+`PutMode::CasVersion` to append an epoch to the record it read. The callers,
+by the role whose credential issues them:
+
+- Gateway, Query and Maintain: `bootstrap_tenant_epoch`
+  (`crates/ravel-catalog/src/tenant_kms.rs`), which `configure_tenant_kms`
+  runs from `services/ravel-server/src/main.rs` at startup in every mode
+  whenever `--tenant-kms-config` is set. For a tenant with no record it creates
+  epoch 0 (`CreateIfAbsent`) and then appends the configured key
+  (`CasVersion`); for a rotated key it appends (`CasVersion`).
+- Maintain: the `ravel-cli` commands of the tenant-KMS `ravel-cli` amendment
+  above, through `configure_tenant_kms_with_policy` under
+  `KeyChangePolicy::Refuse` (`services/ravel-cli/src/store.rs`). They refuse an
+  absent record and append only epoch 1 of an unfinished bootstrap
+  (`CasVersion`).
+
+No production path writes the record unconditionally, so the unconditioned
+grant was wider than any caller: it let a compromised server credential
+overwrite or recreate a tenant's custody history blind.
+
+Decision: the key-epoch record's writes are conditioned the way the prov write
+conditions amendment conditions the provisioning record's. Each of
+`gateway.json`, `query.json` and `maintain.json` drops `t/*/enc` from its
+unconditioned write statement and gains two statements on the one resource
+`t/????????????????????????????????/enc`: `<Role>EncCreate`, conditioned on
+`StringEquals` `s3:if-none-match` `*`, and `<Role>EncCas`, conditioned on
+`Null` `s3:if-match` `false`. Every mode both creates and appends, so all three
+roles hold both; the record is not create-only, because appending an epoch is a
+compare-and-swap and key rotation depends on it. Admin is unchanged: it reads
+the record through `t/*` and holds no write on it. `DenyDeleteProtected` keeps
+`t/*/enc` in all four templates.
+
+What it buys: a compromised Gateway, Query or Maintain credential can still
+create a missing record and append to an existing one, but only by naming the
+version it read; it can no longer overwrite the history with an unconditional
+PUT. `crates/ravel-commit/tests/iam_templates.rs` pins the statements per role
+by exact JSON, checks that no unconditioned `PutObject` in any template reaches
+the record, and matches each caller above to a grant of its own kind; two
+fixtures, the CAS statement without its Condition and `t/*/enc` added back to
+an unconditioned write statement, fail those checks. Nothing here was run
+against AWS.
+
+Net effect on §1: the Gateway, Query and Maintain write columns' `t/<hash>/enc`
+entries are conditioned. The `t/<hash>/enc` key-epoch amendment's "plain
+`s3:PutObject`" grant and the control-plane key amendment's `t/*/enc` in the
+three write statements now stand as these conditioned statements.
+
+Recorded as an appended amendment, with an inline pointer added to §1, the
+`t/<hash>/enc` key-epoch amendment, the control-plane key amendment and the
+tenant-KMS `ravel-cli` amendment.
