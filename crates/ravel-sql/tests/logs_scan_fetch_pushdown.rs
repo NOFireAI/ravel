@@ -632,11 +632,11 @@ async fn fetch_stopped_segment_publishes_its_scan_metrics() {
     let full_decoded = sum_metric(&full, "pages_decoded");
     let full_skipped = sum_metric(&full, "pages_skipped");
     assert!(
-        full_decoded > 0 && full_decoded % MB_BLOCKS == 0,
+        full_decoded > 0 && full_decoded.is_multiple_of(MB_BLOCKS),
         "every block decodes the same pages; got {full_decoded}"
     );
     assert!(
-        full_skipped > 0 && full_skipped % MB_BLOCKS == 0,
+        full_skipped > 0 && full_skipped.is_multiple_of(MB_BLOCKS),
         "every block skips the same unprojected pages; got {full_skipped}"
     );
 
