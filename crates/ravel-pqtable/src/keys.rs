@@ -148,8 +148,10 @@ pub enum ListedManifestKey {
     /// extra path segment, more than `u64::MAX`, all zeros, or not all decimal
     /// digits. The Query grant spells the version as 20 single-character
     /// wildcards, but its `*` binds any run of segments before `/v/`, so it
-    /// admits these keys; readers skip them as they skip a version above
-    /// [`MAX_MANIFEST_VERSION`].
+    /// admits these keys; readers skip one the store lists as they skip a
+    /// version above [`MAX_MANIFEST_VERSION`]. The S3 adapter cannot list one
+    /// holding a control character, an empty segment or a `.` or `..`
+    /// segment: its listing fails instead.
     InvalidVersion {
         tenant_hash: TenantHash,
         table: String,

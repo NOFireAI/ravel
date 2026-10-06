@@ -1099,7 +1099,9 @@ that are not all digits. `keys::parse_listed_manifest_key` names such a key
 `ListedManifestKey::InvalidVersion` instead of refusing it, and every
 listing treats it exactly like a version above the bound: `resolve::versions`
 (and so `resolve::newest`), `resolve::tables` and the sweep's listing skip
-it, count it and warn about it as below, and never fail on it. Before this,
+it, count it and warn about it as below, and never fail on it when the store
+lists it (the invalid table segment amendment below names the keys S3 cannot
+list). Before this,
 one such key failed every query and DDL statement on its table and every
 `parquet ls` and `parquet sweep` of its tenant.
 
@@ -1226,6 +1228,7 @@ and the bench refuses a file that still carries it.
 <!-- amendment-applies: sections="Amendment (2026-10-03): table names an IAM template grants after a wildcard are reserved|Amendment (2026-10-04): manifest versions are bounded, and a repair command removes forged ones" pointer="invalid table segment amendment" -->
 <!-- amendment-supersedes: phrase="is still refused as foreign by the tenant-wide listings" pointer="invalid table segment amendment" -->
 <!-- amendment-supersedes: phrase="so they fail for the whole tenant with `ForeignKey`" pointer="invalid table segment amendment" -->
+<!-- amendment-supersedes: phrase="and never fail on it" pointer="invalid table segment amendment" -->
 
 The version bound amendment left one shape open in its "What stays open"
 paragraph: a key the Query grant admits whose segment between `pq/t/` and
@@ -1259,9 +1262,15 @@ such key fails the whole listing with a store error before Ravel sees it. On
 S3 those shapes therefore still fail `parquet ls`, `parquet sweep` and
 `parquet repair --stray` for the whole tenant. Ravel cannot list such a key,
 so an operator removes it by deleting the exact key with the Maintain
-credential through an S3 tool. The adapter failing a tenant's listing on
-one key it cannot parse is a defect in `ravel-object-store`, left to a
-follow-up. Each listing that finds a key it skips is counted once per tenant,
+credential through an S3 tool. The same holds for a key under a valid
+table's own `v/` prefix whose slot names no version: the version bound
+amendment's listings skip and never fail on one only when the store lists
+it, and on S3 one holding a control character, an empty segment (such as
+`hits/v//<20 digits>.pqm`) or a `.` or `..` segment fails
+`resolve::versions`, and so every query and DDL statement on that table, as
+well as the tenant-wide listings. The adapter failing a listing on one key
+it cannot parse is a defect in `ravel-object-store`, tracked as issue #2637.
+Each listing that finds a key it skips is counted once per tenant,
 however many such keys it finds (`resolve::invalid_table_listings`, a sibling
 of the per-table `resolve::above_bound_resolves`, so neither counter's key
 means two things), and the first such listing of each tenant in a process is
@@ -1283,6 +1292,12 @@ segments and percent-encodes a `.` or `..` segment, control characters,
 every non-ASCII byte and ``\ { ^ } % ` ] " > [ ~ < # | * ?``; a key that
 changes under it (`keys::is_store_path`) is marked undeletable by Ravel,
 since its delete would go to a different key, report success and leave it.
+The listing shows such a key only when no key the encoding changes sits at
+a list page boundary: the adapter also sends a page's continuation, the last
+key of the page, through `Path::from`, so when that key changes the next
+page starts somewhere else and either returns keys again, failing the
+listing with `ListOrderViolation`, or skips the keys after it. That is the
+same adapter defect, issue #2637.
 A well-formed manifest key whose table segment is one of the names the IAM
 segment amendment reserved is marked as possibly a table created before the
 name was reserved; the built-in and signal names were refused before any
@@ -1295,11 +1310,21 @@ table, in any version class, another tenant's key, or a key of no manifest
 shape), an undeletable key, or a reserved-name key not included refuses the
 whole call with `RepairError::NotStray`, `RepairError::Undeletable` or
 `RepairError::ReservedName` and deletes nothing. After deleting, the command
-lists the tenant's `pq/t/` prefix again and exits non-zero naming every such
-key still listed, skipped ones included. An operator removes an undeletable
+prints what it deleted, lists the tenant's `pq/t/` prefix again and exits
+non-zero naming every such key still listed, skipped ones included, or
+exits non-zero with the error of that listing if it fails. Every such key
+still there is named only when no key the encoding changes sits at a page
+boundary, as above. An operator removes an undeletable
 key, as one the store cannot list, by deleting the exact key with the
 Maintain credential through an S3 tool. With nothing listed it says so and
-deletes nothing. `--delete-version` stays table-scoped. The command runs
+deletes nothing. `--delete-version` stays table-scoped. `--table --delete`
+(`repair::delete_flagged`) applies the same store-path check to the keys it
+flags: a flagged key under the table's own `v/` prefix that changes under
+`Path::from`, such as a slot of 20 tildes, or `hits/v//<20 digits>.pqm`,
+whose delete would reach version N of `hits`, is marked undeletable by Ravel
+in the listing, and `--delete` prints the listing and then refuses the whole
+call with `RepairError::Undeletable` naming that key, before any delete.
+The command runs
 under the Maintain credential: `MaintainList` grants the `t/*/pq/t/*`
 listing and `MaintainDelete` grants `s3:DeleteObject` on `t/*/pq/t/*`. It is
 a write only with `--delete`. A table created under a name reserved since

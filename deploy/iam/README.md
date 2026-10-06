@@ -641,9 +641,15 @@ against the Ravel bucket (ADR-0055, HTTP DDL amendment):
   `ravel-cli parquet repair --tenant <tenant> --stray --delete` removes it.
   On S3 a key of either kind holding a control character, an empty segment or
   a `.` or `..` segment cannot be listed at all, and fails the listing that
-  reaches it; a key whose characters the S3 adapter encodes is listed but
-  cannot be deleted through Ravel. The Maintain credential deletes either by
-  its exact key through an S3 tool. That is the same class of harm as the
+  reaches it. A key whose characters the S3 adapter encodes cannot be
+  deleted through Ravel: `--stray --delete` skips it and `--table --delete`
+  refuses to delete anything while one is flagged. It is listed only when no
+  such key sits at a list page boundary: the adapter encodes the page's
+  continuation too, so the next page either repeats keys, failing the
+  listing, or skips the keys after it, and the listing `--stray --delete`
+  runs after deleting then names every key still there only under the same
+  condition. The Maintain credential deletes either by its exact key through
+  an S3 tool. That is the same class of harm as the
   maximal-version wedge below, confined to the manifest keyspace.
 
   Creating a new version is not harmless: the newest version is the table

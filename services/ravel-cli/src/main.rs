@@ -923,7 +923,14 @@ enum ParquetCommand {
     /// key under a table's `v/` prefix whose slot is not a version number, so
     /// one there was put directly in the bucket, for example with a stolen
     /// Query credential. Readers and
-    /// the sweep already skip it; `--delete` removes it. A forged version at
+    /// the sweep already skip it when the store lists it; `--delete` removes
+    /// it. A flagged key the S3 adapter would send a delete of to a different
+    /// key (one holding a character its path encoding escapes, such as `~`)
+    /// is marked undeletable, and `--delete` refuses, deleting nothing, while
+    /// one is flagged. On S3 a key holding a control character, an empty
+    /// segment or a `.` or `..` segment fails this listing and every read of
+    /// the table; delete those with the Maintain credential through an S3
+    /// tool. A forged version at
     /// or below the bound is not flagged: as the newest it serves as the
     /// table, and exactly at the bound it blocks every later DDL. Remove one
     /// with `--delete-version` once the DDL audit log shows no statement wrote
@@ -937,10 +944,14 @@ enum ParquetCommand {
     /// tenant's `t/<tenant_hash>/pq/t/` whose segment before `/v/` is not a
     /// valid table name (upper case, reserved, or a path such as `a/b`), which
     /// the Query grant also admits and the tenant-wide listings skip; with
-    /// `--delete`, delete those, then list again and fail naming any still
-    /// there. A key the S3 adapter would send a delete of to a different key
-    /// (one holding a character its path encoding escapes, such as `~` or
-    /// `%`) is marked undeletable and skipped, and a key under a name reserved
+    /// `--delete`, delete those, print them, then list again and fail naming
+    /// any still there. A key the S3 adapter would send a delete of to a
+    /// different key (one holding a character its path encoding escapes, such
+    /// as `~` or `%`) is marked undeletable and skipped. It is listed, and the
+    /// listing after `--delete` names every key still there, only when no
+    /// such key sits at a list page boundary: the adapter encodes the page's
+    /// continuation too, so the next page repeats keys, failing the listing,
+    /// or skips the keys after it. A key under a name reserved
     /// after tables could be created (such as `l0`) is marked as possibly a
     /// table created before the reservation and skipped unless
     /// `--include-reserved-names` is passed. On S3 a key holding a control

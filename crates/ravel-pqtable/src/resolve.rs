@@ -9,9 +9,13 @@
 //! version at or below the bound instead. A `.pqm` key under a table's `v/`
 //! prefix whose slot names no version at all
 //! ([`ListedManifestKey::InvalidVersion`]) is treated the same way: every
-//! listing here, and the sweep's, skips it rather than failing. Each listing
-//! that finds either kind is counted, and the table is reported once per
-//! process as an [`AboveBoundVersions`] warning.
+//! listing here, and the sweep's, skips it rather than failing when the store
+//! lists it. The S3 adapter cannot list such a key holding a control
+//! character, an empty segment or a `.` or `..` segment: [`versions`], and so
+//! every resolve of that table, fails with [`ResolveError::Store`] instead,
+//! as do the tenant-wide listings. Each listing that finds either kind is
+//! counted, and the table is reported once per process as an
+//! [`AboveBoundVersions`] warning.
 //!
 //! A key the Query grant admits whose segment between `pq/t/` and `/v/` is
 //! not a valid table name ([`ListedManifestKey::InvalidTable`]) belongs to no
@@ -410,7 +414,9 @@ async fn list_grouped(
 /// `v/` prefix, including any above [`MAX_MANIFEST_VERSION`]. A `.pqm` key
 /// whose slot names no version ([`ListedManifestKey::InvalidVersion`]) is
 /// skipped and counted ([`above_bound_resolves`]); any other key that is not a
-/// version of this table is [`ResolveError::ForeignKey`].
+/// version of this table is [`ResolveError::ForeignKey`]. On S3 such a key
+/// holding a control character, an empty segment or a `.` or `..` segment
+/// fails the listing with [`ResolveError::Store`].
 pub async fn versions(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -956,6 +962,59 @@ pub(crate) mod tests {
                 .await
                 .expect("listing");
             assert_eq!(listing.invalid_table_keys, vec![stray], "{rest:?}");
+        }
+    }
+
+    /// On S3 a key under the table's own `v/` prefix whose slot names no
+    /// version and that `Path::parse` refuses fails every listing that meets
+    /// it, the table's own included; only a store that lists it skips it.
+    #[tokio::test]
+    async fn a_key_naming_no_version_the_s3_adapter_cannot_list_fails_every_listing() {
+        for (i, slot) in [
+            "\u{1b}[2J\u{7}xxxxxxxxxxxxxxx",
+            "/00000000000000000003",
+            "./00000000000000000001",
+            "../00000000000000000001",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tenant = TenantHash([0x60 + i as u8; 16]);
+            let store = S3KeyStore {
+                inner: MemoryStore::with_page_size(2),
+            };
+            for v in [1, 2] {
+                put_version(&store.inner, &tenant, v).await;
+            }
+            put_invalid(&store.inner, &tenant, slot).await;
+            let prefix = manifest_prefix(&tenant, "hits").expect("prefix");
+            let got = versions(&store, &tenant, "hits").await;
+            assert!(
+                matches!(&got, Err(ResolveError::Store { key, source })
+                    if *key == prefix && is_unparsed_listing(source)),
+                "{slot:?}: {got:?}"
+            );
+            assert!(
+                matches!(
+                    newest(&store, &tenant, "hits").await,
+                    Err(ResolveError::Store { .. })
+                ),
+                "{slot:?}"
+            );
+            assert!(
+                matches!(
+                    tables(&store, &tenant).await,
+                    Err(ResolveError::Store { .. })
+                ),
+                "{slot:?}"
+            );
+            assert_eq!(
+                versions(&store.inner, &tenant, "hits")
+                    .await
+                    .expect("versions"),
+                vec![1, 2],
+                "{slot:?}"
+            );
         }
     }
 
