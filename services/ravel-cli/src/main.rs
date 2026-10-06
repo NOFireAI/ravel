@@ -5945,3 +5945,96 @@ mod tenant_kms_dispatch_tests {
         assert_nothing_written(&fake, start);
     }
 }
+
+/// `parquet repair --stray` driven through [`run`], the function `main`
+/// calls, so the dispatch's handling of `--include-reserved-names` is what
+/// is pinned, not only the parsed flag.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod parquet_repair_dispatch_tests {
+    use bytes::Bytes;
+    use clap::Parser;
+    use ravel_object_store::{ObjectStoreBackend, PutOptions};
+    use ravel_types::TenantId;
+
+    use super::fake_s3::{Echo, spawn};
+    use super::{Cli, run_logged, store};
+
+    const TENANT: &str = "acme";
+
+    fn argv(endpoint: &str, command: &[&str]) -> Vec<String> {
+        [
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "ravel-test",
+            "--s3-endpoint",
+            endpoint,
+            "--s3-access-key",
+            "test",
+            "--s3-secret-key",
+            "test",
+            "--tenant-hash-unkeyed",
+        ]
+        .iter()
+        .chain(command)
+        .map(|arg| arg.to_string())
+        .collect()
+    }
+
+    /// A well-formed manifest key of `acme` under `l0`, a name reserved
+    /// after tables could be created, written straight to the bucket.
+    async fn reserved_key(endpoint: &str) -> String {
+        let key = format!(
+            "t/{}/pq/t/l0/v/00000000000000000001.pqm",
+            TenantId::new(TENANT).hash().to_hex()
+        );
+        let args = store::StoreArgs::try_parse_from(&argv(endpoint, &[])[..11])
+            .expect("store flags parse");
+        store::build_store(&args)
+            .expect("store")
+            .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+        key
+    }
+
+    async fn run_repair(endpoint: &str, tail: &[&str]) -> anyhow::Result<()> {
+        let mut command = vec![
+            "parquet", "repair", "--tenant", TENANT, "--stray", "--delete",
+        ];
+        command.extend(tail);
+        let cli = Cli::try_parse_from(argv(endpoint, &command)).expect("command parses");
+        run_logged(cli, &mut Vec::new()).await
+    }
+
+    /// Without `--include-reserved-names` the reserved-name key is skipped
+    /// and the run fails naming it; with it, the dispatch hands `true` to the
+    /// repair and the key is deleted.
+    ///
+    /// Non-vacuity: pass `false` for `include_reserved_names` at the
+    /// `repair_stray` call in `run_logged` and the second run sends no
+    /// delete and fails naming the key.
+    #[tokio::test]
+    async fn include_reserved_names_reaches_the_stray_repair() {
+        let (endpoint, fake) = spawn(Echo::Stored, &[]).await;
+        let key = reserved_key(&endpoint).await;
+
+        let err = run_repair(&endpoint, &[])
+            .await
+            .expect_err("the reserved-name key is skipped");
+        assert_eq!(
+            err.to_string(),
+            format!("1 key(s) under no valid table name still listed after --delete: {key:?}")
+        );
+        assert_eq!(fake.deletes(), Vec::<String>::new());
+        assert!(fake.has_object(&key));
+
+        run_repair(&endpoint, &["--include-reserved-names"])
+            .await
+            .expect("the reserved-name key is deleted");
+        assert_eq!(fake.deletes(), vec![key.clone()]);
+        assert!(!fake.has_object(&key));
+    }
+}
