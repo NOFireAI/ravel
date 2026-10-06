@@ -654,8 +654,14 @@ async fn fetch_stopped_segment_publishes_its_scan_metrics() {
         1,
         "the stop came inside the first block"
     );
-    assert_eq!(sum_metric(&limited, "pages_decoded"), full_decoded / MB_BLOCKS);
-    assert_eq!(sum_metric(&limited, "pages_skipped"), full_skipped / MB_BLOCKS);
+    assert_eq!(
+        sum_metric(&limited, "pages_decoded"),
+        full_decoded / MB_BLOCKS
+    );
+    assert_eq!(
+        sum_metric(&limited, "pages_skipped"),
+        full_skipped / MB_BLOCKS
+    );
     assert_eq!(
         sum_metric(&limited, "blocks_total"),
         MB_BLOCKS,
@@ -675,7 +681,11 @@ async fn fetch_stopped_segment_publishes_its_scan_metrics() {
 fn fetched_stats(
     plan: &Arc<dyn ExecutionPlan>,
     fetch: Option<usize>,
-) -> (Precision<usize>, Precision<ScalarValue>, Precision<ScalarValue>) {
+) -> (
+    Precision<usize>,
+    Precision<ScalarValue>,
+    Precision<ScalarValue>,
+) {
     let plan = match fetch {
         Some(_) => plan.with_fetch(fetch).expect("the scan takes a fetch"),
         None => Arc::clone(plan),
@@ -683,11 +693,7 @@ fn fetched_stats(
     let ts = plan.schema().index_of("ts").expect("a ts column");
     let stats = plan.partition_statistics(None).expect("statistics");
     let col = &stats.column_statistics[ts];
-    (
-        stats.num_rows,
-        col.min_value.clone(),
-        col.max_value.clone(),
-    )
+    (stats.num_rows, col.min_value.clone(), col.max_value.clone())
 }
 
 /// Over the 20-row fixture, one partition under `fetch = 1` emits exactly one
