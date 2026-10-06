@@ -72,6 +72,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 use bytes::Bytes;
 use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
@@ -98,7 +99,7 @@ use crate::bucket::Bucket;
 use crate::build::{BuiltPart, OUTPUT_FORMAT_VERSION};
 use crate::claim_guard::{BucketClaim, Checkpoint, ClaimSkipReason, claim_bucket};
 use crate::clock::Clock;
-use crate::compact::ClaimAcquisition;
+use crate::compact::{ClaimAcquisition, CompactionInputSkipReason};
 use crate::config::{CompactorConfig, NS_PER_HOUR};
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
@@ -1589,6 +1590,21 @@ pub async fn build_rewrite_logs(
     // discarded.
     let catalogs = rlog::load_catalogs_by_key(store, config, object_keys, false).await?;
 
+    // A rewrite must carry every input it supersedes, so an input the writer
+    // would refuse fails the build here, typed and before the merge, rather
+    // than as the writer's `Corrupted` at finish.
+    for catalog in &catalogs {
+        if let Some((reason, detail)) =
+            <rlog::RlogCodec as crate::codec::SegmentCodec>::unwritable_input(catalog)
+        {
+            return Err(MaintainError::UnwritableInput {
+                object_key: catalog.object_key.clone(),
+                reason,
+                detail,
+            });
+        }
+    }
+
     // Input-side record-count authority: each input object's RLOG footer
     // declares its own `record_count`, written at flush/compact time
     // independently of the decode path this pass runs. Summing it and
@@ -2126,6 +2142,20 @@ pub enum ErasureRewriteOutcome {
     /// `RewriteRecord` (`dropped_count: 0`) superseding the prior one,
     /// repeatable every pass, churning generations while erasing nothing.
     AlreadyApplied,
+    /// The bucket's live set holds an input object the writer refuses to
+    /// rewrite (`reason`: a log object whose `stream_attrs` blob does not
+    /// decode, written before issue #2548's validation), so nothing was built
+    /// or published (issue #2580). The object stays in storage and stays live,
+    /// so [`bucket_erasure_completion`] keeps every request whose window
+    /// covers it pending. Counted and warned once per object per process
+    /// ([`erasure_unwritable_objects_total`]). Every later pass reports the
+    /// same object until it is removed or repaired. Unlike an `Err`, this
+    /// says nothing about any other bucket, so a driver need not hold back
+    /// the completion of requests this bucket does not block.
+    BlockedByUnwritableObject {
+        object_key: String,
+        reason: CompactionInputSkipReason,
+    },
     /// Built and published (or converged / abandoned): `parts` output parts
     /// written, `publish` records how the `RewriteRecord` PUT resolved.
     ///
@@ -2182,6 +2212,68 @@ impl ErasureAbandon {
             ErasureAbandon::Deadline => "deadline",
         }
     }
+}
+
+/// The signals whose erasure rewrite can report
+/// [`ErasureRewriteOutcome::BlockedByUnwritableObject`]: logs, the one erasure
+/// signal whose codec overrides `SegmentCodec::unwritable_input`. `/metrics`
+/// renders [`erasure_unwritable_objects_total`] for these signals only.
+pub const ERASURE_UNWRITABLE_SIGNALS: [Signal; 1] = [Signal::Logs];
+
+/// The objects this process's erasure rewrites found unwritable, and the
+/// counts behind [`erasure_unwritable_objects_total`].
+#[derive(Default)]
+struct UnwritableErasureObjects {
+    keys: HashSet<String>,
+    counts: HashMap<(Signal, CompactionInputSkipReason), u64>,
+}
+
+static UNWRITABLE_ERASURE_OBJECTS: LazyLock<Mutex<UnwritableErasureObjects>> =
+    LazyLock::new(|| Mutex::new(UnwritableErasureObjects::default()));
+
+/// Distinct input objects of `signal` that blocked an erasure rewrite of their
+/// bucket for `reason` since this process started, each object counted once
+/// however many passes it blocks.
+pub fn erasure_unwritable_objects_total(signal: Signal, reason: CompactionInputSkipReason) -> u64 {
+    UNWRITABLE_ERASURE_OBJECTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .counts
+        .get(&(signal, reason))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Record that the erasure rewrite of `bucket` is blocked by the input object
+/// `key`, `detail` being the decoder's refusal. The first time per object per
+/// process it counts the object and warns with the key, escaped.
+fn note_erasure_unwritable_object(
+    bucket: &Bucket,
+    key: &str,
+    reason: CompactionInputSkipReason,
+    detail: &str,
+) {
+    {
+        let mut seen = UNWRITABLE_ERASURE_OBJECTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !seen.keys.insert(key.to_string()) {
+            return;
+        }
+        *seen.counts.entry((bucket.signal, reason)).or_insert(0) += 1;
+    }
+    tracing::warn!(
+        tenant = %bucket.tenant_hash.to_hex(),
+        signal = ?bucket.signal,
+        shard = bucket.shard,
+        ingest_hour_bucket = bucket.ingest_hour_bucket,
+        object_key = ?key,
+        reason = reason.name(),
+        error = detail,
+        "erasure rewrite of a bucket is blocked by an input object it cannot rewrite; \
+         the bucket is not rewritten, and every erasure request whose window covers the \
+         object stays pending while the object exists (issue #2580)"
+    );
 }
 
 /// Rewrite one sealed bucket against every pending erasure request that
@@ -2362,6 +2454,7 @@ pub async fn erasure_rewrite_bucket(
         start_ns,
     )
     .await;
+    let mut unwritable = None;
     let (parts, publish, abandoned) = match built {
         Err(MaintainError::ClaimLost { at }) => {
             tracing::info!(
@@ -2387,6 +2480,16 @@ pub async fn erasure_rewrite_bucket(
                 Some(ErasureAbandon::ClaimLost { at }),
             )
         }
+        // Refused before the merge: nothing was built. Only this typed refusal
+        // becomes an outcome; every other error still fails the pass.
+        Err(MaintainError::UnwritableInput {
+            object_key,
+            reason,
+            detail,
+        }) => {
+            unwritable = Some((object_key, reason, detail));
+            (0, PublishOutcome::Abandoned, None)
+        }
         other => other?,
     };
     if let Some(guard) = guard
@@ -2402,6 +2505,10 @@ pub async fn erasure_rewrite_bucket(
             "erasure rewrite finished, but marking its claim completed failed; \
              the claim ages out under its lease (ADR-1029)"
         );
+    }
+    if let Some((object_key, reason, detail)) = unwritable {
+        note_erasure_unwritable_object(bucket, &object_key, reason, &detail);
+        return Ok(ErasureRewriteOutcome::BlockedByUnwritableObject { object_key, reason });
     }
 
     invalidate_after_publish(memo, bucket, &publish);

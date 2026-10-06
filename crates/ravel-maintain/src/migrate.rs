@@ -88,6 +88,7 @@ use ravel_types::{Signal, TenantHash};
 use crate::bucket::Bucket;
 use crate::claim_guard::{Checkpoint, ClaimSkipReason};
 use crate::clock::Clock;
+use crate::compact::CompactionInputSkipReason;
 use crate::config::CompactorConfig;
 use crate::error::{MaintainError, Result};
 use crate::publish::PublishOutcome;
@@ -307,6 +308,16 @@ pub struct NotMigratedBucket {
     pub reason: NotMigratedReason,
 }
 
+/// One bucket the walk skipped because `object_key`, a live L0 input in it, is
+/// an object the writer refuses to rewrite for `reason` (issue #2580).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnwritableBucket {
+    pub shard: u32,
+    pub ingest_hour: u32,
+    pub object_key: String,
+    pub reason: CompactionInputSkipReason,
+}
+
 /// What one [`count_below_target`] pass found below the target, with the three
 /// sources kept apart (ADR-1331 decision 1).
 ///
@@ -480,6 +491,16 @@ pub struct FamilyMigrateReport {
     /// run resumes past them, and they are retried by the first run after the
     /// walk drains.
     pub not_migrated: Vec<NotMigratedBucket>,
+    /// Every bucket the walk skipped because a live L0 input in it is an
+    /// object the writer refuses to rewrite ([`MaintainError::UnwritableInput`],
+    /// issue #2580), in walk order, one entry per bucket naming the first such
+    /// object. Bounded like the lists above, by the buckets this invocation
+    /// examined. Nothing in the bucket was written, the walk went on to the
+    /// next bucket, and the fresh re-audit still counts the bucket's
+    /// below-target records, so the floor stays unraised while the object
+    /// remains. No re-run clears it: it stays until the object is removed or
+    /// repaired, or retention ages the bucket out.
+    pub unwritable_skipped: Vec<UnwritableBucket>,
     /// The `(shard, ingest_hour)` the cursor was persisted at, when this
     /// invocation stopped on its budget. `None` once the walk completes: a
     /// drained walk clears the cursor rather than leaving a position behind.
@@ -1583,7 +1604,10 @@ fn record_reencode(
 ///    [`reencode_compaction_parts`] (a no-op reported as blocked while
 ///    [`CompactorConfig::reencode_writer_enabled`] is off), and otherwise it is
 ///    named in [`FamilyMigrateReport::reencode_blocked`]. A dispatched rewrite
-///    that published nothing is named in [`FamilyMigrateReport::not_migrated`];
+///    that published nothing is named in [`FamilyMigrateReport::not_migrated`],
+///    and one refused because a live L0 input is an object the writer cannot
+///    rewrite in [`FamilyMigrateReport::unwritable_skipped`], the walk going
+///    on to the next bucket either way;
 /// 3. stops early once `budget` is spent (persisting the cursor and returning
 ///    with `walk_complete == false` so the caller re-invokes), or runs the
 ///    verify-and-raise step once the walk reaches its end within budget;
@@ -1673,78 +1697,115 @@ pub async fn migrate_family(
                     });
                 };
                 if l0_below > 0 {
-                    match migrate_bucket_format(store, clock, config, &bucket, target_version)
-                        .await?
-                    {
-                        // The run built its parts and published nothing: the
-                        // pre-publish re-list found the record set changed, or
-                        // the deadline passed. The re-audit still counts the
-                        // bucket's records and a later run retries it.
-                        MigrateOutcome::Rewritten {
-                            publish: PublishOutcome::Abandoned,
-                            ..
-                        } => {
-                            not_migrated(&mut report, NotMigratedReason::PublishAbandoned);
-                            spent += l0_below;
-                        }
-                        MigrateOutcome::RecordSetChanged => {
-                            not_migrated(&mut report, NotMigratedReason::RecordSetChanged);
-                            spent += l0_below;
-                        }
-                        MigrateOutcome::Rewritten { .. } => {
-                            report.buckets_migrated += 1;
-                            report.records_migrated += l0_below;
-                            spent += l0_below;
-                        }
-                        // The rewrite primitive serves one record set per
-                        // bucket, so it refuses a bucket that already carries
-                        // compaction or rewrite records. Two different things
-                        // reach this arm and only one of them is permanent:
-                        // a concurrent compaction or erasure rewrite published
-                        // between our listing and the call's own listing or its
-                        // pre-publish re-list, and the migration published
-                        // nothing (the bucket claim and that re-list are what
-                        // stop a compaction record built from unerased inputs
-                        // landing beside an erasure rewrite record, which would
-                        // serve the erased rows again); or the bucket holds overlapping
-                        // compaction records whose loser-only inputs are still
-                        // served raw and below the target, which no rewrite can
-                        // migrate, because a new record over those inputs joins
-                        // the same overlap component and loses to the existing
-                        // winner.
-                        //
-                        // The outcome alone cannot tell them apart: both are
-                        // returned on nothing more than the bucket carrying a
-                        // record at re-list time. So ask the question again
-                        // against current state rather than counting the
-                        // refusal. `blocked_buckets` claims the permanent case
-                        // on both the CLI and in the guide, and a list that also
-                        // named a raced-past bucket would send an operator
-                        // looking for an overlap that is not there.
-                        MigrateOutcome::AlreadyCompacted | MigrateOutcome::RewritePresent => {
-                            if refusal_is_permanent(store, &bucket, config, target_version).await? {
-                                report.blocked_buckets.push(BlockedBucket {
+                    let migrated =
+                        match migrate_bucket_format(store, clock, config, &bucket, target_version)
+                            .await
+                        {
+                            // One object no build can rewrite must not end the
+                            // walk: record the bucket and go on. Its records stay
+                            // live below the target, so the re-audit refuses the
+                            // floor while it remains.
+                            Err(MaintainError::UnwritableInput {
+                                object_key, reason, ..
+                            }) => {
+                                tracing::warn!(
+                                    tenant = %tenant_hash.to_hex(),
+                                    signal = ?signal,
+                                    shard,
+                                    ingest_hour = hour,
+                                    object_key = ?object_key,
+                                    reason = reason.name(),
+                                    "migrate skipped a bucket holding an input object it cannot \
+                                     rewrite; the walk goes on and the floor stays unraised while \
+                                     the object remains (issue #2580)"
+                                );
+                                report.unwritable_skipped.push(UnwritableBucket {
                                     shard,
                                     ingest_hour: hour,
-                                    reason: BlockedReason::LoserOnlyInputs,
+                                    object_key,
+                                    reason,
                                 });
+                                None
                             }
-                        }
-                        // A concurrent tombstone or a bucket already at the
-                        // target: nothing to migrate and nothing to report.
-                        MigrateOutcome::NotSealed
-                        | MigrateOutcome::Tombstoned
-                        | MigrateOutcome::UpToDate => {}
-                        // Another pass held the bucket's claim, or this one lost
-                        // it: nothing was published and the bucket is not
-                        // migrated. The fresh re-audit still counts its
-                        // below-target records, so the floor stays unraised
-                        // until a later invocation migrates it.
-                        MigrateOutcome::SkippedClaimed { reason } => {
-                            not_migrated(&mut report, NotMigratedReason::ClaimSkipped { reason });
-                        }
-                        MigrateOutcome::Cancelled { at } => {
-                            not_migrated(&mut report, NotMigratedReason::Cancelled { at });
+                            other => Some(other?),
+                        };
+                    if let Some(migrated) = migrated {
+                        match migrated {
+                            // The run built its parts and published nothing: the
+                            // pre-publish re-list found the record set changed, or
+                            // the deadline passed. The re-audit still counts the
+                            // bucket's records and a later run retries it.
+                            MigrateOutcome::Rewritten {
+                                publish: PublishOutcome::Abandoned,
+                                ..
+                            } => {
+                                not_migrated(&mut report, NotMigratedReason::PublishAbandoned);
+                                spent += l0_below;
+                            }
+                            MigrateOutcome::RecordSetChanged => {
+                                not_migrated(&mut report, NotMigratedReason::RecordSetChanged);
+                                spent += l0_below;
+                            }
+                            MigrateOutcome::Rewritten { .. } => {
+                                report.buckets_migrated += 1;
+                                report.records_migrated += l0_below;
+                                spent += l0_below;
+                            }
+                            // The rewrite primitive serves one record set per
+                            // bucket, so it refuses a bucket that already carries
+                            // compaction or rewrite records. Two different things
+                            // reach this arm and only one of them is permanent:
+                            // a concurrent compaction or erasure rewrite published
+                            // between our listing and the call's own listing or its
+                            // pre-publish re-list, and the migration published
+                            // nothing (the bucket claim and that re-list are what
+                            // stop a compaction record built from unerased inputs
+                            // landing beside an erasure rewrite record, which would
+                            // serve the erased rows again); or the bucket holds overlapping
+                            // compaction records whose loser-only inputs are still
+                            // served raw and below the target, which no rewrite can
+                            // migrate, because a new record over those inputs joins
+                            // the same overlap component and loses to the existing
+                            // winner.
+                            //
+                            // The outcome alone cannot tell them apart: both are
+                            // returned on nothing more than the bucket carrying a
+                            // record at re-list time. So ask the question again
+                            // against current state rather than counting the
+                            // refusal. `blocked_buckets` claims the permanent case
+                            // on both the CLI and in the guide, and a list that also
+                            // named a raced-past bucket would send an operator
+                            // looking for an overlap that is not there.
+                            MigrateOutcome::AlreadyCompacted | MigrateOutcome::RewritePresent => {
+                                if refusal_is_permanent(store, &bucket, config, target_version)
+                                    .await?
+                                {
+                                    report.blocked_buckets.push(BlockedBucket {
+                                        shard,
+                                        ingest_hour: hour,
+                                        reason: BlockedReason::LoserOnlyInputs,
+                                    });
+                                }
+                            }
+                            // A concurrent tombstone or a bucket already at the
+                            // target: nothing to migrate and nothing to report.
+                            MigrateOutcome::NotSealed
+                            | MigrateOutcome::Tombstoned
+                            | MigrateOutcome::UpToDate => {}
+                            // Another pass held the bucket's claim, or this one lost
+                            // it: nothing was published and the bucket is not
+                            // migrated. The fresh re-audit still counts its
+                            // below-target records, so the floor stays unraised
+                            // until a later invocation migrates it.
+                            MigrateOutcome::SkippedClaimed { reason } => {
+                                not_migrated(
+                                    &mut report,
+                                    NotMigratedReason::ClaimSkipped { reason },
+                                );
+                            }
+                            MigrateOutcome::Cancelled { at } => {
+                                not_migrated(&mut report, NotMigratedReason::Cancelled { at });
+                            }
                         }
                     }
                 } else if listing.rewrite_record_keys.is_empty() {

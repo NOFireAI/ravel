@@ -17,8 +17,8 @@ use ravel_maintain::{
     CompactionOutcome, CompactorConfig, FamilyMigrateReport, FixedClock, GcConfigValues,
     L1PartMemoryTargetSource, LegalHoldCheck, MergeMemoryTracker, MigrateBudget, MigrationPath,
     NotMigratedBucket, NotMigratedReason, PublishOutcome, ReencodeBlockedBucket,
-    ReencodeBlockedReason, ResolvedL1PartMemoryTarget, SweepReport, Verification, census_family,
-    compact_bucket_claimed, count_below_target, migrate_family, sweep_shard,
+    ReencodeBlockedReason, ResolvedL1PartMemoryTarget, SweepReport, UnwritableBucket, Verification,
+    census_family, compact_bucket_claimed, count_below_target, migrate_family, sweep_shard,
 };
 use ravel_object_store::conformance::NoncurrentVersionSource;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
@@ -2260,6 +2260,32 @@ fn not_migrated_report(buckets: &[NotMigratedBucket], retry: NotMigratedRetry) -
     out
 }
 
+/// One line per bucket the walk skipped because a live L0 input in it is an
+/// object the writer refuses to rewrite, naming the object's key escaped,
+/// followed by what that means. Returns the empty string for an empty list.
+fn unwritable_skipped_report(buckets: &[UnwritableBucket]) -> String {
+    if buckets.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for bucket in buckets {
+        out.push_str(&format!(
+            "unwritable_skipped: shard={} hour={} reason={} object_key={:?}\n",
+            bucket.shard,
+            bucket.ingest_hour,
+            bucket.reason.name(),
+            bucket.object_key
+        ));
+    }
+    out.push_str(
+        "# Each unwritable_skipped bucket holds a log object whose stream_attrs blob the RLOG \
+         writer refuses (issue #2580). No migrate run rewrites the bucket while the object is \
+         there, so the floor stays unraised; re-running is not the remedy. Retention ages the \
+         bucket out; no supported command removes or repairs the object yet.\n",
+    );
+    out
+}
+
 /// Everything `migrate` prints to stdout before the verification verdict, as
 /// one string: the `key: value` block, the blocked-bucket lines and the prose
 /// that explains them, in the order an operator reads them.
@@ -2307,6 +2333,11 @@ fn migrate_report_text(
         &report.not_migrated,
         NotMigratedRetry::of(report),
     ));
+    out.push_str(&format!(
+        "buckets_unwritable_skipped: {}\n",
+        report.unwritable_skipped.len()
+    ));
+    out.push_str(&unwritable_skipped_report(&report.unwritable_skipped));
     if let Some((shard, hour)) = report.cursor_advanced_to {
         out.push_str(&format!("cursor_advanced_to: shard={shard} hour={hour}\n"));
     }
@@ -2353,6 +2384,11 @@ fn migrate_report_text(
 /// unless the walk drained and the fresh re-audit raised the floor: another
 /// writer then carried the bucket to the target after the walk passed it, and
 /// the run exits zero.
+///
+/// A bucket whose live L0 set holds a log object the RLOG writer refuses to
+/// rewrite (issue #2580) is skipped and the walk goes on to the next bucket;
+/// it gets an `unwritable_skipped` line naming the object's key, and any such
+/// line makes the run exit nonzero, however the run ended.
 ///
 /// "Until a later run migrates it" below is the next run when this one drained
 /// the walk, since a drained walk clears its cursor. After a budget stop the
@@ -2499,10 +2535,12 @@ pub async fn migrate_to(
 }
 
 /// Print a finished migrate run's report and return its exit verdict. A budget
-/// stop exits zero whatever it left listed: every `reencode_blocked` and
-/// `not_migrated` bucket it names still holds parts or records below the
-/// target, so the run that drains the walk fails on them through its fresh
-/// re-audit's stragglers.
+/// stop exits zero whatever `reencode_blocked` and `not_migrated` buckets it
+/// listed: each still holds parts or records below the target, so the run that
+/// drains the walk fails on them through its fresh re-audit's stragglers. Any
+/// `unwritable_skipped` bucket fails the run however it ended
+/// ([`unwritable_verdict`]): a run past it resumes beyond it and would not name
+/// it again.
 fn migrate_verdict(
     out: &mut dyn Write,
     tenant: &str,
@@ -2525,7 +2563,7 @@ fn migrate_verdict(
              persisted cursor (the floor is not raised until the walk drains and the re-audit is \
              clean)."
         )?;
-        return Ok(());
+        return unwritable_verdict(tenant, sig, family, report);
     }
 
     match &report.verification {
@@ -2542,7 +2580,7 @@ fn migrate_verdict(
                      after this run passed it."
                 )?;
             }
-            Ok(())
+            unwritable_verdict(tenant, sig, family, report)
         }
         Some(Verification::Stragglers {
             l0,
@@ -2597,10 +2635,12 @@ fn migrate_verdict(
                  reencode_blocked line(s) name the buckets whose compaction parts this run did \
                  not re-encode, and the {} not_migrated line(s) the buckets the next migrate \
                  run retries: this run drained the walk and cleared its cursor, so the next run \
-                 starts over.",
+                 starts over. The {} unwritable_skipped line(s) name buckets no migrate run \
+                 rewrites while the log object each names is there.",
                 blocked.len(),
                 report.reencode_blocked.len(),
                 report.not_migrated.len(),
+                report.unwritable_skipped.len(),
             )
         }
         None => {
@@ -2609,6 +2649,28 @@ fn migrate_verdict(
             anyhow::bail!("migrate completed the walk but produced no verification result")
         }
     }
+}
+
+/// The verdict for a migrate run that did not already fail on stragglers: an
+/// error when the walk skipped any bucket for an unwritable object (issue
+/// #2580), whether the run stopped on its budget or raised the floor, since
+/// no later run clears that bucket while the object remains.
+fn unwritable_verdict(
+    tenant: &str,
+    sig: Signal,
+    family: &str,
+    report: &FamilyMigrateReport,
+) -> anyhow::Result<()> {
+    if report.unwritable_skipped.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "migrate skipped {} bucket(s) of the {family} family for tenant {tenant} signal {sig:?} \
+         because each holds a log object the RLOG writer refuses to rewrite; the \
+         unwritable_skipped line(s) above name each bucket and object. Re-running migrate does \
+         not migrate them while the object is there.",
+        report.unwritable_skipped.len(),
+    )
 }
 
 /// `migrate --dry-run`: the read-only re-audit a real run ends with, run before
@@ -3388,6 +3450,7 @@ mod tests {
             ],
             reencode_blocked: Vec::new(),
             not_migrated: Vec::new(),
+            unwritable_skipped: Vec::new(),
             cursor_advanced_to: None,
             walk_complete: true,
             budget_exhausted: false,
@@ -3787,6 +3850,66 @@ mod tests {
                 )),
                 "{text}"
             );
+        }
+    }
+
+    /// A bucket the walk skipped for an unwritable log object (issue #2580)
+    /// prints its `unwritable_skipped` line with the object's key escaped, and
+    /// fails the run however it ended: on a budget stop, on stragglers, and
+    /// even when the floor was raised.
+    ///
+    /// Non-vacuity: with `unwritable_verdict` returning `Ok(())` for every
+    /// report (drop its `bail!`), the budget-stop and floor-raised cases exit
+    /// zero and the `expect_err` fails for them.
+    #[test]
+    fn a_run_that_skipped_an_unwritable_bucket_exits_nonzero() {
+        let key = "t/ab/l/l0/00000/x\"y.rlog";
+        let skipped = FamilyMigrateReport {
+            buckets_examined: 3,
+            buckets_migrated: 2,
+            unwritable_skipped: vec![UnwritableBucket {
+                shard: 0,
+                ingest_hour: 2,
+                object_key: key.to_string(),
+                reason: ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
+            }],
+            ..FamilyMigrateReport::default()
+        };
+        let budget_stop = FamilyMigrateReport {
+            walk_complete: false,
+            budget_exhausted: true,
+            ..skipped.clone()
+        };
+        let stragglers = FamilyMigrateReport {
+            walk_complete: true,
+            verification: Some(Verification::Stragglers {
+                l0: 1,
+                l1: 0,
+                rewrite_parts: 0,
+                blocked: Vec::new(),
+            }),
+            ..skipped.clone()
+        };
+        let raised = FamilyMigrateReport {
+            walk_complete: true,
+            verification: Some(Verification::FloorRaised { floor_version: 2 }),
+            ..skipped
+        };
+        for report in [budget_stop, stragglers, raised] {
+            let mut out: Vec<u8> = Vec::new();
+            let err = migrate_verdict(&mut out, "acme", Signal::Logs, "rlog", 2, 0, &report)
+                .expect_err("a run that skipped an unwritable bucket fails")
+                .to_string();
+            let text = String::from_utf8(out).expect("utf-8 output");
+            assert!(text.contains("buckets_unwritable_skipped: 1\n"), "{text}");
+            assert!(
+                text.contains(
+                    "unwritable_skipped: shard=0 hour=2 reason=unwritable_stream_attrs \
+                     object_key=\"t/ab/l/l0/00000/x\\\"y.rlog\"\n"
+                ),
+                "the key is printed escaped: {text}"
+            );
+            assert!(err.contains("unwritable"), "{err}");
         }
     }
 
