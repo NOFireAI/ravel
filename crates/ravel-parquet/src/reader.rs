@@ -28,12 +28,23 @@ use ravel_query::{CacheFetchError, GetLimiter, PhaseAccounting, QueryPhase, Read
 use ravel_types::TenantHash;
 
 use crate::error::ParquetReadError;
+use crate::footer_shape::check_footer_shape;
 use crate::limits::{ReadLimits, attach};
 use crate::metadata_cache::{CachedFooter, MetadataCache, MetadataKey};
 use crate::store::file_path;
 
 /// Length of the Parquet trailer: a 4-byte footer length and the `PAR1` magic.
 pub(crate) const TRAILER_LEN: u64 = 8;
+
+/// Longest footer accepted, refused from the trailer or the manifest before
+/// the footer is read. parquet 58.4.0's writer puts about 65 bytes per
+/// column chunk in a footer without statistics and 120 to 230 with page
+/// statistics (measured on Int64 columns, whose path the footer repeats per
+/// chunk), so 64 MiB holds about 300,000 column chunks with statistics:
+/// 1,000 columns in 300 row groups, or 10,000 columns in 30. At a writer's
+/// default row group of a million rows, that is hundreds of millions of
+/// rows in one file before the footer nears the limit.
+pub(crate) const MAX_FOOTER_BYTES: u64 = 64 << 20;
 
 /// One manifest file and the store it is read through.
 pub struct PinnedFile {
@@ -393,10 +404,23 @@ impl PinnedParquetReader {
     /// A metadata cache hit counts as a Probe cache hit of the entry's charged
     /// size, the convention the catalog caches use. The key is the pinned
     /// identity and the footer length the manifest recorded, the two inputs
-    /// the footer is decoded or refused from. A footer refused as `Corrupt` is
-    /// cached as refused under that key, so a later read fails the same way
-    /// without reading it again. A read that failed is not cached, whatever
-    /// it failed on: a store error or a read that came back short.
+    /// the footer is decoded or refused from. A footer whose bytes are refused
+    /// as `Corrupt` is cached as refused under that key, so a later read fails
+    /// the same way without reading it again. A read that failed is not
+    /// cached, whatever it failed on: a store error or a read that came back
+    /// short.
+    ///
+    /// Decoding reserves its estimate from the memory budget. The reservation
+    /// is released before this returns, on every path: after the cache has
+    /// admitted the metadata, or with the refusal. The cache charges the
+    /// metadata the larger of its `memory_size` and that estimate. A footer
+    /// whose charge exceeds the cache's whole bound (`metadata_cache_bytes`)
+    /// is refused as `Corrupt`, naming that bound, and is not cached, since
+    /// the refusal depends on configuration rather than on the bytes. So
+    /// metadata this returns was admitted at a charge within that bound, and
+    /// once the reservation is gone that charge is all that accounts for it:
+    /// a caller holding the `Arc` after the cache evicts the entry keeps
+    /// memory neither the budget nor the cache counts, at most that charge.
     pub async fn metadata(&self) -> Result<Arc<ParquetMetaData>, ParquetReadError> {
         let cache_key = MetadataKey::of(&self.cache_key(0, 0), self.file.file.footer_len);
         if let Some((footer, bytes)) = self.services.metadata.get(&cache_key) {
@@ -409,11 +433,21 @@ impl PinnedParquetReader {
             };
         }
         match self.read_footer().await {
-            Ok(metadata) => {
-                self.services
-                    .metadata
-                    .insert(cache_key, Arc::clone(&metadata));
-                Ok(metadata)
+            Ok(decoded) => {
+                let admitted = self.services.metadata.insert(
+                    cache_key,
+                    Arc::clone(&decoded.metadata),
+                    decoded.estimate,
+                );
+                drop(decoded.reservation);
+                match admitted {
+                    Ok(()) => Ok(decoded.metadata),
+                    Err(charge) => Err(self.corrupt(format!(
+                        "the decoded footer is charged {charge} bytes, more than the {}-byte \
+                         bound of the Parquet metadata cache (metadata_cache_bytes)",
+                        self.services.metadata.max_bytes()
+                    ))),
+                }
             }
             Err(FooterError::Refused(message)) => {
                 self.services.metadata.insert_refused(cache_key, &message);
@@ -425,9 +459,10 @@ impl PinnedParquetReader {
 
     /// Read, decode and check the footer. The metadata it returns carries no
     /// page index.
-    async fn read_footer(&self) -> Result<Arc<ParquetMetaData>, FooterError> {
+    async fn read_footer(&self) -> Result<DecodedFooter, FooterError> {
         let size = self.file.file.size;
         let footer_len = u64::from(self.file.file.footer_len);
+        check_footer_len(footer_len).map_err(FooterError::Refused)?;
         let tail_len = footer_len + TRAILER_LEN;
         if tail_len > size {
             return Err(FooterError::Refused(format!(
@@ -445,12 +480,19 @@ impl PinnedParquetReader {
                 "the trailer records a {recorded}-byte footer, the manifest {footer_len}"
             )));
         }
-        decode_footer(&tail[..split], size - tail_len).map_err(FooterError::Refused)
+        decode_footer(&tail[..split], size - tail_len, |bytes| {
+            self.limits.reserve(bytes)
+        })
+        .map_err(|err| match err {
+            DecodeError::Refused(message) => FooterError::Refused(message),
+            DecodeError::Reserve(err) => FooterError::Read(err),
+        })
     }
 }
 
 /// The footer length an 8-byte Parquet trailer records, refusing a trailer
-/// without the magic and an encrypted footer.
+/// without the magic, an encrypted footer, and a footer longer than
+/// [`MAX_FOOTER_BYTES`].
 pub(crate) fn trailer_footer_len(trailer: &[u8]) -> Result<u64, String> {
     let trailer: [u8; TRAILER_LEN as usize] = trailer
         .try_into()
@@ -459,24 +501,88 @@ pub(crate) fn trailer_footer_len(trailer: &[u8]) -> Result<u64, String> {
     if footer.is_encrypted_footer() {
         return Err("the footer is encrypted".to_string());
     }
-    Ok(footer.metadata_length() as u64)
+    let footer_len = footer.metadata_length() as u64;
+    check_footer_len(footer_len)?;
+    Ok(footer_len)
+}
+
+fn check_footer_len(footer_len: u64) -> Result<(), String> {
+    if footer_len > MAX_FOOTER_BYTES {
+        return Err(format!(
+            "the footer is {footer_len} bytes, longer than the {MAX_FOOTER_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
+/// Why [`decode_footer`] did not hand a footer out.
+pub(crate) enum DecodeError<E> {
+    /// The footer is refused; the same bytes are refused the same way again.
+    Refused(String),
+    /// The memory its decoding needs could not be reserved.
+    Reserve(E),
+}
+
+/// A footer [`decode_footer`] decoded and checked.
+pub(crate) struct DecodedFooter {
+    pub(crate) metadata: Arc<ParquetMetaData>,
+    /// The estimate of what decoding the footer allocates.
+    pub(crate) estimate: u64,
+    /// The estimate, reserved. The metadata and what is derived from it
+    /// outlive the decode, so the caller releases this only once whatever
+    /// it keeps of them is charged elsewhere.
+    pub(crate) reservation: Reservation,
 }
 
 /// Decode `footer`, the thrift footer of a file whose column chunks lie in
 /// its first `data_end` bytes, and run every check the scan relies on:
 /// [`check_chunks`], the page index removal, and [`check_arrow_schema`].
-pub(crate) fn decode_footer(footer: &[u8], data_end: u64) -> Result<Arc<ParquetMetaData>, String> {
-    let metadata =
-        ParquetMetaDataReader::decode_metadata(footer).map_err(|err| format!("footer: {err}"))?;
-    check_chunks(&metadata, data_end)?;
+/// The footer's shape is checked first ([`check_footer_shape`]), because the
+/// decoder sizes allocations from counts it does not bound, and the
+/// estimate of what the decoder allocates that the check returns is taken
+/// from `reserve` before decoding and handed back with the metadata.
+///
+/// The reader releases the reservation once it has offered the metadata to
+/// the metadata cache, which charges it at least this estimate. It hands out
+/// only metadata the cache admitted and refuses a footer charged more than
+/// the cache's whole bound, so that bound is what bounds the metadata after
+/// the release. The Arrow schema a scan converts from the metadata each time
+/// it opens the file is within the estimate but is not reserved. The
+/// snapshot holds the reservation until it has built the file's schema and
+/// dropped the metadata.
+pub(crate) fn decode_footer<E>(
+    footer: &[u8],
+    data_end: u64,
+    reserve: impl FnOnce(u64) -> Result<Reservation, E>,
+) -> Result<DecodedFooter, DecodeError<E>> {
+    let estimate = check_footer_shape(footer).map_err(DecodeError::Refused)?;
+    let reservation = reserve(estimate).map_err(DecodeError::Reserve)?;
+    // The decoder asserts, rather than checks, that an INT96 column's
+    // statistics are 12 bytes long.
+    let metadata = match std::panic::catch_unwind(|| ParquetMetaDataReader::decode_metadata(footer))
+    {
+        Ok(Ok(metadata)) => metadata,
+        Ok(Err(err)) => return Err(DecodeError::Refused(format!("footer: {err}"))),
+        Err(_) => {
+            return Err(DecodeError::Refused(
+                "the footer panicked the parquet decoder".to_string(),
+            ));
+        }
+    };
+    check_chunks(&metadata, data_end).map_err(DecodeError::Refused)?;
     let metadata = Arc::new(without_page_index(metadata));
-    check_arrow_schema(&metadata)?;
-    Ok(metadata)
+    check_arrow_schema(&metadata).map_err(DecodeError::Refused)?;
+    Ok(DecodedFooter {
+        metadata,
+        estimate,
+        reservation,
+    })
 }
 
 /// Why [`PinnedParquetReader::read_footer`] could not hand a footer out.
 enum FooterError {
-    /// A read failed. The store may answer the next one, so it is not cached.
+    /// A read failed, or the memory to read or decode the footer could not
+    /// be reserved. A later attempt may succeed, so it is not cached.
     Read(ParquetReadError),
     /// The pinned bytes were read and refused; a later read of the same bytes
     /// would be refused the same way.
@@ -847,6 +953,164 @@ mod tests {
         );
     }
 
+    /// Guards: the `check_footer_len` call in `trailer_footer_len`.
+    #[test]
+    fn a_trailer_recording_more_than_the_limit_is_refused() {
+        let trailer = |len: u64| {
+            let mut out = u32::try_from(len).expect("u32").to_le_bytes().to_vec();
+            out.extend_from_slice(b"PAR1");
+            out
+        };
+        assert_eq!(
+            trailer_footer_len(&trailer(MAX_FOOTER_BYTES)),
+            Ok(MAX_FOOTER_BYTES)
+        );
+        assert_eq!(
+            trailer_footer_len(&trailer(MAX_FOOTER_BYTES + 1)),
+            Err("the footer is 67108865 bytes, longer than the 67108864-byte limit".to_string())
+        );
+    }
+
+    /// Guards: the `check_footer_len` call in `read_footer`. A manifest
+    /// recording a footer longer than the limit is refused before the
+    /// footer is read.
+    #[tokio::test]
+    async fn a_footer_longer_than_the_limit_is_refused_before_its_read() {
+        let (fixture, recording, mut file) = recorded_file(ReadLimits::unlimited()).await;
+        file.footer_len = u32::try_from(MAX_FOOTER_BYTES + 1).expect("u32");
+        file.size = MAX_FOOTER_BYTES + 1 + TRAILER_LEN;
+        let got = fixture.reader(file).metadata().await;
+        match got {
+            Err(ParquetReadError::Corrupt { message, .. }) => assert_eq!(
+                message,
+                "the footer is 67108865 bytes, longer than the 67108864-byte limit"
+            ),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+        assert!(recording.ranges().is_empty(), "{:?}", recording.ranges());
+    }
+
+    /// Guards: the `reserve` call in `decode_footer`, at the reader's
+    /// decode site. The estimate the walk returns is reserved beside the
+    /// footer's own bytes, so a budget one byte short of both refuses the
+    /// footer as memory exhausted, and a budget holding both decodes it.
+    #[tokio::test]
+    async fn decoding_a_footer_reserves_its_estimate() {
+        let bytes = parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]);
+        let tail_len = u64::from(footer_len_of(&bytes)) + TRAILER_LEN;
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let footer = &bytes[end - footer_len_of(&bytes) as usize..end];
+        let estimate = check_footer_shape(footer).expect("a writer footer");
+
+        let memory = Arc::new(ravel_memory::MemoryBudget::new(tail_len + estimate - 1));
+        let limits = limits_of(&memory, ByteLimit::Unlimited, RequestLimit::Unlimited);
+        let (fixture, _, file) = recorded_file(limits).await;
+        let got = fixture.reader(file.clone()).metadata().await;
+        match got {
+            Err(ParquetReadError::MemoryExhausted {
+                requested,
+                reserved,
+                ..
+            }) => {
+                assert_eq!(requested, estimate);
+                assert_eq!(reserved, tail_len);
+            }
+            other => panic!("expected MemoryExhausted, got {other:?}"),
+        }
+
+        let memory = Arc::new(ravel_memory::MemoryBudget::new(tail_len + estimate));
+        let limits = limits_of(&memory, ByteLimit::Unlimited, RequestLimit::Unlimited);
+        let (fixture, _, file) = recorded_file(limits).await;
+        let metadata = fixture.reader(file).metadata().await.expect("decodes");
+        assert_eq!(metadata.file_metadata().num_rows(), 3);
+    }
+
+    /// Guards: the estimate `MetadataCache::insert` charges. A writer
+    /// footer's decoded metadata is smaller than the decode estimate, and
+    /// the cache that keeps it once the reservation is released charges it
+    /// the estimate.
+    #[tokio::test]
+    async fn the_metadata_cache_charges_a_decoded_footer_its_estimate() {
+        let bytes = parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]);
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let footer = &bytes[end - footer_len_of(&bytes) as usize..end];
+        let estimate = check_footer_shape(footer).expect("a writer footer");
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let limits = limits_of(&memory, ByteLimit::Unlimited, RequestLimit::Unlimited);
+        let (fixture, _, file) = recorded_file(limits).await;
+        let metadata = fixture.reader(file).metadata().await.expect("decodes");
+        assert!((metadata.memory_size() as u64) < estimate);
+        assert_eq!(fixture.services().metadata.resident_bytes(), estimate);
+        drop(metadata);
+        assert_eq!(memory.reserved(), 0);
+    }
+
+    /// Guards: the refusal of an `Err` from `MetadataCache::insert` in
+    /// `metadata`. A footer charged more than the cache's whole bound is
+    /// refused, naming the bound, and not cached: the next call reads the
+    /// footer again. A bound equal to the charge admits it as before.
+    #[tokio::test]
+    async fn a_footer_the_metadata_cache_cannot_hold_is_refused_and_not_cached() {
+        let bytes = parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]);
+        let end = bytes.len() - TRAILER_LEN as usize;
+        let footer = &bytes[end - footer_len_of(&bytes) as usize..end];
+        let estimate = check_footer_shape(footer).expect("a writer footer");
+        let memory = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let limits = limits_of(&memory, ByteLimit::Unlimited, RequestLimit::Unlimited);
+
+        let (fixture, recording, file) = recorded_file(limits.clone()).await;
+        let fixture = fixture.with_metadata_cache_only(estimate - 1);
+        for reads in 1..=2 {
+            match fixture.reader(file.clone()).metadata().await {
+                Err(ParquetReadError::Corrupt { message, .. }) => assert_eq!(
+                    message,
+                    format!(
+                        "the decoded footer is charged {estimate} bytes, more than the {}-byte \
+                         bound of the Parquet metadata cache (metadata_cache_bytes)",
+                        estimate - 1
+                    )
+                ),
+                other => panic!("expected the refusal, got {other:?}"),
+            }
+            assert_eq!(recording.ranges().len(), reads, "the footer read again");
+            assert!(fixture.services().metadata.is_empty());
+            assert_eq!(memory.reserved(), 0);
+        }
+
+        let (fixture, recording, file) = recorded_file(limits).await;
+        let fixture = fixture.with_metadata_cache_only(estimate);
+        for _ in 0..2 {
+            let metadata = fixture.reader(file.clone()).metadata().await.expect("fits");
+            assert_eq!(metadata.file_metadata().num_rows(), 3);
+        }
+        assert_eq!(
+            recording.ranges().len(),
+            1,
+            "the second call is a cache hit"
+        );
+        assert_eq!(fixture.services().metadata.resident_bytes(), estimate);
+    }
+
+    /// Guards: the `check_footer_shape` call in `decode_footer`. Without it
+    /// the footer reaches the decoder, which reports its own error (or sizes
+    /// an allocation from the declared count) instead of this refusal.
+    #[tokio::test]
+    async fn a_footer_declaring_more_elements_than_bytes_is_refused_before_decoding() {
+        // FileMetaData field 5 (key_value_metadata) as a list of structs
+        // declaring i32::MAX elements, with no element bytes after it.
+        let mut footer = vec![0x59, 0xfc, 0xff, 0xff, 0xff, 0xff, 0x07, 0x00];
+        let footer_len = u32::try_from(footer.len()).expect("small footer");
+        let mut bytes = b"PAR1".to_vec();
+        bytes.append(&mut footer);
+        bytes.extend_from_slice(&footer_len.to_le_bytes());
+        bytes.extend_from_slice(b"PAR1");
+        let size = bytes.len() as u64;
+        assert_corrupt(
+            footer_of(bytes, size, footer_len).await,
+            &format!("declares {} elements", i32::MAX),
+        );
+    }
+
     #[tokio::test]
     async fn a_footer_longer_than_the_file_is_corrupt() {
         let bytes = valid();
@@ -893,14 +1157,18 @@ mod tests {
     }
 
     /// The trailer is intact and agrees with the manifest; the metadata it
-    /// frames is not Thrift.
+    /// frames is well-formed Thrift that the decoder refuses: a struct that
+    /// ends at its first byte, without the fields the decoder requires.
     #[tokio::test]
     async fn a_footer_that_does_not_decode_is_corrupt() {
         let mut bytes = valid();
         let (size, footer_len) = (bytes.len() as u64, footer_len_of(&bytes));
         let end = bytes.len() - TRAILER_LEN as usize;
-        bytes[end - footer_len as usize..end].fill(0xff);
-        assert_corrupt(footer_of(bytes, size, footer_len).await, "footer: ");
+        bytes[end - footer_len as usize..end].fill(0);
+        assert_corrupt(
+            footer_of(bytes, size, footer_len).await,
+            "footer: Parquet error: Required field version is missing",
+        );
     }
 
     /// A one-bit flip in the footer that still decodes but gives a column

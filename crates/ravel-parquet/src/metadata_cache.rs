@@ -38,19 +38,6 @@ pub enum CachedFooter {
     Refused(Arc<str>),
 }
 
-impl CachedFooter {
-    /// Bytes this entry is charged against the bound: the decoded footer's
-    /// [`ParquetMetaData::memory_size`], or a refusal's message plus its key.
-    fn bytes(&self) -> u64 {
-        match self {
-            CachedFooter::Decoded(metadata) => metadata.memory_size() as u64,
-            CachedFooter::Refused(message) => {
-                (message.len() + std::mem::size_of::<MetadataKey>()) as u64
-            }
-        }
-    }
-}
-
 /// Decoded Parquet footers and refused ones, bounded in bytes and evicted least
 /// recently used first.
 ///
@@ -60,9 +47,11 @@ impl CachedFooter {
 /// It is a separately bounded cache, sized by `metadata_cache_bytes`, and
 /// nothing in it is charged to the process memory budget: the decoded footers
 /// are bounded by this cache's own byte limit, which the server sizes apart
-/// from the budget. What is charged is the footer's raw bytes while the reader
-/// holds them for decoding ([`crate::ReadLimits::reserve`]); the decoded form
-/// that stays here is not.
+/// from the budget. What is charged to the budget is the footer's raw bytes
+/// and the estimate of what decoding them allocates, while the reader reads
+/// and decodes them ([`crate::ReadLimits::reserve`]); the decoded form that
+/// stays here is charged against this cache's bound instead, at no less than
+/// that estimate.
 #[derive(Debug)]
 pub struct MetadataCache {
     max_bytes: u64,
@@ -101,27 +90,43 @@ impl MetadataCache {
         Some((entry.footer.clone(), entry.bytes))
     }
 
-    /// Admit `metadata` under `key`, replacing whatever was there.
-    pub fn insert(&self, key: MetadataKey, metadata: Arc<ParquetMetaData>) {
-        self.admit(key, CachedFooter::Decoded(metadata));
+    /// Admit `metadata` under `key`, replacing whatever was there. It is
+    /// charged its [`ParquetMetaData::memory_size`] or `estimate`, the
+    /// estimate of what decoding it allocated, whichever is larger. A charge
+    /// above the whole bound is returned as the error: nothing is admitted,
+    /// and the entry under `key` is dropped.
+    pub fn insert(
+        &self,
+        key: MetadataKey,
+        metadata: Arc<ParquetMetaData>,
+        estimate: u64,
+    ) -> Result<(), u64> {
+        let bytes = (metadata.memory_size() as u64).max(estimate);
+        if self.admit(key, CachedFooter::Decoded(metadata), bytes) {
+            Ok(())
+        } else {
+            Err(bytes)
+        }
     }
 
-    /// Record that the footer under `key` was refused with `message`.
+    /// Record that the footer under `key` was refused with `message`, charged
+    /// the message and its key.
     pub fn insert_refused(&self, key: MetadataKey, message: &str) {
-        self.admit(key, CachedFooter::Refused(Arc::from(message)));
+        let bytes = (message.len() + std::mem::size_of::<MetadataKey>()) as u64;
+        self.admit(key, CachedFooter::Refused(Arc::from(message)), bytes);
     }
 
-    /// Admit `footer`, evicting least recently used entries until the total
-    /// fits. An entry larger than the whole bound is not admitted, and the
-    /// entry it would have replaced is dropped.
-    fn admit(&self, key: MetadataKey, footer: CachedFooter) {
-        let bytes = footer.bytes();
+    /// Admit `footer`, charged `bytes`, evicting least recently used entries
+    /// until the total fits. An entry larger than the whole bound is not
+    /// admitted, and the entry it would have replaced is dropped. Returns
+    /// whether `footer` was admitted.
+    fn admit(&self, key: MetadataKey, footer: CachedFooter, bytes: u64) -> bool {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         if bytes > self.max_bytes {
             if let Some(old) = inner.entries.remove(&key) {
                 inner.bytes -= old.bytes;
             }
-            return;
+            return false;
         }
         inner.clock += 1;
         let last_used = inner.clock;
@@ -149,6 +154,12 @@ impl MetadataCache {
                 inner.bytes -= evicted.bytes;
             }
         }
+        true
+    }
+
+    /// The bound on the bytes the cache charges its entries.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes
     }
 
     /// Bytes currently resident, as each entry is charged.
