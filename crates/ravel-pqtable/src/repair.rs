@@ -127,6 +127,7 @@ fn classify(tenant: &TenantHash, table: &str, key: &str) -> (ListedVersion, bool
                 (foreign(), false)
             }
         }
+        Ok(ListedManifestKey::InvalidTable { .. }) => (foreign(), false),
         Err(err) => (
             ListedVersion::NotAVersion {
                 reason: err.to_string(),
