@@ -936,8 +936,17 @@ enum ParquetCommand {
     /// With `--stray` instead of `--table`, list every `.pqm` key under the
     /// tenant's `t/<tenant_hash>/pq/t/` whose segment before `/v/` is not a
     /// valid table name (upper case, reserved, or a path such as `a/b`), which
-    /// the Query grant also admits and every reader skips; with `--delete`,
-    /// delete exactly those.
+    /// the Query grant also admits and the tenant-wide listings skip; with
+    /// `--delete`, delete those, then list again and fail naming any still
+    /// there. A key the S3 adapter would send a delete of to a different key
+    /// (one holding a character its path encoding escapes, such as `~` or
+    /// `%`) is marked undeletable and skipped, and a key under a name reserved
+    /// after tables could be created (such as `l0`) is marked as possibly a
+    /// table created before the reservation and skipped unless
+    /// `--include-reserved-names` is passed. On S3 a key holding a control
+    /// character, an empty segment or a `.` or `..` segment fails this listing
+    /// and the tenant-wide ones; delete that exact key with the Maintain
+    /// credential through an S3 tool.
     Repair {
         /// The tenant that owns the table.
         #[arg(long)]
@@ -958,6 +967,16 @@ enum ParquetCommand {
         /// log; zero and versions above the bound are refused.
         #[arg(long, value_name = "N", conflicts_with = "stray")]
         delete_version: Option<u64>,
+        /// With `--stray --delete`, also delete keys under a name reserved
+        /// after tables could be created, which may be manifests of a table
+        /// created before the reservation.
+        #[arg(
+            long,
+            requires = "stray",
+            requires = "delete",
+            conflicts_with = "table"
+        )]
+        include_reserved_names: bool,
     },
 }
 
@@ -2694,13 +2713,17 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     stray,
                     delete,
                     delete_version,
+                    include_reserved_names,
                 },
         } => {
             use ravel_cli::parquet::RepairAction;
             let store = store::build_store(&cli.store)?;
             // clap makes `--stray` and `--table` exclusive and requires one.
             match table.filter(|_| !stray) {
-                None => ravel_cli::parquet::repair_stray(store, &tenant, delete).await,
+                None => {
+                    ravel_cli::parquet::repair_stray(store, &tenant, delete, include_reserved_names)
+                        .await
+                }
                 Some(table) => {
                     let action = match (delete, delete_version) {
                         (_, Some(version)) => RepairAction::DeleteVersion(version),
@@ -4330,6 +4353,19 @@ mod tests {
                     "repair",
                     "--tenant",
                     "t",
+                    "--stray",
+                    "--delete",
+                    "--include-reserved-names",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "parquet",
+                    "repair",
+                    "--tenant",
+                    "t",
                     "--table",
                     "hits",
                     "--delete-version",
@@ -4393,28 +4429,38 @@ mod tests {
             &["--delete"][..],
             &["--stray", "--table", "hits"][..],
             &["--stray", "--delete-version", "5"][..],
+            &["--stray", "--include-reserved-names"][..],
+            &["--table", "hits", "--delete", "--include-reserved-names"][..],
         ] {
             let args: Vec<&str> = base.iter().chain(tail).copied().collect();
             assert!(Cli::try_parse_from(&args).is_err(), "{args:?} parsed");
         }
-        let args: Vec<&str> = base
-            .iter()
-            .chain(&["--stray", "--delete"])
-            .copied()
-            .collect();
-        let cli = Cli::try_parse_from(&args).expect("parse");
-        assert!(matches!(
-            cli.command,
-            Command::Parquet {
-                command: super::ParquetCommand::Repair {
-                    table: None,
-                    stray: true,
-                    delete: true,
-                    delete_version: None,
-                    ..
-                }
-            }
-        ));
+        for (tail, include) in [
+            (&["--stray", "--delete"][..], false),
+            (
+                &["--stray", "--delete", "--include-reserved-names"][..],
+                true,
+            ),
+        ] {
+            let args: Vec<&str> = base.iter().chain(tail).copied().collect();
+            let cli = Cli::try_parse_from(&args).expect("parse");
+            assert!(
+                matches!(
+                    cli.command,
+                    Command::Parquet {
+                        command: super::ParquetCommand::Repair {
+                            table: None,
+                            stray: true,
+                            delete: true,
+                            delete_version: None,
+                            include_reserved_names,
+                            ..
+                        }
+                    } if include_reserved_names == include
+                ),
+                "{args:?}"
+            );
+        }
     }
 
     /// Issue #1184, end to end against the exact gate `main` runs before

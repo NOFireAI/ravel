@@ -159,9 +159,12 @@ pub enum ListedManifestKey {
     /// `t/<tenant_hash>/pq/t/<segment>/v/<20 characters>.pqm` whose
     /// `segment` is not a valid table name: an upper-case or reserved name,
     /// or a path such as `a/b`. The Query grant's `*` binds any such segment,
-    /// so it admits these keys, but no table owns them; the tenant-wide
-    /// listings skip them and `ravel-cli parquet repair --stray` removes
-    /// them. `rest` is the key text after [`tenant_manifest_prefix`].
+    /// so it admits these keys, but no table owns them. The tenant-wide
+    /// listings skip one the store lists, and `ravel-cli parquet repair
+    /// --stray` removes one whose key is its own [`store_path`]. The S3
+    /// adapter cannot list a key holding a control character, an empty
+    /// segment or a `.` or `..` segment: its listing fails instead. `rest`
+    /// is the key text after [`tenant_manifest_prefix`].
     InvalidTable {
         tenant_hash: TenantHash,
         rest: String,
@@ -256,6 +259,22 @@ pub fn parse_listed_manifest_key(key: &str) -> Result<ListedManifestKey, KeyErro
         slot: slot.to_string(),
         reason,
     })
+}
+
+/// The key the S3 adapter sends a request for `key` to: `object_store`'s
+/// `Path::from`, which drops empty segments, percent-encodes a `.` or `..`
+/// segment, and percent-encodes control characters, every non-ASCII byte and
+/// ``\ { ^ } % ` ] " > [ ~ < # | * ?`` within a segment. Every key a builder
+/// here produces is its own store path.
+pub fn store_path(key: &str) -> String {
+    object_store::path::Path::from(key).to_string()
+}
+
+/// Whether a request for `key` through the S3 adapter reaches `key` itself
+/// ([`store_path`] leaves it unchanged). A delete of any other key goes to a
+/// different key, so it reports success and leaves `key` in place.
+pub fn is_store_path(key: &str) -> bool {
+    object_store::path::Path::from(key).as_ref() == key
 }
 
 #[cfg(test)]

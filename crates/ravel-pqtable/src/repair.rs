@@ -18,8 +18,15 @@
 //! The same grant's `*` also admits a `.pqm` key whose segment between
 //! `pq/t/` and `/v/` is not a valid table name
 //! ([`ListedManifestKey::InvalidTable`]). No table owns it, so no per-table
-//! listing shows it; the tenant-wide listings skip it. [`list_stray`] lists
-//! every such key of a tenant and [`delete_stray`] deletes exactly those.
+//! listing shows it; the tenant-wide listings skip it when the store lists
+//! it. [`list_stray`] lists every such key of a tenant and [`delete_stray`]
+//! deletes exactly those, except a key the S3 adapter would send a delete
+//! of to a different key ([`StrayClass::Undeletable`]) and, unless asked, a
+//! key that may be a table created before its name was reserved
+//! ([`StrayClass::ReservedName`]). The S3 adapter cannot list a key holding
+//! a control character, an empty segment or a `.` or `..` segment at all:
+//! the listing that meets one fails, here and in the tenant-wide listings,
+//! and only a delete of the exact key through an S3 tool removes it.
 //!
 //! The repair runs under the Maintain credential, which lists and deletes
 //! under `t/<tenant_hash>/pq/t/` and reads no manifest. Which versions are
@@ -34,10 +41,12 @@ use ravel_object_store::{
 use ravel_types::TenantHash;
 
 use crate::keys::{
-    KeyError, ListedManifestKey, MANIFEST_SUFFIX, MAX_MANIFEST_VERSION, manifest_key,
-    manifest_prefix, parse_listed_manifest_key, tenant_manifest_prefix,
+    KeyError, ListedManifestKey, MANIFEST_SUFFIX, MAX_MANIFEST_VERSION, VERSION_WIDTH,
+    is_store_path, manifest_key, manifest_prefix, parse_listed_manifest_key, store_path,
+    tenant_manifest_prefix,
 };
 use crate::manifest::{Manifest, decode_manifest};
+use crate::names::IAM_GRANT_SEGMENTS;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RepairError {
@@ -73,6 +82,23 @@ pub enum RepairError {
          and /v/ is not a valid table name; only those are removed by --stray --delete"
     )]
     NotStray { key: String },
+    /// A key asked to be deleted that the S3 adapter would send the delete
+    /// of to `path`, a different key ([`StrayClass::Undeletable`]). Nothing
+    /// was deleted.
+    #[error(
+        "refusing to delete {key:?}: the store's path encoding sends a delete of it to {path:?}, \
+         a different key; delete the exact key with the Maintain credential through an S3 tool"
+    )]
+    Undeletable { key: String, path: String },
+    /// A key asked to be deleted that may be the manifest of a table created
+    /// before its name was reserved ([`StrayClass::ReservedName`]), without
+    /// the caller asking to include those. Nothing was deleted.
+    #[error(
+        "refusing to delete {key:?}: its table segment is a name reserved after tables could be \
+         created, so it may be a manifest of such a table; pass --include-reserved-names to \
+         delete it"
+    )]
+    ReservedName { key: String },
     #[error(transparent)]
     Key(#[from] KeyError),
 }
@@ -251,20 +277,70 @@ pub struct StrayEntry {
     pub key: String,
     /// When the store wrote the key, by the store's clock.
     pub last_modified_unix_ms: i64,
+    pub class: StrayClass,
 }
 
-fn is_stray(tenant: &TenantHash, key: &str) -> bool {
-    matches!(
-        parse_listed_manifest_key(key),
-        Ok(ListedManifestKey::InvalidTable { tenant_hash, .. }) if tenant_hash == *tenant
-    )
+/// Whether [`delete_stray`] deletes a stray key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrayClass {
+    /// Deleted.
+    Deletable,
+    /// `t/<tenant_hash>/pq/t/<segment>/v/<20 digits>.pqm` whose segment is
+    /// one of [`IAM_GRANT_SEGMENTS`], reserved after tables could be created,
+    /// so possibly a manifest of a table created before the name was
+    /// reserved. Deleted only when the caller includes reserved names.
+    ReservedName,
+    /// The S3 adapter sends a delete of the key to [`store_path`] of it, a
+    /// different key, so Ravel cannot delete it. Never deleted.
+    Undeletable,
+}
+
+impl StrayClass {
+    fn of(key: &str, rest: &str) -> Self {
+        if !is_store_path(key) {
+            StrayClass::Undeletable
+        } else if reserved_after_tables_existed(rest) {
+            StrayClass::ReservedName
+        } else {
+            StrayClass::Deletable
+        }
+    }
+}
+
+/// Whether `rest`, the key text after `pq/t/`, is `<segment>/v/<20
+/// digits>.pqm` for a single segment [`crate::names::validate_table`] has
+/// refused only since the IAM segment amendment. The built-in and signal
+/// names have been refused since tables could first be created.
+fn reserved_after_tables_existed(rest: &str) -> bool {
+    let Some((segment, slot)) = rest
+        .strip_suffix(MANIFEST_SUFFIX)
+        .and_then(|stem| stem.split_once("/v/"))
+    else {
+        return false;
+    };
+    IAM_GRANT_SEGMENTS.contains(&segment)
+        && slot.len() == VERSION_WIDTH
+        && slot.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The class of `key` when it is a stray key of `tenant`, `None` otherwise.
+fn stray_class(tenant: &TenantHash, key: &str) -> Option<StrayClass> {
+    match parse_listed_manifest_key(key) {
+        Ok(ListedManifestKey::InvalidTable { tenant_hash, rest }) if tenant_hash == *tenant => {
+            Some(StrayClass::of(key, &rest))
+        }
+        _ => None,
+    }
 }
 
 /// Every key under `t/<tenant_hash>/pq/t/` that is
-/// [`ListedManifestKey::InvalidTable`], in ascending key order: the keys the
-/// tenant-wide listings skip because no table owns them. Manifest keys of
-/// valid tables and keys of no manifest shape are not listed. One paginated
-/// LIST of a prefix that ends at a segment boundary; no key is read.
+/// [`ListedManifestKey::InvalidTable`], in ascending key order and with its
+/// [`StrayClass`]: the keys the tenant-wide listings skip because no table
+/// owns them. Manifest keys of valid tables and keys of no manifest shape are
+/// not listed. One paginated LIST of a prefix that ends at a segment
+/// boundary; no key is read. On S3 a key under that prefix holding a control
+/// character, an empty segment or a `.` or `..` segment fails the listing
+/// with [`RepairError::Store`], as it fails the tenant-wide listings.
 pub async fn list_stray(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -280,26 +356,44 @@ pub async fn list_stray(
     listed.dedup_by(|a, b| a.key == b.key);
     Ok(listed
         .into_iter()
-        .filter(|meta| is_stray(tenant, &meta.key))
-        .map(|meta| StrayEntry {
-            key: meta.key,
-            last_modified_unix_ms: meta.last_modified_unix_ms,
+        .filter_map(|meta| {
+            stray_class(tenant, &meta.key).map(|class| StrayEntry {
+                key: meta.key,
+                last_modified_unix_ms: meta.last_modified_unix_ms,
+                class,
+            })
         })
         .collect())
 }
 
 /// Delete `keys`, each of which must be one [`list_stray`] lists for
-/// `tenant`. Every key is classified before the first delete, so a manifest
-/// key of a valid table, another tenant's key, or any other key
-/// ([`RepairError::NotStray`]) deletes nothing. A delete that fails stops the
-/// repair. Returns the deleted keys.
+/// `tenant` as [`StrayClass::Deletable`], or as [`StrayClass::ReservedName`]
+/// when `include_reserved_names` is set. Every key is classified before the
+/// first delete, so a manifest key of a valid table, another tenant's key, or
+/// any other key ([`RepairError::NotStray`]), a key the S3 adapter would
+/// delete a different key for ([`RepairError::Undeletable`]), and an
+/// excluded reserved name ([`RepairError::ReservedName`]) delete nothing. A
+/// delete that fails stops the repair. Returns the deleted keys.
 pub async fn delete_stray(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     keys: &[String],
+    include_reserved_names: bool,
 ) -> Result<Vec<String>, RepairError> {
-    if let Some(key) = keys.iter().find(|key| !is_stray(tenant, key)) {
-        return Err(RepairError::NotStray { key: key.clone() });
+    for key in keys {
+        match stray_class(tenant, key) {
+            None => return Err(RepairError::NotStray { key: key.clone() }),
+            Some(StrayClass::Undeletable) => {
+                return Err(RepairError::Undeletable {
+                    key: key.clone(),
+                    path: store_path(key),
+                });
+            }
+            Some(StrayClass::ReservedName) if !include_reserved_names => {
+                return Err(RepairError::ReservedName { key: key.clone() });
+            }
+            Some(StrayClass::ReservedName | StrayClass::Deletable) => {}
+        }
     }
     delete_each(store, keys).await
 }
@@ -307,9 +401,12 @@ pub async fn delete_stray(
 /// Whether the manifest key `key` is in the listing of `prefix`, the `v/`
 /// prefix it sits under. The S3 adapter appends the delimiter to every list
 /// prefix, so `key` itself cannot be the prefix; the listing starts just
-/// before `key` instead, which costs one request however many versions the
-/// table holds. The Maintain credential may list here but not read, so this
-/// is a listing rather than a HEAD.
+/// before `key` instead, so no version that sorts before it is listed. Only
+/// keys that extend `key`'s 20 digits with text sorting below `.pqm` lie
+/// between the two: none on a table no one put such keys under, where this
+/// is one request, and otherwise paged through up to [`MAX_LIST_PAGES`]
+/// pages. The Maintain credential may list here but not read, so this is a
+/// listing rather than a HEAD.
 async fn is_listed(
     store: &dyn ObjectStoreBackend,
     prefix: &str,
@@ -382,7 +479,7 @@ mod tests {
     use super::*;
     use crate::keys::manifest_key;
     use crate::manifest::encode_manifest;
-    use crate::test_util::{TENANT_A, TENANT_B, live_manifest};
+    use crate::test_util::{S3KeyStore, SegmentAlignedStore, TENANT_A, TENANT_B, live_manifest};
 
     async fn put_version(store: &dyn ObjectStoreBackend, tenant: &TenantHash, version: u64) {
         let key = manifest_key(tenant, "hits", version).expect("key");
@@ -643,92 +740,6 @@ mod tests {
         );
     }
 
-    /// Lists the way the S3 adapter does: `object_store` appends the path
-    /// delimiter to every non-empty list prefix, so a prefix that ends mid
-    /// segment, such as a whole key, matches nothing.
-    struct SegmentAlignedStore {
-        inner: InstrumentedStore<MemoryStore>,
-        /// Every key passed to `delete`, in call order.
-        deletes: std::sync::Mutex<Vec<String>>,
-    }
-
-    impl SegmentAlignedStore {
-        fn new(inner: MemoryStore) -> Self {
-            SegmentAlignedStore {
-                inner: InstrumentedStore::new(inner),
-                deletes: std::sync::Mutex::new(Vec::new()),
-            }
-        }
-
-        fn deletes(&self) -> Vec<String> {
-            self.deletes.lock().expect("lock").clone()
-        }
-    }
-
-    fn segment_aligned(prefix: &str) -> String {
-        let trimmed = prefix.trim_end_matches('/');
-        if trimmed.is_empty() {
-            String::new()
-        } else {
-            format!("{trimmed}/")
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ObjectStoreBackend for SegmentAlignedStore {
-        async fn put(
-            &self,
-            key: &str,
-            data: Bytes,
-            opts: PutOptions,
-        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
-            self.inner.put(key, data, opts).await
-        }
-
-        async fn get(
-            &self,
-            key: &str,
-            range: GetRange,
-        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
-            self.inner.get(key, range).await
-        }
-
-        async fn put_multipart<'a>(
-            &'a self,
-            key: &str,
-        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
-            self.inner.put_multipart(key).await
-        }
-
-        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
-            self.inner.head(key).await
-        }
-
-        async fn list(
-            &self,
-            prefix: &str,
-            page: Option<ravel_object_store::PageToken>,
-        ) -> Result<ravel_object_store::ListPage, StoreError> {
-            self.inner.list(&segment_aligned(prefix), page).await
-        }
-
-        async fn list_delimited(
-            &self,
-            prefix: &str,
-        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
-            self.inner.list_delimited(&segment_aligned(prefix)).await
-        }
-
-        async fn delete(&self, key: &str) -> Result<(), StoreError> {
-            self.deletes.lock().expect("lock").push(key.to_string());
-            self.inner.delete(key).await
-        }
-
-        fn capabilities(&self) -> ravel_object_store::Capabilities {
-            self.inner.capabilities()
-        }
-    }
-
     async fn segment_aligned_forged_store() -> SegmentAlignedStore {
         let store = SegmentAlignedStore::new(forged_store().await);
         for v in [2, 3] {
@@ -737,33 +748,94 @@ mod tests {
         store
     }
 
+    /// [`SegmentAlignedStore`] behind the S3 adapter's key handling.
+    type S3Store = S3KeyStore<SegmentAlignedStore>;
+
+    /// The raw key space under an [`S3Store`], where a test puts what a
+    /// credential could put with any S3 client.
+    fn memory(store: &S3Store) -> &MemoryStore {
+        store.inner.inner.inner()
+    }
+
+    fn deletes_sent(store: &S3Store) -> u64 {
+        store
+            .inner
+            .inner
+            .metrics()
+            .snapshot()
+            .op(StoreOp::Delete)
+            .calls
+    }
+
     /// The text after `t/<tenant_hash>/pq/t/` of keys the Query grant admits
-    /// under a segment that is not a valid table name: upper case, a reserved
-    /// name, a nested path, and an upper-case name whose 20 version
-    /// characters hold control characters.
-    const STRAYS: [&str; 4] = [
+    /// under a segment that is not a valid table name, which the S3 adapter
+    /// lists and deletes: upper case, a nested path, and a name reserved
+    /// since tables could first be created.
+    const STRAYS: [&str; 3] = [
         "Hits/v/00000000000000000001.pqm",
         "a/b/v/00000000000000000001.pqm",
         "logs/v/00000000000000000001.pqm",
+    ];
+
+    /// Stray keys the S3 adapter lists but sends a delete of to a different
+    /// key: `Path::from` percent-encodes a tilde, a percent sign and a
+    /// non-ASCII character.
+    const UNDELETABLE: [&str; 3] = [
+        "Hits~/v/00000000000000000001.pqm",
+        "a%2Fb/v/00000000000000000001.pqm",
+        "Hits/v/0000000000000000000\u{e9}.pqm",
+    ];
+
+    /// Well-formed manifest keys of tables named with words reserved after
+    /// tables could be created.
+    const RESERVED: [&str; 2] = [
+        "l0/v/00000000000000000001.pqm",
+        "u/v/00000000000000000007.pqm",
+    ];
+
+    /// Stray keys the S3 adapter cannot list, because `Path::parse` refuses
+    /// them: control characters, an empty segment, a `.` and a `..` segment,
+    /// and an empty table segment.
+    const UNLISTABLE: [&str; 5] = [
         "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm",
+        "hits//v/00000000000000000003.pqm",
+        "./v/00000000000000000001.pqm",
+        "a/../v/00000000000000000001.pqm",
+        "/v/00000000000000000001.pqm",
     ];
 
     fn stray_key(tenant: &TenantHash, rest: &str) -> String {
         format!("{}{rest}", tenant_manifest_prefix(tenant))
     }
 
-    /// [`forged_store`] with versions 2 and 3, every [`STRAYS`] key of
-    /// tenant A written at store time 5_000, one of tenant B, and a key under
-    /// an invalid table segment without the `.pqm` suffix, behind the
-    /// segment-aligned listing.
-    async fn stray_store() -> SegmentAlignedStore {
-        let store = segment_aligned_forged_store().await;
-        let memory = store.inner.inner();
+    /// Tenant A's keys for `rests` in ascending key order.
+    fn sorted(rests: &[&str]) -> Vec<String> {
+        let mut keys: Vec<String> = rests.iter().map(|r| stray_key(&TENANT_A, r)).collect();
+        keys.sort();
+        keys
+    }
+
+    /// [`forged_store`] with versions 2 and 3, every [`STRAYS`],
+    /// [`UNDELETABLE`] and [`RESERVED`] key of tenant A written at store
+    /// time 5_000, one stray key of tenant B, and a key under an invalid
+    /// table segment without the `.pqm` suffix, behind the S3 adapter's
+    /// listing and key handling.
+    async fn stray_store() -> S3Store {
+        let store = S3KeyStore {
+            inner: segment_aligned_forged_store().await,
+        };
+        let memory = memory(&store);
         memory.set_clock_ms(5_000);
-        for key in STRAYS.iter().map(|rest| stray_key(&TENANT_A, rest)).chain([
-            stray_key(&TENANT_B, STRAYS[0]),
-            stray_key(&TENANT_A, "Hits/v/00000000000000000001.parquet"),
-        ]) {
+        for key in STRAYS
+            .iter()
+            .chain(&UNDELETABLE)
+            .chain(&RESERVED)
+            .map(|rest| stray_key(&TENANT_A, rest))
+            .chain([
+                stray_key(&TENANT_B, STRAYS[0]),
+                stray_key(&TENANT_A, "Hits/v/00000000000000000001.parquet"),
+            ])
+        {
             memory
                 .put(&key, Bytes::from_static(b"x"), PutOptions::default())
                 .await
@@ -772,57 +844,108 @@ mod tests {
         store
     }
 
-    /// Tenant A's [`STRAYS`] keys in ascending key order.
-    fn sorted_strays() -> Vec<String> {
-        let mut keys: Vec<String> = STRAYS.iter().map(|r| stray_key(&TENANT_A, r)).collect();
-        keys.sort();
-        keys
-    }
-
     #[tokio::test]
     async fn list_stray_lists_exactly_the_keys_under_no_valid_table() {
         let store = stray_store().await;
         let got = list_stray(&store, &TENANT_A).await.expect("list");
-        assert_eq!(
-            got,
-            sorted_strays()
-                .into_iter()
-                .map(|key| StrayEntry {
-                    key,
-                    last_modified_unix_ms: 5_000
-                })
-                .collect::<Vec<_>>()
-        );
+        let mut expected: Vec<StrayEntry> = [
+            (&STRAYS[..], StrayClass::Deletable),
+            (&UNDELETABLE[..], StrayClass::Undeletable),
+            (&RESERVED[..], StrayClass::ReservedName),
+        ]
+        .into_iter()
+        .flat_map(|(rests, class)| {
+            sorted(rests).into_iter().map(move |key| StrayEntry {
+                key,
+                last_modified_unix_ms: 5_000,
+                class,
+            })
+        })
+        .collect();
+        expected.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(got, expected);
         assert_eq!(
             list_stray(&store, &TENANT_B).await.expect("list"),
             vec![StrayEntry {
                 key: stray_key(&TENANT_B, STRAYS[0]),
-                last_modified_unix_ms: 5_000
+                last_modified_unix_ms: 5_000,
+                class: StrayClass::Deletable,
             }]
         );
-        assert!(store.deletes().is_empty());
+        assert_eq!(deletes_sent(&store), 0);
+    }
+
+    #[test]
+    fn only_a_well_formed_key_under_a_name_reserved_after_tables_existed_is_reserved() {
+        for segment in IAM_GRANT_SEGMENTS {
+            let rest = format!("{segment}/v/00000000000000000001.pqm");
+            assert_eq!(
+                StrayClass::of(&stray_key(&TENANT_A, &rest), &rest),
+                StrayClass::ReservedName,
+                "{rest}"
+            );
+        }
+        for rest in [
+            // Reserved since tables could first be created.
+            "logs/v/00000000000000000001.pqm",
+            "samples/v/00000000000000000001.pqm",
+            // Not a single reserved segment, or not a well-formed version.
+            "x/l0/v/00000000000000000001.pqm",
+            "l0/x/v/00000000000000000001.pqm",
+            "L0/v/00000000000000000001.pqm",
+            "l0/v/0000000000000000000x.pqm",
+            "l0/v/0000000000000000001x.pqm",
+        ] {
+            assert_eq!(
+                StrayClass::of(&stray_key(&TENANT_A, rest), rest),
+                StrayClass::Deletable,
+                "{rest}"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn delete_stray_deletes_exactly_the_listed_stray_keys() {
+    async fn delete_stray_deletes_exactly_the_deletable_stray_keys() {
         let store = stray_store().await;
         let hits_before = keys_of(list(&store, &TENANT_A, "hits").await.expect("list"));
-        let keys: Vec<String> = list_stray(&store, &TENANT_A)
+        let deletable: Vec<String> = list_stray(&store, &TENANT_A)
             .await
             .expect("list")
             .into_iter()
+            .filter(|e| e.class == StrayClass::Deletable)
             .map(|e| e.key)
             .collect();
-        let deleted = delete_stray(&store, &TENANT_A, &keys)
+        assert_eq!(deletable, sorted(&STRAYS));
+        let deleted = delete_stray(&store, &TENANT_A, &deletable, false)
             .await
             .expect("delete");
-        assert_eq!(deleted, sorted_strays());
-        assert_eq!(store.deletes(), sorted_strays());
-        assert!(
+        assert_eq!(deleted, sorted(&STRAYS));
+        assert_eq!(store.inner.deletes(), sorted(&STRAYS));
+        let mut left = sorted(&UNDELETABLE);
+        left.extend(sorted(&RESERVED));
+        left.sort();
+        assert_eq!(
             list_stray(&store, &TENANT_A)
                 .await
                 .expect("list")
-                .is_empty()
+                .into_iter()
+                .map(|e| e.key)
+                .collect::<Vec<_>>(),
+            left
+        );
+        // With reserved names included, those go too.
+        let deleted = delete_stray(&store, &TENANT_A, &sorted(&RESERVED), true)
+            .await
+            .expect("delete");
+        assert_eq!(deleted, sorted(&RESERVED));
+        assert_eq!(
+            list_stray(&store, &TENANT_A)
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|e| e.key)
+                .collect::<Vec<_>>(),
+            sorted(&UNDELETABLE)
         );
         // Every valid table's keys, the other tenant's stray key and the
         // foreign key are still there.
@@ -841,29 +964,98 @@ mod tests {
     #[tokio::test]
     async fn delete_stray_refuses_any_other_key_before_any_delete() {
         let store = stray_store().await;
-        for refused in [
+        let refusals = [
             mkey(1),
             mkey(u64::MAX),
             invalid_key(ZERO),
             notes_key(),
             stray_key(&TENANT_B, STRAYS[0]),
             stray_key(&TENANT_A, "Hits/v/00000000000000000001.parquet"),
-        ] {
-            // A stray key first: the refusal must come before any delete.
-            let mut keys = sorted_strays();
+        ]
+        .into_iter()
+        .map(|key| (key, "NotStray"))
+        .chain(sorted(&UNDELETABLE).into_iter().map(|k| (k, "Undeletable")))
+        .chain(sorted(&RESERVED).into_iter().map(|k| (k, "ReservedName")));
+        for (refused, kind) in refusals {
+            // A deletable stray key first: the refusal must come before any
+            // delete.
+            let mut keys = sorted(&STRAYS);
             keys.push(refused.clone());
-            let got = delete_stray(&store, &TENANT_A, &keys).await;
-            assert!(
-                matches!(&got, Err(RepairError::NotStray { key }) if *key == refused),
-                "{got:?}"
-            );
+            let got = delete_stray(&store, &TENANT_A, &keys, false).await;
+            let named = match &got {
+                Err(RepairError::NotStray { key }) => ("NotStray", key),
+                Err(RepairError::Undeletable { key, path }) => {
+                    assert_eq!(*path, store_path(key));
+                    assert_ne!(path, key);
+                    ("Undeletable", key)
+                }
+                Err(RepairError::ReservedName { key }) => ("ReservedName", key),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(named, (kind, &refused));
         }
-        assert!(store.deletes().is_empty());
-        assert_eq!(
-            store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
-            0
+        // Including reserved names never admits an undeletable key.
+        let mut keys = sorted(&RESERVED);
+        keys.push(stray_key(&TENANT_A, UNDELETABLE[0]));
+        let got = delete_stray(&store, &TENANT_A, &keys, true).await;
+        assert!(
+            matches!(&got, Err(RepairError::Undeletable { key, .. }) if *key == keys[2]),
+            "{got:?}"
         );
-        assert_eq!(list_stray(&store, &TENANT_A).await.expect("list").len(), 4);
+        assert!(store.inner.deletes().is_empty());
+        assert_eq!(deletes_sent(&store), 0);
+        assert_eq!(list_stray(&store, &TENANT_A).await.expect("list").len(), 8);
+    }
+
+    /// `Path::from` drops the empty segment of `hits//v/<3>.pqm`, so the S3
+    /// adapter would send its delete to version 3 of `hits`.
+    #[tokio::test]
+    async fn delete_stray_refuses_a_key_whose_delete_reaches_a_valid_version() {
+        let store = stray_store().await;
+        let doubled = stray_key(&TENANT_A, "hits//v/00000000000000000003.pqm");
+        memory(&store)
+            .put(&doubled, Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .expect("put");
+        assert!(matches!(
+            parse_listed_manifest_key(&doubled),
+            Ok(ListedManifestKey::InvalidTable { .. })
+        ));
+        assert_eq!(store_path(&doubled), mkey(3));
+        let got = delete_stray(&store, &TENANT_A, std::slice::from_ref(&doubled), true).await;
+        assert!(
+            matches!(&got, Err(RepairError::Undeletable { key, path })
+                if *key == doubled && *path == mkey(3)),
+            "{got:?}"
+        );
+        assert_eq!(deletes_sent(&store), 0);
+        memory(&store).head(&mkey(3)).await.expect("version 3 kept");
+        memory(&store).head(&doubled).await.expect("still there");
+    }
+
+    /// On S3 a stray key `Path::parse` refuses fails the listing that meets
+    /// it; only a store that lists any key, such as `MemoryStore`, lists it.
+    #[tokio::test]
+    async fn a_key_the_s3_adapter_cannot_list_fails_list_stray_with_the_store_error() {
+        for rest in UNLISTABLE {
+            let store = stray_store().await;
+            let key = stray_key(&TENANT_A, rest);
+            memory(&store)
+                .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("put");
+            let got = list_stray(&store, &TENANT_A).await;
+            assert!(
+                matches!(&got, Err(RepairError::Store {
+                    key: prefix,
+                    source: StoreError::Permanent(msg),
+                }) if *prefix == tenant_manifest_prefix(&TENANT_A)
+                    && msg.starts_with("invalid path")),
+                "{rest:?}: {got:?}"
+            );
+            let listed = list_stray(memory(&store), &TENANT_A).await.expect("list");
+            assert!(listed.iter().any(|e| e.key == key), "{rest:?}");
+        }
     }
 
     #[tokio::test]
