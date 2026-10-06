@@ -979,7 +979,7 @@ pub(crate) mod tests {
         .into_iter()
         .enumerate()
         {
-            let tenant = TenantHash([0x60 + i as u8; 16]);
+            let tenant = TenantHash([0x90 + i as u8; 16]);
             let store = S3KeyStore {
                 inner: MemoryStore::with_page_size(2),
             };
