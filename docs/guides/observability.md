@@ -1214,19 +1214,24 @@ Labels: `mode`.
 
 ### Maintenance safety
 
-Labels: `mode` and `signal`, with four exceptions. No series carries a
+Labels: `mode` and `signal`, with seven exceptions. No series carries a
 `tenant_hash` label.
 
 | Series | Labels |
 |---|---|
 | `ravel_maintain_legal_hold_refresh_failures_total` | `mode` only. |
+| `ravel_maintain_retention_held_out_of_window_objects_total` | `mode` only. |
+| `ravel_maintain_retention_held_by_lease_buckets_total` | `mode` only. |
 | `ravel_maintain_objects_deleted_total` | `mode` and `kind`, no `signal`. |
 | `ravel_maintain_superseded_inputs_held_total` | `mode`, `signal`, and `reason`. |
 | `ravel_maintain_compaction_inputs_skipped_total` | `mode`, `signal`, and `reason`. |
+| `ravel_maintain_erasure_unwritable_objects_total` | `mode`, `signal`, and `reason`. |
 
 | Metric | Meaning |
 |---|---|
 | `ravel_maintain_legal_hold_refresh_failures_total` | Legal-hold refresh failures. Each one skips that tenant's whole maintenance tick. |
+| `ravel_maintain_retention_held_out_of_window_objects_total` | Data objects the retention sweep declined to delete because their format version is outside this build's reader window, counted once per object per pass and summed over every signal. The whole bucket keeps its tombstone and nothing in it is deleted that pass. A rising total means retention is holding data past its window: finish the upgrade, complete `maintain migrate`, or roll back. See [maintenance](operations/maintenance.md#the-format-version-hold). |
+| `ravel_maintain_retention_held_by_lease_buckets_total` | Tombstoned buckets the retention sweep declined to touch because a lease or legal hold protects a key it would delete, counted once per bucket per pass and summed over every signal. It rises for as long as a hold stands, so a rise is not by itself a fault. See [maintenance](operations/maintenance.md#retention-under-a-hold). |
 | `ravel_maintain_l0_records_pending` | Gauge. L0 commit records sitting below `min_compaction_inputs` in a sealed bucket, by signal, summed over every tenant and shard this process maintains. |
 | `ravel_maintain_objects_deleted_total` | Objects the sweep physically deleted, by `kind`: `superseded_records_deleted`, `superseded_data_deleted`, `unreferenced_parts_deleted`, `quarantine_reaped`. |
 | `ravel_maintain_bytes_reclaimed_total` | Bytes of deleted objects reclaimed by the sweep, by signal. Object sizes, not wire bytes: the quarantine reaper and the unreferenced-part delete at their listed size, and the superseded-input sweep at the `object_size` the commit, compaction or rewrite record naming each object carries, a superseded L1 segment on the pass that deletes that record, so it is charged once. Retention deletions are excluded because they delete by key without a known size, so it undercounts the bytes reclaimed, except that two replicas sweeping one unit during an ownership handoff can each count the same object. Per process. |
@@ -1234,7 +1239,8 @@ Labels: `mode` and `signal`, with four exceptions. No series carries a
 | `ravel_maintain_units_scan_failed` | Gauge. Units whose retention and compaction scan returned an error in this process's most recent completed cycle, or that a failed provisioning check or shard-generation read skipped unscanned, by signal. While it is nonzero the retention lag does not cover every unit. |
 | `ravel_maintain_conservation_aborts_total` | Compaction publishes aborted by the record-count conservation gate, by signal. |
 | `ravel_maintain_compaction_inputs_skipped_total` | Input objects compaction left out of its merge instead of failing on them, by signal and `reason`, each object counted once per process. Carries `signal="logs"` and `signal="audit"` (the query-audit shard), the two signals that compact through RLOG, each rendered from zero. `reason="unwritable_stream_attrs"`: a log object carrying a `stream_attrs` blob the RLOG writer refuses, written before the writer checked it. The rest of the bucket is merged when at least `min_compaction_inputs` inputs remain; the skipped object stays in storage, named by no compaction record, and a `WARN` line names its key. The counter resets on restart, so alert on an increase, not on a level. See [maintenance](operations/maintenance.md#a-log-object-compaction-cannot-rewrite) for what to do. |
-| `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. Also carries `signal="alerts"` and `signal="audit"` for the alerts shard's orphan sweep and the query-audit shard's input-cleanup sweep, which run outside the maintained signals. The superseded refusal counter and the two superseded hold families below carry those two signals as well, and `ravel_maintain_compaction_inputs_skipped_total` carries only logs and audit; every other per-signal series here covers only metrics, logs and spans. |
+| `ravel_maintain_erasure_unwritable_objects_total` | Input objects that blocked the selective-erasure rewrite of their bucket, by signal and `reason`, each object counted once per process however many passes it blocks. Carries `signal="logs"` only, rendered from zero. `reason="unwritable_stream_attrs"`: a log object carrying a `stream_attrs` blob the RLOG writer refuses, in a bucket with no compaction record. Nothing in the bucket is rewritten, so every live object in it, healthy ones included, stays live, and every erasure request whose window reaches any of them stays pending; a request whose window reaches no live object of a blocked bucket completes. A `WARN` line names the object's key. The counter resets on restart, so alert on an increase, not on a level. See [maintenance](operations/maintenance.md#a-log-object-an-erasure-rewrite-cannot-rewrite) for what to do. |
+| `ravel_maintain_orphan_breaker_tripped_total` | Orphan-GC mass-orphan circuit breaker trips, by signal. Also carries `signal="alerts"` and `signal="audit"` for the alerts shard's orphan sweep and the query-audit shard's input-cleanup sweep, which run outside the maintained signals. The superseded refusal counter and the two superseded hold families below carry those two signals as well, `ravel_maintain_compaction_inputs_skipped_total` carries only logs and audit, and `ravel_maintain_erasure_unwritable_objects_total` carries only logs; every other per-signal series here covers only metrics, logs and spans. |
 | `ravel_maintain_orphans_withheld` | Gauge. Orphan candidates withheld by the last completed orphan pass, by signal. |
 | `ravel_maintain_orphans_present` | Gauge. Orphan candidates the last completed orphan pass found, by signal, whether or not the breaker tripped. |
 | `ravel_maintain_orphans_quarantined_total` | Orphan candidates moved from the live L0 set to the quarantine prefix, by signal. |

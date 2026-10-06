@@ -670,22 +670,84 @@ compaction. The exception is erasure:
   record's outputs and never reaches the skipped object, so an erasure request
   whose window covers the object stays pending.
 - In a bucket with no compaction record (every input skipped, or too few left
-  to meet the minimum), the erasure rewrite of that bucket reads every L0
-  object in it and fails when it writes the skipped object's records into its
-  output, the same refusal compaction avoids, on every tick. The failure is
-  logged for that bucket and the pass goes on to the next one, but no erasure
-  request for that tenant and signal is marked complete on a tick where any
-  bucket failed, so the request stays pending.
+  to meet the minimum), the erasure rewrite of that bucket finds the object
+  before it merges, writes nothing to the bucket and reports it blocked. See
+  [A log object an erasure rewrite cannot
+  rewrite](#a-log-object-an-erasure-rewrite-cannot-rewrite).
 
-`ravel-cli maintain migrate`, which skips no input, still fails on a bucket it
-rewrites while that bucket has no compaction record and holds the object. The
-failure is not confined to that bucket: it ends the run for that tenant, signal
-and format family, no later shard or hour is migrated, and a rerun starts from
-the same place and fails on the same bucket, so that family's migration cannot
-finish while the object is there. A
+`ravel-cli maintain migrate`, which skips no input, does not rewrite a bucket
+that has no compaction record and holds the object. It skips that bucket,
+walks on to the later ones, and leaves the family's floor where it is while
+the object remains; the same section describes what it prints. A
 `compact-bucket` or `compact-tenant` run skips the object the same
 way and logs the same warning, but it is a separate process with no `/metrics`
 endpoint, so it moves no server counter.
+
+### A log object an erasure rewrite cannot rewrite
+
+The erasure rewrite of a bucket with no compaction record reads every live L0
+object in it. When one of them carries a `stream_attrs` blob the RLOG writer
+refuses (the object described in [A log object compaction cannot
+rewrite](#a-log-object-compaction-cannot-rewrite)), the rewrite checks every
+input before it merges, builds and publishes nothing for the bucket, and
+reports the bucket blocked by that object. Unlike compaction, it does not
+leave the object out and rewrite the rest.
+
+A blocked bucket writes nothing, so every live object in it, healthy ones
+included, stays live. The completion check counts each of them as live raw
+L0, so an erasure request whose event-time window reaches any live object of
+the bucket stays pending while the object exists: its `.dreq` and its
+query-time filter stay, and no `.done` is written. The blocked bucket does
+not hold back anything else. Every other bucket of the tenant and signal is
+rewritten and verified on the same tick, and a request whose window reaches
+no live object of a blocked bucket completes. The pass still takes and
+completes the bucket's claim, and counts it like any other.
+
+In a bucket that does have a compaction record the rewrite rewrites only that
+record's parts and never reaches the object, so it is not blocked, counted or
+warned about there. A request whose window covers the object stays pending in
+that case too.
+
+What an operator sees:
+
+- `ravel_maintain_erasure_unwritable_objects_total{signal="logs",reason="unwritable_stream_attrs"}`
+  moves by one per blocking object. It counts objects, not passes: each
+  object counts once per process however many ticks it blocks. The counter
+  resets to 0 on restart, and the first pass after a restart that tries to
+  rewrite the bucket for a pending request counts the object again. Alert on
+  an increase, not on a level.
+- One `WARN` line per object per process, `erasure rewrite of a bucket is
+  blocked by an input object it cannot rewrite`, carrying `object_key` (the
+  object's storage key, escaped), `reason` and `error` (the decoder's
+  refusal), with the bucket's tenant, signal, shard and hour.
+- Every request whose window reaches a live object of the bucket stays
+  pending with no `.done`, on every tick, while the object exists.
+
+`ravel-cli maintain migrate` skips such a bucket in the same way. The run
+prints one line per skipped bucket, followed by a `# ` line that says what it
+means:
+
+```
+buckets_unwritable_skipped: 1
+unwritable_skipped: shard=0 hour=495001 reason=unwritable_stream_attrs object_key="t/.../logs/..."
+# Each unwritable_skipped bucket holds a log object whose stream_attrs blob the RLOG writer refuses (issue #2580). ...
+```
+
+The walk goes on to the next bucket, and the skipped bucket's below-target L0
+records count against `--budget-records` as a migrated bucket's would. The
+fresh re-audit counts those records as stragglers, so the floor is not raised
+while the object remains. A run that skipped a bucket exits nonzero however it
+ended, including a run that stopped on its budget, because a later run that
+resumes from the cursor does not name that bucket again. Re-running migrate is
+not the remedy.
+
+No maintenance path removes or repairs the object, and there is no supported
+manual procedure to remove or repair it yet, for the reasons given in [A log
+object compaction cannot rewrite](#a-log-object-compaction-cannot-rewrite):
+its key is derived from its content, and deleting only the data object leaves
+its commit record pointing at an object that no longer exists. Retention
+expiry deletes it with the rest of its bucket. Until then, every request it
+holds stays pending, with its `.dreq` and query-time filter in place.
 
 ## Garbage collection and retention
 
@@ -735,9 +797,10 @@ holds the bucket:
 
 - It deletes nothing in that bucket and leaves the tombstone in place.
 - It logs a warning that names the versions.
-- It counts the objects on `held_out_of_window_objects_total`, an in-process
-  counter that is not yet on the scrape endpoint (see
-  [legal hold](#legal-hold)).
+- It counts the objects on
+  `ravel_maintain_retention_held_out_of_window_objects_total`, once per
+  object per pass. A rising total means retention is holding data past its
+  window: finish the upgrade, complete `maintain migrate`, or roll back.
 
 Such an object is usually not corrupt. The other side of a rolling upgrade, or
 the build that a rollback returns to, reads it. A binary rollback across a
@@ -1355,6 +1418,9 @@ The exit code follows how the run ended:
   fresh re-audit counts them as stragglers.
 - The run that drains the walk exits zero when it raises the floor, even with
   `not_migrated` lines printed.
+- A run that printed any `unwritable_skipped` line exits nonzero however it
+  ended, a budget stop included. See [A log object an erasure rewrite cannot
+  rewrite](#a-log-object-an-erasure-rewrite-cannot-rewrite).
 
 `--dry-run` does not run the walk. It runs the read-only re-audit, prints the
 three below-target figures and any `blocked_bucket` lines, takes no claim,
@@ -1495,12 +1561,8 @@ and the tombstone keeps the bucket excluded. Deleting those while the held
 bytes stay would leave bytes that nothing can read and nothing can later
 sweep.
 
-The count is `ravel_maintain::retention::held_by_lease_buckets_total`, the
-process-wide seam for
-`ravel_maintain_retention_held_by_lease_buckets_total`, one per bucket per
-declining pass. Like the version-hold counter beside it
-(`held_out_of_window_objects_total`) it is a seam today and not yet on the
-scrape endpoint.
+The count is `ravel_maintain_retention_held_by_lease_buckets_total` on
+`/metrics`, one per bucket per declining pass, summed over every signal.
 
 A held bucket is a bucket kept past its retention window, so the count rises
 for as long as the hold stands. That is expected. The count goes flat again

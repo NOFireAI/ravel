@@ -111,7 +111,9 @@ const MIGRATE_CURSOR_LEN: usize = 9;
 /// The per-invocation work budget for [`migrate_family`], counted in L0 records:
 /// those an L0 migration rewrote, and the inputs a re-encoded compaction record
 /// names, for every rewrite that built its parts and then published, converged,
-/// abandoned at its deadline, or stopped at a changed record set. A budget bounds how much one invocation does before
+/// abandoned at its deadline, or stopped at a changed record set, plus the L0
+/// records of a bucket skipped because an input in it is an object the writer
+/// refuses ([`FamilyMigrateReport::unwritable_skipped`]). A budget bounds how much one invocation does before
 /// persisting its cursor and returning control, so a large migration runs
 /// across many invocations without a lock or a long-lived process. It does not
 /// bound request cost: the walk reads the compaction and rewrite records of
@@ -499,7 +501,8 @@ pub struct FamilyMigrateReport {
     /// next bucket, and the fresh re-audit still counts the bucket's
     /// below-target records, so the floor stays unraised while the object
     /// remains. No re-run clears it: it stays until the object is removed or
-    /// repaired, or retention ages the bucket out.
+    /// repaired, or retention ages the bucket out. Its below-target L0 records
+    /// count against the [`MigrateBudget`] as a rewritten bucket's would.
     pub unwritable_skipped: Vec<UnwritableBucket>,
     /// The `(shard, ingest_hour)` the cursor was persisted at, when this
     /// invocation stopped on its budget. `None` once the walk completes: a
@@ -1725,6 +1728,7 @@ pub async fn migrate_family(
                                     object_key,
                                     reason,
                                 });
+                                spent += l0_below;
                                 None
                             }
                             other => Some(other?),
@@ -4524,5 +4528,160 @@ mod tests {
             "the winner's one and the loser's two below-target parts all count \
              in l1; the loser names the bucket and the rewrite parts count nowhere"
         );
+    }
+
+    /// Seed one single-record L0 `.rlog` input at `(0, hour)`, recorded at
+    /// `segment_format_version`. With `refused` the record's scope name is not
+    /// UTF-8, written past the writer's check, so the RLOG writer refuses to
+    /// rewrite the object (issue #2580); its stream is one no healthy input
+    /// carries.
+    async fn seed_rlog_at(
+        store: &dyn ObjectStoreBackend,
+        hour: u32,
+        seq: u64,
+        refused: bool,
+        segment_format_version: u32,
+    ) {
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let th = tenant_hash();
+        let shard = 0;
+        let writer_id = Uuid::from_u128(u128::from(seq));
+        let created = i64::from(hour) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+        let service = if refused { "svc9" } else { "svc0" };
+        let res = vec![(
+            "service.name".to_string(),
+            AttrValue::Str(service.to_string()),
+        )];
+        let mut stream_attrs = ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]);
+        if refused {
+            let at = stream_attrs
+                .windows(5)
+                .position(|w| w == b"scope")
+                .expect("scope name in blob");
+            stream_attrs[at] = 0xFF;
+        }
+        let record = LogRecord {
+            stream_id: log_stream_id(&res, "scope", "1", &[]),
+            stream_attrs,
+            ts_ns: created,
+            observed_ts_ns: created,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "alpha".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        };
+        let mut writer = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: th.0,
+                shard,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: EPOCH,
+                writer_seq: seq,
+            },
+        );
+        if refused {
+            writer = writer.with_unchecked_stream_attrs();
+        }
+        writer.push(record).expect("push log record");
+        let bytes = Bytes::from(writer.finish().expect("finish rlog L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let data_key = keys::data_key(
+            &th,
+            Signal::Logs,
+            shard,
+            writer_id,
+            EPOCH,
+            seq,
+            &content_hash,
+        )
+        .expect("data key");
+        store
+            .put(&data_key, bytes.clone(), PutOptions::default())
+            .await
+            .expect("put rlog data");
+
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: th,
+            signal: Signal::Logs,
+            shard,
+            writer_id,
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: 1,
+            series_count: 1,
+            min_event_ts_ns: created,
+            max_event_ts_ns: created,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version,
+            created_unix_ns: created,
+            ingest_hour_bucket: hour,
+        })
+        .expect("build logs commit record");
+        let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
+        store
+            .put(&commit_key, record::encode(&rec), PutOptions::default())
+            .await
+            .expect("put commit record");
+    }
+
+    /// A bucket skipped for an unwritable input spends its L0 records against
+    /// the budget, as a rewritten one does. Three logs buckets of two
+    /// below-target records each, the first two holding one refused object
+    /// apiece, walked with a two-record budget: the first invocation skips
+    /// hour 100 and stops there, and the next resumes past it, skips hour 101
+    /// and stops there. With `spent += l0_below` removed from the walk's
+    /// `UnwritableInput` arm the first invocation walks the whole family,
+    /// skipping both and migrating hour 102 before the budget stops it.
+    #[tokio::test]
+    async fn a_bucket_skipped_for_an_unwritable_input_spends_the_budget() {
+        let store = MemoryStore::new();
+        let target = crate::rlog::OUTPUT_FORMAT_VERSION;
+        let mut seq = 0;
+        for hour in [100, 101, 102] {
+            for refused in [false, hour != 102] {
+                seq += 1;
+                seed_rlog_at(&store, hour, seq, refused, target - 1).await;
+            }
+        }
+        let clock = FixedClock::new(sealed_now_ns_for(102));
+        let config = CompactorConfig::default();
+        let run = || {
+            migrate_family(
+                &store,
+                &clock,
+                &config,
+                tenant_hash(),
+                Signal::Logs,
+                "rlog",
+                target,
+                1,
+                MigrateBudget::records(2),
+                "migrate test",
+            )
+        };
+
+        for hour in [100, 101] {
+            let report = run().await.expect("the walk stops on its budget");
+            let skipped: Vec<(u32, u32)> = report
+                .unwritable_skipped
+                .iter()
+                .map(|b| (b.shard, b.ingest_hour))
+                .collect();
+            assert_eq!(skipped, vec![(0, hour)], "{report:?}");
+            assert_eq!(report.buckets_migrated, 0, "{report:?}");
+            assert!(report.budget_exhausted, "{report:?}");
+            assert!(!report.walk_complete, "{report:?}");
+            assert_eq!(report.cursor_advanced_to, Some((0, hour)), "{report:?}");
+        }
     }
 }

@@ -462,6 +462,13 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
         .buffered(config.input_read_concurrency.max(1))
         .try_collect()
         .await?;
+    // Both arms below pair inputs with catalogs by zipping, which stops at the
+    // shorter side and would pass an input it never checked.
+    if inputs.len() != catalogs.len() {
+        return Err(MaintainError::Invariant(
+            "inputs and catalogs length mismatch".to_string(),
+        ));
+    }
 
     match unwritable {
         UnwritableInputs::Skip => {
@@ -554,17 +561,13 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
 
 /// Split off every input whose catalog the codec's writer would refuse
 /// ([`SegmentCodec::unwritable_input`]), recording each as skipped, and return
-/// the rest with their catalogs, still aligned and in canonical order.
+/// the rest with their catalogs, still aligned and in canonical order. The
+/// caller has checked that `inputs` and `catalogs` are the same length.
 fn skip_unwritable_inputs<C: SegmentCodec>(
     bucket: &Bucket,
     inputs: Vec<crate::read::InputRecord>,
     catalogs: Vec<C::Catalog>,
 ) -> Result<(Vec<crate::read::InputRecord>, Vec<C::Catalog>)> {
-    if inputs.len() != catalogs.len() {
-        return Err(MaintainError::Invariant(
-            "inputs and catalogs length mismatch".to_string(),
-        ));
-    }
     let mut kept_inputs = Vec::with_capacity(inputs.len());
     let mut kept_catalogs = Vec::with_capacity(catalogs.len());
     for (input, catalog) in inputs.into_iter().zip(catalogs) {
