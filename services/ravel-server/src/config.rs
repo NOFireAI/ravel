@@ -16921,13 +16921,14 @@ mod tests {
     /// the host, and the budget is held at the 1 GiB floor rather than
     /// collapsing further. A second host proves the floor never LIFTS the
     /// budget above `MemTotal - RESERVE`: at 600 MiB of MemTotal the reserve
-    /// is 150 MiB, and the derived budget is 450 MiB, not the 1 GiB floor.
+    /// is the 256 MiB baseline (a quarter is 150 MiB), and the derived budget
+    /// is 344 MiB, not the 1 GiB floor.
     ///
     /// Prove-the-test: move the floor outside the `min` (apply
     /// `.max(MEMORY_BUDGET_FLOOR_BYTES)` to the final `min` result rather
     /// than to the available-term before the `min`). The first host's
     /// assertion is unaffected (both orderings land on the floor), but the
-    /// second reads 1,073,741,824 against the expected 471,859,200.
+    /// second reads 1,073,741,824 against the expected 360,710,144.
     #[test]
     fn the_floor_binds_but_never_lifts_the_budget_above_mem_total_minus_reserve() {
         // A co-resident process has claimed almost all of a 32,903,794,688
@@ -16946,7 +16947,7 @@ mod tests {
         assert_eq!(resolved.memory_budget_bytes, 1_073_741_824);
         assert!(resolved.memory_budget_floor_bound);
 
-        // A 600 MiB host: MemTotal - RESERVE is 450 MiB, below the floor.
+        // A 600 MiB host: MemTotal - RESERVE is 344 MiB, below the floor.
         // The floor must not lift the budget back above that.
         let tiny = HostProfile::new(
             1,
@@ -16957,9 +16958,9 @@ mod tests {
             Some(0),
         );
         let resolved = resolve_performance_defaults(tiny, PerformanceFlags::default());
-        assert_eq!(resolved.memory_overhead_reserve_bytes, 150 << 20);
-        assert_eq!(resolved.memory_budget_bytes, 450 << 20);
-        assert_eq!(resolved.memory_budget_bytes, 471_859_200);
+        assert_eq!(resolved.memory_overhead_reserve_bytes, 256 << 20);
+        assert_eq!(resolved.memory_budget_bytes, 344 << 20);
+        assert_eq!(resolved.memory_budget_bytes, 360_710_144);
         assert!(resolved.memory_budget_floor_bound);
         assert_eq!(
             resolved.sources.memory_budget_bytes,
