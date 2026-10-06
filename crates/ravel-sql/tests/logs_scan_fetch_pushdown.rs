@@ -713,8 +713,8 @@ async fn fetch_narrows_the_scan_statistics() {
 
     let one = table_provider.plan(1).expect("plan");
     let four = table_provider.plan(SEGS).expect("plan");
-    assert_eq!(one.output_partitioning().partition_count(), 1);
-    assert_eq!(four.output_partitioning().partition_count(), SEGS);
+    assert_eq!(one.properties().partitioning.partition_count(), 1);
+    assert_eq!(four.properties().partitioning.partition_count(), SEGS);
 
     for plan in [&one, &four] {
         assert_eq!(
