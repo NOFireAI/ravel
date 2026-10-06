@@ -155,7 +155,7 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         (Category::Clause, "SUBSTRING(x FROM y)") => Some(Expect::Str("cdef")),
         // 'x' replaces the second character of 'abc'.
         (Category::Clause, "OVERLAY(x PLACING y FROM n)") => Some(Expect::Str("axc")),
-        // The second field of each struct holds 2.
+        // The field each statement reads holds 2.
         (
             Category::Clause,
             "STRUCT(...) literal"

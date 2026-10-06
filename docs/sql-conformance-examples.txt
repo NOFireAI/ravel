@@ -82,7 +82,7 @@ Clause / operator	date_part(minute)	SELECT date_part('minute', ts) FROM samples
 Clause / operator	declared i64 typed aggregate	SELECT sum(dur) FROM logs
 Clause / operator	declared i64 typed comparison	SELECT ts FROM logs WHERE dur >= 20
 Clause / operator	named_struct(...)['k'] subscript	SELECT named_struct('a', 1, 'b', 2)['b']
-Clause / operator	struct field s.a	SELECT s.b FROM (SELECT named_struct('a', 1, 'b', 2) AS s)
+Clause / operator	struct field s.a	SELECT s.a FROM (SELECT named_struct('a', 2, 'b', 1) AS s)
 Clause / operator	trace_id = '<32-hex>'	SELECT count(*) FROM spans WHERE trace_id = '01234567890123456789012345678901'
 Clause / operator	unquoted substr(x, y, z)	SELECT substr('abcdef', 2, 3)
 Clause / operator	unquoted substring(x, y, z)	SELECT substring('abcdef', 2, 3)
