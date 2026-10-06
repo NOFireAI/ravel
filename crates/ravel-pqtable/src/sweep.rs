@@ -23,7 +23,11 @@
 //! above [`MAX_MANIFEST_VERSION`] are left out of that pairing, and so are
 //! `.pqm` keys whose slot names no version, which the listing skips
 //! and counts as [`crate::resolve::versions`] does: none is a table's newest,
-//! so none counts as a successor, and none is deleted here.
+//! so none counts as a successor, and none is deleted here. A `.pqm` key the
+//! Query grant admits under a segment that is not a valid table name
+//! ([`ListedManifestKey::InvalidTable`]) belongs to no table; the listing
+//! skips and counts it as [`crate::resolve::tenant_listing`] does, and the
+//! sweep never deletes it.
 //!
 //! [`plan`] refuses a grace below the deployment's minimum (its
 //! `--gc-max-query-duration`). Ages come from the store's
@@ -111,6 +115,7 @@ async fn manifests_by_table(
     // Per table: its versions, and the version characters of its keys that
     // name no version.
     let mut tables: BTreeMap<String, (Versions, Vec<String>)> = BTreeMap::new();
+    let mut invalid_table_keys = Vec::new();
     for meta in listed {
         match parse_listed_manifest_key(&meta.key).map_err(|e| foreign(&meta.key, &prefix, e))? {
             ListedManifestKey::Version(parsed) => {
@@ -134,8 +139,17 @@ async fn manifests_by_table(
                 }
                 tables.entry(table).or_default().1.push(slot);
             }
+            ListedManifestKey::InvalidTable { tenant_hash, .. } => {
+                if tenant_hash != *tenant {
+                    return Err(foreign(&meta.key, &prefix, "belongs to another tenant"));
+                }
+                invalid_table_keys.push(meta.key);
+            }
         }
     }
+    invalid_table_keys.sort_unstable();
+    invalid_table_keys.dedup();
+    resolve::note_invalid_tables(tenant, &invalid_table_keys);
     Ok(tables
         .into_iter()
         .map(|(table, (mut versions, mut slots))| {
@@ -211,6 +225,7 @@ mod tests {
     use bytes::Bytes;
     use ravel_object_store::PutOptions;
     use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
     use ravel_object_store::memory::MemoryStore;
 
     use super::*;
@@ -500,6 +515,79 @@ mod tests {
         );
         assert_eq!(resolve::above_bound_resolves(&TENANT, "hits"), 1);
         assert_eq!(warnings_naming(&logs, NESTED), 1);
+    }
+
+    #[tokio::test]
+    async fn a_key_under_an_invalid_table_segment_is_skipped_by_the_sweep() {
+        use crate::resolve::tests::{STRAY_SHAPES, capture_logs, put_stray, stray_warnings_naming};
+
+        for (i, rest) in STRAY_SHAPES.iter().enumerate() {
+            let tenant = TenantHash([0x63 + i as u8; 16]);
+            let (logs, _guard) = capture_logs();
+            let store = InstrumentedStore::new(MemoryStore::with_page_size(2));
+            store.inner().set_clock_ms(0);
+            for v in [1, 2] {
+                let bytes =
+                    encode_manifest(&tenant, &live_manifest("hits", v, &[1])).expect("encode");
+                store
+                    .put(
+                        &manifest_key(&tenant, "hits", v).expect("key"),
+                        Bytes::from(bytes),
+                        PutOptions::create_if_absent(),
+                    )
+                    .await
+                    .expect("put");
+            }
+            let stray = put_stray(store.inner(), &tenant, rest).await;
+            let now = (1 + GRACE + SKEW_MS) as i64;
+            for _ in 0..2 {
+                let planned = plan(&store, &tenant, now, GRACE, GRACE)
+                    .await
+                    .expect("plan");
+                assert_eq!(
+                    planned,
+                    SweepPlan {
+                        manifest_deletes: vec![manifest_key(&tenant, "hits", 1).expect("key")]
+                    },
+                    "{rest}"
+                );
+            }
+            assert_eq!(resolve::invalid_table_listings(&tenant), 2, "{rest}");
+            assert_eq!(stray_warnings_naming(&logs, &stray), 1, "{rest}");
+            let planned = plan(&store, &tenant, now, GRACE, GRACE)
+                .await
+                .expect("plan");
+            execute(&store, &planned).await.expect("execute");
+            assert_eq!(store.metrics().snapshot().op(StoreOp::Delete).calls, 1);
+            store
+                .head(&stray)
+                .await
+                .expect("the stray key is untouched");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_under_an_invalid_table_segment_without_the_suffix_is_refused() {
+        for rest in [
+            "Hits/v/00000000000000000001.parquet",
+            "a/b/v/00000000000000000001.pqm.tmp",
+            "Hits/v/00000000000000000001",
+            "Hits/v/0000000000000001.txt",
+        ] {
+            let store = MemoryStore::new();
+            let junk = format!("{}{rest}", tenant_manifest_prefix(&TENANT_A));
+            store
+                .put(&junk, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("put");
+            assert!(
+                matches!(
+                    plan(&store, &TENANT_A, 0, GRACE, GRACE).await,
+                    Err(SweepError::ForeignKey { ref key, .. }) if *key == junk
+                ),
+                "{rest}"
+            );
+        }
     }
 
     #[tokio::test]

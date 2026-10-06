@@ -156,6 +156,16 @@ pub enum ListedManifestKey {
         slot: String,
         reason: &'static str,
     },
+    /// `t/<tenant_hash>/pq/t/<segment>/v/<20 characters>.pqm` whose
+    /// `segment` is not a valid table name: an upper-case or reserved name,
+    /// or a path such as `a/b`. The Query grant's `*` binds any such segment,
+    /// so it admits these keys, but no table owns them; the tenant-wide
+    /// listings skip them and `ravel-cli parquet repair --stray` removes
+    /// them. `rest` is the key text after [`tenant_manifest_prefix`].
+    InvalidTable {
+        tenant_hash: TenantHash,
+        rest: String,
+    },
 }
 
 /// Split a manifest-shaped key into its tenant, its validated table name and
@@ -197,14 +207,40 @@ pub fn parse_manifest_key(key: &str) -> Result<ParsedManifestKey, KeyError> {
     })
 }
 
+/// The tenant and the text after `pq/t/` of a key the Query grant's pattern
+/// `t/<32 characters>/pq/t/*/v/<20 characters>.pqm` admits, whatever `*`
+/// binds; `None` for any other key.
+fn query_grant_shaped(key: &str) -> Option<(TenantHash, &str)> {
+    let (tenant_hash, after_pq) = split_tenant_pq(key).ok()?;
+    let rest = after_pq.strip_prefix("t/")?;
+    let stem = rest.strip_suffix(MANIFEST_SUFFIX)?;
+    let (slot_start, _) = stem.char_indices().rev().nth(VERSION_WIDTH - 1)?;
+    stem[..slot_start]
+        .ends_with("/v/")
+        .then_some((tenant_hash, rest))
+}
+
 /// Parse a key a manifest listing returned. A key [`parse_manifest_key`]
 /// accepts is [`ListedManifestKey::Version`]; one under a valid table's `v/`
 /// prefix ending in `.pqm` whose `slot` names no version is
-/// [`ListedManifestKey::InvalidVersion`]. Every other key is an error, as it
-/// is for [`parse_manifest_key`]: a suffix other than `.pqm`, a key outside a
-/// valid table's `v/` prefix, or a table segment [`validate_table`] refuses.
+/// [`ListedManifestKey::InvalidVersion`]; one the Query grant admits whose
+/// segment between `pq/t/` and `/v/` is not a valid table name is
+/// [`ListedManifestKey::InvalidTable`]. Every other key is an error, as it is
+/// for [`parse_manifest_key`]: a suffix other than `.pqm`, or a key with no
+/// `/v/<20 characters>.pqm` ending outside a valid table's `v/` prefix.
 pub fn parse_listed_manifest_key(key: &str) -> Result<ListedManifestKey, KeyError> {
-    let (tenant_hash, table, slot) = split_manifest_key(key)?;
+    let (tenant_hash, table, slot) = match split_manifest_key(key) {
+        Ok(parts) => parts,
+        Err(err) => {
+            return match query_grant_shaped(key) {
+                Some((tenant_hash, rest)) => Ok(ListedManifestKey::InvalidTable {
+                    tenant_hash,
+                    rest: rest.to_string(),
+                }),
+                None => Err(err),
+            };
+        }
+    };
     let reason = if slot.len() != VERSION_WIDTH || !slot.bytes().all(|b| b.is_ascii_digit()) {
         "version is not 20 decimal digits"
     } else {
@@ -381,15 +417,49 @@ mod tests {
                 "{key:?}"
             );
         }
-        // Only a key with a non-`.pqm` suffix, outside a valid table's `v/`
-        // prefix, or under an invalid table segment stays foreign.
+        // Only a key with a non-`.pqm` suffix, or with no `/v/<20>.pqm`
+        // ending outside a valid table's `v/` prefix, stays foreign.
         for key in [
             format!("t/{th}/pq/t/hits/v/00000000000000000001.parquet"),
             format!("t/{th}/pq/t/hits/x/00000000000000000001.pqm"),
-            format!("t/{th}/pq/t/Hits/v/00000000000000000001.pqm"),
+            format!("t/{th}/pq/t/Hits/v/00000000000000000001.parquet"),
+            format!("t/{th}/pq/t/Hits/v/0000000000000001.txt"),
+            format!("t/{th}/pq/t/Hits/v/00000000000000000001"),
+            format!("t/{th}/pq/t/Hits/v/0000000000000000001.pqm"),
+            format!("t/{th}/pq/t/Hits/v/000000000000000000001.pqm"),
+            format!("t/{th}/pq/t/a/b/00000000000000000001.pqm"),
             format!("t/{th}/pq/t/hits/notes.txt"),
+            format!("t/{th}/pq/x/Hits/v/00000000000000000001.pqm"),
         ] {
             assert!(parse_listed_manifest_key(&key).is_err(), "{key:?} parsed");
+        }
+    }
+
+    #[test]
+    fn a_listed_key_the_query_grant_admits_under_an_invalid_table_is_named() {
+        let th = "a1".repeat(16);
+        for rest in [
+            "Hits/v/00000000000000000001.pqm",
+            "logs/v/00000000000000000001.pqm",
+            "l0/v/00000000000000000001.pqm",
+            "a/b/v/00000000000000000001.pqm",
+            "hits/x/v/00000000000000000001.pqm",
+            "/v/00000000000000000001.pqm",
+            // The 20 characters are any characters, as the grant's `?` is.
+            "Hits/v/\u{1b}[2Jxxxxxxxxxxxxxxxx.pqm",
+            "Hits/v/0000000000000000000\u{e9}.pqm",
+        ] {
+            let key = format!("t/{th}/pq/t/{rest}");
+            assert_eq!(
+                parse_listed_manifest_key(&key).expect("parse"),
+                ListedManifestKey::InvalidTable {
+                    tenant_hash: TENANT_A,
+                    rest: rest.into(),
+                },
+                "{key:?}"
+            );
+            // Never a manifest key a writer or resolver accepts.
+            assert!(parse_manifest_key(&key).is_err(), "{key:?}");
         }
     }
 }

@@ -1,7 +1,8 @@
 //! `ravel-cli parquet` (ADR-2040): inspect a tenant's Parquet table manifests,
 //! delete the manifest versions a sweep has made superseded, and remove
 //! forged versions: those above the manifest version bound, keys naming no
-//! version, and one version an operator names.
+//! version, one version an operator names, and keys under a segment that is
+//! not a valid table name.
 //!
 //! Every subcommand delegates to [`ravel_pqtable`]: `ls` reads through
 //! [`ravel_pqtable::resolve`], `sweep` plans and executes through
@@ -138,7 +139,15 @@ pub async fn ls(
     table: Option<&str>,
 ) -> anyhow::Result<()> {
     let hash = TenantId::new(tenant).hash();
-    let all = resolve::table_listings(store.as_ref(), &hash).await?;
+    let listing = resolve::tenant_listing(store.as_ref(), &hash).await?;
+    let stray = listing.invalid_table_keys.len();
+    if stray > 0 {
+        println!(
+            "{stray} manifest-shaped key(s) under no valid table name, skipped by every \
+             reader: run `ravel-cli parquet repair --tenant {tenant} --stray`"
+        );
+    }
+    let all = listing.tables;
     let selected: Vec<(&String, &resolve::TableListing)> = match table {
         Some(name) => all.iter().filter(|(t, _)| t.as_str() == name).collect(),
         None => all.iter().collect(),
@@ -302,6 +311,58 @@ async fn repair_lines(
     }
     let deleted = repair::delete_flagged(store, &hash, table, &flagged).await?;
     out.push(format!("deleted {} manifest versions", deleted.len()));
+    out.extend(deleted.iter().map(|key| format!("  {key:?}")));
+    Ok(out)
+}
+
+/// `parquet repair --stray`: list every key under the tenant's manifest
+/// prefix whose segment between `pq/t/` and `/v/` is not a valid table name;
+/// with `delete`, remove exactly those.
+pub async fn repair_stray(
+    store: Arc<dyn ObjectStoreBackend>,
+    tenant: &str,
+    delete: bool,
+) -> anyhow::Result<()> {
+    for line in repair_stray_lines(store.as_ref(), tenant, delete).await? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// What [`repair_stray`] prints. The keys are chosen by whoever put them, so
+/// they are printed quoted and escaped.
+async fn repair_stray_lines(
+    store: &dyn ObjectStoreBackend,
+    tenant: &str,
+    delete: bool,
+) -> anyhow::Result<Vec<String>> {
+    let hash = TenantId::new(tenant).hash();
+    let entries = repair::list_stray(store, &hash).await?;
+    let mut out = vec![format!(
+        "tenant: {tenant} ({} key(s) under no valid table name)",
+        entries.len()
+    )];
+    for entry in &entries {
+        out.push(format!("  key: {:?}", entry.key));
+        out.push(format!(
+            "    stored_unix_ms: {} (the store's clock)",
+            entry.last_modified_unix_ms
+        ));
+    }
+    if entries.is_empty() {
+        out.push("no keys under no valid table name; nothing to delete".to_string());
+        return Ok(out);
+    }
+    if !delete {
+        out.push(format!(
+            "{} key(s) listed; rerun with --delete to remove exactly these",
+            entries.len()
+        ));
+        return Ok(out);
+    }
+    let keys: Vec<String> = entries.into_iter().map(|e| e.key).collect();
+    let deleted = repair::delete_stray(store, &hash, &keys).await?;
+    out.push(format!("deleted {} key(s)", deleted.len()));
     out.extend(deleted.iter().map(|key| format!("  {key:?}")));
     Ok(out)
 }
@@ -684,6 +745,184 @@ mod tests {
         );
         assert!(printed.contains("deleted 2 manifest versions"), "{printed}");
         assert_eq!(deletes(denied.inner()), 2);
+    }
+
+    /// Records the key of every `delete` before passing it on.
+    struct DeleteLog<S> {
+        inner: S,
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl<S> DeleteLog<S> {
+        fn deletes(&self) -> Vec<String> {
+            self.deletes.lock().expect("lock").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl<S: ObjectStoreBackend> ObjectStoreBackend for DeleteLog<S> {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, ravel_object_store::StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: ravel_object_store::GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, ravel_object_store::StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, ravel_object_store::StoreError>
+        {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(
+            &self,
+            key: &str,
+        ) -> Result<ravel_object_store::ObjectMeta, ravel_object_store::StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, ravel_object_store::StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, ravel_object_store::StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ravel_object_store::StoreError> {
+            self.deletes.lock().expect("lock").push(key.to_string());
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// The text after `t/<tenant_hash>/pq/t/` of `.pqm` keys under a segment
+    /// that is not a valid table name: upper case, a reserved name, a nested
+    /// path, and one whose version characters hold control characters.
+    const STRAYS: [&str; 4] = [
+        "Hits/v/00000000000000000001.pqm",
+        "logs/v/00000000000000000001.pqm",
+        "a/b/v/00000000000000000001.pqm",
+        "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm",
+    ];
+
+    /// [`forged_table`] plus every [`STRAYS`] key of `acme`, written at store
+    /// time 5_000, with every delete recorded. Returns the store and the stray
+    /// keys in ascending order.
+    async fn stray_table() -> (DeleteLog<InstrumentedStore<MemoryStore>>, Vec<String>) {
+        let store = forged_table().await;
+        let hash = TenantId::new("acme").hash();
+        store.inner().set_clock_ms(5_000);
+        let mut keys: Vec<String> = STRAYS
+            .iter()
+            .map(|rest| {
+                format!(
+                    "{}{rest}",
+                    ravel_pqtable::keys::tenant_manifest_prefix(&hash)
+                )
+            })
+            .collect();
+        for key in &keys {
+            store
+                .inner()
+                .put(key, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        keys.sort();
+        let store = DeleteLog {
+            inner: store,
+            deletes: std::sync::Mutex::new(Vec::new()),
+        };
+        (store, keys)
+    }
+
+    #[tokio::test]
+    async fn repair_stray_lists_exactly_the_stray_keys_escaped_and_deletes_nothing() {
+        let (store, strays) = stray_table().await;
+        let lines = repair_stray_lines(&store, "acme", false)
+            .await
+            .expect("repair");
+        let printed = lines.join("\n");
+        let listed: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("  key: "))
+            .collect();
+        let expected: Vec<String> = strays.iter().map(|k| format!("{k:?}")).collect();
+        assert_eq!(listed, expected, "{printed}");
+        assert_eq!(
+            printed
+                .matches("stored_unix_ms: 5000 (the store's clock)")
+                .count(),
+            4
+        );
+        assert!(!printed.contains("/hits/"), "{printed}");
+        assert!(!printed.contains('\u{1b}'), "{printed}");
+        assert!(!printed.contains('\u{7}'), "{printed}");
+        assert!(
+            printed.ends_with("4 key(s) listed; rerun with --delete to remove exactly these"),
+            "{printed}"
+        );
+        assert!(store.deletes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn repair_stray_with_the_flag_deletes_exactly_the_stray_keys() {
+        let (store, strays) = stray_table().await;
+        let hash = TenantId::new("acme").hash();
+        let lines = repair_stray_lines(&store, "acme", true)
+            .await
+            .expect("repair");
+        let printed = lines.join("\n");
+        assert_eq!(store.deletes(), strays);
+        assert!(printed.contains("deleted 4 key(s)"), "{printed}");
+        assert!(!printed.contains('\u{1b}'), "{printed}");
+        // The valid table keeps every key it had, flagged ones included.
+        assert_eq!(
+            resolve::versions(&store, &hash, "hits")
+                .await
+                .expect("versions"),
+            vec![1, MAX_MANIFEST_VERSION, MAX_MANIFEST_VERSION + 1, u64::MAX]
+        );
+        // The tenant-wide listings no longer skip anything.
+        assert!(
+            resolve::tenant_listing(&store, &hash)
+                .await
+                .expect("listing")
+                .invalid_table_keys
+                .is_empty()
+        );
+        // Run again: nothing to delete, and nothing is.
+        let lines = repair_stray_lines(&store, "acme", true)
+            .await
+            .expect("repair");
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("no keys under no valid table name; nothing to delete")
+        );
+        assert_eq!(store.deletes().len(), 4);
     }
 
     /// A bucket no server has bootstrapped has no deployment minimum, so the

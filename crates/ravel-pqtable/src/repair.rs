@@ -15,6 +15,12 @@
 //! having judged it forged from the DDL audit log (every statement the server
 //! runs records `attempted` before it touches the store), and nothing else.
 //!
+//! The same grant's `*` also admits a `.pqm` key whose segment between
+//! `pq/t/` and `/v/` is not a valid table name
+//! ([`ListedManifestKey::InvalidTable`]). No table owns it, so no per-table
+//! listing shows it; the tenant-wide listings skip it. [`list_stray`] lists
+//! every such key of a tenant and [`delete_stray`] deletes exactly those.
+//!
 //! The repair runs under the Maintain credential, which lists and deletes
 //! under `t/<tenant_hash>/pq/t/` and reads no manifest. Which versions are
 //! flagged is therefore decided from the listing alone. [`describe`] reads a
@@ -22,12 +28,14 @@
 //! reports a read it could not make rather than failing. Any other key that is
 //! not a manifest version is listed, never flagged and never deleted here.
 
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{
+    DrainStep, GetRange, MAX_LIST_PAGES, ObjectStoreBackend, StoreError, drain_pages, list_all,
+};
 use ravel_types::TenantHash;
 
 use crate::keys::{
-    KeyError, ListedManifestKey, MAX_MANIFEST_VERSION, manifest_key, manifest_prefix,
-    parse_listed_manifest_key,
+    KeyError, ListedManifestKey, MANIFEST_SUFFIX, MAX_MANIFEST_VERSION, manifest_key,
+    manifest_prefix, parse_listed_manifest_key, tenant_manifest_prefix,
 };
 use crate::manifest::{Manifest, decode_manifest};
 
@@ -57,6 +65,14 @@ pub enum RepairError {
     /// listing. Nothing was deleted.
     #[error("refusing to delete {key:?}: no such key is listed")]
     NotListed { key: String },
+    /// A key asked to be deleted that [`list_stray`] does not list: a manifest
+    /// key of a valid table, another tenant's key, or one of no manifest
+    /// shape. Nothing was deleted.
+    #[error(
+        "refusing to delete {key:?}: it is not a key of this tenant whose segment between pq/t/ \
+         and /v/ is not a valid table name; only those are removed by --stray --delete"
+    )]
+    NotStray { key: String },
     #[error(transparent)]
     Key(#[from] KeyError),
 }
@@ -127,6 +143,7 @@ fn classify(tenant: &TenantHash, table: &str, key: &str) -> (ListedVersion, bool
                 (foreign(), false)
             }
         }
+        Ok(ListedManifestKey::InvalidTable { .. }) => (foreign(), false),
         Err(err) => (
             ListedVersion::NotAVersion {
                 reason: err.to_string(),
@@ -205,6 +222,14 @@ pub async fn delete_flagged(
             });
         }
     }
+    delete_each(store, keys).await
+}
+
+/// Delete `keys` in order, stopping at the first delete that fails.
+async fn delete_each(
+    store: &dyn ObjectStoreBackend,
+    keys: &[String],
+) -> Result<Vec<String>, RepairError> {
     let mut deleted = Vec::with_capacity(keys.len());
     for key in keys {
         store
@@ -217,6 +242,101 @@ pub async fn delete_flagged(
         deleted.push(key.clone());
     }
     Ok(deleted)
+}
+
+/// A key of `tenant` whose segment between `pq/t/` and `/v/` is not a valid
+/// table name ([`ListedManifestKey::InvalidTable`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrayEntry {
+    pub key: String,
+    /// When the store wrote the key, by the store's clock.
+    pub last_modified_unix_ms: i64,
+}
+
+fn is_stray(tenant: &TenantHash, key: &str) -> bool {
+    matches!(
+        parse_listed_manifest_key(key),
+        Ok(ListedManifestKey::InvalidTable { tenant_hash, .. }) if tenant_hash == *tenant
+    )
+}
+
+/// Every key under `t/<tenant_hash>/pq/t/` that is
+/// [`ListedManifestKey::InvalidTable`], in ascending key order: the keys the
+/// tenant-wide listings skip because no table owns them. Manifest keys of
+/// valid tables and keys of no manifest shape are not listed. One paginated
+/// LIST of a prefix that ends at a segment boundary; no key is read.
+pub async fn list_stray(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> Result<Vec<StrayEntry>, RepairError> {
+    let prefix = tenant_manifest_prefix(tenant);
+    let mut listed = list_all(store, &prefix)
+        .await
+        .map_err(|source| RepairError::Store {
+            key: prefix.clone(),
+            source,
+        })?;
+    listed.sort_by(|a, b| a.key.cmp(&b.key));
+    listed.dedup_by(|a, b| a.key == b.key);
+    Ok(listed
+        .into_iter()
+        .filter(|meta| is_stray(tenant, &meta.key))
+        .map(|meta| StrayEntry {
+            key: meta.key,
+            last_modified_unix_ms: meta.last_modified_unix_ms,
+        })
+        .collect())
+}
+
+/// Delete `keys`, each of which must be one [`list_stray`] lists for
+/// `tenant`. Every key is classified before the first delete, so a manifest
+/// key of a valid table, another tenant's key, or any other key
+/// ([`RepairError::NotStray`]) deletes nothing. A delete that fails stops the
+/// repair. Returns the deleted keys.
+pub async fn delete_stray(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    keys: &[String],
+) -> Result<Vec<String>, RepairError> {
+    if let Some(key) = keys.iter().find(|key| !is_stray(tenant, key)) {
+        return Err(RepairError::NotStray { key: key.clone() });
+    }
+    delete_each(store, keys).await
+}
+
+/// Whether the manifest key `key` is in the listing of `prefix`, the `v/`
+/// prefix it sits under. The S3 adapter appends the delimiter to every list
+/// prefix, so `key` itself cannot be the prefix; the listing starts just
+/// before `key` instead, which costs one request however many versions the
+/// table holds. The Maintain credential may list here but not read, so this
+/// is a listing rather than a HEAD.
+async fn is_listed(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    key: &str,
+) -> Result<bool, RepairError> {
+    // Below `key`, and every key between the two starts with it.
+    let start_after = key.strip_suffix(MANIFEST_SUFFIX).unwrap_or(prefix);
+    let mut found = false;
+    drain_pages::<StoreError, _, _, _>(
+        prefix,
+        Some(start_after),
+        MAX_LIST_PAGES,
+        |after, token| async move { store.list_after(prefix, after.as_deref(), token).await },
+        |meta| {
+            if meta.key.as_str() < key {
+                return Ok(DrainStep::Continue);
+            }
+            found = meta.key == key;
+            Ok(DrainStep::Stop)
+        },
+    )
+    .await
+    .map_err(|source| RepairError::Store {
+        key: prefix.to_string(),
+        source,
+    })?;
+    Ok(found)
 }
 
 /// Delete exactly the key of `table`'s manifest `version`, which must be in
@@ -237,15 +357,8 @@ pub async fn delete_version(
         });
     }
     let key = manifest_key(tenant, table, version)?;
-    // Listing the key itself costs one request however many versions the
-    // table holds.
-    let listed = list_all(store, &key)
-        .await
-        .map_err(|source| RepairError::Store {
-            key: key.clone(),
-            source,
-        })?;
-    if !listed.iter().any(|meta| meta.key == key) {
+    let prefix = manifest_prefix(tenant, table)?;
+    if !is_listed(store, &prefix, &key).await? {
         return Err(RepairError::NotListed { key });
     }
     store
@@ -527,6 +640,292 @@ mod tests {
         assert_eq!(
             list(&store, &TENANT_A, "hits").await.expect("list").len(),
             9
+        );
+    }
+
+    /// Lists the way the S3 adapter does: `object_store` appends the path
+    /// delimiter to every non-empty list prefix, so a prefix that ends mid
+    /// segment, such as a whole key, matches nothing.
+    struct SegmentAlignedStore {
+        inner: InstrumentedStore<MemoryStore>,
+        /// Every key passed to `delete`, in call order.
+        deletes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SegmentAlignedStore {
+        fn new(inner: MemoryStore) -> Self {
+            SegmentAlignedStore {
+                inner: InstrumentedStore::new(inner),
+                deletes: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn deletes(&self) -> Vec<String> {
+            self.deletes.lock().expect("lock").clone()
+        }
+    }
+
+    fn segment_aligned(prefix: &str) -> String {
+        let trimmed = prefix.trim_end_matches('/');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}/")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for SegmentAlignedStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(&segment_aligned(prefix), page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(&segment_aligned(prefix)).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.deletes.lock().expect("lock").push(key.to_string());
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    async fn segment_aligned_forged_store() -> SegmentAlignedStore {
+        let store = SegmentAlignedStore::new(forged_store().await);
+        for v in [2, 3] {
+            put_version(store.inner.inner(), &TENANT_A, v).await;
+        }
+        store
+    }
+
+    /// The text after `t/<tenant_hash>/pq/t/` of keys the Query grant admits
+    /// under a segment that is not a valid table name: upper case, a reserved
+    /// name, a nested path, and an upper-case name whose 20 version
+    /// characters hold control characters.
+    const STRAYS: [&str; 4] = [
+        "Hits/v/00000000000000000001.pqm",
+        "a/b/v/00000000000000000001.pqm",
+        "logs/v/00000000000000000001.pqm",
+        "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm",
+    ];
+
+    fn stray_key(tenant: &TenantHash, rest: &str) -> String {
+        format!("{}{rest}", tenant_manifest_prefix(tenant))
+    }
+
+    /// [`forged_store`] with versions 2 and 3, every [`STRAYS`] key of
+    /// tenant A written at store time 5_000, one of tenant B, and a key under
+    /// an invalid table segment without the `.pqm` suffix, behind the
+    /// segment-aligned listing.
+    async fn stray_store() -> SegmentAlignedStore {
+        let store = segment_aligned_forged_store().await;
+        let memory = store.inner.inner();
+        memory.set_clock_ms(5_000);
+        for key in STRAYS.iter().map(|rest| stray_key(&TENANT_A, rest)).chain([
+            stray_key(&TENANT_B, STRAYS[0]),
+            stray_key(&TENANT_A, "Hits/v/00000000000000000001.parquet"),
+        ]) {
+            memory
+                .put(&key, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("put");
+        }
+        store
+    }
+
+    /// Tenant A's [`STRAYS`] keys in ascending key order.
+    fn sorted_strays() -> Vec<String> {
+        let mut keys: Vec<String> = STRAYS.iter().map(|r| stray_key(&TENANT_A, r)).collect();
+        keys.sort();
+        keys
+    }
+
+    #[tokio::test]
+    async fn list_stray_lists_exactly_the_keys_under_no_valid_table() {
+        let store = stray_store().await;
+        let got = list_stray(&store, &TENANT_A).await.expect("list");
+        assert_eq!(
+            got,
+            sorted_strays()
+                .into_iter()
+                .map(|key| StrayEntry {
+                    key,
+                    last_modified_unix_ms: 5_000
+                })
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            list_stray(&store, &TENANT_B).await.expect("list"),
+            vec![StrayEntry {
+                key: stray_key(&TENANT_B, STRAYS[0]),
+                last_modified_unix_ms: 5_000
+            }]
+        );
+        assert!(store.deletes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_stray_deletes_exactly_the_listed_stray_keys() {
+        let store = stray_store().await;
+        let hits_before = keys_of(list(&store, &TENANT_A, "hits").await.expect("list"));
+        let keys: Vec<String> = list_stray(&store, &TENANT_A)
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        let deleted = delete_stray(&store, &TENANT_A, &keys)
+            .await
+            .expect("delete");
+        assert_eq!(deleted, sorted_strays());
+        assert_eq!(store.deletes(), sorted_strays());
+        assert!(
+            list_stray(&store, &TENANT_A)
+                .await
+                .expect("list")
+                .is_empty()
+        );
+        // Every valid table's keys, the other tenant's stray key and the
+        // foreign key are still there.
+        assert_eq!(
+            keys_of(list(&store, &TENANT_A, "hits").await.expect("list")),
+            hits_before
+        );
+        for key in [
+            stray_key(&TENANT_B, STRAYS[0]),
+            stray_key(&TENANT_A, "Hits/v/00000000000000000001.parquet"),
+        ] {
+            store.head(&key).await.expect("untouched");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_stray_refuses_any_other_key_before_any_delete() {
+        let store = stray_store().await;
+        for refused in [
+            mkey(1),
+            mkey(u64::MAX),
+            invalid_key(ZERO),
+            notes_key(),
+            stray_key(&TENANT_B, STRAYS[0]),
+            stray_key(&TENANT_A, "Hits/v/00000000000000000001.parquet"),
+        ] {
+            // A stray key first: the refusal must come before any delete.
+            let mut keys = sorted_strays();
+            keys.push(refused.clone());
+            let got = delete_stray(&store, &TENANT_A, &keys).await;
+            assert!(
+                matches!(&got, Err(RepairError::NotStray { key }) if *key == refused),
+                "{got:?}"
+            );
+        }
+        assert!(store.deletes().is_empty());
+        assert_eq!(
+            store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+            0
+        );
+        assert_eq!(list_stray(&store, &TENANT_A).await.expect("list").len(), 4);
+    }
+
+    #[tokio::test]
+    async fn the_wrapper_lists_by_whole_segment() {
+        let store = segment_aligned_forged_store().await;
+        assert!(list_all(&store, &mkey(2)).await.expect("list").is_empty());
+        assert_eq!(
+            list(&store, &TENANT_A, "hits").await.expect("list").len(),
+            11
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_version_finds_an_existing_version_on_a_segment_aligned_store() {
+        let store = segment_aligned_forged_store().await;
+        let before = keys_of(list(&store, &TENANT_A, "hits").await.expect("list"));
+        let deleted = delete_version(&store, &TENANT_A, "hits", 2)
+            .await
+            .expect("delete");
+        assert_eq!(deleted, mkey(2));
+        assert_eq!(
+            store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+            1
+        );
+        let after = keys_of(list(&store, &TENANT_A, "hits").await.expect("list"));
+        let expected: Vec<String> = before.into_iter().filter(|k| *k != mkey(2)).collect();
+        assert_eq!(after, expected);
+        // Version 1 sorts first and the bound among the highest: both are
+        // found too.
+        for version in [1, MAX_MANIFEST_VERSION] {
+            assert_eq!(
+                delete_version(&store, &TENANT_A, "hits", version)
+                    .await
+                    .expect("delete"),
+                mkey(version)
+            );
+        }
+        assert_eq!(
+            store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_version_of_a_missing_version_on_a_segment_aligned_store_is_not_listed() {
+        let store = segment_aligned_forged_store().await;
+        // 5 is missing between listed versions; 4294967295 sorts just below
+        // the bound, which is listed.
+        for version in [5, MAX_MANIFEST_VERSION - 1] {
+            let got = delete_version(&store, &TENANT_A, "hits", version).await;
+            assert!(
+                matches!(&got, Err(RepairError::NotListed { key }) if *key == mkey(version)),
+                "{got:?}"
+            );
+        }
+        assert_eq!(
+            store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+            0
+        );
+        assert_eq!(
+            list(&store, &TENANT_A, "hits").await.expect("list").len(),
+            11
         );
     }
 

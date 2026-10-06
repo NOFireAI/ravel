@@ -12,6 +12,13 @@
 //! listing here, and the sweep's, skips it rather than failing. Each listing
 //! that finds either kind is counted, and the table is reported once per
 //! process as an [`AboveBoundVersions`] warning.
+//!
+//! A key the Query grant admits whose segment between `pq/t/` and `/v/` is
+//! not a valid table name ([`ListedManifestKey::InvalidTable`]) belongs to no
+//! table, so no per-table listing sees it. The tenant-wide listings here and
+//! in the sweep skip it the same way, count it per tenant
+//! ([`invalid_table_listings`]) and report the tenant once per process as an
+//! [`InvalidTableKeys`] warning.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
@@ -47,6 +54,25 @@ pub struct AboveBoundVersions {
     pub bound: u64,
 }
 
+/// A tenant whose manifest prefix holds keys the Query grant admits under a
+/// segment that is not a valid table name
+/// ([`ListedManifestKey::InvalidTable`]). Logged once per tenant per process;
+/// [`invalid_table_listings`] counts every listing that saw one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "tenant {tenant_hash} has {count} manifest-shaped key(s) whose segment between pq/t/ and \
+     /v/ is not a valid table name (first {first:?}); they are ignored, and \
+     `ravel-cli parquet repair --tenant <tenant> --stray --delete` removes them"
+)]
+pub struct InvalidTableKeys {
+    /// The tenant hash, as 32 lowercase hex characters.
+    pub tenant_hash: String,
+    pub count: usize,
+    /// The first such key in key order, whole. Chosen by whoever put it, so
+    /// print it escaped.
+    pub first: String,
+}
+
 /// How many (tenant hash, table) pairs [`ABOVE_BOUND`] records. Past it, a
 /// listing of a table not yet recorded is not counted, so the map cannot grow
 /// with the number of tables someone forges keys under. The warning is then
@@ -64,24 +90,30 @@ pub const ABOVE_BOUND_WARN_EVERY: u64 = 1024;
 /// The per-process warning state: listings that saw a version key no reader
 /// resolves, per (tenant hash, table), for at most [`ABOVE_BOUND_TABLES_MAX`]
 /// pairs, and a saturating count of listings the full map had no room for.
+/// `invalid_tables` and `invalid_tables_overflow` are the same per tenant hash
+/// for [`ListedManifestKey::InvalidTable`] keys, under the same cap.
 struct AboveBoundState {
     seen: BTreeMap<(String, String), u64>,
     overflow: u64,
+    invalid_tables: BTreeMap<String, u64>,
+    invalid_tables_overflow: u64,
 }
 
 static ABOVE_BOUND: Mutex<AboveBoundState> = Mutex::new(AboveBoundState {
     seen: BTreeMap::new(),
     overflow: 0,
+    invalid_tables: BTreeMap::new(),
+    invalid_tables_overflow: 0,
 });
 
 /// Count one listing of `key` in `seen`, which holds at most `cap` entries,
 /// and in `overflow` once it is full. Returns true when the caller should log
 /// it: the first time `key` is recorded, and on one in every `warn_every`
 /// listings of a key the full map has no room for.
-fn record_in(
-    seen: &mut BTreeMap<(String, String), u64>,
+fn record_in<K: Ord>(
+    seen: &mut BTreeMap<K, u64>,
     overflow: &mut u64,
-    key: (String, String),
+    key: K,
     cap: usize,
     warn_every: u64,
 ) -> bool {
@@ -126,7 +158,7 @@ pub(crate) fn note_unresolvable(
     };
     let log = {
         let mut state = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
-        let AboveBoundState { seen, overflow } = &mut *state;
+        let AboveBoundState { seen, overflow, .. } = &mut *state;
         record_in(
             seen,
             overflow,
@@ -154,6 +186,55 @@ pub fn above_bound_resolves(tenant: &TenantHash, table: &str) -> u64 {
     state
         .seen
         .get(&(tenant.to_hex(), table.to_string()))
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Count and, the first time for `tenant`, log one tenant-wide listing that
+/// found `keys` ([`ListedManifestKey::InvalidTable`] keys, ascending).
+/// Nothing when `keys` is empty.
+pub(crate) fn note_invalid_tables(tenant: &TenantHash, keys: &[String]) {
+    let Some(first) = keys.first() else {
+        return;
+    };
+    let warning = InvalidTableKeys {
+        tenant_hash: tenant.to_hex(),
+        count: keys.len(),
+        first: first.clone(),
+    };
+    let log = {
+        let mut state = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+        let AboveBoundState {
+            invalid_tables,
+            invalid_tables_overflow,
+            ..
+        } = &mut *state;
+        record_in(
+            invalid_tables,
+            invalid_tables_overflow,
+            warning.tenant_hash.clone(),
+            ABOVE_BOUND_TABLES_MAX,
+            ABOVE_BOUND_WARN_EVERY,
+        )
+    };
+    if log {
+        tracing::warn!(
+            tenant_hash = %warning.tenant_hash,
+            first = ?warning.first,
+            "{warning}"
+        );
+    }
+}
+
+/// How many tenant-wide listings of `tenant` in this process found a key the
+/// Query grant admits under a segment that is not a valid table name
+/// ([`ListedManifestKey::InvalidTable`]). Zero for a tenant first seen after
+/// [`ABOVE_BOUND_TABLES_MAX`] others were recorded.
+pub fn invalid_table_listings(tenant: &TenantHash) -> u64 {
+    let state = ABOVE_BOUND.lock().unwrap_or_else(PoisonError::into_inner);
+    state
+        .invalid_tables
+        .get(&tenant.to_hex())
         .copied()
         .unwrap_or(0)
 }
@@ -233,15 +314,28 @@ pub struct TableListing {
     pub invalid_keys: Vec<String>,
 }
 
+/// What one listing of a tenant's whole manifest prefix found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TenantListing {
+    /// Every table with at least one key under its `v/` prefix.
+    pub tables: BTreeMap<String, TableListing>,
+    /// The keys whose segment between `pq/t/` and `/v/` is not a valid table
+    /// name ([`ListedManifestKey::InvalidTable`]), whole and ascending. No
+    /// reader resolves them and no table owns them.
+    pub invalid_table_keys: Vec<String>,
+}
+
 /// Every key under `prefix`, grouped by table. `only_table` is the table a
 /// per-table prefix belongs to, which every key must name. Each table with a
-/// key no reader resolves is passed to [`note_unresolvable`].
+/// key no reader resolves is passed to [`note_unresolvable`], and the keys
+/// under no valid table, which only a tenant-wide listing can see, to
+/// [`note_invalid_tables`].
 async fn list_grouped(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     prefix: &str,
     only_table: Option<&str>,
-) -> Result<BTreeMap<String, TableListing>, ResolveError> {
+) -> Result<TenantListing, ResolveError> {
     let listed = list_all(store, prefix)
         .await
         .map_err(|e| store_error(prefix, e))?;
@@ -251,6 +345,7 @@ async fn list_grouped(
         reason,
     };
     let mut out: BTreeMap<String, (TableListing, Vec<String>)> = BTreeMap::new();
+    let mut invalid_table_keys = Vec::new();
     for meta in listed {
         let parsed = parse_listed_manifest_key(&meta.key)
             .map_err(|e| foreign(meta.key.clone(), e.to_string()))?;
@@ -259,6 +354,16 @@ async fn list_grouped(
             ListedManifestKey::InvalidVersion {
                 tenant_hash, table, ..
             } => (*tenant_hash, table.as_str()),
+            ListedManifestKey::InvalidTable { tenant_hash, .. } => {
+                if *tenant_hash != *tenant || only_table.is_some() {
+                    return Err(foreign(
+                        meta.key,
+                        "belongs to another tenant or table".into(),
+                    ));
+                }
+                invalid_table_keys.push(meta.key);
+                continue;
+            }
         };
         if tenant_hash != *tenant || only_table.is_some_and(|t| t != table) {
             return Err(foreign(
@@ -273,9 +378,13 @@ async fn list_grouped(
                 listing.invalid_keys.push(meta.key);
                 slots.push(slot);
             }
+            ListedManifestKey::InvalidTable { .. } => {}
         }
     }
-    Ok(out
+    invalid_table_keys.sort_unstable();
+    invalid_table_keys.dedup();
+    note_invalid_tables(tenant, &invalid_table_keys);
+    let tables = out
         .into_iter()
         .map(|(table, (mut listing, mut slots))| {
             slots.sort_unstable();
@@ -287,7 +396,11 @@ async fn list_grouped(
             note_unresolvable(tenant, &table, &listing.versions, &slots);
             (table, listing)
         })
-        .collect())
+        .collect();
+    Ok(TenantListing {
+        tables,
+        invalid_table_keys,
+    })
 }
 
 /// Every version number of `table`, ascending, from a paginated LIST of its
@@ -302,22 +415,33 @@ pub async fn versions(
 ) -> Result<Vec<u64>, ResolveError> {
     let prefix = manifest_prefix(tenant, table)?;
     let mut grouped = list_grouped(store, tenant, &prefix, Some(table)).await?;
-    Ok(grouped.remove(table).unwrap_or_default().versions)
+    Ok(grouped.tables.remove(table).unwrap_or_default().versions)
 }
 
-/// Every table of `tenant` with at least one key under its `v/` prefix, and
-/// what that prefix holds.
+/// Every table of `tenant` with at least one key under its `v/` prefix, what
+/// that prefix holds, and the keys under no valid table.
 ///
 /// One LIST of `t/<tenant_hash>/pq/t/` answers for every table, so an
 /// inspection of a whole tenant costs the same listing a sweep does rather
 /// than one per table. Keys whose slot names no version are skipped and
-/// counted as in [`versions`]; any other key under that prefix that is not a
-/// manifest key is [`ResolveError::ForeignKey`].
+/// counted as in [`versions`]. Keys the Query grant admits under a segment
+/// that is not a valid table name ([`ListedManifestKey::InvalidTable`]) are
+/// skipped and counted per tenant ([`invalid_table_listings`]). Any other key
+/// under that prefix that is not a manifest key is
+/// [`ResolveError::ForeignKey`].
+pub async fn tenant_listing(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+) -> Result<TenantListing, ResolveError> {
+    list_grouped(store, tenant, &tenant_manifest_prefix(tenant), None).await
+}
+
+/// The tables of [`tenant_listing`].
 pub async fn table_listings(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
 ) -> Result<BTreeMap<String, TableListing>, ResolveError> {
-    list_grouped(store, tenant, &tenant_manifest_prefix(tenant), None).await
+    Ok(tenant_listing(store, tenant).await?.tables)
 }
 
 /// Every table of `tenant` that has at least one manifest version, with that
@@ -660,6 +784,117 @@ pub(crate) mod tests {
         );
         assert_eq!(above_bound_resolves(&TENANT, "hits"), 3);
         assert_eq!(warnings_naming(&logs, NESTED), 1);
+    }
+
+    /// The text after `t/<tenant_hash>/pq/t/` of a key the Query grant admits
+    /// under a segment that is not a valid table name: upper case, a reserved
+    /// name, and a nested path.
+    pub(crate) const STRAY_SHAPES: [&str; 3] = [
+        "Hits/v/00000000000000000001.pqm",
+        "logs/v/00000000000000000001.pqm",
+        "a/b/v/00000000000000000001.pqm",
+    ];
+
+    /// Put `t/<tenant>/pq/t/<rest>` with a body that is not a manifest, and
+    /// return the key.
+    pub(crate) async fn put_stray(store: &MemoryStore, tenant: &TenantHash, rest: &str) -> String {
+        let key = format!("{}{rest}", tenant_manifest_prefix(tenant));
+        store
+            .put(&key, Bytes::from_static(b"forged"), PutOptions::default())
+            .await
+            .expect("put");
+        key
+    }
+
+    /// How many times the invalid-table warning names `key`, escaped, in
+    /// `logs`.
+    pub(crate) fn stray_warnings_naming(logs: &Mutex<Vec<u8>>, key: &str) -> usize {
+        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
+        text.lines()
+            .filter(|l| {
+                l.contains("WARN")
+                    && l.contains("is not a valid table name")
+                    && l.contains(&format!("{key:?}"))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_key_under_an_invalid_table_segment_is_skipped_by_the_tenant_listing() {
+        for (i, rest) in STRAY_SHAPES.iter().enumerate() {
+            let tenant = TenantHash([0x60 + i as u8; 16]);
+            let (logs, _guard) = capture_logs();
+            let store = MemoryStore::with_page_size(2);
+            for v in [1, 2] {
+                put_version(&store, &tenant, v).await;
+            }
+            let stray = put_stray(&store, &tenant, rest).await;
+            for _ in 0..2 {
+                assert_eq!(
+                    tables(&store, &tenant).await.expect("tables"),
+                    BTreeMap::from([("hits".to_string(), vec![1, 2])]),
+                    "{rest}"
+                );
+            }
+            assert_eq!(invalid_table_listings(&tenant), 2, "{rest}");
+            assert_eq!(stray_warnings_naming(&logs, &stray), 1, "{rest}");
+            // The healthy table has nothing of its own to report.
+            assert_eq!(above_bound_resolves(&tenant, "hits"), 0, "{rest}");
+            let listing = tenant_listing(&store, &tenant).await.expect("listing");
+            assert_eq!(listing.invalid_table_keys, vec![stray], "{rest}");
+            assert_eq!(listing.tables.len(), 1, "{rest}");
+            // A named valid table never lists the stray key.
+            assert_eq!(
+                versions(&store, &tenant, "hits").await.expect("versions"),
+                vec![1, 2],
+                "{rest}"
+            );
+            assert_eq!(invalid_table_listings(&tenant), 3, "{rest}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_invalid_table_warning_prints_the_key_escaped() {
+        const TENANT: TenantHash = TenantHash([0x66; 16]);
+        let rest = "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm";
+        let (logs, _guard) = capture_logs();
+        let store = MemoryStore::new();
+        put_version(&store, &TENANT, 1).await;
+        let stray = put_stray(&store, &TENANT, rest).await;
+        assert_eq!(
+            tables(&store, &TENANT).await.expect("tables"),
+            BTreeMap::from([("hits".to_string(), vec![1])])
+        );
+        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(!text.contains('\u{7}'), "{text}");
+        assert_eq!(stray_warnings_naming(&logs, &stray), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_key_under_an_invalid_table_segment_without_the_suffix_is_still_foreign() {
+        for rest in [
+            "Hits/v/00000000000000000001.parquet",
+            "a/b/v/00000000000000000001.pqm.tmp",
+            "Hits/v/00000000000000000001",
+            "Hits/v/0000000000000001.txt",
+            "logs/notes.txt",
+        ] {
+            let store = MemoryStore::new();
+            put_version(&store, &TENANT_A, 1).await;
+            let junk = format!("{}{rest}", tenant_manifest_prefix(&TENANT_A));
+            store
+                .put(&junk, Bytes::from_static(b"x"), PutOptions::default())
+                .await
+                .expect("put");
+            assert!(
+                matches!(
+                    tables(&store, &TENANT_A).await,
+                    Err(ResolveError::ForeignKey { ref key, .. }) if *key == junk
+                ),
+                "{rest}"
+            );
+        }
     }
 
     #[test]
