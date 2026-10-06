@@ -108,6 +108,20 @@ impl Mode {
     pub fn uses_memory_budget(self) -> bool {
         !matches!(self, Mode::Gateway)
     }
+
+    /// Whether [`crate::start`] builds the metrics, log and span ingest routers
+    /// for this mode, which buffer ingest bytes under the
+    /// `--max-ingest-buffer-bytes` ceiling: [`Mode::All`] and [`Mode::Gateway`].
+    /// [`Mode::Query`] and [`Mode::Maintain`] build none, so no ingest bytes
+    /// are buffered there.
+    ///
+    /// Read by `start` to decide which routers to build and by
+    /// [`Cli::performance_flags`], where the overhead reserve of a mode that
+    /// buffers ingest covers that ceiling (ADR-1170, small-host reserve
+    /// amendment).
+    pub fn holds_ingest_buffer(self) -> bool {
+        matches!(self, Mode::All | Mode::Gateway)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -1627,6 +1641,14 @@ pub struct Cli {
     /// it is enabled. A host with many active tenants can exhaust memory
     /// under `0` with the store healthy too, without any single bound being
     /// crossed.
+    ///
+    /// This ceiling sits outside the ADR-1170 memory budget, so in `--mode
+    /// all` the derived overhead reserve covers it: the reserve is at least
+    /// this value plus a 256 MiB baseline, up to its 2 GiB ceiling. On a small
+    /// host, where that sum is more than a quarter of the memory, lowering
+    /// this flag is what leaves a larger budget. Under `0` there is no bound to cover, so the reserve is
+    /// its full 2 GiB ceiling on every host (ADR-1170, small-host reserve
+    /// amendment). A gateway derives no budget and reserves nothing.
     #[arg(long = "max-ingest-buffer-bytes", default_value_t = 512 * 1024 * 1024)]
     pub max_ingest_buffer_bytes: u64,
 
@@ -3268,15 +3290,19 @@ impl Default for CpuGatePermits {
 /// circular.
 ///
 /// Until that run exists, this is a round, clearly-provisional 2 GiB: well
-/// above the few hundred MiB an idle process (binary text/data, thread
-/// stacks, the tokio runtime, tracing buffers) costs before its first query,
-/// so a flag combination is not falsely refused for lack of the real number.
+/// above what an idle process (binary text/data, thread stacks, the tokio
+/// runtime, tracing buffers) costs before its first query, provisionally
+/// [`NON_BUDGET_BASELINE_BYTES`], plus the default 512 MiB
+/// `--max-ingest-buffer-bytes` ceiling, so a flag combination is not falsely
+/// refused for lack of the real number.
 ///
 /// This is the reserve's ceiling: the derivation deducts
 /// [`effective_memory_overhead_reserve_bytes`] of the memory it starts from,
-/// which is this constant from 8 GiB up and a quarter of that memory below
-/// (ADR-1170, small-host reserve amendment, issue #2607).
+/// at the floor [`non_budget_floor_bytes`] gives this process's mode. That
+/// is this constant from 8 GiB up (ADR-1170, small-host reserve amendment,
+/// issue #2607).
 pub use ravel_maintain::config::MEMORY_OVERHEAD_RESERVE_BYTES;
+pub use ravel_maintain::config::NON_BUDGET_BASELINE_BYTES;
 pub use ravel_maintain::config::effective_memory_overhead_reserve_bytes;
 
 /// The smallest derived `memory_budget_bytes` startup accepts: 256 MiB
@@ -3525,6 +3551,32 @@ pub struct PerformanceFlags {
     /// [`ResolvedPerformanceDefaults::check_memory_budget`]'s refusal like
     /// any other resolved budget.
     pub memory_budget_bytes: Option<u64>,
+    /// The ingest buffer this process holds outside the memory budget:
+    /// `--max-ingest-buffer-bytes`, parsed, in a mode that buffers ingest
+    /// ([`Mode::holds_ingest_buffer`]), and `None` in one that does not. Not
+    /// a flag on its own: the flag's value is only read here in a mode that
+    /// builds the buffers. The derived overhead reserve covers it on a small
+    /// host ([`non_budget_floor_bytes`]).
+    pub ingest_buffer_limit: Option<ravel_ingest::IngestByteBudgetLimit>,
+}
+
+/// The memory a process holds outside the memory budget that the overhead
+/// reserve must cover however small the host, the floor passed to
+/// [`effective_memory_overhead_reserve_bytes`] (ADR-1170, small-host reserve
+/// amendment, issue #2607): [`NON_BUDGET_BASELINE_BYTES`], plus the
+/// `--max-ingest-buffer-bytes` ceiling in a mode that buffers ingest. A `0`
+/// ceiling is unlimited, so there is no bound to reserve: the floor is then
+/// [`MEMORY_OVERHEAD_RESERVE_BYTES`], the reserve's cap.
+pub fn non_budget_floor_bytes(
+    ingest_buffer_limit: Option<ravel_ingest::IngestByteBudgetLimit>,
+) -> u64 {
+    match ingest_buffer_limit {
+        None => NON_BUDGET_BASELINE_BYTES,
+        Some(ravel_ingest::IngestByteBudgetLimit::Bounded(bytes)) => {
+            NON_BUDGET_BASELINE_BYTES.saturating_add(bytes)
+        }
+        Some(ravel_ingest::IngestByteBudgetLimit::Unlimited) => MEMORY_OVERHEAD_RESERVE_BYTES,
+    }
 }
 
 /// The six performance settings this process runs with, each with the source it
@@ -3610,6 +3662,12 @@ pub struct ResolvedPerformanceDefaults {
     /// [`MEMORY_OVERHEAD_RESERVE_BYTES`]. Logged so an operator can see the
     /// reserve that was live for a given run.
     pub memory_overhead_reserve_bytes: u64,
+    /// The `--max-ingest-buffer-bytes` ceiling when it set
+    /// [`Self::memory_overhead_reserve_bytes`]: this mode buffers ingest, and
+    /// the reserve is larger than [`effective_memory_overhead_reserve_bytes`]
+    /// at the [`NON_BUDGET_BASELINE_BYTES`] floor alone would make it. `None`
+    /// otherwise, including on every source that deducts no reserve.
+    pub memory_overhead_reserve_ingest_limit: Option<ravel_ingest::IngestByteBudgetLimit>,
     /// `cache_max_bytes + catalog_cache_max_bytes`: the two hard, non-shedding
     /// eviction caps carved from [`Self::memory_budget_bytes`]. Startup
     /// refuses (see `Cli::resolve_performance`) rather than clamps when this
@@ -3922,68 +3980,90 @@ pub fn resolve_performance_defaults(
     // process may reuse rather than a competing claim against it.
     //
     // Every derived arm deducts the reserve scaled to the memory it starts
-    // from (issue #2607), so the cgroup and available-memory branches agree on
-    // a host of the same size.
-    let (memory_budget_bytes, memory_budget_source, memory_budget_floor_bound, memory_reserve) =
-        if flags.memory_budget_not_applicable {
-            (
+    // from, at this mode's non-budget floor (issue #2607), so the cgroup and
+    // available-memory branches agree on a host of the same size. The fifth
+    // element is that memory, `None` on a source that deducts no reserve.
+    let non_budget_floor = non_budget_floor_bytes(flags.ingest_buffer_limit);
+    let (
+        memory_budget_bytes,
+        memory_budget_source,
+        memory_budget_floor_bound,
+        memory_reserve,
+        memory_reserve_basis,
+    ) = if flags.memory_budget_not_applicable {
+        (
+            u64::MAX,
+            PERF_SOURCE_NOT_APPLICABLE,
+            false,
+            MEMORY_OVERHEAD_RESERVE_BYTES,
+            None,
+        )
+    } else if let Some(explicit) = flags.memory_budget_bytes {
+        (
+            explicit,
+            PERF_SOURCE_FLAG,
+            false,
+            MEMORY_OVERHEAD_RESERVE_BYTES,
+            None,
+        )
+    } else {
+        match host.mem_total_bytes {
+            None => (
                 u64::MAX,
-                PERF_SOURCE_NOT_APPLICABLE,
+                PERF_SOURCE_FALLBACK,
                 false,
                 MEMORY_OVERHEAD_RESERVE_BYTES,
-            )
-        } else if let Some(explicit) = flags.memory_budget_bytes {
-            (
-                explicit,
-                PERF_SOURCE_FLAG,
-                false,
-                MEMORY_OVERHEAD_RESERVE_BYTES,
-            )
-        } else {
-            match host.mem_total_bytes {
-                None => (
-                    u64::MAX,
-                    PERF_SOURCE_FALLBACK,
+                None,
+            ),
+            Some(total) if host.cgroup_memory_limit_bytes.is_some() => {
+                let reserve = effective_memory_overhead_reserve_bytes(total, non_budget_floor);
+                (
+                    total.saturating_sub(reserve),
+                    PERF_SOURCE_DERIVED_CGROUP,
                     false,
-                    MEMORY_OVERHEAD_RESERVE_BYTES,
-                ),
-                Some(total) if host.cgroup_memory_limit_bytes.is_some() => {
-                    let reserve = effective_memory_overhead_reserve_bytes(total);
+                    reserve,
+                    Some(total),
+                )
+            }
+            Some(total) => match (host.mem_total_raw_bytes, host.mem_available_bytes) {
+                (Some(raw_total), Some(available)) => {
+                    let reserve =
+                        effective_memory_overhead_reserve_bytes(raw_total, non_budget_floor);
+                    let own_rss = host.own_rss_bytes.unwrap_or(0);
+                    let mem_total_minus_reserve = raw_total.saturating_sub(reserve);
+                    let raw_available_term =
+                        available.saturating_add(own_rss).saturating_sub(reserve);
+                    let floor_bound = raw_available_term < MEMORY_BUDGET_FLOOR_BYTES;
+                    let available_term = raw_available_term.max(MEMORY_BUDGET_FLOOR_BYTES);
                     (
-                        total.saturating_sub(reserve),
-                        PERF_SOURCE_DERIVED_CGROUP,
-                        false,
+                        mem_total_minus_reserve.min(available_term),
+                        PERF_SOURCE_DERIVED_AVAILABLE,
+                        floor_bound,
                         reserve,
+                        Some(raw_total),
                     )
                 }
-                Some(total) => match (host.mem_total_raw_bytes, host.mem_available_bytes) {
-                    (Some(raw_total), Some(available)) => {
-                        let reserve = effective_memory_overhead_reserve_bytes(raw_total);
-                        let own_rss = host.own_rss_bytes.unwrap_or(0);
-                        let mem_total_minus_reserve = raw_total.saturating_sub(reserve);
-                        let raw_available_term =
-                            available.saturating_add(own_rss).saturating_sub(reserve);
-                        let floor_bound = raw_available_term < MEMORY_BUDGET_FLOOR_BYTES;
-                        let available_term = raw_available_term.max(MEMORY_BUDGET_FLOOR_BYTES);
-                        (
-                            mem_total_minus_reserve.min(available_term),
-                            PERF_SOURCE_DERIVED_AVAILABLE,
-                            floor_bound,
-                            reserve,
-                        )
-                    }
-                    _ => {
-                        let reserve = effective_memory_overhead_reserve_bytes(total);
-                        (
-                            total.saturating_sub(reserve),
-                            PERF_SOURCE_DERIVED,
-                            false,
-                            reserve,
-                        )
-                    }
-                },
-            }
-        };
+                _ => {
+                    let reserve = effective_memory_overhead_reserve_bytes(total, non_budget_floor);
+                    (
+                        total.saturating_sub(reserve),
+                        PERF_SOURCE_DERIVED,
+                        false,
+                        reserve,
+                        Some(total),
+                    )
+                }
+            },
+        }
+    };
+    // The ingest buffer set the reserve when the reserve is larger than the
+    // same derivation at the baseline floor alone would have made it.
+    let memory_reserve_ingest_limit = memory_reserve_basis
+        .filter(|&memory| {
+            memory_reserve
+                > effective_memory_overhead_reserve_bytes(memory, NON_BUDGET_BASELINE_BYTES)
+        })
+        .and(flags.ingest_buffer_limit);
 
     // Caches carve their share from `memory_budget_bytes` whenever that budget
     // is itself known -- a flag-derived budget on a host with no readable
@@ -4130,6 +4210,7 @@ pub fn resolve_performance_defaults(
         query_deadline,
         memory_budget_bytes,
         memory_overhead_reserve_bytes: memory_reserve,
+        memory_overhead_reserve_ingest_limit: memory_reserve_ingest_limit,
         memory_hard_caps_bytes,
         memory_remainder_bytes,
         cache_disabled: flags.disable_cache,
@@ -4242,6 +4323,9 @@ pub struct MemoryBudgetBelowMinimum {
     pub reserve_bytes: u64,
     /// The derived budget.
     pub memory_budget_bytes: u64,
+    /// [`ResolvedPerformanceDefaults::memory_overhead_reserve_ingest_limit`]:
+    /// the `--max-ingest-buffer-bytes` ceiling when it set the reserve.
+    pub ingest_buffer_limit: Option<ravel_ingest::IngestByteBudgetLimit>,
 }
 
 impl std::fmt::Display for MemoryBudgetBelowMinimum {
@@ -4251,10 +4335,32 @@ impl std::fmt::Display for MemoryBudgetBelowMinimum {
             "this host has too little memory for ravel-server's derived memory budget: {} is {} \
              bytes, the overhead reserve taken from it is {} bytes, and that leaves a derived \
              memory budget of {} bytes, below the {MIN_DERIVED_MEMORY_BUDGET_BYTES}-byte minimum \
-             (256 MiB). Give the process more memory, or set --memory-budget-bytes to size the \
-             budget explicitly",
+             (256 MiB). ",
             self.memory_basis, self.memory_bytes, self.reserve_bytes, self.memory_budget_bytes
-        )
+        )?;
+        // The ingest term makes the reserve larger than a quarter of the
+        // memory, which the figures above do not explain on their own.
+        match self.ingest_buffer_limit {
+            Some(ravel_ingest::IngestByteBudgetLimit::Bounded(bytes)) => write!(
+                f,
+                "The reserve covers this mode's {bytes}-byte ingest buffer ceiling \
+                 (--max-ingest-buffer-bytes) plus the {NON_BUDGET_BASELINE_BYTES}-byte baseline \
+                 the process holds outside the budget. Give the process more memory, lower \
+                 --max-ingest-buffer-bytes, or set --memory-budget-bytes to size the budget \
+                 explicitly",
+            ),
+            Some(ravel_ingest::IngestByteBudgetLimit::Unlimited) => write!(
+                f,
+                "--max-ingest-buffer-bytes is 0, which leaves this mode's ingest buffer \
+                 unbounded, so the reserve is its {MEMORY_OVERHEAD_RESERVE_BYTES}-byte ceiling. \
+                 Give the process more memory, set --max-ingest-buffer-bytes to a bound, or set \
+                 --memory-budget-bytes to size the budget explicitly",
+            ),
+            None => f.write_str(
+                "Give the process more memory, or set --memory-budget-bytes to size the budget \
+                 explicitly",
+            ),
+        }
     }
 }
 
@@ -4347,6 +4453,7 @@ impl ResolvedPerformanceDefaults {
             memory_bytes: memory_bytes.unwrap_or(0),
             reserve_bytes: self.memory_overhead_reserve_bytes,
             memory_budget_bytes: self.memory_budget_bytes,
+            ingest_buffer_limit: self.memory_overhead_reserve_ingest_limit,
         })
     }
 }
@@ -4517,16 +4624,24 @@ impl ResolvedPerformanceDefaults {
             || self.sources.memory_budget_bytes == PERF_SOURCE_DERIVED_AVAILABLE
             || self.sources.memory_budget_bytes == PERF_SOURCE_DERIVED_CGROUP;
         if self.cache_disabled
-            && (self.memory_remainder_bytes == 0
-                || (derived_budget && self.memory_budget_bytes < MIN_DERIVED_MEMORY_BUDGET_BYTES))
+            && derived_budget
+            && self.memory_budget_bytes < MIN_DERIVED_MEMORY_BUDGET_BYTES
         {
             tracing::warn!(
                 memory_budget_bytes = self.memory_budget_bytes,
                 memory_overhead_reserve_bytes = self.memory_overhead_reserve_bytes,
-                "the shared SQL/fetch memory budget is below the 256 MiB minimum a derived budget \
-                 must reach, and only --disable-cache let the process start; a 0-byte budget \
-                 refuses every query that reserves memory; give the process more memory, or set \
+                "the derived memory budget is below the 256 MiB minimum a derived budget must \
+                 reach, and only --disable-cache let the process start; a 0-byte budget refuses \
+                 every query that reserves memory; give the process more memory, or set \
                  --memory-budget-bytes"
+            );
+        } else if self.cache_disabled && self.memory_remainder_bytes == 0 {
+            tracing::warn!(
+                memory_budget_bytes = self.memory_budget_bytes,
+                "the shared SQL/fetch memory budget is 0 bytes, from an explicit \
+                 --memory-budget-bytes 0, and only --disable-cache let the process start; it \
+                 refuses every query that reserves memory; set --memory-budget-bytes above 0, or \
+                 leave it unset to derive the budget from the host's memory"
             );
         }
         // The only line that carries `clamped`: when it is true the value is
@@ -7370,6 +7485,11 @@ impl Cli {
             disable_cache: self.disable_cache,
             memory_budget_not_applicable: !self.mode.uses_memory_budget(),
             memory_budget_bytes: self.memory_budget_bytes,
+            ingest_buffer_limit: if self.mode.holds_ingest_buffer() {
+                Some(self.parse_ingest_buffer_budget()?)
+            } else {
+                None
+            },
         })
     }
 
@@ -11354,18 +11474,21 @@ mod tests {
         assert_eq!(resolved.cache_max_bytes, 20_000_000_000);
         assert_eq!(resolved.catalog_cache_max_bytes, 20_000_000_000);
 
-        // Configuration 2: the small container. 300 MiB of effective memory
-        // derives a 225 MiB budget, below the 256 MiB minimum, which refuses
-        // with the caches on (`budget_below_minimum_refuses_with_a_plain_message`)
-        // and must start with them off.
+        // Configuration 2: the small container. In `--mode all` 300 MiB of
+        // effective memory takes a 768 MiB reserve (the 512 MiB ingest buffer
+        // ceiling plus the 256 MiB baseline) and derives a 0-byte budget,
+        // below the 256 MiB minimum, which refuses with the caches on
+        // (`budget_below_minimum_refuses_with_a_plain_message`) and must start
+        // with them off.
         let tiny = HostProfile::new(2, Some(300 << 20), Some(300 << 20), None, None, None);
         let cli = Cli::try_parse_from(["ravel-server", "--disable-cache"]).expect("flag parses");
         let resolved = cli
             .resolve_performance(tiny)
             .expect("a container that ran before ADR-1170 must keep starting with --disable-cache");
-        assert_eq!(resolved.memory_budget_bytes, 225 << 20);
+        assert_eq!(resolved.memory_overhead_reserve_bytes, 768 << 20);
+        assert_eq!(resolved.memory_budget_bytes, 0);
         assert_eq!(resolved.memory_hard_caps_bytes, 0);
-        assert_eq!(resolved.memory_remainder_bytes, 225 << 20);
+        assert_eq!(resolved.memory_remainder_bytes, 0);
 
         // Configuration 3: a `0` budget.
         let cli = Cli::try_parse_from([
@@ -11509,15 +11632,24 @@ mod tests {
         assert_eq!(resolved.memory_remainder_bytes, u64::MAX);
     }
 
-    /// The modes that build a cache or the shared SQL/fetch budget derive a
-    /// budget on the same 512 MiB host the gateway starts on: a 128 MiB
-    /// reserve leaves 384 MiB, and they start (issue #2607). Under a 300 MiB
-    /// limit, where the gateway also starts, the 225 MiB budget is below the
-    /// minimum and they refuse. Maintain is included: it folds through the
+    /// The modes that build a cache or the shared SQL/fetch budget, on the
+    /// same 512 MiB the gateway starts on, as a whole host and as a cgroup
+    /// limit (issue #2607). `--mode all` buffers ingest, so its reserve is the
+    /// 512 MiB `--max-ingest-buffer-bytes` default plus the 256 MiB baseline,
+    /// 768 MiB, which leaves a 0-byte budget: it refuses, and the refusal names
+    /// the ingest flag. `query` and `maintain` buffer no ingest: their reserve
+    /// is `max(512 / 4, 256)` = 256 MiB, which leaves exactly the 256 MiB
+    /// minimum, and they start. Under 300 MiB, where the gateway also starts,
+    /// all three refuse: `all` with a 0-byte budget, `query` and `maintain`
+    /// with 300 - 256 = 44 MiB. Maintain is included: it folds through the
     /// catalog byte cache.
+    ///
+    /// Prove-the-test: the pre-fix reserve, `min(2 GiB, memory / 4)`, gives
+    /// every mode a 128 MiB reserve and a 384 MiB budget at 512 MiB, so the
+    /// `all` row's `expect_err` panics.
     #[test]
     fn query_all_and_maintain_refuse_below_the_minimum_budget() {
-        let host = HostProfile::new(
+        let whole_host = HostProfile::new(
             2,
             Some(SMALL_POD_MEM_BYTES),
             Some(SMALL_POD_MEM_BYTES),
@@ -11525,20 +11657,53 @@ mod tests {
             None,
             None,
         );
+        let cgroup = HostProfile::new(
+            2,
+            Some(SMALL_POD_MEM_BYTES),
+            Some(32 << 30),
+            Some(SMALL_POD_MEM_BYTES),
+            Some(30 << 30),
+            Some(0),
+        );
         let tiny = HostProfile::new(2, Some(300 << 20), Some(300 << 20), None, None, None);
-        for mode in ["query", "all", "maintain"] {
-            let cli = Cli::try_parse_from(["ravel-server", "--mode", mode]).expect("flags parse");
-            let resolved = cli
+        for host in [whole_host, cgroup] {
+            let all = Cli::try_parse_from(["ravel-server", "--mode", "all"]).expect("flags parse");
+            let err = all
                 .resolve_performance(host)
-                .expect("a 512 MiB host derives a 384 MiB budget, which starts");
-            assert_eq!(resolved.memory_budget_bytes, 384 << 20, "--mode {mode}");
-            let err = cli
-                .resolve_performance(tiny)
-                .expect_err("a 300 MiB host derives a 225 MiB budget, which must refuse");
+                .expect_err("--mode all at 512 MiB takes a 768 MiB reserve and must refuse");
             let refused = err
                 .downcast_ref::<MemoryBudgetBelowMinimum>()
                 .expect("typed MemoryBudgetBelowMinimum error");
-            assert_eq!(refused.memory_budget_bytes, 225 << 20, "--mode {mode}");
+            assert_eq!(refused.reserve_bytes, 768 << 20);
+            assert_eq!(refused.memory_budget_bytes, 0);
+            assert_eq!(
+                refused.ingest_buffer_limit,
+                Some(ravel_ingest::IngestByteBudgetLimit::Bounded(512 << 20))
+            );
+            for mode in ["query", "maintain"] {
+                let cli =
+                    Cli::try_parse_from(["ravel-server", "--mode", mode]).expect("flags parse");
+                let resolved = cli
+                    .resolve_performance(host)
+                    .expect("a 512 MiB host derives exactly the 256 MiB minimum, which starts");
+                assert_eq!(
+                    resolved.memory_overhead_reserve_bytes,
+                    256 << 20,
+                    "--mode {mode}"
+                );
+                assert_eq!(resolved.memory_budget_bytes, 256 << 20, "--mode {mode}");
+                assert_eq!(resolved.memory_overhead_reserve_ingest_limit, None);
+            }
+        }
+        for (mode, budget) in [("all", 0), ("query", 44 << 20), ("maintain", 44 << 20)] {
+            let cli = Cli::try_parse_from(["ravel-server", "--mode", mode]).expect("flags parse");
+            let err = cli
+                .resolve_performance(tiny)
+                .expect_err("a 300 MiB host derives a budget below the minimum, which must refuse");
+            let refused = err
+                .downcast_ref::<MemoryBudgetBelowMinimum>()
+                .expect("typed MemoryBudgetBelowMinimum error");
+            assert_eq!(refused.memory_budget_bytes, budget, "--mode {mode}");
         }
         let gateway =
             Cli::try_parse_from(["ravel-server", "--mode", "gateway"]).expect("flags parse");
@@ -17050,21 +17215,23 @@ mod tests {
         )
     }
 
-    /// A t3a.small (MemTotal 1,912 MiB, issue #2607): the reserve is a
-    /// quarter of `MemTotal`, 478 MiB, so `MemTotal - reserve` is 1,434 MiB.
-    /// `MemAvailable + own_rss - reserve` is 972 MiB, which the 1 GiB floor
-    /// lifts to 1 GiB, and the `min` keeps that: the budget is 1 GiB, and both
-    /// caches and the shared remainder are positive, so the server starts.
+    /// A t3a.small (MemTotal 1,912 MiB, issue #2607) with no ingest buffer:
+    /// the reserve is a quarter of `MemTotal`, 478 MiB, above the 256 MiB
+    /// baseline, so `MemTotal - reserve` is 1,434 MiB. `MemAvailable +
+    /// own_rss - reserve` is 972 MiB, which the 1 GiB floor lifts to 1 GiB,
+    /// and the `min` keeps that: the budget is 1 GiB, and both caches and the
+    /// shared remainder are positive. Stock flags (`--mode all`, 512 MiB
+    /// ingest ceiling) take a 768 MiB reserve; `MemTotal - reserve` is then
+    /// 1,144 MiB and the 1 GiB floor still sets the budget, so it starts.
     ///
-    /// A 600 MiB host is the second case: the reserve is 150 MiB and the
-    /// budget is `MemTotal - reserve`, 450 MiB, below the 1 GiB floor.
+    /// A 600 MiB host is the second case: a quarter is 150 MiB, below the
+    /// baseline, so the reserve is 256 MiB and the budget is `MemTotal -
+    /// reserve`, 344 MiB, below the 1 GiB floor. `--mode query` starts on it;
+    /// `--mode all` takes a 768 MiB reserve, more than the host, and refuses.
     ///
-    /// Prove-the-test: with the fixed 2 GiB reserve (the pre-#2607 code) the
-    /// reserve assertion reads 2,147,483,648 against 501,219,328. A fix that
-    /// moves the floor outside the `min` instead of scaling the reserve also
-    /// keeps the 2 GiB reserve and fails the same assertion; with the scaled
-    /// reserve too, it fails the 600 MiB case, reading 1,073,741,824 (a budget
-    /// above that host's whole memory) against 471,859,200.
+    /// Prove-the-test: with the pre-fix reserve, `min(2 GiB, memory / 4)`,
+    /// the stock-flags reserve reads 501,219,328 against 805,306,368 and the
+    /// 600 MiB reserve reads 157,286,400 against 268,435,456.
     #[test]
     fn small_host_derives_a_positive_budget_and_caches() {
         let host = available_host(1912 * MIB, 1400 * MIB, 50 * MIB);
@@ -17089,15 +17256,29 @@ mod tests {
         let started = cli
             .resolve_performance(host)
             .expect("a 1,912 MiB host must start with stock flags");
+        assert_eq!(started.memory_overhead_reserve_bytes, 805_306_368);
         assert_eq!(started.memory_budget_bytes, 1_073_741_824);
+        assert!(started.memory_budget_floor_bound);
 
         let host = available_host(600 * MIB, 400 * MIB, 20 * MIB);
         let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
-        assert_eq!(resolved.memory_overhead_reserve_bytes, 150 * MIB);
-        assert_eq!(resolved.memory_budget_bytes, 450 * MIB);
-        assert_eq!(resolved.memory_budget_bytes, 471_859_200);
-        cli.resolve_performance(host)
-            .expect("a 450 MiB derived budget is above the 256 MiB minimum");
+        assert_eq!(resolved.memory_overhead_reserve_bytes, 256 * MIB);
+        assert_eq!(resolved.memory_overhead_reserve_bytes, 268_435_456);
+        assert_eq!(resolved.memory_budget_bytes, 344 * MIB);
+        assert_eq!(resolved.memory_budget_bytes, 360_710_144);
+        let query = Cli::try_parse_from(["ravel-server", "--mode", "query"]).expect("flags parse");
+        let started = query
+            .resolve_performance(host)
+            .expect("a 344 MiB derived budget is above the 256 MiB minimum");
+        assert_eq!(started.memory_budget_bytes, 360_710_144);
+        let refused = cli
+            .resolve_performance(host)
+            .expect_err("--mode all at 600 MiB takes a 768 MiB reserve and must refuse");
+        let refused = refused
+            .downcast_ref::<MemoryBudgetBelowMinimum>()
+            .expect("typed MemoryBudgetBelowMinimum error");
+        assert_eq!(refused.reserve_bytes, 805_306_368);
+        assert_eq!(refused.memory_budget_bytes, 0);
     }
 
     /// From 8 GiB up the reserve is the fixed 2 GiB, so every derived figure
@@ -17108,7 +17289,9 @@ mod tests {
     /// Prove-the-test: dividing by 2 instead of 4 in
     /// `effective_memory_overhead_reserve_bytes` makes the reserve 4 GiB at
     /// 8 GiB (cap 2 GiB still applies at 32 GiB) and fails the 8 GiB rows;
-    /// dropping the `min` against the constant fails every row.
+    /// dropping the `min` against the constant fails the 32 GiB rows (an
+    /// 8 GiB reserve), and on the 8 GiB 3 GiB-ingest rows reads a 3,489,660,928-byte reserve (3 GiB plus the
+    /// 256 MiB baseline) against 2,147,483,648.
     #[test]
     fn reserve_is_unchanged_at_and_above_eight_gib() {
         const OLD_RESERVE: u64 = 2 * GIB;
@@ -17170,17 +17353,64 @@ mod tests {
             assert_eq!(resolved.memory_overhead_reserve_bytes, OLD_RESERVE);
             assert_eq!(resolved.memory_budget_bytes, total - OLD_RESERVE);
         }
+
+        // `--mode all` with a 3 GiB ingest ceiling: the ingest term asks for
+        // a 3.25 GiB reserve, and the 2 GiB ceiling still bounds it, so the
+        // figures stay the pre-#2607 ones in every branch.
+        let ingesting = Cli::try_parse_from([
+            "ravel-server",
+            "--mode",
+            "all",
+            "--max-ingest-buffer-bytes",
+            "3221225472",
+        ])
+        .expect("flags parse");
+        for total in [8 * GIB, 32 * GIB] {
+            let hosts = [
+                (
+                    available_host(total, total - GIB, 0),
+                    old_budget(total, total - GIB, 0),
+                ),
+                (
+                    HostProfile::new(
+                        4,
+                        Some(total),
+                        Some(64 * GIB),
+                        Some(total),
+                        Some(GIB),
+                        Some(0),
+                    ),
+                    total - OLD_RESERVE,
+                ),
+                (
+                    HostProfile::new(4, Some(total), Some(total), None, None, None),
+                    total - OLD_RESERVE,
+                ),
+            ];
+            for (host, budget) in hosts {
+                let resolved = ingesting
+                    .resolve_performance(host)
+                    .expect("an 8 GiB or larger host starts with a 3 GiB ingest ceiling");
+                assert_eq!(
+                    resolved.memory_overhead_reserve_bytes, OLD_RESERVE,
+                    "{host:?}"
+                );
+                assert_eq!(resolved.memory_budget_bytes, budget, "{host:?}");
+            }
+        }
     }
 
-    /// A 1.5 GiB cgroup limit on a 32 GiB host: the reserve is a quarter of
-    /// the limit, 384 MiB, and the budget is 1,152 MiB. A host whose whole
-    /// `MemTotal` is 1.5 GiB, with no cgroup limit and all of it available
-    /// (so the `min` takes `MemTotal - reserve`), derives the same reserve and
-    /// budget through the available-memory branch.
+    /// A 1.5 GiB cgroup limit on a 32 GiB host, with no ingest buffer: the
+    /// reserve is a quarter of the limit, 384 MiB, and the budget is 1,152
+    /// MiB. A host whose whole `MemTotal` is 1.5 GiB, with no cgroup limit and
+    /// all of it available (so the `min` takes `MemTotal - reserve`), derives
+    /// the same reserve and budget through the available-memory branch. Stock
+    /// flags (`--mode all`) take a 768 MiB reserve and a 768 MiB budget there.
     ///
     /// Prove-the-test: leaving the cgroup arm on the fixed
     /// `MEMORY_OVERHEAD_RESERVE_BYTES` (only the available arm scaled) reads a
-    /// 0-byte budget against 1,207,959,552.
+    /// 0-byte budget against 1,207,959,552; leaving it on `memory / 4` with no
+    /// ingest floor reads a 402,653,184 reserve against 805,306,368.
     #[test]
     fn cgroup_branch_uses_the_same_scaled_reserve() {
         const LIMIT: u64 = 1536 * MIB;
@@ -17204,8 +17434,11 @@ mod tests {
         assert!(resolved.catalog_cache_max_bytes > 0);
         assert!(resolved.memory_remainder_bytes > 0);
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
-        cli.resolve_performance(host)
+        let started = cli
+            .resolve_performance(host)
             .expect("a 1.5 GiB container must start with stock flags");
+        assert_eq!(started.memory_overhead_reserve_bytes, 805_306_368);
+        assert_eq!(started.memory_budget_bytes, 805_306_368);
 
         let uncapped = available_host(LIMIT, LIMIT, 0);
         let available = resolve_performance_defaults(uncapped, PerformanceFlags::default());
@@ -17220,18 +17453,18 @@ mod tests {
         assert_eq!(available.memory_budget_bytes, resolved.memory_budget_bytes);
     }
 
-    /// A 300 MiB host derives a 225 MiB budget (reserve 75 MiB), below the
-    /// 256 MiB minimum, and refuses with a message naming `MemTotal`, the
-    /// reserve, the budget and `--memory-budget-bytes`, and not the cache caps.
-    /// Under a 320 MiB cgroup limit the message names the limit instead.
-    /// `--memory-budget-bytes` on the same host starts.
-    ///
-    /// (A 600 MiB host is not this case: its budget is 450 MiB, see
-    /// `small_host_derives_a_positive_budget_and_caches`.)
+    /// `--mode query` (no ingest buffer) on a 300 MiB host takes the 256 MiB
+    /// baseline as its reserve, a quarter being only 75 MiB, and derives a
+    /// 44 MiB budget, below the 256 MiB minimum. It refuses with a message
+    /// naming `MemTotal`, the reserve, the budget and `--memory-budget-bytes`,
+    /// and neither the cache caps nor `--max-ingest-buffer-bytes`, which plays
+    /// no part in this mode's reserve. Under a 320 MiB cgroup limit the
+    /// message names the limit instead. `--memory-budget-bytes` on the same
+    /// host starts.
     ///
     /// Prove-the-test: dropping the `check_memory_budget_minimum` call from
     /// `Cli::resolve_performance` makes the first `expect_err` panic, since
-    /// the 225 MiB budget clears the cache-cap check.
+    /// the 44 MiB budget clears the cache-cap check.
     ///
     /// The explicit flag is set to 100 MiB, below the minimum, so the final
     /// `expect` fails if `check_memory_budget_minimum` also applies to
@@ -17240,13 +17473,13 @@ mod tests {
     fn budget_below_minimum_refuses_with_a_plain_message() {
         let host = available_host(300 * MIB, 250 * MIB, 10 * MIB);
         let resolved = resolve_performance_defaults(host, PerformanceFlags::default());
-        assert_eq!(resolved.memory_overhead_reserve_bytes, 75 * MIB);
-        assert_eq!(resolved.memory_budget_bytes, 225 * MIB);
+        assert_eq!(resolved.memory_overhead_reserve_bytes, 256 * MIB);
+        assert_eq!(resolved.memory_budget_bytes, 44 * MIB);
 
-        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        let cli = Cli::try_parse_from(["ravel-server", "--mode", "query"]).expect("flags parse");
         let err = cli
             .resolve_performance(host)
-            .expect_err("a 225 MiB derived budget must refuse to start");
+            .expect_err("a 44 MiB derived budget must refuse to start");
         let refused = err
             .downcast_ref::<MemoryBudgetBelowMinimum>()
             .expect("typed MemoryBudgetBelowMinimum error");
@@ -17255,21 +17488,23 @@ mod tests {
             MemoryBudgetBelowMinimum {
                 memory_basis: "MemTotal",
                 memory_bytes: 314_572_800,
-                reserve_bytes: 78_643_200,
-                memory_budget_bytes: 235_929_600,
+                reserve_bytes: 268_435_456,
+                memory_budget_bytes: 46_137_344,
+                ingest_buffer_limit: None,
             }
         );
         let message = refused.to_string();
         for needle in [
             "MemTotal is 314572800 bytes",
-            "overhead reserve taken from it is 78643200 bytes",
-            "derived memory budget of 235929600 bytes",
+            "overhead reserve taken from it is 268435456 bytes",
+            "derived memory budget of 46137344 bytes",
             "268435456-byte minimum",
             "--memory-budget-bytes",
         ] {
             assert!(message.contains(needle), "missing {needle:?}: {message}");
         }
         assert!(!message.contains("cache_max_bytes"), "{message}");
+        assert!(!message.contains("--max-ingest-buffer-bytes"), "{message}");
 
         let container = HostProfile::new(
             2,
@@ -17281,7 +17516,7 @@ mod tests {
         );
         let err = cli
             .resolve_performance(container)
-            .expect_err("a 240 MiB derived budget must refuse to start");
+            .expect_err("a 64 MiB derived budget must refuse to start");
         let message = err
             .downcast_ref::<MemoryBudgetBelowMinimum>()
             .expect("typed MemoryBudgetBelowMinimum error")
@@ -17290,7 +17525,7 @@ mod tests {
             message.contains("the cgroup memory limit is 335544320 bytes"),
             "{message}"
         );
-        assert!(message.contains("251658240 bytes, below"), "{message}");
+        assert!(message.contains("67108864 bytes, below"), "{message}");
 
         let flagged = Cli::try_parse_from(["ravel-server", "--memory-budget-bytes", "104857600"])
             .expect("flag parses");
@@ -17299,14 +17534,266 @@ mod tests {
             .expect("an explicit --memory-budget-bytes is not held to the minimum");
         assert_eq!(started.memory_budget_bytes, 100 * MIB);
 
-        // The smallest MemTotal that clears the minimum is a little over
-        // 341 MiB: three quarters of it must reach 256 MiB.
-        let threshold = available_host(357_913_941, 357_913_941, 0);
+        // The smallest MemTotal that clears the minimum without an ingest
+        // buffer is 512 MiB: the 256 MiB baseline reserve plus the 256 MiB
+        // minimum budget.
+        let threshold = available_host(536_870_912, 536_870_912, 0);
         let at = cli
             .resolve_performance(threshold)
-            .expect("357,913,941 bytes derives exactly the minimum");
+            .expect("536,870,912 bytes derives exactly the minimum");
         assert_eq!(at.memory_budget_bytes, MIN_DERIVED_MEMORY_BUDGET_BYTES);
-        cli.resolve_performance(available_host(357_913_940, 357_913_940, 0))
+        cli.resolve_performance(available_host(536_870_911, 536_870_911, 0))
             .expect_err("one byte less derives one byte under the minimum");
+    }
+
+    /// Wherever a budget mode starts on a derived budget, the budget, the
+    /// ingest buffer ceiling the mode holds outside it, and the 256 MiB
+    /// baseline fit in the memory the budget was derived from. Swept from
+    /// 512 MiB to 8 GiB in 64 MiB steps, as a cgroup limit, as `MemTotal`
+    /// with `MemAvailable` known, and as `MemTotal` alone, for `all`, `query`
+    /// and `maintain`, at the default ingest ceiling and at 128 MiB. The
+    /// number of starts per mode and ceiling is pinned too, so a refusal that
+    /// hides a host from the fit check fails.
+    ///
+    /// Prove-the-test: with the pre-fix reserve, `min(2 GiB, memory / 4)`,
+    /// the first `--mode all` row fails: at 512 MiB the budget is 384 MiB,
+    /// and 384 + 512 + 256 MiB is 1,152 MiB.
+    #[test]
+    fn budget_plus_ingest_and_baseline_fit_in_memory() {
+        const INGEST_DEFAULT: u64 = 512 * MIB;
+        const INGEST_SMALL: u64 = 128 * MIB;
+        let mut starts = std::collections::BTreeMap::new();
+        for memory in (512 * MIB..=8 * GIB).step_by(usize::try_from(64 * MIB).expect("fits")) {
+            let hosts = [
+                HostProfile::new(
+                    2,
+                    Some(memory),
+                    Some(64 * GIB),
+                    Some(memory),
+                    Some(60 * GIB),
+                    Some(0),
+                ),
+                available_host(memory, memory, 0),
+                HostProfile::new(2, Some(memory), Some(memory), None, None, None),
+            ];
+            for host in hosts {
+                for mode in ["all", "query", "maintain"] {
+                    for ingest in [INGEST_DEFAULT, INGEST_SMALL] {
+                        let ingest_flag = ingest.to_string();
+                        let cli = Cli::try_parse_from([
+                            "ravel-server",
+                            "--mode",
+                            mode,
+                            "--max-ingest-buffer-bytes",
+                            &ingest_flag,
+                        ])
+                        .expect("flags parse");
+                        let Ok(resolved) = cli.resolve_performance(host) else {
+                            continue;
+                        };
+                        let held = if mode == "all" { ingest } else { 0 };
+                        assert!(
+                            resolved.memory_budget_bytes + held + NON_BUDGET_BASELINE_BYTES
+                                <= memory,
+                            "--mode {mode}, ingest {ingest}, {host:?}: budget {} + ingest \
+                             {held} + baseline {NON_BUDGET_BASELINE_BYTES} exceeds {memory}",
+                            resolved.memory_budget_bytes,
+                        );
+                        *starts.entry((mode, ingest)).or_insert(0_u32) += 1;
+                    }
+                }
+            }
+        }
+        // Three branches per memory size. `query` and `maintain` start from
+        // 512 MiB (121 sizes); `all` needs 768 MiB of reserve plus the
+        // minimum, 1 GiB (113 sizes), or 384 MiB plus it, 640 MiB (119).
+        let expected = std::collections::BTreeMap::from([
+            (("all", INGEST_DEFAULT), 3 * 113),
+            (("all", INGEST_SMALL), 3 * 119),
+            (("maintain", INGEST_DEFAULT), 3 * 121),
+            (("maintain", INGEST_SMALL), 3 * 121),
+            (("query", INGEST_DEFAULT), 3 * 121),
+            (("query", INGEST_SMALL), 3 * 121),
+        ]);
+        assert_eq!(starts, expected);
+    }
+
+    /// The reserve and budget each mode derives on a t3a.small (1,912 MiB),
+    /// as `MemTotal` and as a cgroup limit. `all` holds the 512 MiB ingest
+    /// ceiling outside the budget, so its reserve is 768 MiB and its budget
+    /// 1,144 MiB; `query` and `maintain` hold none, so a quarter, 478 MiB,
+    /// sets the reserve and the budget is 1,434 MiB. A gateway derives no
+    /// budget. `all` with a 128 MiB ceiling asks for 384 MiB, below the
+    /// quarter, so the quarter sets it; with `0` (unbounded) the reserve is
+    /// its 2 GiB ceiling, more than the host, and it refuses.
+    ///
+    /// Prove-the-test: with the pre-fix reserve every budget mode reads a
+    /// 501,219,328 reserve, so the `all` row fails against 805,306,368.
+    #[test]
+    fn t3a_small_reserve_and_budget_per_mode() {
+        const T3A_SMALL: u64 = 1912 * MIB;
+        let hosts = [
+            HostProfile::new(2, Some(T3A_SMALL), Some(T3A_SMALL), None, None, None),
+            HostProfile::new(
+                2,
+                Some(T3A_SMALL),
+                Some(32 * GIB),
+                Some(T3A_SMALL),
+                Some(30 * GIB),
+                Some(0),
+            ),
+        ];
+        for host in hosts {
+            for (args, reserve, budget) in [
+                (&["--mode", "all"][..], 768 * MIB, 1144 * MIB),
+                (&["--mode", "query"][..], 478 * MIB, 1434 * MIB),
+                (&["--mode", "maintain"][..], 478 * MIB, 1434 * MIB),
+                (
+                    &["--mode", "all", "--max-ingest-buffer-bytes", "134217728"][..],
+                    478 * MIB,
+                    1434 * MIB,
+                ),
+            ] {
+                let cli = Cli::try_parse_from(
+                    std::iter::once("ravel-server").chain(args.iter().copied()),
+                )
+                .expect("flags parse");
+                let resolved = cli
+                    .resolve_performance(host)
+                    .expect("a t3a.small starts in every mode");
+                assert_eq!(resolved.memory_overhead_reserve_bytes, reserve, "{args:?}");
+                assert_eq!(resolved.memory_budget_bytes, budget, "{args:?}");
+            }
+            assert_eq!(768 * MIB, 805_306_368);
+            assert_eq!(1144 * MIB, 1_199_570_944);
+            assert_eq!(478 * MIB, 501_219_328);
+            assert_eq!(1434 * MIB, 1_503_657_984);
+
+            let gateway =
+                Cli::try_parse_from(["ravel-server", "--mode", "gateway"]).expect("flags parse");
+            let resolved = gateway.resolve_performance(host).expect("a gateway starts");
+            assert!(resolved.memory_budget_not_applicable);
+            assert_eq!(resolved.memory_budget_bytes, u64::MAX);
+            assert_eq!(resolved.memory_overhead_reserve_ingest_limit, None);
+
+            let unbounded = Cli::try_parse_from([
+                "ravel-server",
+                "--mode",
+                "all",
+                "--max-ingest-buffer-bytes",
+                "0",
+            ])
+            .expect("flags parse");
+            let err = unbounded
+                .resolve_performance(host)
+                .expect_err("an unbounded ingest buffer takes the whole 2 GiB reserve");
+            let refused = err
+                .downcast_ref::<MemoryBudgetBelowMinimum>()
+                .expect("typed MemoryBudgetBelowMinimum error");
+            assert_eq!(refused.reserve_bytes, MEMORY_OVERHEAD_RESERVE_BYTES);
+            assert_eq!(refused.memory_budget_bytes, 0);
+        }
+    }
+
+    /// The refusal names `--max-ingest-buffer-bytes` exactly when the
+    /// ingest term set the reserve: `all` at 600 MiB (a 768 MiB reserve
+    /// against a 256 MiB baseline reserve) and `all` with an unbounded
+    /// buffer. `query` and `maintain` on the same host refuse without it.
+    /// `ResolvedPerformanceDefaults` records the same thing: `all` on a
+    /// t3a.small carries the ingest limit, `all` at 8 GiB, where a quarter
+    /// covers it, does not.
+    ///
+    /// Prove-the-test: with the pre-fix reserve `all` at 600 MiB starts (a
+    /// 450 MiB budget), so the first `expect_err` panics; with the message
+    /// branch dropped (every refusal on the `None` text) the first `contains`
+    /// fails.
+    #[test]
+    fn refusal_names_the_ingest_flag_only_when_it_set_the_reserve() {
+        let host = HostProfile::new(2, Some(600 * MIB), Some(600 * MIB), None, None, None);
+        let all = Cli::try_parse_from(["ravel-server", "--mode", "all"]).expect("flags parse");
+        let err = all
+            .resolve_performance(host)
+            .expect_err("--mode all at 600 MiB must refuse");
+        let refused = err
+            .downcast_ref::<MemoryBudgetBelowMinimum>()
+            .expect("typed MemoryBudgetBelowMinimum error");
+        assert_eq!(
+            *refused,
+            MemoryBudgetBelowMinimum {
+                memory_basis: "MemTotal",
+                memory_bytes: 629_145_600,
+                reserve_bytes: 805_306_368,
+                memory_budget_bytes: 0,
+                ingest_buffer_limit: Some(ravel_ingest::IngestByteBudgetLimit::Bounded(
+                    536_870_912
+                )),
+            }
+        );
+        let message = refused.to_string();
+        for needle in [
+            "overhead reserve taken from it is 805306368 bytes",
+            "536870912-byte ingest buffer ceiling (--max-ingest-buffer-bytes)",
+            "268435456-byte baseline",
+            "lower --max-ingest-buffer-bytes",
+            "--memory-budget-bytes",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+
+        let unbounded = Cli::try_parse_from([
+            "ravel-server",
+            "--mode",
+            "all",
+            "--max-ingest-buffer-bytes",
+            "0",
+        ])
+        .expect("flags parse");
+        let err = unbounded
+            .resolve_performance(host)
+            .expect_err("an unbounded ingest buffer at 600 MiB must refuse");
+        let refused = err
+            .downcast_ref::<MemoryBudgetBelowMinimum>()
+            .expect("typed MemoryBudgetBelowMinimum error");
+        assert_eq!(
+            refused.ingest_buffer_limit,
+            Some(ravel_ingest::IngestByteBudgetLimit::Unlimited)
+        );
+        let message = refused.to_string();
+        for needle in [
+            "--max-ingest-buffer-bytes is 0",
+            "the reserve is its 2147483648-byte ceiling",
+            "set --max-ingest-buffer-bytes to a bound",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?}: {message}");
+        }
+
+        let tiny = HostProfile::new(2, Some(300 * MIB), Some(300 * MIB), None, None, None);
+        for mode in ["query", "maintain"] {
+            let cli = Cli::try_parse_from(["ravel-server", "--mode", mode]).expect("flags parse");
+            let err = cli
+                .resolve_performance(tiny)
+                .expect_err("a 44 MiB budget must refuse");
+            let refused = err
+                .downcast_ref::<MemoryBudgetBelowMinimum>()
+                .expect("typed MemoryBudgetBelowMinimum error");
+            assert_eq!(refused.ingest_buffer_limit, None, "--mode {mode}");
+            let message = refused.to_string();
+            assert!(
+                !message.contains("--max-ingest-buffer-bytes"),
+                "--mode {mode}: {message}"
+            );
+        }
+
+        let t3a_small = HostProfile::new(2, Some(1912 * MIB), Some(1912 * MIB), None, None, None);
+        let resolved = all
+            .resolve_performance(t3a_small)
+            .expect("t3a.small starts");
+        assert_eq!(
+            resolved.memory_overhead_reserve_ingest_limit,
+            Some(ravel_ingest::IngestByteBudgetLimit::Bounded(536_870_912))
+        );
+        let large = HostProfile::new(4, Some(8 * GIB), Some(8 * GIB), None, None, None);
+        let resolved = all.resolve_performance(large).expect("8 GiB starts");
+        assert_eq!(resolved.memory_overhead_reserve_ingest_limit, None);
     }
 }
