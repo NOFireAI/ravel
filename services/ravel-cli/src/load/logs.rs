@@ -1100,9 +1100,11 @@ enum SpanOutcome {
     Done,
     /// A cursor's Parquet read failed.
     Failed(String),
-    /// Up to K contiguous spans, each with its own file-absolute base row. May
-    /// be empty (every dealt share came back empty), which the caller turns
-    /// into a zero-row batch.
+    /// The round's non-empty spans, each with its own file-absolute base row.
+    /// A cursor's share can arrive as several spans, so a round can hold more
+    /// than K; a cursor dealt nothing, or whose rows were all skipped,
+    /// contributes none. May be empty, which the caller turns into a zero-row
+    /// batch.
     Spans(Vec<(RecordBatch, u64)>),
 }
 

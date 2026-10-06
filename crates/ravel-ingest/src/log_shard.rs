@@ -1558,7 +1558,7 @@ impl LogShardActor {
                 }
             }
             BufContent::Columnar(batches) => {
-                for batch in &batches {
+                for batch in batches {
                     for (target, part) in partition_columnar(batch, count) {
                         if let FlushPayload::Columnar(into) = payloads
                             .entry(target)
@@ -5233,6 +5233,189 @@ mod tests {
             .expect("the flush is written");
         assert_eq!(rig.own_commits().await, 1);
         assert_eq!(rig.own_records().await, 6, "every record, once");
+        drop(rig.tx);
+        rig.task.await.expect("actor ends");
+    }
+
+    /// Writes `hand_backs` into a fresh shard-0 actor with a pinned writer id,
+    /// seed and clock, flushes it once, and returns every stored object.
+    async fn write_hand_backs(
+        hand_backs: Vec<(FlushPayload, HandBackArrival)>,
+    ) -> Vec<(String, Vec<u8>)> {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let (tx, rx) = mpsc::channel(16);
+        let config = IngestConfig {
+            shard_count: 3,
+            ..IngestConfig::default()
+        };
+        let actor = LogShardActor::new(
+            0,
+            Uuid::from_u128(0x2624),
+            1,
+            Arc::clone(&store),
+            TestClock::new(BASE_NS),
+            Arc::new(ravel_commit::rng::SeededRng::new(0x00C0_FFEE)),
+            config,
+            Arc::new(LogIngestMetrics::default()),
+            rx,
+            Arc::new(IndexedFieldsOverlay::new(Arc::new(
+                crate::log_router::NoIndexedFields,
+            ))),
+            BufferBudgetCeiling::unlimited(),
+            DeferralCapFlag::new(config.flush_deferral_cap_ns()),
+            crate::generation::ScriptedScope::new(ScanCheck::InScanSet, None),
+            #[cfg(feature = "stage-timing")]
+            Arc::new(LogStageTimings::new()),
+        );
+        let task = tokio::spawn(actor.run());
+        for (payload, arrival) in hand_backs {
+            tx.send(LogShardMsg::HandBack {
+                tenant: TenantId::new("acme"),
+                payload,
+                charges: Vec::new(),
+                arrival,
+            })
+            .await
+            .expect("send HandBack");
+        }
+        let (done, wait) = oneshot::channel();
+        tx.send(LogShardMsg::Shutdown { done })
+            .await
+            .expect("send Shutdown");
+        wait.await.expect("Shutdown answered");
+        drop(tx);
+        task.await.expect("actor ends");
+        crate::log_router::collect_objects(store.as_ref()).await
+    }
+
+    /// A retiring shard's columnar buffer of two writes, handed back to a
+    /// three-shard set and written there in one flush, stores the same objects
+    /// as the cloning reference partition gives for the same writes. Each
+    /// write is partitioned for four shards and shard 3's part is buffered
+    /// here; the hand-back re-partitions those parts, which already carry
+    /// compacted dictionaries, for three shards, and one actor takes every
+    /// target's message into one buffer. The reference payloads are the
+    /// cloning partition applied the same two times, grouped the way
+    /// `hand_back` groups them: per target, ascending, each write's part in
+    /// write order.
+    #[tokio::test]
+    async fn a_handed_back_columnar_buffer_stores_the_same_objects_as_the_cloning_reference() {
+        use crate::log_router::{
+            assert_same_objects, cloning_partition_reference_pre_2624, dict_kept, dictionary_writes,
+        };
+        let shard_of = |parts: Vec<(u32, ColumnarLogBatch)>, shard: u32| {
+            parts
+                .into_iter()
+                .find(|(s, _)| *s == shard)
+                .map(|(_, part)| part)
+                .expect("the shard receives rows")
+        };
+        let writes = dictionary_writes();
+
+        let rig = HandBackRig::new(None);
+        let (target, mut inbox) = mpsc::channel(16);
+        // Every stream on shard 3 of 4 is on shard 1 of 2, so a two-shard
+        // target set would not split the part; three shards do.
+        let to_three = ScanCheck::HandBack {
+            scan_count: 3,
+            target_count: 3,
+            reason: HandBackReason::RetiredIndex,
+        };
+        rig.scope.set(to_three, Some(target));
+        for write in &writes {
+            rig.tx
+                .send(LogShardMsg::WriteColumnar {
+                    tenant: TenantId::new("acme"),
+                    batch: Box::new(shard_of(partition_columnar(write.clone(), 4), 3)),
+                    ack: None,
+                    charge: None,
+                })
+                .await
+                .expect("send columnar write");
+        }
+        rig.flush_now().await;
+        assert_eq!(rig.metrics.snapshot().rerouted_flushes, 1, "one hand-back");
+        let mut moved = Vec::new();
+        while let Ok(msg) = inbox.try_recv() {
+            if let LogShardMsg::HandBack {
+                payload, arrival, ..
+            } = msg
+            {
+                moved.push((payload, arrival));
+            }
+        }
+
+        let mut reference: Vec<(u32, Vec<ColumnarLogBatch>)> = Vec::new();
+        for write in &writes {
+            let part = shard_of(cloning_partition_reference_pre_2624(write, 4), 3);
+            for (target, sub) in cloning_partition_reference_pre_2624(&part, 3) {
+                match reference.iter_mut().find(|(t, _)| *t == target) {
+                    Some((_, batches)) => batches.push(sub),
+                    None => reference.push((target, vec![sub])),
+                }
+            }
+        }
+        reference.sort_by_key(|(target, _)| *target);
+        assert!(reference.len() > 1, "the part splits across targets");
+        assert_eq!(
+            moved.len(),
+            reference.len(),
+            "one hand-back message per target"
+        );
+
+        let mut blob_dropped_beside_raw = 0;
+        for (t, (payload, _)) in moved.iter().enumerate() {
+            let FlushPayload::Columnar(batches) = payload else {
+                panic!("target {t}: a columnar buffer hands back columnar batches");
+            };
+            assert_eq!(batches.len(), 2, "target {t}: a part of each write");
+            for (w, part) in batches.iter().enumerate() {
+                assert_eq!(
+                    dict_kept(part, "k_str"),
+                    Some(w == 0),
+                    "target {t}, write {w}: k_str's dictionary only from the first write"
+                );
+                assert_eq!(
+                    dict_kept(part, "raw"),
+                    Some(true),
+                    "target {t}, write {w}: raw keeps its dictionary"
+                );
+                let blob = part
+                    .dyn_columns
+                    .iter()
+                    .find(|c| c.name == "blob")
+                    .expect("blob column");
+                // A share without a Map cell can still have none: the
+                // four-shard part it came from dropped it for one.
+                let has_map = blob.cells.iter().any(|c| matches!(c, AttrValue::Map(_)));
+                if has_map {
+                    assert_eq!(
+                        dict_kept(part, "blob"),
+                        Some(false),
+                        "target {t}, write {w}: blob drops its dictionary for a Map cell"
+                    );
+                    blob_dropped_beside_raw += 1;
+                }
+            }
+        }
+        assert!(
+            blob_dropped_beside_raw > 0,
+            "some handed-back part drops blob's dictionary for a Map cell"
+        );
+
+        let reference: Vec<(FlushPayload, HandBackArrival)> = reference
+            .into_iter()
+            .zip(&moved)
+            .map(|((_, batches), (_, arrival))| (FlushPayload::Columnar(batches), *arrival))
+            .collect();
+        let objs_ref = write_hand_backs(reference).await;
+        let objs_new = write_hand_backs(moved).await;
+        let commits = objs_ref
+            .iter()
+            .filter(|(key, _)| key.contains("/c/"))
+            .count();
+        assert_eq!(commits, 1, "every target's parts are written in one flush");
+        assert_same_objects(&objs_ref, &objs_new);
         drop(rig.tx);
         rig.task.await.expect("actor ends");
     }

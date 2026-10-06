@@ -12,7 +12,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use ravel_commit::rng::{RngSource, SystemRng};
-use ravel_logseg::{Bitmap, ColumnarLogBatch, DynColumn};
+use ravel_logseg::{Bitmap, ColumnarLogBatch, DynColumn, FieldType, StrColumnDict};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_normalize::NormalizedLogRecord;
 use ravel_types::logstream::AttrValue;
@@ -558,6 +558,23 @@ impl LogIngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<LogWriteReceipt, LogWriteError> {
+        self.write_columnar_partitioned(tenant, batch, mode, ack_deadline, partition_columnar)
+            .await
+    }
+
+    /// [`Self::write_columnar`] with the partition step supplied, so a test can
+    /// run the same write through a reference partition and compare objects.
+    async fn write_columnar_partitioned<P>(
+        &self,
+        tenant: ravel_types::TenantId,
+        batch: ColumnarLogBatch,
+        mode: WriteMode,
+        ack_deadline: Duration,
+        partition: P,
+    ) -> Result<LogWriteReceipt, LogWriteError>
+    where
+        P: FnOnce(ColumnarLogBatch, u32) -> Vec<(u32, ColumnarLogBatch)>,
+    {
         // Caller-side input rejection, before anything else: a malformed batch
         // must not reach `est_columnar_bytes` (which indexes `stream_attrs` by
         // `stream_refs` with no bound check of its own) or `partition_columnar`,
@@ -592,8 +609,9 @@ impl LogIngestRouter {
 
         // Partition into per-shard column selections. `partition_columnar`
         // returns ascending-shard order and omits a shard with no rows, matching
-        // `write`'s sorted `by_shard` keys.
-        let by_shard = partition_columnar(&batch, shard_count);
+        // `write`'s sorted `by_shard` keys. It consumes the batch, so the parent
+        // is freed before any shard is sent its part.
+        let by_shard = partition(batch, shard_count);
         if by_shard.is_empty() {
             return Ok(LogWriteReceipt::default());
         }
@@ -750,8 +768,9 @@ impl LogIngestRouter {
 /// `shard_for_log` over each row's stream id (ADR-0109 decision 4), the
 /// columnar analogue of [`LogIngestRouter::write`]'s `by_shard` grouping.
 ///
-/// Each returned sub-batch is exactly what `ColumnarLogBatch::from_records`
-/// would build from that shard's rows taken in row order: dynamic columns keep
+/// Each returned sub-batch, apart from the dictionaries described below, is
+/// exactly what `ColumnarLogBatch::from_records` would build from that shard's
+/// rows taken in row order: dynamic columns keep
 /// the parent's `(name, type)`-sorted order and any the subset leaves all-absent
 /// are dropped (`from_records` over the subset would never have created them),
 /// and the stream directory is rebuilt id-ascending with dense refs. That
@@ -759,128 +778,302 @@ impl LogIngestRouter {
 /// path's, whose per-shard record vector this reproduces (the writer-level proof
 /// is #602). Returns ascending-shard order; a shard with no rows is omitted,
 /// exactly as the row path omits it.
+///
+/// The parent is consumed column by column: every cell, residual attribute list
+/// and stream blob moves into its shard's sub-batch rather than being cloned,
+/// and the parent is freed column by column, each column once its rows are
+/// dealt (#2624). The severity text, body, and trace and span id bytes are
+/// copied, and each column's per-shard vectors coexist with the parent's while
+/// it is dealt.
+///
+/// A Str or Bytes column's dictionary (`dyn_col_dicts`) is carried into each
+/// sub-batch, compacted to the entries that sub-batch references, in
+/// first-referenced order. The writer encodes a dictionary column through
+/// `string_dict_shape`, which equals `string_shape` over the cells' bytes when
+/// every referenced entry equals its cell's bytes, so the object does not
+/// change. [`ColumnarLogBatch::validate`] checks that equality for `Str` and
+/// `Bytes` cells only, so a sub-batch whose share of a column holds a `List` or
+/// `Map` cell gets no dictionary for that column and the writer takes its plain
+/// path. A dictionary on a column of any other type is dropped as well: the
+/// writer reads dictionaries for Str and Bytes columns only.
 pub(crate) fn partition_columnar(
-    batch: &ColumnarLogBatch,
+    batch: ColumnarLogBatch,
     shard_count: u32,
 ) -> Vec<(u32, ColumnarLogBatch)> {
-    // Per-shard accumulator: the sub-batch under construction, the parent stream
-    // refs of its rows (remapped to dense child refs once all rows are seen),
-    // and one dense (cells, validity) pair per parent dynamic column.
-    struct Acc {
-        out: ColumnarLogBatch,
-        parent_refs: Vec<u32>,
-        dyn_cells: Vec<Vec<AttrValue>>,
-        dyn_validity: Vec<Bitmap>,
+    let ColumnarLogBatch {
+        num_rows: _,
+        ts_ns,
+        observed_ts_ns,
+        severity_num,
+        flags,
+        severity_text,
+        body,
+        trace_id,
+        trace_id_validity,
+        span_id,
+        span_id_validity,
+        stream_refs,
+        stream_ids,
+        mut stream_attrs,
+        dyn_columns,
+        dyn_col_dicts,
+        residual_attrs,
+    } = batch;
+
+    // The shards that receive rows, ascending, and each row's index into them.
+    // A stream maps to one shard, so the shard is resolved once per stream.
+    let mut referenced = vec![false; stream_ids.len()];
+    for &r in &stream_refs {
+        referenced[r as usize] = true;
     }
-    let ncol = batch.dyn_columns.len();
-    let mut accs: HashMap<u32, Acc> = HashMap::new();
+    let stream_shard: Vec<u32> = stream_ids
+        .iter()
+        .map(|id| shard_for_log(id, shard_count))
+        .collect();
+    let mut shards: Vec<u32> = stream_shard
+        .iter()
+        .zip(&referenced)
+        .filter_map(|(&shard, &used)| used.then_some(shard))
+        .collect();
+    shards.sort_unstable();
+    shards.dedup();
+    let stream_part: Vec<usize> = stream_shard
+        .iter()
+        .map(|&shard| shards.partition_point(|&s| s < shard))
+        .collect();
+    let row_part: Vec<usize> = stream_refs
+        .iter()
+        .map(|&r| stream_part[r as usize])
+        .collect();
 
-    // Dense-slot cursors into the parent's packed buffers, advanced once per row
-    // (regardless of shard) so a present cell reads the correct dense slot.
-    let mut trace_slot = 0usize;
-    let mut span_slot = 0usize;
-    let mut col_slot = vec![0usize; ncol];
+    let mut rows_per_part = vec![0usize; shards.len()];
+    for &p in &row_part {
+        rows_per_part[p] += 1;
+    }
+    let mut out: Vec<ColumnarLogBatch> = rows_per_part
+        .iter()
+        .map(|&num_rows| ColumnarLogBatch {
+            num_rows,
+            ..ColumnarLogBatch::new()
+        })
+        .collect();
 
-    for row in 0..batch.num_rows {
-        let stream_id = batch.stream_ids[batch.stream_refs[row] as usize];
-        let shard = shard_for_log(&stream_id, shard_count);
-        let acc = accs.entry(shard).or_insert_with(|| Acc {
-            out: ColumnarLogBatch::new(),
-            parent_refs: Vec::new(),
-            dyn_cells: vec![Vec::new(); ncol],
-            dyn_validity: vec![Bitmap::new(); ncol],
-        });
+    for (part, v) in out
+        .iter_mut()
+        .zip(deal_rows(ts_ns, &row_part, &rows_per_part))
+    {
+        part.ts_ns = v;
+    }
+    for (part, v) in out
+        .iter_mut()
+        .zip(deal_rows(observed_ts_ns, &row_part, &rows_per_part))
+    {
+        part.observed_ts_ns = v;
+    }
+    for (part, v) in out
+        .iter_mut()
+        .zip(deal_rows(severity_num, &row_part, &rows_per_part))
+    {
+        part.severity_num = v;
+    }
+    for (part, v) in out
+        .iter_mut()
+        .zip(deal_rows(flags, &row_part, &rows_per_part))
+    {
+        part.flags = v;
+    }
+    for (part, v) in out
+        .iter_mut()
+        .zip(deal_rows(residual_attrs, &row_part, &rows_per_part))
+    {
+        part.residual_attrs = v;
+    }
+    for (row, &p) in row_part.iter().enumerate() {
+        out[p].severity_text.push(severity_text.get(row));
+    }
+    drop(severity_text);
+    for (row, &p) in row_part.iter().enumerate() {
+        out[p].body.push(body.get(row));
+    }
+    drop(body);
+    for (part, (ids, validity)) in out.iter_mut().zip(deal_fixed_width(
+        trace_id,
+        &trace_id_validity,
+        16,
+        &row_part,
+    )) {
+        part.trace_id = ids;
+        part.trace_id_validity = validity;
+    }
+    drop(trace_id_validity);
+    for (part, (ids, validity)) in
+        out.iter_mut()
+            .zip(deal_fixed_width(span_id, &span_id_validity, 8, &row_part))
+    {
+        part.span_id = ids;
+        part.span_id_validity = validity;
+    }
+    drop(span_id_validity);
 
-        acc.out.num_rows += 1;
-        acc.out.ts_ns.push(batch.ts_ns[row]);
-        acc.out.observed_ts_ns.push(batch.observed_ts_ns[row]);
-        acc.out.severity_num.push(batch.severity_num[row]);
-        acc.out.flags.push(batch.flags[row]);
-        acc.out.severity_text.push(batch.severity_text.get(row));
-        acc.out.body.push(batch.body.get(row));
-
-        if batch.trace_id_validity.get(row) {
-            acc.out
-                .trace_id
-                .extend_from_slice(batch.trace_id_at(trace_slot));
-            acc.out.trace_id_validity.push(true);
-            trace_slot += 1;
-        } else {
-            acc.out.trace_id_validity.push(false);
+    // Stream directory: walking the parent's refs ascending gives each shard its
+    // streams id-ascending (the parent's `stream_ids` are id-ascending), as dense
+    // child refs. Each stream belongs to exactly one shard, so its blob moves.
+    let mut child_ref = vec![0u32; stream_ids.len()];
+    for (r, &used) in referenced.iter().enumerate() {
+        if !used {
+            continue;
         }
-        if batch.span_id_validity.get(row) {
-            acc.out
-                .span_id
-                .extend_from_slice(batch.span_id_at(span_slot));
-            acc.out.span_id_validity.push(true);
-            span_slot += 1;
-        } else {
-            acc.out.span_id_validity.push(false);
-        }
+        let part = &mut out[stream_part[r]];
+        child_ref[r] = part.stream_ids.len() as u32;
+        part.stream_ids.push(stream_ids[r]);
+        part.stream_attrs.push(std::mem::take(&mut stream_attrs[r]));
+    }
+    drop(stream_attrs);
+    for (&r, &p) in stream_refs.iter().zip(&row_part) {
+        out[p].stream_refs.push(child_ref[r as usize]);
+    }
+    drop(stream_refs);
 
-        acc.out
-            .residual_attrs
-            .push(batch.residual_attrs[row].clone());
-        acc.parent_refs.push(batch.stream_refs[row]);
-
-        for (c, slot) in col_slot.iter_mut().enumerate() {
-            let col = &batch.dyn_columns[c];
-            if col.validity.get(row) {
-                acc.dyn_cells[c].push(col.cells[*slot].clone());
-                acc.dyn_validity[c].push(true);
-                *slot += 1;
+    // Dynamic columns: keep the parent's `(name, type)` order, dropping any
+    // column a shard leaves all-absent.
+    let mut part_dicts: Vec<Vec<Option<StrColumnDict>>> =
+        (0..shards.len()).map(|_| Vec::new()).collect();
+    let mut part_has_dict = vec![false; shards.len()];
+    let mut dicts = dyn_col_dicts.into_iter();
+    for column in dyn_columns {
+        let DynColumn {
+            name,
+            field_type,
+            cells,
+            validity,
+        } = column;
+        let dict = dicts
+            .next()
+            .flatten()
+            .filter(|_| matches!(field_type, FieldType::Str | FieldType::Bytes));
+        let mut part_cells: Vec<Vec<AttrValue>> = (0..shards.len()).map(|_| Vec::new()).collect();
+        let mut part_validity: Vec<Bitmap> = (0..shards.len()).map(|_| Bitmap::new()).collect();
+        let mut part_ids: Vec<Vec<u32>> = (0..shards.len()).map(|_| Vec::new()).collect();
+        let mut parent_ids = dict.as_ref().map(|d| d.ids.iter());
+        let mut cells = cells.into_iter();
+        for (row, &p) in row_part.iter().enumerate() {
+            let cell = if validity.get(row) {
+                cells.next()
             } else {
-                acc.dyn_validity[c].push(false);
+                None
+            };
+            match cell {
+                Some(cell) => {
+                    part_cells[p].push(cell);
+                    part_validity[p].push(true);
+                    if let Some(&id) = parent_ids.as_mut().and_then(Iterator::next) {
+                        part_ids[p].push(id);
+                    }
+                }
+                None => part_validity[p].push(false),
             }
         }
-    }
-
-    let mut result: Vec<(u32, ColumnarLogBatch)> = Vec::with_capacity(accs.len());
-    for (shard, acc) in accs {
-        let Acc {
-            mut out,
-            parent_refs,
-            dyn_cells,
-            dyn_validity,
-        } = acc;
-
-        // Stream directory: distinct parent refs ascending. The parent's
-        // `stream_ids` are id-ascending, so ascending parent refs are
-        // id-ascending too; rebuild them as dense child refs.
-        let mut distinct: Vec<u32> = parent_refs.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        let mut child_ref_of: HashMap<u32, u32> = HashMap::with_capacity(distinct.len());
-        for (child, &parent_ref) in distinct.iter().enumerate() {
-            child_ref_of.insert(parent_ref, child as u32);
-            out.stream_ids.push(batch.stream_ids[parent_ref as usize]);
-            out.stream_attrs
-                .push(batch.stream_attrs[parent_ref as usize].clone());
-        }
-        out.stream_refs = parent_refs
-            .iter()
-            .map(|parent_ref| child_ref_of[parent_ref])
-            .collect();
-
-        // Dynamic columns: keep the parent's `(name, type)` order, dropping any
-        // column the subset left all-absent.
-        for (c, (cells, validity)) in dyn_cells.into_iter().zip(dyn_validity).enumerate() {
-            if validity.count_present() == 0 {
+        drop(cells);
+        for (p, ((cells, validity), ids)) in part_cells
+            .into_iter()
+            .zip(part_validity)
+            .zip(part_ids)
+            .enumerate()
+        {
+            if cells.is_empty() {
                 continue;
             }
-            out.dyn_columns.push(DynColumn {
-                name: batch.dyn_columns[c].name.clone(),
-                field_type: batch.dyn_columns[c].field_type,
+            let checked = cells
+                .iter()
+                .all(|c| matches!(c, AttrValue::Str(_) | AttrValue::Bytes(_)));
+            let child_dict = dict
+                .as_ref()
+                .filter(|_| checked)
+                .map(|d| compact_dict(&d.distinct, ids));
+            part_has_dict[p] |= child_dict.is_some();
+            part_dicts[p].push(child_dict);
+            out[p].dyn_columns.push(DynColumn {
+                name: name.clone(),
+                field_type,
                 cells,
                 validity,
             });
         }
-
-        result.push((shard, out));
     }
-    result.sort_by_key(|(shard, _)| *shard);
-    result
+    for ((part, dicts), has_dict) in out.iter_mut().zip(part_dicts).zip(part_has_dict) {
+        if has_dict {
+            part.dyn_col_dicts = dicts;
+        }
+    }
+
+    shards.into_iter().zip(out).collect()
 }
+
+/// Moves each row's value into its part's vector, in row order.
+fn deal_rows<T>(values: Vec<T>, row_part: &[usize], rows_per_part: &[usize]) -> Vec<Vec<T>> {
+    let mut parts: Vec<Vec<T>> = rows_per_part
+        .iter()
+        .map(|&n| Vec::with_capacity(n))
+        .collect();
+    for (value, &p) in values.into_iter().zip(row_part) {
+        parts[p].push(value);
+    }
+    parts
+}
+
+/// Deals a packed fixed-width optional column (dense over present rows, with a
+/// per-row presence bitmap) into one packed column and bitmap per part.
+fn deal_fixed_width(
+    packed: Vec<u8>,
+    validity: &Bitmap,
+    width: usize,
+    row_part: &[usize],
+) -> Vec<(Vec<u8>, Bitmap)> {
+    let parts = row_part.iter().max().map_or(0, |&p| p + 1);
+    let mut out: Vec<(Vec<u8>, Bitmap)> = (0..parts).map(|_| (Vec::new(), Bitmap::new())).collect();
+    let mut slot = 0usize;
+    for (row, &p) in row_part.iter().enumerate() {
+        let (ids, present) = &mut out[p];
+        if validity.get(row) {
+            ids.extend_from_slice(&packed[slot * width..slot * width + width]);
+            present.push(true);
+            slot += 1;
+        } else {
+            present.push(false);
+        }
+    }
+    out
+}
+
+/// A sub-batch's dictionary: the parent `distinct` entries its `ids` reference,
+/// in first-referenced order, with the ids renumbered to match.
+fn compact_dict(distinct: &[Vec<u8>], ids: Vec<u32>) -> StrColumnDict {
+    let mut child_of: Vec<Option<u32>> = vec![None; distinct.len()];
+    let mut child_distinct: Vec<Vec<u8>> = Vec::new();
+    let mut child_ids: Vec<u32> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let child = match child_of[id as usize] {
+            Some(child) => child,
+            None => {
+                let child = child_distinct.len() as u32;
+                child_distinct.push(distinct[id as usize].clone());
+                child_of[id as usize] = Some(child);
+                child
+            }
+        };
+        child_ids.push(child);
+    }
+    StrColumnDict {
+        distinct: child_distinct,
+        ids: child_ids,
+    }
+}
+
+#[cfg(test)]
+pub(crate) use tests::{
+    assert_same_objects, cloning_partition_reference_pre_2624, collect_objects, dict_kept,
+    dictionary_writes,
+};
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
@@ -1217,7 +1410,7 @@ mod tests {
         out
     }
 
-    async fn collect_objects(store: &dyn ObjectStoreBackend) -> Vec<(String, Vec<u8>)> {
+    pub(crate) async fn collect_objects(store: &dyn ObjectStoreBackend) -> Vec<(String, Vec<u8>)> {
         let mut metas = list_all(store, "").await.expect("list all objects");
         metas.sort_by(|a, b| a.key.cmp(&b.key));
         let mut out = Vec::with_capacity(metas.len());
@@ -1558,7 +1751,7 @@ mod tests {
             expected.entry(shard).or_default().push(lr.clone());
         }
 
-        let parts = partition_columnar(&batch, shard_count);
+        let parts = partition_columnar(batch, shard_count);
         let seen: std::collections::HashSet<u32> = parts.iter().map(|(s, _)| *s).collect();
         assert_eq!(
             seen.len(),
@@ -1578,5 +1771,750 @@ mod tests {
                 "shard {shard}'s partition must equal from_records of its rows"
             );
         }
+    }
+
+    // ---- #2624: partition by move ----
+
+    use proptest::prelude::*;
+
+    /// The reference `partition_columnar` is checked against: the partition as
+    /// it stood before #2624, which borrows the parent, clones every cell,
+    /// residual list and stream blob, and builds no dictionaries. Kept verbatim
+    /// apart from its name.
+    pub(crate) fn cloning_partition_reference_pre_2624(
+        batch: &ColumnarLogBatch,
+        shard_count: u32,
+    ) -> Vec<(u32, ColumnarLogBatch)> {
+        // Per-shard accumulator: the sub-batch under construction, the parent stream
+        // refs of its rows (remapped to dense child refs once all rows are seen),
+        // and one dense (cells, validity) pair per parent dynamic column.
+        struct Acc {
+            out: ColumnarLogBatch,
+            parent_refs: Vec<u32>,
+            dyn_cells: Vec<Vec<AttrValue>>,
+            dyn_validity: Vec<Bitmap>,
+        }
+        let ncol = batch.dyn_columns.len();
+        let mut accs: HashMap<u32, Acc> = HashMap::new();
+
+        // Dense-slot cursors into the parent's packed buffers, advanced once per row
+        // (regardless of shard) so a present cell reads the correct dense slot.
+        let mut trace_slot = 0usize;
+        let mut span_slot = 0usize;
+        let mut col_slot = vec![0usize; ncol];
+
+        for row in 0..batch.num_rows {
+            let stream_id = batch.stream_ids[batch.stream_refs[row] as usize];
+            let shard = shard_for_log(&stream_id, shard_count);
+            let acc = accs.entry(shard).or_insert_with(|| Acc {
+                out: ColumnarLogBatch::new(),
+                parent_refs: Vec::new(),
+                dyn_cells: vec![Vec::new(); ncol],
+                dyn_validity: vec![Bitmap::new(); ncol],
+            });
+
+            acc.out.num_rows += 1;
+            acc.out.ts_ns.push(batch.ts_ns[row]);
+            acc.out.observed_ts_ns.push(batch.observed_ts_ns[row]);
+            acc.out.severity_num.push(batch.severity_num[row]);
+            acc.out.flags.push(batch.flags[row]);
+            acc.out.severity_text.push(batch.severity_text.get(row));
+            acc.out.body.push(batch.body.get(row));
+
+            if batch.trace_id_validity.get(row) {
+                acc.out
+                    .trace_id
+                    .extend_from_slice(batch.trace_id_at(trace_slot));
+                acc.out.trace_id_validity.push(true);
+                trace_slot += 1;
+            } else {
+                acc.out.trace_id_validity.push(false);
+            }
+            if batch.span_id_validity.get(row) {
+                acc.out
+                    .span_id
+                    .extend_from_slice(batch.span_id_at(span_slot));
+                acc.out.span_id_validity.push(true);
+                span_slot += 1;
+            } else {
+                acc.out.span_id_validity.push(false);
+            }
+
+            acc.out
+                .residual_attrs
+                .push(batch.residual_attrs[row].clone());
+            acc.parent_refs.push(batch.stream_refs[row]);
+
+            for (c, slot) in col_slot.iter_mut().enumerate() {
+                let col = &batch.dyn_columns[c];
+                if col.validity.get(row) {
+                    acc.dyn_cells[c].push(col.cells[*slot].clone());
+                    acc.dyn_validity[c].push(true);
+                    *slot += 1;
+                } else {
+                    acc.dyn_validity[c].push(false);
+                }
+            }
+        }
+
+        let mut result: Vec<(u32, ColumnarLogBatch)> = Vec::with_capacity(accs.len());
+        for (shard, acc) in accs {
+            let Acc {
+                mut out,
+                parent_refs,
+                dyn_cells,
+                dyn_validity,
+            } = acc;
+
+            // Stream directory: distinct parent refs ascending. The parent's
+            // `stream_ids` are id-ascending, so ascending parent refs are
+            // id-ascending too; rebuild them as dense child refs.
+            let mut distinct: Vec<u32> = parent_refs.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            let mut child_ref_of: HashMap<u32, u32> = HashMap::with_capacity(distinct.len());
+            for (child, &parent_ref) in distinct.iter().enumerate() {
+                child_ref_of.insert(parent_ref, child as u32);
+                out.stream_ids.push(batch.stream_ids[parent_ref as usize]);
+                out.stream_attrs
+                    .push(batch.stream_attrs[parent_ref as usize].clone());
+            }
+            out.stream_refs = parent_refs
+                .iter()
+                .map(|parent_ref| child_ref_of[parent_ref])
+                .collect();
+
+            // Dynamic columns: keep the parent's `(name, type)` order, dropping any
+            // column the subset left all-absent.
+            for (c, (cells, validity)) in dyn_cells.into_iter().zip(dyn_validity).enumerate() {
+                if validity.count_present() == 0 {
+                    continue;
+                }
+                out.dyn_columns.push(DynColumn {
+                    name: batch.dyn_columns[c].name.clone(),
+                    field_type: batch.dyn_columns[c].field_type,
+                    cells,
+                    validity,
+                });
+            }
+
+            result.push((shard, out));
+        }
+        result.sort_by_key(|(shard, _)| *shard);
+        result
+    }
+
+    /// The dictionaries a sub-batch should carry when its parent's came from
+    /// `with_dictionaries`: the parent's, compacted in first-referenced order,
+    /// which is what `with_dictionaries` derives from the sub-batch's own cells,
+    /// with `None` for a column holding a `List` or `Map` cell and no list at
+    /// all when no column keeps one. Rebuilding from the cells matches only a
+    /// parent with a dictionary on every Str/Bytes column and no two equal
+    /// `distinct` entries; the parent's entry order and unreferenced entries
+    /// do not matter, since compaction keeps first-referenced order and drops
+    /// the rest. Any other parent needs its expected dictionaries stated.
+    fn expected_dicts(part: &ColumnarLogBatch) -> Vec<Option<StrColumnDict>> {
+        let dicts: Vec<Option<StrColumnDict>> = part
+            .clone()
+            .with_dictionaries()
+            .dyn_col_dicts
+            .into_iter()
+            .zip(&part.dyn_columns)
+            .map(|(dict, column)| {
+                dict.filter(|_| {
+                    column
+                        .cells
+                        .iter()
+                        .all(|c| matches!(c, AttrValue::Str(_) | AttrValue::Bytes(_)))
+                })
+            })
+            .collect();
+        if dicts.iter().any(Option::is_some) {
+            dicts
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Partitions `batch` both ways and asserts each sub-batch equals the
+    /// cloning reference's apart from dictionaries, validates, and carries
+    /// [`expected_dicts`] (none when the parent had none).
+    fn assert_partition_matches_reference(
+        batch: &ColumnarLogBatch,
+        shard_count: u32,
+    ) -> Vec<(u32, ColumnarLogBatch)> {
+        let want = cloning_partition_reference_pre_2624(batch, shard_count);
+        let got = partition_columnar(batch.clone(), shard_count);
+        let got_shards: Vec<u32> = got.iter().map(|(s, _)| *s).collect();
+        let want_shards: Vec<u32> = want.iter().map(|(s, _)| *s).collect();
+        assert_eq!(got_shards, want_shards, "the same shards, ascending");
+        for ((shard, part), (_, reference)) in got.iter().zip(&want) {
+            part.validate().expect("every sub-batch validates");
+            let mut plain = part.clone();
+            plain.dyn_col_dicts = Vec::new();
+            assert_eq!(
+                &plain, reference,
+                "shard {shard}: the moved sub-batch must equal the cloning reference's"
+            );
+            let dicts = if batch.dyn_col_dicts.is_empty() {
+                Vec::new()
+            } else {
+                expected_dicts(reference)
+            };
+            assert_eq!(
+                part.dyn_col_dicts, dicts,
+                "shard {shard}: dictionaries carried, compacted, in first-referenced order"
+            );
+        }
+        got
+    }
+
+    fn partition_stream(host: u32) -> (ravel_types::logstream::LogStreamId, Vec<u8>) {
+        let res: Vec<(String, AttrValue)> =
+            vec![("host".to_string(), AttrValue::Str(format!("p{host}")))];
+        (
+            log_stream_id(&res, "scope", "", &[]),
+            stream_attrs_bytes(&res, "scope", "", &[]),
+        )
+    }
+
+    /// Three streams on three different shards of eight (so five shards get no
+    /// rows) with 1, 4 and 9 rows, interleaved. Every row of a stream shares
+    /// one timestamp. `only_first` is present on the first stream's rows only,
+    /// so it is all-absent in the other two shards; `blob` holds a `Map` cell
+    /// beside `Bytes` cells; trace and span ids alternate present and absent.
+    fn uneven_records() -> Vec<LogRecord> {
+        let shard_count = 8;
+        let mut streams = Vec::new();
+        let mut seen_shards = Vec::new();
+        for host in 0.. {
+            let (id, attrs) = partition_stream(host);
+            let shard = shard_for_log(&id, shard_count);
+            if !seen_shards.contains(&shard) {
+                seen_shards.push(shard);
+                streams.push((id, attrs));
+            }
+            if streams.len() == 3 {
+                break;
+            }
+        }
+        let rows_per_stream = [1usize, 4, 9];
+        let mut order = Vec::new();
+        let mut left = rows_per_stream;
+        while left.iter().any(|&n| n > 0) {
+            for (s, n) in left.iter_mut().enumerate().rev() {
+                if *n > 0 {
+                    order.push(s);
+                    *n -= 1;
+                }
+            }
+        }
+        order
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let (stream_id, stream_attrs) = streams[s].clone();
+                let mut attrs = vec![
+                    ("k_str".to_string(), AttrValue::Str(format!("v{}", i % 5))),
+                    ("k_int".to_string(), AttrValue::I64(i as i64)),
+                ];
+                if s == 0 {
+                    attrs.push(("only_first".to_string(), AttrValue::Str("x".to_string())));
+                }
+                if i % 2 == 0 {
+                    attrs.push(("raw".to_string(), AttrValue::Bytes(vec![i as u8 % 3, 7])));
+                }
+                attrs.push((
+                    "blob".to_string(),
+                    if i % 4 == 0 {
+                        AttrValue::Map(vec![("a".to_string(), AttrValue::I64(1))])
+                    } else {
+                        AttrValue::Bytes(vec![1, 2])
+                    },
+                ));
+                if i % 3 == 0 {
+                    attrs.push(("k_str".to_string(), AttrValue::Str(format!("dup{i}"))));
+                }
+                LogRecord {
+                    stream_id,
+                    stream_attrs,
+                    ts_ns: 1_000 + s as i64,
+                    observed_ts_ns: 2_000 + i as i64,
+                    severity_num: (i % 24) as u8,
+                    severity_text: format!("S{}", i % 2),
+                    body: format!("body {i}"),
+                    trace_id: (i % 2 == 0).then_some([i as u8; 16]),
+                    span_id: (i % 3 != 0).then_some([i as u8; 8]),
+                    flags: i as u32,
+                    attrs,
+                }
+            })
+            .collect()
+    }
+
+    /// The moving partition yields the cloning reference's sub-batches over
+    /// several shards of uneven size, absent cells, a dynamic column present in
+    /// only one shard, and shards that receive no rows, and it carries each
+    /// Str/Bytes dictionary compacted per shard. The parent's string cells,
+    /// residual lists and stream blobs reappear in the sub-batches at their
+    /// original heap addresses: they were moved, not copied.
+    #[test]
+    fn partition_columnar_moves_cells_and_keeps_dictionaries() {
+        let shard_count = 8u32;
+        let records = uneven_records();
+        let mut batch = ColumnarLogBatch::from_records(&records).with_dictionaries();
+
+        // A producer dictionary in its own order, with an entry no id
+        // references, for `k_str`; and one on the `I64` column, which the
+        // writer never reads.
+        let k_str = batch
+            .dyn_columns
+            .iter()
+            .position(|c| c.name == "k_str")
+            .expect("k_str column");
+        let parent = batch.dyn_col_dicts[k_str]
+            .clone()
+            .expect("k_str dictionary");
+        let mut distinct = parent.distinct.clone();
+        distinct.reverse();
+        distinct.insert(1, b"unreferenced".to_vec());
+        let ids = parent
+            .ids
+            .iter()
+            .map(|&id| {
+                let bytes = &parent.distinct[id as usize];
+                distinct.iter().position(|d| d == bytes).expect("entry") as u32
+            })
+            .collect();
+        batch.dyn_col_dicts[k_str] = Some(StrColumnDict { distinct, ids });
+        let k_int = batch
+            .dyn_columns
+            .iter()
+            .position(|c| c.name == "k_int")
+            .expect("k_int column");
+        batch.dyn_col_dicts[k_int] = Some(StrColumnDict {
+            distinct: vec![Vec::new()],
+            ids: vec![0; batch.dyn_columns[k_int].cells.len()],
+        });
+        batch.validate().expect("the parent validates");
+
+        let parts = assert_partition_matches_reference(&batch, shard_count);
+        assert_eq!(parts.len(), 3, "three shards receive rows, five do not");
+        let mut rows: Vec<usize> = parts.iter().map(|(_, p)| p.num_rows).collect();
+        rows.sort_unstable();
+        assert_eq!(rows, [1, 4, 9]);
+        let with_only_first = parts
+            .iter()
+            .filter(|(_, p)| p.dyn_columns.iter().any(|c| c.name == "only_first"))
+            .count();
+        assert_eq!(with_only_first, 1, "only_first is dropped where all-absent");
+        let mut map_shards = 0;
+        for (shard, part) in &parts {
+            for (column, dict) in part.dyn_columns.iter().zip(&part.dyn_col_dicts) {
+                let has_map = column.cells.iter().any(|c| matches!(c, AttrValue::Map(_)));
+                map_shards += usize::from(has_map);
+                let kept = match column.name.as_str() {
+                    "k_str" | "only_first" | "raw" => true,
+                    "blob" => !has_map,
+                    _ => false,
+                };
+                assert_eq!(
+                    dict.is_some(),
+                    kept,
+                    "shard {shard}: {} keeps a dictionary only for Str/Bytes cells",
+                    column.name
+                );
+            }
+        }
+        assert!(map_shards > 0, "some shard's blob cells include a Map");
+
+        let str_ptrs = |b: &ColumnarLogBatch| {
+            let mut ptrs: Vec<usize> = b
+                .dyn_columns
+                .iter()
+                .flat_map(|c| &c.cells)
+                .filter_map(|c| match c {
+                    AttrValue::Str(s) => Some(s.as_ptr() as usize),
+                    _ => None,
+                })
+                .chain(b.stream_attrs.iter().map(|a| a.as_ptr() as usize))
+                .chain(
+                    b.residual_attrs
+                        .iter()
+                        .filter(|r| !r.is_empty())
+                        .map(|r| r.as_ptr() as usize),
+                )
+                .collect();
+            ptrs.sort_unstable();
+            ptrs
+        };
+        let parent_ptrs = str_ptrs(&batch);
+        let parts = partition_columnar(batch, shard_count);
+        let mut child_ptrs: Vec<usize> = parts.iter().flat_map(|(_, p)| str_ptrs(p)).collect();
+        child_ptrs.sort_unstable();
+        assert_eq!(
+            child_ptrs, parent_ptrs,
+            "every string cell, stream blob and residual list is moved, not reallocated"
+        );
+    }
+
+    /// Records for the property test: few streams and attribute names, so
+    /// streams repeat, timestamps tie, and columns are partly present; values
+    /// mix Str, Bytes, I64 and a Map that shares the Bytes column.
+    fn partition_record_strategy() -> impl Strategy<Value = LogRecord> {
+        let value = prop_oneof![
+            "[a-c]{1,2}".prop_map(AttrValue::Str),
+            proptest::collection::vec(0u8..3, 1..3).prop_map(AttrValue::Bytes),
+            (0i64..3).prop_map(AttrValue::I64),
+            ("[a-b]", 0i64..2).prop_map(|(k, v)| AttrValue::Map(vec![(k, AttrValue::I64(v))])),
+        ];
+        (
+            0u32..6,
+            0i64..3,
+            proptest::collection::vec(("[a-d]", value), 0..5),
+            proptest::option::of(any::<[u8; 16]>()),
+            proptest::option::of(any::<[u8; 8]>()),
+            "[a-z]{0,4}",
+            any::<u32>(),
+        )
+            .prop_map(|(host, ts_ns, attrs, trace_id, span_id, body, flags)| {
+                let (stream_id, stream_attrs) = partition_stream(host);
+                LogRecord {
+                    stream_id,
+                    stream_attrs,
+                    ts_ns,
+                    observed_ts_ns: ts_ns,
+                    severity_num: (flags % 24) as u8,
+                    severity_text: String::new(),
+                    body,
+                    trace_id,
+                    span_id,
+                    flags,
+                    attrs,
+                }
+            })
+    }
+
+    proptest! {
+        /// The moving partition equals the cloning reference over generated
+        /// batches and shard counts, with and without dictionaries.
+        #[test]
+        fn partition_columnar_matches_the_cloning_reference(
+            records in proptest::collection::vec(partition_record_strategy(), 0..40),
+            shard_count in 1u32..9,
+            dictionaries in any::<bool>(),
+        ) {
+            let mut batch = ColumnarLogBatch::from_records(&records);
+            if dictionaries {
+                batch = batch.with_dictionaries();
+            }
+            assert_partition_matches_reference(&batch, shard_count);
+        }
+    }
+
+    /// The stored objects do not change when the moving partition replaces the
+    /// cloning one, with dictionaries now carried into the writer: the same
+    /// dictionary-bearing batch written through each partition by two routers
+    /// with one seed and one pinned clock gives byte-identical objects. Rows
+    /// tie on `(stream, ts)`, so a partition that reordered rows within a
+    /// shard would change bytes; `k_str` keeps its dictionary and `nested`
+    /// (a `Map` in a Bytes column) does not, so both writer paths run.
+    #[tokio::test]
+    async fn moved_partition_writes_the_same_objects_as_the_cloning_reference() {
+        let seed = 0x00C0_FFEE_u64;
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_700_000_000_000_000_000));
+        let tenant = TenantId::new("acme");
+        let records: Vec<LogRecord> = diverse_records()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut r)| {
+                let res: Vec<(String, AttrValue)> = vec![
+                    (
+                        "service.name".to_string(),
+                        AttrValue::Str("api".to_string()),
+                    ),
+                    ("host".to_string(), AttrValue::Str(format!("h{}", i % 6))),
+                ];
+                r.stream_id = log_stream_id(&res, "scope", "", &[]);
+                r.stream_attrs = stream_attrs_bytes(&res, "scope", "", &[]);
+                r.ts_ns = 1_000 + (i / 12) as i64;
+                to_logrecord(&r)
+            })
+            .collect();
+        let batch = ColumnarLogBatch::from_records(&records).with_dictionaries();
+
+        let parts = partition_columnar(batch.clone(), 4);
+        assert!(parts.len() > 1, "the fixture spans several shards");
+        for (shard, part) in &parts {
+            let dict_of = |name: &str| {
+                part.dyn_columns
+                    .iter()
+                    .position(|c| c.name == name)
+                    .map(|i| part.dyn_col_dicts[i].is_some())
+            };
+            assert_eq!(
+                dict_of("k_str"),
+                Some(true),
+                "shard {shard} carries k_str's dictionary"
+            );
+            assert_ne!(
+                dict_of("nested"),
+                Some(true),
+                "shard {shard} drops nested's dictionary"
+            );
+        }
+
+        let router = |store: &Arc<dyn ObjectStoreBackend>| {
+            LogIngestRouter::with_rng(
+                buffer_all(),
+                Arc::clone(store),
+                Arc::clone(&clock),
+                overlay(),
+                Arc::new(SeededRng::new(seed)),
+            )
+        };
+        let store_ref: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router_ref = router(&store_ref);
+        router_ref
+            .write_columnar_partitioned(
+                tenant.clone(),
+                batch.clone(),
+                WriteMode::Buffered,
+                Duration::from_secs(5),
+                |b, n| cloning_partition_reference_pre_2624(&b, n),
+            )
+            .await
+            .expect("reference write enqueues");
+        router_ref.flush_all().await;
+
+        let store_new: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router_new = router(&store_new);
+        router_new
+            .write_columnar(tenant, batch, WriteMode::Buffered, Duration::from_secs(5))
+            .await
+            .expect("moving write enqueues");
+        router_new.flush_all().await;
+
+        let objs_ref = collect_objects(store_ref.as_ref()).await;
+        let objs_new = collect_objects(store_new.as_ref()).await;
+        assert!(
+            objs_ref.len() > parts.len(),
+            "one data object per shard plus commit records, got {}",
+            objs_ref.len()
+        );
+        assert_eq!(
+            objs_ref, objs_new,
+            "the moving partition must not change a stored byte"
+        );
+    }
+
+    /// Asserts two stores' objects have the same keys and the same bytes,
+    /// naming the first object that differs.
+    pub(crate) fn assert_same_objects(want: &[(String, Vec<u8>)], got: &[(String, Vec<u8>)]) {
+        let keys = |objs: &[(String, Vec<u8>)]| -> Vec<String> {
+            objs.iter().map(|(key, _)| key.clone()).collect()
+        };
+        assert_eq!(keys(got), keys(want), "the same object keys");
+        for ((key, want), (_, got)) in want.iter().zip(got) {
+            assert!(
+                got == want,
+                "object {key} differs from the cloning reference's"
+            );
+        }
+    }
+
+    /// Whether `part` carries a dictionary for column `name`, or `None` when it
+    /// has no such column.
+    pub(crate) fn dict_kept(part: &ColumnarLogBatch, name: &str) -> Option<bool> {
+        part.dyn_columns
+            .iter()
+            .position(|c| c.name == name)
+            .map(|i| part.dyn_col_dicts.get(i).is_some_and(Option::is_some))
+    }
+
+    /// Two writes over the same 24 streams, every row at one timestamp, so
+    /// rows tie on `(stream, ts)` within and across writes and a flush that
+    /// merged them in another order would change bytes. Both carry the
+    /// dictionaries `with_dictionaries` derives, except that the second drops
+    /// `k_str`'s: a buffer holding both gets `k_str` with a dictionary from
+    /// one batch and without one from the other. `svc` (Str) and `raw` (Bytes)
+    /// keep theirs in both, so both reach the writer's dictionary pass. `blob`
+    /// (Bytes) holds a `Map` cell every fifth row, so a share that includes
+    /// one drops `blob`'s dictionary while `raw` keeps its own.
+    pub(crate) fn dictionary_writes() -> Vec<ColumnarLogBatch> {
+        (0..2u32)
+            .map(|w| {
+                let records: Vec<LogRecord> = (0..48u32)
+                    .map(|i| {
+                        let res: Vec<(String, AttrValue)> = vec![
+                            (
+                                "service.name".to_string(),
+                                AttrValue::Str("api".to_string()),
+                            ),
+                            ("host".to_string(), AttrValue::Str(format!("m{}", i % 24))),
+                        ];
+                        let blob = if (i + w) % 5 == 0 {
+                            AttrValue::Map(vec![("a".to_string(), AttrValue::I64(i64::from(w)))])
+                        } else {
+                            AttrValue::Bytes(vec![(i % 2) as u8, 5])
+                        };
+                        LogRecord {
+                            stream_id: log_stream_id(&res, "scope", "", &[]),
+                            stream_attrs: stream_attrs_bytes(&res, "scope", "", &[]),
+                            ts_ns: 1_000,
+                            observed_ts_ns: 2_000 + i64::from(i),
+                            severity_num: (i % 24) as u8,
+                            severity_text: "INFO".to_string(),
+                            body: format!("w{w} row {i}"),
+                            trace_id: (i % 2 == 0).then_some([i as u8; 16]),
+                            span_id: (i % 3 == 0).then_some([(i + w) as u8; 8]),
+                            flags: i,
+                            attrs: vec![
+                                (
+                                    "k_str".to_string(),
+                                    AttrValue::Str(format!("v{}", (i + w) % 7)),
+                                ),
+                                ("svc".to_string(), AttrValue::Str(format!("s{}", i % 3))),
+                                (
+                                    "raw".to_string(),
+                                    AttrValue::Bytes(vec![((i + w) % 4) as u8, 9]),
+                                ),
+                                ("blob".to_string(), blob),
+                                ("k_int".to_string(), AttrValue::I64(i64::from(i))),
+                            ],
+                        }
+                    })
+                    .collect();
+                let mut batch = ColumnarLogBatch::from_records(&records).with_dictionaries();
+                if w == 1 {
+                    let k_str = batch
+                        .dyn_columns
+                        .iter()
+                        .position(|c| c.name == "k_str")
+                        .expect("k_str column");
+                    batch.dyn_col_dicts[k_str] = None;
+                }
+                batch.validate().expect("the write validates");
+                batch
+            })
+            .collect()
+    }
+
+    /// Two columnar writes merged into each shard's buffer and written by one
+    /// flush per shard store the same objects whether the router partitions
+    /// them by move or with the cloning reference. In every flush `k_str`
+    /// arrives with a dictionary from the first write and without one from
+    /// the second, so the writer falls back to plain for it; `svc` (Str) and
+    /// `raw` (Bytes) arrive with one from both, so the writer's dictionary
+    /// pass encodes them; and some flush gets `blob` without a dictionary,
+    /// dropped for a `Map` cell, beside `raw` with one.
+    #[tokio::test]
+    async fn merged_columnar_writes_store_the_same_objects_as_the_cloning_reference() {
+        let seed = 0x00C0_FFEE_u64;
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_700_000_000_000_000_000));
+        let shard_count = buffer_all().shard_count;
+        let writes = dictionary_writes();
+
+        let parts: Vec<Vec<(u32, ColumnarLogBatch)>> = writes
+            .iter()
+            .map(|w| partition_columnar(w.clone(), shard_count))
+            .collect();
+        let shards_of = |parts: &[(u32, ColumnarLogBatch)]| -> Vec<u32> {
+            parts.iter().map(|(s, _)| *s).collect()
+        };
+        let shards = shards_of(&parts[0]);
+        assert!(shards.len() > 1, "the writes span several shards");
+        assert_eq!(
+            shards_of(&parts[1]),
+            shards,
+            "both writes reach the same shards"
+        );
+        let mut blob_dropped_beside_raw = 0;
+        for (w, write_parts) in parts.iter().enumerate() {
+            for (shard, part) in write_parts {
+                assert_eq!(
+                    dict_kept(part, "k_str"),
+                    Some(w == 0),
+                    "write {w}, shard {shard}: k_str's dictionary only from the first write"
+                );
+                for name in ["svc", "raw"] {
+                    assert_eq!(
+                        dict_kept(part, name),
+                        Some(true),
+                        "write {w}, shard {shard}: {name} keeps its dictionary"
+                    );
+                }
+                let blob = part
+                    .dyn_columns
+                    .iter()
+                    .find(|c| c.name == "blob")
+                    .expect("blob column");
+                let has_map = blob.cells.iter().any(|c| matches!(c, AttrValue::Map(_)));
+                assert_eq!(
+                    dict_kept(part, "blob"),
+                    Some(!has_map),
+                    "write {w}, shard {shard}: blob drops its dictionary exactly for a Map cell"
+                );
+                blob_dropped_beside_raw += usize::from(has_map);
+            }
+        }
+        assert!(
+            blob_dropped_beside_raw > 0,
+            "some share drops blob's dictionary for a Map cell"
+        );
+
+        let tenant = TenantId::new("acme");
+        let router = |store: &Arc<dyn ObjectStoreBackend>| {
+            LogIngestRouter::with_rng(
+                buffer_all(),
+                Arc::clone(store),
+                Arc::clone(&clock),
+                overlay(),
+                Arc::new(SeededRng::new(seed)),
+            )
+        };
+        let store_ref: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router_ref = router(&store_ref);
+        for batch in &writes {
+            router_ref
+                .write_columnar_partitioned(
+                    tenant.clone(),
+                    batch.clone(),
+                    WriteMode::Buffered,
+                    Duration::from_secs(5),
+                    |b, n| cloning_partition_reference_pre_2624(&b, n),
+                )
+                .await
+                .expect("reference write enqueues");
+        }
+        router_ref.flush_all().await;
+
+        let store_new: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let router_new = router(&store_new);
+        for batch in writes {
+            router_new
+                .write_columnar(
+                    tenant.clone(),
+                    batch,
+                    WriteMode::Buffered,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("moving write enqueues");
+        }
+        router_new.flush_all().await;
+
+        let objs_ref = collect_objects(store_ref.as_ref()).await;
+        let objs_new = collect_objects(store_new.as_ref()).await;
+        let commits = objs_ref
+            .iter()
+            .filter(|(key, _)| key.contains("/c/"))
+            .count();
+        assert_eq!(
+            commits,
+            shards.len(),
+            "one flush per shard, so each shard's two writes share one object"
+        );
+        assert_same_objects(&objs_ref, &objs_new);
     }
 }
