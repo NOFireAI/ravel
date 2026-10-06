@@ -290,8 +290,9 @@ pub(crate) enum UnwritableInputs {
     /// `min_compaction_inputs` inputs the run publishes nothing
     /// ([`FencedRewrite::TooFewWritableInputs`]).
     Skip,
-    /// Merge it, so the writer's refusal fails the run. Format migration does
-    /// this: it promises to rewrite the whole live L0 set.
+    /// Fail the run before the merge with [`MaintainError::UnwritableInput`]
+    /// naming the first such input. Format migration does this: it promises
+    /// to rewrite the whole live L0 set, so it cannot leave one out.
     Fail,
 }
 
@@ -461,17 +462,37 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
         .buffered(config.input_read_concurrency.max(1))
         .try_collect()
         .await?;
+    // Both arms below pair inputs with catalogs by zipping, which stops at the
+    // shorter side and would pass an input it never checked.
+    if inputs.len() != catalogs.len() {
+        return Err(MaintainError::Invariant(
+            "inputs and catalogs length mismatch".to_string(),
+        ));
+    }
 
-    if unwritable == UnwritableInputs::Skip {
-        let loaded = inputs.len();
-        (inputs, catalogs) = skip_unwritable_inputs::<C>(bucket, inputs, catalogs)?;
-        if inputs.len() != loaded {
-            if inputs.is_empty() || inputs.len() < config.min_compaction_inputs {
-                return Ok(FencedRewrite::TooFewWritableInputs {
-                    remaining: inputs.len(),
-                });
+    match unwritable {
+        UnwritableInputs::Skip => {
+            let loaded = inputs.len();
+            (inputs, catalogs) = skip_unwritable_inputs::<C>(bucket, inputs, catalogs)?;
+            if inputs.len() != loaded {
+                if inputs.is_empty() || inputs.len() < config.min_compaction_inputs {
+                    return Ok(FencedRewrite::TooFewWritableInputs {
+                        remaining: inputs.len(),
+                    });
+                }
+                hash = input_set_hash(&inputs);
             }
-            hash = input_set_hash(&inputs);
+        }
+        UnwritableInputs::Fail => {
+            for (input, catalog) in inputs.iter().zip(&catalogs) {
+                if let Some((reason, detail)) = C::unwritable_input(catalog) {
+                    return Err(MaintainError::UnwritableInput {
+                        object_key: keys::reconstruct_data_key(&input.record)?,
+                        reason,
+                        detail,
+                    });
+                }
+            }
         }
     }
 
@@ -540,17 +561,13 @@ async fn rewrite_and_publish_guarded<C: SegmentCodec>(
 
 /// Split off every input whose catalog the codec's writer would refuse
 /// ([`SegmentCodec::unwritable_input`]), recording each as skipped, and return
-/// the rest with their catalogs, still aligned and in canonical order.
+/// the rest with their catalogs, still aligned and in canonical order. The
+/// caller has checked that `inputs` and `catalogs` are the same length.
 fn skip_unwritable_inputs<C: SegmentCodec>(
     bucket: &Bucket,
     inputs: Vec<crate::read::InputRecord>,
     catalogs: Vec<C::Catalog>,
 ) -> Result<(Vec<crate::read::InputRecord>, Vec<C::Catalog>)> {
-    if inputs.len() != catalogs.len() {
-        return Err(MaintainError::Invariant(
-            "inputs and catalogs length mismatch".to_string(),
-        ));
-    }
     let mut kept_inputs = Vec::with_capacity(inputs.len());
     let mut kept_catalogs = Vec::with_capacity(catalogs.len());
     for (input, catalog) in inputs.into_iter().zip(catalogs) {
@@ -645,6 +662,12 @@ pub enum MigrateOutcome {
 /// through the record PUT, backing off ([`MigrateOutcome::SkippedClaimed`])
 /// when it cannot, and it re-lists the bucket before that PUT either way,
 /// publishing nothing when the record set changed since its listing.
+///
+/// A live L0 input the writer would refuse to rewrite (a log object whose
+/// `stream_attrs` blob does not decode, issue #2548) fails the call with
+/// [`MaintainError::UnwritableInput`] naming it, before anything is built; the
+/// claim is released. [`crate::migrate::migrate_family`] records that bucket
+/// and walks on.
 pub async fn migrate_bucket_format(
     store: &dyn ObjectStoreBackend,
     clock: &dyn Clock,
@@ -733,7 +756,7 @@ async fn migrate_bucket_format_scoped(
         None => config.clone(),
     };
 
-    let fenced = dispatch_rewrite(
+    let fenced = match dispatch_rewrite(
         bucket.signal,
         store,
         clock,
@@ -742,7 +765,29 @@ async fn migrate_bucket_format_scoped(
         &listing,
         start_ns,
     )
-    .await?;
+    .await
+    {
+        // Refused before the merge, so nothing was built: release the claim
+        // now rather than hold the bucket's compaction off for the lease.
+        Err(err @ MaintainError::UnwritableInput { .. }) => {
+            if let Some(guard) = guard
+                && guard.cancelled_at().await.is_none()
+                && let Err(claim_err) = guard.complete(store).await
+            {
+                tracing::warn!(
+                    signal = ?bucket.signal,
+                    shard = bucket.shard,
+                    ingest_hour_bucket = bucket.ingest_hour_bucket,
+                    work_id = %guard.work_id_hex(),
+                    error = %claim_err,
+                    "migration refused an unwritable input, and marking its claim completed \
+                     failed; the claim ages out under its lease (ADR-1029)"
+                );
+            }
+            return Err(err);
+        }
+        other => other?,
+    };
 
     // As in compaction: a run that lost its claim cancelled and published
     // nothing; one that still holds it marks it completed, and a failure to

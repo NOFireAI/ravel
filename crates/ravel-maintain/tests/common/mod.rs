@@ -423,6 +423,34 @@ async fn seed_rlog_input_with(
     records: &[ravel_logseg::LogRecord],
     unchecked_stream_attrs: bool,
 ) -> String {
+    seed_rlog_input_at_hour(
+        store,
+        writer_id,
+        epoch,
+        seq,
+        HOUR,
+        records,
+        unchecked_stream_attrs,
+        u32::from(ravel_logseg::footer::VERSION),
+    )
+    .await
+}
+
+/// [`seed_rlog_input`] or [`seed_rlog_input_unchecked`] into ingest hour
+/// `hour` of the logs shard instead of [`HOUR`], with a commit record claiming
+/// `segment_format_version` (a migration test claims one below the target the
+/// bytes already meet). Returns the commit key.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_rlog_input_at_hour(
+    store: &dyn ObjectStoreBackend,
+    writer_id: Uuid,
+    epoch: u64,
+    seq: u64,
+    hour: u32,
+    records: &[ravel_logseg::LogRecord],
+    unchecked_stream_attrs: bool,
+    segment_format_version: u32,
+) -> String {
     use ravel_logseg::writer::ObjectIdentity;
     use ravel_logseg::{RlogConfig, RlogWriter};
     let th = tenant_hash();
@@ -465,7 +493,7 @@ async fn seed_rlog_input_with(
         max_ts = max_ts.max(r.ts_ns);
         streams.insert(r.stream_id);
     }
-    let created = i64::from(HOUR) * NS_PER_HOUR + (seq as i64) * 1_000_000;
+    let created = i64::from(hour) * NS_PER_HOUR + (seq as i64) * 1_000_000;
     let rec = record::build(NewCommitRecord {
         tenant_hash: th,
         signal: Signal::Logs,
@@ -481,13 +509,14 @@ async fn seed_rlog_input_with(
         max_event_ts_ns: max_ts,
         min_ingest_ts_ns: created,
         max_ingest_ts_ns: created,
-        // The RLOG version the object above was actually written at, read from
-        // the format crate's single-sourced constant. A literal here goes stale
-        // on every trailer bump (v2 -> v3, ADR-0095) and makes the seeded input
-        // claim a version its bytes are not.
-        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        // `seed_rlog_input_with` passes the RLOG version the object above was
+        // actually written at, read from the format crate's single-sourced
+        // constant. A literal there goes stale on every trailer bump (v2 -> v3,
+        // ADR-0095) and makes the seeded input claim a version its bytes are
+        // not.
+        segment_format_version,
         created_unix_ns: created,
-        ingest_hour_bucket: HOUR,
+        ingest_hour_bucket: hour,
     })
     .expect("build logs commit record");
     let commit_key = keys::commit_key_for_record(&rec).expect("commit key");
