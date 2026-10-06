@@ -515,8 +515,9 @@ const BUCKET_KEY_PREFIX: &str = "arn:aws:s3:::my-ravel-bucket/";
 /// any of those fields is resolved as the wildcard IAM treats it as instead of
 /// being escaped to a literal `\?` that quietly matches nothing. The shipped
 /// templates carry a `?` only in the Resources of gateway's
-/// `GatewayAdmissionDelete`, query's `QueryManifestCreate` and the five
-/// provisioning-record write statements, in the `s3:prefix` values of the three
+/// `GatewayAdmissionDelete`, query's `QueryManifestCreate`, the five
+/// provisioning-record write statements and the six key-epoch write
+/// statements, in the `s3:prefix` values of the three
 /// `*ListTenantBootstrapKeys` statements, and in no Action;
 /// `every_shipped_template_passes_the_choke_point` asserts that (not assumes
 /// it) over Action, Resource, and the `s3:prefix` values it reads through
@@ -2232,9 +2233,12 @@ struct ExpectedRolePatterns {
 
 const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // Gateway: ingest. Writes L0 data, commit records, idempotency and
-    // admission records, and provenance. No commit path writes a catalog
-    // object: the scheduled fold moved off the gateway with ADR-1693, so no
-    // gateway-mode ingest path exercises the catalog put patterns below.
+    // admission records, and provenance. A gateway-mode process writes no
+    // catalog object: the scheduled fold runs only in maintain and all mode
+    // (Mode::runs_scheduled_fold) and gateway mode mounts no fold route. The
+    // three catalog put patterns below stay for a single-process deployment
+    // that runs mode all, whose scheduled fold writes the catalog under
+    // whichever role's credential the process holds.
     // Its one delete is the admission reconcile's reap of dead
     // processes' mutable admission snapshots, and reaches no durable object
     // (gateway_template_covers_the_admission_snapshot_reap): its tenant hash
@@ -2248,6 +2252,8 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
     // and gateway_template_covers_the_recovery_manifest_write. t/*/enc is the
     // KMS key-epoch record every server mode bootstraps under
     // --tenant-kms-config (server_roles_read_and_write_the_key_epoch_record),
+    // written only through the create-only and CAS-only KEY_EPOCH_PATTERN
+    // statements (key_epoch_put_grants_are_exactly_the_expected_statements),
     // and t/*/m/meta the metric metadata record the ingest metadata sink
     // writes (metric_metadata_record_is_written_by_gateway_and_read_by_query).
     ExpectedRolePatterns {
@@ -2302,15 +2308,23 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "t/*/catalog/*/idx/*",
             "sys/tenancy",
             "sys/t/*",
-            "t/*/enc",
             "t/*/m/meta",
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
+            KEY_EPOCH_PATTERN,
+            KEY_EPOCH_PATTERN,
         ],
         // One entry per statement: GatewayWrite, then the create-only
-        // GatewayProvCreate (prov_put_grants_carry_exactly_the_expected_conditions).
-        put_actions: &["s3:PutObject", "s3:PutObject"],
+        // GatewayProvCreate (prov_put_grants_carry_exactly_the_expected_conditions),
+        // then GatewayEncCreate and GatewayEncCas
+        // (key_epoch_put_grants_are_exactly_the_expected_statements).
+        put_actions: &[
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+        ],
         deletes: &["t/????????????????????????????????/?/admission/*"],
         delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
@@ -2394,18 +2408,24 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "admission/query/*",
             "sys/tenancy",
             "sys/query/workers/*",
-            "t/*/enc",
             "t/*/a/l0/*",
             "t/*/a/c/*",
             "t/*/a/alert-lease",
             "t/*/a/state/latest",
             "sys/pq-probe/*",
             "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
+            KEY_EPOCH_PATTERN,
+            KEY_EPOCH_PATTERN,
         ],
-        // QueryWrite, then QueryManifestCreate. No provisioning write: a query
-        // process checks a present record at startup and never adopts
-        // (query_template_writes_no_provisioning_record).
-        put_actions: &["s3:PutObject", "s3:PutObject"],
+        // QueryWrite, then QueryManifestCreate, QueryEncCreate and QueryEncCas.
+        // No provisioning write: a query process checks a present record at
+        // startup and never adopts (query_template_writes_no_provisioning_record).
+        put_actions: &[
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+        ],
         deletes: &["sys/pq-probe/*"],
         delete_actions: &["s3:DeleteObject"],
         protected_deletes: PROTECTED_DELETE_KEYS,
@@ -2576,7 +2596,6 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/tenancy",
             "sys/maintain/*",
             "quarantine/t/*/*/l0/*",
-            "t/*/enc",
             "t/*/catalog/*/snap/*",
             "t/*/catalog/*/idx/*",
             "t/*/catalog/*/HEAD",
@@ -2586,11 +2605,21 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
+            KEY_EPOCH_PATTERN,
+            KEY_EPOCH_PATTERN,
         ],
         // MaintainWrite, then MaintainProvCreate (create-only, the maintain
         // tick's adopt) and MaintainProvCas (CAS-only, the maintain migrate
         // floor raise): every_prov_write_call_site_has_a_grant_of_its_kind.
-        put_actions: &["s3:PutObject", "s3:PutObject", "s3:PutObject"],
+        // Then MaintainEncCreate and MaintainEncCas:
+        // every_key_epoch_write_call_site_has_a_grant_of_its_kind.
+        put_actions: &[
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+            "s3:PutObject",
+        ],
         deletes: &[
             "t/*/*/l0/*",
             "t/*/*/c/*",
@@ -4880,8 +4909,11 @@ fn is_alert_subkey(key: &str, sub: &str) -> bool {
 /// `record_key_epoch` (`crates/ravel-catalog/src/key_epoch.rs`):
 /// `CreateIfAbsent` for the bootstrap epoch, `CasVersion` for every appended
 /// one. Only `NotFound` reads as absence, so a refused GET or PUT makes the
-/// process refuse to start. Admin reads the record for `ravel-cli
-/// verify-custody` and writes it nowhere in production code. Nothing lists it.
+/// process refuse to start. Each server role writes it through a create-only
+/// and a CAS-only grant and no unconditioned one
+/// (`key_epoch_put_grants_are_exactly_the_expected_statements`). Admin reads
+/// the record for `ravel-cli verify-custody` and writes it nowhere in
+/// production code.
 #[test]
 fn server_roles_read_and_write_the_key_epoch_record() {
     let enc = key_epoch_key();
@@ -4895,11 +4927,20 @@ fn server_roles_read_and_write_the_key_epoch_record() {
              which bootstrap_tenant_epoch reads at startup under \
              --tenant-kms-config. The process refuses to start. Grants: {gets:?}"
         );
+        for kind in [PutCondition::CreateOnly, PutCondition::CasOnly] {
+            let granted = conditioned_put_patterns(&policy, kind);
+            assert!(
+                granted.iter().any(|p| glob_matches(p, &enc)),
+                "{role}: no {kind:?} PutObject Allow reaches the key-epoch record \
+                 {enc:?}, which record_key_epoch writes for a new tenant or a \
+                 rotated key. The process refuses to start. Grants: {granted:?}"
+            );
+        }
+        let unconditioned = unconditioned_put_patterns(&policy);
         assert!(
-            puts.iter().any(|p| glob_matches(p, &enc)),
-            "{role}: no PutObject Allow reaches the key-epoch record {enc:?}, \
-             which record_key_epoch writes for a new tenant or a rotated key. \
-             The process refuses to start. Grants: {puts:?}"
+            !unconditioned.iter().any(|p| glob_matches(p, &enc)),
+            "{role}: an unconditioned PutObject Allow reaches the key-epoch \
+             record {enc:?}. Grants: {unconditioned:?}"
         );
         assert_reaches_nothing_outside(role, "s3:GetObject Allow", &gets, &enc, &enc);
         assert_reaches_nothing_outside(role, "s3:PutObject Allow", &puts, &enc, &enc);
@@ -4943,6 +4984,324 @@ fn key_epoch_records_are_delete_protected_in_every_role() {
              key-epoch record. Allow: {allows:?}"
         );
     }
+}
+
+/// The resource every key-epoch write statement names: `t/<hash>/enc` with the
+/// tenant hash spelled as 32 single-character wildcards, the form the
+/// provisioning-record grants use.
+const KEY_EPOCH_PATTERN: &str = "t/????????????????????????????????/enc";
+
+/// Every production write of the key-epoch record, the role whose credential
+/// issues it, and the conditional write it sends. Every write goes through
+/// `record_key_epoch` (`crates/ravel-catalog/src/key_epoch.rs`):
+/// `PutMode::CreateIfAbsent` when its GET finds no record, `PutMode::CasVersion`
+/// to append an epoch to the one it read. Its callers are
+/// `bootstrap_tenant_epoch` (`crates/ravel-catalog/src/tenant_kms.rs`), which
+/// `configure_tenant_kms` runs from `services/ravel-server/src/main.rs` at
+/// startup in every mode under `--tenant-kms-config`, and the `ravel-cli`
+/// commands that take that flag under the Maintain credential
+/// (`services/ravel-cli/src/store.rs`, `KeyChangePolicy::Refuse`), which refuse
+/// an absent record and append only epoch 1 of an unfinished bootstrap.
+const ENC_WRITE_CALL_SITES: &[(&str, &str, PutCondition)] = &[
+    (
+        "bootstrap_tenant_epoch, EpochAction::Bootstrap: record_key_epoch creates \
+         epoch 0, ravel-server startup in gateway mode or all",
+        "gateway",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "bootstrap_tenant_epoch, EpochAction::Bootstrap then EpochAction::Append: \
+         record_key_epoch appends the configured key, ravel-server startup in \
+         gateway mode or all",
+        "gateway",
+        PutCondition::CasOnly,
+    ),
+    (
+        "bootstrap_tenant_epoch, EpochAction::Bootstrap: record_key_epoch creates \
+         epoch 0, ravel-server startup in query mode or all",
+        "query",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "bootstrap_tenant_epoch, EpochAction::Bootstrap then EpochAction::Append: \
+         record_key_epoch appends the configured key, ravel-server startup in \
+         query mode or all",
+        "query",
+        PutCondition::CasOnly,
+    ),
+    (
+        "bootstrap_tenant_epoch, EpochAction::Bootstrap: record_key_epoch creates \
+         epoch 0, ravel-server startup in maintain mode",
+        "maintain",
+        PutCondition::CreateOnly,
+    ),
+    (
+        "bootstrap_tenant_epoch, EpochAction::Bootstrap then EpochAction::Append: \
+         record_key_epoch appends the configured key, ravel-server startup in \
+         maintain mode",
+        "maintain",
+        PutCondition::CasOnly,
+    ),
+    (
+        "configure_tenant_kms_with_policy under KeyChangePolicy::Refuse \
+         (services/ravel-cli/src/store.rs): ravel-cli maintain compact-bucket, \
+         compact-tenant, migrate and catalog fold append epoch 1 of an \
+         unfinished bootstrap",
+        "maintain",
+        PutCondition::CasOnly,
+    ),
+];
+
+/// A `Sid`, an exact key-epoch write statement in the templates' spelling.
+fn key_epoch_statement(sid: &str, kind: PutCondition) -> serde_json::Value {
+    let condition = match kind {
+        PutCondition::CreateOnly => serde_json::json!({
+            CREATE_ONLY_CONDITION_OPERATOR: {CREATE_ONLY_CONDITION_KEY: CREATE_ONLY_CONDITION_VALUE}
+        }),
+        PutCondition::CasOnly => serde_json::json!({
+            CAS_ONLY_CONDITION_OPERATOR: {CAS_ONLY_CONDITION_KEY: CAS_ONLY_CONDITION_VALUE}
+        }),
+    };
+    serde_json::json!({
+        "Sid": sid,
+        "Effect": "Allow",
+        "Action": "s3:PutObject",
+        "Resource": format!("{BUCKET_KEY_PREFIX}{KEY_EPOCH_PATTERN}"),
+        "Condition": condition,
+    })
+}
+
+/// Per role, the `(Sid, condition)` of every statement that may write the
+/// key-epoch record, in template order.
+const EXPECTED_ENC_PUT_STATEMENTS: &[(&str, &[(&str, PutCondition)])] = &[
+    (
+        "gateway",
+        &[
+            ("GatewayEncCreate", PutCondition::CreateOnly),
+            ("GatewayEncCas", PutCondition::CasOnly),
+        ],
+    ),
+    (
+        "query",
+        &[
+            ("QueryEncCreate", PutCondition::CreateOnly),
+            ("QueryEncCas", PutCondition::CasOnly),
+        ],
+    ),
+    (
+        "maintain",
+        &[
+            ("MaintainEncCreate", PutCondition::CreateOnly),
+            ("MaintainEncCas", PutCondition::CasOnly),
+        ],
+    ),
+    ("admin", &[]),
+];
+
+/// Every `Allow` statement in `policy` granting `s3:PutObject` on a resource
+/// that reaches `key_epoch_key()`, conditioned or not, in template order.
+fn key_epoch_put_statements(policy: &Policy) -> Vec<serde_json::Value> {
+    let enc = key_epoch_key();
+    policy_statements(policy)
+        .iter()
+        .filter(|stmt| {
+            stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case("Allow"))
+                && any_action_grants_any(&statement_actions(stmt), &["s3:PutObject"])
+                && object_key_patterns(policy.role, statement_sid(stmt), &statement_resources(stmt))
+                    .iter()
+                    .any(|p| glob_matches(p, &enc))
+        })
+        .cloned()
+        .collect()
+}
+
+/// The unconditioned PutObject patterns in `policy` that reach the key-epoch
+/// witness `key_epoch_key()`, which `key_domain()` carries.
+fn unconditioned_puts_reaching_the_key_epoch_record(policy: &Policy) -> Vec<String> {
+    let enc = key_epoch_key();
+    assert!(
+        key_domain().contains(&enc),
+        "key_domain() carries the key-epoch witness {enc:?}"
+    );
+    unconditioned_put_patterns(policy)
+        .into_iter()
+        .filter(|p| glob_matches(p, &enc))
+        .collect()
+}
+
+/// The `ENC_WRITE_CALL_SITES` rows for `role` that no grant of their own kind
+/// in `policy` covers.
+fn key_epoch_call_sites_without_a_grant(role: &str, policy: &Policy) -> Vec<&'static str> {
+    let enc = key_epoch_key();
+    ENC_WRITE_CALL_SITES
+        .iter()
+        .filter(|(_, r, _)| *r == role)
+        .filter(|(_, _, kind)| {
+            !conditioned_put_patterns(policy, *kind)
+                .iter()
+                .any(|p| glob_matches(p, &enc))
+        })
+        .map(|(call, _, _)| *call)
+        .collect()
+}
+
+/// Every role writes the key-epoch record only through the statements
+/// `EXPECTED_ENC_PUT_STATEMENTS` lists, each exactly the create-only or
+/// CAS-only statement on `KEY_EPOCH_PATTERN`. An unconditioned PutObject on it
+/// would let a compromised server credential overwrite or recreate a tenant's
+/// custody history blind; a CAS-only grant still has to name the version it
+/// read.
+#[test]
+fn key_epoch_put_grants_are_exactly_the_expected_statements() {
+    let mut roles: Vec<&str> = EXPECTED_ENC_PUT_STATEMENTS
+        .iter()
+        .map(|(r, _)| *r)
+        .collect();
+    roles.sort_unstable();
+    let mut all_roles: Vec<&str> = ALL_ROLES.to_vec();
+    all_roles.sort_unstable();
+    assert_eq!(
+        roles, all_roles,
+        "one EXPECTED_ENC_PUT_STATEMENTS row per role"
+    );
+
+    for (role, expected) in EXPECTED_ENC_PUT_STATEMENTS {
+        let want: Vec<serde_json::Value> = expected
+            .iter()
+            .map(|(sid, kind)| key_epoch_statement(sid, *kind))
+            .collect();
+        assert_eq!(
+            key_epoch_put_statements(&load_policy(role)),
+            want,
+            "{role}: the PutObject statements reaching the key-epoch record are \
+             not exactly the expected create-only and CAS-only statements"
+        );
+    }
+}
+
+/// No unconditioned PutObject in any template reaches a key-epoch key.
+#[test]
+fn no_unconditioned_put_reaches_the_key_epoch_record() {
+    for role in ALL_ROLES {
+        assert_eq!(
+            unconditioned_puts_reaching_the_key_epoch_record(&load_policy(role)),
+            Vec::<String>::new(),
+            "{role}: an unconditioned PutObject Allow reaches the key-epoch record"
+        );
+    }
+}
+
+/// Each production write of the key-epoch record in `ENC_WRITE_CALL_SITES` is
+/// matched by a grant of its own kind on the role that issues it, and each
+/// role's expected statements carry exactly the kinds its call sites send: a
+/// create-only grant does not cover an appended epoch, and rotation depends on
+/// the CAS one.
+#[test]
+fn every_key_epoch_write_call_site_has_a_grant_of_its_kind() {
+    for (role, expected) in EXPECTED_ENC_PUT_STATEMENTS {
+        let policy = load_policy(role);
+        assert_eq!(
+            key_epoch_call_sites_without_a_grant(role, &policy),
+            Vec::<&str>::new(),
+            "{role}: key-epoch call sites with no grant of their kind"
+        );
+        let mut from_calls: Vec<PutCondition> = ENC_WRITE_CALL_SITES
+            .iter()
+            .filter(|(_, r, _)| r == role)
+            .map(|(_, _, kind)| *kind)
+            .collect();
+        from_calls.sort_unstable();
+        from_calls.dedup();
+        let mut granted: Vec<PutCondition> = expected.iter().map(|(_, kind)| *kind).collect();
+        granted.sort_unstable();
+        assert_eq!(
+            granted, from_calls,
+            "{role}: the key-epoch grants' kinds are not the kinds its call sites send"
+        );
+    }
+}
+
+/// `role`'s template with `edit` applied to the statement named `sid`.
+fn template_with_statement_edit(
+    role: &'static str,
+    sid: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> Policy {
+    let path = policy_json_path(role);
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read template"))
+            .expect("parse template");
+    let stmt = json["Statement"]
+        .as_array_mut()
+        .expect("Statement array")
+        .iter_mut()
+        .find(|s| s["Sid"] == serde_json::json!(sid))
+        .unwrap_or_else(|| panic!("{role}.json carries a {sid} statement"));
+    edit(stmt);
+    build_policy(role, "mutated fixture", &json)
+}
+
+/// The pins are live: removing the Condition from `GatewayEncCas` leaves an
+/// unconditioned PutObject on the record, which the exact-statement pin, the
+/// unconditioned check and the call-site check each refuse.
+#[test]
+fn a_key_epoch_grant_without_its_condition_fails_the_pins() {
+    let mutated = template_with_statement_edit("gateway", "GatewayEncCas", |stmt| {
+        stmt.as_object_mut()
+            .expect("statement object")
+            .remove("Condition")
+            .expect("GatewayEncCas carries a Condition");
+    });
+    let mut unconditioned = key_epoch_statement("GatewayEncCas", PutCondition::CasOnly);
+    unconditioned
+        .as_object_mut()
+        .expect("statement object")
+        .remove("Condition");
+    assert_eq!(
+        key_epoch_put_statements(&mutated),
+        vec![
+            key_epoch_statement("GatewayEncCreate", PutCondition::CreateOnly),
+            unconditioned,
+        ]
+    );
+    assert_eq!(
+        unconditioned_puts_reaching_the_key_epoch_record(&mutated),
+        vec![KEY_EPOCH_PATTERN.to_string()]
+    );
+    let missing: Vec<&str> = ENC_WRITE_CALL_SITES
+        .iter()
+        .filter(|(_, r, kind)| *r == "gateway" && *kind == PutCondition::CasOnly)
+        .map(|(call, _, _)| *call)
+        .collect();
+    assert_eq!(missing.len(), 1);
+    assert_eq!(
+        key_epoch_call_sites_without_a_grant("gateway", &mutated),
+        missing
+    );
+}
+
+/// The pins are live: `t/*/enc` added back to `QueryWrite` is an unconditioned
+/// PutObject on the record, which the unconditioned check and the
+/// exact-statement pin each refuse.
+#[test]
+fn an_unconditioned_key_epoch_resource_fails_the_pins() {
+    let mutated = template_with_statement_edit("query", "QueryWrite", |stmt| {
+        stmt["Resource"]
+            .as_array_mut()
+            .expect("QueryWrite Resource array")
+            .push(serde_json::json!(format!("{BUCKET_KEY_PREFIX}t/*/enc")));
+    });
+    assert_eq!(
+        unconditioned_puts_reaching_the_key_epoch_record(&mutated),
+        vec!["t/*/enc".to_string()]
+    );
+    let sids: Vec<String> = key_epoch_put_statements(&mutated)
+        .iter()
+        .map(|s| statement_sid(s).to_string())
+        .collect();
+    assert_eq!(sids, ["QueryWrite", "QueryEncCreate", "QueryEncCas"]);
 }
 
 /// The ingest metadata sink (`crates/ravel-ingest/src/metrics_meta_sink.rs`),
@@ -5416,15 +5775,25 @@ fn query_manifest_write_is_create_only() {
 /// `*` because names run 1 to 63 bytes; the version is exactly 20 characters
 /// (`VERSION_WIDTH` in `crates/ravel-pqtable/src/keys.rs`) with the `.pqm`
 /// suffix. A key that is not a manifest version, or one under another tenant
-/// prefix shape, must not match.
+/// prefix shape, must not match. Query's other create-only grant is the
+/// key-epoch record's, which reaches no manifest key either.
 #[test]
 fn query_manifest_create_grant_reaches_only_manifest_keys() {
     let query = load_policy("query");
     let create_only: Vec<String> = create_only_put_patterns(&query);
     assert_eq!(
         create_only,
-        ["t/????????????????????????????????/pq/t/*/v/????????????????????.pqm"],
-        "query: the create-only grant must be exactly the manifest key pattern"
+        [
+            "t/????????????????????????????????/pq/t/*/v/????????????????????.pqm",
+            KEY_EPOCH_PATTERN
+        ],
+        "query: the create-only grants must be exactly the manifest key pattern \
+         and the key-epoch record"
+    );
+    let parquet_manifests = &create_only[..1];
+    assert!(
+        !glob_matches(KEY_EPOCH_PATTERN, &parquet_manifest_key()),
+        "{KEY_EPOCH_PATTERN:?} reaches a manifest key"
     );
     let tenant = parquet_tenant_manifest_prefix();
     let reached = [
@@ -5444,7 +5813,7 @@ fn query_manifest_create_grant_reaches_only_manifest_keys() {
         parquet_grants_key(),
         format!("t/{}/pq/t/hits/v/{:020}.pqm", "ab".repeat(17), 1),
     ];
-    for pattern in &create_only {
+    for pattern in parquet_manifests {
         for key in &reached {
             assert!(
                 glob_matches(pattern, key),
@@ -9347,11 +9716,17 @@ fn empty_routed_write_set_is_not_a_skip() {
     let statements = json["Statement"]
         .as_array_mut()
         .expect("maintain.json Statement is an array");
-    // The two conditioned prov statements route through the tenant key too, so
-    // they go with the narrowing.
+    // The conditioned prov and key-epoch statements route through the tenant
+    // key too, so they go with the narrowing.
     statements.retain(|stmt| {
-        stmt["Sid"] != serde_json::json!("MaintainProvCreate")
-            && stmt["Sid"] != serde_json::json!("MaintainProvCas")
+        ![
+            "MaintainProvCreate",
+            "MaintainProvCas",
+            "MaintainEncCreate",
+            "MaintainEncCas",
+        ]
+        .iter()
+        .any(|sid| stmt["Sid"] == serde_json::json!(sid))
     });
     let target = statements
         .iter_mut()
@@ -10306,10 +10681,15 @@ fn shipped_gateway_write_mutated_to_wildcard_action_fails_closed() {
     let statements = json["Statement"]
         .as_array_mut()
         .expect("gateway.json Statement is an array");
-    // GatewayProvCreate is a second PutObject grant round three would have
-    // read; dropping it leaves GatewayWrite as the only put statement, which is
-    // the shape the reviewer mutated.
-    statements.retain(|stmt| stmt["Sid"] != serde_json::json!("GatewayProvCreate"));
+    // GatewayProvCreate, GatewayEncCreate and GatewayEncCas are further
+    // PutObject grants round three would have read; dropping them leaves
+    // GatewayWrite as the only put statement, which is the shape the reviewer
+    // mutated.
+    statements.retain(|stmt| {
+        !["GatewayProvCreate", "GatewayEncCreate", "GatewayEncCas"]
+            .iter()
+            .any(|sid| stmt["Sid"] == serde_json::json!(sid))
+    });
     let target = statements
         .iter_mut()
         .find(|stmt| stmt["Sid"] == serde_json::json!("GatewayWrite"))
@@ -10491,12 +10871,18 @@ fn operation_vocabulary_is_consistent() {
 
 /// The `role/Sid` of every statement whose Resource carries IAM's
 /// single-character `?` wildcard.
-const QUESTION_MARK_RESOURCE_STATEMENTS: [&str; 7] = [
+const QUESTION_MARK_RESOURCE_STATEMENTS: [&str; 13] = [
     "gateway/GatewayAdmissionDelete",
     "gateway/GatewayProvCreate",
+    "gateway/GatewayEncCreate",
+    "gateway/GatewayEncCas",
     "query/QueryManifestCreate",
+    "query/QueryEncCreate",
+    "query/QueryEncCas",
     "maintain/MaintainProvCreate",
     "maintain/MaintainProvCas",
+    "maintain/MaintainEncCreate",
+    "maintain/MaintainEncCas",
     "admin/AdminProvCreate",
     "admin/AdminProvCas",
 ];
