@@ -1039,8 +1039,9 @@ client asks for a new one. The tenant-wide manifest listings
 (`resolve::tables`, behind `ravel-cli parquet ls`, and
 `sweep::manifests_by_table`) go further: parsing the key refuses the name,
 so they fail for the whole tenant with `ForeignKey` naming that key until
-its manifests are gone. An operator who finds one recreates the definition
-under a name that is not reserved and deletes the old manifests under
+its manifests are gone (no longer: see the invalid table segment amendment
+below, under which they skip it). An operator who finds one recreates the
+definition under a name that is not reserved and deletes the old manifests under
 `t/<tenant_hash>/pq/t/<table>/` by hand.
 
 The set is kept in step with the templates by a test,
@@ -1180,9 +1181,10 @@ can make every resolve of a table arbitrarily expensive until
 `parquet repair --delete` removes them. A key whose segment between `pq/t/`
 and `/v/` is not a single valid table name (such as
 `t/<tenant_hash>/pq/t/a/b/v/<20 chars>.pqm`, which the Query grant's `*`
-admits) is still refused as foreign by the tenant-wide listings, so it fails
-`parquet ls` and `parquet sweep` for the whole tenant, though no table's
-resolve; validating that segment is issue #2510. A key whose extra segments
+admits) is still refused as foreign by the tenant-wide listings
+(see the invalid table segment amendment below, which skips it instead),
+so it fails `parquet ls` and `parquet sweep` for the whole tenant, though no
+table's resolve; validating that segment is issue #2510. A key whose extra segments
 sit under a valid table's own `v/` prefix, by contrast, is now a key that
 names no version, skipped and flagged like the rest. Narrowing the Query
 grant, item 1 of issue #2430, remains the root
@@ -1217,3 +1219,66 @@ any of them, so whenever rule 2 passes that ratio is 0. The
 per-statement rule is strictly stronger than any ceiling over the same
 statements. `prereg.toml` drops its `concurrency_error_ratio_ceiling` key,
 and the bench refuses a file that still carries it.
+
+## Amendment (2026-10-06): a manifest key under an invalid table segment is skipped, and repair removes it
+
+<!-- amendment-applies: sections="Amendment (2026-10-03): table names an IAM template grants after a wildcard are reserved|Amendment (2026-10-04): manifest versions are bounded, and a repair command removes forged ones" pointer="invalid table segment amendment" -->
+<!-- amendment-supersedes: phrase="is still refused as foreign by the tenant-wide listings" pointer="invalid table segment amendment" -->
+<!-- amendment-supersedes: phrase="so they fail for the whole tenant with `ForeignKey`" pointer="invalid table segment amendment" -->
+
+The version bound amendment left one shape open in its "What stays open"
+paragraph: a key the Query grant admits whose segment between `pq/t/` and
+`/v/` is not a single valid table name. The grant is
+`t/<32 characters>/pq/t/*/v/<20 characters>.pqm`, and its `*` binds any run
+of characters, `/` included, so it admits an upper-case name
+(`Hits/v/...`), a reserved name (`logs/v/...`) and a path (`a/b/v/...`).
+`resolve::versions` for a named valid table never lists such a key, but
+`resolve::tables` and the sweep's listing refused it as `ForeignKey`, so one
+put failed `parquet ls` and `parquet sweep` for the whole tenant. The IAM
+segment amendment above records the same failure for a table created under a
+name reserved since. This is issue #2510.
+
+**Classification.** `keys::parse_listed_manifest_key` names such a key
+`ListedManifestKey::InvalidTable`, carrying the tenant and the key text after
+`t/<tenant_hash>/pq/t/`, when it has exactly the grant's shape (`pq/t/`, any
+text, `/v/`, 20 characters, `.pqm`) and is not a manifest key of a validly
+named table. A key whose first segment is a valid table name followed by `v/`
+keeps its earlier class: a version, or `InvalidVersion`. Every other key
+under `pq/t/`, such as one with a suffix other than `.pqm` or with no `/v/`
+and 20 characters before the suffix, is still foreign and still an error:
+only the shape the Query grant can write is skipped.
+
+**Listings.** `resolve::tables` (through `resolve::tenant_listing`, which
+also returns the skipped keys) and the sweep's listing skip such a key and
+never fail on it. Each listing that finds one is counted per tenant
+(`resolve::invalid_table_listings`, a sibling of the per-table
+`resolve::above_bound_resolves`, so neither counter's key means two things),
+and the first in a process is logged at `warn` as a
+`resolve::InvalidTableKeys`, which names the tenant hash, how many keys, the
+first key (escaped, since whoever put it chose it) and the repair command.
+The per-tenant map has the same cap, `resolve::ABOVE_BOUND_TABLES_MAX`, and
+the same overflow sampling, `resolve::ABOVE_BOUND_WARN_EVERY`, as the
+per-table one. The sweep never deletes such a key, and no table's versions or
+newest change. `ravel-cli parquet ls` says when the tenant holds any.
+
+**Repair.** `ravel-cli parquet repair --tenant <t> --stray`, exclusive with
+`--table`, lists every such key of the tenant (`repair::list_stray`, one
+listing of `t/<tenant_hash>/pq/t/`, a prefix that ends at a segment
+boundary), escaped, with the time the store wrote it. With `--delete` it
+deletes exactly those (`repair::delete_stray`): every key is classified
+before the first delete, and a key that is not one (a manifest key of a valid
+table, in any version class, another tenant's key, or a key of no manifest
+shape) refuses the whole command with `RepairError::NotStray` and deletes
+nothing. With nothing listed it says so and deletes nothing.
+`--delete-version` stays table-scoped. The command runs under the Maintain
+credential: `MaintainList` grants the `t/*/pq/t/*` listing and
+`MaintainDelete` grants `s3:DeleteObject` on `t/*/pq/t/*`. It is a write
+only with `--delete`. A table created under a name reserved since the IAM
+segment amendment is such a key too, so once its definition is recreated
+under a name that is not reserved, `--stray --delete` removes the old
+manifests that amendment says to delete by hand.
+
+**What stays open.** Narrowing the Query grant, item 1 of issue #2430, is
+still the root fix: until it lands, a stolen Query credential can put such
+keys, and every tenant-wide listing pages through them until an operator
+removes them.
