@@ -2145,16 +2145,22 @@ pub enum ErasureRewriteOutcome {
     /// The bucket's live set holds an input object the writer refuses to
     /// rewrite (`reason`: a log object whose `stream_attrs` blob does not
     /// decode, written before issue #2548's validation), so nothing was built
-    /// or published (issue #2580). The object stays in storage and stays live,
-    /// so [`bucket_erasure_completion`] keeps every request whose window
-    /// covers it pending. Counted and warned once per object per process
+    /// or published (issue #2580). The object and every other live object of
+    /// the bucket, healthy ones included, stay in storage and stay live, so
+    /// [`bucket_erasure_completion`] keeps every request whose window reaches
+    /// any of them pending. Counted and warned once per object per process
     /// ([`erasure_unwritable_objects_total`]). Every later pass reports the
     /// same object until it is removed or repaired. Unlike an `Err`, this
     /// says nothing about any other bucket, so a driver need not hold back
     /// the completion of requests this bucket does not block.
+    ///
+    /// `claim` is the bucket claim the pass took before it found the object,
+    /// as on [`ErasureRewriteOutcome::Rewritten`], so a driver counts it the
+    /// same way.
     BlockedByUnwritableObject {
         object_key: String,
         reason: CompactionInputSkipReason,
+        claim: Option<ClaimAcquisition>,
     },
     /// Built and published (or converged / abandoned): `parts` output parts
     /// written, `publish` records how the `RewriteRecord` PUT resolved.
@@ -2271,8 +2277,8 @@ fn note_erasure_unwritable_object(
         reason = reason.name(),
         error = detail,
         "erasure rewrite of a bucket is blocked by an input object it cannot rewrite; \
-         the bucket is not rewritten, and every erasure request whose window covers the \
-         object stays pending while the object exists (issue #2580)"
+         the bucket is not rewritten, and every erasure request whose window reaches a \
+         live object of the bucket stays pending while the object exists (issue #2580)"
     );
 }
 
@@ -2508,7 +2514,11 @@ pub async fn erasure_rewrite_bucket(
     }
     if let Some((object_key, reason, detail)) = unwritable {
         note_erasure_unwritable_object(bucket, &object_key, reason, &detail);
-        return Ok(ErasureRewriteOutcome::BlockedByUnwritableObject { object_key, reason });
+        return Ok(ErasureRewriteOutcome::BlockedByUnwritableObject {
+            object_key,
+            reason,
+            claim,
+        });
     }
 
     invalidate_after_publish(memo, bucket, &publish);

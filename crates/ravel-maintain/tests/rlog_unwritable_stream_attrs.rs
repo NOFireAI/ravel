@@ -30,7 +30,9 @@ use ravel_maintain::{
     PublishOutcome, UnwritableBucket, Verification, compact_bucket,
     compaction_inputs_skipped_total, migrate_bucket_format, migrate_family,
 };
-use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Sequence, SequenceStep};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence, SequenceStep,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_types::Signal;
@@ -644,6 +646,80 @@ async fn migrate_skips_a_bucket_with_a_refused_object_and_walks_on() {
         assert_eq!(records, expected, "compaction records at hour {hour}");
     }
     assert_eq!(skipped_total(), skipped_before, "migration skips no input");
+}
+
+/// Only the typed refusal becomes a skip: a transient GET fault on a healthy
+/// data object of the middle bucket, read inside `migrate_bucket_format`,
+/// still ends the walk with `Err`, and no bucket is named as unwritable.
+///
+/// With the walk's `Err(MaintainError::UnwritableInput { .. })` arm in
+/// `migrate_family` widened to `Err(err)` (recording `err` as the skipped
+/// bucket), the walk finishes and `expect_err` fails.
+#[tokio::test]
+async fn migrate_still_fails_on_any_other_error() {
+    capture();
+    let _serial = SERIAL.lock().await;
+    const BASE: u128 = 0x700;
+    let target = ravel_maintain::rlog::OUTPUT_FORMAT_VERSION;
+
+    let inner = MemoryStore::new();
+    let hours = [HOUR - 2, HOUR - 1, HOUR];
+    let mut seq = 0u64;
+    let mut faulted_data = String::new();
+    for (i, hour) in hours.into_iter().enumerate() {
+        for n in 0..2u64 {
+            seq += 1;
+            let ts = i64::from(hour) * 3_600_000_000_000 + n as i64;
+            let commit = seed_rlog_input_at_hour(
+                &inner,
+                Uuid::from_u128(BASE + u128::from(seq)),
+                10,
+                seq,
+                hour,
+                &[log_record(0, ts, "alpha")],
+                false,
+                target - 1,
+            )
+            .await;
+            if i == 1 && n == 0 {
+                faulted_data = data_key_of(&inner, &commit).await;
+            }
+        }
+    }
+    let store = FaultStore::new(
+        inner,
+        FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("data object unavailable".into()),
+            )
+            .with_key_contains(faulted_data.clone()),
+        ),
+    );
+
+    let err = migrate_family(
+        &store,
+        &FixedClock::new(sealed_now_ns()),
+        &CompactorConfig::default(),
+        tenant_hash(),
+        Signal::Logs,
+        "rlog",
+        target,
+        SHARD + 1,
+        MigrateBudget::unlimited(),
+        "rlog_unwritable_stream_attrs test",
+    )
+    .await
+    .expect_err("a transient read failure ends the walk");
+
+    assert!(
+        store.fault_count(Op::Get, FaultKind::Transient) > 0,
+        "the fault fired"
+    );
+    assert!(
+        !matches!(err, MaintainError::UnwritableInput { .. }),
+        "the error is the read failure, not a refusal: {err:?}"
+    );
 }
 
 /// A bucket with no refused object compacts every input exactly as before:

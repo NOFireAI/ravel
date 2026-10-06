@@ -4276,9 +4276,10 @@ fn render_maintain_safety_family(
         "Input objects that blocked the selective-erasure rewrite of their bucket, by signal and \
          reason, each object counted once per process since process start (issue #2580). \
          reason=\"unwritable_stream_attrs\": a log object carrying a stream_attrs blob the RLOG \
-         writer refuses. The bucket is not rewritten and the object stays in storage, so every \
-         erasure request whose window covers it stays pending; requests it does not cover \
-         complete. A warn log line names its key. Resets on restart: alert on an increase.",
+         writer refuses. Nothing in the bucket is rewritten, so every live object in it, \
+         healthy ones included, stays live and every erasure request whose window reaches any \
+         of them stays pending; a request whose window reaches no live object of a blocked \
+         bucket completes. A warn log line names its key. Resets on restart: alert on an increase.",
         "counter",
     );
     for &(signal, reason, value) in &snapshot.erasure_unwritable_objects {
