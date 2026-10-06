@@ -336,29 +336,70 @@ async fn collect_repair(
         out.push("no versions above the version bound and no keys naming no version".to_string());
         return Ok(());
     }
-    let undeletable = entries
+    let undeletable: Vec<&String> = entries
         .iter()
         .filter(|e| e.flagged && e.undeletable)
-        .count();
+        .map(|e| &e.key)
+        .collect();
     if action != RepairAction::DeleteFlagged {
-        out.push(if undeletable == 0 {
+        out.push(if undeletable.is_empty() {
             format!(
                 "{} version(s) flagged; rerun with --delete to remove exactly these",
                 flagged.len()
             )
         } else {
             format!(
-                "{} version(s) flagged; {undeletable} of them undeletable by Ravel, marked above, \
-                 and --delete refuses to delete any while one of those is listed",
-                flagged.len()
+                "{} version(s) flagged; rerun with --delete to remove {} of them; it skips the \
+                 other {}, undeletable by Ravel and marked above",
+                flagged.len(),
+                flagged.len() - undeletable.len(),
+                undeletable.len()
             )
         });
         return Ok(());
     }
-    let deleted = repair::delete_flagged(store, &hash, table, &flagged).await?;
-    out.push(format!("deleted {} manifest versions", deleted.len()));
-    out.extend(deleted.iter().map(|key| format!("  {key:?}")));
+    for key in &undeletable {
+        out.push(format!(
+            "skipped {key:?}: undeletable by Ravel; delete the exact key with the Maintain \
+             credential through an S3 tool"
+        ));
+    }
+    let deletion = repair::delete_flagged(store, &hash, table, &flagged)
+        .await
+        .map_err(|err| delete_failed(out, "manifest versions", err))?;
+    push_deleted(out, "manifest versions", &deletion.deleted);
+    if !deletion.undeletable.is_empty() {
+        let keys: Vec<String> = deletion
+            .undeletable
+            .iter()
+            .map(|k| format!("{k:?}"))
+            .collect();
+        anyhow::bail!(
+            "{} flagged key(s) undeletable by Ravel left in place: {}",
+            keys.len(),
+            keys.join(", ")
+        );
+    }
     Ok(())
+}
+
+/// Push the line counting `deleted`, then each deleted key, escaped.
+fn push_deleted(out: &mut Vec<String>, what: &str, deleted: &[String]) {
+    out.push(format!("deleted {} {what}", deleted.len()));
+    out.extend(deleted.iter().map(|key| format!("  {key:?}")));
+}
+
+/// `err` from a repair delete. A delete that failed part-way
+/// ([`RepairError::Delete`]) pushes the keys deleted before it first, so they
+/// are printed before the error.
+fn delete_failed(out: &mut Vec<String>, what: &str, err: RepairError) -> anyhow::Error {
+    let RepairError::Delete { deleted, .. } = &err else {
+        return err.into();
+    };
+    push_deleted(out, what, deleted);
+    anyhow::Error::from(err).context(
+        "deleted the keys printed above, then a delete failed; no key after it was deleted",
+    )
 }
 
 /// `parquet repair --stray`: list every key under the tenant's manifest
@@ -382,7 +423,8 @@ pub async fn repair_stray(
 }
 
 /// [`repair_stray`], writing to `out` rather than stdout. The deletions are
-/// written before a failed listing after them is reported.
+/// written before a failed delete or a failed listing after them is
+/// reported.
 async fn write_repair_stray(
     store: &dyn ObjectStoreBackend,
     tenant: &str,
@@ -392,11 +434,8 @@ async fn write_repair_stray(
 ) -> anyhow::Result<()> {
     let report = repair_stray_lines(store, tenant, delete, include_reserved_names).await?;
     print_lines(&report.lines, out)?;
-    if let Some(err) = report.relist_error {
-        return Err(anyhow::Error::from(err).context(
-            "deleted the keys printed above, then could not list the tenant's keys under no \
-             valid table name again to confirm none is left",
-        ));
+    if let Some(err) = report.error {
+        return Err(err);
     }
     if !report.remaining.is_empty() {
         let keys: Vec<String> = report.remaining.iter().map(|k| format!("{k:?}")).collect();
@@ -410,11 +449,11 @@ async fn write_repair_stray(
 }
 
 /// What [`repair_stray`] prints, and with `delete` the stray keys a listing
-/// after the deletes still found, or why that listing failed.
+/// after the deletes still found, or why a delete or that listing failed.
 struct StrayReport {
     lines: Vec<String>,
     remaining: Vec<String>,
-    relist_error: Option<RepairError>,
+    error: Option<anyhow::Error>,
 }
 
 /// Why `--delete` leaves `entry` in place, if it does.
@@ -470,7 +509,7 @@ async fn repair_stray_lines(
     let mut report = StrayReport {
         lines,
         remaining: Vec::new(),
-        relist_error: None,
+        error: None,
     };
     if entries.is_empty() {
         report
@@ -506,16 +545,23 @@ async fn repair_stray_lines(
                 .push(format!("skipped {:?}: {reason}", entry.key));
         }
     }
-    let deleted = repair::delete_stray(store, &hash, &to_delete, include_reserved_names).await?;
-    report
-        .lines
-        .push(format!("deleted {} key(s)", deleted.len()));
-    report
-        .lines
-        .extend(deleted.iter().map(|key| format!("  {key:?}")));
+    let deleted = match repair::delete_stray(store, &hash, &to_delete, include_reserved_names).await
+    {
+        Ok(deleted) => deleted,
+        Err(err) => {
+            report.error = Some(delete_failed(&mut report.lines, "key(s)", err));
+            return Ok(report);
+        }
+    };
+    push_deleted(&mut report.lines, "key(s)", &deleted);
     match repair::list_stray(store, &hash).await {
         Ok(entries) => report.remaining = entries.into_iter().map(|entry| entry.key).collect(),
-        Err(err) => report.relist_error = Some(err),
+        Err(err) => {
+            report.error = Some(anyhow::Error::from(err).context(
+                "deleted the keys printed above, then could not list the tenant's keys under no \
+                 valid table name again to confirm none is left",
+            ));
+        }
     }
     Ok(report)
 }
@@ -784,8 +830,9 @@ mod tests {
     }
 
     /// A key is chosen by whoever put it, control characters included, so
-    /// every line that prints one escapes it, and so does the refusal to
-    /// delete it: the store's path encoding would send its delete elsewhere.
+    /// every line that prints one escapes it, and so does the error naming it
+    /// left in place: the store's path encoding would send its delete
+    /// elsewhere.
     #[tokio::test]
     async fn repair_prints_every_key_escaped() {
         let store = forged_table().await;
@@ -806,14 +853,18 @@ mod tests {
             let result = collect_repair(&store, "acme", "hits", action, &mut lines).await;
             let mut printed = lines.join("\n");
             if action == RepairAction::DeleteFlagged {
-                let err = result.expect_err("refused");
+                let err = result.expect_err("left in place");
                 printed.push_str(&format!("\n{err:#}"));
                 assert!(
+                    printed.contains(&format!(
+                        "\nskipped {key:?}: undeletable by Ravel; delete the exact key with the \
+                         Maintain credential through an S3 tool\ndeleted 2 manifest versions\n"
+                    )),
+                    "{printed}"
+                );
+                assert!(
                     printed.ends_with(&format!(
-                        "\nrefusing to delete {key:?}: the store's path encoding sends a delete \
-                         of it to {:?}, a different key; delete the exact key with the Maintain \
-                         credential through an S3 tool",
-                        store_path(&key)
+                        "\n1 flagged key(s) undeletable by Ravel left in place: {key:?}"
                     )),
                     "{printed}"
                 );
@@ -824,7 +875,7 @@ mod tests {
             assert!(!printed.contains('\u{7}'), "{printed}");
             assert!(printed.contains(&format!("{key:?}")), "{printed}");
         }
-        assert_eq!(deletes(&store), 0);
+        assert_eq!(deletes(&store), 2);
     }
 
     #[tokio::test]
@@ -1285,10 +1336,10 @@ mod tests {
 
     /// A flagged key under the table's own `v/` prefix whose delete the
     /// store's path encoding would send to a different key is marked in the
-    /// listing, and `--delete` prints the listing and then refuses, deleting
-    /// nothing.
+    /// listing. `--delete` deletes every other flagged version, never sends
+    /// that key a delete, and fails naming it as undeletable.
     #[tokio::test]
-    async fn repair_marks_and_refuses_a_flagged_key_the_path_encoding_changes() {
+    async fn repair_marks_and_skips_a_flagged_key_the_path_encoding_changes() {
         let hash = TenantId::new("acme").hash();
         let tilde = format!(
             "{}~~~~~~~~~~~~~~~~~~~~.pqm",
@@ -1315,8 +1366,8 @@ mod tests {
         assert_eq!(printed.matches("undeletable by Ravel").count(), 2);
         assert!(
             printed.ends_with(
-                "3 version(s) flagged; 1 of them undeletable by Ravel, marked above, and \
-                 --delete refuses to delete any while one of those is listed"
+                "3 version(s) flagged; rerun with --delete to remove 2 of them; it skips the \
+                 other 1, undeletable by Ravel and marked above"
             ),
             "{printed}"
         );
@@ -1330,24 +1381,95 @@ mod tests {
             &mut lines,
         )
         .await
-        .expect_err("must refuse");
-        assert!(
-            format!("{err:#}").starts_with(&format!(
-                "refusing to delete {tilde:?}: the store's path encoding sends a delete of it to \
-                 {:?}",
-                store_path(&tilde)
-            )),
-            "{err:#}"
+        .expect_err("the undeletable key is left");
+        assert_eq!(
+            format!("{err:#}"),
+            format!("1 flagged key(s) undeletable by Ravel left in place: {tilde:?}")
         );
-        assert!(lines.join("\n").contains(&mark), "{lines:?}");
-        assert_eq!(store.deletes(), Vec::<String>::new());
-        assert_eq!(deletes(&store.inner), 0);
+        let printed = lines.join("\n");
+        assert!(printed.contains(&mark), "{printed}");
+        let forged = [
+            manifest_key(&hash, "hits", MAX_MANIFEST_VERSION + 1).expect("key"),
+            manifest_key(&hash, "hits", u64::MAX).expect("key"),
+        ];
+        assert!(
+            printed.ends_with(&format!(
+                "skipped {tilde:?}: undeletable by Ravel; delete the exact key with the Maintain \
+                 credential through an S3 tool\ndeleted 2 manifest versions\n  {:?}\n  {:?}",
+                forged[0], forged[1]
+            )),
+            "{printed}"
+        );
+        // Each deletable version is sent a delete at its own key; the tilde
+        // key is never sent one.
+        assert_eq!(store.deletes(), forged);
+        assert_eq!(deletes(&store.inner), 2);
+        store.inner.inner().head(&tilde).await.expect("still there");
         assert_eq!(
             resolve::versions(&store, &hash, "hits")
                 .await
                 .expect("versions"),
-            vec![1, MAX_MANIFEST_VERSION, MAX_MANIFEST_VERSION + 1, u64::MAX]
+            vec![1, MAX_MANIFEST_VERSION]
         );
+    }
+
+    /// The second delete of `--stray --delete` fails: the listing and the
+    /// key deleted before it are still written, then the command fails with
+    /// the store error.
+    #[tokio::test]
+    async fn repair_stray_prints_the_keys_deleted_before_a_failed_delete() {
+        let store = forged_table().await;
+        for rest in STRAYS {
+            store
+                .inner()
+                .put(
+                    &acme_key(rest),
+                    Bytes::from_static(b"x"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put");
+        }
+        let store = S3Keys::new(FaultStore::new(
+            store,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Delete,
+                    ScriptedFault::Permanent("delete refused".into()),
+                )
+                .with_occurrence(Occurrence::Nth(2)),
+            ),
+        ));
+        let mut out = Vec::new();
+        let err = write_repair_stray(&store, "acme", true, false, &mut out)
+            .await
+            .expect_err("the second delete fails");
+        assert_eq!(store.inner.fault_count(Op::Delete, FaultKind::Permanent), 1);
+        let keys = sorted(&STRAYS);
+        assert_eq!(store.deletes(), keys[..2]);
+        assert_eq!(deletes(store.inner.inner()), 1);
+        let printed = String::from_utf8(out).expect("utf-8");
+        assert!(
+            printed.starts_with("tenant: acme (3 key(s) under no valid table name)\n"),
+            "{printed}"
+        );
+        for key in &keys {
+            assert!(printed.contains(&format!("  key: {key:?}\n")), "{printed}");
+        }
+        assert!(
+            printed.ends_with(&format!("deleted 1 key(s)\n  {:?}\n", keys[0])),
+            "{printed}"
+        );
+        let text = format!("{err:#}");
+        assert!(
+            text.starts_with(&format!(
+                "deleted the keys printed above, then a delete failed; no key after it was \
+                 deleted: object store error deleting {:?}, after deleting 1 key(s) before it",
+                keys[1]
+            )),
+            "{text}"
+        );
+        assert!(text.contains("delete refused"), "{text}");
     }
 
     #[tokio::test]
