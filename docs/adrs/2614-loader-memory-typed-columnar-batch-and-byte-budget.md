@@ -175,12 +175,17 @@ is:
   `--max-inflight-flushes` permits (Stage 0 measured that term separately
   from the encoder's working set).
 
-This is the lifetime of the ingest byte budget ADR-0069 already charges in
-`write_columnar`. The charge is cloned into every shard message and refunded
-when the flush holding the bytes completes or fails. The loader builds its
-router with that budget unlimited today. `--load-memory-bytes` is the same
-mechanism with a ceiling. The difference is that the loader waits for room
-before it builds the next batch, instead of the router refusing a write.
+The loader takes the charge on one shared budget before it builds a batch,
+so the 1 + Q batches being built or waiting in the decode queue are covered.
+ADR-0069's ingest byte budget only covers the tail of that lifetime. Its
+charge is taken inside `write_columnar`, after the batch was built and
+queued. It is cloned into every shard message and refunded when the flush
+holding the bytes completes or fails. Reusing ADR-0069's charge unchanged
+would therefore leave the build side, the second-largest Stage 0 term,
+unbounded. The implementing task carries the loader's charge into the router
+in place of a fresh one, so each batch is charged once from build to flush.
+The loader waits for room before it builds; the router never refuses one of
+its writes.
 
 The decoder waits when the budget is spent.
 - `--pipeline-depth`, `--decode-queue-batches` and `--max-inflight-flushes`
@@ -207,7 +212,7 @@ and loader RSS sampled every 5 s.
 | criterion | how measured | target |
 |---|---|---|
 | 1,000,000-row objects (≥ 25 MB) load under a fixed RSS | r6a.4xlarge, `--target-bytes` at the object size | peak loader RSS < 8 GB |
-| load time no worse | same box, against today's 1,489 s at 1,000,000 rows | ≤ 1,560 s |
+| load time no worse | same box; the first acceptance step measures main at 524bff9d (v0.22.0 plus #2621) at 1,000,000 rows, since 1,489 s was measured on v0.22.0 and #2621's wall-clock rate was never measured | ≤ 1.05 × that baseline |
 | objects byte-identical | differential tests, row vs columnar and old vs new batch type, on fixed inputs | pass |
 | the corpus loads on a 4 GB machine with ≥ 25 MB objects | c6a.large, full ClickBench run | load completes, no swap-induced shard-ack timeout |
 | the corpus loads on 8 GB and 16 GB with ≥ 25 MB objects | c6a.xlarge, c6a.2xlarge | load completes in ≤ 1.5 × today's stock load time on that machine |
@@ -255,7 +260,9 @@ corpus twice, q33 exceeds the per-query limit), and on spill needing
   - On small machines the byte budget turns "swap, then a shard-ack timeout"
     into slower progress.
 - **API change.** The `ColumnarLogBatch` change touches `ravel-logseg`'s
-  writer, `ravel-ingest`'s router and shard actor, and `ravel-cli`'s loader.
+  writer, `ravel-ingest`'s router and shard actor, `ravel-cli`'s loader, and
+  `ravel-bench`'s columnar load harness (`columnar_load.rs`, which builds a
+  `ColumnarLogBatch` with `from_records` and drives `write_columnar`).
   - The OTLP ingest flush builds row-shaped buffers through
     `build_object`, not through the columnar path, so it is unaffected; the
     implementing task confirms that by grep.
