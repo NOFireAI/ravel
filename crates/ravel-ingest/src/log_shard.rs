@@ -1559,7 +1559,22 @@ impl LogShardActor {
             }
             BufContent::Columnar(batches) => {
                 for batch in batches {
-                    for (target, part) in partition_columnar(batch, count) {
+                    // Every buffered batch validated on admission or came out of
+                    // a partition, so a refusal is a bug; it is dropped loudly,
+                    // as a hand-back that cannot merge is below.
+                    let parts = match partition_columnar(batch, count) {
+                        Ok(parts) => parts,
+                        Err(err) => {
+                            tracing::error!(
+                                shard = self.shard,
+                                error = %err,
+                                "ravel-ingest: a buffered columnar batch could not be \
+                                 re-partitioned for hand-back; dropping it"
+                            );
+                            continue;
+                        }
+                    };
+                    for (target, part) in parts {
                         if let FlushPayload::Columnar(into) = payloads
                             .entry(target)
                             .or_insert_with(|| FlushPayload::Columnar(Vec::new()))
@@ -5291,17 +5306,19 @@ mod tests {
     /// A retiring shard's columnar buffer of two writes, handed back to a
     /// three-shard set and written there in one flush, stores the same objects
     /// as the cloning reference partition gives for the same writes. Each
-    /// write is partitioned for four shards and shard 3's part is buffered
-    /// here; the hand-back re-partitions those parts, which already carry
-    /// compacted dictionaries, for three shards, and one actor takes every
-    /// target's message into one buffer. The reference payloads are the
-    /// cloning partition applied the same two times, grouped the way
+    /// write, carrying dictionaries on Str and Bytes columns (one holding a
+    /// `Map` cell), is partitioned for four shards and shard 3's part is
+    /// buffered here; the hand-back re-partitions those parts for three
+    /// shards, and one actor takes every target's message into one buffer.
+    /// No handed-back part carries a dictionary. The reference payloads are
+    /// the cloning partition applied the same two times, grouped the way
     /// `hand_back` groups them: per target, ascending, each write's part in
     /// write order.
     #[tokio::test]
     async fn a_handed_back_columnar_buffer_stores_the_same_objects_as_the_cloning_reference() {
         use crate::log_router::{
-            assert_same_objects, cloning_partition_reference_pre_2624, dict_kept, dictionary_writes,
+            assert_no_child_dictionaries, assert_parent_dictionaries, assert_same_objects,
+            cloning_partition_reference_pre_2624, dictionary_writes,
         };
         let shard_of = |parts: Vec<(u32, ColumnarLogBatch)>, shard: u32| {
             parts
@@ -5311,6 +5328,9 @@ mod tests {
                 .expect("the shard receives rows")
         };
         let writes = dictionary_writes();
+        for write in &writes {
+            assert_parent_dictionaries(write, &["svc", "raw", "blob"], "blob");
+        }
 
         let rig = HandBackRig::new(None);
         let (target, mut inbox) = mpsc::channel(16);
@@ -5326,7 +5346,10 @@ mod tests {
             rig.tx
                 .send(LogShardMsg::WriteColumnar {
                     tenant: TenantId::new("acme"),
-                    batch: Box::new(shard_of(partition_columnar(write.clone(), 4), 3)),
+                    batch: Box::new(shard_of(
+                        partition_columnar(write.clone(), 4).expect("a valid batch partitions"),
+                        3,
+                    )),
                     ack: None,
                     charge: None,
                 })
@@ -5363,45 +5386,13 @@ mod tests {
             "one hand-back message per target"
         );
 
-        let mut blob_dropped_beside_raw = 0;
         for (t, (payload, _)) in moved.iter().enumerate() {
             let FlushPayload::Columnar(batches) = payload else {
                 panic!("target {t}: a columnar buffer hands back columnar batches");
             };
             assert_eq!(batches.len(), 2, "target {t}: a part of each write");
-            for (w, part) in batches.iter().enumerate() {
-                assert_eq!(
-                    dict_kept(part, "k_str"),
-                    Some(w == 0),
-                    "target {t}, write {w}: k_str's dictionary only from the first write"
-                );
-                assert_eq!(
-                    dict_kept(part, "raw"),
-                    Some(true),
-                    "target {t}, write {w}: raw keeps its dictionary"
-                );
-                let blob = part
-                    .dyn_columns
-                    .iter()
-                    .find(|c| c.name == "blob")
-                    .expect("blob column");
-                // A share without a Map cell can still have none: the
-                // four-shard part it came from dropped it for one.
-                let has_map = blob.cells.iter().any(|c| matches!(c, AttrValue::Map(_)));
-                if has_map {
-                    assert_eq!(
-                        dict_kept(part, "blob"),
-                        Some(false),
-                        "target {t}, write {w}: blob drops its dictionary for a Map cell"
-                    );
-                    blob_dropped_beside_raw += 1;
-                }
-            }
+            assert_no_child_dictionaries(batches.iter().map(|part| (t as u32, part)));
         }
-        assert!(
-            blob_dropped_beside_raw > 0,
-            "some handed-back part drops blob's dictionary for a Map cell"
-        );
 
         let reference: Vec<(FlushPayload, HandBackArrival)> = reference
             .into_iter()
@@ -5418,6 +5409,48 @@ mod tests {
         assert_same_objects(&objs_ref, &objs_new);
         drop(rig.tx);
         rig.task.await.expect("actor ends");
+    }
+
+    /// After columnar writes, each shard buffer's registered `est_bytes`, the
+    /// figure charged against the ADR-0069 ceiling, equals
+    /// `est_columnar_bytes` of the batches it holds, and those batches carry
+    /// no dictionaries, which that estimate does not count. Across shards the
+    /// registered bytes are the writes' own charge.
+    #[test]
+    fn a_columnar_buffer_registers_the_estimate_of_what_it_holds() {
+        use crate::log_router::{
+            assert_no_child_dictionaries, assert_parent_dictionaries, dictionary_writes,
+        };
+        let writes = dictionary_writes();
+        let charged: usize = writes.iter().map(est_columnar_bytes).sum();
+        let mut bufs: HashMap<u32, LogTenantBuf> = HashMap::new();
+        for write in writes {
+            assert_parent_dictionaries(&write, &["svc", "raw", "blob"], "blob");
+            for (shard, part) in partition_columnar(write, 4).expect("a valid batch partitions") {
+                bufs.entry(shard)
+                    .or_default()
+                    .merge_columnar(part, BASE_NS)
+                    .expect("a columnar write into a columnar buffer");
+            }
+        }
+        assert!(bufs.len() > 1, "the writes span several shards");
+        let mut registered = 0;
+        for (shard, buf) in &bufs {
+            let BufContent::Columnar(batches) = &buf.content else {
+                panic!("shard {shard}: the buffer holds columnar batches");
+            };
+            let held: usize = batches.iter().map(est_columnar_bytes).sum();
+            assert_eq!(
+                buf.est_bytes, held,
+                "shard {shard}: registered bytes are the estimate of what the buffer holds"
+            );
+            assert_no_child_dictionaries(batches.iter().map(|batch| (*shard, batch)));
+            registered += buf.est_bytes;
+        }
+        assert_eq!(
+            registered, charged,
+            "the shards register what the writes charged"
+        );
     }
 }
 
