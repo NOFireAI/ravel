@@ -110,7 +110,7 @@ fn arm_excludes(
             };
             arm.max.is_some_and(|q| q < seg_min) || arm.min.is_some_and(|q| q > seg_max)
         }
-        (None, None) => coverage.null_count_proven && coverage.null_count == seg.sample_count,
+        (None, None) => coverage.null_count == seg.sample_count,
         _ => false,
     }
 }

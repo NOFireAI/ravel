@@ -681,21 +681,18 @@ fn declared_scalar(ty: DeclaredType, value: &ColumnValue) -> Option<ScalarValue>
 /// One segment's coverage of one declared column as one carrier states it.
 ///
 /// `min`/`max` both absent is a coverage statement, not a gap: the column had
-/// zero non-null values in that segment, which is exact. `null_count_proven`
-/// records whether the carrier's NULL count was reconciled against the
-/// segment's row count before it got here: true for a stamp, where the proof is
-/// [`stamp_coverage`]'s parameter type ([`DeclaredColumnStats`], constructable
-/// non-empty only from a `ValidatedDeclaredStats`) rather than a convention its
-/// caller is trusted to have followed; false for a `.cstat` entry, whose row
-/// accounting [`cstat_coverage`] reconciles against the segment's
-/// `sample_count` before any grant but whose NULL count is deliberately not
-/// promoted to proven here.
+/// zero non-null values in that segment, which is exact.
+///
+/// Only a stamp's coverage ([`stamp_coverage`]) answers a statistic or skips a
+/// segment, and its `null_count` passed the row-count clauses before the
+/// container [`stamp_coverage`] takes could be built. A `.cstat` entry's
+/// coverage ([`cstat_coverage`]) never answers: it is compared with a stamp's,
+/// or read only for its defect tally.
 #[derive(Clone)]
 pub(crate) struct SegmentCoverage {
     pub(crate) min: Option<ScalarValue>,
     pub(crate) max: Option<ScalarValue>,
     pub(crate) null_count: u64,
-    pub(crate) null_count_proven: bool,
 }
 
 impl SegmentCoverage {
@@ -771,12 +768,14 @@ fn stamp_scalar(ty: DeclaredType, value: DeclaredStatValue) -> Option<ScalarValu
 /// kind disagreeing with the type the tenant declares the column as).
 ///
 /// The parameter is [`DeclaredColumnStats`], the validated container, not a
-/// slice of entries, and the signature is the argument: `null_count_proven` is
-/// set unconditionally below, so this function's correctness rests on the
-/// entries having passed the full statistics validity predicate, row-count
-/// clauses included. `DeclaredColumnStats`'s only non-empty constructor is
-/// `from_validated`, so possessing one is that proof (ADR-0873 decision 2), and
-/// a caller cannot satisfy this signature with entries it decoded itself. A
+/// slice of entries, and the signature is the argument: callers trust the NULL
+/// count returned here with no further check (summed into `COUNT(col)`, and
+/// compared with `sample_count` to skip an all-NULL segment), so this
+/// function's correctness rests on the entries having passed the full
+/// statistics validity predicate, row-count clauses included.
+/// `DeclaredColumnStats`'s only non-empty constructor is `from_validated`, so
+/// possessing one is that proof (ADR-0873 decision 2), and a caller cannot
+/// satisfy this signature with entries it decoded itself. A
 /// `&[DeclaredColumnStat]` parameter would leave the same claim resting on a
 /// caller invariant nothing checks, which is the #970 shape.
 ///
@@ -807,7 +806,6 @@ pub(crate) fn stamp_coverage(
         min,
         max,
         null_count: stat.null_count(),
-        null_count_proven: true,
     })
 }
 
@@ -922,7 +920,6 @@ fn entry_coverage(declared: &DeclaredColumn, stat: &ColumnStat) -> Option<Segmen
         min,
         max,
         null_count: stat.null_count,
-        null_count_proven: false,
     })
 }
 
@@ -947,8 +944,11 @@ pub(crate) fn segment_column_stats<'a>(
 /// carrier wrong. The entry therefore never answers and is never compared with
 /// the stamp here: a segment the stamp does not cover declines the column even
 /// when a `.cstat` entry covers it, and where both exist the stamp's triple is
-/// returned as is. The entry is still read, so a defective one stays visible on
-/// the [`StatCarrier::Cstat`] drop tally.
+/// returned as is. The entry is still read, so a defective one is counted on
+/// the [`StatCarrier::Cstat`] drop tally, but only on segments this is called
+/// for: [`LogsScanExec::declared_min_max_all`] stops calling it for a column at
+/// the first touched segment with no stamp for that column, so on a stamp-less
+/// tenant only the first touched segment's entry is read on that path.
 ///
 /// `None` declines the column for this segment: a `Str` column (no scalar form
 /// on the statistics paths), or a segment with no usable stamp for it.
@@ -1935,12 +1935,9 @@ impl LogsScanExec {
                 if let Some(max) = coverage.max {
                     a.max = keep_extreme(a.max.take(), max, std::cmp::Ordering::Greater);
                 }
-                a.null_count = if coverage.null_count_proven {
-                    a.null_count
-                        .and_then(|sum| sum.checked_add(coverage.null_count))
-                } else {
-                    None
-                };
+                a.null_count = a
+                    .null_count
+                    .and_then(|sum| sum.checked_add(coverage.null_count));
             }
             // Nothing left to resolve once every column has declined, which is
             // the common shape on a tenant with no stamps: one segment

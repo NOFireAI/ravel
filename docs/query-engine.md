@@ -248,7 +248,7 @@ q07's shape) is answered at plan time, with no `LogsScanExec` in the plan and
 zero data GETs, through DataFusion's stock `AggregateStatistics` rule rather
 than through `MetadataOnlyAggregate`: `LogsScanExec::partition_statistics`
 reports the column's `min_value`/`max_value` as `Precision::Exact`, and its
-`null_count` too where that figure is proven, so
+`null_count` too unless the per-segment sum overflows `u64`, so
 `COUNT(<typed attribute column>)` takes the same path. A statement answered
 this way records zero
 `data_objects_touched`, since no segment is opened on either read route.
@@ -269,7 +269,9 @@ or scope reads NULL to it, and its extrema and NULL count can differ from what
 SQL returns (a declared key set to 100 on the resource of some rows and 1 to 5
 on the records of others has the entry claim `[1, 5]`). A segment covered by a
 `.cstat` entry and no stamp is read, and where both exist the stamp answers
-and the entry is not compared with it. A declared `Str` column is declined
+and the entry is not compared with it. This replaces the union of the two
+carriers ADR-0873 decision 4 first specified; see that ADR's merged-value
+read amendment. A declared `Str` column is declined
 before any carrier is read, since it is projected as a dictionary-encoded
 string with no scalar form on this path, and a `Bytes` column has no stamp,
 so `MIN`/`MAX` over either is always answered by the scan.
@@ -318,7 +320,7 @@ that is null, so `MIN`/`MAX` over such a column keeps its `LogsScanExec` and
 scans to the same NULL. `COUNT(<typed attribute column>)` on that same column
 is still a plan-time literal (`num_rows - null_count`, exactly 0).
 
-### Defect metrics for the two carriers
+### Defect metric for dropped statistics entries
 
 A process-wide tally makes the defect classes visible, since a coverage
 regression otherwise reads as a slow query. It counts OBSERVATIONS, which is

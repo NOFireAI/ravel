@@ -150,6 +150,7 @@ serde_json = { workspace = true }
 # records the full, unredacted error (the same discipline the HTTP endpoint
 # follows).
 tracing = { workspace = true }
+# Unconditional: `page_plan` (base build) renders binary resume values as hex.
 hex = { workspace = true }
 # `ravel-proto` is a hard dependency, not gated behind `flight-sql`: ADR-0850's
 # metadata-only aggregate path (`logs_scan`/`metadata_agg`) reads
