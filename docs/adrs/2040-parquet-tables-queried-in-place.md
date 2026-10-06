@@ -1181,10 +1181,11 @@ can make every resolve of a table arbitrarily expensive until
 `parquet repair --delete` removes them. A key whose segment between `pq/t/`
 and `/v/` is not a single valid table name (such as
 `t/<tenant_hash>/pq/t/a/b/v/<20 chars>.pqm`, which the Query grant's `*`
-admits) is still refused as foreign by the tenant-wide listings
-(see the invalid table segment amendment below, which skips it instead),
-so it fails `parquet ls` and `parquet sweep` for the whole tenant, though no
-table's resolve; validating that segment is issue #2510. A key whose extra segments
+admits) was, when this amendment landed, refused as foreign by the
+tenant-wide listings, failing `parquet ls` and `parquet sweep` for the whole
+tenant, though no table's resolve; validating that segment was issue #2510,
+which the invalid table segment amendment below closes for the keys the
+store can list. A key whose extra segments
 sit under a valid table's own `v/` prefix, by contrast, is now a key that
 names no version, skipped and flagged like the rest. Narrowing the Query
 grant, item 1 of issue #2430, remains the root
@@ -1249,11 +1250,22 @@ and 20 characters before the suffix, is still foreign and still an error:
 only the shape the Query grant can write is skipped.
 
 **Listings.** `resolve::tables` (through `resolve::tenant_listing`, which
-also returns the skipped keys) and the sweep's listing skip such a key and
-never fail on it. Each listing that finds one is counted per tenant
-(`resolve::invalid_table_listings`, a sibling of the per-table
-`resolve::above_bound_resolves`, so neither counter's key means two things),
-and the first in a process is logged at `warn` as a
+also returns the skipped keys) and the sweep's listing skip such a key when
+the store lists it. The S3 adapter does not list every such key:
+`object_store` parses each key of a listing response with `Path::parse`,
+which refuses a key holding a control character, an empty segment (such as
+`hits//v/...`, or an empty table segment) or a `.` or `..` segment, and one
+such key fails the whole listing with a store error before Ravel sees it. On
+S3 those shapes therefore still fail `parquet ls`, `parquet sweep` and
+`parquet repair --stray` for the whole tenant. Ravel cannot list such a key,
+so an operator removes it by deleting the exact key with the Maintain
+credential through an S3 tool. The adapter failing a tenant's listing on
+one key it cannot parse is a defect in `ravel-object-store`, left to a
+follow-up. Each listing that finds a key it skips is counted once per tenant,
+however many such keys it finds (`resolve::invalid_table_listings`, a sibling
+of the per-table `resolve::above_bound_resolves`, so neither counter's key
+means two things), and the first such listing of each tenant in a process is
+logged at `warn` as a
 `resolve::InvalidTableKeys`, which names the tenant hash, how many keys, the
 first key (escaped, since whoever put it chose it) and the repair command.
 The per-tenant map has the same cap, `resolve::ABOVE_BOUND_TABLES_MAX`, and
@@ -1262,23 +1274,42 @@ per-table one. The sweep never deletes such a key, and no table's versions or
 newest change. `ravel-cli parquet ls` says when the tenant holds any.
 
 **Repair.** `ravel-cli parquet repair --tenant <t> --stray`, exclusive with
-`--table`, lists every such key of the tenant (`repair::list_stray`, one
-listing of `t/<tenant_hash>/pq/t/`, a prefix that ends at a segment
-boundary), escaped, with the time the store wrote it. With `--delete` it
-deletes exactly those (`repair::delete_stray`): every key is classified
-before the first delete, and a key that is not one (a manifest key of a valid
+`--table`, lists every such key of the tenant that the store lists
+(`repair::list_stray`, one listing of `t/<tenant_hash>/pq/t/`, a prefix that
+ends at a segment boundary), escaped, with the time the store wrote it, and
+marks two kinds of key (`repair::StrayClass`). The S3 adapter sends a
+request for a key to `object_store`'s `Path::from` of it, which drops empty
+segments and percent-encodes a `.` or `..` segment, control characters,
+every non-ASCII byte and ``\ { ^ } % ` ] " > [ ~ < # | * ?``; a key that
+changes under it (`keys::is_store_path`) is marked undeletable by Ravel,
+since its delete would go to a different key, report success and leave it.
+A well-formed manifest key whose table segment is one of the names the IAM
+segment amendment reserved is marked as possibly a table created before the
+name was reserved; the built-in and signal names were refused before any
+table could be created, so no table holds one. With `--delete` the command
+deletes the unmarked keys, and the marked reserved-name ones only when
+`--include-reserved-names` is also passed, and names every key it skips
+(`repair::delete_stray`). Every key is classified before the first delete,
+and a key that is not such a key of this tenant (a manifest key of a valid
 table, in any version class, another tenant's key, or a key of no manifest
-shape) refuses the whole command with `RepairError::NotStray` and deletes
-nothing. With nothing listed it says so and deletes nothing.
-`--delete-version` stays table-scoped. The command runs under the Maintain
-credential: `MaintainList` grants the `t/*/pq/t/*` listing and
-`MaintainDelete` grants `s3:DeleteObject` on `t/*/pq/t/*`. It is a write
-only with `--delete`. A table created under a name reserved since the IAM
-segment amendment is such a key too, so once its definition is recreated
-under a name that is not reserved, `--stray --delete` removes the old
-manifests that amendment says to delete by hand.
+shape), an undeletable key, or a reserved-name key not included refuses the
+whole call with `RepairError::NotStray`, `RepairError::Undeletable` or
+`RepairError::ReservedName` and deletes nothing. After deleting, the command
+lists the tenant's `pq/t/` prefix again and exits non-zero naming every such
+key still listed, skipped ones included. An operator removes an undeletable
+key, as one the store cannot list, by deleting the exact key with the
+Maintain credential through an S3 tool. With nothing listed it says so and
+deletes nothing. `--delete-version` stays table-scoped. The command runs
+under the Maintain credential: `MaintainList` grants the `t/*/pq/t/*`
+listing and `MaintainDelete` grants `s3:DeleteObject` on `t/*/pq/t/*`. It is
+a write only with `--delete`. A table created under a name reserved since
+the IAM segment amendment is such a key too, so once its definition is
+recreated under a name that is not reserved, `--stray --delete
+--include-reserved-names` removes the old manifests that amendment says to
+delete by hand.
 
 **What stays open.** Narrowing the Query grant, item 1 of issue #2430, is
 still the root fix: until it lands, a stolen Query credential can put such
-keys, and every tenant-wide listing pages through them until an operator
-removes them.
+keys, every tenant-wide listing pages through them until an operator
+removes them, and on S3 one key of a shape the adapter cannot list fails
+those listings outright.

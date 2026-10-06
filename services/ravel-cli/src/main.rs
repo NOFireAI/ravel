@@ -958,8 +958,9 @@ enum ParquetCommand {
         /// table's versions.
         #[arg(long)]
         stray: bool,
-        /// Delete every flagged key, or with `--stray` every listed key.
-        /// Without it or `--delete-version` the command only lists.
+        /// Delete every flagged key, or with `--stray` every listed key not
+        /// marked as skipped. Without it or `--delete-version` the command
+        /// only lists.
         #[arg(long, conflicts_with = "delete_version")]
         delete: bool,
         /// Delete exactly this version's key, from 1 to the version bound,

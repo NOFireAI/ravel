@@ -644,8 +644,9 @@ The repair for a forged manifest version: list one table's manifest version keys
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
-| `--delete` |  |  | Delete every flagged key, or with `--stray` every listed key. Without it or `--delete-version` the command only lists |
+| `--delete` |  |  | Delete every flagged key, or with `--stray` every listed key not marked as skipped. Without it or `--delete-version` the command only lists |
 | `--delete-version` |  |  | Delete exactly this version's key, from 1 to the version bound, and nothing else. For a version judged forged from the DDL audit log; zero and versions above the bound are refused |
+| `--include-reserved-names` |  |  | With `--stray --delete`, also delete keys under a name reserved after tables could be created, which may be manifests of a table created before the reservation |
 | `--stray` |  |  | List the tenant's keys under no valid table name instead of one table's versions |
 | `--table` |  |  | The table whose manifest versions to list |
 | `--tenant` |  |  | The tenant that owns the table |

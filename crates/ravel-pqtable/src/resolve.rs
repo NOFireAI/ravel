@@ -16,9 +16,12 @@
 //! A key the Query grant admits whose segment between `pq/t/` and `/v/` is
 //! not a valid table name ([`ListedManifestKey::InvalidTable`]) belongs to no
 //! table, so no per-table listing sees it. The tenant-wide listings here and
-//! in the sweep skip it the same way, count it per tenant
-//! ([`invalid_table_listings`]) and report the tenant once per process as an
-//! [`InvalidTableKeys`] warning.
+//! in the sweep skip it the same way when the store lists it, count each
+//! listing that finds one per tenant ([`invalid_table_listings`]) and report
+//! the tenant once per process as an [`InvalidTableKeys`] warning. The S3
+//! adapter cannot list such a key holding a control character, an empty
+//! segment or a `.` or `..` segment: the listing fails with
+//! [`ResolveError::Store`] instead.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, PoisonError};
@@ -426,9 +429,11 @@ pub async fn versions(
 /// than one per table. Keys whose slot names no version are skipped and
 /// counted as in [`versions`]. Keys the Query grant admits under a segment
 /// that is not a valid table name ([`ListedManifestKey::InvalidTable`]) are
-/// skipped and counted per tenant ([`invalid_table_listings`]). Any other key
-/// under that prefix that is not a manifest key is
-/// [`ResolveError::ForeignKey`].
+/// skipped, and the listing is counted per tenant
+/// ([`invalid_table_listings`]). Any other key under that prefix that is not
+/// a manifest key is [`ResolveError::ForeignKey`]. On S3 a key under that
+/// prefix holding a control character, an empty segment or a `.` or `..`
+/// segment fails the listing with [`ResolveError::Store`].
 pub async fn tenant_listing(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
@@ -514,7 +519,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::manifest::encode_manifest;
-    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, live_manifest};
+    use crate::test_util::{CountingStore, S3KeyStore, TENANT_A, TENANT_B, live_manifest};
 
     #[test]
     fn only_a_manifest_above_the_ceiling_is_newer() {
@@ -795,6 +800,23 @@ pub(crate) mod tests {
         "a/b/v/00000000000000000001.pqm",
     ];
 
+    /// Keys of the same kind that the S3 adapter cannot list, because
+    /// `object_store`'s `Path::parse` refuses them: control characters, an
+    /// empty segment, a `.` and a `..` segment, and an empty table segment.
+    pub(crate) const UNLISTABLE_SHAPES: [&str; 5] = [
+        "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm",
+        "hits//v/00000000000000000003.pqm",
+        "./v/00000000000000000001.pqm",
+        "a/../v/00000000000000000001.pqm",
+        "/v/00000000000000000001.pqm",
+    ];
+
+    /// Whether `err` is the S3 adapter's error for a listed key
+    /// `object_store` could not parse.
+    pub(crate) fn is_unparsed_listing(err: &StoreError) -> bool {
+        matches!(err, StoreError::Permanent(msg) if msg.starts_with("invalid path"))
+    }
+
     /// Put `t/<tenant>/pq/t/<rest>` with a body that is not a manifest, and
     /// return the key.
     pub(crate) async fn put_stray(store: &MemoryStore, tenant: &TenantHash, rest: &str) -> String {
@@ -824,11 +846,13 @@ pub(crate) mod tests {
         for (i, rest) in STRAY_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x60 + i as u8; 16]);
             let (logs, _guard) = capture_logs();
-            let store = MemoryStore::with_page_size(2);
+            let store = S3KeyStore {
+                inner: MemoryStore::with_page_size(2),
+            };
             for v in [1, 2] {
-                put_version(&store, &tenant, v).await;
+                put_version(&store.inner, &tenant, v).await;
             }
-            let stray = put_stray(&store, &tenant, rest).await;
+            let stray = put_stray(&store.inner, &tenant, rest).await;
             for _ in 0..2 {
                 assert_eq!(
                     tables(&store, &tenant).await.expect("tables"),
@@ -853,22 +877,86 @@ pub(crate) mod tests {
         }
     }
 
+    /// The counter counts listings, not keys: one listing that finds two
+    /// stray keys adds one, and its warning counts both.
+    #[tokio::test]
+    async fn the_invalid_table_counter_counts_listings_not_keys() {
+        const TENANT: TenantHash = TenantHash([0x78; 16]);
+        let (logs, _guard) = capture_logs();
+        let store = S3KeyStore {
+            inner: MemoryStore::new(),
+        };
+        put_version(&store.inner, &TENANT, 1).await;
+        let first = put_stray(&store.inner, &TENANT, STRAY_SHAPES[0]).await;
+        put_stray(&store.inner, &TENANT, STRAY_SHAPES[2]).await;
+        let listing = tenant_listing(&store, &TENANT).await.expect("listing");
+        assert_eq!(listing.invalid_table_keys.len(), 2);
+        assert_eq!(invalid_table_listings(&TENANT), 1);
+        tenant_listing(&store, &TENANT).await.expect("listing");
+        assert_eq!(invalid_table_listings(&TENANT), 2);
+        let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
+        assert_eq!(stray_warnings_naming(&logs, &first), 1, "{text}");
+        assert!(text.contains("has 2 manifest-shaped key(s)"), "{text}");
+    }
+
+    /// A stray key S3 lists can still hold characters a terminal would act
+    /// on or misread; the warning prints it escaped.
     #[tokio::test]
     async fn the_invalid_table_warning_prints_the_key_escaped() {
         const TENANT: TenantHash = TenantHash([0x66; 16]);
-        let rest = "Hits/v/\u{1b}[2J\u{7}xxxxxxxxxxxxxxx.pqm";
+        let rest = "Hits/v/\"\\xxxxxxxxxxxxxxxxxx.pqm";
         let (logs, _guard) = capture_logs();
-        let store = MemoryStore::new();
-        put_version(&store, &TENANT, 1).await;
-        let stray = put_stray(&store, &TENANT, rest).await;
+        let store = S3KeyStore {
+            inner: MemoryStore::new(),
+        };
+        put_version(&store.inner, &TENANT, 1).await;
+        let stray = put_stray(&store.inner, &TENANT, rest).await;
         assert_eq!(
             tables(&store, &TENANT).await.expect("tables"),
             BTreeMap::from([("hits".to_string(), vec![1])])
         );
         let text = String::from_utf8(logs.lock().expect("logs").clone()).expect("utf8");
-        assert!(!text.contains('\u{1b}'), "{text}");
-        assert!(!text.contains('\u{7}'), "{text}");
+        assert!(!text.contains("v/\""), "{text}");
+        assert!(text.contains("v/\\\"\\\\x"), "{text}");
         assert_eq!(stray_warnings_naming(&logs, &stray), 1, "{text}");
+    }
+
+    /// On S3 a stray key `Path::parse` refuses fails the tenant-wide listing
+    /// with the store error; it is skipped only by a store that lists it.
+    #[tokio::test]
+    async fn a_stray_key_the_s3_adapter_cannot_list_fails_the_tenant_listing() {
+        for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
+            let tenant = TenantHash([0x70 + i as u8; 16]);
+            let store = S3KeyStore {
+                inner: MemoryStore::with_page_size(2),
+            };
+            for v in [1, 2] {
+                put_version(&store.inner, &tenant, v).await;
+            }
+            let stray = put_stray(&store.inner, &tenant, rest).await;
+            for got in [
+                tables(&store, &tenant).await.map(drop),
+                tenant_listing(&store, &tenant).await.map(drop),
+            ] {
+                assert!(
+                    matches!(&got, Err(ResolveError::Store { key, source })
+                        if *key == tenant_manifest_prefix(&tenant)
+                            && is_unparsed_listing(source)),
+                    "{rest:?}: {got:?}"
+                );
+            }
+            assert_eq!(invalid_table_listings(&tenant), 0, "{rest:?}");
+            // The table's own listing never meets it.
+            assert_eq!(
+                versions(&store, &tenant, "hits").await.expect("versions"),
+                vec![1, 2],
+                "{rest:?}"
+            );
+            let listing = tenant_listing(&store.inner, &tenant)
+                .await
+                .expect("listing");
+            assert_eq!(listing.invalid_table_keys, vec![stray], "{rest:?}");
+        }
     }
 
     #[tokio::test]

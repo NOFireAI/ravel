@@ -455,6 +455,35 @@ mod tests {
     }
 
     #[test]
+    fn store_path_is_the_key_the_s3_adapter_sends_a_request_to() {
+        let longest = format!("t{}", "x".repeat(62));
+        for key in [
+            manifest_key(&TENANT_A, "hits", 1).expect("key"),
+            manifest_key(&TENANT_A, &longest, u64::MAX).expect("key"),
+            manifest_key(&TENANT_A, "_a0", MAX_MANIFEST_VERSION).expect("key"),
+            grants_key(&TENANT_A),
+        ] {
+            assert!(is_store_path(&key), "{key:?}");
+            assert_eq!(store_path(&key), key);
+        }
+        let th = "a1".repeat(16);
+        for (rest, sent) in [
+            ("Hits~/v/1.pqm", "Hits%7E/v/1.pqm"),
+            ("a%2Fb/v/1.pqm", "a%252Fb/v/1.pqm"),
+            ("hits//v/3.pqm", "hits/v/3.pqm"),
+            ("./v/1.pqm", "%2E/v/1.pqm"),
+            ("../v/1.pqm", "%2E%2E/v/1.pqm"),
+            ("Hits/v/\"\\x.pqm", "Hits/v/%22%5Cx.pqm"),
+            ("Hits/v/\u{e9}.pqm", "Hits/v/%C3%A9.pqm"),
+            ("Hits/v/\u{1b}.pqm", "Hits/v/%1B.pqm"),
+        ] {
+            let key = format!("t/{th}/pq/t/{rest}");
+            assert!(!is_store_path(&key), "{key:?}");
+            assert_eq!(store_path(&key), format!("t/{th}/pq/t/{sent}"), "{key:?}");
+        }
+    }
+
+    #[test]
     fn a_listed_key_the_query_grant_admits_under_an_invalid_table_is_named() {
         let th = "a1".repeat(16);
         for rest in [

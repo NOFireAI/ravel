@@ -27,7 +27,9 @@
 //! Query grant admits under a segment that is not a valid table name
 //! ([`ListedManifestKey::InvalidTable`]) belongs to no table; the listing
 //! skips and counts it as [`crate::resolve::tenant_listing`] does, and the
-//! sweep never deletes it.
+//! sweep never deletes it. On S3 one such key holding a control character, an
+//! empty segment or a `.` or `..` segment fails the listing, and so the sweep,
+//! with [`SweepError::Store`].
 //!
 //! [`plan`] refuses a grace below the deployment's minimum (its
 //! `--gc-max-query-duration`). Ages come from the store's
@@ -233,7 +235,9 @@ mod tests {
     use crate::keys::{grants_key, manifest_key};
     use crate::manifest::encode_manifest;
     use crate::resolve;
-    use crate::test_util::{CountingStore, TENANT_A, TENANT_B, file_for, live_manifest};
+    use crate::test_util::{
+        CountingStore, S3KeyStore, TENANT_A, TENANT_B, file_for, live_manifest,
+    };
     use crate::writer::{Intent, Outcome, apply};
 
     const GRACE: u64 = 660_000;
@@ -524,21 +528,8 @@ mod tests {
         for (i, rest) in STRAY_SHAPES.iter().enumerate() {
             let tenant = TenantHash([0x63 + i as u8; 16]);
             let (logs, _guard) = capture_logs();
-            let store = InstrumentedStore::new(MemoryStore::with_page_size(2));
-            store.inner().set_clock_ms(0);
-            for v in [1, 2] {
-                let bytes =
-                    encode_manifest(&tenant, &live_manifest("hits", v, &[1])).expect("encode");
-                store
-                    .put(
-                        &manifest_key(&tenant, "hits", v).expect("key"),
-                        Bytes::from(bytes),
-                        PutOptions::create_if_absent(),
-                    )
-                    .await
-                    .expect("put");
-            }
-            let stray = put_stray(store.inner(), &tenant, rest).await;
+            let store = two_versions_behind_s3_keys(&tenant).await;
+            let stray = put_stray(store.inner.inner(), &tenant, rest).await;
             let now = (1 + GRACE + SKEW_MS) as i64;
             for _ in 0..2 {
                 let planned = plan(&store, &tenant, now, GRACE, GRACE)
@@ -558,11 +549,62 @@ mod tests {
                 .await
                 .expect("plan");
             execute(&store, &planned).await.expect("execute");
-            assert_eq!(store.metrics().snapshot().op(StoreOp::Delete).calls, 1);
+            assert_eq!(
+                store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+                1
+            );
             store
                 .head(&stray)
                 .await
                 .expect("the stray key is untouched");
+        }
+    }
+
+    /// Versions 1 and 2 of `hits`, written at store time 0, behind the S3
+    /// adapter's key handling.
+    async fn two_versions_behind_s3_keys(
+        tenant: &TenantHash,
+    ) -> S3KeyStore<InstrumentedStore<MemoryStore>> {
+        let store = S3KeyStore {
+            inner: InstrumentedStore::new(MemoryStore::with_page_size(2)),
+        };
+        store.inner.inner().set_clock_ms(0);
+        for v in [1, 2] {
+            let bytes = encode_manifest(tenant, &live_manifest("hits", v, &[1])).expect("encode");
+            store
+                .put(
+                    &manifest_key(tenant, "hits", v).expect("key"),
+                    Bytes::from(bytes),
+                    PutOptions::create_if_absent(),
+                )
+                .await
+                .expect("put");
+        }
+        store
+    }
+
+    /// On S3 a stray key `Path::parse` refuses fails the sweep's listing with
+    /// the store error, and nothing is deleted.
+    #[tokio::test]
+    async fn a_stray_key_the_s3_adapter_cannot_list_fails_the_sweep() {
+        use crate::resolve::tests::{UNLISTABLE_SHAPES, is_unparsed_listing, put_stray};
+
+        for (i, rest) in UNLISTABLE_SHAPES.iter().enumerate() {
+            let tenant = TenantHash([0x7a + i as u8; 16]);
+            let store = two_versions_behind_s3_keys(&tenant).await;
+            put_stray(store.inner.inner(), &tenant, rest).await;
+            let now = (1 + GRACE + SKEW_MS) as i64;
+            let got = plan(&store, &tenant, now, GRACE, GRACE).await;
+            assert!(
+                matches!(&got, Err(SweepError::Store { key, source })
+                    if *key == tenant_manifest_prefix(&tenant) && is_unparsed_listing(source)),
+                "{rest:?}: {got:?}"
+            );
+            assert_eq!(resolve::invalid_table_listings(&tenant), 0, "{rest:?}");
+            assert_eq!(
+                store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+                0
+            );
         }
     }
 
