@@ -268,13 +268,23 @@ async fn load_zstd_level_reaches_every_written_page() {
             let p3 = &pages3[at];
             if p19.comp == COMP_ZSTD {
                 let stored19 = &obj19[p19.offset as usize..(p19.offset + p19.len) as usize];
-                assert_level_applied(&format!("page {at:?} (level 19 load)"), 19, stored19, p19.uncomp_len);
+                assert_level_applied(
+                    &format!("page {at:?} (level 19 load)"),
+                    19,
+                    stored19,
+                    p19.uncomp_len,
+                );
                 zpages19 += p19.len;
                 zpage_count19 += 1;
             }
             if p3.comp == COMP_ZSTD {
                 let stored3 = &obj3[p3.offset as usize..(p3.offset + p3.len) as usize];
-                assert_level_applied(&format!("page {at:?} (level 3 load)"), 3, stored3, p3.uncomp_len);
+                assert_level_applied(
+                    &format!("page {at:?} (level 3 load)"),
+                    3,
+                    stored3,
+                    p3.uncomp_len,
+                );
                 zpages3 += p3.len;
                 zpage_count3 += 1;
             }
@@ -299,10 +309,20 @@ async fn load_zstd_level_reaches_every_written_page() {
         for (k, desc19) in &sections19 {
             let desc3 = &sections3[k];
             let stored19 = &obj19[desc19.offset as usize..(desc19.offset + desc19.len) as usize];
-            assert_level_applied(&format!("section kind {k} (level 19 load)"), 19, stored19, desc19.uncomp_len);
+            assert_level_applied(
+                &format!("section kind {k} (level 19 load)"),
+                19,
+                stored19,
+                desc19.uncomp_len,
+            );
             section_count19 += 1;
             let stored3 = &obj3[desc3.offset as usize..(desc3.offset + desc3.len) as usize];
-            assert_level_applied(&format!("section kind {k} (level 3 load)"), 3, stored3, desc3.uncomp_len);
+            assert_level_applied(
+                &format!("section kind {k} (level 3 load)"),
+                3,
+                stored3,
+                desc3.uncomp_len,
+            );
             section_count3 += 1;
         }
         // Measured 8309 against 9083 bytes (91.5%).
