@@ -513,7 +513,11 @@ over_ceiling (body_uncompressed_len > 268435456): false
 ```
 
 A `.cstat` object carries the per-column minimum, maximum, count, sum and
-value dictionary that a query uses to skip segments it cannot match.
+value dictionary of the values set on each segment's records. A value a row
+takes from its resource or scope is not in it, so a query answers from it only
+where the statistics carried with the segment itself, which do count those
+values, state the same minimum, maximum and NULL count, and otherwise reads
+the segment.
 
 `signal` is the raw numeric code from the header, not a word: 1 is metrics,
 2 is spans, 3 is logs. `part_blake3` is comma-joined when a header covers

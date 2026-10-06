@@ -3090,8 +3090,9 @@ mod tests {
     /// simplifies it to `code = 100`, which reaches the scan as a `[100, 100]`
     /// arm disjoint from the entry.
     ///
-    /// Flipped assertions: dropping the stamp check from `arm_excludes` (the
-    /// `if stamp_coverage(..).is_none() { return false; }`) skips the segment
+    /// Flipped assertions: letting `arm_excludes` fall back to the entry when
+    /// there is no stamp (`stamp_coverage(..)` to
+    /// `stamp_coverage(..).or_else(|| cstat_coverage(..))`) skips the segment
     /// on its `.cstat` entry and fails the result assertion (a count of `0`
     /// where `3` is expected). The last assertion pins that `execute` fetched
     /// the `.cstat` object, so the test cannot pass because no entry was
@@ -3226,6 +3227,248 @@ mod tests {
         );
     }
 
+    /// Publish and fold the resource-level fixture of
+    /// [`a_cstat_entry_alone_never_skips_a_segment_with_resource_level_matches`]
+    /// as one segment: `code` 1..=5 on five records, and `code = 100` only in
+    /// the resource attributes of three more. The fold's `.cstat` entry claims
+    /// `[1, 5]` with three NULLs, while SQL reads `[1, 100]` with none. With
+    /// `stamped` the commit record carries the stamp a correct writer folds
+    /// from the merged value. Returns the segment's data key.
+    async fn publish_resource_code_segment(
+        memory: &Arc<dyn ObjectStoreBackend>,
+        tenant: &ravel_types::TenantId,
+        now_ns: i64,
+        stamped: bool,
+    ) -> String {
+        let config = ravel_catalog::TenantConfig {
+            typed_attr_columns: Some(
+                code_declared()
+                    .iter()
+                    .map(|d| ravel_catalog::DeclaredTypedColumn {
+                        key: d.key.clone(),
+                        ty: ravel_catalog::DeclaredColumnType::I64,
+                    })
+                    .collect(),
+            ),
+            ..ravel_catalog::TenantConfig::new(ravel_catalog::TenantLifecycleState::Active)
+        };
+        ravel_catalog::set_tenant_config(memory.as_ref(), &tenant.hash(), &config, 1)
+            .await
+            .expect("tenant config");
+
+        let plain = vec![("service.name".to_string(), s("api"))];
+        let with_code = vec![
+            ("service.name".to_string(), s("api")),
+            (CODE.to_string(), AttrValue::I64(100)),
+        ];
+        let records: Vec<LogRecord> = (0..8usize)
+            .map(|i| {
+                let mut attrs = vec![(OTHER.to_string(), AttrValue::I64(1))];
+                let resource = if i < 5 {
+                    attrs.push((CODE.to_string(), AttrValue::I64(i as i64 + 1)));
+                    &plain
+                } else {
+                    &with_code
+                };
+                let (ts, body) = code_row(1, i);
+                record(resource, &attrs, ts, &body)
+            })
+            .collect();
+        let merged: Vec<Option<i64>> = (0..8i64)
+            .map(|i| Some(if i < 5 { i + 1 } else { 100 }))
+            .collect();
+        let stamps = if stamped {
+            vec![code_stamp(&merged)]
+        } else {
+            Vec::new()
+        };
+        let key = publish_records(memory.as_ref(), tenant, 1, &records, &stamps).await;
+
+        let catalog = ravel_catalog::Catalog::new(
+            Arc::clone(memory),
+            ravel_catalog::CatalogConfig::default(),
+        )
+        .expect("catalog");
+        let report = catalog
+            .fold(
+                &tenant.hash(),
+                ravel_types::Signal::Logs,
+                Uuid::from_u128(0x2159),
+                now_ns,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        assert_eq!(
+            report.column_stats_part_objects_built, 1,
+            "the fold builds one .cstat object"
+        );
+        key
+    }
+
+    /// Every statement shape an exact-statistics path can answer for `code`,
+    /// with its exact result over the merged values 1, 2, 3, 4, 5, 100, 100,
+    /// 100. From the `.cstat` entry alone the first would read `1 | 5`, the
+    /// third `15`, the fourth `4`, and the fifth would carry no `100` group.
+    const RESOURCE_CODE_STATEMENTS: [(&str, &str); 5] = [
+        (
+            "SELECT MIN(code) AS lo, MAX(code) AS hi FROM logs",
+            "\
++----+-----+
+| lo | hi  |
++----+-----+
+| 1  | 100 |
++----+-----+",
+        ),
+        (
+            "SELECT COUNT(code) AS n FROM logs",
+            "\
++---+
+| n |
++---+
+| 8 |
++---+",
+        ),
+        (
+            "SELECT SUM(code) AS total FROM logs",
+            "\
++-------+
+| total |
++-------+
+| 315   |
++-------+",
+        ),
+        (
+            "SELECT COUNT(*) AS n FROM logs WHERE code <> 3",
+            "\
++---+
+| n |
++---+
+| 7 |
++---+",
+        ),
+        (
+            "SELECT code, COUNT(*) AS n FROM logs GROUP BY code ORDER BY code",
+            "\
++------+---+
+| code | n |
++------+---+
+| 1    | 1 |
+| 2    | 1 |
+| 3    | 1 |
+| 4    | 1 |
+| 5    | 1 |
+| 100  | 3 |
++------+---+",
+        ),
+    ];
+
+    /// One statement of [`RESOURCE_CODE_STATEMENTS`] as `SqlExecutor::execute`
+    /// ran it: the formatted result, whether the `.cstat` object was fetched,
+    /// and whether the segment's data object was.
+    #[derive(Debug, PartialEq)]
+    struct StatementRun {
+        sql: &'static str,
+        result: String,
+        cstat_loaded: bool,
+        segment_read: bool,
+    }
+
+    /// Run every statement of [`RESOURCE_CODE_STATEMENTS`] over `memory`, each
+    /// through its own GET-counting store.
+    async fn run_resource_code_statements(
+        memory: &Arc<dyn ObjectStoreBackend>,
+        tenant: &ravel_types::TenantId,
+        data_key: &str,
+        now_ns: i64,
+    ) -> Vec<StatementRun> {
+        let mut runs = Vec::new();
+        for (sql, _) in RESOURCE_CODE_STATEMENTS {
+            let store = KeyCountingStore::new(Arc::clone(memory));
+            let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as _;
+            let outcome = execute_code_sql(&backend, tenant, sql, now_ns).await;
+            let result =
+                datafusion::arrow::util::pretty::pretty_format_batches(outcome.output.batches())
+                    .expect("format")
+                    .to_string();
+            runs.push(StatementRun {
+                sql,
+                result,
+                cstat_loaded: store.gets_with_suffix(".cstat") > 0,
+                segment_read: store.gets_of(data_key) > 0,
+            });
+        }
+        runs
+    }
+
+    /// A segment covered by a `.cstat` entry and no stamp answers no
+    /// statistic of a declared column from that entry: the entry tallies the
+    /// record-level cells only, so it misses the three rows whose `code`
+    /// comes from the resource. Every statement reads the segment and returns
+    /// the exact answer, with the `.cstat` object loaded each time.
+    ///
+    /// Flipped assertions: with `.cstat` coverage in
+    /// `segment_declared_coverage` (the code before this test) MIN/MAX reads
+    /// `1 | 5` and the segment is not read; calling `reconciled_column_stat`
+    /// in place of `merged_view_entry` makes the SUM `15`, the not-equal count
+    /// `4`, and the GROUP BY a NULL group of 3 in place of the `100` group,
+    /// each without reading the segment.
+    #[tokio::test]
+    async fn a_cstat_entry_without_a_stamp_answers_no_declared_statistic() {
+        const NOW_NS: i64 = 4 * 3_600_000_000_000;
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("cstat-no-stamp".to_string());
+        let key = publish_resource_code_segment(&memory, &tenant, NOW_NS, false).await;
+
+        let got = run_resource_code_statements(&memory, &tenant, &key, NOW_NS).await;
+        let want: Vec<StatementRun> = RESOURCE_CODE_STATEMENTS
+            .iter()
+            .map(|(sql, result)| StatementRun {
+                sql,
+                result: result.to_string(),
+                cstat_loaded: true,
+                segment_read: true,
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    /// The same segment with a stamp: the stamp answers MIN, MAX and
+    /// `COUNT(code)` with no data GET, although the `.cstat` entry differs
+    /// from it in all three figures, and the shapes only the entry's
+    /// dictionary or sum can answer read the segment, since the stamp does not
+    /// match the entry. The difference is the expected one between a
+    /// record-level entry and the merged view, so it is not treated as a
+    /// carrier conflict and does not decline the stamp.
+    ///
+    /// Flipped assertions: declining when the stamp and the entry differ (the
+    /// conflict rule `segment_declared_coverage` applied before this test)
+    /// reads the segment for MIN/MAX and `COUNT(code)`; dropping the
+    /// `agrees_with` check from `merged_view_entry` makes the SUM `15`, the
+    /// not-equal count `4`, and the GROUP BY a NULL group of 3.
+    #[tokio::test]
+    async fn a_stamp_answers_over_a_record_level_cstat_entry() {
+        const NOW_NS: i64 = 4 * 3_600_000_000_000;
+        let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantId::new("cstat-and-stamp".to_string());
+        let key = publish_resource_code_segment(&memory, &tenant, NOW_NS, true).await;
+
+        let got = run_resource_code_statements(&memory, &tenant, &key, NOW_NS).await;
+        // MIN/MAX and COUNT(code) come from the stamp; the rest read.
+        let want: Vec<StatementRun> = RESOURCE_CODE_STATEMENTS
+            .iter()
+            .enumerate()
+            .map(|(i, (sql, result))| StatementRun {
+                sql,
+                result: result.to_string(),
+                cstat_loaded: true,
+                segment_read: i >= 2,
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
     /// Only a stamp that no `.cstat` entry contradicts skips a segment by
     /// `code`'s arm. A stamp with a disagreeing `.cstat` entry, no carrier at
     /// all, and an exact `.cstat` entry with no stamp each leave the segment
@@ -3233,10 +3476,11 @@ mod tests {
     /// `code = 500`. A segment with only an exact stamp is skipped, which shows
     /// the arm excludes in this test.
     ///
-    /// Flipped assertions: ignoring a disagreement (`if !stamp.agrees_with(&cstat)`
-    /// in `segment_declared_coverage` to `if false`) skips the conflicting
-    /// segment on its stamp, and dropping the stamp check from `arm_excludes`
-    /// skips the `.cstat`-only segment; each fails the count (`2 != 1`).
+    /// Flipped assertions: ignoring a disagreement (the `cstat_coverage(..)
+    /// .is_some_and(..)` check in `arm_excludes` to `false`) skips the
+    /// conflicting segment on its stamp, and the same fallback to the entry
+    /// when there is no stamp skips the `.cstat`-only segment; each fails the
+    /// count (`2 != 1`).
     #[tokio::test]
     async fn only_an_uncontradicted_stamp_skips_a_segment() {
         let memory: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
