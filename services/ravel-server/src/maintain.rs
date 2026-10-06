@@ -3349,6 +3349,14 @@ struct ErasureRewritePass {
     /// later pass and excludes them from a request's scope; their data is
     /// already unreturnable through the query-time filter meanwhile.
     not_sealed: usize,
+    /// Buckets whose rewrite is blocked by an input object the writer refuses
+    /// ([`ErasureRewriteOutcome::BlockedByUnwritableObject`], issue #2580).
+    /// They do not set `deferred`: nothing in such a bucket is rewritten, so
+    /// every live object in it stays live, and the completion gate below puts
+    /// every request whose window reaches any of them in `catalog_blocked`.
+    /// A blocked bucket holds back no request whose window reaches none of its
+    /// live objects.
+    blocked_by_unwritable_object: usize,
     /// A bucket in scope was NOT brought up to date this tick: a legal hold,
     /// an abandoned publish, a listing failure, or a rewrite error. Any of
     /// these makes the completion verification unsound, so no `.done` is
@@ -3473,6 +3481,17 @@ async fn erasure_rewrite_pass(
                         | ErasureRewriteOutcome::Tombstoned,
                     ) => pass.out_of_scope += 1,
                     Ok(ErasureRewriteOutcome::NotSealed) => pass.not_sealed += 1,
+                    // Not `deferred`: an object this process cannot rewrite
+                    // fails the same way on every tick, so deferring here would
+                    // hold back every request of the tenant and signal for as
+                    // long as it exists. The completion gate below still counts
+                    // every live object of the bucket, so a request whose
+                    // window reaches any of them stays pending.
+                    // ravel-maintain warns once per object with its key.
+                    Ok(ErasureRewriteOutcome::BlockedByUnwritableObject { claim, .. }) => {
+                        tally_claim(&mut pass, claim);
+                        pass.blocked_by_unwritable_object += 1;
+                    }
                     Ok(ErasureRewriteOutcome::Held) => {
                         // ADR-0064 §6: a legal hold wins over erasure. The request
                         // stays pending, query-time exclusion keeps hiding the
@@ -3563,12 +3582,7 @@ fn tally_erasure_rewrite(
     abandoned: Option<ErasureAbandon>,
     claim: Option<ravel_maintain::ClaimAcquisition>,
 ) {
-    if let Some(claim) = claim {
-        pass.claims_acquired += 1;
-        if claim.stolen {
-            pass.claims_stolen += 1;
-        }
-    }
+    tally_claim(pass, claim);
     if matches!(publish, ravel_maintain::PublishOutcome::Abandoned) {
         pass.deferred = true;
     }
@@ -3577,6 +3591,16 @@ fn tally_erasure_rewrite(
         Some(ErasureAbandon::ClaimHeld { .. }) => pass.claim_backoffs += 1,
         Some(ErasureAbandon::ClaimLost { .. }) => pass.claims_lost += 1,
         Some(ErasureAbandon::RecordSetChanged | ErasureAbandon::Deadline) => {}
+    }
+}
+
+/// Count a bucket claim an erasure rewrite took, fresh or stolen, into `pass`.
+fn tally_claim(pass: &mut ErasureRewritePass, claim: Option<ravel_maintain::ClaimAcquisition>) {
+    if let Some(claim) = claim {
+        pass.claims_acquired += 1;
+        if claim.stolen {
+            pass.claims_stolen += 1;
+        }
     }
 }
 
@@ -3745,6 +3769,7 @@ async fn run_erasure_pass(
                 already_applied = pass.already_applied,
                 out_of_scope = pass.out_of_scope,
                 not_sealed = pass.not_sealed,
+                blocked_by_unwritable_object = pass.blocked_by_unwritable_object,
                 deferred = pass.deferred,
                 catalog_blocked = pass.catalog_blocked.len(),
                 "maintenance: erasure rewrite pass complete"
@@ -6141,6 +6166,574 @@ mod tests {
             store.get(&done_key, GetRange::Full).await.is_ok(),
             "every in-scope bucket now carries the request, so it completes exactly once"
         );
+    }
+
+    // --- Issue #2580: a log object whose stream_attrs blob the writer refuses ---
+
+    /// Serializes the tests that read the process-wide
+    /// `erasure_unwritable_objects_total` counter and its warn line.
+    static UNWRITABLE_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The ingest hours of the two log buckets the #2580 tests seed, and the
+    /// hour every request in them is acknowledged in: after both, and sealed
+    /// at [`TEST_ERASURE_NOW_NS`], so the ack-open hour blocks nothing.
+    const HEALTHY_LOG_HOUR: u32 = 1;
+    const UNWRITABLE_LOG_HOUR: u32 = 2;
+    const UNWRITABLE_ACK_NS: i64 = 3 * TEST_NS_PER_HOUR;
+
+    /// A log record of stream `stream_n` at `ts_ns` whose own `user_id`
+    /// attribute is `subject`.
+    fn subject_log_record(stream_n: u32, ts_ns: i64, subject: &str) -> ravel_logseg::LogRecord {
+        use ravel_logseg::AttrValue;
+        let res = vec![(
+            "service.name".to_string(),
+            AttrValue::Str(format!("svc{stream_n}")),
+        )];
+        ravel_logseg::LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&res, "scope", "1", &[]),
+            stream_attrs: ravel_logseg::stream_attrs_bytes(&res, "scope", "1", &[]),
+            ts_ns,
+            observed_ts_ns: ts_ns,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: "body".into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![(
+                TEST_SUBJECT_LABEL.to_string(),
+                AttrValue::Str(subject.to_string()),
+            )],
+        }
+    }
+
+    /// Write `records` as one logs L0 object of `writer_id` into `hour` of
+    /// shard 0 and publish its commit record; returns the data object's key.
+    /// `unchecked` stores a `stream_attrs` blob the writer would refuse, as an
+    /// object written before issue #2548's validation carries.
+    async fn publish_log_l0(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        writer_id: Uuid,
+        hour: u32,
+        records: &[ravel_logseg::LogRecord],
+        unchecked: bool,
+    ) -> String {
+        let mut writer = ravel_logseg::RlogWriter::new(
+            ravel_logseg::RlogConfig::default(),
+            ravel_logseg::ObjectIdentity {
+                tenant_hash: tenant.0,
+                shard: 0,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: 1,
+                writer_seq: 1,
+            },
+        );
+        if unchecked {
+            writer = writer.with_unchecked_stream_attrs();
+        }
+        for r in records {
+            writer.push(r.clone()).expect("push log record");
+        }
+        let bytes = bytes::Bytes::from(writer.finish().expect("finish rlog L0"));
+        let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
+        let min_ts = records.iter().map(|r| r.ts_ns).min().expect("records");
+        let max_ts = records.iter().map(|r| r.ts_ns).max().expect("records");
+        let created = i64::from(hour) * TEST_NS_PER_HOUR + 1;
+        let rec = record::build(NewCommitRecord {
+            tenant_hash: *tenant,
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq: 1,
+            object_size: bytes.len() as u64,
+            content_hash,
+            sample_count: records.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: min_ts,
+            max_event_ts_ns: max_ts,
+            min_ingest_ts_ns: created,
+            max_ingest_ts_ns: created,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            created_unix_ns: created,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid commit record");
+        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        store
+            .put(&data_key, bytes, PutOptions::default())
+            .await
+            .expect("put data object");
+        publish::publish(store, &rec, &RetryPolicy::default())
+            .await
+            .expect("publish");
+        data_key
+    }
+
+    /// Seed the two buckets the #2580 tests share: [`HEALTHY_LOG_HOUR`] holds
+    /// one healthy object with the subject and a bystander, and
+    /// [`UNWRITABLE_LOG_HOUR`] one object whose `stream_attrs` blob carries a
+    /// scope name that is not UTF-8, the shape the RLOG writer refuses, and
+    /// no compaction record. With `healthy_second` the second bucket's object
+    /// is healthy instead. Writer ids derive from `base`, so each test's
+    /// objects have keys of their own. Returns the second bucket's data key.
+    async fn seed_two_log_buckets(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        base: u128,
+        healthy_second: bool,
+    ) -> String {
+        let healthy_ts = i64::from(HEALTHY_LOG_HOUR) * TEST_NS_PER_HOUR + 1_000;
+        publish_log_l0(
+            store,
+            tenant,
+            Uuid::from_u128(base),
+            HEALTHY_LOG_HOUR,
+            &[
+                subject_log_record(0, healthy_ts, TEST_ERASED_SUBJECT),
+                subject_log_record(0, healthy_ts + 1, TEST_SURVIVING_SUBJECT),
+            ],
+            false,
+        )
+        .await;
+        let second_ts = i64::from(UNWRITABLE_LOG_HOUR) * TEST_NS_PER_HOUR + 1_000;
+        let mut second = subject_log_record(1, second_ts, TEST_ERASED_SUBJECT);
+        if !healthy_second {
+            let at = second
+                .stream_attrs
+                .windows(5)
+                .position(|w| w == b"scope")
+                .expect("scope name in blob");
+            second.stream_attrs[at] = 0xFF;
+            assert!(ravel_logseg::stream_attr_pairs(&second.stream_attrs).is_err());
+        }
+        publish_log_l0(
+            store,
+            tenant,
+            Uuid::from_u128(base + 1),
+            UNWRITABLE_LOG_HOUR,
+            &[second],
+            !healthy_second,
+        )
+        .await
+    }
+
+    /// Submit a logs erasure request for [`TEST_ERASED_SUBJECT`] acknowledged
+    /// at [`UNWRITABLE_ACK_NS`], over `[window_start_ns, window_end_ns)` (both
+    /// 0: no window). Returns its `.done` key.
+    async fn submit_log_request(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        request_id: Uuid,
+        window_start_ns: i64,
+        window_end_ns: i64,
+    ) -> String {
+        let request = ErasureRequest {
+            format_version: ravel_commit::erasure::FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: ravel_commit::signal::to_proto(Signal::Logs) as i32,
+            request_id: request_id.to_string(),
+            created_unix_ns: UNWRITABLE_ACK_NS,
+            predicate: vec![ravel_proto::commit::v1::ErasurePredicateMatcher {
+                key: TEST_SUBJECT_LABEL.to_string(),
+                value: TEST_ERASED_SUBJECT.to_string(),
+            }],
+            window_start_ns,
+            window_end_ns,
+            reason: "dsar".to_string(),
+        };
+        ravel_commit::erasure::validate_request(&request).expect("valid request");
+        let key = keys::erasure_request_key(tenant, Signal::Logs, request_id).expect("dreq key");
+        store
+            .put(
+                &key,
+                ravel_commit::erasure::encode_request(&request),
+                PutOptions::create_if_absent(),
+            )
+            .await
+            .expect("submit .dreq");
+        keys::erasure_completion_key(tenant, Signal::Logs, request_id).expect("done key")
+    }
+
+    /// The two requests the #2580 tests submit: one whose window covers only
+    /// the healthy bucket's hour, and one with no window, which covers both.
+    /// Returns their `.done` keys in that order.
+    async fn submit_healthy_and_covering_requests(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        base: u128,
+    ) -> (String, String) {
+        let healthy_only = submit_log_request(
+            store,
+            tenant,
+            Uuid::from_u128(base),
+            i64::from(HEALTHY_LOG_HOUR) * TEST_NS_PER_HOUR,
+            i64::from(HEALTHY_LOG_HOUR + 1) * TEST_NS_PER_HOUR,
+        )
+        .await;
+        let covering = submit_log_request(store, tenant, Uuid::from_u128(base + 1), 0, 0).await;
+        (healthy_only, covering)
+    }
+
+    /// One logs erasure pass over shard 0 at [`TEST_ERASURE_NOW_NS`].
+    async fn logs_erasure_tick(store: &dyn ObjectStoreBackend, tenant: &TenantHash) {
+        run_erasure_pass(
+            store,
+            &ravel_maintain::FixedClock::new(TEST_ERASURE_NOW_NS),
+            &CompactorConfig::default(),
+            &ravel_maintain::NoLeases,
+            tenant,
+            Signal::Logs,
+            1,
+            &mut MaintainMemo::with_default_interval(),
+            &MaintenanceSafetyMetrics::default(),
+        )
+        .await;
+    }
+
+    fn unwritable_total() -> u64 {
+        ravel_maintain::erasure_unwritable_objects_total(
+            Signal::Logs,
+            ravel_maintain::CompactionInputSkipReason::UnwritableStreamAttrs,
+        )
+    }
+
+    /// A `tracing` writer into a shared buffer, for the warn line.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLog {
+        /// Install a WARN-level subscriber writing here for the current
+        /// thread, for as long as the guard lives.
+        fn install(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || writer.clone())
+                    .with_ansi(false)
+                    .with_max_level(tracing::Level::WARN)
+                    .finish(),
+            )
+        }
+
+        /// Captured warn lines saying an erasure rewrite is blocked, naming
+        /// `key` escaped (in quotes).
+        fn blocked_warnings_naming(&self, key: &str) -> Vec<String> {
+            let bytes = self.0.lock().expect("log buffer lock").clone();
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .filter(|l| {
+                    l.contains("WARN")
+                        && l.contains("is blocked by an input object it cannot rewrite")
+                        && l.contains(&format!("{key:?}"))
+                })
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    /// Issue #2580: one log object the writer refuses, in a bucket with no
+    /// compaction record, blocks only its own bucket. After one tick the
+    /// request whose window covers only the healthy bucket is complete, the
+    /// request with no window (which covers the unwritable object) is not, the
+    /// counter moved by exactly 1, and exactly one warn line names the key.
+    ///
+    /// Against the pre-change code the unwritable bucket's rewrite fails with
+    /// the writer's `Corrupted`, `erasure_rewrite_pass`'s `Err` arm sets
+    /// `deferred`, and no `.done` is written: the first assertion fails. With
+    /// `pass.blocked_by_unwritable_object += 1` replaced by
+    /// `pass.deferred = true` it fails the same way.
+    #[tokio::test]
+    async fn an_unwritable_log_object_blocks_only_the_request_that_covers_it() {
+        let _serial = UNWRITABLE_SERIAL.lock().await;
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let unwritable_key = seed_two_log_buckets(&store, &tenant, 0x2580_0000, false).await;
+        let (healthy_only, covering) =
+            submit_healthy_and_covering_requests(&store, &tenant, 0x2580_0010).await;
+        let before = unwritable_total();
+
+        logs_erasure_tick(&store, &tenant).await;
+
+        assert!(
+            store.get(&healthy_only, GetRange::Full).await.is_ok(),
+            "the request whose window covers only the healthy bucket completes"
+        );
+        assert!(
+            store.get(&covering, GetRange::Full).await.is_err(),
+            "the request whose window covers the unwritable object stays pending"
+        );
+        assert!(
+            store.get(&unwritable_key, GetRange::Full).await.is_ok(),
+            "the unwritable object stays in storage"
+        );
+        assert_eq!(unwritable_total() - before, 1, "the object counts once");
+        let warnings = log.blocked_warnings_naming(&unwritable_key);
+        assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("not utf-8") && warnings[0].contains("unwritable_stream_attrs"),
+            "the warning carries the decoder's error and the reason: {}",
+            warnings[0]
+        );
+    }
+
+    /// The counter counts objects, not occurrences: a second tick meets the
+    /// same unwritable object again, still leaves the covering request
+    /// pending, and neither counts nor warns again.
+    ///
+    /// With the early `return` on `seen.keys.insert` in
+    /// `note_erasure_unwritable_object` removed, the counter reads 2 and two
+    /// warn lines name the key after the second tick.
+    #[tokio::test]
+    async fn a_second_tick_neither_counts_nor_warns_the_same_object_again() {
+        let _serial = UNWRITABLE_SERIAL.lock().await;
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let unwritable_key = seed_two_log_buckets(&store, &tenant, 0x2580_0100, false).await;
+        let (healthy_only, covering) =
+            submit_healthy_and_covering_requests(&store, &tenant, 0x2580_0110).await;
+        let before = unwritable_total();
+
+        logs_erasure_tick(&store, &tenant).await;
+        assert_eq!(unwritable_total() - before, 1);
+        assert_eq!(log.blocked_warnings_naming(&unwritable_key).len(), 1);
+
+        logs_erasure_tick(&store, &tenant).await;
+        assert_eq!(
+            unwritable_total() - before,
+            1,
+            "the same object is not counted twice"
+        );
+        assert_eq!(
+            log.blocked_warnings_naming(&unwritable_key).len(),
+            1,
+            "nor warned twice"
+        );
+        assert!(store.get(&healthy_only, GetRange::Full).await.is_ok());
+        assert!(
+            store.get(&covering, GetRange::Full).await.is_err(),
+            "the covering request is still pending after the second tick"
+        );
+    }
+
+    /// Any other rewrite error keeps today's behaviour: a transient GET fault
+    /// on the second bucket's (healthy) data object fails that bucket's
+    /// rewrite, the pass defers, and no request completes, not even the one
+    /// whose window covers only the first bucket. Nothing is counted or warned
+    /// as unwritable.
+    ///
+    /// With `pass.deferred = true` dropped from `erasure_rewrite_pass`'s `Err`
+    /// arm, the arm every error other than the typed refusal still reaches,
+    /// the healthy-only request completes here.
+    #[tokio::test]
+    async fn any_other_rewrite_error_still_defers_every_request() {
+        let _serial = UNWRITABLE_SERIAL.lock().await;
+        let log = CapturedLog::default();
+        let _subscriber = log.install();
+        let inner = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let second_key = seed_two_log_buckets(&inner, &tenant, 0x2580_0200, true).await;
+        let (healthy_only, covering) =
+            submit_healthy_and_covering_requests(&inner, &tenant, 0x2580_0210).await;
+        let store = FaultStore::new(
+            inner,
+            FaultPlan::empty().with_rule(
+                Rule::new(
+                    Op::Get,
+                    ScriptedFault::Transient("data object unavailable".into()),
+                )
+                .with_key_contains(second_key.clone()),
+            ),
+        );
+        let before = unwritable_total();
+
+        logs_erasure_tick(&store, &tenant).await;
+
+        assert!(
+            store.fault_count(Op::Get, ravel_object_store::fault::FaultKind::Transient) > 0,
+            "the fault fired"
+        );
+        assert!(
+            store.get(&healthy_only, GetRange::Full).await.is_err(),
+            "a failed bucket still holds back every request of the tenant and signal"
+        );
+        assert!(store.get(&covering, GetRange::Full).await.is_err());
+        assert_eq!(unwritable_total(), before, "nothing counted as unwritable");
+        assert!(log.blocked_warnings_naming(&second_key).is_empty());
+    }
+
+    /// Seed one bucket at [`UNWRITABLE_LOG_HOUR`] holding a healthy object with
+    /// the subject in the hour's first second and an object the writer refuses
+    /// in its tenth, with no compaction record. Writer ids derive from `base`.
+    /// Returns the refused object's data key.
+    async fn seed_blocked_bucket_with_a_healthy_object(
+        store: &dyn ObjectStoreBackend,
+        tenant: &TenantHash,
+        base: u128,
+    ) -> String {
+        let hour_ns = i64::from(UNWRITABLE_LOG_HOUR) * TEST_NS_PER_HOUR;
+        publish_log_l0(
+            store,
+            tenant,
+            Uuid::from_u128(base),
+            UNWRITABLE_LOG_HOUR,
+            &[subject_log_record(0, hour_ns + 1_000, TEST_ERASED_SUBJECT)],
+            false,
+        )
+        .await;
+        let mut refused = subject_log_record(1, hour_ns + 10_000_000_000, TEST_ERASED_SUBJECT);
+        let at = refused
+            .stream_attrs
+            .windows(5)
+            .position(|w| w == b"scope")
+            .expect("scope name in blob");
+        refused.stream_attrs[at] = 0xFF;
+        publish_log_l0(
+            store,
+            tenant,
+            Uuid::from_u128(base + 1),
+            UNWRITABLE_LOG_HOUR,
+            &[refused],
+            true,
+        )
+        .await
+    }
+
+    /// A blocked bucket writes nothing, so its healthy objects stay live too:
+    /// a request whose window covers only the healthy object, and not the
+    /// refused one, stays pending after a tick that reports the bucket blocked.
+    /// A request whose window reaches no live object of the bucket completes on
+    /// the same tick.
+    ///
+    /// With `erasure_rewrite_pass`'s `BlockedByUnwritableObject` arm ending in
+    /// `continue`, which skips the completion gate for a blocked bucket, the
+    /// healthy-object request is written a `.done` and the first assertion
+    /// fails.
+    #[tokio::test]
+    async fn a_blocked_bucket_holds_a_request_that_reaches_only_its_healthy_object() {
+        let _serial = UNWRITABLE_SERIAL.lock().await;
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let refused_key =
+            seed_blocked_bucket_with_a_healthy_object(&store, &tenant, 0x2580_0300).await;
+        let hour_ns = i64::from(UNWRITABLE_LOG_HOUR) * TEST_NS_PER_HOUR;
+        let healthy_window = submit_log_request(
+            &store,
+            &tenant,
+            Uuid::from_u128(0x2580_0310),
+            hour_ns,
+            hour_ns + 1_000_000_000,
+        )
+        .await;
+        let elsewhere = submit_log_request(
+            &store,
+            &tenant,
+            Uuid::from_u128(0x2580_0311),
+            i64::from(HEALTHY_LOG_HOUR) * TEST_NS_PER_HOUR,
+            hour_ns,
+        )
+        .await;
+        let before = unwritable_total();
+
+        logs_erasure_tick(&store, &tenant).await;
+
+        assert_eq!(
+            unwritable_total() - before,
+            1,
+            "the tick reported the bucket blocked by the refused object"
+        );
+        assert!(
+            store.get(&healthy_window, GetRange::Full).await.is_err(),
+            "a request whose window reaches only the blocked bucket's healthy object \
+             stays pending"
+        );
+        assert!(
+            store.get(&elsewhere, GetRange::Full).await.is_ok(),
+            "a request whose window reaches no live object of the blocked bucket completes"
+        );
+        assert!(store.get(&refused_key, GetRange::Full).await.is_ok());
+    }
+
+    /// The bucket claim a blocked erasure rewrite took counts on
+    /// `ravel_maintain_claims_acquired_total` like any other: one blocked
+    /// bucket under coordination is exactly one fresh acquisition.
+    ///
+    /// With `tally_claim(&mut pass, claim)` dropped from
+    /// `erasure_rewrite_pass`'s `BlockedByUnwritableObject` arm, or with
+    /// `erasure_rewrite_bucket` reporting `claim: None` there, the count reads
+    /// 0.
+    #[tokio::test]
+    async fn a_blocked_erasure_rewrite_counts_its_claim() {
+        let _serial = UNWRITABLE_SERIAL.lock().await;
+        let store = MemoryStore::new();
+        store.set_clock_ms((TEST_ERASURE_NOW_NS / 1_000_000) as u64);
+        let tenant = TenantId::new("acme").hash();
+        seed_blocked_bucket_with_a_healthy_object(&store, &tenant, 0x2580_0400).await;
+        let hour_ns = i64::from(UNWRITABLE_LOG_HOUR) * TEST_NS_PER_HOUR;
+        let pending = submit_log_request(
+            &store,
+            &tenant,
+            Uuid::from_u128(0x2580_0410),
+            hour_ns,
+            hour_ns + 1_000_000_000,
+        )
+        .await;
+        let clock = FixedClock::new(TEST_ERASURE_NOW_NS);
+        let compactor = CompactorConfig {
+            coordination: Coordination::On,
+            claim_participant: Some(ClaimParticipant::new(
+                Uuid::from_u128(0x2580_04C1),
+                Arc::new(clock.clone()) as Arc<dyn Clock>,
+            )),
+            ..CompactorConfig::default()
+        };
+        let safety = MaintenanceSafetyMetrics::default();
+        let before = unwritable_total();
+
+        run_erasure_pass(
+            &store,
+            &clock,
+            &compactor,
+            &ravel_maintain::NoLeases,
+            &tenant,
+            Signal::Logs,
+            1,
+            &mut MaintainMemo::with_default_interval(),
+            &safety,
+        )
+        .await;
+
+        assert_eq!(unwritable_total() - before, 1, "the bucket was blocked");
+        assert_eq!(
+            (
+                safety.claims_acquired(Signal::Logs),
+                safety.claims_stolen(Signal::Logs),
+                safety.claims_skipped(Signal::Logs),
+                safety.claims_lost(Signal::Logs),
+            ),
+            (1, 0, 0, 0),
+            "one fresh acquisition, for the blocked bucket"
+        );
+        assert!(store.get(&pending, GetRange::Full).await.is_err());
     }
 
     /// Submit one erasure request exactly as `ravel-cli erase submit` does: a

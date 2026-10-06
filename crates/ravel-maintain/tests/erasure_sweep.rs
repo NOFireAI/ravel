@@ -1121,7 +1121,8 @@ async fn erasure_tick(store: &dyn ObjectStoreBackend, now_ns: i64) -> ErasureTic
             ErasureRewriteOutcome::Held => tick.deferred = true,
             ErasureRewriteOutcome::AlreadyApplied
             | ErasureRewriteOutcome::NoApplicableRequests
-            | ErasureRewriteOutcome::Tombstoned => {}
+            | ErasureRewriteOutcome::Tombstoned
+            | ErasureRewriteOutcome::BlockedByUnwritableObject { .. } => {}
         }
 
         let completion = bucket_erasure_completion(store, &clock, &config, &NoLeases, &b, &pending)

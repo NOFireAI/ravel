@@ -92,9 +92,10 @@ pub use config::{
 };
 pub use discover::discover_tenants;
 pub use erasure_rewrite::{
-    ApplicableRequest, BucketErasureCompletion, ErasureAbandon, ErasureMatcher,
-    ErasureRewriteOutcome, PendingErasureRequest, RewriteBuild, RewriteSupersession, RunProvenance,
-    bucket_erasure_completion, bucket_may_overlap, build_rewrite, erasure_rewrite_bucket,
+    ApplicableRequest, BucketErasureCompletion, ERASURE_UNWRITABLE_SIGNALS, ErasureAbandon,
+    ErasureMatcher, ErasureRewriteOutcome, PendingErasureRequest, RewriteBuild,
+    RewriteSupersession, RunProvenance, bucket_erasure_completion, bucket_may_overlap,
+    build_rewrite, erasure_rewrite_bucket, erasure_unwritable_objects_total,
     pending_erasure_requests, publish_rewrite_record,
 };
 pub use error::{MaintainError, MergeCursorBudgetSite, Result};
@@ -112,7 +113,8 @@ pub use memo_snapshot::{MEMO_PREFIX, memo_key, read_all_memo_snapshots, write_me
 pub use migrate::{
     BelowTargetReport, BlockedBucket, BlockedReason, FamilyCensus, FamilyMigrateReport,
     MigrateBudget, MigrationPath, NotMigratedBucket, NotMigratedReason, ReencodeBlockedBucket,
-    ReencodeBlockedReason, Verification, census_family, count_below_target, migrate_family,
+    ReencodeBlockedReason, UnwritableBucket, Verification, census_family, count_below_target,
+    migrate_family,
 };
 pub use provision_audit::write_reshard_audit;
 pub use publish::{
