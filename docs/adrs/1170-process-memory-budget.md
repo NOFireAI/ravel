@@ -718,10 +718,10 @@ decisions 3 and 4 narrows the regression this ADR opened with (the
 analyzes: an infallible-`grow` overshoot is still bounded only by a
 provisional constant, and fetch-layer memory is still uncharged until
 decision 2 lands and a calibration run freezes the reserve against it. The
-small-host reserve amendment below makes the 2 GiB a ceiling, taking a
-quarter of effective memory instead below 8 GiB, or the memory the mode holds
-outside the budget when that is more; the 2 GiB value itself is still this
-uncalibrated placeholder.
+small-host reserve amendment below takes a quarter of effective memory capped
+at the 2 GiB, so less below 8 GiB, or the memory the mode holds outside the
+budget when that is more, which is above 2 GiB at an ingest ceiling above
+1.75 GiB; the 2 GiB value itself is still this uncalibrated placeholder.
 
 ## Amendment 2026-09-26 (issue #1255): decision 2 reaches the server
 
@@ -938,7 +938,8 @@ server were alone on the host, and on that host it was not.
    the `min`, so it never lifts the budget above `MemTotal - RESERVE`. A
    host too small to fit the reserve still derives 0 and is still refused,
    as before this amendment. (The small-host reserve amendment below scales
-   the reserve under 8 GiB; a derived budget under 256 MiB, 0 included, now
+   the reserve under 8 GiB and lifts it to the memory held outside the
+   budget; a derived budget under 256 MiB, 0 included, now
    refuses with its own message instead.) When the floor binds, the derivation logs a
    warning naming the `MemAvailable` reading and `--memory-budget-bytes` as
    the remedy.
@@ -1024,18 +1025,23 @@ budget at 0 whatever the 1 GiB floor says, and startup refused with the
 
 **Decision.**
 
-1. The reserve is `min(MEMORY_OVERHEAD_RESERVE_BYTES, max(memory / 4,
-   floor))`, where `memory` is what the derivation starts from: the cgroup
+1. The reserve is `max(min(MEMORY_OVERHEAD_RESERVE_BYTES, memory / 4),
+   floor)`, where `memory` is what the derivation starts from: the cgroup
    limit under a cgroup memory limit, otherwise `MemTotal`. `floor` is the
    memory the process holds outside the budget, which the reserve must cover
-   however small the host: `NON_BUDGET_BASELINE_BYTES` (256 MiB), plus the
+   whatever the host's size: `NON_BUDGET_BASELINE_BYTES` (256 MiB), plus the
    resolved `--max-ingest-buffer-bytes` ceiling in a mode that holds the
    ingest buffer (`all`; a gateway holds it too but derives no budget). The
    ingest buffer is bounded by that flag and sits outside the budget, so
    without this term a quarter of a small host (478 MiB on a t3a.small) is
-   less than the 512 MiB default ceiling alone. Under `0`, which leaves the
-   buffer unbounded, `floor` is the 2 GiB ceiling. The 256 MiB baseline is
-   uncalibrated, like the 2 GiB ceiling: it is a provisional allowance for
+   less than the 512 MiB default ceiling alone. The floor wins over the
+   2 GiB constant: an ingest ceiling above 1.75 GiB puts the floor above
+   2 GiB, and the reserve is then the floor at every host size, so the
+   budget, the ingest ceiling and the baseline fit in memory for every
+   bounded ceiling. Under `0`, which leaves the buffer unbounded, the memory
+   it holds cannot be accounted, and `floor` is the 2 GiB constant, so the
+   reserve is 2 GiB at every host size. The 256 MiB baseline is
+   uncalibrated, like the 2 GiB constant: it is a provisional allowance for
    the allocator, thread stacks and the runtime, not a measured figure.
    Every site that subtracts the reserve uses this rule: the three derived
    branches of `resolve_performance_defaults` (`derived-cgroup`,
@@ -1045,13 +1051,22 @@ budget at 0 whatever the 1 GiB floor says, and startup refused with the
    no ingest buffer. The rule is `effective_memory_overhead_reserve_bytes` in
    `crates/ravel-maintain/src/config.rs`, and the floor is
    `non_budget_floor_bytes` in `services/ravel-server/src/config.rs`; the
-   2 GiB constant stays and is now its ceiling. The resolved reserve is
-   logged as `memory_overhead_reserve_bytes`, as before.
-2. A host or container with a `MemTotal` (or cgroup memory limit) of 8 GiB
-   or more is unchanged byte for byte: a quarter of 8 GiB is the 2 GiB
-   constant. So are the merge-target derivations at the default 20 GiB merge
-   cursor budget, since below 8 GiB the host less its reserve is under 20 GiB
-   either way and the merge budget is 0 in both. A nominal 8 GiB instance
+   2 GiB constant stays and now caps the quarter-of-memory term. The
+   resolved reserve is logged as `memory_overhead_reserve_bytes` on a
+   derived budget; a `--memory-budget-bytes` or fallback budget subtracts no
+   reserve and does not log one.
+2. At an ingest ceiling of 1.75 GiB or less (the default is 512 MiB), a
+   host or container with a `MemTotal` (or cgroup memory limit) of 8 GiB or
+   more is unchanged byte for byte: a quarter of 8 GiB is the 2 GiB
+   constant, at or above the floor. So are the merge-target derivations at
+   the default 20 GiB merge cursor budget, since below 8 GiB the host less
+   its reserve is under 20 GiB either way and the merge budget is 0 in both.
+   A larger ingest ceiling in `all` makes the reserve the floor at every
+   size, so the budget is smaller than the fixed 2 GiB gave by the floor's
+   excess over 2 GiB: a 3 GiB ceiling takes a 3.25 GiB reserve and derives a
+   4,864 MiB budget on an 8 GiB host where the fixed reserve derived 6 GiB.
+   That is the intended correction, not a regression: the old figure plus
+   the ingest ceiling and the baseline came to 9.25 GiB. A nominal 8 GiB instance
    usually reports less: cloud providers commonly show a `MemTotal` of about
    7.6-7.8 GiB after firmware and kernel reservations, which is below the
    8 GiB line and falls on the scaled side, with its reserve about 50-100 MiB
@@ -1065,7 +1080,8 @@ budget at 0 whatever the 1 GiB floor says, and startup refused with the
    budget. The smallest memory that starts is 512 MiB in `query` and
    `maintain` (the 256 MiB baseline reserve plus the 256 MiB minimum) and
    1 GiB in `all` at the default ingest ceiling (a 768 MiB reserve plus the
-   minimum). An explicit
+   minimum); in `all` it is the floor plus the minimum at any bounded
+   ceiling, 3,584 MiB at a 3 GiB ceiling. An explicit
    `--memory-budget-bytes` is not held to this minimum, and neither is
    `--disable-cache`, which keeps the 2026-09-07 amendment's path for a
    container too small to cache: such a process starts and `emit` WARNs that
@@ -1098,9 +1114,9 @@ that derives a budget.
 The zero-budget arm of the `cache_max_bytes` refusal is now reached only by
 an explicit `--memory-budget-bytes 0`, and its message says so.
 
-The 2 GiB ceiling is still the uncalibrated placeholder the 2026-09-07
+The 2 GiB constant is still the uncalibrated placeholder the 2026-09-07
 amendment describes, and neither a quarter of memory nor the 256 MiB baseline
 is more measured than it is. Decision 3's calibration run replaces all three;
 until then, a small host's reserve is a proportion chosen so the budget is
-positive, held at or above the ingest ceiling it must cover, not a figure
+positive, held at or above the memory it must cover outside the budget, not a figure
 shown to cover the allocator and stacks on that host.

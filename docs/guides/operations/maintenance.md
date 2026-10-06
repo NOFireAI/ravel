@@ -316,7 +316,7 @@ segments have no stored-size target to cap them:
 
 ```text
 budget = host memory - overhead reserve - merge cursor budget  (at least 0)
-reserve = min(2 GiB, max(host memory / 4, 256 MiB))
+reserve = max(min(2 GiB, host memory / 4), 256 MiB)
 target = max( min( budget / 8 / concurrent_merges,
                    claim lease * 10 MiB/s / 2,
                    8 GiB ),
