@@ -22,12 +22,14 @@
 //! reports a read it could not make rather than failing. Any other key that is
 //! not a manifest version is listed, never flagged and never deleted here.
 
-use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError, list_all};
+use ravel_object_store::{
+    DrainStep, GetRange, MAX_LIST_PAGES, ObjectStoreBackend, StoreError, drain_pages, list_all,
+};
 use ravel_types::TenantHash;
 
 use crate::keys::{
-    KeyError, ListedManifestKey, MAX_MANIFEST_VERSION, manifest_key, manifest_prefix,
-    parse_listed_manifest_key,
+    KeyError, ListedManifestKey, MANIFEST_SUFFIX, MAX_MANIFEST_VERSION, manifest_key,
+    manifest_prefix, parse_listed_manifest_key,
 };
 use crate::manifest::{Manifest, decode_manifest};
 
@@ -220,6 +222,41 @@ pub async fn delete_flagged(
     Ok(deleted)
 }
 
+/// Whether the manifest key `key` is in the listing of `prefix`, the `v/`
+/// prefix it sits under. The S3 adapter appends the delimiter to every list
+/// prefix, so `key` itself cannot be the prefix; the listing starts just
+/// before `key` instead, which costs one request however many versions the
+/// table holds. The Maintain credential may list here but not read, so this
+/// is a listing rather than a HEAD.
+async fn is_listed(
+    store: &dyn ObjectStoreBackend,
+    prefix: &str,
+    key: &str,
+) -> Result<bool, RepairError> {
+    // Below `key`, and every key between the two starts with it.
+    let start_after = key.strip_suffix(MANIFEST_SUFFIX).unwrap_or(prefix);
+    let mut found = false;
+    drain_pages::<StoreError, _, _, _>(
+        prefix,
+        Some(start_after),
+        MAX_LIST_PAGES,
+        |after, token| async move { store.list_after(prefix, after.as_deref(), token).await },
+        |meta| {
+            if meta.key.as_str() < key {
+                return Ok(DrainStep::Continue);
+            }
+            found = meta.key == key;
+            Ok(DrainStep::Stop)
+        },
+    )
+    .await
+    .map_err(|source| RepairError::Store {
+        key: prefix.to_string(),
+        source,
+    })?;
+    Ok(found)
+}
+
 /// Delete exactly the key of `table`'s manifest `version`, which must be in
 /// `1..=MAX_MANIFEST_VERSION` ([`RepairError::VersionOutOfRange`] otherwise,
 /// before any store call) and listed ([`RepairError::NotListed`] otherwise).
@@ -238,15 +275,8 @@ pub async fn delete_version(
         });
     }
     let key = manifest_key(tenant, table, version)?;
-    // Listing the key itself costs one request however many versions the
-    // table holds.
-    let listed = list_all(store, &key)
-        .await
-        .map_err(|source| RepairError::Store {
-            key: key.clone(),
-            source,
-        })?;
-    if !listed.iter().any(|meta| meta.key == key) {
+    let prefix = manifest_prefix(tenant, table)?;
+    if !is_listed(store, &prefix, &key).await? {
         return Err(RepairError::NotListed { key });
     }
     store
@@ -528,6 +558,149 @@ mod tests {
         assert_eq!(
             list(&store, &TENANT_A, "hits").await.expect("list").len(),
             9
+        );
+    }
+
+    /// Lists the way the S3 adapter does: `object_store` appends the path
+    /// delimiter to every non-empty list prefix, so a prefix that ends mid
+    /// segment, such as a whole key, matches nothing.
+    struct SegmentAlignedStore {
+        inner: InstrumentedStore<MemoryStore>,
+    }
+
+    fn segment_aligned(prefix: &str) -> String {
+        let trimmed = prefix.trim_end_matches('/');
+        if trimmed.is_empty() {
+            String::new()
+        } else {
+            format!("{trimmed}/")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for SegmentAlignedStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn ravel_object_store::MultipartUpload + 'a>, StoreError> {
+            self.inner.put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            self.inner.list(&segment_aligned(prefix), page).await
+        }
+
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(&segment_aligned(prefix)).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    async fn segment_aligned_forged_store() -> SegmentAlignedStore {
+        let store = SegmentAlignedStore {
+            inner: InstrumentedStore::new(forged_store().await),
+        };
+        for v in [2, 3] {
+            put_version(store.inner.inner(), &TENANT_A, v).await;
+        }
+        store
+    }
+
+    #[tokio::test]
+    async fn the_wrapper_lists_by_whole_segment() {
+        let store = segment_aligned_forged_store().await;
+        assert!(list_all(&store, &mkey(2)).await.expect("list").is_empty());
+        assert_eq!(
+            list(&store, &TENANT_A, "hits").await.expect("list").len(),
+            11
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_version_finds_an_existing_version_on_a_segment_aligned_store() {
+        let store = segment_aligned_forged_store().await;
+        let before = keys_of(list(&store, &TENANT_A, "hits").await.expect("list"));
+        let deleted = delete_version(&store, &TENANT_A, "hits", 2)
+            .await
+            .expect("delete");
+        assert_eq!(deleted, mkey(2));
+        assert_eq!(
+            store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+            1
+        );
+        let after = keys_of(list(&store, &TENANT_A, "hits").await.expect("list"));
+        let expected: Vec<String> = before.into_iter().filter(|k| *k != mkey(2)).collect();
+        assert_eq!(after, expected);
+        // Version 1 sorts first and the bound among the highest: both are
+        // found too.
+        for version in [1, MAX_MANIFEST_VERSION] {
+            assert_eq!(
+                delete_version(&store, &TENANT_A, "hits", version)
+                    .await
+                    .expect("delete"),
+                mkey(version)
+            );
+        }
+        assert_eq!(
+            store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_version_of_a_missing_version_on_a_segment_aligned_store_is_not_listed() {
+        let store = segment_aligned_forged_store().await;
+        // 5 is missing between listed versions; 4294967295 sorts just below
+        // the bound, which is listed.
+        for version in [5, MAX_MANIFEST_VERSION - 1] {
+            let got = delete_version(&store, &TENANT_A, "hits", version).await;
+            assert!(
+                matches!(&got, Err(RepairError::NotListed { key }) if *key == mkey(version)),
+                "{got:?}"
+            );
+        }
+        assert_eq!(
+            store.inner.metrics().snapshot().op(StoreOp::Delete).calls,
+            0
+        );
+        assert_eq!(
+            list(&store, &TENANT_A, "hits").await.expect("list").len(),
+            11
         );
     }
 
