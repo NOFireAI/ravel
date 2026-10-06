@@ -11519,6 +11519,48 @@ mod tests {
             .expect_err("the refusal still fires for a process that does build caches");
     }
 
+    /// The two ways `--disable-cache` lets a process start on a budget that
+    /// would otherwise refuse each get their own WARN: a derived budget below
+    /// the 256 MiB minimum names the minimum and the memory remedy, and an
+    /// explicit `--memory-budget-bytes 0` names that flag value, and neither
+    /// line carries the other's cause.
+    ///
+    /// Prove-the-test: replacing the second branch's text with the first's
+    /// fails the explicit-zero `contains` assertion.
+    #[test]
+    fn disable_cache_warns_with_the_cause_of_each_branch() {
+        let warns_for = |args: &[&str], host: HostProfile| {
+            let cli =
+                Cli::try_parse_from(std::iter::once("ravel-server").chain(args.iter().copied()))
+                    .expect("flags parse");
+            let resolved = cli
+                .resolve_performance(host)
+                .expect("--disable-cache starts");
+            let (captured, _guard) = capture_events(tracing::Level::WARN);
+            resolved.emit(host);
+            let lines = captured.lock().clone();
+            lines.join("\n")
+        };
+        let tiny = HostProfile::new(2, Some(300 << 20), Some(300 << 20), None, None, None);
+        let below = warns_for(&["--mode", "query", "--disable-cache"], tiny);
+        assert!(
+            below.contains("the derived memory budget is below the 256 MiB minimum"),
+            "{below}"
+        );
+        assert!(below.contains("give the process more memory"), "{below}");
+        assert!(!below.contains("--memory-budget-bytes 0"), "{below}");
+
+        let zero = warns_for(
+            &["--disable-cache", "--memory-budget-bytes", "0"],
+            reference_host(),
+        );
+        assert!(
+            zero.contains("is 0 bytes, from an explicit --memory-budget-bytes 0"),
+            "{zero}"
+        );
+        assert!(!zero.contains("256 MiB minimum"), "{zero}");
+    }
+
     /// A 512 MiB container: the kind lane's gateway pod limit.
     const SMALL_POD_MEM_BYTES: u64 = 512 * 1024 * 1024;
 
