@@ -415,74 +415,113 @@ shard, dynamic columns keep the parent's order, a column whose cells are all
 absent in a shard is left out of that shard, and each shard's stream
 directory stays ascending.
 
-Dictionaries: the cloning partition dropped `dyn_col_dicts`, so every
-per-shard write took the plain path. The moving one carries each dictionary
-into every shard that uses its column, compacted to the entries that shard
-references, in first-referenced order. A dictionary is dropped for a column
-whose type is not `Str` or `Bytes`, and for a shard whose share of a `Bytes`
-column holds a `List` or `Map` cell. The writer (ravel-logseg `writer.rs`,
-the dictionary pass) consults dictionaries only for `Str` and `Bytes` plan
-columns, falls back to plain encoding when any contributing batch has no
-dictionary, and interns dictionary entries by their bytes, so a dictionary
-whose entries equal its cells' bytes yields the same object as no
-dictionary. `ColumnarLogBatch::validate` checks that equality for `Str` and
-`Bytes` cells only, which is why a shard holding a `List` or `Map` cell in a
-`Bytes` column gets none.
+Dictionaries are dropped at the split, as the cloning partition dropped
+them: every shard part has an empty `dyn_col_dicts`, so every per-shard
+write takes the writer's plain path, the same path it took before wave 1.
+An earlier revision of wave 1 carried each `Str`/`Bytes` dictionary into
+every shard using its column, compacted to that shard's entries, and
+measured no resolved difference against dropping them (Measurement, below).
+It was reverted for three reasons:
+
+- Carrying costs one copy of each distinct value per shard that uses it,
+  plus 4 bytes of id per present cell. In the carrying run those child
+  dictionaries held a median 62 MB inside `partition_columnar`.
+- That memory is invisible to the byte budget. `est_columnar_bytes`
+  (`log_shard.rs`), the figure a shard buffer registers in `est_bytes` and
+  the write charges against the ADR-0069 ceiling, never reads
+  `dyn_col_dicts`. The goal of epic #2614 is memory a budget can bound.
+- Carrying needed a carve-out: `ColumnarLogBatch::validate` checks
+  dictionary entries against `Str` and `Bytes` cells only, so a shard whose
+  share of a `Bytes` column held a `List` or `Map` cell had to get no
+  dictionary.
+
+The typed columnar batch (#2625, ADR-2614 decision 4) decides the string
+column's dictionary form afresh, inside a batch whose size is counted.
+
+`partition_columnar` also checks every per-row column's length against the
+row count, and each dynamic column's cell count against its present rows,
+before it deals anything (`rows_agree`, `deal_rows`, `deal_fixed_width`). A
+mismatch returns `LogSegError::MalformedColumnarBatch` naming the column
+instead of truncating to the shorter length. `write_columnar` maps it to
+`LogWriteError::SegmentBuild` and refunds the charge; a shard's hand-back
+logs it and drops that buffered batch. `write_columnar` validates the batch
+first, so either path means a partition bug.
 
 Tests (ravel-ingest `log_router.rs`) compare against
 `cloning_partition_reference_pre_2624`, a test-only copy of the previous
-partition:
+partition, which never carries a dictionary. Each per-shard comparison is
+whole-batch equality, `dyn_col_dicts` included:
 
-- `partition_columnar_moves_cells_and_keeps_dictionaries`: three streams on
+- `partition_columnar_moves_cells_and_drops_dictionaries`: three streams on
   three shards with 1, 4 and 9 rows, a column only the first stream sets,
   `Bytes`, `Map` and `I64` columns, a reversed producer dictionary with an
-  unreferenced entry and a dictionary on an `I64` column. Every shard must
-  equal the reference's apart from the expected dictionaries, and the heap
-  pointers of moved strings, stream blobs and residual lists must be the
-  parent's.
+  unreferenced entry and a dictionary on an `I64` column. The parent has
+  dictionaries on `k_str`, `k_int`, `raw` and `blob`, and `blob` holds a
+  `Map` cell. Every shard must equal the reference's, no part may carry a
+  dictionary, and the heap pointers of moved strings, stream blobs and
+  residual lists must be the parent's.
 - `partition_columnar_matches_the_cloning_reference`: a proptest over 0 to
   39 generated records, 1 to 8 shards, with and without dictionaries. Its
   regression seed is checked in under `crates/ravel-ingest/proptest-regressions/`.
 - `moved_partition_writes_the_same_objects_as_the_cloning_reference`: one
-  fixed batch with dictionaries, written through a router using the
-  reference partition and through the real one; every stored object must be
-  byte-identical.
+  fixed batch whose parent has dictionaries on `k_str` (`Str`), `raw`
+  (`Bytes`) and `nested` (`Bytes`, holding a `Map` cell), written through a
+  router using the reference partition and through the real one; no part
+  may carry a dictionary, and every stored object must be byte-identical.
 - `merged_columnar_writes_store_the_same_objects_as_the_cloning_reference`:
   two writes over the same 24 streams, so every shard buffer merges two
-  parts into one flush. `k_str` keeps its dictionary in the first write's
-  parts and has none in the second's, `raw` (`Bytes`) keeps its dictionary
-  in every part, and `blob` (`Bytes`) loses it in exactly the parts whose
-  share holds a `Map` cell. The test asserts those dictionary states on
-  every part, then asserts one commit per shard and byte-identical objects
-  against a router that partitions with the reference.
+  parts into one flush. Each write's parent has dictionaries on `svc`,
+  `raw` and `blob`, `blob` holding a `Map` cell; no part may carry one. The
+  test asserts one commit per shard and byte-identical objects against a
+  router that partitions with the reference.
 - `a_handed_back_columnar_buffer_stores_the_same_objects_as_the_cloning_reference`
   (`log_shard.rs`): a shard actor buffers both writes' shard-3-of-4 parts and
-  hands them back to three targets after a retired-index verdict. In its
-  re-partitioned parts `k_str` and `raw` must keep the same dictionary
-  states, and `blob` must have none wherever its share holds a `Map` cell;
-  one actor merging them for every target must write them in one flush,
-  with objects byte-identical to the reference's parts handed back the same
-  way.
+  hands them back to three targets after a retired-index verdict. No
+  re-partitioned part may carry a dictionary; one actor merging them for
+  every target must write them in one flush, with objects byte-identical to
+  the reference's parts handed back the same way.
+- `partition_columnar_refuses_a_short_column_instead_of_truncating`: a
+  batch with one of `flags`, `residual_attrs`, `ts_ns`, the packed
+  `trace_id` bytes or `k_str`'s cells cut short must return
+  `MalformedColumnarBatch` naming that column.
+- `a_columnar_buffer_registers_the_estimate_of_what_it_holds`
+  (`log_shard.rs`): both dictionary writes, partitioned for four shards and
+  merged into shard buffers. Each buffer's registered `est_bytes` must equal
+  the sum of `est_columnar_bytes` over the batches it holds, and the
+  buffers together must hold exactly the bytes the writes were charged. The
+  estimate does not read dictionaries, so the equality alone cannot see one;
+  the test also asserts no buffered batch carries a dictionary.
 
-`raw` holds only `Bytes` cells and keeps a dictionary in every contributing
-part of every flush in both tests, which is the writer's condition for its
-dictionary pass (ravel-logseg `writer.rs`, `plan_uses_dict`). The writer
-exposes nothing that shows which path ran, so this rests on that asserted
-precondition. With `compact_dict` keeping the parent's ids instead of
-re-indexing them onto the child's entries, both tests and
-`moved_partition_writes_the_same_objects_as_the_cloning_reference` fail,
-the moving side storing no object at all (the first two at the key
-comparison):
+Two mutants of the drop, each against the 17 partition and columnar tests
+(`cargo test -p ravel-ingest --lib -- partition columnar cloning`):
 
-```
-assertion `left == right` failed: the same object keys
-  left: []
- right: ["t/86bc967f6b7c19288226b362b9a7b013/l/c/0000/20231114T22/5b99bdbf-2c56-419a-9580-ae830e0818fa.1700000000.00000000000000000000.cmt", ...]
-```
+- Copying the parent's whole `dyn_col_dicts` into every part fails 6. The
+  per-shard comparison stops at the validation before its equality
+  assertion, the parent's dictionary count no longer matching the part's
+  columns:
 
-Mutants run before those two tests existed, each against the ten partition
-and columnar-write tests in `log_router.rs`: dealing rows in reverse fails
-six of them (the first three listed above,
+  ```
+  every sub-batch validates: MalformedColumnarBatch("dyn_col_dicts has 5 entries but dyn_columns has 4")
+  ```
+
+- Giving every part valid dictionaries of its own (`with_dictionaries` on
+  each part, the shape the earlier revision produced) fails 7, the
+  per-shard comparison at its equality assertion:
+
+  ```
+  assertion `left == right` failed: shard 3: the moved sub-batch must equal the cloning reference's
+  ```
+
+  and the stored-object tests and the `est_bytes` test at their
+  no-dictionaries assertion:
+
+  ```
+  shard 0: a part carries no dictionaries, got [None, None, Some(StrColumnDict { distinct: [[118, 50], [118, 56], ...
+  ```
+
+Mutants run against the earlier revision, each against the ten partition
+and columnar-write tests in `log_router.rs` that existed then: dealing rows
+in reverse fails six of them (the first three listed above,
 `partition_columnar_matches_from_records_per_shard`, and both
 columnar-versus-row write tests); keeping an all-absent column fails the
 first and the proptest only; the three stored-object tests pass under it,
@@ -490,18 +529,22 @@ so the stored bytes of their batches do not depend on that rule.
 
 ### Measurement
 
-Wave 1 changed two things on the loader path at once: the partition moves
-instead of cloning, and it carries the column dictionaries the loader
-attaches (`services/ravel-cli/src/load/columnar.rs`,
+The earlier revision of wave 1 changed two things on the loader path at
+once: the partition moved instead of cloning, and it carried the column
+dictionaries the loader attaches (`services/ravel-cli/src/load/columnar.rs`,
 `str_column_dict_from_cells` for a dictionary-encoded Parquet string
 column) into each shard, where the cloning partition dropped them, so the
-writer's dictionary pass now runs on this path. To separate them, two binaries ran back to back on the same box:
+writer's dictionary pass ran on this path. To separate them, two binaries
+ran back to back on the same box:
 
-- **shipped**: this checkout (0b0bb40, whose non-test code is the wave 1
-  result).
+- **dictionaries carried**: 0b0bb40, whose non-test code was that earlier
+  revision.
 - **dictionaries dropped**: the same tree with the dictionary filter on
   `dicts.next()` in `partition_columnar` made always false, so every shard
-  part carries no dictionary, as before wave 1. A local edit, not committed.
+  part carried no dictionary, as before wave 1. A local edit, not
+  committed. Wave 1 as it lands drops them in `partition_columnar` itself
+  and gives every part the same empty `dyn_col_dicts`; that code was not
+  measured again.
 
 Both were built with `CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release
 -p ravel-cli --features profiling` and run with the stage-0 after-run's
@@ -521,11 +564,11 @@ column repeats the figures above, which used the first-frame method, so
 its `build_columnar_batch` row includes slots and strings attributed to it
 by that method.
 
-| | stage 0 after-run | wave 1, dictionaries dropped | wave 1, shipped |
+| | stage 0 after-run | wave 1, dictionaries dropped | wave 1, dictionaries carried |
 |---|---|---|---|
 | peak RSS | 15.48 GB (15,475,300 kB) | 11.37 GB (11,367,488 kB, +326 s) | 11.33 GB (11,326,364 kB, +340 s) |
 | `partition_columnar` at dump 100 | 2,238 MB | 2,579 MB | 2,137 MB |
-| same, at the +180 s dump (dropped: 99, shipped: 95) | | 2,087 MB | 3,099 MB |
+| same, at the +180 s dump (dropped: 99, carried: 95) | | 2,087 MB | 3,099 MB |
 | same, median of dumps from +60 s | | 2,934 MB | 2,988 MB |
 | `build_columnar_batch` at dump 100 | 3,615 MB | 3,064 MB | 2,088 MB |
 | same, at the +180 s dump | | 2,119 MB | 2,116 MB |
@@ -541,7 +584,7 @@ by that method.
 | rows read by +358 s, estimated | | 33.2 million | 32.1 million |
 
 Dumps 50/100/150/179 landed at +94/+182/+270/+319 s with dictionaries
-dropped and +97/+189/+282/+335 s shipped (stage 0: +96/+195/+296/n.a.).
+dropped and +97/+189/+282/+335 s carried (stage 0: +96/+195/+296/n.a.).
 
 Load rate: the loader prints no progress before it finishes and the memory
 store dies with the process, so neither a progress line nor an object count
@@ -558,7 +601,7 @@ structure in both binaries. As a relative cross check, the object buffers
 allocated at `push_section` (`writer.rs` 1890), which the memory store
 keeps (see the correction above) and which hold byte-identical objects in
 both binaries, were 5,706 MB in the last dump with dictionaries dropped
-(+359 s) and 5,578 MB shipped (+358 s), 2.3% apart. The two binaries had
+(+359 s) and 5,578 MB carried (+358 s), 2.3% apart. The two binaries had
 read the same bytes to within 0.01% at +60 s and +179 s; the 3.2% gap by
 +358 s is from one run each and is not attributed to either change. The
 implied rate, about 90,000 rows/s, is below the 150,000 rows/s the
@@ -570,20 +613,25 @@ What each variable moved:
 - **The move** (stage 0 against dictionaries dropped): peak RSS 15.48 to
   11.37 GB, 4.11 GB or 8.2 KB per batch row. The stage-0 run is from an
   earlier session on this host type, so this compares across sessions.
-- **Carrying dictionaries** (dictionaries dropped against shipped): peak RSS
-  11.37 to 11.33 GB, 0.04 GB. Two runs of the shipped code differ by
-  0.02 GB (an earlier run of the same code peaked at 11.30 GB,
-  11,302,472 kB), so no effect on peak RSS is resolved. The medians of
-  `partition_columnar`, `build_columnar_batch` and total live differ by
-  under 60, 30 and 440 MB. The writer's dictionary-only allocations (the
+- **Carrying dictionaries** (dictionaries dropped against carried): peak
+  RSS 11.37 GB dropped against 11.33 GB carried, 0.04 GB. Two runs of the
+  carrying code differ by 0.02 GB (an earlier run of the same code peaked
+  at 11.30 GB, 11,302,472 kB), so no effect on peak RSS is resolved. The
+  medians of `partition_columnar`, `build_columnar_batch` and total live
+  differ by under 60, 30 and 440 MB (total live 10,267 MB dropped against
+  9,833 MB carried); by +358 s the dropped run had read an estimated
+  33.2 million rows against 32.1 million carried, so the carried run's
+  lower total live also covers fewer rows read. The writer's dictionary-only allocations (the
   interner and global dictionary, the per-block ids, the bloom's seen set,
   which was 0 MB in every dump of both runs) stay under 10 MB at every dump,
   and the dictionary path's skipped value pages save about 16 MB at the
   median. `col_dict_ids`, one `Option<u32>` per row for every Str/Bytes plan
   column, is allocated before the writer knows whether any contributor
   lacks a dictionary, so both paths pay it (medians 137 and 115 MB). The
-  child dictionaries `compact_dict` builds hold a median 62 MB inside
-  `partition_columnar`.
+  child dictionaries the carrying revision built (its `compact_dict`, since
+  removed) held a median 62 MB inside `partition_columnar`, none of it
+  counted by `est_columnar_bytes`. With no peak RSS effect resolved and
+  that memory outside the byte budget, wave 1 drops the dictionaries.
 
 Single dumps swing by about 1 GB per site: at the +180 s dumps, where both
 runs had read the same Parquet bytes, `partition_columnar` held 2,087 MB in
@@ -594,10 +642,11 @@ shows 2,119 MB. The peak RSS drop is the figure both wave 1 binaries agree
 on.
 
 What did not move: `partition_columnar` itself holds a median of about
-2.9 to 3.0 GB in both wave 1 runs and up to 4.45 GB (dump 39 of the shipped
-run, +78 s), most of it in the per-shard cell vectors (`log_router.rs`
-966, `part_cells[p].push(cell)`: 2,060 MB of 2,137 MB at dump 100 shipped,
-2,516 of 2,579 MB with dictionaries dropped). Moving a cell moves only its
+2.9 to 3.0 GB in both wave 1 runs and up to 4.45 GB (dump 39 of the carrying
+run, +78 s), most of it in the per-shard cell vectors (the
+`part_cells[p].push(cell)` in `partition_columnar`'s dynamic-column loop:
+2,060 MB of 2,137 MB at dump 100 carried, 2,516 of 2,579 MB with
+dictionaries dropped). Moving a cell moves only its
 heap payload; each shard still needs new 32-byte `AttrValue` slots for its
 cells, most of this corpus's cells are `I64` with no payload, and vectors
 grown by doubling carry up to 2x slack. The issue's expectation of
@@ -617,11 +666,11 @@ multiplicity section above gives the terms.
    copy per in-flight write (2.2 to 4.2 GB measured at B=500,000). Byte
    identity follows from equal values; ravel-ingest's
    `partition_columnar_matches_from_records_per_shard` already pins the
-   partition's content. Landed in wave 1 (#2624, above): the move alone
-   took peak RSS from 15.48 to 11.37 GB (4.11 GB), and carrying dictionaries
-   into the shards, which landed with it, moved it by 0.04 GB, which one run
-   per binary does not resolve. The per-shard cell vectors still hold about
-   2 to 2.5 GB at dump 100.
+   partition's content. Landed in wave 1 (#2624, above): the move took peak
+   RSS from 15.48 to 11.37 GB (4.11 GB) with dictionaries dropped at the
+   split, as wave 1 lands. A run carrying them into the shards peaked at
+   11.33 GB, a difference one run per binary does not resolve. The
+   per-shard cell vectors still hold about 2 to 2.5 GB at dump 100.
 2. **Build dense `DynColumn`s directly** (ravel-cli `columnar.rs`): drop the
    per-slot `Vec<Option<AttrValue>>` intermediate. Saves 2.4 to 2.8 KB per
    row (320 MB to 1.2 GB measured). The existing row-path differential test
@@ -637,7 +686,9 @@ multiplicity section above gives the terms.
    Takes the `ColumnarLogBatch` from about 4.5 KB per row to about 0.5 KB
    per row for this corpus, so every remaining copy shrinks about 9x; with
    1 and 2 landed this is the step that brings 1,000,000-row batches under
-   the 8 GB target. Largest change; its own task with a byte-identity
+   the 8 GB target. It also decides the string column's dictionary form
+   afresh, since wave 1 drops dictionaries at the shard split. Largest
+   change; its own task with a byte-identity
    differential test against the current writer over the ClickBench fixture.
 5. **Operator recipe for large objects from small batches** (docs): with 4
    landed, document `--batch-rows 100000 --target-bytes <one object's

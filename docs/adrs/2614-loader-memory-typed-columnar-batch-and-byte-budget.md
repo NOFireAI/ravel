@@ -128,7 +128,9 @@ encoder re-interns, so RLOG bytes are the same either way. The wave 1 task
 keeps the dictionaries only if it shows byte identity; otherwise it keeps
 dropping them and says so. Under decision 4 the dictionary becomes the
 dictionary form of the typed string column, and the same subset-and-reindex
-rule applies to it.
+rule applies to it. Wave 1 drops the dictionaries at the split, and decision
+4 decides the typed string column's dictionary form afresh: see the wave 1
+dictionary amendment below.
 
 ### 3. Dense columns from the start
 
@@ -272,3 +274,44 @@ corpus twice, q33 exceeds the per-query limit), and on spill needing
   roughly the depth. Stage 0 measured otherwise, and #2621 corrected it.
 - **Validation.** The ClickBench entry's sizing (#2592) waits for this epic,
   then is measured on all nine machine types before any upstream PR.
+
+## Amendment (2026-10-07): wave 1 drops dictionaries at the split (issue #2624)
+
+<!-- amendment-applies: sections="2. One copy of a batch at a time" pointer="wave 1 dictionary amendment" -->
+
+Decision 2 left open whether wave 1 keeps the parent's column dictionaries
+(`dyn_col_dicts`) on the per-shard batches. It does not: `partition_columnar`
+drops them, and every per-shard batch has an empty `dyn_col_dicts`, as the
+clone path did. The move itself stands as decision 2 states it: cells,
+residual attribute lists and stream blobs move into the shards, the parent
+is freed column by column, and it is gone before any shard message is sent.
+
+An earlier revision of wave 1 kept them, cut down and re-indexed per
+decision 2, and was reverted:
+
+- Keeping them costs one copy of each distinct value per shard that uses
+  it. In the measured run those child dictionaries held a median 62 MB.
+- That memory is invisible to the byte budget. `est_columnar_bytes`, the
+  figure a shard buffer registers and the write is charged, does not read
+  `dyn_col_dicts`, so decision 5's budget could not bound it. This epic's
+  goal is memory a budget bounds.
+- `validate()` checks dictionary entries against `Str` and `Bytes` cells
+  only, so a `Bytes` column holding a `List` or `Map` cell needed a
+  carve-out that gave that shard no dictionary.
+
+Figures, `ravel-cli load` on ClickBench `hits.parquet` at
+`--batch-rows 500000 --read-cursors 16 --shards 4`, one run per binary
+(docs/internal/loader-memory-2613.md, "Wave 1 (#2624)"):
+
+- With dictionaries dropped, peak RSS fell from 15.48 GB (stage 0) to
+  11.37 GB.
+- Keeping them peaked at 11.33 GB, within the 0.02 GB spread of two runs of
+  that code, so no effect is resolved.
+- Median total live heap was 10,267 MB dropped against 9,833 MB kept, and
+  the dropped run had read an estimated 33.2 million rows by +358 s against
+  32.1 million.
+
+Stored objects are byte-identical either way, since the writer interns
+dictionary entries by their bytes. Decision 4 decides the typed string
+column's dictionary form afresh, inside a batch whose bytes the budget
+counts; decision 2's subset-and-reindex rule for it no longer binds.
