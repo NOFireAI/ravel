@@ -384,10 +384,20 @@ The catalog grants per role:
 | `t/*/catalog/*/idx/*` | list, get, put | list, get, put | list, get, put, delete | list, get |
 
 Gateway's and Query's grants are the whole-family `t/*/catalog/*/*` list and
-read plus the three puts, carried over from when both modes ran the
-scheduled fold. Query still mounts the on-demand `POST /api/v1/admin/fold`
-route. Gateway folds by no route; removing its catalog grants is a separate
-least-privilege decision recorded on issue #2382. Admin lists and reads the
+read plus the three puts. A process in `gateway` mode writes no catalog
+object: the scheduled fold runs only in `maintain` and `all` mode
+(`Mode::runs_scheduled_fold` in `services/ravel-server/src/config.rs`), and
+`gateway` mode mounts no fold route. A process in `all` mode runs the
+scheduled fold and writes the catalog under whichever role's credential it
+holds, so `gateway.json` keeps the three catalog puts for a single-process
+deployment that runs `all` mode under it. No document states which template
+an `all` mode process runs under: the operations configuration guide maps
+the ingest half of `--mode all` to Gateway and the query half to Query, and
+names one shared credential as the choice for a development or
+single-operator deployment. Query mounts the on-demand
+`POST /api/v1/admin/fold` route in `query` and `all` mode, which writes the
+same three. Removing Gateway's catalog grants is a separate least-privilege
+decision recorded on issue #2382. Admin lists and reads the
 catalog through `t/*`. Maintain's two deletes are the unreferenced-catalog sweep
 (see "Delete grants per role" above).
 
@@ -436,7 +446,7 @@ and #2350:
 | `read_all_memo_snapshots` lists `sys/maintain/memo/` on a maintain warm start | `maintain` | `s3:ListBucket` with `prefix=sys/maintain/memo/` | `MaintainList` `s3:prefix` `sys/maintain/memo/*` (the GETs and the snapshot PUT fall under `MaintainRead` and `MaintainWrite` `sys/maintain/*`) |
 | `read_config` reads `t/<tenant_hash>/config` (the tenant config record, ADR-0066) | `maintain`, `query`, `gateway` | `s3:GetObject` | `MaintainRead`, `QueryRead` and `GatewayRead` `t/*/config` |
 | `ravel-cli typed-attr-column set`, `clustering-key set` and `clear`, and `bloom-scope set` write `t/<tenant_hash>/config` (`CreateIfAbsent`, then `CasVersion`) | Admin | `s3:PutObject` | `AdminWrite` `t/*/config` (the read is `AdminRead` `t/*`) |
-| `bootstrap_tenant_epoch` reads `t/<tenant_hash>/enc`, then `record_key_epoch` writes it (`CreateIfAbsent` for epoch 0, `CasVersion` for each appended epoch), for each tenant in `--tenant-kms-config` at startup | every mode | `s3:GetObject`, `s3:PutObject` | `GatewayRead`, `QueryRead`, `MaintainRead`, `GatewayWrite`, `QueryWrite` and `MaintainWrite` `t/*/enc` (Admin reads it for `verify-custody` through `AdminRead` `t/*`) |
+| `bootstrap_tenant_epoch` reads `t/<tenant_hash>/enc`, then `record_key_epoch` writes it (`CreateIfAbsent` for epoch 0, `CasVersion` for each appended epoch), for each tenant in `--tenant-kms-config` at startup; the `ravel-cli` commands that take the flag under the Maintain credential append only epoch 1 of an unfinished bootstrap (`CasVersion`) | every mode | `s3:GetObject`, `s3:PutObject` | `GatewayRead`, `QueryRead` and `MaintainRead` `t/*/enc`; the create-if-absent PUT under `GatewayEncCreate`, `QueryEncCreate` and `MaintainEncCreate` and the compare-and-swap PUT under `GatewayEncCas`, `QueryEncCas` and `MaintainEncCas`, each on `t/????????????????????????????????/enc` and conditioned the way the provisioning record's are (see "Provisioning records: conditioned writes" below); no unconditioned PUT reaches the record (Admin reads it for `verify-custody` through `AdminRead` `t/*`) |
 | The ingest metadata sink reads and writes `t/<tenant_hash>/m/meta` (`CreateIfAbsent`, then `CasVersion`); the query metadata cache reads it for `/api/v1/metadata` | `gateway`, `all` (write); `query`, `all` (read) | `s3:GetObject`, `s3:PutObject` | `GatewayRead`, `GatewayWrite` and `QueryRead` `t/*/m/meta` |
 | The alert evaluator: `acquire_lease` writes `t/<tenant_hash>/a/alert-lease` (`CreateIfAbsent`, or a GET then `CasVersion`), `read_alert_state_memo` reads and `write_alert_state_memo` overwrites `t/<tenant_hash>/a/state/latest`, and each transition is published as an L0 data object and a commit record (`CreateIfAbsent`) | `query`, `all` | `s3:GetObject`, `s3:PutObject` | `QueryRead` `t/*/a/alert-lease` and `t/*/a/state/latest`; `QueryWrite` `t/*/a/alert-lease`, `t/*/a/state/latest`, `t/*/a/l0/*` and `t/*/a/c/*` |
 | Alert retention: `alert_keep_set` reads `t/<tenant_hash>/a/state/latest`, and `alert_keyspace_is_empty` lists `t/<tenant_hash>/a/` and `quarantine/t/<tenant_hash>/a/` | `maintain` | `s3:GetObject`, `s3:ListBucket` | `MaintainRead` `t/*/a/state/latest`; `MaintainList` `s3:prefix` `t/*/a/` and `quarantine/t/*/a/` |
@@ -715,14 +725,18 @@ data sits on a shard index at or above its `--shards`, because it reads such
 a tenant through that shard count and would leave those shards out (ADR-0050
 section 5). Otherwise it passes without writing anything. It never lists
 `l0/`, since Query serves committed data only. Adoption belongs to ingest,
-maintenance and the CLI. The read role therefore holds no provisioning write
-and no `l0/` listing: `QueryList` does not admit `t/*/*/l0/*`, so an
-adopting Query startup would be refused at that listing before it reached the
-write.
+maintenance and the CLI. The read role therefore holds no provisioning write,
+so an adopting Query startup would be refused at the write. `QueryList` does
+admit `t/*/*/l0/*`, for the reason "Data objects a query reads" below gives,
+so the template would not refuse an `l0/` listing: what keeps the startup
+check from issuing one is `static_absent_policy`, and the ravel-server test
+`query_mode_startup_over_in_range_committed_data_lists_commits_and_writes_nothing`
+fails any `l0/` listing.
 
-Each create-only statement is `s3:PutObject` conditioned on `StringEquals`
-`s3:if-none-match` `*`, the form `QueryManifestCreate` uses. Each CAS-only
-statement is `s3:PutObject` conditioned on `Null` `s3:if-match` `false`: a PUT
+Each create-only provisioning-record statement is `s3:PutObject` conditioned
+on `StringEquals` `s3:if-none-match` `*`, the form `QueryManifestCreate` uses.
+Each CAS-only one is `s3:PutObject` conditioned on `Null` `s3:if-match`
+`false`: a PUT
 that sends `If-Match` passes, and an unconditional PUT or a create-if-absent
 PUT that sends no `If-Match` is refused. Every one of them names exactly three
 resources, one per provisioned signal:
@@ -773,6 +787,35 @@ PutObject that `QueryWrite` and `AdminWrite` grant for audit records. The
 audit signal has no provisioning record, so nothing legitimate is there to
 replace; a planted one could widen the shard range an audit scan reads or make
 audit reads fail, and cannot hide any record.
+
+## The key-epoch record: conditioned writes
+
+The key-epoch record `t/<tenant_hash>/enc` (ADR-0062 decision 1b) is a
+tenant's append-only KMS custody history. Every write goes through
+`record_key_epoch` (`crates/ravel-catalog/src/key_epoch.rs`): `CreateIfAbsent`
+when it finds no record, `CasVersion` to append an epoch to the one it read.
+Its callers:
+
+| Call | Role | Put mode | Grant |
+|---|---|---|---|
+| `bootstrap_tenant_epoch` (`crates/ravel-catalog/src/tenant_kms.rs`), run by `configure_tenant_kms` from `services/ravel-server/src/main.rs` at startup under `--tenant-kms-config`, creates epoch 0 for a tenant with no record | Gateway, Query, Maintain (every mode) | `CreateIfAbsent` | `GatewayEncCreate`, `QueryEncCreate`, `MaintainEncCreate` |
+| The same startup step appends the configured key after epoch 0, and appends a rotated key to an existing record | Gateway, Query, Maintain (every mode) | `CasVersion` | `GatewayEncCas`, `QueryEncCas`, `MaintainEncCas` |
+| `ravel-cli maintain compact-bucket`, `compact-tenant`, `migrate` and `catalog fold` under `--tenant-kms-config` (`configure_tenant_kms_with_policy` with `KeyChangePolicy::Refuse`, `services/ravel-cli/src/store.rs`) append epoch 1 of an unfinished bootstrap and refuse an absent record | Maintain | `CasVersion` | `MaintainEncCas` |
+
+Each statement names the one resource
+`t/????????????????????????????????/enc` and carries the provisioning
+record's create-only or CAS-only Condition. No unconditioned PUT in any
+template reaches the record, so a compromised server credential can create a
+missing record, and can replace an existing one only with a PUT that names the
+version it read; it cannot overwrite or recreate the history blind. IAM cannot
+limit what that PUT contains, so a credential that reads the record can still
+rewrite it. Every mode both
+creates and appends, so all three server roles hold both statements, and key
+rotation depends on the CAS one. `DenyDeleteProtected` denies delete on
+`t/*/enc` in all four templates. `crates/ravel-commit/tests/iam_templates.rs`
+pins the statements per role by exact JSON, checks that no unconditioned
+PutObject reaches the record, and matches each call above to a grant of its
+own kind.
 
 ## Bootstrap keys: a list grant on each absent key a role reads
 
@@ -834,12 +877,54 @@ and checks that the bootstrap statements admit no other
 key: neither a sibling key the role does not read (`sys/auth` for Maintain),
 nor a deeper key, a listing prefix, a 31- or 33-character tenant segment, or
 `t/<tenant_hash>/x/prov` for Query.
+`a_list_on_a_bootstrap_prefix_returns_only_that_key` checks the second
+sentence of this paragraph: no key the test models begins with an admitted
+value and continues, under the raw string prefix rule ListObjectsV2 applies.
 
 Some keys are deliberately left out. `sys/t/<tenant_hash>`, the alert lease
 and the compaction claims are written with a create-if-absent PUT first and
 read only once that PUT reports the object exists. A data object that a
-concurrent compaction deleted is a race, not a bootstrap state, and naming
-those keys would need a `*`.
+concurrent compaction deleted is a race, not a bootstrap state, so it is not
+named here: `QueryList` names the `l0/` and `l1/` prefixes with a `*` for it
+(see the next section).
+
+## Data objects a query reads: a list grant so a deleted one reads as missing
+
+On AWS S3, a GET of an absent key answered 404 when one of the caller's
+`s3:ListBucket` grants had an `s3:prefix` value matching the key itself, and
+403 when none did (an unconditioned list grant also gives 404). Measured on a
+real S3 bucket on 2026-10-05: under a
+`StringLike` grant on `t/*/*/l0/*`, a GET of an absent L0 key answered 404;
+under a grant on `t/` alone, a GET of an absent L1 key answered 403.
+
+A query pins its segment set when it resolves and then GETs each segment. A
+compaction or retention delete can remove one in between. Both query engines
+re-resolve and retry once, and only on `NotFound`:
+
+| Call | Mode | S3 operation | Grant |
+|---|---|---|---|
+| The PromQL engine's segment fetch (`crates/ravel-query/src/engine.rs`) and the SQL executor's (`crates/ravel-sql/src/executor.rs`, `SqlError::is_segment_not_found`) GET each pinned L0 and L1 segment, and re-resolve once when a GET reports `NotFound` | `query`, `all` | `s3:GetObject`; the 404 needs `s3:ListBucket` | `QueryRead` `t/*/*/l0/*` and `t/*/*/l1/*`; `QueryList` `s3:prefix` `t/*/*/l0/*` and `t/*/*/l1/*` |
+
+Until issue #2462 `QueryList` named neither prefix, so on AWS S3 a query
+whose read raced such a delete was refused with `AccessDenied` and failed
+instead of retrying. The list grant lets Query list the data prefixes,
+including objects no commit record names (an L0 object from an ingest that
+died before its commit, an L1 part from a crashed compaction, a legal-hold
+audit object). Query could already enumerate those through the bare `t/`
+value in `QueryList`, which carries no delimiter condition, and read them
+through `QueryRead`.
+
+`query_lists_the_data_prefixes_so_a_deleted_segment_reads_as_missing` in
+`crates/ravel-commit/tests/iam_templates.rs` derives the keys Query may GET
+and Maintain can delete from the two templates and checks that a `QueryList`
+value matches each one. The same check over every server role against every
+other role's deletes finds two kinds of key no list grant of the reader
+matches, both pinned by `deletable_reads_without_a_list_grant_per_server_role`:
+Gateway's `t/*/*/idem/*` read and Maintain's `t/*/*/idem/*` delete meet on the
+test's literal `idem/` witnesses, a shape no marker has (a real marker key is
+matched by `GatewayListTenantBootstrapKeys`), and Maintain's `t/*/u/*` read
+reaches the audit signal's admission snapshot, which Gateway's reap deletes and
+no Maintain path reads.
 
 ## Idempotency markers: the keyed-ingest lookup
 

@@ -68,7 +68,6 @@
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/t/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/enc",
         "arn:aws:s3:::my-ravel-bucket/t/*/m/meta"
       ]
     },
@@ -84,6 +83,28 @@
       "Condition": {
         "StringEquals": {
           "s3:if-none-match": "*"
+        }
+      }
+    },
+    {
+      "Sid": "GatewayEncCreate",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/enc",
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*"
+        }
+      }
+    },
+    {
+      "Sid": "GatewayEncCas",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/enc",
+      "Condition": {
+        "Null": {
+          "s3:if-match": "false"
         }
       }
     },

@@ -187,6 +187,8 @@ key-epoch record `t/<hash>/enc`, the metric metadata record `t/<hash>/m/meta`,
 and the alert evaluator's lease and state memo under `t/<hash>/a/`, along with
 the alert transition writes the Query role makes; the control-plane key
 amendment below adds them and lists every control-plane key each role uses.
+The key-epoch write conditions amendment below makes every server role's
+`t/<hash>/enc` write a create-only or a CAS-only grant.
 
 The table's `prov` entries are incomplete too: Maintain creates the record
 on the startup and maintain-tick adopt paths and raises format floors under
@@ -204,6 +206,11 @@ those keys; the bootstrap-key list amendment below adds it.
 The Gateway row's `idem/<key>` (dedup lookup) is a read of one marker key per
 hour of the dedup window, most of them absent, and the marker lookup amendment
 below grants the list of exactly that key an absent key needs on AWS S3.
+
+The Query row's `l0/**` and `l1/**` reads race the compaction and retention
+deletes, and a read of a segment deleted after the query resolved must be
+answered 404, not 403, for the query's one re-resolve retry to run; the
+data-prefix list amendment below adds the list grant that makes it so.
 
 This is not a literal "ingest, compaction, query, and sweep" four-way split
 — sweep is not split into its own process here. Sweep
@@ -713,7 +720,8 @@ The needed grant, once provisioned:
 - **Gateway, Query, Maintain**: `GetObject` + `PutObject` on `t/*/enc`
   (`CreateIfAbsent` for the bootstrap epoch 0, `CasVersion` for every
   later rotation — both are plain `s3:PutObject` at the IAM layer per §1's
-  existing note on `CreateIfAbsent`/`CasVersion`/`Put`). Add `t/*/enc` to
+  existing note on `CreateIfAbsent`/`CasVersion`/`Put`; the key-epoch write
+  conditions amendment below grants each under its own Condition). Add `t/*/enc` to
   each role's `ListBucket` `s3:prefix` condition alongside the existing
   per-key wildcards, the same way the bare `t/` discovery entry is added
   (ADR-0072 decision 5).
@@ -1113,7 +1121,8 @@ below are the narrowest that cover each call:
   and `CasVersion` for each appended epoch. Only `NotFound` reads as absence,
   so a refused GET or PUT stops the process from starting. `GatewayRead`,
   `QueryRead`, `MaintainRead`, `GatewayWrite`, `QueryWrite` and
-  `MaintainWrite` gain `t/*/enc`. Admin reads it for `ravel-cli
+  `MaintainWrite` gain `t/*/enc` (the writes move to conditioned statements
+  in the key-epoch write conditions amendment below). Admin reads it for `ravel-cli
   verify-custody` through its blanket `t/*` and writes it nowhere. Nothing
   lists it, so no `ListBucket` prefix is added, unlike the follow-up the
   `t/<hash>/enc` amendment above proposed (the bootstrap-key list amendment
@@ -1535,9 +1544,11 @@ or above its configured shard count, since it would read that tenant through
 the implicit generation 0 of that count and leave those shards out. Otherwise
 it passes with no write. It never lists `l0/`: Query serves committed data
 only. ADR-0050 section 5 therefore holds in every mode, and the read role
-holds no provisioning write and no `l0/` listing. Before this, Query ran the
-adopt path, whose first call lists `t/<hash>/<sig>/l0/`, a prefix
-`QueryList` does not admit, so a Query process with a statically known
+holds no provisioning write and no `l0/` listing (the template grants one
+since the data-prefix list amendment below; the code still issues none).
+Before this, Query ran the adopt path, whose first call lists
+`t/<hash>/<sig>/l0/`, a prefix `QueryList` did not admit until the
+data-prefix list amendment below, so a Query process with a statically known
 tenant that had data and no record was refused at startup with
 `AccessDenied` before it reached any write. ADR-0050 section 5 already
 assigns adoption to ingest, maintenance and the CLI and keeps the read path
@@ -1594,8 +1605,8 @@ refuses an unconditioned `PutObject` reaching the record, refuses a `prov`
 grant reaching a nested `/prov` key, an unprovisioned signal's key, or a key
 whose tenant segment is 31 or 33 characters wide, asserts `query.json`
 reaches no record and admits the commit-prefix listing of the Query startup
-check but not an `l0/` one, and matches each caller above to a grant of its
-own kind.
+check but not an `l0/` one (an assertion the data-prefix list amendment below
+replaces), and matches each caller above to a grant of its own kind.
 
 Net effect on §1: the Maintain write column gains the `prov` writes above,
 the Gateway and Admin entries are conditioned and narrowed to the three
@@ -1664,7 +1675,8 @@ under `t/*/*/maint/*` by `MaintainList`, so they gain nothing. Left out:
 exists; the idempotency markers are found by a prefix listing, not a
 single-key read (no longer so, see the marker lookup amendment below); and a
 data object a concurrent compaction deleted is a race,
-not a bootstrap state, whose key cannot be named without a `*`.
+not a bootstrap state, whose key cannot be named without a `*` (the
+data-prefix list amendment below names it with one).
 
 A list request whose prefix is one of these keys can return only that key,
 since no key the system writes begins with one and continues, so the grants
@@ -1730,7 +1742,8 @@ default, as the servers write it. Routing is opt-in through the flag: without
 it these commands write under the bucket default as before. Maintain already
 holds `kms:Encrypt` and `kms:GenerateDataKey*` on the
 tenant keys and the `t/*/enc` write, so §1's Maintain row and the templates
-are unchanged.
+are unchanged. (The key-epoch write conditions amendment below splits that
+write into create-only and CAS-only grants; these commands need the CAS one.)
 
 Admin is unchanged as well: decrypt-only on the tenant keys, as §1 and the
 `t/<hash>/enc` amendment have it. No Admin command takes the flag, so its
@@ -1811,3 +1824,123 @@ reads where absence is a normal state.
 
 Recorded as an appended amendment, with an inline pointer added to §1 and to
 the bootstrap-key list amendment.
+
+## Amendment (2026-10-05): Query lists the data prefixes it reads
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|Amendment (2026-10-03): prov write conditions per role|Amendment (2026-10-03): bootstrap-key list grants per role" pointer="data-prefix list amendment" -->
+<!-- amendment-supersedes: phrase="whose key cannot be named without a `*`" pointer="data-prefix list amendment" -->
+<!-- amendment-supersedes: phrase="no `l0/` listing" pointer="data-prefix list amendment" -->
+
+Issue #2462. A query pins its segment set when it resolves and then GETs each
+L0 and L1 segment. A compaction or retention delete can remove one in
+between. The PromQL engine (`crates/ravel-query/src/engine.rs`) and the SQL
+executor (`crates/ravel-sql/src/executor.rs`) then re-resolve and retry once,
+and only when the GET fails with `NotFound`.
+
+Measured on a real S3 bucket on 2026-10-05 (issue #2462 records the probe and
+its output): a GET of a key that does not exist answered 404 when one of the
+caller's `ListBucket` grants had an `s3:prefix` condition matching the key
+itself, and 403 when none did. An unconditioned `ListBucket` grant also gives
+404; the probe did not use one. Under a
+`StringLike` grant on `t/*/*/l0/*`, an absent L0 key answered 404; under a
+grant on `t/` alone, an absent L1 key answered 403. `QueryRead` granted
+`t/*/*/l0/*` and `t/*/*/l1/*` and `QueryList` named neither, so on AWS S3 a
+query whose read raced such a delete was refused with `AccessDenied`, the retry
+did not run, and the query failed.
+
+Decision: `QueryList` gains the `s3:prefix` values `t/*/*/l0/*` and
+`t/*/*/l1/*`. The bootstrap-key list amendment left this race out because its
+key cannot be named without a `*`; this grant names it with one. What it costs:
+Query can now list the data prefixes, which names objects no commit record or
+catalog object names: an L0 object from an ingest that died before its commit,
+an L1 part from a compaction that crashed, a legal-hold audit object. Query
+could already enumerate those, because the bare `t/` value in `QueryList`
+carries no delimiter condition, and it can read every object under these
+prefixes through `QueryRead`. The Query startup
+provisioning check still lists only `t/<hash>/<sig>/c/` and never `l0/`; the
+ravel-server test that fails an `l0/` listing, not the template, is what holds
+that now. Gateway and Maintain are unchanged.
+
+`crates/ravel-commit/tests/iam_templates.rs` derives the keys Query may GET and
+Maintain can delete (its delete grants less its `DenyDeleteProtected`) from the
+two templates, asserts every L0 data key and L1 part key Maintain can delete is
+among them, and asserts a `QueryList` value matches each one; with the two
+values removed, exactly those keys are left unmatched. The same check for each
+server role against every other role's deletes finds, and pins, two kinds of
+key the reader's list grants do not match: the test's literal `idem/` witness
+keys under Gateway's `t/*/*/idem/*` read and Maintain's delete, a shape no
+marker has (a real marker key is matched by the marker list grant of the marker
+lookup amendment), and the audit signal's admission snapshot under Maintain's
+`t/*/u/*` read, which Gateway's reap deletes and no Maintain path reads.
+Nothing here was run against AWS beyond the measurement above.
+
+Net effect on §1: the Query role's `l0/**` and `l1/**` reads gain a list grant.
+The prov write conditions amendment's "no `l0/` listing" for the read role and
+the bootstrap-key list amendment's note on the race no longer hold of the
+template.
+
+Recorded as an appended amendment, with an inline pointer added to §1, the prov
+write conditions amendment and the bootstrap-key list amendment.
+
+## Amendment (2026-10-05): the key-epoch record's writes are conditional
+
+<!-- amendment-applies: sections="1. Four roles, mapped to existing process boundaries|Amendment: the `t/<hash>/enc` key-epoch record needs a read/write grant|Amendment (2026-10-01): the control-plane keys each role reads and writes|Amendment (2026-10-03): `ravel-cli` routes Maintain data writes through the tenant key" pointer="key-epoch write conditions amendment" -->
+
+Issue #2462. `GatewayWrite`, `QueryWrite` and `MaintainWrite` granted an
+unconditioned `PutObject` on `t/*/enc`, the append-only key-epoch record
+(ADR-0062 decision 1b). Every production write of it goes through
+`record_key_epoch` (`crates/ravel-catalog/src/key_epoch.rs`), with
+`PutMode::CreateIfAbsent` when its GET finds no record and
+`PutMode::CasVersion` to append an epoch to the record it read. The callers,
+by the role whose credential issues them:
+
+- Gateway, Query and Maintain: `bootstrap_tenant_epoch`
+  (`crates/ravel-catalog/src/tenant_kms.rs`), which `configure_tenant_kms`
+  runs from `services/ravel-server/src/main.rs` at startup in every mode
+  whenever `--tenant-kms-config` is set. For a tenant with no record it creates
+  epoch 0 (`CreateIfAbsent`) and then appends the configured key
+  (`CasVersion`); for a rotated key it appends (`CasVersion`).
+- Maintain: the `ravel-cli` commands of the tenant-KMS `ravel-cli` amendment
+  above, through `configure_tenant_kms_with_policy` under
+  `KeyChangePolicy::Refuse` (`services/ravel-cli/src/store.rs`). They refuse an
+  absent record and append only epoch 1 of an unfinished bootstrap
+  (`CasVersion`).
+
+No production path writes the record unconditionally, so the unconditioned
+grant was wider than any caller: it let a compromised server credential
+overwrite or recreate a tenant's custody history blind.
+
+Decision: the key-epoch record's writes are conditioned the way the prov write
+conditions amendment conditions the provisioning record's. Each of
+`gateway.json`, `query.json` and `maintain.json` drops `t/*/enc` from its
+unconditioned write statement and gains two statements on the one resource
+`t/????????????????????????????????/enc`: `<Role>EncCreate`, conditioned on
+`StringEquals` `s3:if-none-match` `*`, and `<Role>EncCas`, conditioned on
+`Null` `s3:if-match` `false`. Every mode both creates and appends, so all three
+roles hold both; the record is not create-only, because appending an epoch is a
+compare-and-swap and key rotation depends on it. Admin is unchanged: it reads
+the record through `t/*` and holds no write on it. `DenyDeleteProtected` keeps
+`t/*/enc` in all four templates.
+
+What it buys: a compromised Gateway, Query or Maintain credential can still
+create a missing record, and can replace an existing one only with a PUT that
+names the version it read. IAM cannot constrain what that PUT contains, so a
+credential that can read the record can still rewrite its history; what the
+conditions remove is the blind overwrite, an unconditional PUT that does not
+depend on what is there. The statements admit the server's writes only if S3
+evaluates `s3:if-none-match` and `s3:if-match` on `PutObject`, as the
+provisioning-record statements already require. `crates/ravel-commit/tests/iam_templates.rs` pins the statements per role
+by exact JSON, checks that no unconditioned `PutObject` in any template reaches
+the record, and matches each caller above to a grant of its own kind; two
+fixtures, the CAS statement without its Condition and `t/*/enc` added back to
+an unconditioned write statement, fail those checks. Nothing here was run
+against AWS.
+
+Net effect on §1: the Gateway, Query and Maintain write columns' `t/<hash>/enc`
+entries are conditioned. The `t/<hash>/enc` key-epoch amendment's "plain
+`s3:PutObject`" grant and the control-plane key amendment's `t/*/enc` in the
+three write statements now stand as these conditioned statements.
+
+Recorded as an appended amendment, with an inline pointer added to §1, the
+`t/<hash>/enc` key-epoch amendment, the control-plane key amendment and the
+tenant-KMS `ravel-cli` amendment.

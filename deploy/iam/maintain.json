@@ -71,7 +71,6 @@
         "arn:aws:s3:::my-ravel-bucket/sys/tenancy",
         "arn:aws:s3:::my-ravel-bucket/sys/maintain/*",
         "arn:aws:s3:::my-ravel-bucket/quarantine/t/*/*/l0/*",
-        "arn:aws:s3:::my-ravel-bucket/t/*/enc",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/snap/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/idx/*",
         "arn:aws:s3:::my-ravel-bucket/t/*/catalog/*/HEAD"
@@ -101,6 +100,28 @@
         "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/l/prov",
         "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/s/prov"
       ],
+      "Condition": {
+        "Null": {
+          "s3:if-match": "false"
+        }
+      }
+    },
+    {
+      "Sid": "MaintainEncCreate",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/enc",
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*"
+        }
+      }
+    },
+    {
+      "Sid": "MaintainEncCas",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/enc",
       "Condition": {
         "Null": {
           "s3:if-match": "false"
