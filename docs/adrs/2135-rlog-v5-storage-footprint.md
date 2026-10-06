@@ -613,7 +613,7 @@ decide it, and the floor is applied last:
 
 ```text
 budget = memory - overhead reserve - merge cursor budget   (at least 0)
-reserve = min(2 GiB, memory / 4)
+reserve = min(2 GiB, max(memory / 4, non-budget floor))   (ADR-1170)
 target = max( min( budget / 8 / concurrent_merges,
                    claim lease * 10 MiB/s / 2,
                    8 GiB ),
@@ -621,8 +621,8 @@ target = max( min( budget / 8 / concurrent_merges,
 ```
 
 `ravel-server` uses its resolved `memory_budget_bytes` (memory less its
-overhead reserve, 2 GiB from 8 GiB of memory up and a quarter of that
-memory below it -- ADR-1170, small-host reserve amendment, issue #2607)
+overhead reserve, 2 GiB from 8 GiB of memory up and set by ADR-1170's
+small-host reserve amendment below it, issue #2607)
 and its maintenance unit concurrency; `ravel-cli
 maintain` uses the host's total memory, capped by a cgroup memory limit on
 Linux, less the same reserve, and its bucket concurrency (1 for

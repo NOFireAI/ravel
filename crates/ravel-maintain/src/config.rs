@@ -559,8 +559,8 @@ pub const DEFAULT_MAX_L1_PART_BYTES: u64 = 256 * 1024 * 1024;
 /// satisfies `budget / 8 / concurrent_merges <= 256 MiB`. With the default
 /// 20 GiB merge cursor budget and the overhead reserve already deducted
 /// from that budget (the fixed 2 GiB [`MEMORY_OVERHEAD_RESERVE_BYTES`]: every
-/// host in the ranges below is well above the 8 GiB threshold where
-/// [`effective_memory_overhead_reserve_bytes`] still scales it down), that is
+/// host in the ranges below is well above the 8 GiB threshold below which
+/// [`effective_memory_overhead_reserve_bytes`] scales it down), that is
 /// a host of at most `22 GiB + 2 GiB *
 /// concurrent_merges` for `ravel-cli maintain` (`compact-bucket` is one merge:
 /// 24 GiB or less) and, for `ravel-server` at `--maintain-unit-concurrency` 4,
@@ -584,35 +584,56 @@ pub const L1_PART_MEMORY_TARGET_BUDGET_DIVISOR: u64 = 8;
 /// it) and `ravel-cli maintain` deducts it in [`host_memory_budget_bytes`], so
 /// the two derive from one definition of "memory the merges may use".
 ///
-/// A provisional round figure, not a measurement: well above the few hundred MiB
-/// an idle process costs before its first query, so a flag combination is not
-/// falsely refused for lack of the real number.
+/// A provisional round figure, not a measurement: well above the idle process
+/// cost ([`NON_BUDGET_BASELINE_BYTES`]) plus the default 512 MiB ingest buffer
+/// bound, so a flag combination is not falsely refused for lack of the real
+/// number.
 ///
 /// This is the reserve's ceiling. Both binaries deduct
 /// [`effective_memory_overhead_reserve_bytes`], which is this constant on a
-/// host with 8 GiB or more and a quarter of the host's memory below that.
+/// host with 8 GiB or more.
 pub const MEMORY_OVERHEAD_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Below `MEMORY_OVERHEAD_RESERVE_BYTES * MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR`
-/// (8 GiB) the overhead reserve is the host's memory divided by this (ADR-1170,
-/// small-host reserve amendment, issue #2607).
+/// (8 GiB) the overhead reserve scales with the host's memory divided by this,
+/// down to the non-budget floor (ADR-1170, small-host reserve amendment, issue
+/// #2607).
 pub const MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR: u64 = 4;
+
+/// What a process costs outside the memory budget before it holds any ingest
+/// buffer or serves its first query: binary text and data, thread stacks, the
+/// tokio runtime and tracing buffers. 256 MiB, a provisional round figure like
+/// [`MEMORY_OVERHEAD_RESERVE_BYTES`], not a measurement. It is the smallest
+/// overhead reserve either binary deducts (ADR-1170, small-host reserve
+/// amendment, issue #2607).
+pub const NON_BUDGET_BASELINE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The overhead reserve deducted from `total_bytes` (`MemTotal`, or the cgroup
 /// memory limit when one caps it): `min(MEMORY_OVERHEAD_RESERVE_BYTES,
-/// total_bytes / 4)`. The fixed 2 GiB alone leaves nothing on a host with
-/// 2 GiB or less; a quarter of the host leaves three quarters to derive from.
-/// From 8 GiB up it is [`MEMORY_OVERHEAD_RESERVE_BYTES`] exactly.
-pub fn effective_memory_overhead_reserve_bytes(total_bytes: u64) -> u64 {
-    MEMORY_OVERHEAD_RESERVE_BYTES.min(total_bytes / MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR)
+/// max(total_bytes / 4, non_budget_floor_bytes))`.
+///
+/// `non_budget_floor_bytes` is the memory the process holds outside the budget
+/// that the reserve must cover however small the host:
+/// [`NON_BUDGET_BASELINE_BYTES`], plus the ingest buffer bound in a
+/// `ravel-server` mode that buffers ingest. From 8 GiB up the quarter reaches
+/// the cap, so the reserve is [`MEMORY_OVERHEAD_RESERVE_BYTES`] exactly
+/// whatever the floor.
+pub fn effective_memory_overhead_reserve_bytes(
+    total_bytes: u64,
+    non_budget_floor_bytes: u64,
+) -> u64 {
+    MEMORY_OVERHEAD_RESERVE_BYTES
+        .min((total_bytes / MEMORY_OVERHEAD_RESERVE_HOST_DIVISOR).max(non_budget_floor_bytes))
 }
 
-/// Host memory less [`effective_memory_overhead_reserve_bytes`]: the budget
-/// `ravel-cli maintain` starts its derivation from before
+/// Host memory less [`effective_memory_overhead_reserve_bytes`] at the
+/// [`NON_BUDGET_BASELINE_BYTES`] floor (`ravel-cli maintain` holds no ingest
+/// buffer): the budget `ravel-cli maintain` starts its derivation from before
 /// [`merge_memory_budget_bytes`] deducts the merge cursor budget.
 pub fn host_memory_budget_bytes(host_memory_total_bytes: u64) -> u64 {
     host_memory_total_bytes.saturating_sub(effective_memory_overhead_reserve_bytes(
         host_memory_total_bytes,
+        NON_BUDGET_BASELINE_BYTES,
     ))
 }
 
@@ -2310,33 +2331,76 @@ mod tests {
         assert_eq!(bound, L1PartMemoryTargetBound::Floor);
     }
 
-    /// Issue #2607: the reserve is a quarter of the host below 8 GiB and the
-    /// fixed 2 GiB from 8 GiB up. A fixed 2 GiB fails the 2 GiB and 1,912 MiB
-    /// rows (it reads 2 GiB and leaves a 0 host budget there).
+    /// Issue #2607: the reserve is `min(2 GiB, max(host / 4, floor))`. A
+    /// fixed 2 GiB fails the 2 GiB and 1,912 MiB rows (it reads 2 GiB and
+    /// leaves a 0 host budget there); dropping the floor fails the 512 MiB,
+    /// 600 MiB and 0 rows (128 MiB, 150 MiB and 0 instead of 256 MiB) and the
+    /// 768 MiB floor rows; dropping the outer `min` fails the 3 GiB floor rows.
     #[test]
-    fn the_reserve_is_a_quarter_of_the_host_below_eight_gib() {
+    fn the_reserve_is_a_quarter_of_the_host_between_its_floor_and_cap() {
+        assert_eq!(NON_BUDGET_BASELINE_BYTES, 256 * MIB);
+        let baseline = NON_BUDGET_BASELINE_BYTES;
         assert_eq!(
-            effective_memory_overhead_reserve_bytes(1912 * MIB),
+            effective_memory_overhead_reserve_bytes(1912 * MIB, baseline),
             478 * MIB
         );
         assert_eq!(host_memory_budget_bytes(1912 * MIB), 1434 * MIB);
-        assert_eq!(effective_memory_overhead_reserve_bytes(2 * GIB), 512 * MIB);
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(2 * GIB, baseline),
+            512 * MIB
+        );
         assert_eq!(host_memory_budget_bytes(2 * GIB), 1536 * MIB);
         assert_eq!(
-            effective_memory_overhead_reserve_bytes(8 * GIB - 4),
+            effective_memory_overhead_reserve_bytes(8 * GIB - 4, baseline),
             2 * GIB - 1
         );
+        // Below 1 GiB a quarter is under the baseline, which then binds.
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(512 * MIB, baseline),
+            256 * MIB
+        );
+        assert_eq!(host_memory_budget_bytes(512 * MIB), 256 * MIB);
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(600 * MIB, baseline),
+            256 * MIB
+        );
+        assert_eq!(host_memory_budget_bytes(600 * MIB), 344 * MIB);
+        // A floor of baseline + the default 512 MiB ingest bound.
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(1912 * MIB, 768 * MIB),
+            768 * MIB
+        );
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(3072 * MIB, 768 * MIB),
+            768 * MIB
+        );
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(4 * GIB, 768 * MIB),
+            GIB
+        );
         for total in [8 * GIB, 32 * GIB, 30 * GIB, u64::MAX] {
-            assert_eq!(
-                effective_memory_overhead_reserve_bytes(total),
-                MEMORY_OVERHEAD_RESERVE_BYTES
-            );
+            for floor in [0, baseline, 768 * MIB, 3 * GIB] {
+                assert_eq!(
+                    effective_memory_overhead_reserve_bytes(total, floor),
+                    MEMORY_OVERHEAD_RESERVE_BYTES,
+                    "total {total}, floor {floor}"
+                );
+            }
             assert_eq!(
                 host_memory_budget_bytes(total),
                 total - MEMORY_OVERHEAD_RESERVE_BYTES
             );
         }
-        assert_eq!(effective_memory_overhead_reserve_bytes(0), 0);
+        // A floor above the cap is held at the cap on a small host too.
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(GIB, 3 * GIB),
+            MEMORY_OVERHEAD_RESERVE_BYTES
+        );
+        assert_eq!(effective_memory_overhead_reserve_bytes(0, 0), 0);
+        assert_eq!(
+            effective_memory_overhead_reserve_bytes(0, baseline),
+            256 * MIB
+        );
         assert_eq!(host_memory_budget_bytes(0), 0);
     }
 

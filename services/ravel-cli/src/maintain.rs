@@ -244,8 +244,10 @@ pub enum CompactorKnobError {
 /// [`ravel_maintain::detect_host_memory_total_bytes`]) with
 /// [`ResolvedL1PartMemoryTarget::resolve`]. The budget that is divided is the
 /// host memory less [`ravel_maintain::config::effective_memory_overhead_reserve_bytes`]
-/// (the fixed [`ravel_maintain::MEMORY_OVERHEAD_RESERVE_BYTES`] from 8 GiB of
-/// memory up, scaled down to a quarter of that memory below it) less the
+/// at the [`ravel_maintain::config::NON_BUDGET_BASELINE_BYTES`] floor, since this
+/// process holds no ingest buffer (the fixed
+/// [`ravel_maintain::MEMORY_OVERHEAD_RESERVE_BYTES`] from 8 GiB of memory up,
+/// scaled down below it as that function states) less the
 /// merge cursor budget the same invocation runs with
 /// ([`merge_cursor_budget_total_bytes`]: the default 20 GiB for any
 /// `concurrent_merges`, because [`per_bucket_config`] splits it between them),
