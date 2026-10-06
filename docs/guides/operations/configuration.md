@@ -1484,8 +1484,8 @@ per-query share: statements running together share the tenant ceiling, and a
 statement that arrives while another holds most of it gets what is left, not a
 reserved quarter. One tenant's SQL memory is therefore still at most 50% of
 `MemTotal`. The two caches carve the memory budget (`MemTotal` less the
-overhead reserve, 2 GiB from 8 GiB of memory up and scaled down below it, as
-described below) rather than `MemTotal`, so the three ceilings together come to about
+overhead reserve, 2 GiB from 8 GiB of memory up and scaled down below it at
+the default ingest ceiling, as described below) rather than `MemTotal`, so the three ceilings together come to about
 78% of `MemTotal` on the reference host (25,125,558,681 of 32,212,254,720),
 and more on a loopback store, where the fetcher cache derives at 40%.
 
@@ -1536,12 +1536,17 @@ and a readable `MemAvailable` (Linux's own `/proc/meminfo` estimate of memory
 a new allocation could claim without swapping), the budget is
 `min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`,
 every subtraction saturating at zero. `RESERVE` is the overhead reserve,
-`min(2 GiB, max(memory / 4, held))` of the memory the budget starts from
+`max(min(2 GiB, memory / 4), held)` of the memory the budget starts from
 (`MemTotal`, or the cgroup memory limit when one applies), where `held` is
 what the process holds outside the budget: a provisional, uncalibrated
 256 MiB baseline, plus the `--max-ingest-buffer-bytes` ceiling in
-`--mode all`, or the whole 2 GiB when that flag is `0` (unbounded). The
-reserve is a fixed 2 GiB from 8 GiB up. Below that, a t3a.small (`MemTotal`
+`--mode all`, or 2 GiB when that flag is `0`, since an unbounded buffer
+cannot be accounted. `held` wins over the 2 GiB cap, so the budget, the
+ingest ceiling and the baseline fit in memory at every bounded ceiling. At
+an ingest ceiling of 1.75 GiB or less the reserve is a fixed 2 GiB from
+8 GiB up. A larger ceiling makes the reserve the ceiling plus 256 MiB at
+every size: at `--max-ingest-buffer-bytes 3221225472` it is 3.25 GiB, so an
+8 GiB host derives a budget of at most 4,864 MiB. Below 8 GiB, a t3a.small (`MemTotal`
 1,912 MiB) reserves 768 MiB in `--mode all` at the default 512 MiB ingest
 ceiling, for a budget of at most 1,144 MiB, and 478 MiB, a quarter, in
 `--mode query` and `--mode maintain`, for at most 1,434 MiB. `FLOOR` is a 1 GiB
@@ -1553,8 +1558,8 @@ A derived budget below 256 MiB refuses to start, with a message naming
 `MemTotal` (or the cgroup limit), the reserve, the budget and
 `--memory-budget-bytes`, and `--max-ingest-buffer-bytes` when the ingest
 ceiling set the reserve; a host or container needs 512 MiB of memory to
-clear it in `--mode query` or `--mode maintain`, and 1 GiB in `--mode all` at
-the default ingest ceiling.
+clear it in `--mode query` or `--mode maintain`, and in `--mode all` a
+bounded ingest ceiling plus 512 MiB: 1 GiB at the default ingest ceiling.
 The process's own resident set counts as available because the kernel does
 not call a process's own resident pages "available" even though this
 process may reuse them rather than compete with them. A cgroup memory
@@ -1660,7 +1665,9 @@ fetcher cache's larger 40% share, resolved instead of `budget-carve` when
 the store is `s3` against a loopback endpoint and `--cache-max-bytes` is
 unset), or `fallback` (no flag and no readable `MemTotal`, so the
 compiled-in constant is used). `memory_budget_bytes` resolved with source
-`flag` means `--memory-budget-bytes` won over every derivation branch. So
+`flag` means `--memory-budget-bytes` won over every derivation branch. A
+`flag` or `fallback` budget subtracts no overhead reserve, so the
+`memory_overhead_reserve_bytes` line is printed only on a derived source. So
 `journalctl -u ravel-server | grep
 'performance default resolved'` answers "what is this process actually running
 with" without reading the unit file:
