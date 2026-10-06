@@ -11036,12 +11036,8 @@ fn bootstrap_negative_witnesses() -> Vec<String> {
     keys
 }
 
-/// The candidates out of `key_domain()`, the bootstrap reads and the negative
-/// witnesses that `expected`'s two statements in `policy` admit.
-fn bootstrap_admitted(
-    policy: &Policy,
-    expected: &ExpectedBootstrapGrants,
-) -> std::collections::BTreeSet<String> {
+/// The `s3:prefix` values of `expected`'s two statements in `policy`.
+fn bootstrap_list_prefixes(policy: &Policy, expected: &ExpectedBootstrapGrants) -> Vec<String> {
     let statements: Vec<serde_json::Value> = policy_statements(policy)
         .iter()
         .filter(|s| {
@@ -11054,7 +11050,16 @@ fn bootstrap_admitted(
         role: policy.role,
         statements: serde_json::Value::Array(statements),
     };
-    let prefixes = list_prefix_patterns(&bootstrap_only, Some("Allow"));
+    list_prefix_patterns(&bootstrap_only, Some("Allow"))
+}
+
+/// The candidates out of `key_domain()`, the bootstrap reads and the negative
+/// witnesses that `expected`'s two statements in `policy` admit.
+fn bootstrap_admitted(
+    policy: &Policy,
+    expected: &ExpectedBootstrapGrants,
+) -> std::collections::BTreeSet<String> {
+    let prefixes = bootstrap_list_prefixes(policy, expected);
     let mut candidates: Vec<String> = key_domain().to_vec();
     candidates.extend(bootstrap_reads().into_iter().map(|r| r.key));
     candidates.extend(bootstrap_negative_witnesses());
@@ -11428,4 +11433,91 @@ fn a_single_wildcard_query_prov_pattern_fails_the_negative_witnesses() {
 
     check_bootstrap_grants_admit_only(&load_policy("query"), expected)
         .expect("the shipped template passes the same check");
+}
+
+/// The keys a list on a bootstrap prefix is checked against: `key_domain()`
+/// plus every bootstrap read's key, which supplies the full-width tenant
+/// witnesses (`config`, the catalog `HEAD`s, the idempotency markers) the
+/// domain spells with a shorter tenant segment or not at all.
+fn bootstrap_list_candidates() -> Vec<String> {
+    let mut keys: Vec<String> = key_domain().to_vec();
+    keys.extend(bootstrap_reads().into_iter().map(|r| r.key));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+/// Each `(prefix, key)` where `prefixes` admits `prefix` as an `s3:prefix` and
+/// `key` in `keys` starts with it and is longer: a key a ListObjectsV2 on that
+/// prefix returns besides the prefix's own key. "Starts with" is the raw string
+/// prefix rule ListObjectsV2 applies, so every proper prefix of every key is
+/// tried against the template's own matcher.
+fn list_returns_beyond_the_key(prefixes: &[String], keys: &[String]) -> Vec<(String, String)> {
+    let matchers: Vec<regex::Regex> = prefixes.iter().map(|p| glob_to_regex(p)).collect();
+    let mut out = Vec::new();
+    for key in keys {
+        for (end, _) in key.char_indices().skip(1) {
+            let prefix = &key[..end];
+            if matchers.iter().any(|m| m.is_match(prefix)) {
+                out.push((prefix.to_string(), key.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// A list request whose prefix is a value a bootstrap list statement admits
+/// returns that one key and no other: no key in `bootstrap_list_candidates()`
+/// begins with an admitted value and continues. Every admitted value is
+/// witnessed by a candidate equal to it, so the check is not vacuous for any
+/// of them.
+#[test]
+fn a_list_on_a_bootstrap_prefix_returns_only_that_key() {
+    let keys = bootstrap_list_candidates();
+    for expected in &EXPECTED_BOOTSTRAP_GRANTS {
+        let role = expected.role;
+        let policy = load_policy(role);
+        let prefixes = bootstrap_list_prefixes(&policy, expected);
+        assert_eq!(
+            prefixes.len(),
+            expected.fixed_keys.len() + expected.tenant_patterns.len(),
+            "{role}: the bootstrap statements' s3:prefix values"
+        );
+        for prefix in &prefixes {
+            assert!(
+                keys.iter().any(|k| glob_matches(prefix, k)),
+                "{role}: no candidate key is admitted by {prefix:?}, so the check \
+                 examines nothing for it"
+            );
+        }
+        assert_eq!(
+            list_returns_beyond_the_key(&prefixes, &keys),
+            Vec::<(String, String)>::new(),
+            "{role}: a list on an admitted bootstrap prefix returns these \
+             (prefix, key) pairs besides the prefix's own key"
+        );
+    }
+}
+
+/// The check is live: a key one suffix longer than a fixed bootstrap key and
+/// one longer than a per-tenant one, added to a copy of the candidates, are
+/// each reported against the key they extend, and nothing else is.
+#[test]
+fn a_key_extending_a_bootstrap_key_fails_the_list_check() {
+    let hex = test_tenant().to_hex();
+    let expected = EXPECTED_BOOTSTRAP_GRANTS
+        .iter()
+        .find(|e| e.role == "gateway")
+        .expect("gateway row");
+    let prefixes = bootstrap_list_prefixes(&load_policy("gateway"), expected);
+    let mut keys = bootstrap_list_candidates();
+    keys.push("sys/gc.bak".to_string());
+    keys.push(format!("t/{hex}/enc.bak"));
+    assert_eq!(
+        list_returns_beyond_the_key(&prefixes, &keys),
+        vec![
+            ("sys/gc".to_string(), "sys/gc.bak".to_string()),
+            (format!("t/{hex}/enc"), format!("t/{hex}/enc.bak")),
+        ]
+    );
 }
