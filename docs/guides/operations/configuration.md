@@ -841,6 +841,12 @@ aggregate (such as `MAX` or `MIN`), over a float `GROUP BY` column, over
 grouping sets, over a `HAVING` filter, or over a nested subquery is left as
 written, and the query does not spill.
 
+A `SELECT DISTINCT ON` keeps one row of each group, chosen by its own
+`ORDER BY`, and nothing is appended to that order. Such a statement spills
+only when its `ORDER BY` names every selected column as a plain column, so
+that any two rows the order ties on are the same row; otherwise it does not
+spill. A plain `SELECT DISTINCT` is not affected.
+
 ## Retention and garbage-collection configuration
 
 These values govern when a deleted object's bytes actually go away, and they must
